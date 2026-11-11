@@ -222,11 +222,19 @@ pub const TIMING_ENV: &str = "CARRICK_RECHECK_TIMING";
 /// timing lines.
 static RUN_STARTED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
+/// Mark `started` as the beginning of this command, for the offsets in the
+/// timing lines.
+pub(super) fn start_timing(started: Instant) {
+    if let Ok(mut at) = RUN_STARTED.lock() {
+        *at = Some(started);
+    }
+}
+
 /// Say that `phase` took from `began` until now, and where in the command that
 /// ended: one line per phase, `recheck-timing <phase> took <ms> ms, ended at
-/// <ms> ms`. Only the per-edit re-check calls it; the several-file check is
-/// not timed here.
-fn took(phase: &str, began: Instant) {
+/// <ms> ms`. Both checks call it: the per-edit re-check and the several-file
+/// `check --changed`, whose parent writes no log of its own.
+pub(super) fn took(phase: &str, began: Instant) {
     let now = Instant::now();
     let at = RUN_STARTED
         .lock()
@@ -265,9 +273,7 @@ pub fn run(
     rescan: bool,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
-    if let Ok(mut at) = RUN_STARTED.lock() {
-        *at = Some(started);
-    }
+    start_timing(started);
     let budget = budget();
     let deadline = started + budget;
     // The index is read once, here, and named twice: for what the edit added
@@ -496,7 +502,35 @@ pub(super) fn kept_dir(
             }
         })
         .collect();
-    Some(workspace.index_dir().join(kind).join(name))
+    Some(kept_dir_of(
+        &workspace.index_dir(),
+        kind,
+        &name,
+        &build_id(),
+    ))
+}
+
+/// `.carrick/<kind>/<generation>.<build>/`. Kept state is only ever read by
+/// the build that wrote it: a different scanner build builds different pairs
+/// and rows from the same index.
+fn kept_dir_of(index_dir: &Path, kind: &str, generation: &str, build: &str) -> std::path::PathBuf {
+    index_dir.join(kind).join(format!("{generation}.{build}"))
+}
+
+/// The running binary's identity for kept state: its version, its stamped
+/// commit and whether the tree was dirty. An unstamped (debug) build says so.
+fn build_id() -> String {
+    let stamp = crate::cloud_storage::ScannerBuild::current().map_or_else(
+        || "unstamped".to_string(),
+        |build| {
+            format!(
+                "{}{}",
+                build.commit,
+                if build.dirty { "-dirty" } else { "" }
+            )
+        },
+    );
+    format!("{}-{stamp}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Remove every generation of `kind` except `keep`: a new index replaces what
@@ -684,11 +718,6 @@ impl Plan {
         let _ = std::fs::create_dir_all(&dir)
             .and_then(|()| std::fs::write(&staged, bytes))
             .and_then(|()| std::fs::rename(&staged, &kept));
-    }
-
-    /// Where the type checker keeps its finished answers for this re-check.
-    fn judged_dir(&self, workspace: &Workspace) -> Option<std::path::PathBuf> {
-        kept_dir(workspace, "judged", &self.generation)
     }
 }
 
@@ -1058,6 +1087,7 @@ fn inside(
         deadline,
         None,
         Some(plan),
+        &plan.generation,
     )?;
     // A re-scan that could not replay the index's model answers has lost every
     // row only the model stated: not a pass, as in the plain check's `answer`
@@ -1301,25 +1331,34 @@ pub(super) fn rejoin(
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
+    index_generation: &str,
 ) -> Result<Rejoined, String> {
+    let began = Instant::now();
+    let held = Held::read(workspace)?;
+    took("held-read", began);
     rejoin_held(
         workspace,
-        Held::read(workspace)?,
+        held,
         repos,
         generation,
         deadline,
         narrator,
         None,
+        index_generation,
     )
 }
 
-/// [`rejoin`], over an index already read.
+/// [`rejoin`], over an index already read. Both checks keep the type checker's
+/// answers per index and build (`index_generation`, the index's `indexed_at`),
+/// so a run that moves no type finds the index's own answer, or the last run's,
+/// in `.carrick/judged`.
 ///
 /// `plan` is the per-edit re-check's: it narrows the re-scan to the services
 /// it names, stands the newest known copy in for the rest, keeps what the
 /// scan read, and keeps the type checker's answers per index. `None` is the
 /// several-file check, which re-reads whatever the change scope reaches and
 /// keeps nothing.
+#[allow(clippy::too_many_arguments)]
 fn rejoin_held(
     workspace: &Workspace,
     held: Held,
@@ -1328,19 +1367,15 @@ fn rejoin_held(
     deadline: Instant,
     narrator: Option<&Narrator>,
     plan: Option<&Plan>,
+    index_generation: &str,
 ) -> Result<Rejoined, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("no carrick binary to re-scan with: {e}"))?;
-    // Timed only for the per-edit re-check, which has a plan.
-    let timed = plan.is_some();
     let began = Instant::now();
     let blobs = generation.join("repos");
     // The re-scans and the re-join judge the same stubs and pairs; the folder
-    // is where the first answer waits for the others. A per-edit re-check
-    // keeps it per index, so an edit that moves no type finds the index's own
-    // answer there.
-    let judged = plan
-        .and_then(|plan| plan.judged_dir(workspace))
+    // is where the first answer waits for the others.
+    let judged = kept_dir(workspace, "judged", index_generation)
         .unwrap_or_else(|| generation.join("judged"));
     std::fs::create_dir_all(&blobs).map_err(|e| format!("{}: {e}", blobs.display()))?;
     let names: std::collections::BTreeSet<String> =
@@ -1368,9 +1403,7 @@ fn rejoin_held(
         remote_services.insert(service_id(&blob), remote);
         write_blob(&blobs.join(format!("hosted-{position}.json")), &blob)?;
     }
-    if timed {
-        took("stage/retained-and-hosted-blobs", began);
-    }
+    took("stage/retained-and-hosted-blobs", began);
     let began = Instant::now();
 
     // Phase 1, one scan per repo, analysing only the services whose inputs
@@ -1413,9 +1446,7 @@ fn rejoin_held(
     }
     drop(hosted);
     drop(indexed);
-    if timed {
-        took("stage/hosted-and-previous-lists", began);
-    }
+    took("stage/hosted-and-previous-lists", began);
 
     for (position, tree) in repos.iter().enumerate() {
         let name = repo_label(&tree.repo);
@@ -1442,14 +1473,10 @@ fn rejoin_held(
             scan.env(crate::progress::PROGRESS_ENV, "1");
             narrator.repo(Instant::now(), &name, position + 1, repos.len());
         }
-        if timed {
-            took("scan-starts", Instant::now());
-        }
+        took("scan-starts", Instant::now());
         let began = Instant::now();
         bounded(scan, "re-scan", deadline, narrator)?;
-        if timed {
-            took("scan", began);
-        }
+        took("scan", began);
         let began = Instant::now();
         let fresh = read_blobs(&scan_dir)?;
         if let Some(plan) = plan {
@@ -1457,15 +1484,11 @@ fn rejoin_held(
                 plan.keep(workspace, blob);
             }
         }
-        if timed {
-            took("after-scan/read-fresh-and-keep", began);
-        }
+        took("after-scan/read-fresh-and-keep", began);
         let began = Instant::now();
         let hosted_data = read_staged(&staged(generation, "hosted", position))?;
         let previous_data = read_staged(&previous)?;
-        if timed {
-            took("after-scan/read-staged-lists", began);
-        }
+        took("after-scan/read-staged-lists", began);
         let began = Instant::now();
         let carried =
             super::index::carried_services(&tree.checkout, &hosted_data, &previous_data, &fresh)?;
@@ -1475,17 +1498,13 @@ fn rejoin_held(
         // so the next check reads them instead of walking again. Never an
         // analysed service's rows.
         super::index::keep_carried_walks(&scan_dir, &kept, &carried);
-        if timed {
-            took("after-scan/carried-and-kept-walks", began);
-        }
+        took("after-scan/carried-and-kept-walks", began);
         let began = Instant::now();
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {
             services.insert(service_id(blob));
             write_blob(&blobs.join(format!("local-{position}-{offset}.json")), blob)?;
         }
-        if timed {
-            took("after-scan/write-local-blobs", began);
-        }
+        took("after-scan/write-local-blobs", began);
     }
 
     // Phase 2. The join reads the blobs back and runs the type check over
@@ -1516,9 +1535,7 @@ fn rejoin_held(
     }
     let began = Instant::now();
     bounded(join, "re-join", deadline, narrator)?;
-    if timed {
-        took("join", began);
-    }
+    took("join", began);
     let began = Instant::now();
     let text = std::fs::read_to_string(&out)
         .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
@@ -1528,9 +1545,7 @@ fn rejoin_held(
     // The same fold the indexer performs, over the same shapes, so a re-checked
     // row and an indexed row can never be built two different ways.
     let index = build(workspace, &blobs, &joined, &remote_services)?;
-    if timed {
-        took("fold", began);
-    }
+    took("fold", began);
     Ok(Rejoined {
         index,
         join: joined,
@@ -1996,6 +2011,32 @@ mod tests {
         assert_eq!(
             crate::engine::service_workers::at_once_with(12_452, 12, Some(3072)),
             2
+        );
+    }
+
+    /// Kept judge answers are the writing build's alone: the same index under
+    /// another build is another folder, so a build never reads answers another
+    /// one kept, and this build's own folder names its build.
+    #[test]
+    fn kept_answers_are_keyed_by_the_build_that_kept_them() {
+        let index_dir = Path::new("/w/.carrick");
+        let one = kept_dir_of(index_dir, "judged", "2026-11-11T00:00:00Z", "0.3.153-abc");
+        let other = kept_dir_of(index_dir, "judged", "2026-11-11T00:00:00Z", "0.3.154-def");
+        assert_ne!(one, other);
+        let workspace = Workspace {
+            root: Path::new("/w").to_path_buf(),
+            repos: Vec::new(),
+            missing: Vec::new(),
+            repos_detected_by: String::new(),
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            parent_proposal: None,
+        };
+        let here = kept_dir(&workspace, "judged", "2026-11-11T00:00:00Z").expect("a generation");
+        assert!(
+            here.to_string_lossy()
+                .ends_with(&format!(".{}", build_id())),
+            "{here:?}"
         );
     }
 

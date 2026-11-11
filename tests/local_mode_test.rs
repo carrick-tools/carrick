@@ -6996,3 +6996,116 @@ fn a_type_neutral_edit_moves_no_row() {
     );
     assert!(moved_of(&answer).is_empty(), "{answer:#}");
 }
+
+/// Every kept judge answer under `.carrick/judged`, with its size and last
+/// write time: a file written again changes its time.
+fn kept_judge_answers(
+    root: &Path,
+) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)> {
+    fn walk(
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "json") {
+                let meta = entry.metadata().expect("kept answer metadata");
+                out.insert(path, (meta.len(), meta.modified().expect("mtime")));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(&root.join(".carrick/judged"), &mut out);
+    out
+}
+
+/// A `check --changed` answer without the time it took.
+fn without_time(mut json: serde_json::Value) -> serde_json::Value {
+    json["elapsed_ms"] = serde_json::Value::Null;
+    json
+}
+
+/// The workspace with a contract field dropped from the producer, uncommitted,
+/// and an index built before the edit.
+fn workspace_with_a_dropped_field() -> tempfile::TempDir {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    index(root);
+    let route = root.join("catalog-web/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+    workspace
+}
+
+/// A second identical `check --changed` takes the type checker's answer the
+/// first one kept: nothing is judged or written again, and the answer is the
+/// one a cold judge gives (verdicts, exit code and JSON identical), the planted
+/// break included.
+#[test]
+#[serial]
+fn a_repeated_check_reuses_the_kept_judge_answer_and_says_what_a_cold_judge_says() {
+    let workspace = workspace_with_a_dropped_field();
+    let root = workspace.path();
+    let before = kept_judge_answers(root);
+
+    let (code_first, first, _) = check_changed_json_with(root, &[("CARRICK_MOCK_ALL", "1")]);
+    let kept = kept_judge_answers(root);
+    assert!(
+        kept.len() > before.len(),
+        "the first check kept the answer it judged under .carrick/judged:\n{before:#?}\n{kept:#?}"
+    );
+    let (code_second, second, _) = check_changed_json_with(root, &[("CARRICK_MOCK_ALL", "1")]);
+    assert_eq!(
+        kept_judge_answers(root),
+        kept,
+        "the second check read the kept answer and wrote nothing"
+    );
+    assert_eq!(code_second, code_first);
+    assert_eq!(without_time(second.clone()), without_time(first.clone()));
+
+    // A cold judge: no kept answer anywhere.
+    std::fs::remove_dir_all(root.join(".carrick/judged")).expect("clear the kept answers");
+    let (code_cold, cold, _) = check_changed_json_with(root, &[("CARRICK_MOCK_ALL", "1")]);
+    assert_eq!(code_cold, code_first);
+    assert_eq!(without_time(cold), without_time(second.clone()));
+    assert!(
+        second["problems"]
+            .as_array()
+            .is_some_and(|problems| problems.iter().any(|p| p["fails"] == true)),
+        "the planted break fails the check, kept answer or not:\n{second:#}"
+    );
+}
+
+/// The parent writes no log, so `CARRICK_RECHECK_TIMING` is where its seconds
+/// are read: a line for each step of `check --changed`.
+#[test]
+#[serial]
+fn check_changed_times_each_step_of_its_parent() {
+    let workspace = workspace_with_a_dropped_field();
+    let (_, _, stderr) = check_changed_json_with(
+        workspace.path(),
+        &[("CARRICK_MOCK_ALL", "1"), ("CARRICK_RECHECK_TIMING", "1")],
+    );
+    for step in [
+        "check/read-index",
+        "check/load-workspace",
+        "check/changed-files",
+        "check/reads-the-same",
+        "held-read",
+        "stage/retained-and-hosted-blobs",
+        "check/rejoin",
+        "check/judge",
+        "check/remap-lines",
+        "check/unread",
+    ] {
+        assert!(
+            stderr.contains(&format!("recheck-timing {step} took ")),
+            "no timing line for {step}:\n{stderr}"
+        );
+    }
+}

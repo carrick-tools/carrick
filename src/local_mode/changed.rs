@@ -433,20 +433,30 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
              your repos.",
         );
     };
+    // The parent writes no log (a read command installs none): its phases go
+    // to stderr under `CARRICK_RECHECK_TIMING`, the same lines the per-edit
+    // re-check prints (carrick#3288).
+    super::recheck::start_timing(started);
     let shown = root.display().to_string();
+    let began = Instant::now();
     let index = match super::query::read_index(&root) {
         Ok(index) => index,
         Err(failure) => return not_checked(&shown, failure.message()),
     };
+    super::recheck::took("check/read-index", began);
+    let began = Instant::now();
     let workspace = match super::workspace::Workspace::load(&root) {
         Ok(workspace) => workspace,
         Err(e) => return not_checked(&shown, e),
     };
+    super::recheck::took("check/load-workspace", began);
 
+    let began = Instant::now();
     let (repos, changed) = match selection {
         Selection::Changed => changed_files(&workspace, &index),
         Selection::Named(files) => named_files(&root, &index, files),
     };
+    super::recheck::took("check/changed-files", began);
     let files: usize = changed.values().map(|(_, files)| files.len()).sum();
     let mut output = ChangedOutput {
         repos,
@@ -469,6 +479,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // built from is not re-scanned: the index already holds its answer
     // (carrick#3245).
     let always = std::env::var(RESCAN_ENV).is_ok_and(|value| value == "always");
+    let began = Instant::now();
     let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
     let mut rescan: Vec<Tree> = Vec::new();
     let mut rescanned: BTreeSet<&String> = BTreeSet::new();
@@ -496,6 +507,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
             }
         }
     }
+    super::recheck::took("check/reads-the-same", began);
     for entry in &mut output.repos {
         let name = super::index::repo_label(Path::new(&entry.repo));
         if changed.contains_key(&name) {
@@ -512,13 +524,16 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // carry the join's `unmatched.injected` (which call bases are set at run
     // time), and `judge` prints it, so the join runs, and the answer stays
     // the re-scan's.
+    let began = Instant::now();
     let rejoined = super::recheck::rejoin(
         &workspace,
         &rescan,
         &generation,
         started + budget(),
         Some(&narrator),
+        &index.indexed_at,
     );
+    super::recheck::took("check/rejoin", began);
     // The temporary generation goes on every path, as the single-file
     // re-check's does.
     let _ = std::fs::remove_dir_all(&generation);
@@ -555,6 +570,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     if !same_build {
         output.index_scanner = Some(index.scanner_shown());
     }
+    let began = Instant::now();
     let judged = judge(
         &root,
         &index,
@@ -564,7 +580,11 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
         &wanted,
         &touched_since_index(&index, &trees),
     );
+    super::recheck::took("check/judge", began);
+    let began = Instant::now();
     let judged = remap_lines(judged, &root, &rejoined.index, &unmoved);
+    super::recheck::took("check/remap-lines", began);
+    let began = Instant::now();
     output.routes = judged.routes;
     output.calls = judged.calls;
     output.failing = judged.problems.iter().filter(|p| p.fails).count();
@@ -573,6 +593,7 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     output.outside_moved = judged.outside_moved;
     output.problems = judged.problems;
     output.unread = unread_in(&root, &rejoined.index, &wanted, &unmoved);
+    super::recheck::took("check/unread", began);
     output
 }
 
