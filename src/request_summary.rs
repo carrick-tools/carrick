@@ -2371,7 +2371,7 @@ pub fn extract_file_ir(
                     // A wrapper that only states a type (`(async () => {})
                     // satisfies ActionFunction`, `as`, `!`, parentheses) still
                     // binds the function itself (carrick#2740).
-                    let mut span = init.span();
+                    let span;
                     let ir = match crate::graphql_document_sites::unwrap_expression(init) {
                         Expr::Arrow(arrow) => {
                             span = arrow.span;

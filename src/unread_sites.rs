@@ -300,6 +300,16 @@ pub fn from_scan(
     out
 }
 
+/// A saved site that reached a decorator export: where it is, and what the
+/// label says of it.
+struct DecoratorEnd {
+    file: String,
+    start: u32,
+    end: LabelledEndRef,
+    kind: Option<String>,
+    role: Option<String>,
+}
+
 /// The unread sites of methods decorated through a decorator factory of the
 /// service (carrick#3688 C1). A factory whose body holds a site the scan
 /// already saved (`saved` and `leads`) with a labelled end that is a
@@ -307,7 +317,7 @@ pub fn from_scan(
 /// method's name: slot `name`, reason [`Stop::OwnFunction`], the factory as
 /// the callee. The saved site is read, never the body again; a factory
 /// holding none gives its methods nothing.
-pub fn of_own_decorators(
+pub(crate) fn of_own_decorators(
     decorators: &[crate::request_summary::own_decorators::OwnDecoratorAt],
     claims: &[crate::library_claims::ExportClaims],
     saved: &[UnreadSite],
@@ -326,35 +336,35 @@ pub fn of_own_decorators(
     };
     // Each saved site that reached a decorator export: where it is, and
     // what the label says of it.
-    let mut ends: Vec<(&str, u32, &LabelledEndRef, Option<&String>, Option<&String>)> = Vec::new();
+    let mut ends: Vec<DecoratorEnd> = Vec::new();
     for site in saved {
         if let Some(end) = site.labelled_end.as_ref().filter(|end| is_decorator(end)) {
-            ends.push((
-                &site.file,
-                site.span_start,
-                end,
-                site.kind.as_ref(),
-                site.role.as_ref(),
-            ));
+            ends.push(DecoratorEnd {
+                file: site.file.clone(),
+                start: site.span_start,
+                end: end.clone(),
+                kind: site.kind.clone(),
+                role: site.role.clone(),
+            });
         }
     }
     for lead in leads {
         if let Some(end) = lead.labelled_end.as_ref().filter(|end| is_decorator(end)) {
-            ends.push((
-                &lead.file_path,
-                lead.span_start,
-                end,
-                lead.kind.as_ref(),
-                lead.role.as_ref(),
-            ));
+            ends.push(DecoratorEnd {
+                file: lead.file_path.clone(),
+                start: lead.span_start,
+                end: end.clone(),
+                kind: lead.kind.clone(),
+                role: lead.role.clone(),
+            });
         }
     }
     let relative = |file: &Path| crate::site_rows::relative(root, &file.to_string_lossy());
     let mut out: Vec<UnreadSite> = Vec::new();
     for at in decorators {
         let factory_file = relative(&at.factory_file);
-        let Some((_, _, end, kind, role)) = ends.iter().find(|(file, start, ..)| {
-            *file == factory_file && at.factory.0 <= *start && *start <= at.factory.1
+        let Some(found) = ends.iter().find(|found| {
+            found.file == factory_file && at.factory.0 <= found.start && found.start <= at.factory.1
         }) else {
             continue;
         };
@@ -369,9 +379,9 @@ pub fn of_own_decorators(
             callee: callee(&at.decorator.callee),
             stop_at: None,
             depth: 1,
-            labelled_end: Some((*end).clone()),
-            kind: kind.cloned(),
-            role: role.cloned(),
+            labelled_end: Some(found.end.clone()),
+            kind: found.kind.clone(),
+            role: found.role.clone(),
             listed: false,
         });
     }
