@@ -120,6 +120,7 @@ fn lead(place: &ComparisonPlace, reason: Stop) -> PossibleCall {
             reason,
         },
         trace_depth: 0,
+        ends: Vec::new(),
     }
 }
 

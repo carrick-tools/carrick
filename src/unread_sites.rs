@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::possible_calls::{
-    LabelledEndRef, PossibleCall, Unread, kind_of, labelled_end, role_of, slot_of,
+    LabelledEndRef, PossibleCall, PossibleEnd, Unread, kind_of, labelled_end, role_of, slot_of,
 };
 use crate::request_summary::decided_sites::{Decided, DecidedStop};
 use crate::request_summary::discovery::{Discovery, DiscoverySite};
@@ -86,6 +86,10 @@ pub struct UnreadSite {
     /// `producer` or `consumer`, when the label's op says one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Every labelled end a possible call reaches, first included
+    /// (carrick#3818); empty unless it reaches two or more.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ends: Vec<PossibleEnd>,
     /// A possible call: the row `possible_calls` is written from. Not on
     /// the wire.
     #[serde(skip)]
@@ -113,6 +117,7 @@ impl UnreadSite {
             labelled_end: call.labelled_end.clone(),
             kind: call.kind.clone(),
             role: call.role.clone(),
+            ends: call.ends.clone(),
             listed: true,
         }
     }
@@ -132,6 +137,7 @@ impl UnreadSite {
                 reason: self.reason,
             },
             trace_depth: self.depth,
+            ends: self.ends.clone(),
         }
     }
 
@@ -154,6 +160,7 @@ impl UnreadSite {
             labelled_end: None,
             kind: None,
             role: None,
+            ends: Vec::new(),
             listed: false,
         }
     }
@@ -174,6 +181,7 @@ impl UnreadSite {
             labelled_end: Some(labelled_end(&stop.end)),
             kind: kind_of(&stop.end.role).map(str::to_string),
             role: role_of(&stop.end.role, stop.end.op.as_deref()).map(str::to_string),
+            ends: Vec::new(),
             listed: false,
         }
     }
@@ -215,6 +223,7 @@ impl UnreadSite {
             }),
             kind: Some("http".to_string()),
             role: Some("consumer".to_string()),
+            ends: Vec::new(),
             listed: false,
         }
     }
@@ -268,6 +277,7 @@ pub fn from_scan(
             labelled_end: None,
             kind: None,
             role: None,
+            ends: Vec::new(),
             listed: false,
         });
     }
@@ -388,6 +398,7 @@ pub(crate) fn of_own_decorators(
             labelled_end: Some(found.end.clone()),
             kind: found.kind.clone(),
             role: found.role.clone(),
+            ends: Vec::new(),
             listed: false,
         });
     }
@@ -463,10 +474,28 @@ pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[Possib
             .collect(),
     );
     let Capped {
-        rows,
+        mut rows,
         total,
         by_reason,
     } = cap(rows);
+    // The ends the possible call at the same span reaches (carrick#3818).
+    let ends: BTreeMap<(&str, u32, u32), &Vec<PossibleEnd>> = data
+        .possible_calls
+        .iter()
+        .flatten()
+        .filter(|call| !call.ends.is_empty())
+        .map(|call| {
+            (
+                (call.file_path.as_str(), call.span_start, call.span_end),
+                &call.ends,
+            )
+        })
+        .collect();
+    for row in rows.iter_mut().filter(|row| row.listed) {
+        if let Some(found) = ends.get(&(row.file.as_str(), row.span_start, row.span_end)) {
+            row.ends = (*found).clone();
+        }
+    }
     data.unread_sites = Some(rows);
     data.unread_sites_total = (total > 0).then_some(total as u32);
     data.unread_sites_by_reason = (!by_reason.is_empty()).then_some(by_reason);
@@ -503,6 +532,7 @@ mod tests {
             labelled_end: None,
             kind: None,
             role: None,
+            ends: Vec::new(),
             listed: false,
         }
     }
@@ -525,6 +555,7 @@ mod tests {
                 reason: Stop::Unanswered,
             },
             trace_depth: 1,
+            ends: Vec::new(),
         }
     }
 

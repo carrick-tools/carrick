@@ -308,6 +308,7 @@ mod tests {
                 reason: Stop::NameNeverBound,
             },
             trace_depth: 0,
+            ends: Vec::new(),
         }
     }
 

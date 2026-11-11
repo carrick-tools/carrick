@@ -21,7 +21,7 @@
 //! discovered call whose name no call of this code decides
 //! ([`DecidedLead`]).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +67,37 @@ pub struct PossibleCall {
     /// How many functions the walk entered from the call to the labelled
     /// call.
     pub trace_depth: u32,
+    /// Every labelled end the call reaches, in the order the walk found
+    /// them, the first included (carrick#3818). Written only when the call
+    /// reaches two or more distinct ends; the fields above stay the first
+    /// end's, so a reader that does not know this key reads what it always
+    /// read. At most [`MAX_ENDS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ends: Vec<PossibleEnd>,
+}
+
+/// The most ends one possible call lists.
+pub const MAX_ENDS: usize = 8;
+
+/// One end a possible call reaches, with its own kind and role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PossibleEnd {
+    pub labelled_end: LabelledEndRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+impl PossibleEnd {
+    /// The end `row` itself names, when it names one.
+    fn of(row: &PossibleCall) -> Option<Self> {
+        Some(PossibleEnd {
+            labelled_end: row.labelled_end.clone()?,
+            kind: row.kind.clone(),
+            role: row.role.clone(),
+        })
+    }
 }
 
 impl PossibleCall {
@@ -163,6 +194,7 @@ pub(crate) fn from_lead(lead: &DecidedLead) -> PossibleCall {
             reason: lead.reason,
         },
         trace_depth: lead.depth,
+        ends: Vec::new(),
     }
 }
 
@@ -196,6 +228,7 @@ pub fn from_sites(decided: &Decided, records: &[SiteRecord]) -> Vec<PossibleCall
                 reason: reason_of(record),
             },
             trace_depth: site.map_or(0, |s| s.via.len() as u32),
+            ends: Vec::new(),
         });
     }
     out.extend(
@@ -232,18 +265,44 @@ pub fn from_site(site: &DecidedSite, reason: Stop) -> PossibleCall {
             reason,
         },
         trace_depth: site.via.len() as u32,
+        ends: Vec::new(),
     }
 }
 
-/// Order the rows (file, line, span), drop a repeat of one call, and keep
-/// [`MAX_PER_SERVICE`]. Returns the rows kept and how many were left out.
+/// Order the rows (file, line, span), fold the repeats of one call into it,
+/// and keep [`MAX_PER_SERVICE`]. The first row of a call by input order stays
+/// as it is; a repeat that reaches another labelled end adds that end to its
+/// `ends` (carrick#3818). Returns the rows kept and how many were left out.
 pub fn cap(mut rows: Vec<PossibleCall>) -> (Vec<PossibleCall>, usize) {
     rows.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-    let mut seen: BTreeSet<(String, u32, u32)> = BTreeSet::new();
-    rows.retain(|row| seen.insert((row.file_path.clone(), row.span_start, row.span_end)));
-    let omitted = rows.len().saturating_sub(MAX_PER_SERVICE);
-    rows.truncate(MAX_PER_SERVICE);
-    (rows, omitted)
+    let mut at: BTreeMap<(String, u32, u32), usize> = BTreeMap::new();
+    let mut kept: Vec<PossibleCall> = Vec::new();
+    for row in rows {
+        let key = (row.file_path.clone(), row.span_start, row.span_end);
+        let Some(&i) = at.get(&key) else {
+            at.insert(key, kept.len());
+            kept.push(row);
+            continue;
+        };
+        let first = &mut kept[i];
+        let Some(end) = PossibleEnd::of(&row) else {
+            continue;
+        };
+        if first.ends.is_empty() {
+            first.ends.extend(PossibleEnd::of(first));
+        }
+        if first.ends.len() < MAX_ENDS && !first.ends.contains(&end) {
+            first.ends.push(end);
+        }
+    }
+    for row in &mut kept {
+        if row.ends.len() < 2 {
+            row.ends.clear();
+        }
+    }
+    let omitted = kept.len().saturating_sub(MAX_PER_SERVICE);
+    kept.truncate(MAX_PER_SERVICE);
+    (kept, omitted)
 }
 
 /// Write a service's possible calls on its blob. Its one caller is
@@ -273,6 +332,7 @@ mod tests {
                 reason: Stop::Unanswered,
             },
             trace_depth: 0,
+            ends: Vec::new(),
         }
     }
 
@@ -302,6 +362,41 @@ mod tests {
         assert_eq!(role_of("graphql_client", Some("send")), Some("consumer"));
         assert_eq!(role_of("server_framework", Some("request")), None);
         assert_eq!(role_of("server_framework", None), None);
+    }
+
+    /// carrick#3818: a wrapper whose call reaches a `fetch` and an
+    /// `Agent.close` lists both, in order; the first end's fields stay the
+    /// row's own, and a call with one end writes no `ends` key.
+    #[test]
+    fn a_call_reaching_two_ends_lists_both_and_keeps_the_first() {
+        let end = |export: &str, member: Option<&str>, role: Option<&str>| {
+            let mut row = call("a.ts", 3);
+            row.labelled_end = Some(LabelledEndRef {
+                package: "undici".into(),
+                export: export.into(),
+                member: member.map(str::to_string),
+            });
+            row.kind = role.map(|_| "http".to_string());
+            row.role = role.map(str::to_string);
+            row
+        };
+        let close = end("Agent", Some("close"), None);
+        let fetch = end("fetch", None, Some("consumer"));
+        let (kept, _) = cap(vec![close.clone(), fetch.clone(), close.clone()]);
+        assert_eq!(kept.len(), 1);
+        let row = &kept[0];
+        assert_eq!(row.labelled_end, close.labelled_end);
+        assert_eq!(row.role, None);
+        assert_eq!(row.ends.len(), 2);
+        assert_eq!(row.ends[0].labelled_end.export, "Agent");
+        assert_eq!(row.ends[1].labelled_end.export, "fetch");
+        assert_eq!(row.ends[1].role.as_deref(), Some("consumer"));
+        let json = serde_json::to_value(&kept).unwrap();
+        assert_eq!(json[0]["ends"].as_array().unwrap().len(), 2);
+
+        let (one, _) = cap(vec![close.clone(), close]);
+        assert!(one[0].ends.is_empty());
+        assert!(serde_json::to_value(&one).unwrap()[0].get("ends").is_none());
     }
 
     /// Past the cap the rows kept are the first by file and line, in that
