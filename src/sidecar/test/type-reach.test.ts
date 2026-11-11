@@ -129,14 +129,14 @@ function reachOf(...changes: FileChange[]): ReachResult {
 describe('reach (carrick#3100)', () => {
   it('reaches the importers of an edited export through a barrel, and not a file that reads another export', () => {
     const answer = reachOf(edit('src/contracts/orders.ts', (t) => t.replace('id: string;', 'id: number;')));
-    assert.deepStrictEqual(answer.reached, ['src/contracts/orders.ts', 'src/uses-orders.ts']);
+    assert.deepStrictEqual(answer.reached, ['src/contracts/index.ts', 'src/contracts/orders.ts', 'src/uses-orders.ts']);
     assert.deepStrictEqual(answer.augmented, []);
     assert.strictEqual(answer.exports_moved, false);
   });
 
-  it('reaches only the changed file when nothing reads the edited name', () => {
+  it('reaches only the changed file and the barrel re-exporting it when no importer reads the edited name', () => {
     const answer = reachOf(edit('src/contracts/orders.ts', (t) => t.replace('unusedFlag = 1', 'unusedFlag = 2')));
-    assert.deepStrictEqual(answer.reached, ['src/contracts/orders.ts']);
+    assert.deepStrictEqual(answer.reached, ['src/contracts/index.ts', 'src/contracts/orders.ts']);
   });
 
   it('follows a name declared from another in the same file, and on through the importers', () => {
@@ -164,7 +164,7 @@ describe('reach (carrick#3100)', () => {
 
   it('keeps the held rule for a modified file that adds an export', () => {
     const answer = reachOf(edit('src/contracts/orders.ts', (t) => `${t}export const extra = 3;\n`));
-    assert.deepStrictEqual(answer.reached, ['src/contracts/orders.ts', 'src/imports-extra.ts']);
+    assert.deepStrictEqual(answer.reached, ['src/contracts/index.ts', 'src/contracts/orders.ts', 'src/imports-extra.ts']);
     assert.strictEqual(answer.exports_moved, true);
   });
 
@@ -177,7 +177,7 @@ describe('reach (carrick#3100)', () => {
   it('returns an augmentation that reads an edited name in augmented', () => {
     const answer = reachOf(edit('src/contracts/users.ts', (t) => t.replace('name: string', 'name: number')));
     assert.deepStrictEqual(answer.augmented, ['src/augment.ts']);
-    assert.deepStrictEqual(answer.reached, ['src/augment.ts', 'src/contracts/users.ts', 'src/uses-users.ts']);
+    assert.deepStrictEqual(answer.reached, ['src/augment.ts', 'src/contracts/index.ts', 'src/contracts/users.ts', 'src/uses-users.ts']);
   });
 
   it('returns an added declaration script and an edited one in augmented', () => {
@@ -235,6 +235,95 @@ describe('reach (carrick#3100)', () => {
   });
 });
 
+/** A tree whose one declaring file is re-exported by barrels of every form. */
+const BARRELS: Record<string, string> = {
+  'tsconfig.json': BASE['tsconfig.json']!,
+  'package.json': BASE['package.json']!,
+  'src/kinds/status.ts':
+    "export type Status = 'open' | 'closed';\nfunction tally(): number {\n  return 1;\n}\nexport const label = 'kind';\n",
+  // One level of `export *`, and a second barrel stacked on it.
+  'src/kinds/index.ts': "export * from './status';\n",
+  'src/top/index.ts': "export * from '../kinds';\n",
+  // A named re-export of the edited name, and one of another name.
+  'src/named.ts': "export { Status } from './kinds/status';\n",
+  'src/named-other.ts': "export { label } from './kinds/status';\n",
+  // A namespace re-export.
+  'src/ns.ts': "export * as kinds from './kinds/status';\n",
+  // A barrel over an unrelated file.
+  'src/flags/flag.ts': 'export const flag = true;\n',
+  'src/flags/index.ts': "export * from './flag';\n",
+  // Importers through the stacked barrel, and of another name.
+  'src/uses-status.ts': "import { Status } from './top';\nexport const s: Status = 'open';\n",
+  'src/uses-label.ts': "import { label } from './kinds';\nexport const l = label;\n",
+};
+
+let barrelGraph: ReturnType<typeof importGraphOf> | undefined;
+
+/** `reachOf` over the barrel tree: the serialised answer must equal the live walk. */
+function barrelReach(edited: (text: string) => string): ReachResult {
+  if (!barrelGraph) {
+    const root = tree(BARRELS);
+    const project = new Project({ tsConfigFilePath: path.join(root, 'tsconfig.json') });
+    barrelGraph = importGraphOf(project.getProgram().compilerObject, root);
+  }
+  const before = BARRELS['src/kinds/status.ts']!;
+  const changes = [{ file: 'src/kinds/status.ts', before, after: edited(before) }];
+  const live = affectedFiles(barrelGraph, changes);
+  const serial = reach(JSON.parse(JSON.stringify(serialiseGraph(barrelGraph))), changes);
+  assert.notStrictEqual(live, 'all');
+  if (live !== 'all') {
+    assert.deepStrictEqual(serial, {
+      reached: [...live.files].sort(),
+      augmented: [...live.augmented].sort(),
+      exports_moved: live.exportsMoved,
+    });
+  }
+  return serial;
+}
+
+const ADD_MEMBER = (t: string): string => t.replace("'open' | 'closed'", "'open' | 'closed' | 'held'");
+
+describe('reach marks the barrels that re-export a changed declaration', () => {
+  it('marks a one-level export * barrel when a union member is added', () => {
+    const answer = barrelReach(ADD_MEMBER);
+    assert.ok((answer.reached as string[]).includes('src/kinds/index.ts'), String(answer.reached));
+    assert.deepStrictEqual(answer.reached, [
+      'src/kinds/index.ts',
+      'src/kinds/status.ts',
+      'src/named.ts',
+      'src/ns.ts',
+      'src/top/index.ts',
+      'src/uses-status.ts',
+    ]);
+    assert.deepStrictEqual(answer.augmented, []);
+  });
+
+  it('marks the second barrel of a two-level export * chain', () => {
+    assert.ok((barrelReach(ADD_MEMBER).reached as string[]).includes('src/top/index.ts'));
+  });
+
+  it('marks a named export { X } from of the changed name, and not one of another name', () => {
+    const reached = barrelReach(ADD_MEMBER).reached as string[];
+    assert.ok(reached.includes('src/named.ts'));
+    assert.ok(!reached.includes('src/named-other.ts'));
+  });
+
+  it('marks an export * as ns barrel', () => {
+    assert.ok((barrelReach(ADD_MEMBER).reached as string[]).includes('src/ns.ts'));
+  });
+
+  it('marks no barrel when only a non-exported function body changes', () => {
+    const answer = barrelReach((t) => t.replace('return 1;', 'return 2;'));
+    assert.deepStrictEqual(answer.reached, ['src/kinds/status.ts']);
+  });
+
+  it('marks the star and namespace barrels when the file adds an export', () => {
+    const answer = barrelReach((t) => `${t}export const fresh = 1;\n`);
+    assert.deepStrictEqual(answer.reached, ['src/kinds/index.ts', 'src/kinds/status.ts', 'src/ns.ts', 'src/top/index.ts']);
+    assert.strictEqual(answer.exports_moved, true);
+  });
+});
+
 describe('reach_graph and reach actions (carrick#3100)', () => {
   it('serialises repo files only, relative to the scan root, and answers reach without init', async () => {
     const root = tree({
@@ -276,7 +365,7 @@ describe('reach_graph and reach actions (carrick#3100)', () => {
         changes: [change],
       });
       assert.strictEqual(asked.status, 'success');
-      assert.deepStrictEqual(asked.reached, ['src/contracts/orders.ts', 'src/uses-orders.ts']);
+      assert.deepStrictEqual(asked.reached, ['src/contracts/index.ts', 'src/contracts/orders.ts', 'src/uses-orders.ts']);
       assert.deepStrictEqual(asked.augmented, []);
       assert.strictEqual(asked.exports_moved, false);
     } finally {
