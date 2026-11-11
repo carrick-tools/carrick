@@ -300,6 +300,84 @@ pub fn from_scan(
     out
 }
 
+/// The unread sites of methods decorated through a decorator factory of the
+/// service (carrick#3688 C1). A factory whose body holds a site the scan
+/// already saved (`saved` and `leads`) with a labelled end that is a
+/// decorator export gives each method that calls it one site at the
+/// method's name: slot `name`, reason [`Stop::OwnFunction`], the factory as
+/// the callee. The saved site is read, never the body again; a factory
+/// holding none gives its methods nothing.
+pub fn of_own_decorators(
+    decorators: &[crate::request_summary::own_decorators::OwnDecoratorAt],
+    claims: &[crate::library_claims::ExportClaims],
+    saved: &[UnreadSite],
+    leads: &[PossibleCall],
+    root: &Path,
+) -> Vec<UnreadSite> {
+    let is_decorator = |end: &LabelledEndRef| {
+        claims.iter().any(|export| {
+            export.package == end.package
+                && export.export == end.export
+                && export
+                    .claims
+                    .iter()
+                    .any(|claim| claim.is_decorate_form_op())
+        })
+    };
+    // Each saved site that reached a decorator export: where it is, and
+    // what the label says of it.
+    let mut ends: Vec<(&str, u32, &LabelledEndRef, Option<&String>, Option<&String>)> = Vec::new();
+    for site in saved {
+        if let Some(end) = site.labelled_end.as_ref().filter(|end| is_decorator(end)) {
+            ends.push((
+                &site.file,
+                site.span_start,
+                end,
+                site.kind.as_ref(),
+                site.role.as_ref(),
+            ));
+        }
+    }
+    for lead in leads {
+        if let Some(end) = lead.labelled_end.as_ref().filter(|end| is_decorator(end)) {
+            ends.push((
+                &lead.file_path,
+                lead.span_start,
+                end,
+                lead.kind.as_ref(),
+                lead.role.as_ref(),
+            ));
+        }
+    }
+    let relative = |file: &Path| crate::site_rows::relative(root, &file.to_string_lossy());
+    let mut out: Vec<UnreadSite> = Vec::new();
+    for at in decorators {
+        let factory_file = relative(&at.factory_file);
+        let Some((_, _, end, kind, role)) = ends.iter().find(|(file, start, ..)| {
+            *file == factory_file && at.factory.0 <= *start && *start <= at.factory.1
+        }) else {
+            continue;
+        };
+        out.push(UnreadSite {
+            file: relative(&at.file),
+            line: at.decorator.line,
+            span_start: at.decorator.call.span_start,
+            span_end: at.decorator.call.span_end,
+            reason: Stop::OwnFunction,
+            also: Vec::new(),
+            slot: "name".to_string(),
+            callee: callee(&at.decorator.callee),
+            stop_at: None,
+            depth: 1,
+            labelled_end: Some((*end).clone()),
+            kind: kind.cloned(),
+            role: role.cloned(),
+            listed: false,
+        });
+    }
+    out
+}
+
 /// What [`cap`] keeps, and what it counts.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Capped {
