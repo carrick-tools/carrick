@@ -263,7 +263,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       markStated(session, root, coverage.upTo, true, home);
       continue;
     }
-    const queued = enqueueChanged(root, session, clock(), { home });
+    const queued = enqueueChanged(root, session, clock(), { home, named: coverage.gaps.map((gap) => gap.file) });
     if (queued === null) {
       log("could not queue check --changed for", root);
       continue;
