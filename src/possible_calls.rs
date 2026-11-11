@@ -126,11 +126,16 @@ pub(crate) fn slot_of(role: &str) -> &'static str {
 
 /// Why a decided site's name is unstated: an identifier the compiler reads
 /// as `any` with no declaration is an import the scan could not read, the
-/// narrower fact; else the hole the resolver met reading the name
+/// narrower fact; except a name the code builds over an environment read,
+/// whose `process` has no declaration either and which `env_value` names
+/// (carrick#3846); else the hole the resolver met reading the name
 /// (carrick#3688 U2), whose text reader reads every declaration it cannot
 /// enter as `outside_service`. Otherwise nothing says, and the call was not
 /// checked on this scan.
 fn reason_of(record: &SiteRecord) -> Stop {
+    if record.unread == Some(Stop::EnvValue) {
+        return Stop::EnvValue;
+    }
     let unreadable = record.compiler().is_some_and(|compiler| {
         compiler.names.iter().any(|name| {
             name.declaration.is_none()
@@ -502,10 +507,14 @@ mod tests {
     /// `any`: a reason chosen by the record's own names alone would say
     /// `unanswered`. The row says the hole.
     fn lead_record(unread: Option<Stop>) -> SiteRecord {
+        lead_record_with(unread, Vec::new())
+    }
+
+    fn lead_record_with(unread: Option<Stop>, names: Vec<serde_json::Value>) -> SiteRecord {
         use crate::request_summary::site_record::{AnchorAt, TypeAnchors};
         let state = serde_json::from_value(serde_json::json!({
             "point": { "at": "src/emit.ts:4", "code": "" },
-            "compiler": { "names": [], "callees": [], "enclosing": null, "reached": [] },
+            "compiler": { "names": names, "callees": [], "enclosing": null, "reached": [] },
             "syntax": [],
             "libraries": [],
             "call": null,
@@ -548,5 +557,22 @@ mod tests {
         assert_eq!(reason(Some(Stop::Reassigned)), Stop::Reassigned);
         // The control: a record whose name met no hole keeps today's word.
         assert_eq!(reason(None), Stop::Unanswered);
+    }
+
+    /// A name built over an environment read: `process` is an undeclared
+    /// `any` to the compiler, which would read as an unreadable import; the
+    /// record's `env_value` is the narrower word (carrick#3846).
+    #[test]
+    fn an_environment_read_beats_the_undeclared_any_it_reads_through() {
+        let process = serde_json::json!({
+            "text": "process", "at": "src/emit.ts:4", "declaration": null,
+            "declaration_text": null, "package": null, "type": "any", "literal": null,
+        });
+        let reason = |unread| {
+            let record = lead_record_with(unread, vec![process.clone()]);
+            from_sites(&Decided::default(), &[record])[0].unread.reason
+        };
+        assert_eq!(reason(Some(Stop::EnvValue)), Stop::EnvValue);
+        assert_eq!(reason(None), Stop::UnresolvedImport);
     }
 }
