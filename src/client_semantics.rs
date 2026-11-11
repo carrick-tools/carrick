@@ -177,7 +177,17 @@ fn parse_entry(value: &Value, dropped: &mut usize) -> Option<ClientSemanticsEntr
     };
     let status: SemanticsStatus = serde_json::from_value(object.get("status")?.clone()).ok()?;
     let clients = match status {
-        SemanticsStatus::Answered => elements(object.get("clients")?, dropped, parse_client),
+        SemanticsStatus::Answered => {
+            let raw = object.get("clients")?;
+            let clients = elements(raw, dropped, parse_client);
+            // An answer whose every client was unreadable is not one that
+            // states no client: dropped whole, so `clients: []` always is
+            // what the answer said (read by [`no_client_packages`]).
+            if clients.is_empty() && raw.as_array().is_some_and(|raw| !raw.is_empty()) {
+                return None;
+            }
+            clients
+        }
         // Empty unless answered, whatever the element says.
         SemanticsStatus::Pending | SemanticsStatus::Skipped => Vec::new(),
     };
@@ -187,6 +197,25 @@ fn parse_entry(value: &Value, dropped: &mut usize) -> Option<ClientSemanticsEntr
         status,
         clients,
     })
+}
+
+/// The packages detection answered with no client at all (`status:
+/// answered`, `clients: []`), settled: a package that is pending, skipped,
+/// not asked, or answered more than once with any entry that lists a client
+/// is not one. What a package answered this way sends is no request, so a
+/// call into it is no HTTP call.
+pub fn no_client_packages(entries: &[ClientSemanticsEntry]) -> BTreeSet<&str> {
+    let mut no_client: BTreeSet<&str> = BTreeSet::new();
+    let mut other: BTreeSet<&str> = BTreeSet::new();
+    for entry in entries {
+        if entry.status == SemanticsStatus::Answered && entry.clients.is_empty() {
+            no_client.insert(&entry.package);
+        } else {
+            other.insert(&entry.package);
+        }
+    }
+    no_client.retain(|package| !other.contains(package));
+    no_client
 }
 
 fn parse_client(value: &Value, dropped: &mut usize) -> Option<ClientSemantics> {
@@ -1328,6 +1357,22 @@ mod tests {
         let entries = parse_entries(value.get("client_semantics")).unwrap();
         assert_eq!(entries.len(), 4, "the bad entry goes, the four stay");
         assert_eq!(entries, sample_entries(), "and every bad element with it");
+    }
+
+    #[test]
+    fn only_an_answer_that_says_no_client_is_one() {
+        let value = serde_json::json!([
+            { "package": "cache", "major": 1, "status": "answered", "clients": [] },
+            { "package": "pending", "major": 1, "status": "pending", "clients": [] },
+            // Every client unreadable: not an answer of no client.
+            { "package": "garbled", "major": 1, "status": "answered",
+              "clients": [{ "export": "9 lives" }] },
+            { "package": "twice", "major": 1, "status": "answered", "clients": [] },
+            { "package": "twice", "major": 2, "status": "pending", "clients": [] }
+        ]);
+        let entries = parse_entries(Some(&value)).unwrap();
+        assert_eq!(no_client_packages(&entries), BTreeSet::from(["cache"]));
+        assert!(entries.iter().all(|entry| entry.package != "garbled"));
     }
 
     #[test]

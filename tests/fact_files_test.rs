@@ -148,6 +148,8 @@ const PUBLISH: &str = "import { enqueue } from \"./enqueue\";\n\nexport function
 
 const ORIGIN: &str = "const pick = (env?: string): string => env ?? \"https://app.example.test\";\n\nexport const APP_ORIGIN: string = pick(process.env.APP_ORIGIN);\n";
 
+const CACHE_UI: &str = "import { useCache } from \"@fixture/cache\";\nimport { useFetcher } from \"@fixture/fetcher\";\nimport { useMystery } from \"@fixture/mystery\";\n\nexport async function refresh(): Promise<unknown> {\n  const cache = useCache();\n  cache.invalidate(\"connections\");\n  const fetcher = useFetcher();\n  fetcher.read(\"things\");\n  const mystery = useMystery();\n  mystery.invalidate(\"unknown\");\n  return fetch(\"/api/refreshed\");\n}\n";
+
 /// An answer the reader gives for one file, keyed by its stem.
 fn canned_answer(repo: &Path, stem: &str, answer: serde_json::Value) {
     let dir = repo.join("__llm__/analyze-file");
@@ -306,6 +308,69 @@ fn repo(tmp: &Path) -> PathBuf {
             }]
         }),
     );
+    // Three packages whose calls the reader answers with a GET row. Detection
+    // answers the first with no client, the second with one, and says nothing
+    // of the third.
+    for (package, declarations) in [
+        (
+            "@fixture/cache",
+            "export declare function useCache(): { invalidate(key: string): void };\n",
+        ),
+        (
+            "@fixture/fetcher",
+            "export declare function useFetcher(): { read(path: string): void };\n",
+        ),
+        (
+            "@fixture/mystery",
+            "export declare function useMystery(): { invalidate(key: string): void };\n",
+        ),
+    ] {
+        add_package(&repo, package, "1.0.0", declarations);
+    }
+    fs::write(repo.join("src/refresh.ts"), CACHE_UI).unwrap();
+    let model_row = |call: &str, line: u32, target: &str| {
+        serde_json::json!({
+            "candidate_id": span_id(CACHE_UI, call),
+            "line_number": line, "target": target,
+            "method": "GET", "pattern_matched": "invalidate(",
+            "call_expression_text": null, "call_expression_line": null,
+            "payload_expression_text": null, "payload_expression_line": null,
+            "primary_type_symbol": null, "type_import_source": null
+        })
+    };
+    canned_answer(
+        &repo,
+        "refresh",
+        serde_json::json!({
+            "mounts": [], "endpoints": [],
+            "data_calls": [
+                model_row("cache.invalidate(\"connections\")", 7, "/api/v1/connections"),
+                model_row("fetcher.read(\"things\")", 9, "/api/v1/things"),
+                model_row("mystery.invalidate(\"unknown\")", 11, "/api/v1/unknown"),
+                {
+                    "candidate_id": "@line:12", "line_number": 12, "target": "/api/refreshed",
+                    "method": "GET", "pattern_matched": "fetch(",
+                    "call_expression_text": null, "call_expression_line": null,
+                    "payload_expression_text": null, "payload_expression_line": null,
+                    "primary_type_symbol": null, "type_import_source": null
+                }
+            ]
+        }),
+    );
+    let detect = repo.join("__llm__/framework-detect/framework-detect.json");
+    let mut detection: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&detect).unwrap()).unwrap();
+    detection["client_semantics"] = serde_json::json!([
+        { "package": "@fixture/cache", "major": 1, "status": "answered", "clients": [] },
+        {
+            "package": "@fixture/fetcher", "major": 1, "status": "answered",
+            "clients": [{
+                "export": "useFetcher", "factories": [], "requests": [],
+                "verbs": [{ "member": "read", "method": "GET", "args": "path_options" }]
+            }]
+        }
+    ]);
+    fs::write(&detect, detection.to_string()).unwrap();
     let cassette = repo.join("__llm__/library-claims/default.json");
     let mut answer: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&cassette).unwrap()).unwrap();
@@ -369,6 +434,21 @@ fn repo(tmp: &Path) -> PathBuf {
             "ops": [], "reserved": [], "calls": [], "patterns": []
         }]
     }));
+    for (package, export) in [
+        ("@fixture/cache", "useCache"),
+        ("@fixture/fetcher", "useFetcher"),
+        ("@fixture/mystery", "useMystery"),
+    ] {
+        claims.push(serde_json::json!({
+            "package": package, "version": "1.0.0", "status": "answered",
+            "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "exports": [{
+                "specifier": package, "export": export, "role": "none",
+                "side": null, "classifier": "fixture-classifier", "makes": [], "scopes": [],
+                "ops": [], "reserved": [], "calls": [], "patterns": []
+            }]
+        }));
+    }
     claims.push(serde_json::json!({
         "package": "@fixture/slow", "version": "1.0.0", "status": "pending",
         "reason": "lister_unavailable"
@@ -845,6 +925,31 @@ fn a_row_at_a_call_into_a_graphql_client_is_withdrawn() {
         "the withdrawal is logged: {}",
         on.log
     );
+}
+
+/// A row the reader states at a call into a package framework detection
+/// answered with no client (`clients: []`) is withdrawn: a cache key written
+/// like a path is no request. The same shape through a package detection
+/// answered with a client, or one it said nothing about, keeps its row, and
+/// so does the fetch beside them.
+#[test]
+fn a_row_at_a_call_into_a_package_with_no_client_is_withdrawn() {
+    let on = choosing();
+    let rows = |path: &str| on.calls.iter().filter(|call| call["path"] == path).count();
+    assert_eq!(
+        rows("/api/v1/connections"),
+        0,
+        "no row at a no-client package's call: {:#?}",
+        on.calls
+    );
+    assert!(
+        on.log_has(&["Withdrawing HTTP row", "/api/v1/connections", "no client"]),
+        "the withdrawal is logged: {}",
+        on.log
+    );
+    for kept in ["/api/v1/things", "/api/v1/unknown", "/api/refreshed"] {
+        assert_eq!(rows(kept), 1, "{kept} keeps its row: {:#?}", on.calls);
+    }
 }
 
 /// A call can reach a GraphQL client and an HTTP client at once (a helper that

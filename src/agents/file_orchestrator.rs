@@ -699,6 +699,9 @@ pub struct ProcessingStats {
     /// HTTP rows the reader stated at a call whose labelled export is a
     /// GraphQL client (carrick#2763).
     pub graphql_client_site_drops: usize,
+    /// HTTP rows the reader stated at a call into a package framework
+    /// detection answered with no client.
+    pub no_client_site_drops: usize,
     /// Consumer rows folded onto the request they belong to (carrick#1371),
     /// by the rule that decided it.
     pub consumer_row_folds: crate::consumer_row_fold::ConsumerRowFolds,
@@ -4850,6 +4853,20 @@ impl FileOrchestrator {
                 debug!(
                     "  - HTTP rows withdrawn at calls into a GraphQL client: {}",
                     stats.graphql_client_site_drops
+                );
+            }
+        }
+
+        // PHASE 5c4: the same withdrawal for a call into a package framework
+        // detection answered with no client. A cache key written as a path
+        // (`invalidateQueries({ queryKey: ["connections"] })`) is no request.
+        if let Some(facts) = fact_files.as_ref() {
+            stats.no_client_site_drops =
+                Self::withdraw_no_client_rows(&mut file_results, facts, framework_detection);
+            if stats.no_client_site_drops > 0 {
+                debug!(
+                    "  - HTTP rows withdrawn at calls into a package with no client: {}",
+                    stats.no_client_site_drops
                 );
             }
         }
@@ -10659,14 +10676,52 @@ impl FileOrchestrator {
     }
 
     /// Withdraw every HTTP data call the reader stated at a call whose
-    /// labelled export is a GraphQL client (carrick#2763). The key is the
-    /// row's own span, else the span its `candidate_id` names: a cached answer
-    /// is replayed only for a file whose bytes are unchanged, so the id still
-    /// names the call it was recorded at. Never the line alone. A row another
-    /// layer stated (a request summary, a request spec) is left alone.
+    /// labelled export is a GraphQL client (carrick#2763).
     fn withdraw_graphql_client_rows(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         facts: &crate::request_summary::fact_files::FactFiles,
+    ) -> usize {
+        Self::withdraw_reader_rows_at(
+            file_results,
+            "the store labels the export this call reaches a GraphQL client",
+            |module, span| facts.graphql_client_call(module, span),
+        )
+    }
+
+    /// Withdraw every HTTP data call the reader stated at a call made only
+    /// through packages framework detection answered with no client
+    /// (`client_semantics` `clients: []`): a cache or state library's call
+    /// sends no request. A call into a package detection did not answer, or
+    /// one that also reaches an export listed for the reader, keeps its row.
+    fn withdraw_no_client_rows(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        facts: &crate::request_summary::fact_files::FactFiles,
+        detection: &DetectionResult,
+    ) -> usize {
+        let Some(entries) = detection.client_semantics.as_deref() else {
+            return 0;
+        };
+        let no_client = crate::client_semantics::no_client_packages(entries);
+        if no_client.is_empty() {
+            return 0;
+        }
+        Self::withdraw_reader_rows_at(
+            file_results,
+            "framework detection answered the package this call reaches with no client",
+            |module, span| facts.only_through(module, span, |package| no_client.contains(package)),
+        )
+    }
+
+    /// Withdraw every row the reader (the model) stated at a call `at`
+    /// accepts. The key is the row's own span, else the span its
+    /// `candidate_id` names: a cached answer is replayed only for a file whose
+    /// bytes are unchanged, so the id still names the call it was recorded at.
+    /// Never the line alone. A row another layer stated (a request summary, a
+    /// request spec) is left alone.
+    fn withdraw_reader_rows_at(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        reason: &str,
+        at: impl Fn(&Path, (u32, u32)) -> bool,
     ) -> usize {
         let mut withdrawn = 0;
         for (file, result) in file_results.iter_mut() {
@@ -10675,22 +10730,26 @@ impl FileOrchestrator {
                 if call.resolution_source != Some(ResolutionSource::Model) {
                     return true;
                 }
-                let span = match (call.call_expression_span_start, call.call_expression_span_end) {
+                let span = match (
+                    call.call_expression_span_start,
+                    call.call_expression_span_end,
+                ) {
                     (Some(lo), Some(hi)) => (lo, hi),
                     _ => match crate::call_through::span_named_by_id(&call.candidate_id) {
                         Some(span) => span,
                         None => return true,
                     },
                 };
-                if !facts.graphql_client_call(module, span) {
+                if !at(module, span) {
                     return true;
                 }
                 debug!(
-                    "Withdrawing HTTP row {} {} at {}:{}: the store labels the export this call reaches a GraphQL client",
+                    "Withdrawing HTTP row {} {} at {}:{}: {}",
                     call.method.as_deref().unwrap_or("?"),
                     call.target,
                     file,
-                    call.line_number
+                    call.line_number,
+                    reason
                 );
                 withdrawn += 1;
                 false
@@ -21359,6 +21418,129 @@ export { routes };
         );
         assert!(resolved.is_empty(), "{resolved:?}");
         assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// A reader row at a call made only through a package detection answered
+    /// with no client is withdrawn, by its span or the span its id names. A
+    /// package detection did not answer, one it answered with a client, a
+    /// call that also reaches a listed export, and another layer's row at the
+    /// span all keep theirs.
+    #[test]
+    fn a_reader_row_at_a_call_into_a_package_with_no_client_is_withdrawn() {
+        use crate::client_semantics::{ClientSemanticsEntry, SemanticsStatus};
+        let row = |id: &str, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: id.to_string(),
+            line_number: 3,
+            target: "/api/v1/connections".to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: String::new(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+            static_asset: None,
+        };
+        let entry = |package: &str, status: SemanticsStatus| ClientSemanticsEntry {
+            package: package.to_string(),
+            major: Some(1),
+            status,
+            clients: Vec::new(),
+        };
+        let calls = |spans: &[((u32, u32), &[&str])]| {
+            spans
+                .iter()
+                .map(|(span, packages)| {
+                    (
+                        *span,
+                        packages
+                            .iter()
+                            .map(|p| p.to_string())
+                            .collect::<BTreeSet<_>>(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let facts = crate::request_summary::fact_files::FactFiles {
+            library_calls: BTreeMap::from([(
+                "ui.tsx".to_string(),
+                calls(&[
+                    ((10, 40), &["cache"]),
+                    ((50, 80), &["unasked"]),
+                    ((90, 120), &["pending"]),
+                    ((130, 160), &["cache", "sender"]),
+                    ((170, 200), &["cache"]),
+                ]),
+            )]),
+            listed: BTreeMap::from([("ui.tsx".to_string(), BTreeSet::from([(170, 200)]))]),
+            ..Default::default()
+        };
+        let detection = DetectionResult {
+            client_semantics: Some(vec![
+                entry("cache", SemanticsStatus::Answered),
+                entry("pending", SemanticsStatus::Pending),
+                // Answered twice, once with nothing: not a package that
+                // states no client.
+                entry("sender", SemanticsStatus::Answered),
+                ClientSemanticsEntry {
+                    clients: vec![crate::client_semantics::ClientSemantics {
+                        export: "default".to_string(),
+                        factories: Vec::new(),
+                        verbs: Vec::new(),
+                        requests: Vec::new(),
+                    }],
+                    ..entry("sender", SemanticsStatus::Answered)
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut file_results = HashMap::from([(
+            "/repo/ui.tsx".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    row("span:10-40", ResolutionSource::Model),
+                    row("span:50-80", ResolutionSource::Model),
+                    row("span:90-120", ResolutionSource::Model),
+                    row("span:130-160", ResolutionSource::Model),
+                    row("span:170-200", ResolutionSource::Model),
+                    row("span:10-40", ResolutionSource::RequestSummary),
+                ],
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            FileOrchestrator::withdraw_no_client_rows(&mut file_results, &facts, &detection),
+            1
+        );
+        let kept: Vec<_> = file_results["/repo/ui.tsx"]
+            .data_calls
+            .iter()
+            .map(|call| (call.candidate_id.as_str(), call.resolution_source))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("span:50-80", Some(ResolutionSource::Model)),
+                ("span:90-120", Some(ResolutionSource::Model)),
+                ("span:130-160", Some(ResolutionSource::Model)),
+                ("span:170-200", Some(ResolutionSource::Model)),
+                ("span:10-40", Some(ResolutionSource::RequestSummary)),
+            ]
+        );
     }
 
     /// carrick#2745: with the fact layer choosing files, a member whose
