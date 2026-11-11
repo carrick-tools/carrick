@@ -9,6 +9,12 @@
       "unanswered_package"
     ]
   },
+  "cause": {
+    "src/failed.ts": "lister_out_of_memory"
+  },
+  "no_cause": [
+    "src/pending.ts"
+  ],
   "none": [
     "src/stated.ts"
   ],

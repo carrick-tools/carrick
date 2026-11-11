@@ -33,7 +33,7 @@ use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, ImportSymb
 pub use durability::ModelSetup;
 use durability::ServiceAnalysis;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -5727,7 +5727,7 @@ async fn analyze_current_repo_incremental(
                 graphql_schemas,
                 analysis.builds_graphql_schema_in_code,
             );
-            let (library, claims, unready) = library_rows(
+            let (library, claims, unready, causes) = library_rows(
                 library_ask.as_ref(),
                 library_answer,
                 sidecar,
@@ -5746,6 +5746,7 @@ async fn analyze_current_repo_incremental(
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     unready: unready.as_ref(),
+                    causes: Some(&causes),
                     ..SiteContext::default()
                 },
                 sidecar,
@@ -5765,6 +5766,7 @@ async fn analyze_current_repo_incremental(
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     unready: unready.as_ref(),
+                    causes: Some(&causes),
                 },
             )
             .await;
@@ -5781,6 +5783,7 @@ async fn analyze_current_repo_incremental(
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     unready: unready.as_ref(),
+                    causes: Some(&causes),
                 },
             );
             let withdrawn = withdraw_model_routes_at_definitions(
@@ -6951,6 +6954,7 @@ fn library_rows(
     crate::library_claims::LibraryRows,
     Vec<crate::library_claims::ExportClaims>,
     Option<BTreeSet<String>>,
+    BTreeMap<String, String>,
 ) {
     let Some(ask) = ask else {
         return Default::default();
@@ -6965,6 +6969,11 @@ fn library_rows(
     // without is unknown, as it was before the pass asked: nothing is
     // pending on its account, and no site rests on one.
     let unready = (!ask.read_only).then(|| settled.unanswered.clone());
+    let causes = if ask.read_only {
+        BTreeMap::new()
+    } else {
+        settled.failed_reasons.clone()
+    };
     if !ask.read_only {
         crate::scan_health::record_library_packages(crate::scan_health::LibraryUnready {
             pending: settled.pending,
@@ -6975,6 +6984,7 @@ fn library_rows(
         read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
         unready,
+        causes,
     )
 }
 
@@ -7146,6 +7156,10 @@ struct SiteContext<'a> {
     /// ([`crate::library_store::Settled::unanswered`]); `None` for no ask or a
     /// read-only ask, where no call reads unready (carrick#3684).
     unready: Option<&'a BTreeSet<String>>,
+    /// The store's failure reason for each package of `unready` it gave one
+    /// for ([`crate::library_store::Settled::failed_reasons`]), for the cause
+    /// an unread site states (carrick#3739).
+    causes: Option<&'a BTreeMap<String, String>>,
 }
 
 /// What the analysis sidecar finds for each call of the service through an
@@ -7475,7 +7489,13 @@ fn site_records_of(
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
-        unread: crate::unread_sites::from_scan(&discovery, &decided, context.caller_stops, root),
+        unread: crate::unread_sites::from_scan(
+            &discovery,
+            &decided,
+            context.caller_stops,
+            root,
+            context.causes.unwrap_or(&BTreeMap::new()),
+        ),
         decided,
         records,
         labels,
@@ -13779,7 +13799,7 @@ async fn analyze_current_repo(
         graphql_schemas,
         analysis_result.builds_graphql_schema_in_code,
     );
-    let (library, claims, unready) =
+    let (library, claims, unready, causes) =
         library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
     protocol_extractions.library = library;
     let server_claims = server_claims_of(&claims, &service_root);
@@ -13793,6 +13813,7 @@ async fn analyze_current_repo(
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
             unready: unready.as_ref(),
+            causes: Some(&causes),
             ..SiteContext::default()
         },
         sidecar,
@@ -13811,6 +13832,7 @@ async fn analyze_current_repo(
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
             unready: unready.as_ref(),
+            causes: Some(&causes),
         },
     )
     .await;
@@ -13827,6 +13849,7 @@ async fn analyze_current_repo(
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
             unready: unready.as_ref(),
+            causes: Some(&causes),
         },
     );
     let withdrawn = withdraw_model_routes_at_definitions(

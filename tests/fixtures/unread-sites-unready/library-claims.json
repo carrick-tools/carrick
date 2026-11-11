@@ -45,7 +45,8 @@
       "package": "@fixture/failed",
       "version": "1.0.0",
       "status": "skipped",
-      "reason": "build_failed"
+      "reason": "build_failed",
+      "failed_reason": "lister_out_of_memory"
     }
   ]
 }

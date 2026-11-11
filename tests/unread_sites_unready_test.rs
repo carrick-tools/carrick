@@ -150,6 +150,18 @@ fn a_call_into_a_package_the_scan_ended_without_is_saved_as_unread() {
             wrong.push(format!("{file}: want also {want}, got {sites:?}"));
         }
     }
+    for (file, want) in key["cause"].as_object().unwrap() {
+        let sites = sites_of(&blob, file);
+        if !sites.iter().any(|site| site["cause"] == *want) {
+            wrong.push(format!("{file}: want cause {want}, got {sites:?}"));
+        }
+    }
+    for file in key["no_cause"].as_array().unwrap() {
+        let sites = sites_of(&blob, file.as_str().unwrap());
+        if sites.iter().any(|site| site.get("cause").is_some()) {
+            wrong.push(format!("{file}: want no cause, got {sites:?}"));
+        }
+    }
     for file in key["none"].as_array().unwrap() {
         let file = file.as_str().unwrap();
         let sites = sites_of(&blob, file);
