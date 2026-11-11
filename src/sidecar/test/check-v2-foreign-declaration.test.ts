@@ -87,8 +87,8 @@ const SERVICES: Record<string, { files: Record<string, string>; anchors: Capture
       'src/aug.ts': [
         'export interface GaMark { c: number }',
         'declare global {',
-        '  interface Array<T> { extra(): T }',
-        '  interface Date { extra2(): number }',
+        '  interface Array<T> { groupBy(fn: (item: T) => string): { [k: string]: T[] } }',
+        '  interface Date { meta: { tag: string } }',
         '  interface Shared { b: number }',
         '}',
         '',

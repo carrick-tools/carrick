@@ -241,13 +241,16 @@ export function pairForeignFindings(
 
   const { program, checker, probesDir } = opened;
   const normalText = (d: ts.Declaration): string => d.getText().replace(/\s+/g, ' ');
-  /** Whether `d`, or the interface or class it is a member of,
-   * merges into a symbol the default library declares. */
+  /** Whether `d` is, or is written inside, an interface or class that merges
+   * into a symbol the default library declares: the augmentation itself, a
+   * member it adds, or a type literal written in that member. */
   const mergesIntoDefaultLibrary = (d: ts.Declaration): boolean => {
-    const owner = ts.isInterfaceDeclaration(d.parent) || ts.isClassDeclaration(d.parent) ? d.parent : d;
-    const name = (owner as ts.NamedDeclaration).name;
-    const merged = name ? checker.getSymbolAtLocation(name) : undefined;
-    return (merged?.declarations ?? []).some((x) => program.isSourceFileDefaultLibrary(x.getSourceFile()));
+    for (let n: ts.Node | undefined = d; n && !ts.isSourceFile(n); n = n.parent) {
+      if (!ts.isInterfaceDeclaration(n) && !ts.isClassDeclaration(n)) continue;
+      const merged = n.name ? checker.getSymbolAtLocation(n.name) : undefined;
+      return (merged?.declarations ?? []).some((x) => program.isSourceFileDefaultLibrary(x.getSourceFile()));
+    }
+    return false;
   };
   for (const plan of plans) {
     const file = program.getSourceFile(path.join(probesDir, 'probes', plan.fileName));
