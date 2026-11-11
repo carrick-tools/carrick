@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Stop hook: what the background re-checks of this session's edits answered,
-// and a wait for the ones still running (`stop-wait.ts`, carrick#3198). It
+// and which are still running (`stop-wait.ts`, carrick#3198). It never waits. It
 // reports what the agent's edits came to; it never asks the agent to start
 // something new at the end of a task (carrick#3436).
 //
@@ -26,7 +26,7 @@ import { resolveChannel } from "../channel.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { markInvoker } from "./invoker.ts";
-import { stopAnswers, waitSeconds } from "./stop-wait.ts";
+import { stopAnswers } from "./stop-wait.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -67,10 +67,11 @@ async function main(): Promise<void> {
     return;
   }
 
-  // What the background re-checks of this session's edits answered, and a
-  // wait for the ones still running (`--wait-s`, from the settings entry).
+  // What the background re-checks of this session's edits answered, and the
+  // ones still running, named without waiting. An older entry's `--wait-s` is
+  // ignored: Stop never holds up the agent.
   const parts: string[] = [];
-  const late = await stopAnswers(session, { waitS: waitSeconds(process.argv.slice(2)) });
+  const late = stopAnswers(session);
   parts.push(...late.lines);
 
   // The other thing a task's end is a good moment for: the `carrick` these

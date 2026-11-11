@@ -14,9 +14,11 @@
 // Commands that move the tree in bulk (`git checkout`, `npm ci`) start nothing.
 //
 // It runs on every shell command, so the work before a target is found is a
-// node start, a stdin read and one regex: nothing else is imported. A command
-// that names no source file prints nothing and starts nothing. Whatever
-// happens it exits 0 and prints at most the one JSON object.
+// node start, a stdin read and one regex. A command that names no source file
+// starts nothing and prints only the background re-check answers that landed
+// since the last hook spoke (`late.ts`): the Stop hook never waits for them,
+// so this is often the first hook after one lands (hook-wording audit T2).
+// Whatever happens it exits 0 and prints at most the one JSON object.
 
 import { readStdin } from "./stdin.ts";
 import path from "node:path";
@@ -40,6 +42,15 @@ type Payload = {
   tool_response?: string | { stdout?: string };
 };
 
+/** Print the late answers alone: the path for a command this hook has nothing else to say about. */
+async function lateOnly(session: string | undefined): Promise<void> {
+  if (!session) return;
+  const { resolveChannel } = await import("../channel.ts");
+  if (resolveChannel({ hooksInstalled: true }).channel !== "hook") return;
+  const { deliverLate, emitPostToolUse } = await import("./late.ts");
+  emitPostToolUse(deliverLate(session));
+}
+
 async function main(): Promise<void> {
   let payload: Payload;
   try {
@@ -48,13 +59,13 @@ async function main(): Promise<void> {
     return;
   }
   const command = payload.tool_input?.command;
-  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return;
+  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(payload.session_id);
   const cwd = payload.cwd ?? process.cwd();
   const { reads, writes } = bashTargets(command, path.resolve(cwd));
   const candidates = writes.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? writes : [];
   // A search for a function's name: the index sites its output did not print.
   const searched = SEARCH_WORD.test(command) ? searchedNames(command, path.resolve(cwd)) : { names: [], operands: [] };
-  if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return;
+  if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return lateOnly(payload.session_id);
 
   const session = payload.session_id;
   const { markInvoker } = await import("./invoker.ts");
@@ -107,14 +118,8 @@ async function main(): Promise<void> {
     await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel }, toEdit, answers);
     return;
   }
-  const { deliverLate } = await import("./late.ts");
-  const contexts = [...deliverLate(session), ...answers];
-  if (contexts.length === 0) return;
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: contexts.join("\n\n") },
-    }),
-  );
+  const { deliverLate, emitPostToolUse } = await import("./late.ts");
+  emitPostToolUse([...deliverLate(session), ...answers]);
 }
 
 await main();

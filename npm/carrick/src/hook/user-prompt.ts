@@ -1,15 +1,17 @@
 #!/usr/bin/env node
-// UserPromptSubmit hook, on Codex (carrick#1335): the finished background
-// re-checks that Claude Code's Stop hook would deliver. It names no function a
-// task added (carrick#3436), as the Stop hook does not.
+// UserPromptSubmit hook: the finished background re-checks no other hook has
+// delivered yet. It names no function a task added (carrick#3436).
 //
-// Why this event and not `Stop`. Codex accepts `additionalContext` on
-// `PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit` and
-// `SubagentStart`, and warns "this event cannot emit additionalContext" for
-// every other one (`codex-rs/hooks/src/engine/discovery.rs`). A Codex `Stop`
-// hook can reach the model only by refusing to let the turn end, which is a
-// block. `UserPromptSubmit` is the one event that is both model-visible and
-// non-blocking there.
+// On Codex (carrick#1335) it stands in for Stop. Codex accepts
+// `additionalContext` on `PreToolUse`, `PostToolUse`, `SessionStart`,
+// `UserPromptSubmit` and `SubagentStart`, and warns "this event cannot emit
+// additionalContext" for every other one (`codex-rs/hooks/src/engine/discovery.rs`).
+// A Codex `Stop` hook can reach the model only by refusing to let the turn
+// end, which is a block.
+//
+// On Claude Code it carries what landed after Stop returned: Stop never waits
+// for a re-check (hook-wording audit T2), so an answer that lands later comes
+// with the next prompt, unless a tool hook carried it first.
 //
 // What that costs: an answer arrives with the NEXT prompt rather than at the
 // end of the task that earned it, and a run that ends on that task never sees
@@ -69,7 +71,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Finished background re-checks (Codex has no Stop to carry them).
+  // Finished background re-checks no hook has delivered yet.
   const parts: string[] = [...deliverLate(session)];
   const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
 

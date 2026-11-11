@@ -447,9 +447,11 @@ test("the hook entries land beside everything else the settings file holds", () 
   // The same answer for a file a shell command reads.
   assert.equal(written.hooks.PostToolUse[2].matcher, "Bash");
   assert.equal(written.hooks.PostToolUse[2].hooks[0].command, "carrick hook post-bash");
-  // The end-of-task re-check wait (carrick#3198). Installed beside the other
-  // two rather than by anything the user has to add.
-  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop --wait-s 200");
+  // The end-of-task delivery of the background re-checks (carrick#3198), which
+  // never waits. Installed beside the other two rather than by anything the
+  // user has to add, with the prompt hook that carries what lands after it.
+  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
+  assert.equal(written.hooks.UserPromptSubmit[0].hooks[0].command, "carrick hook user-prompt");
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
 });
 
@@ -487,7 +489,10 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
     ["carrick hook session-start"],
     "one session-start message",
   );
-  assert.deepEqual(written.hooks.UserPromptSubmit, [{ hooks: [pack("turn-reminder")] }]);
+  assert.deepEqual(written.hooks.UserPromptSubmit, [
+    { hooks: [pack("turn-reminder")] },
+    { hooks: [{ type: "command", command: "carrick hook user-prompt", timeout: 5 }] },
+  ]);
   assert.deepEqual(written.hooks.PreToolUse, [
     { matcher: "Grep", hooks: [pack("search-gate")] },
     { matcher: "Bash", hooks: [pack("search-gate")] },
