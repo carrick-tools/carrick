@@ -44,6 +44,8 @@
       ],
       "total": 2
     },
+    "unemitted_literal_candidates": 0,
+    "unemitted_literal_sites": [],
     "unknown_call_paths": {
       "total": 0
     },

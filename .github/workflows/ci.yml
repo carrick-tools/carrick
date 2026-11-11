@@ -150,7 +150,7 @@ jobs:
           - shard: steps
             runner: steps
             targets: >-
-              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test queue_enum_base_class_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test queue_enum_base_class_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test --test previous_release_reads_blob_test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -166,6 +166,30 @@ jobs:
         with:
           crate: cargo-nextest
           version: "0.9.148"
+
+      # carrick#3762: the oldest release that must still read this build's
+      # index blobs (tests/fixtures/blob-reader-floor/FLOOR) and the latest
+      # release, for previous_release_reads_blob_test. One 16 MB release asset
+      # each; the test runs each binary once per service of a three-service
+      # fixture, under a second a run.
+      - name: Fetch the floor and latest releases for the blob reader test
+        if: matrix.shard == 'steps'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          floor=$(tr -d '[:space:]' < tests/fixtures/blob-reader-floor/FLOOR)
+          latest=$(gh release view -R "$REPO" --json tagName -q .tagName)
+          latest=${latest#carrick-v}
+          bins=""
+          for version in $(printf '%s\n%s\n' "$floor" "$latest" | sort -u); do
+            dir="$RUNNER_TEMP/carrick-$version"
+            mkdir -p "$dir"
+            gh release download "carrick-v$version" -R "$REPO" -p carrick-action-linux.tar.gz -D "$dir"
+            tar -xzf "$dir/carrick-action-linux.tar.gz" -C "$dir" carrick
+            bins="$bins $version=$dir/carrick"
+          done
+          echo "CARRICK_PREVIOUS_RELEASE_BINS=$bins" >> "$GITHUB_ENV"
 
       # One build of every target this shard runs, before any of it runs, so
       # the test steps find their binaries Fresh.

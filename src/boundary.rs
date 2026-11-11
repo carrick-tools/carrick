@@ -146,6 +146,18 @@ pub struct ServiceBoundary {
     /// absent as 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_not_parsed: Option<Counted>,
+    /// Retired (carrick#3762): always 0, and nothing reads it. Still written
+    /// on every blob because releases up to 0.3.153 require it, and a sibling
+    /// on such a release fails to read the whole blob without it. Delete it
+    /// only once `tests/fixtures/blob-reader-floor/FLOOR` names a release
+    /// that no longer requires it; `previous_release_reads_blob_test` fails
+    /// until then.
+    #[serde(default)]
+    pub unemitted_literal_candidates: usize,
+    /// Retired with the count above: always empty, never read, written for
+    /// the same readers.
+    #[serde(default)]
+    pub unemitted_literal_sites: Vec<String>,
     /// Candidates in files no model was asked about, with no deterministic row
     /// at their span: what a paid scan would classify and this one did not.
     /// Zero on any scan that ran the model. `None` on a blob from a scanner
@@ -361,6 +373,8 @@ impl ServiceBoundary {
             files_lost: Counted::new(stats.files_analysis_failed, lost),
             final_losses: Some(final_losses(data, repo_path)),
             files_not_parsed: Some(files_not_parsed(data, &prefix)),
+            unemitted_literal_candidates: 0,
+            unemitted_literal_sites: Vec::new(),
             candidates_awaiting_model: Some(stats.candidates_awaiting_model),
             type_extraction_status: data.type_extraction_status.clone(),
             consumers_not_resolved: unfollowed_members(data),
@@ -1545,14 +1559,20 @@ mod tests {
 
     /// `unread_sites` is the one answer for HTTP sites the fact layer did not
     /// read; the route-literal count was a second reader of that question and
-    /// is gone from the blob and from the printed lines.
+    /// is gone from the printed lines. Its two fields stay on the blob as 0 and
+    /// `[]` (carrick#3762 broke 0.3.153 readers, which require the count), and
+    /// nothing reads them: a blob that carries a count reads and prints nothing.
     #[test]
-    fn a_boundary_carries_no_literal_count() {
+    fn a_boundary_writes_the_retired_literal_fields_as_zero_and_reads_none() {
         let value = serde_json::to_value(ServiceBoundary::default()).unwrap();
-        for field in ["unemitted_literal_candidates", "unemitted_literal_sites"] {
-            assert!(value.get(field).is_none(), "{field} is still written");
-        }
-        let lines = ServiceBoundary::default().lines("gateway");
+        assert_eq!(value["unemitted_literal_candidates"], serde_json::json!(0));
+        assert_eq!(value["unemitted_literal_sites"], serde_json::json!([]));
+
+        let mut old = value.clone();
+        old["unemitted_literal_candidates"] = serde_json::json!(4);
+        old["unemitted_literal_sites"] = serde_json::json!(["src/a.ts:4"]);
+        let read: ServiceBoundary = serde_json::from_value(old).unwrap();
+        let lines = read.lines("gateway");
         assert!(
             !lines.iter().any(|line| line.contains("route-literal")),
             "{lines:?}"
