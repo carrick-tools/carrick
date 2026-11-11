@@ -1531,9 +1531,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             && previous_generation(previous_generations, &repo_name, service)
                 .is_some_and(|stored| carried_serves_schema(service, stored))
         {
+            let exclusion =
+                crate::file_finder::Exclusion::of_service(Path::new(repo_path), service);
             graphql_schemas.settle_carried(
                 service.service_name.as_deref().unwrap_or("(root)"),
                 &service_graphql_roots(repo_path, service),
+                |path| exclusion.excludes(path, false),
             );
         }
     }

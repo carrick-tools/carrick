@@ -1491,17 +1491,24 @@ impl SchemaCatalogue {
 
     /// Record the vote of a service `--changed-only` carries, which is never
     /// settled by [`Self::settle_walked_schemas`]: it serves every undeclared
-    /// file its walk (`roots`, as the catalogue was built from) reads. Called
-    /// only with evidence from its stored generation; with none, it is left
-    /// unheard, and what waits on it stays `Served` ([`Self::settle_held`]).
-    pub fn settle_carried(&self, service: &str, roots: &[WalkRoot]) {
+    /// file its walk (`roots`, as the catalogue was built from) reads and it
+    /// does not exclude (`excluded`), as a live service votes only on the
+    /// files whose producers it keeps. Called only with evidence from its
+    /// stored generation; with none, it is left unheard, and what waits on it
+    /// stays `Served` ([`Self::settle_held`]).
+    pub fn settle_carried(
+        &self,
+        service: &str,
+        roots: &[WalkRoot],
+        excluded: impl Fn(&Path) -> bool,
+    ) {
         let mut verdicts = self
             .walked_verdicts
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for path in graphql_files_under(roots) {
             let file = repo_relative(&self.repo_root, &path);
-            if self.declared.contains(&file) {
+            if self.declared.contains(&file) || excluded(&path) {
                 continue;
             }
             let votes = verdicts.entry(file).or_default();
@@ -4343,6 +4350,56 @@ export const typeDefs = gql`
         let mut walked = scan_repo(&[root.join("shared")], &[], &[]);
         catalogue.settle_walked_schemas("b", &mut walked, false);
         let mut calls = document_call_rows(&extraction);
+        assert_eq!(catalogue.settle_held("c", &mut calls, &mut None), 0);
+        assert_eq!(calls.len(), 1, "the row stays served");
+    }
+
+    /// carrick#3888: a carried walker votes only on the files it does not
+    /// exclude, as a live one does. Here its vote would serve `shared` and
+    /// send the document, which a vendor copy also holds, to an unknown
+    /// transport; excluded, it is never heard and the document stays served.
+    #[test]
+    fn a_carried_walker_does_not_vote_on_a_file_it_excludes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write("shared/schema.graphql", "type Query { accounts: [String] }");
+        write("v/vendor.graphql", "type Query { accounts: [String] }");
+        write("c/src/accounts.gql", "query Accounts { accounts }");
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("shared")]),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("shared"), root.join("v")]),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("c")]),
+                    declared: vec![],
+                },
+            ],
+        );
+        let mut walked = scan_repo(&[root.join("shared"), root.join("v")], &[], &[]);
+        catalogue.settle_walked_schemas("b", &mut walked, false);
+        let shared = root.join("shared");
+        catalogue.settle_carried("a", &whole(vec![shared.clone()]), |path| {
+            path.starts_with(&shared)
+        });
+        let mut extraction = scan_repo(&[root.join("c")], &[], &[]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+        let summary = attribution.apply(&mut extraction);
+        catalogue.hold("c", &attribution, &extraction);
+        catalogue.record("c", summary);
+        let mut calls = document_call_rows(&extraction);
+        assert_eq!(calls.len(), 1, "held, not decided");
         assert_eq!(catalogue.settle_held("c", &mut calls, &mut None), 0);
         assert_eq!(calls.len(), 1, "the row stays served");
     }
