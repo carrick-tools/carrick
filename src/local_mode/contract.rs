@@ -787,12 +787,21 @@ impl Recheck {
     /// `ran`, which is the field that says whose rows these are.
     pub fn line(&self, index_commit: &str) -> String {
         if self.not_checked() {
+            // The reason goes last, as its own sentence: a known miss's reason
+            // is two sentences already, and the clause that names the index
+            // must not be appended to the second.
+            let reason = self
+                .reason
+                .as_deref()
+                .unwrap_or("the re-check ran past its budget")
+                .trim_end_matches('.');
+            let mut chars = reason.chars();
+            let reason: String = match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            };
             return format!(
-                "re-check: not checked: {}, so these verdicts are the indexed ones, from the index at {}{}.",
-                self.reason
-                    .as_deref()
-                    .map(|reason| reason.trim_end_matches('.'))
-                    .unwrap_or("the re-check ran past its budget"),
+                "re-check: not checked, so these verdicts are the indexed ones, from the index at {}{}. {reason}.",
                 short_commit(index_commit),
                 match self.stale_since.as_deref() {
                     Some(since) => format!(", computed at {since}"),
@@ -1596,14 +1605,44 @@ mod tests {
         });
         let text = stopped.render();
         let line = format!(
-            "re-check: not checked: the re-scan ran past the budget, so these verdicts are the \
-             indexed ones, from the index at {}, computed at 2026-09-13T22:26:26Z.",
+            "re-check: not checked, so these verdicts are the indexed ones, from the index at {}, \
+             computed at 2026-09-13T22:26:26Z. The re-scan ran past the budget.\n",
             short_commit(&stopped.index_commit)
         );
         let said = text.find(&line).unwrap_or_else(|| panic!("{text}"));
         let item = text.find("src/api.ts:44").expect("item");
         assert!(said < item, "the line comes before the rows:\n{text}");
         assert_eq!(text.matches("re-check:").count(), 1, "{text}");
+    }
+
+    /// A known miss is the same fallback, remembered: the same line, with
+    /// its own two-sentence reason last and whole.
+    #[test]
+    fn a_known_miss_says_not_checked_with_its_reason_whole() {
+        let recheck = Recheck {
+            ran: "none".to_string(),
+            elapsed_ms: 3,
+            stale_since: Some("2026-09-13T22:26:26Z".to_string()),
+            reason: Some(
+                "re-reading catalog (12 indexed files) took longer than 10 s against this \
+                 index, so edits in catalog are not re-checked until `carrick refresh`. Run \
+                 `carrick check --changed` before you finish."
+                    .to_string(),
+            ),
+            new_functions: Vec::new(),
+            known_miss: true,
+            deferred: false,
+            deadline: false,
+            scope: None,
+            moved: Vec::new(),
+        };
+        assert_eq!(
+            recheck.line("1a2b3c4d5e6f"),
+            "re-check: not checked, so these verdicts are the indexed ones, from the index at \
+             1a2b3c4, computed at 2026-09-13T22:26:26Z. Re-reading catalog (12 indexed files) \
+             took longer than 10 s against this index, so edits in catalog are not re-checked \
+             until `carrick refresh`. Run `carrick check --changed` before you finish."
+        );
     }
 
     /// carrick#1374: a re-check that had nothing to do is a `none` too, and

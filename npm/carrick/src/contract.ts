@@ -240,6 +240,11 @@ export type Recheck = {
    * indexed ones. Absent otherwise.
    */
   deferred?: boolean;
+  /**
+   * True on a `none` whose re-check started and ran past its budget: the rows
+   * are the indexed ones because time ran out (carrick#3860). Absent otherwise.
+   */
+  deadline?: boolean;
   /** Which services this re-check read and which it judged at another version. */
   scope?: RecheckScope;
   /**

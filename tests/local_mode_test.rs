@@ -1023,14 +1023,16 @@ fn a_re_check_stopped_at_its_budget_is_never_a_clean_result() {
         .unwrap_or_else(|| panic!("no index commit in the header:\n{text}"));
     let line = text
         .lines()
-        .find(|line| line.starts_with("re-check: not checked: "))
+        .find(|line| line.starts_with("re-check: not checked, "))
         .unwrap_or_else(|| panic!("the answer does not say it was not checked:\n{text}"));
     assert!(
         line.contains(&format!("from the index at {commit}")),
         "it names the index it answered from:\n{text}"
     );
     let said = text.find(line).expect("the line");
-    let verdict = text.find("verdict").expect("the indexed verdict row");
+    let verdict = text
+        .find("    verdict   ")
+        .unwrap_or_else(|| panic!("no indexed verdict row:\n{text}"));
     assert!(said < verdict, "it says so before any verdict:\n{text}");
 }
 

@@ -72,7 +72,7 @@ not a check of the edit, so it is never a clean result (carrick#3860): the
 terminal says so before any row, naming the index commit it answered from,
 
 ```
-re-check: not checked: the re-scan ran past the budget, so these verdicts are the indexed ones, from the index at 1a2b3c4, computed at 2026-11-11T09:12:00Z.
+re-check: not checked, so these verdicts are the indexed ones, from the index at 1a2b3c4, computed at 2026-11-11T09:12:00Z. The re-scan ran past the budget.
 ```
 
 and `check <file> --recheck` exits 2, as a check that covered nothing does. A
