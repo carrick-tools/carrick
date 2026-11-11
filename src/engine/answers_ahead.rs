@@ -71,6 +71,9 @@ pub(super) struct LibraryHanded {
     first: Shared<oneshot::Receiver<FirstAnswer>>,
     /// `None` once [`Self::settle`] has it.
     settled: Option<tokio::task::JoinHandle<Settled>>,
+    /// Started by the lane, not by the analysis: a panic in its ask is a
+    /// miss the analysis answers by asking for itself.
+    by_lane: bool,
 }
 
 impl Drop for LibraryHanded {
@@ -93,7 +96,14 @@ impl LibraryHanded {
             asked,
             first: first.shared(),
             settled: Some(settled),
+            by_lane: false,
         }
+    }
+
+    /// This ask was started by the lane ahead of the analysis.
+    pub(super) fn by_lane(mut self) -> Self {
+        self.by_lane = true;
+        self
     }
 
     /// The store's first answer, for the lane's own prompts. `None` when it
@@ -104,14 +114,28 @@ impl LibraryHanded {
 
     /// The settled answer, with the first sent on `early` the moment it is
     /// in hand: what [`super::settled_library_answer`] gives the analysis
-    /// when it asks for itself.
-    pub(super) async fn settle(mut self, early: oneshot::Sender<FirstAnswer>) -> Settled {
-        if let Ok(first) = self.first.clone().await {
+    /// when it asks for itself. A panic in the analysis's own ask ends the
+    /// scan, as it does where the analysis awaits its ask itself. A panic in
+    /// the lane's is a miss (the lane's own rule): `Err` hands back `early`
+    /// if the first was not sent, and the analysis asks for itself.
+    pub(super) async fn settle(
+        mut self,
+        early: oneshot::Sender<FirstAnswer>,
+    ) -> Result<Settled, Option<oneshot::Sender<FirstAnswer>>> {
+        let mut early = Some(early);
+        if let Ok(first) = self.first.clone().await
+            && let Some(early) = early.take()
+        {
             let _ = early.send(first);
         }
         match self.settled.take() {
-            Some(settled) => settled.await.unwrap_or_default(),
-            None => Settled::default(),
+            Some(settled) => match settled.await {
+                Ok(settled) => Ok(settled),
+                Err(error) if error.is_panic() && self.by_lane => Err(early),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(_) => Ok(Settled::default()),
+            },
+            None => Ok(Settled::default()),
         }
     }
 }
@@ -669,6 +693,35 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(stopped.load(Ordering::SeqCst), "refused, it is stopped");
+    }
+
+    /// A store ask that panics, held as the lane (`by_lane`) or the analysis
+    /// holds it.
+    fn panicking_ask(by_lane: bool) -> (LibraryHanded, oneshot::Sender<FirstAnswer>) {
+        let (_early, first) = oneshot::channel();
+        let settled = tokio::spawn(async { panic!("the store ask panicked") });
+        let handed = LibraryHanded::new(Asked::naming(&["pkg"]), first, settled);
+        let (early, _first) = oneshot::channel();
+        (if by_lane { handed.by_lane() } else { handed }, early)
+    }
+
+    /// carrick#3869 review: a panic in the lane's store ask is a miss (the
+    /// analysis asks for itself), never a failed scan.
+    #[tokio::test]
+    async fn a_panic_in_the_lane_s_store_ask_is_a_miss() {
+        let (handed, early) = panicking_ask(true);
+        assert!(
+            handed.settle(early).await.is_err(),
+            "handed back for the analysis to ask itself"
+        );
+    }
+
+    /// The analysis's own ask keeps main's behaviour: a panic ends the scan.
+    #[tokio::test]
+    async fn a_panic_in_the_analysis_s_own_store_ask_ends_the_scan() {
+        let (handed, early) = panicking_ask(false);
+        let ended = tokio::spawn(async move { handed.settle(early).await.is_ok() }).await;
+        assert!(ended.is_err_and(|error| error.is_panic()));
     }
 
     /// carrick#3131 review: the analysis takes the lane's store answers only

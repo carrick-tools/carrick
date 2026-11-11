@@ -1,0 +1,1538 @@
+{
+  "full": {
+    "cli": {
+      "call_through": {
+        "return_shapes": [
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 5
+            },
+            "shape": {
+              "first_line": 5,
+              "kind": "value",
+              "last_line": 5
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 6
+            },
+            "shape": {
+              "first_line": 6,
+              "kind": "value",
+              "last_line": 6
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 7
+            },
+            "shape": {
+              "first_line": 7,
+              "kind": "value",
+              "last_line": 7
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 8
+            },
+            "shape": {
+              "first_line": 8,
+              "kind": "value",
+              "last_line": 8
+            }
+          }
+        ]
+      },
+      "calls": [
+        {
+          "file_path": "services/cli/src/client.ts:4",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|CLIENT->SERVER|chat.in",
+          "consumer_repo": "cli",
+          "producer_key": "socket|CLIENT->SERVER|chat.in",
+          "producer_repo": "srv",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/cli/src/client.ts:4",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/cli/src/client.ts:5",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:7",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:8",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "abe8394cd236abdbf683df7933d0c83aad7f572ff571ea4e83c357433c4fc329",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "srv/Endpoint_5e8bf21bef2aabc5_Response~cli/Endpoint_606b11e5d3f6b96f_Response_Call14340dff0fd1f1cf",
+            "producer_surface_hash": "82e47eaeb4fb9ed93f8ceb10aa5896d0a10a2ddf27fbbea909897c5bf8b19a35",
+            "resolved": false,
+            "spec_hash": "c0e37bdfdafe6a40ca923042706be2b05af9a0c13c4730ea2c314af3f4f33d3a",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [],
+      "possible_calls_omitted": null,
+      "unread_sites": [],
+      "unread_sites_by_reason": null,
+      "unread_sites_total": null
+    },
+    "srv": {
+      "call_through": null,
+      "calls": [
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "socket_call",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:9",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:13",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:18",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.fan",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.fan",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:18",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.hello",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.hello",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:9",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.notice",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.notice",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:23",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.reply",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.reply",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:13",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/srv/src/server.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "23ceb131990ad14a7ba9defa78d59d04ff91095901a1cc38cc993293a9af5575",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_0fc1d8241d8214a0_Response~srv/Endpoint_41e86151040ea076_Response_Calld5f323e62ca6d1d0",
+            "producer_surface_hash": "d92418f56d99e7f1fa3eb2398f2ffe917fb57215a02453e39781dbadcd5f5c97",
+            "resolved": false,
+            "spec_hash": "48e44d0a2564d0319915d7a53a5612c804ce47e245c3922ebdefdd1f52faa960",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
+            "resolved": false,
+            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "b61e0a99c2922d452ffaa18fbf5ab8221e8102aa43bd63a6ad8c7a21c98c6af6",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_a4c99afee8eed164_Response~srv/Endpoint_32ab3a5a2607c832_Response_Call64f22dedaf01399b",
+            "producer_surface_hash": "ccfb5b525a077b282712dfa589cc375ddd65440867ebaf25719f2636bd5e54b7",
+            "resolved": false,
+            "spec_hash": "cc892f124c11e987811c92e867abaff8fc8e0dfc3a25d959681b5912f44945ea",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "91c94587b487414603e3fb40609d697dff247cfcc77302454d024b7745d17629",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_cb47492e00eaa2c1_Response~srv/Endpoint_f4d75d4922516d33_Response_Call6c193372d326c69d",
+            "producer_surface_hash": "985122cffa2eb7cd5ccd552f493a2f8034c83aece86de58bd75e7256a973b7c2",
+            "resolved": false,
+            "spec_hash": "56993d60dd3bb5a052b2dda9feb8eecf3d12e59343ac754a048c97dab586a8b4",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [
+        {
+          "file_path": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line_number": 5,
+          "role": "consumer",
+          "span_end": 245,
+          "span_start": 87,
+          "trace_depth": 0,
+          "unread": {
+            "reason": "unanswered",
+            "slot": "name"
+          }
+        }
+      ],
+      "possible_calls_omitted": null,
+      "unread_sites": [
+        {
+          "depth": 0,
+          "file": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line": 5,
+          "reason": "unanswered",
+          "role": "consumer",
+          "slot": "name",
+          "span_end": 245,
+          "span_start": 87
+        }
+      ],
+      "unread_sites_by_reason": {
+        "unanswered": 1
+      },
+      "unread_sites_total": 1
+    }
+  },
+  "incremental": {
+    "cli": {
+      "call_through": {
+        "return_shapes": [
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 5
+            },
+            "shape": {
+              "first_line": 5,
+              "kind": "value",
+              "last_line": 5
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 6
+            },
+            "shape": {
+              "first_line": 6,
+              "kind": "value",
+              "last_line": 6
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 7
+            },
+            "shape": {
+              "first_line": 7,
+              "kind": "value",
+              "last_line": 7
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 8
+            },
+            "shape": {
+              "first_line": 8,
+              "kind": "value",
+              "last_line": 8
+            }
+          }
+        ]
+      },
+      "calls": [
+        {
+          "file_path": "services/cli/src/client.ts:4",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|CLIENT->SERVER|chat.in",
+          "consumer_repo": "cli",
+          "producer_key": "socket|CLIENT->SERVER|chat.in",
+          "producer_repo": "srv",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/cli/src/client.ts:4",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/cli/src/client.ts:5",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:7",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:8",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "abe8394cd236abdbf683df7933d0c83aad7f572ff571ea4e83c357433c4fc329",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "srv/Endpoint_5e8bf21bef2aabc5_Response~cli/Endpoint_606b11e5d3f6b96f_Response_Call14340dff0fd1f1cf",
+            "producer_surface_hash": "82e47eaeb4fb9ed93f8ceb10aa5896d0a10a2ddf27fbbea909897c5bf8b19a35",
+            "resolved": false,
+            "spec_hash": "c0e37bdfdafe6a40ca923042706be2b05af9a0c13c4730ea2c314af3f4f33d3a",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [],
+      "possible_calls_omitted": null,
+      "unread_sites": [],
+      "unread_sites_by_reason": null,
+      "unread_sites_total": null
+    },
+    "srv": {
+      "call_through": null,
+      "calls": [
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "socket_call",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:9",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:13",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:18",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.fan",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.fan",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:18",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.hello",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.hello",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:9",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.notice",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.notice",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:23",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.reply",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.reply",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:13",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/srv/src/server.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "23ceb131990ad14a7ba9defa78d59d04ff91095901a1cc38cc993293a9af5575",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_0fc1d8241d8214a0_Response~srv/Endpoint_41e86151040ea076_Response_Calld5f323e62ca6d1d0",
+            "producer_surface_hash": "d92418f56d99e7f1fa3eb2398f2ffe917fb57215a02453e39781dbadcd5f5c97",
+            "resolved": false,
+            "spec_hash": "48e44d0a2564d0319915d7a53a5612c804ce47e245c3922ebdefdd1f52faa960",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
+            "resolved": false,
+            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "b61e0a99c2922d452ffaa18fbf5ab8221e8102aa43bd63a6ad8c7a21c98c6af6",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_a4c99afee8eed164_Response~srv/Endpoint_32ab3a5a2607c832_Response_Call64f22dedaf01399b",
+            "producer_surface_hash": "ccfb5b525a077b282712dfa589cc375ddd65440867ebaf25719f2636bd5e54b7",
+            "resolved": false,
+            "spec_hash": "cc892f124c11e987811c92e867abaff8fc8e0dfc3a25d959681b5912f44945ea",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "91c94587b487414603e3fb40609d697dff247cfcc77302454d024b7745d17629",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_cb47492e00eaa2c1_Response~srv/Endpoint_f4d75d4922516d33_Response_Call6c193372d326c69d",
+            "producer_surface_hash": "985122cffa2eb7cd5ccd552f493a2f8034c83aece86de58bd75e7256a973b7c2",
+            "resolved": false,
+            "spec_hash": "56993d60dd3bb5a052b2dda9feb8eecf3d12e59343ac754a048c97dab586a8b4",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [
+        {
+          "file_path": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line_number": 5,
+          "role": "consumer",
+          "span_end": 245,
+          "span_start": 87,
+          "trace_depth": 0,
+          "unread": {
+            "reason": "unanswered",
+            "slot": "name"
+          }
+        }
+      ],
+      "possible_calls_omitted": null,
+      "unread_sites": [
+        {
+          "depth": 0,
+          "file": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line": 5,
+          "reason": "unanswered",
+          "role": "consumer",
+          "slot": "name",
+          "span_end": 245,
+          "span_start": 87
+        }
+      ],
+      "unread_sites_by_reason": {
+        "unanswered": 1
+      },
+      "unread_sites_total": 1
+    }
+  },
+  "incremental_no_lane": {
+    "cli": {
+      "call_through": {
+        "return_shapes": [
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 5
+            },
+            "shape": {
+              "first_line": 5,
+              "kind": "value",
+              "last_line": 5
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 6
+            },
+            "shape": {
+              "first_line": 6,
+              "kind": "value",
+              "last_line": 6
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 7
+            },
+            "shape": {
+              "first_line": 7,
+              "kind": "value",
+              "last_line": 7
+            }
+          },
+          {
+            "definition": {
+              "file": "services/cli/src/client.ts",
+              "line": 8
+            },
+            "shape": {
+              "first_line": 8,
+              "kind": "value",
+              "last_line": 8
+            }
+          }
+        ]
+      },
+      "calls": [
+        {
+          "file_path": "services/cli/src/client.ts:4",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|CLIENT->SERVER|chat.in",
+          "consumer_repo": "cli",
+          "producer_key": "socket|CLIENT->SERVER|chat.in",
+          "producer_repo": "srv",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/cli/src/client.ts:4",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/cli/src/client.ts:5",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:7",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/cli/src/client.ts:8",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "abe8394cd236abdbf683df7933d0c83aad7f572ff571ea4e83c357433c4fc329",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "srv/Endpoint_5e8bf21bef2aabc5_Response~cli/Endpoint_606b11e5d3f6b96f_Response_Call14340dff0fd1f1cf",
+            "producer_surface_hash": "82e47eaeb4fb9ed93f8ceb10aa5896d0a10a2ddf27fbbea909897c5bf8b19a35",
+            "resolved": false,
+            "spec_hash": "c0e37bdfdafe6a40ca923042706be2b05af9a0c13c4730ea2c314af3f4f33d3a",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [],
+      "possible_calls_omitted": null,
+      "unread_sites": [],
+      "unread_sites_by_reason": null,
+      "unread_sites_total": null
+    },
+    "srv": {
+      "call_through": null,
+      "calls": [
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
+            "protocol": "socket"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "socket_call",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:9",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.hello",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:13",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.reply",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:18",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "compat_verdicts": [
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.fan",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.fan",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:18",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.hello",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.hello",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:9",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.notice",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.notice",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:23",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        },
+        {
+          "consumer_key": "socket|SERVER->CLIENT|chat.reply",
+          "consumer_repo": "srv",
+          "producer_key": "socket|SERVER->CLIENT|chat.reply",
+          "producer_repo": "cli",
+          "response": {
+            "resolved": false,
+            "unresolved_reason": "the producer type is 'unknown'",
+            "verdict": "unverifiable"
+          },
+          "scanner_version": "<scanner version>",
+          "sites": [
+            {
+              "consumer_location": "services/srv/src/server.ts:13",
+              "edge_source": "fact",
+              "response": {
+                "resolved": false,
+                "unresolved_reason": "the producer type is 'unknown'",
+                "verdict": "unverifiable"
+              }
+            }
+          ]
+        }
+      ],
+      "endpoints": [
+        {
+          "file_path": "services/srv/src/server.ts:6",
+          "handler_name": null,
+          "key": {
+            "direction": "client_to_server",
+            "event": "chat.in",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        }
+      ],
+      "mounts": [],
+      "pair_outcomes": {
+        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "outcomes": [
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "23ceb131990ad14a7ba9defa78d59d04ff91095901a1cc38cc993293a9af5575",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_0fc1d8241d8214a0_Response~srv/Endpoint_41e86151040ea076_Response_Calld5f323e62ca6d1d0",
+            "producer_surface_hash": "d92418f56d99e7f1fa3eb2398f2ffe917fb57215a02453e39781dbadcd5f5c97",
+            "resolved": false,
+            "spec_hash": "48e44d0a2564d0319915d7a53a5612c804ce47e245c3922ebdefdd1f52faa960",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
+            "resolved": false,
+            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "b61e0a99c2922d452ffaa18fbf5ab8221e8102aa43bd63a6ad8c7a21c98c6af6",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_a4c99afee8eed164_Response~srv/Endpoint_32ab3a5a2607c832_Response_Call64f22dedaf01399b",
+            "producer_surface_hash": "ccfb5b525a077b282712dfa589cc375ddd65440867ebaf25719f2636bd5e54b7",
+            "resolved": false,
+            "spec_hash": "cc892f124c11e987811c92e867abaff8fc8e0dfc3a25d959681b5912f44945ea",
+            "unresolved_reason": "the producer type is 'unknown'"
+          },
+          {
+            "bucket": "unverifiable",
+            "consumer_surface_hash": "91c94587b487414603e3fb40609d697dff247cfcc77302454d024b7745d17629",
+            "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
+            "gate": "producer:unknown",
+            "judged": true,
+            "pair_key": "cli/Endpoint_cb47492e00eaa2c1_Response~srv/Endpoint_f4d75d4922516d33_Response_Call6c193372d326c69d",
+            "producer_surface_hash": "985122cffa2eb7cd5ccd552f493a2f8034c83aece86de58bd75e7256a973b7c2",
+            "resolved": false,
+            "spec_hash": "56993d60dd3bb5a052b2dda9feb8eecf3d12e59343ac754a048c97dab586a8b4",
+            "unresolved_reason": "the producer type is 'unknown'"
+          }
+        ],
+        "scanner_build": null,
+        "version": 2
+      },
+      "possible_calls": [
+        {
+          "file_path": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line_number": 5,
+          "role": "consumer",
+          "span_end": 245,
+          "span_start": 87,
+          "trace_depth": 0,
+          "unread": {
+            "reason": "unanswered",
+            "slot": "name"
+          }
+        }
+      ],
+      "possible_calls_omitted": null,
+      "unread_sites": [
+        {
+          "depth": 0,
+          "file": "services/srv/src/server.ts",
+          "kind": "socket",
+          "labelled_end": {
+            "export": "Server",
+            "member": "on",
+            "package": "socket.io"
+          },
+          "line": 5,
+          "reason": "unanswered",
+          "role": "consumer",
+          "slot": "name",
+          "span_end": 245,
+          "span_start": 87
+        }
+      ],
+      "unread_sites_by_reason": {
+        "unanswered": 1
+      },
+      "unread_sites_total": 1
+    }
+  }
+}

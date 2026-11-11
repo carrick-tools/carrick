@@ -1189,6 +1189,11 @@ impl AgentService {
             {
                 return Err(AgentCallError::permanent("unreachable", message));
             }
+            if injected.is_none()
+                && let Some(message) = mock_panics_when_asked_ahead(task_path)
+            {
+                panic!("{}", message.trim());
+            }
             if let Some(outcome) = injected {
                 return outcome.map(|text| LambdaOutcome {
                     text,
@@ -2318,6 +2323,21 @@ fn mock_unreachable(task_path: &str) -> Option<String> {
         std::path::Path::new(&dir)
             .join(task_path.trim_start_matches('/'))
             .join("unreachable.txt"),
+    )
+    .ok()
+}
+
+/// The message a call to `task_path` panics with when it is made while asking
+/// ahead for a service, when `CARRICK_MOCK_FIXTURE_DIR` holds
+/// `<task>/panics_when_asked_ahead.txt`. It is how an integration test makes
+/// the lane's own ask panic and not the analysis's (carrick#3869).
+fn mock_panics_when_asked_ahead(task_path: &str) -> Option<String> {
+    crate::current_service::asked_ahead()?;
+    let dir = env::var("CARRICK_MOCK_FIXTURE_DIR").ok()?;
+    std::fs::read_to_string(
+        std::path::Path::new(&dir)
+            .join(task_path.trim_start_matches('/'))
+            .join("panics_when_asked_ahead.txt"),
     )
     .ok()
 }

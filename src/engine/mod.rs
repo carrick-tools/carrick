@@ -3562,10 +3562,12 @@ impl ServiceScan {
         // A sidecar process of the service's own, scoped to its directory and
         // tsconfig, at the heap cap the run's ledger gave it (carrick#3084).
         // It is dropped, and its process stopped, when this analysis ends.
+        // It gets ready while discovery runs, and the analysis waits for it
+        // once discovery has ended: what is left of that wait is counted in
+        // discovery's phase.
         let sidecar_started = Instant::now();
-        let sidecar = self.sidecar.as_ref().and_then(|recipe| {
-            start_service_sidecar(recipe, &self.repo_path, service, heap_cap_mb)
-        });
+        let sidecar =
+            ServiceSidecar::start(self.sidecar.as_ref(), &self.repo_path, service, heap_cap_mb);
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
@@ -3574,7 +3576,7 @@ impl ServiceScan {
                 &self.repo_path,
                 service,
                 &packages,
-                sidecar.as_ref(),
+                &sidecar,
                 previous_data,
                 generation,
                 self.setups.source(index, generation),
@@ -3647,14 +3649,14 @@ impl ServiceScan {
             "Service {} ended: sidecar peak {}, {} file(s) read",
             label,
             sidecar
-                .as_ref()
+                .held()
                 .and_then(TypeSidecar::peak_resident_bytes)
                 .map(|bytes| format!("{} MB", bytes / (1024 * 1024)))
                 .unwrap_or_else(|| "unknown".to_string()),
             crate::scan_timing::files_of_current_service().unwrap_or(0),
         );
         let analysis_peak_mb = sidecar
-            .as_ref()
+            .held()
             .and_then(TypeSidecar::peak_resident_bytes)
             .map(|bytes| bytes / (1024 * 1024));
         drop(sidecar);
@@ -3880,11 +3882,15 @@ impl ServiceScan {
             let ask = std::sync::Arc::clone(library_ask.as_ref()?);
             let asked = ask.asked.clone();
             let (early, first_answer) = tokio::sync::oneshot::channel();
-            let settled = tokio::spawn(crate::current_service::asked_for(
-                service.service_name.clone(),
-                async move { settled_library_answer(Some(&ask), early).await },
+            // Quiet, as the lane is (`ask_ahead`): its own task is polled
+            // outside the lane's quiet future, and a panic here is a miss
+            // the analysis answers by asking for itself, not the run dying.
+            let settled = tokio::spawn(crate::panic_report::quiet(
+                crate::current_service::asked_for(service.service_name.clone(), async move {
+                    settled_library_answer(Some(&ask), early).await
+                }),
             ));
-            let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled);
+            let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled).by_lane();
             first = Some(handed.first());
             Some(handed)
         });
@@ -5253,7 +5259,7 @@ async fn analyze_current_repo_incremental(
     repo_path: &str,
     service: &Config,
     packages: &Packages,
-    sidecar: Option<&TypeSidecar>,
+    sidecar: &ServiceSidecar,
     previous_data: Option<&CloudRepoData>,
     generation: PreviousGeneration,
     model_setup: setup_ahead::SetupSource,
@@ -5290,6 +5296,9 @@ async fn analyze_current_repo_incremental(
         workspace,
         Read::Own,
     )?;
+    // The service's own compiler engine got ready while discovery ran
+    // (discovery reads no type); everything from here reads whether it did.
+    let sidecar = sidecar.ready();
     let siblings = reached_siblings(neighbours, sidecar.is_some(), &request_inputs);
     crate::phase_timing::mark(crate::phase_timing::Phase::Discover);
 
@@ -5349,15 +5358,38 @@ async fn analyze_current_repo_incremental(
                 function_definitions.values(),
                 repo_path,
             );
-            // Asked once, before the intents start, and read by every walk
-            // below: the fact layer's and the call graph's (carrick#2432
-            // slice B).
-            let implementations = implementations_for(
+            // What the service asks the library store, and its own ask of it,
+            // sent now: the round trip runs beside the implementations ask and
+            // the setup below, and is awaited where the analysis reads it.
+            // A service the lane may have asked for keeps its ask where the
+            // lane's hand-off is claimed, below: claimed earlier, the lane
+            // would ask ahead for fewer services.
+            let ask_turns = model_setup.turns();
+            let semantics_root = service_scan_root(repo_path, config);
+            let library_ask = LibraryAsk::start(
                 &request_inputs,
-                sidecar,
+                &siblings,
+                sidecar.is_some(),
+                &semantics_root,
                 Path::new(repo_path),
-                crate::phase_timing::Phase::Cache,
-            );
+                ask_turns.clone(),
+            )
+            .map(std::sync::Arc::new);
+            // The implementations are asked once, before the intents start,
+            // and read by every walk below: the fact layer's and the call
+            // graph's (carrick#2432 slice B).
+            let (own_library, implementations) = library_beside_implementations(
+                library_ask.as_ref().filter(|_| ahead.is_none()),
+                || {
+                    implementations_for(
+                        &request_inputs,
+                        sidecar,
+                        Path::new(repo_path),
+                        crate::phase_timing::Phase::Cache,
+                    )
+                },
+            )
+            .await;
             let intents = IntentsInFlight::start(
                 AgentService::new(),
                 function_definitions,
@@ -5398,7 +5430,6 @@ async fn analyze_current_repo_incremental(
             // instead of ending the run (see `SetupSource::settle`). Whether
             // to ask is decided where the queue that asks ahead decides it
             // (`StoredSetup::decide`, carrick#1895).
-            let ask_turns = model_setup.turns();
             let mut setup = if crate::local_mode::no_model() {
                 if !pkg_changed {
                     ModelSetup::ready(
@@ -5558,16 +5589,7 @@ async fn analyze_current_repo_incremental(
             // The summaries are composed once the schedule started above has
             // settled; the analysis reads them only once the model has been
             // asked (carrick#1564).
-            let semantics_root = service_scan_root(repo_path, config);
             let sibling_inputs = siblings.inputs();
-            let library_ask = LibraryAsk::start(
-                &request_inputs,
-                &siblings,
-                sidecar.is_some(),
-                &semantics_root,
-                Path::new(repo_path),
-                ask_turns.clone(),
-            );
             // What a lane asked the library store ahead for this service
             // (carrick#3131), taken when it read the service as this analysis
             // does (a type checker running or not) and asked what this
@@ -5579,7 +5601,7 @@ async fn analyze_current_repo_incremental(
                 Some((place, Some(lane))) => {
                     if lane.agrees(
                         sidecar.is_some(),
-                        library_ask.as_ref().map(|ask| &ask.asked),
+                        library_ask.as_deref().map(|ask| &ask.asked),
                     ) {
                         lane.handed
                     } else {
@@ -5593,7 +5615,9 @@ async fn analyze_current_repo_incremental(
                         None
                     }
                 }
-                _ => None,
+                Some((_, None)) => None,
+                // No lane: the ask this analysis sent above.
+                None => own_library,
             };
             // The calls that execute a GraphQL document, read through the
             // value resolver (carrick#3504 S9), as on the full path.
@@ -5643,14 +5667,9 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                async {
-                    match library_handed {
-                        Some(handed) => handed.settle(early_answer).await,
-                        None => settled_library_answer(library_ask.as_ref(), early_answer).await,
-                    }
-                },
+                async { settled_from(library_handed, library_ask.as_deref(), early_answer).await },
                 fact_files_of(
-                    library_ask.as_ref(),
+                    library_ask.as_deref(),
                     first_answer,
                     &request_inputs,
                     &sibling_inputs,
@@ -5732,7 +5751,7 @@ async fn analyze_current_repo_incremental(
                 analysis.builds_graphql_schema_in_code,
             );
             let (library, claims, unready) = library_rows(
-                library_ask.as_ref(),
+                library_ask.as_deref(),
                 library_answer,
                 sidecar,
                 &semantics_root,
@@ -6826,6 +6845,156 @@ fn library_turn(
     move |request| {
         let ask = setup_ahead::library_ask(request);
         Box::pin(async move { turns.take(ask).await })
+    }
+}
+
+/// The settled answer of the ask `handed` holds, or of the ask the analysis
+/// sends itself when nothing was handed to it, or when the lane's ask
+/// panicked (a miss, never a failed scan: [`answers_ahead::LibraryHanded::settle`]).
+async fn settled_from(
+    handed: Option<answers_ahead::LibraryHanded>,
+    ask: Option<&LibraryAsk>,
+    early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
+) -> crate::library_store::Settled {
+    match handed {
+        Some(handed) => match handed.settle(early).await {
+            Ok(settled) => settled,
+            Err(early) => {
+                // The first answer may already be sent; a spare channel
+                // takes the one this ask sends again.
+                let early = early.unwrap_or_else(|| tokio::sync::oneshot::channel().0);
+                settled_library_answer(ask, early).await
+            }
+        },
+        None => settled_library_answer(ask, early).await,
+    }
+}
+
+/// Send the service's own library-store `ask` on a task of its own, then ask
+/// the compiler engine for the implementations with `implementations`: the
+/// store's round trip runs beside that ask and whatever follows it, rather
+/// than starting once the analysis is joined. The ask is the one
+/// [`settled_library_answer`] makes, in the analysis's scope, and its answers
+/// are handed over as the lane's are ([`answers_ahead::LibraryHanded`]):
+/// dropped unsettled, it stops.
+async fn library_beside_implementations<Answer>(
+    ask: Option<&std::sync::Arc<LibraryAsk>>,
+    implementations: impl FnOnce() -> Answer,
+) -> (Option<answers_ahead::LibraryHanded>, Answer) {
+    let sent = ask.map(|ask| {
+        let ask = std::sync::Arc::clone(ask);
+        let asked = ask.asked.clone();
+        let (early, first) = tokio::sync::oneshot::channel();
+        (asked, first, async move {
+            settled_library_answer(Some(&ask), early).await
+        })
+    });
+    let (sent, store) = match sent {
+        Some((asked, first, store)) => (Some((asked, first)), Some(store)),
+        None => (None, None),
+    };
+    let (settled, answer) = beside(store, implementations).await;
+    let handed = sent
+        .zip(settled)
+        .map(|((asked, first), settled)| answers_ahead::LibraryHanded::new(asked, first, settled));
+    (handed, answer)
+}
+
+/// Start `store` on a task of its own, in the running task's service scope
+/// and log span, and once it has been polled the first time (its request is
+/// as far out as it gets without waiting) run `work` on this one. `work`
+/// blocks its thread (a compiler-engine request), so the store's task must
+/// already be under way when it starts.
+async fn beside<Store, Answer>(
+    store: Option<Store>,
+    work: impl FnOnce() -> Answer,
+) -> (Option<tokio::task::JoinHandle<Store::Output>>, Answer)
+where
+    Store: std::future::Future + Send + 'static,
+    Store::Output: Send + 'static,
+{
+    let task = match store {
+        Some(store) => {
+            let (begun, has_begun) = tokio::sync::oneshot::channel();
+            let task = crate::current_service::spawn(async move {
+                let mut store = std::pin::pin!(store);
+                let mut begun = Some(begun);
+                std::future::poll_fn(|cx| {
+                    let polled = std::future::Future::poll(store.as_mut(), cx);
+                    if let Some(begun) = begun.take() {
+                        let _ = begun.send(());
+                    }
+                    polled
+                })
+                .await
+            });
+            let _ = has_begun.await;
+            Some(task)
+        }
+        None => None,
+    };
+    (task, work())
+}
+
+#[cfg(test)]
+mod beside_tests {
+    use super::beside;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// The store's request is under way before the blocking compiler-engine
+    /// ask starts, and its wait runs beside that ask rather than after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_store_ask_is_under_way_before_the_engine_is_asked() {
+        let wait = Duration::from_millis(300);
+        let sent: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let store = {
+            let sent = Arc::clone(&sent);
+            async move {
+                *sent.lock().unwrap() = Some(Instant::now());
+                tokio::time::sleep(wait).await;
+                "answered"
+            }
+        };
+        let started = Instant::now();
+        let (task, sent_before_the_ask) = beside(Some(store), || {
+            let sent_before_the_ask = sent.lock().unwrap().is_some();
+            std::thread::sleep(wait);
+            sent_before_the_ask
+        })
+        .await;
+        assert!(
+            sent_before_the_ask,
+            "the store was asked after the compiler engine"
+        );
+        assert_eq!(task.expect("a store task").await.unwrap(), "answered");
+        let took = started.elapsed();
+        assert!(
+            took < wait * 2 - Duration::from_millis(50),
+            "the store's wait ran after the engine's ask: {took:?}"
+        );
+    }
+
+    /// The store's task asks for the service the analysis is for: its
+    /// requests are counted and replayed under that service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_store_ask_runs_in_the_analysis_s_scope() {
+        let (task, ()) = crate::current_service::scope(Some("orders".to_string()), async {
+            beside(Some(async { crate::current_service::name() }), || ()).await
+        })
+        .await;
+        assert_eq!(
+            task.expect("a store task").await.unwrap().as_deref(),
+            Some("orders")
+        );
+    }
+
+    /// No ask, no task: the work runs alone.
+    #[tokio::test]
+    async fn no_ask_starts_no_task() {
+        let (task, answer) = beside(None::<std::future::Ready<()>>, || 7).await;
+        assert!(task.is_none());
+        assert_eq!(answer, 7);
     }
 }
 
@@ -10576,39 +10745,96 @@ fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf
 }
 
 /// A sidecar process of the service's own, scoped to its directory and
-/// tsconfig and ready, or `None` with the loss recorded when it could not be
-/// started (carrick#1066).
+/// tsconfig (carrick#1066).
 ///
 /// Every service gets one, whatever the width: a service's program is built
 /// by a process nothing else has asked, so its types do not depend on which
 /// services ran before it or beside it. Each process starts with
 /// `heap_cap_mb`, the cap the run's ledger gave the service (carrick#3084),
 /// and a restart of it keeps that cap.
-fn start_service_sidecar(
-    recipe: &crate::services::type_sidecar::SidecarRecipe,
-    repo_path: &str,
-    service: &Config,
-    heap_cap_mb: Option<u64>,
-) -> Option<TypeSidecar> {
-    let recipe = recipe.clone().with_heap_cap_mb(heap_cap_mb);
-    let service_root = service_sidecar_root(repo_path, service);
-    let label = service.service_name.as_deref().unwrap_or("(root)");
-    debug!(
-        "Starting a sidecar for service '{}' at {}",
-        label,
-        service_root.display()
-    );
-    match recipe.spawn_scoped(&service_root, service.tsconfig.as_deref()) {
-        Ok(sidecar) => Some(sidecar),
-        Err(e) => {
-            warn!(
-                "Sidecar re-init for service '{}' failed: {} — type extraction may be skipped \
-                 for this service",
-                label, e
+///
+/// It is started when the service is admitted and waited for only once
+/// discovery has run ([`Self::ready`]): discovery reads no type, so the
+/// process gets ready beside it rather than before it.
+struct ServiceSidecar {
+    label: String,
+    /// The process started and not yet waited for.
+    starting: std::sync::Mutex<Option<Result<TypeSidecar, String>>>,
+    /// The process once waited for: `None` when it could not be started.
+    ready: std::sync::OnceLock<Option<TypeSidecar>>,
+}
+
+impl ServiceSidecar {
+    /// Start the service's process from `recipe`, or hold none when the run
+    /// has no recipe.
+    fn start(
+        recipe: Option<&crate::services::type_sidecar::SidecarRecipe>,
+        repo_path: &str,
+        service: &Config,
+        heap_cap_mb: Option<u64>,
+    ) -> Self {
+        let label = service.service_name.as_deref().unwrap_or("(root)");
+        let starting = recipe.map(|recipe| {
+            let recipe = recipe.clone().with_heap_cap_mb(heap_cap_mb);
+            let service_root = service_sidecar_root(repo_path, service);
+            debug!(
+                "Starting a sidecar for service '{}' at {}",
+                label,
+                service_root.display()
             );
-            crate::scan_health::record_types_unavailable(label, &e.to_string());
-            None
+            recipe
+                .start_scoped(&service_root, service.tsconfig.as_deref())
+                .map_err(|e| e.to_string())
+        });
+        Self {
+            label: label.to_string(),
+            starting: std::sync::Mutex::new(starting),
+            ready: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The process, ready, or `None` with the loss recorded when it could
+    /// not be started or did not get ready. Waits for it the first time.
+    fn ready(&self) -> Option<&TypeSidecar> {
+        self.ready
+            .get_or_init(|| {
+                let starting = self
+                    .starting
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()?;
+                let waited = Instant::now();
+                let readied = starting.and_then(|sidecar| {
+                    sidecar
+                        .wait_ready(crate::services::type_sidecar::ready_budget())
+                        .map(|()| sidecar)
+                        .map_err(|e| e.to_string())
+                });
+                match readied {
+                    Ok(sidecar) => {
+                        debug!(
+                            elapsed_ms = waited.elapsed().as_millis() as u64,
+                            "Sidecar for service '{}' waited for after discovery", self.label
+                        );
+                        Some(sidecar)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Sidecar re-init for service '{}' failed: {} — type extraction may \
+                             be skipped for this service",
+                            self.label, e
+                        );
+                        crate::scan_health::record_types_unavailable(&self.label, &e);
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// The process if it was waited for and got ready; never waits.
+    fn held(&self) -> Option<&TypeSidecar> {
+        self.ready.get().and_then(Option::as_ref)
     }
 }
 
@@ -13648,14 +13874,34 @@ async fn analyze_current_repo(
         function_definitions.values(),
         repo_path,
     );
-    // Asked once, before the intents start, and read by every walk below:
-    // the fact layer's and the call graph's (carrick#2432 slice B).
-    let implementations = implementations_for(
+    // What the service asks the library store, sent now: the round trip runs
+    // beside the implementations ask and the setup below, and is awaited
+    // where the analysis reads it. The full path has no lane to hand an ask
+    // over.
+    let ask_turns = model_setup.turns();
+    let service_root = service_scan_root(repo_path, config);
+    let library_ask = LibraryAsk::start(
         &request_inputs,
-        sidecar,
+        siblings,
+        sidecar.is_some(),
+        &service_root,
         Path::new(repo_path),
-        crate::phase_timing::Phase::Model,
-    );
+        ask_turns.clone(),
+    )
+    .map(std::sync::Arc::new);
+    // The implementations are asked once, before the intents start, and read
+    // by every walk below: the fact layer's and the call graph's
+    // (carrick#2432 slice B).
+    let (own_library, implementations) =
+        library_beside_implementations(library_ask.as_ref(), || {
+            implementations_for(
+                &request_inputs,
+                sidecar,
+                Path::new(repo_path),
+                crate::phase_timing::Phase::Model,
+            )
+        })
+        .await;
     let intents = IntentsInFlight::start(
         AgentService::new(),
         function_definitions,
@@ -13668,7 +13914,6 @@ async fn analyze_current_repo(
 
     // 3b. Settle the model stages for this service: detection and guidance
     // (or a deferral), plus the extraction config. Local mode asks nothing.
-    let ask_turns = model_setup.turns();
     let mut setup = if crate::local_mode::no_model() {
         debug!("Local mode: skipping framework detection and guidance (no model)");
         ModelSetup::ready(
@@ -13716,7 +13961,6 @@ async fn analyze_current_repo(
 
     // 4. Run the complete multi-agent analysis
     let normalizer = UrlNormalizer::new(config);
-    let service_root = service_scan_root(repo_path, config);
     // Composed here rather than in discovery: the library semantics they read
     // through exist only once detection has answered (carrick#1564).
     let (summaries_sender, summaries) = tokio::sync::oneshot::channel();
@@ -13729,14 +13973,6 @@ async fn analyze_current_repo(
     // (carrick#1564).
     let service_root_text = service_root.to_string_lossy().into_owned();
     let sibling_inputs = siblings.inputs();
-    let library_ask = LibraryAsk::start(
-        &request_inputs,
-        siblings,
-        sidecar.is_some(),
-        &service_root,
-        Path::new(repo_path),
-        ask_turns.clone(),
-    );
     // The calls that execute a GraphQL document, read through the value
     // resolver (carrick#3504 S9): the analysis drops their HTTP twins, and
     // their consumer rows are placed once the transport fold has run.
@@ -13775,9 +14011,9 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        settled_library_answer(library_ask.as_ref(), early_answer),
+        async { settled_from(own_library, library_ask.as_deref(), early_answer).await },
         fact_files_of(
-            library_ask.as_ref(),
+            library_ask.as_deref(),
             first_answer,
             &request_inputs,
             &sibling_inputs,
@@ -13849,8 +14085,12 @@ async fn analyze_current_repo(
         graphql_schemas,
         analysis_result.builds_graphql_schema_in_code,
     );
-    let (library, claims, unready) =
-        library_rows(library_ask.as_ref(), library_answer, sidecar, &service_root);
+    let (library, claims, unready) = library_rows(
+        library_ask.as_deref(),
+        library_answer,
+        sidecar,
+        &service_root,
+    );
     protocol_extractions.library = library;
     let server_claims = server_claims_of(&claims, &service_root);
     let declarations = member_declarations(&request_inputs, &claims, sidecar, &service_root);
