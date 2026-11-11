@@ -42,14 +42,25 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 const NOTHING: &str = r#"{"mounts":[],"endpoints":[],"data_calls":[]}"#;
 
-fn stating(line: i64, owner: &str, path: &str) -> String {
+fn endpoint(id: &str, line: i64, owner: &str, path: &str) -> String {
     format!(
-        r#"{{"mounts":[],"endpoints":[{{"candidate_id":"@line:{line}","line_number":{line},
+        r#"{{"candidate_id":"{id}","line_number":{line},
         "owner_node":"{owner}","method":"GET","path":"{path}","handler_name":"anonymous",
         "pattern_matched":"{owner}.get(","payload_expression_text":null,
         "payload_expression_line":null,"response_expression_text":"\"ok\"",
         "response_expression_line":{line},"emission_style":"imperative-send",
-        "primary_type_symbol":null,"type_import_source":null}}],"data_calls":[]}}"#
+        "primary_type_symbol":null,"type_import_source":null}}"#
+    )
+}
+
+fn stating(line: i64, owner: &str, path: &str) -> String {
+    answer(&[endpoint(&format!("@line:{line}"), line, owner, path)], "")
+}
+
+fn answer(endpoints: &[String], data_calls: &str) -> String {
+    format!(
+        r#"{{"mounts":[],"endpoints":[{}],"data_calls":[{data_calls}]}}"#,
+        endpoints.join(",")
     )
 }
 
@@ -153,6 +164,41 @@ fn a_sent_file_keeps_the_rows_a_deterministic_pass_reads() {
             omitted
                 .iter()
                 .any(|r| r.starts_with(row) && !r.ends_with("llm")),
+            "the omitting answer lost {row}: {omitted:#?}"
+        );
+    }
+}
+
+/// The same file also registers routes in a loop over a tuple array and holds
+/// a data call the model is asked about. The answer that states the loop
+/// routes and the call adds rows; the answer that omits them still leaves the
+/// rows the fact layer reads, and its loop routes cost no row of a wrong kind.
+#[test]
+fn a_sent_file_with_a_loop_and_a_data_call_keeps_its_deterministic_rows() {
+    let ledger = r#"{"candidate_id":"@line:27","line_number":27,"target":"https://${host}/ledger","method":"GET","pattern_matched":"fetch(","call_expression_text":"fetch(`https://${host}/ledger`)","call_expression_line":27,"payload_expression_text":null,"payload_expression_line":null}"#;
+    let stated_app = answer(
+        &[
+            endpoint("@line:10", 10, "app", "/widgets"),
+            endpoint("@line:22:a", 22, "app", "/orders"),
+            endpoint("@line:22:b", 22, "app", "/invoices"),
+        ],
+        ledger,
+    );
+    let stated = routes(&[
+        ("app", stated_app),
+        ("typed", stating(7, "server", "/gadgets")),
+    ]);
+    let omitted = routes(&[("app", NOTHING.to_string()), ("typed", NOTHING.to_string())]);
+    eprintln!("stated: {stated:#?}\nomitted: {omitted:#?}");
+    for row in ["src/app.ts:10 GET /widgets", "src/typed.ts:7 GET /gadgets"] {
+        assert!(
+            stated.iter().any(|r| r.starts_with(row)),
+            "the stating answer lost {row}: {stated:#?}"
+        );
+        assert!(
+            omitted
+                .iter()
+                .any(|r| r.starts_with(row) && !r.ends_with(" model")),
             "the omitting answer lost {row}: {omitted:#?}"
         );
     }
