@@ -801,10 +801,10 @@ impl Recheck {
                 None => String::new(),
             };
             return format!(
-                "re-check: not checked, so these verdicts are the indexed ones, from the index at {}{}. {reason}.",
+                "re-check: not checked, so these verdicts do not include your edits and are from the index at {}{}. {reason}.",
                 short_commit(index_commit),
                 match self.stale_since.as_deref() {
-                    Some(since) => format!(", computed at {since}"),
+                    Some(since) => format!(" (computed {since})"),
                     None => String::new(),
                 }
             );
@@ -1605,8 +1605,8 @@ mod tests {
         });
         let text = stopped.render();
         let line = format!(
-            "re-check: not checked, so these verdicts are the indexed ones, from the index at {}, \
-             computed at 2026-09-13T22:26:26Z. The re-scan ran past the budget.\n",
+            "re-check: not checked, so these verdicts do not include your edits and are from the index at {} \
+             (computed 2026-09-13T22:26:26Z). The re-scan ran past the budget.\n",
             short_commit(&stopped.index_commit)
         );
         let said = text.find(&line).unwrap_or_else(|| panic!("{text}"));
@@ -1638,8 +1638,8 @@ mod tests {
         };
         assert_eq!(
             recheck.line("1a2b3c4d5e6f"),
-            "re-check: not checked, so these verdicts are the indexed ones, from the index at \
-             1a2b3c4, computed at 2026-09-13T22:26:26Z. Re-reading catalog (12 indexed files) \
+            "re-check: not checked, so these verdicts do not include your edits and are from the index at \
+             1a2b3c4 (computed 2026-09-13T22:26:26Z). Re-reading catalog (12 indexed files) \
              took longer than 10 s against this index, so edits in catalog are not re-checked \
              until `carrick refresh`. Run `carrick check --changed` before you finish."
         );

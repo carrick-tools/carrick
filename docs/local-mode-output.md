@@ -67,16 +67,7 @@ checker's finished answers are kept per index in
 read by every re-check, so an edit that moves no type skips the checker's
 dependency install. A new index replaces both folders. The whole re-check has a
 budget (10 s, `CARRICK_RECHECK_BUDGET_MS`); past it the answer is the indexed
-one, and the `recheck` block below says so (`deadline: true`). That answer is
-not a check of the edit, so it is never a clean result (carrick#3860): the
-terminal says so before any row, naming the index commit it answered from,
-
-```
-re-check: not checked, so these verdicts are the indexed ones, from the index at 1a2b3c4, computed at 2026-11-11T09:12:00Z. The re-scan ran past the budget.
-```
-
-and `check <file> --recheck` exits 2, as a check that covered nothing does. A
-`known_miss` answer (below) prints and exits the same way.
+one, and the `recheck` block below says so.
 A re-check that missed its budget is remembered in
 `.carrick/recheck-misses.json`, per service and against the index it ran on
 (its `indexed_at`). Until `refresh` or `index` writes a new index, a later
@@ -253,7 +244,6 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, `{ "name": string, "line": int }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so it is present on a `none` that missed its budget too. Absent when the edit added no function, and when the index could not be read |
 | `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
 | `deferred` | `true` \| absent | on a `none` from `--recheck --no-rescan` for an edit that needs a re-scan: the call was asked not to start one, so the rows are the indexed ones. Absent otherwise |
-| `deadline` | `true` \| absent | on a `none` whose re-check started and ran past its budget, so the rows are the indexed ones because time ran out. With it, as with `known_miss`, `check <file> --recheck` exits 2. Absent otherwise |
 | `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
 | `moved` | array \| absent | rows outside the edited file whose state this edit moved (below). Absent when the edit moved nothing |
 

@@ -2107,13 +2107,9 @@ USAGE:
                and signed in, about the installed packages: package names,
                versions, import specifiers and the TypeScript library globals
                the code uses go on the wire, no source code, and the store
-               builds nothing for the ask. It has ten seconds
-               (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
-               one, says "not checked" and exits 2. A repo whose re-check missed
-               its budget is remembered against that index
-               (.carrick/recheck-misses.json): later re-checks there answer at
-               once from the index, the same way, until the next `carrick
-               refresh`.
+               builds nothing for the ask. Re-checks have 10
+               seconds (`CARRICK_RECHECK_BUDGET_MS`); past that the answer comes
+               from the index, says "not checked" and exits 2.
                --no-rescan (with --recheck) never starts that re-scan: a file
                that needs none is answered as usual, and one that does comes
                back with `recheck.deferred` true and the indexed rows.
