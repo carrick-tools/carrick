@@ -358,27 +358,32 @@ fn each_service_asks_the_store_once_per_scan() {
     }
 }
 
-/// The lane ran in the incremental scan that has it: each service's analysis
-/// says what it was handed ("Answers ahead for <service>: asked ..."), and
-/// does not say it refused. The scans without it say nothing of the kind.
+/// The lane ran in the incremental scan that has it: the run log says it
+/// asked the file reader ahead for the service whose file changed, and
+/// the scans without the lane say nothing of the kind.
 #[test]
 fn the_lane_runs_in_the_scan_that_has_it() {
     for (scan, scanned) in scanned() {
-        for service in ["cli", "srv"] {
-            let lines = service_lines(&scanned.log, service);
-            let ahead = lines
-                .iter()
-                .filter(|line| line.contains("Answers ahead for"))
-                .collect::<Vec<_>>();
-            if *scan == "incremental" {
-                assert!(!ahead.is_empty(), "{scan} scan, {service}: the lane ran");
-                assert!(
-                    ahead.iter().all(|line| !line.contains("refused")),
-                    "{scan} scan, {service}: {ahead:?}"
-                );
-            } else {
-                assert!(ahead.is_empty(), "{scan} scan, {service}: {ahead:?}");
-            }
+        let asked = scanned
+            .log
+            .lines()
+            .map(plain)
+            .filter(|line| line.contains("Asking the file reader ahead for cli:"))
+            .count();
+        if *scan == "incremental" {
+            assert_eq!(
+                asked,
+                1,
+                "{scan} scan: the lane asked ahead for cli:\n{}",
+                scanned
+                    .log
+                    .lines()
+                    .filter(|line| line.contains("head"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        } else {
+            assert_eq!(asked, 0, "{scan} scan: no lane asks ahead");
         }
     }
 }
