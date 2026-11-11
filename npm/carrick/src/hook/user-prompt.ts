@@ -28,6 +28,7 @@ import { resolveChannel } from "../channel.ts";
 import { deliverLate } from "./late.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
+import { timed } from "./timings.ts";
 
 const log = createLogger("carrick-user-prompt");
 
@@ -84,5 +85,5 @@ async function main(): Promise<void> {
   process.stdout.write(emission(parts.join("\n\n")));
 }
 
-await main();
+await timed("prompt-submit", main);
 process.exit(0);

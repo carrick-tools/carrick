@@ -27,6 +27,7 @@ import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
 import { createLogger } from "../log.ts";
+import { timed, type Timing } from "./timings.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -66,7 +67,7 @@ export function filesFromPayload(payload: Payload): string[] {
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
 }
 
-async function main(): Promise<void> {
+async function main(timing: Timing): Promise<void> {
   markInvoker("post-edit");
   // `off` stops the work as well as the printing. `lsp` stops only the
   // printing: it decides which surface delivers a verdict, and the session
@@ -102,8 +103,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  await editFlow({ cwd, session, channel: channel.channel }, edited);
+  timing.file = edited[0]!;
+  await editFlow({ cwd, session, channel: channel.channel, timing }, edited);
 }
 
-await main();
+await timed("post-edit", main);
 process.exit(0);

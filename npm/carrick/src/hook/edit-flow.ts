@@ -19,6 +19,7 @@ import { deliverLate, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
+import type { Timing } from "./timings.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -28,7 +29,7 @@ const log = createLogger("carrick-hook");
  * command) are printed first, in the same object.
  */
 export async function editFlow(
-  input: { cwd: string | null; session: string | undefined; channel: Channel },
+  input: { cwd: string | null; session: string | undefined; channel: Channel; timing?: Timing },
   edited: string[],
   extra: string[] = [],
 ): Promise<void> {
@@ -63,6 +64,7 @@ export async function editFlow(
   // reads it, a known miss) comes back at once and prints below. Every other
   // file is queued for the background runner (carrick#3198).
   const answers = await probeEdits(relatives, choice.root);
+  if (input.timing) input.timing.waitedMs = answers.ms;
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();

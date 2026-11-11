@@ -21,6 +21,7 @@ import { wasRead } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse as emit } from "./late.ts";
 import { answerRead } from "./read-answer.ts";
+import { timed, type Timing } from "./timings.ts";
 
 const log = createLogger("carrick-hook");
 /** The files the index has rows for. */
@@ -32,7 +33,7 @@ type Payload = {
   tool_input?: { file_path?: string };
 };
 
-async function main(): Promise<void> {
+async function main(timing: Timing): Promise<void> {
   markInvoker("post-read");
   // Only `hook` prints from here; `lsp` and `off` start nothing and write
   // nothing, so a file is not marked as asked about by a channel that said
@@ -57,9 +58,11 @@ async function main(): Promise<void> {
   const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
   if (session && wasRead(session, file)) return emit(late);
 
+  const waitStarted = Date.now();
   const context = await answerRead(file, payload.cwd, session);
+  timing.waitedMs = Date.now() - waitStarted;
   emit(context ? [...late, context] : late);
 }
 
-await main();
+await timed("post-read", main);
 process.exit(0);

@@ -36,6 +36,7 @@ import {
 import { outdatedFiles, outdatedInstall, versionMismatch } from "../init/outdated.ts";
 import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
+import { slowHookLines, timed } from "./timings.ts";
 
 const log = createLogger("carrick-session");
 
@@ -104,6 +105,7 @@ async function main(): Promise<void> {
   // have nothing to report: a machine with no index yet is a machine about to
   // run its first scan, which is the worst moment to be on a stale build.
   lines.push(...versionLines());
+  if (choice.markerFound) lines.push(...slowHookLines(choice.root));
 
   // And the other mismatch: not "a newer one is published" but "the one
   // answering this hook is not the one that wrote these files". Unthrottled,
@@ -197,5 +199,5 @@ function flush(lines: string[], codex: boolean): void {
   else process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-await main();
+await timed("session-start", () => main());
 process.exit(0);
