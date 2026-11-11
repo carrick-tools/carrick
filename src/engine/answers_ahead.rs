@@ -123,7 +123,9 @@ impl LibraryHanded {
         early: oneshot::Sender<FirstAnswer>,
     ) -> Result<Settled, Option<oneshot::Sender<FirstAnswer>>> {
         let mut early = Some(early);
-        if let (Ok(first), Some(early)) = (self.first.clone().await, early.take()) {
+        if let Ok(first) = self.first.clone().await
+            && let Some(early) = early.take()
+        {
             let _ = early.send(first);
         }
         match self.settled.take() {
