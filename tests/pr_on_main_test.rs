@@ -2428,6 +2428,33 @@ fn a_removed_row_the_renderer_does_not_post_is_no_false_row() {
     assert!(wrong.iter().all(|(stage, _)| *stage == 3), "{wrong:?}");
 }
 
+/// A delta row is of the service the manifest row names, as the PR-accuracy
+/// instrument keys it (`service or '-'`): in a repo with several services the
+/// same operation under another service, or under none, is a false row and
+/// a miss.
+#[test]
+fn a_delta_row_of_another_service_is_a_false_row_and_a_miss() {
+    let entry = |service: Option<&str>| {
+        let mut row = serde_json::json!({"kind": "delta_new", "label": "POST /api/rpc/shelf.put"});
+        if let Some(service) = service {
+            row["service"] = serde_json::json!(service);
+        }
+        serde_json::json!({"expect": {
+            "title": "no_contract_risks", "conclusion": "success", "rows": [row]}})
+    };
+    let payload = serde_json::json!({"delta": {"new_endpoints": [
+        {"method": "POST", "path": "/api/rpc/shelf.put", "service": "api", "edge_source": "fact"}
+    ]}});
+    assert_eq!(
+        seed_stages::wrong_scanner_stages(&entry(Some("api")), &payload),
+        Vec::new()
+    );
+    for other in [None, Some("web")] {
+        let wrong = seed_stages::wrong_scanner_stages(&entry(other), &payload);
+        assert_eq!(wrong.len(), 2, "{other:?}: {wrong:?}");
+    }
+}
+
 /// Every seed that takes part in runs has its stage asserted by a test that
 /// runs: a seed whose only test is `#[ignore]`d would carry a declaration
 /// nothing holds it to (carrick-cloud#2880).
