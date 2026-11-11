@@ -42,7 +42,9 @@ mod text_reader;
 
 pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
 pub(super) use text::{args_text, pattern_members, text_of};
-pub(super) use text_reader::{ArgTexts, TextValue};
+pub(super) use text_reader::{
+    ArgTexts, Hop, PartValue, PiecedText, SpanAt, TextPart, TextValue, handed,
+};
 
 /// How many object literals deep an argument's keys are read (the decision
 /// record's object-depth cap, D7).
@@ -2497,10 +2499,12 @@ pub(super) struct Resolver<'a> {
     /// The declarations being read for their text (carrick#3504 S2): a
     /// value that reads itself holds no text.
     texts_reading: RefCell<HashSet<(PathBuf, u32, String)>>,
-    /// The open text query reads a parameter as the texts its callers pass
-    /// ([`Self::texts_through_callers`], carrick#3504 B10-1b). Off for every
-    /// other entry point, which answers a parameter as before.
-    callers_mode: Cell<bool>,
+    /// Whether the open text query reads a parameter as the texts its
+    /// callers pass, and as whole texts or as pieces
+    /// ([`Self::texts_through_callers`], carrick#3504 B10-1b;
+    /// [`Self::pieces_through_callers`], B10-2a2). Off for every other entry
+    /// point, which answers a parameter as before.
+    callers_mode: Cell<text_reader::CallersRead>,
     /// The exported module bindings some importer may change or hand on,
     /// by declaring file and name; `None`: every one is contested
     /// (carrick#2448). Built on first use.
@@ -2558,7 +2562,7 @@ impl<'a> Resolver<'a> {
             cap: MAX_QUERY_STEPS,
             bindings_reading: RefCell::new(HashSet::new()),
             texts_reading: RefCell::new(HashSet::new()),
-            callers_mode: Cell::new(false),
+            callers_mode: Cell::new(text_reader::CallersRead::Off),
             contested: std::cell::OnceCell::new(),
         }
     }

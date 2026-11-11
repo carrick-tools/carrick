@@ -42,6 +42,120 @@ pub(in crate::request_summary) enum TextValue {
         reason: guards::HoleReason,
         callers: Vec<CallAt>,
     },
+    /// The name as parts ([`Resolver::pieces_through_callers`], carrick#3504
+    /// B10-2a2): produced only in that mode.
+    Pieced(PiecedText),
+}
+
+/// A name read through callers as parts (carrick#3504 B10-2a2, Q2): each
+/// part a literal or a hole, with where it was read and the parameters it
+/// was passed through, so a consumer can spell each part as the request
+/// summaries read it ([`FileIr::arg_pieces`]) and place it at a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) struct PiecedText {
+    pub(in crate::request_summary) parts: Vec<TextPart>,
+    /// The calls the value was read through, innermost first, as
+    /// [`TextValue::Text`] carries them.
+    pub(in crate::request_summary) callers: Vec<CallAt>,
+    pub(in crate::request_summary) from_type: bool,
+}
+
+/// One part of a [`PiecedText`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) struct TextPart {
+    pub(in crate::request_summary) value: PartValue,
+    /// The term the part was read at, in the numbering `arg_texts` uses;
+    /// `None` for text written in place (a template's quasi, a literal).
+    pub(in crate::request_summary) at: Option<SpanAt>,
+    /// Each parameter the part was passed through, innermost first.
+    pub(in crate::request_summary) through: Vec<Hop>,
+}
+
+/// What a part states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) enum PartValue {
+    Lit {
+        text: String,
+        read_from: Vec<String>,
+    },
+    Hole(guards::HoleReason),
+}
+
+/// A term's span in a file of the run, as `inputs` keys the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) struct SpanAt {
+    pub(in crate::request_summary) file: PathBuf,
+    pub(in crate::request_summary) lo: u32,
+    pub(in crate::request_summary) hi: u32,
+}
+
+/// One parameter a part was passed through: the call that fills it, and the
+/// parameter read inside the function the call fills. A keyed read the code
+/// does not write (a slot's key, an entry read off an argument handed to the
+/// parameter) is its object's span, with the keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::request_summary) struct Hop {
+    pub(in crate::request_summary) call: CallAt,
+    pub(in crate::request_summary) read: SpanAt,
+    pub(in crate::request_summary) keys: Vec<String>,
+}
+
+impl PiecedText {
+    /// The reason of the first part that is a hole.
+    pub(in crate::request_summary) fn first_hole(&self) -> Option<guards::HoleReason> {
+        self.parts.iter().find_map(|part| match part.value {
+            PartValue::Hole(reason) => Some(reason),
+            PartValue::Lit { .. } => None,
+        })
+    }
+
+    /// One part, read through no parameter.
+    fn one(value: PartValue, at: Option<SpanAt>, callers: Vec<CallAt>) -> Self {
+        PiecedText {
+            parts: vec![TextPart {
+                value,
+                at,
+                through: Vec::new(),
+            }],
+            callers,
+            from_type: false,
+        }
+    }
+}
+
+/// The span of `term` in `file`, where the lowering keeps one.
+fn span_of(file: &Path, term: &ValueAt) -> Option<SpanAt> {
+    let (lo, hi) = match term {
+        ValueAt::Read { lo, hi, .. }
+        | ValueAt::Field { lo, hi, .. }
+        | ValueAt::Returned { lo, hi, .. }
+        | ValueAt::New { lo, hi, .. }
+        | ValueAt::Constructed { lo, hi, .. }
+        | ValueAt::KeyOf { lo, hi, .. }
+        | ValueAt::Member { lo, hi, .. }
+        | ValueAt::BuiltIn { lo, hi, .. }
+        | ValueAt::Alt { lo, hi, .. }
+        | ValueAt::Unstated { lo, hi } => (*lo, *hi),
+        _ => return None,
+    };
+    // `handed`'s wrap is written nowhere.
+    ((lo, hi) != (0, 0)).then(|| SpanAt {
+        file: file.to_path_buf(),
+        lo,
+        hi,
+    })
+}
+
+/// How the open text query reads a parameter (carrick#3504 B10-2a2, Q1):
+/// not at all (every entry point but the two below), as the whole texts its
+/// callers pass ([`Resolver::texts_through_callers`]), or as parts
+/// ([`Resolver::pieces_through_callers`]). Both callers modes share the one
+/// caller walk ([`Resolver::param_texts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::request_summary) enum CallersRead {
+    Off,
+    Whole,
+    Pieces,
 }
 
 /// One call a parameter was read at (carrick#3504 B10-1b): the caller's file
@@ -91,19 +205,57 @@ impl TextValue {
     /// outside [`Resolver::texts_through_callers`].
     pub(in crate::request_summary) fn callers(&self) -> &[CallAt] {
         match self {
-            TextValue::Text { callers, .. } | TextValue::Hole { callers, .. } => callers,
+            TextValue::Text { callers, .. }
+            | TextValue::Hole { callers, .. }
+            | TextValue::Pieced(PiecedText { callers, .. }) => callers,
         }
     }
 
     /// This value, read one caller further out: `at` goes first on its
-    /// chain.
-    fn read_at(mut self, at: &CallAt) -> Self {
+    /// chain. Read as parts, each part was passed through the parameter
+    /// read `read` (with its keys), which goes first on its hops.
+    fn read_at(mut self, at: &CallAt, read: Option<&(SpanAt, Vec<String>)>) -> Self {
         match &mut self {
             TextValue::Text { callers, .. } | TextValue::Hole { callers, .. } => {
                 callers.insert(0, at.clone());
             }
+            TextValue::Pieced(pieced) => {
+                pieced.callers.insert(0, at.clone());
+                if let Some((read, keys)) = read {
+                    for part in &mut pieced.parts {
+                        part.through.insert(
+                            0,
+                            Hop {
+                                call: at.clone(),
+                                read: read.clone(),
+                                keys: keys.clone(),
+                            },
+                        );
+                    }
+                }
+            }
         }
         self
+    }
+
+    /// This value as parts: a whole text or a hole is one part, read at
+    /// `at`.
+    fn into_pieced(self, at: Option<SpanAt>) -> PiecedText {
+        match self {
+            TextValue::Pieced(pieced) => pieced,
+            TextValue::Hole { reason, callers } => {
+                PiecedText::one(PartValue::Hole(reason), at, callers)
+            }
+            TextValue::Text {
+                text,
+                read_from,
+                from_type,
+                callers,
+            } => PiecedText {
+                from_type,
+                ..PiecedText::one(PartValue::Lit { text, read_from }, at, callers)
+            },
+        }
     }
 }
 
@@ -126,11 +278,21 @@ fn chains_joined(head: &[CallAt], tail: &[CallAt]) -> Vec<CallAt> {
     out
 }
 
+/// Counts one more value on `chain` (carrick#3504 B10-2a2, Q6: the cap
+/// counts within one caller chain, never across chains).
+fn count_chain(counts: &mut Vec<(Vec<CallAt>, usize)>, chain: &[CallAt]) {
+    match counts.iter_mut().find(|(held, _)| held.as_slice() == chain) {
+        Some((_, count)) => *count += 1,
+        None => counts.push((chain.to_vec(), 1)),
+    }
+}
+
 /// What `term`, handed to a parameter, holds down `keys`: an object literal's
 /// last entry with each key (`None` where it writes none: the key is
 /// omitted), else a read of the key off the term, as
-/// [`Resolver::keyed_text_set`] reads one.
-fn handed(term: &ValueAt, keys: &[String]) -> Option<ValueAt> {
+/// [`Resolver::keyed_text_set`] reads one. Also how a slot's key is read off
+/// the labelled call's argument (carrick#3504 B10-2a2).
+pub(in crate::request_summary) fn handed(term: &ValueAt, keys: &[String]) -> Option<ValueAt> {
     let mut term = term.clone();
     for key in keys {
         term = match term {
@@ -156,11 +318,20 @@ fn handed(term: &ValueAt, keys: &[String]) -> Option<ValueAt> {
     Some(term)
 }
 
-/// Turns on [`Resolver::texts_through_callers`]'s mode until it drops, then
-/// puts back what was there.
+/// Sets the open query's [`CallersRead`] until it drops, then puts back what
+/// was there.
 struct CallersMode<'r> {
-    mode: &'r Cell<bool>,
-    before: bool,
+    mode: &'r Cell<CallersRead>,
+    before: CallersRead,
+}
+
+impl<'r> CallersMode<'r> {
+    fn set(mode: &'r Cell<CallersRead>, to: CallersRead) -> Self {
+        CallersMode {
+            mode,
+            before: mode.replace(to),
+        }
+    }
 }
 
 impl Drop for CallersMode<'_> {
@@ -194,7 +365,13 @@ impl<'a> Resolver<'a> {
             return vec![TextValue::hole(guards::HoleReason::FanOutCap)];
         }
         let out = self.text_in(file, value);
-        if self.open.get().0 == 1 && self.capped.get() {
+        // Read through callers, the values read before the cap stand, and
+        // each read after it is a cap hole on its own chain (carrick#3504
+        // B10-2a2, Q6).
+        if self.open.get().0 == 1
+            && self.capped.get()
+            && self.callers_mode.get() == CallersRead::Off
+        {
             return vec![TextValue::hole(guards::HoleReason::FanOutCap)];
         }
         out
@@ -220,15 +397,259 @@ impl<'a> Resolver<'a> {
         file: &Path,
         value: &ValueAt,
     ) -> Vec<TextValue> {
-        let _mode = CallersMode {
-            mode: &self.callers_mode,
-            before: self.callers_mode.replace(true),
-        };
+        let _mode = CallersMode::set(&self.callers_mode, CallersRead::Whole);
         self.text_values(file, value)
+    }
+
+    /// Every value `value`, written in `file` (as `inputs` keys it), may be
+    /// through its callers, as [`Self::texts_through_callers`] reads it, but
+    /// as parts (carrick#3504 B10-2a2, Q1-Q3): one per caller chain, never
+    /// collapsed. A term splits only on its own structure (a template's or a
+    /// `+` chain's parts), on a local the same function body declares and
+    /// never writes again, and on parameter reads, which read each caller's
+    /// term split the same way, with the parameter read as a [`Hop`]. Any
+    /// other term (a choice, a builder call, a module constant, `this.x`, an
+    /// environment read) is one part: its one text, else a hole at its span.
+    /// A parameter is read before the one literal its type may be.
+    pub(in crate::request_summary) fn pieces_through_callers(
+        &self,
+        file: &Path,
+        value: &ValueAt,
+    ) -> Vec<PiecedText> {
+        let _mode = CallersMode::set(&self.callers_mode, CallersRead::Pieces);
+        let at = span_of(file, value);
+        self.text_values(file, value)
+            .into_iter()
+            .map(|value| value.into_pieced(at.clone()))
+            .collect()
+    }
+
+    /// `value` as parts, read in pieces mode (Q3).
+    fn pieces_in(&self, file: &Path, value: &ValueAt) -> Vec<TextValue> {
+        match value {
+            // An empty literal writes nothing.
+            ValueAt::Lit(text) if text.is_empty() => vec![TextValue::Pieced(PiecedText {
+                parts: Vec::new(),
+                callers: Vec::new(),
+                from_type: false,
+            })],
+            ValueAt::Lit(text) => vec![TextValue::Pieced(PiecedText::one(
+                PartValue::Lit {
+                    text: text.clone(),
+                    read_from: Vec::new(),
+                },
+                None,
+                Vec::new(),
+            ))],
+            ValueAt::Concat(parts) => self.pieces_joined(file, parts),
+            ValueAt::Read {
+                lo,
+                hi,
+                member: false,
+                ..
+            } => {
+                let read = SpanAt {
+                    file: file.to_path_buf(),
+                    lo: *lo,
+                    hi: *hi,
+                };
+                if let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident) {
+                    if let Some((at, param)) = self.declared_param(row) {
+                        return self.param_pieces(at, param, &[], read, Vec::new());
+                    }
+                    if let Some(split) = self.local_pieces(row, &read) {
+                        return split;
+                    }
+                }
+                self.one_part(file, value)
+            }
+            ValueAt::Member {
+                lo,
+                hi,
+                object,
+                key,
+            } => {
+                if let ValueAt::Read {
+                    lo: object_lo,
+                    hi: object_hi,
+                    member: false,
+                    ..
+                } = &**object
+                    && let Some(row) = self.row_at(file, *object_lo, *object_hi, Kind::Ident)
+                    && let Some((at, param)) = self.declared_param(row)
+                {
+                    let key = {
+                        let _whole = CallersMode::set(&self.callers_mode, CallersRead::Whole);
+                        self.one_text(file, key)
+                    };
+                    let key = match key {
+                        Ok((key, _)) => key,
+                        Err(reason) => {
+                            return vec![TextValue::Pieced(PiecedText::one(
+                                PartValue::Hole(reason),
+                                span_of(file, value),
+                                Vec::new(),
+                            ))];
+                        }
+                    };
+                    // A read the code does not write (`handed`'s wrap) is
+                    // its object's, down the key.
+                    let ((read_lo, read_hi), keys) = if (*lo, *hi) == (0, 0) {
+                        ((*object_lo, *object_hi), vec![key.clone()])
+                    } else {
+                        ((*lo, *hi), Vec::new())
+                    };
+                    let read = SpanAt {
+                        file: file.to_path_buf(),
+                        lo: read_lo,
+                        hi: read_hi,
+                    };
+                    return self.param_pieces(at, param, std::slice::from_ref(&key), read, keys);
+                }
+                self.one_part(file, value)
+            }
+            _ => self.one_part(file, value),
+        }
+    }
+
+    /// `value` as the one part it is: its one text where the whole reader
+    /// reads exactly one with no caller deciding it, else a hole of why not,
+    /// at its span.
+    fn one_part(&self, file: &Path, value: &ValueAt) -> Vec<TextValue> {
+        let read = {
+            let _whole = CallersMode::set(&self.callers_mode, CallersRead::Whole);
+            self.one_text(file, value)
+        };
+        let part = match read {
+            Ok((text, read_from)) => PartValue::Lit { text, read_from },
+            Err(reason) => PartValue::Hole(reason),
+        };
+        vec![TextValue::Pieced(PiecedText::one(
+            part,
+            span_of(file, value),
+            Vec::new(),
+        ))]
+    }
+
+    /// The parameter `param`, read at `read`, as parts: each caller's term
+    /// split, with the read as its hop; a parameter no caller states is one
+    /// hole at the read.
+    fn param_pieces(
+        &self,
+        at: (&'a Path, u32, String),
+        param: &ParamAt,
+        more: &[String],
+        read: SpanAt,
+        keys: Vec<String>,
+    ) -> Vec<TextValue> {
+        let hop = (read, keys);
+        self.param_texts(at, param, more, Some(&hop))
+            .into_iter()
+            .map(|value| TextValue::Pieced(value.into_pieced(Some(hop.0.clone()))))
+            .collect()
+    }
+
+    /// A local `row` names, read at `read`, split as its initialiser
+    /// (Q3): a `const`, or a `let` never written again, that a function
+    /// body declares. `None` where it is no such local, and where the
+    /// request summaries read it by other pieces than its initialiser's
+    /// parts (a local of an opaque base and a parameter, or one holding a
+    /// parameter's key, is read by its own name): there it is one part, so
+    /// it is spelled as they read it.
+    fn local_pieces(&self, row: &Row, read: &SpanAt) -> Option<Vec<TextValue>> {
+        let (at, binding, _) = self.declared_entry(row)?;
+        let once = match binding.kind {
+            BindingKind::Const => !binding.unplaceable,
+            BindingKind::Let => binding.writes.is_empty() && !binding.unplaceable,
+            _ => false,
+        };
+        if binding.declared_in.is_none() || !once {
+            return None;
+        }
+        let text = binding.text.as_ref()?;
+        let split = {
+            let _reading = self.reading_text(&at)?;
+            self.text_values(at.0, text)
+        };
+        let summaries = self
+            .inputs_for(&read.file)
+            .files
+            .get(&read.file)
+            .and_then(|ir| ir.arg_pieces.get(&(read.lo, read.hi)));
+        if let Some(summaries) = summaries {
+            for value in &split {
+                let TextValue::Pieced(pieced) = value else {
+                    return None;
+                };
+                if super::super::decided_sites::rendered(self, pieced, 0) != *summaries {
+                    return None;
+                }
+            }
+        }
+        Some(split)
+    }
+
+    /// Every value `parts`, joined in order, may be, as parts: one per
+    /// choice of a value of each part, joined only where their chains agree
+    /// (as [`Self::joined`]). [`MAX_VALUES`] counts the joinings within one
+    /// chain (Q6): a chain with more is one cap hole.
+    fn pieces_joined(&self, file: &Path, parts: &[ValueAt]) -> Vec<TextValue> {
+        let mut out = vec![PiecedText {
+            parts: Vec::new(),
+            callers: Vec::new(),
+            from_type: false,
+        }];
+        for part in parts {
+            if matches!(part, ValueAt::Lit(text) if text.is_empty()) {
+                continue;
+            }
+            let at = span_of(file, part);
+            let values: Vec<PiecedText> = self
+                .text_values(file, part)
+                .into_iter()
+                .map(|value| value.into_pieced(at.clone()))
+                .collect();
+            let mut next: Vec<PiecedText> = Vec::new();
+            let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
+            for head in &out {
+                for tail in &values {
+                    if !chains_agree(&head.callers, &tail.callers) {
+                        continue;
+                    }
+                    let callers = chains_joined(&head.callers, &tail.callers);
+                    count_chain(&mut counts, &callers);
+                    let mut joined_parts = head.parts.clone();
+                    joined_parts.extend(tail.parts.iter().cloned());
+                    let joined = PiecedText {
+                        parts: joined_parts,
+                        callers,
+                        from_type: head.from_type || tail.from_type,
+                    };
+                    if !next.contains(&joined) {
+                        next.push(joined);
+                    }
+                }
+            }
+            for (chain, count) in counts {
+                if count > MAX_VALUES {
+                    next.retain(|value| value.callers != chain);
+                    next.push(PiecedText::one(
+                        PartValue::Hole(guards::HoleReason::FanOutCap),
+                        None,
+                        chain,
+                    ));
+                }
+            }
+            out = next;
+        }
+        out.into_iter().map(TextValue::Pieced).collect()
     }
 
     fn text_in(&self, file: &Path, value: &ValueAt) -> Vec<TextValue> {
         use guards::HoleReason::*;
+        if self.callers_mode.get() == CallersRead::Pieces {
+            return self.pieces_in(file, value);
+        }
         let hole = |reason| vec![TextValue::hole(reason)];
         match value {
             ValueAt::Lit(text) => vec![TextValue::stated(text.clone(), Vec::new())],
@@ -303,11 +724,12 @@ impl<'a> Resolver<'a> {
     /// Read through callers (carrick#3504 B10-1b, P5), two values join only
     /// where their chains agree on every definition both fill, and the
     /// joined value carries the union: `pair(a, x)` and `pair(b, y)` state
-    /// `a:x` and `b:y`, never `a:y`. The cap counts the joinings that agree.
+    /// `a:x` and `b:y`, never `a:y`. The cap counts the joinings within one
+    /// chain (B10-2a2, Q6): a chain with more is one cap hole on that chain.
     /// A part that is only holes is one hole per reason and chain, so a
     /// consumer can place one lead per caller.
     fn joined(&self, file: &Path, parts: &[ValueAt]) -> Vec<TextValue> {
-        let through_callers = self.callers_mode.get();
+        let through_callers = self.callers_mode.get() != CallersRead::Off;
         let mut out = vec![TextValue::stated(String::new(), Vec::new())];
         for part in parts {
             let values = self.text_values(file, part);
@@ -327,25 +749,29 @@ impl<'a> Resolver<'a> {
                 }
                 return holes;
             }
-            let agreeing = out
-                .iter()
-                .map(|head| {
-                    values
-                        .iter()
-                        .filter(|tail| chains_agree(head.callers(), tail.callers()))
-                        .count()
-                })
-                .sum::<usize>();
-            if agreeing > MAX_VALUES {
-                return vec![TextValue::hole(guards::HoleReason::FanOutCap)];
+            if !through_callers {
+                let agreeing = out
+                    .iter()
+                    .map(|head| {
+                        values
+                            .iter()
+                            .filter(|tail| chains_agree(head.callers(), tail.callers()))
+                            .count()
+                    })
+                    .sum::<usize>();
+                if agreeing > MAX_VALUES {
+                    return vec![TextValue::hole(guards::HoleReason::FanOutCap)];
+                }
             }
             let mut next: Vec<TextValue> = Vec::new();
+            let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
             for head in &out {
                 for tail in &values {
                     if !chains_agree(head.callers(), tail.callers()) {
                         continue;
                     }
                     let callers = chains_joined(head.callers(), tail.callers());
+                    count_chain(&mut counts, &callers);
                     let joined = match (head, tail) {
                         (TextValue::Hole { reason, .. }, _)
                         | (_, TextValue::Hole { reason, .. }) => TextValue::Hole {
@@ -375,9 +801,28 @@ impl<'a> Resolver<'a> {
                                 callers,
                             }
                         }
+                        // Parts are joined by `pieces_joined`, never here:
+                        // a part read as a whole text is never pieced.
+                        (TextValue::Pieced(_), _) | (_, TextValue::Pieced(_)) => TextValue::Hole {
+                            reason: guards::HoleReason::UnreadExpression,
+                            callers,
+                        },
                     };
                     if !next.contains(&joined) {
                         next.push(joined);
+                    }
+                }
+            }
+            // Read through callers, the cap counts the joinings within one
+            // chain, never across chains (carrick#3504 B10-2a2, Q6).
+            if through_callers {
+                for (chain, count) in counts {
+                    if count > MAX_VALUES {
+                        next.retain(|value| value.callers() != chain.as_slice());
+                        next.push(TextValue::Hole {
+                            reason: guards::HoleReason::FanOutCap,
+                            callers: chain,
+                        });
                     }
                 }
             }
@@ -404,6 +849,12 @@ impl<'a> Resolver<'a> {
                 },
             ] if callers.is_empty() => Ok((text.clone(), read_from.clone())),
             [TextValue::Hole { reason, .. }] => Err(*reason),
+            // A name read as parts is refused (carrick#3504 B10-2a2, Q5):
+            // with its first hole's reason, as the whole reader answers it,
+            // else as a text a caller decides.
+            [TextValue::Pieced(pieced)] => Err(pieced
+                .first_hole()
+                .unwrap_or(guards::HoleReason::UnreadExpression)),
             _ => Err(guards::HoleReason::UnreadExpression),
         }
     }
@@ -466,10 +917,10 @@ impl<'a> Resolver<'a> {
         // Read through callers, a parameter is what its callers pass: asked
         // before the binding table, which holds a defaulted parameter as the
         // choice of its default (carrick#3504 B10-1b).
-        if self.callers_mode.get()
+        if self.callers_mode.get() != CallersRead::Off
             && let Some((at, param)) = self.declared_param(row)
         {
-            return self.param_texts(at, param, &[]);
+            return self.param_texts(at, param, &[], None);
         }
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(self.unread_declaration(row));
@@ -626,10 +1077,10 @@ impl<'a> Resolver<'a> {
         };
         // Read through callers, an entry of a parameter (`opts.topic`) is
         // what each caller passes at that key (carrick#3504 B10-1b).
-        if self.callers_mode.get()
+        if self.callers_mode.get() != CallersRead::Off
             && let Some((at, param)) = self.declared_param(row)
         {
-            let mut out = self.param_texts(at, param, std::slice::from_ref(&key));
+            let mut out = self.param_texts(at, param, std::slice::from_ref(&key), None);
             for entry in &mut out {
                 if let TextValue::Text {
                     read_from: from, ..
@@ -805,11 +1256,17 @@ impl<'a> Resolver<'a> {
     /// is written and tagged with that call; the default where the caller
     /// passes nothing there. A caller passing on a parameter being read
     /// unchanged adds nothing (soundness rule 7).
+    ///
+    /// Read as parts (carrick#3504 B10-2a2), `read` is the parameter read
+    /// and its keys: each part a caller passes goes through it. Values
+    /// across callers are never capped; [`MAX_VALUES`] counts within one
+    /// chain (Q6).
     fn param_texts(
         &self,
         at: (&'a Path, u32, String),
         param: &ParamAt,
         more: &[String],
+        read: Option<&(SpanAt, Vec<String>)>,
     ) -> Vec<TextValue> {
         use guards::HoleReason::*;
         let hole = |reason| vec![TextValue::hole(reason)];
@@ -869,14 +1326,24 @@ impl<'a> Resolver<'a> {
                 }
             };
             for value in values {
-                let value = value.read_at(&call);
+                let value = value.read_at(&call, read);
                 if !out.contains(&value) {
                     out.push(value);
                 }
             }
         }
-        if out.len() > MAX_VALUES {
-            return hole(FanOutCap);
+        let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
+        for value in &out {
+            count_chain(&mut counts, value.callers());
+        }
+        for (chain, count) in counts {
+            if count > MAX_VALUES {
+                out.retain(|value| value.callers() != chain.as_slice());
+                out.push(TextValue::Hole {
+                    reason: FanOutCap,
+                    callers: chain,
+                });
+            }
         }
         out
     }
@@ -1199,6 +1666,7 @@ mod tests {
                 .filter_map(|value| match value {
                     TextValue::Text { text, .. } => Some(text),
                     TextValue::Hole { .. } => None,
+                    TextValue::Pieced(pieced) => panic!("pieced outside its entry: {pieced:?}"),
                 })
                 .collect();
             texts.sort();
@@ -1384,6 +1852,7 @@ mod tests {
                     TextValue::Hole { reason, .. } => {
                         format!("hole:{}", Stop::from(*reason).as_str())
                     }
+                    TextValue::Pieced(pieced) => panic!("pieced outside its entry: {pieced:?}"),
                 };
                 let calls = value
                     .callers()
@@ -1658,6 +2127,276 @@ mod tests {
                 "{got:?}"
             );
             assert_ne!(got[0].callers(), got[1].callers(), "{got:?}");
+        }
+    }
+
+    // A name read through callers as pieces (carrick#3504 B10-2a2).
+    // Fixture `resolve-text`, `pieces.ts`; its README holds the key.
+
+    /// The file of the piece probes, and the term the one call of `callee`
+    /// in it hands its first argument as.
+    fn piece_arg(on: &Walked, callee: &str) -> (PathBuf, ValueAt) {
+        let path = on.path("services/web/src/pieces.ts");
+        let mut found: Vec<ValueAt> = super::super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}: {found:?}");
+        (path, found.remove(0))
+    }
+
+    /// Q6: values across callers are never capped, one per chain.
+    #[test]
+    fn seventeen_callers_give_seventeen_values() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, term) = piece_arg(&on, "p_wide");
+        let whole = resolver.texts_through_callers(&path, &term);
+        let mut texts: Vec<String> = whole
+            .iter()
+            .map(|value| match value {
+                TextValue::Text { text, callers, .. } if callers.len() == 1 => text.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        texts.sort();
+        let want: Vec<String> = (1..=17).map(|n| format!("w{n:02}")).collect();
+        assert_eq!(texts, want);
+        let mut pieced: Vec<String> = resolver
+            .pieces_through_callers(&path, &term)
+            .iter()
+            .map(|value| {
+                assert_eq!(value.callers.len(), 1, "{value:?}");
+                match described(&on, value).as_slice() {
+                    [(said, hops)] if hops.len() == 1 => said.clone(),
+                    other => panic!("{other:?}"),
+                }
+            })
+            .collect();
+        pieced.sort();
+        assert_eq!(pieced, want);
+    }
+
+    /// Each part of a pieced value: its text, or `hole:` and its word, and
+    /// the calls of the parameters it was passed through, innermost first.
+    fn described(on: &Walked, value: &PiecedText) -> Vec<(String, Vec<String>)> {
+        value
+            .parts
+            .iter()
+            .map(|part| {
+                let said = match &part.value {
+                    PartValue::Lit { text, .. } => text.clone(),
+                    PartValue::Hole(reason) => format!("hole:{}", Stop::from(*reason).as_str()),
+                };
+                let hops = part
+                    .through
+                    .iter()
+                    .map(|hop| call_named(on, &hop.call))
+                    .collect();
+                (said, hops)
+            })
+            .collect()
+    }
+
+    /// Q2, Q3: a template over a parameter keeps its literal part, and each
+    /// caller's term is a part passed through the parameter at that call: a
+    /// literal, or a hole at the caller's term.
+    #[test]
+    fn a_template_over_a_parameter_keeps_its_parts_and_each_caller_s_term() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, term) = piece_arg(&on, "p_url");
+        let mut got: Vec<Vec<(String, Vec<String>)>> = resolver
+            .pieces_through_callers(&path, &term)
+            .iter()
+            .map(|value| {
+                assert_eq!(value.callers.len(), 1, "{value:?}");
+                let [_, part] = value.parts.as_slice() else {
+                    panic!("{value:?}");
+                };
+                assert_eq!(part.through[0].call, value.callers[0], "{value:?}");
+                if matches!(part.value, PartValue::Hole(_)) {
+                    // The hole is at the caller's term, in the caller's file.
+                    let at = part.at.as_ref().expect("a hole at the caller's term");
+                    assert_eq!(at.file, part.through[0].call.file);
+                    assert!(
+                        at.lo >= part.through[0].call.lo && at.hi <= part.through[0].call.hi,
+                        "{value:?}"
+                    );
+                }
+                described(&on, value)
+            })
+            .collect();
+        got.sort();
+        let part = |said: &str, hops: &[&str]| {
+            (
+                said.to_string(),
+                hops.iter().map(|hop| hop.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            got,
+            [
+                vec![part("/users/", &[]), part("42", &["user(\"42\")"]),],
+                vec![
+                    part("/users/", &[]),
+                    part("hole:unread_expression", &["user(_)"]),
+                ],
+            ]
+        );
+    }
+
+    /// Q3: a term not split by its own template, a local or a parameter is
+    /// one part: a choice is one hole at its span, an imported constant one
+    /// literal at its read, never its initialiser's parts.
+    #[test]
+    fn a_term_not_split_by_its_own_template_is_one_part() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let one = |callee: &str| -> (PathBuf, ValueAt, PiecedText) {
+            let (path, term) = piece_arg(&on, callee);
+            let mut got = resolver.pieces_through_callers(&path, &term);
+            assert_eq!(got.len(), 1, "{callee}: {got:?}");
+            (path, term, got.remove(0))
+        };
+        let (path, term, env) = one("p_env");
+        let ValueAt::Concat(terms) = &term else {
+            panic!("{term:?}");
+        };
+        let choice = terms
+            .iter()
+            .find(|term| matches!(term, ValueAt::Alt { .. }))
+            .expect("the choice");
+        assert_eq!(
+            described(&on, &env),
+            [
+                ("hole:unread_expression".to_string(), Vec::new()),
+                ("/items".to_string(), Vec::new()),
+            ]
+        );
+        assert_eq!(env.parts[0].at, span_of(&path, choice));
+        assert!(env.parts[0].at.is_some());
+
+        let (path, term, base) = one("p_base");
+        let ValueAt::Concat(terms) = &term else {
+            panic!("{term:?}");
+        };
+        let read = terms
+            .iter()
+            .find(|term| matches!(term, ValueAt::Read { .. }))
+            .expect("the base's read");
+        assert_eq!(
+            described(&on, &base),
+            [
+                ("https://api.example.test".to_string(), Vec::new()),
+                ("/things".to_string(), Vec::new()),
+            ]
+        );
+        assert_eq!(base.parts[0].at, span_of(&path, read));
+        assert!(base.parts[0].at.is_some());
+    }
+
+    /// Q3: in pieces mode a parameter is read before the one literal its
+    /// type may be, so the part is passed through it; read whole, it is the
+    /// type's literal, through no call.
+    #[test]
+    fn a_parameter_typed_as_one_literal_is_read_as_a_parameter() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, term) = piece_arg(&on, "p_typed");
+        let got: Vec<Vec<(String, Vec<String>)>> = resolver
+            .pieces_through_callers(&path, &term)
+            .iter()
+            .map(|value| described(&on, value))
+            .collect();
+        assert_eq!(
+            got,
+            [vec![(
+                "jobs.run".to_string(),
+                vec!["typed(\"jobs.run\")".to_string()]
+            )]]
+        );
+        assert_eq!(
+            flat(&on, &resolver.texts_through_callers(&path, &term)),
+            [("jobs.run".to_string(), Vec::new())]
+        );
+    }
+
+    /// Q5: a pieced value is refused by `one_text` with its first hole's
+    /// word, and with `unread_expression` where its parts are all literals a
+    /// caller decides; a part of one text never takes a caller's text.
+    #[test]
+    fn a_pieced_value_is_refused_with_its_first_hole_s_word() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let in_pieces = |path: &Path, term: &ValueAt| {
+            let _mode = CallersMode::set(&resolver.callers_mode, CallersRead::Pieces);
+            resolver.one_text(path, term)
+        };
+        let (path, uncalled) = probe_arg(&on, "p_uncalled");
+        assert_eq!(
+            in_pieces(&path, &uncalled),
+            Err(guards::HoleReason::NameNeverBound)
+        );
+        let (path, one) = probe_arg(&on, "p_one");
+        assert_eq!(
+            in_pieces(&path, &one),
+            Err(guards::HoleReason::UnreadExpression)
+        );
+        for callee in ["p_joined", "p_lookup"] {
+            let (path, term) = probe_arg(&on, callee);
+            let got: Vec<Vec<(String, Vec<String>)>> = resolver
+                .pieces_through_callers(&path, &term)
+                .iter()
+                .map(|value| described(&on, value))
+                .collect();
+            assert_eq!(
+                got,
+                [vec![("hole:unread_expression".to_string(), Vec::new())]],
+                "{callee}"
+            );
+        }
+    }
+
+    /// The B10-2a1 caveat: a local splits into its initialiser's parts only
+    /// where the request summaries read it as those parts. Read at the
+    /// labelled call's own function, every probe spells what the summaries
+    /// read at the call's argument.
+    #[test]
+    fn a_local_splits_only_where_the_summaries_read_it_as_its_initialiser() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for (callee, parts) in [("p_local", 2), ("p_target", 1), ("p_renamed", 1)] {
+            let (path, term) = piece_arg(&on, callee);
+            let ValueAt::Read { lo, hi, .. } = term else {
+                panic!("{callee}: {term:?}");
+            };
+            let summaries = on.inputs.files[&path]
+                .arg_pieces
+                .get(&(lo, hi))
+                .cloned()
+                .unwrap_or_else(|| panic!("{callee}: no pieces at the argument"));
+            let got = resolver.pieces_through_callers(&path, &term);
+            assert_eq!(got.len(), 1, "{callee}: {got:?}");
+            assert_eq!(got[0].parts.len(), parts, "{callee}: {got:?}");
+            assert_eq!(
+                super::super::super::decided_sites::rendered(&resolver, &got[0], 0),
+                summaries,
+                "{callee}: {got:?}"
+            );
         }
     }
 }

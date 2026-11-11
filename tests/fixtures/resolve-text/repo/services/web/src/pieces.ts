@@ -46,3 +46,57 @@ itemsApi.label = "items";
 
 user("42");
 itemsApi.replace("7");
+
+// Read through callers as pieces (carrick#3504 B10-2a2).
+declare const req: { params: { id: string } };
+declare function p_wide(name: string): void;
+declare function p_typed(kind: string): void;
+declare function p_target(path: string): void;
+declare function p_renamed(path: string): void;
+
+// A second caller of `user`, passing a value read at runtime.
+user(req.params.id);
+
+// A parameter the compiler types as one literal.
+export function typed(kind: "jobs.run"): void {
+  p_typed(kind);
+}
+
+typed("jobs.run");
+
+// A local of an environment base and a parameter, with no text of its
+// own: the summaries read the local by its name, not as its initialiser.
+export function target(id: string): void {
+  const t = process.env.API_URL + id;
+  p_target(t);
+}
+
+// A local holding one key of a parameter: the summaries read it by the
+// local's name.
+export function renamed(opts: { url: string }): void {
+  const u = opts.url;
+  p_renamed(u);
+}
+
+// A wrapper with seventeen callers, each passing its own literal.
+export function wide(name: string): void {
+  p_wide(name);
+}
+
+wide("w01");
+wide("w02");
+wide("w03");
+wide("w04");
+wide("w05");
+wide("w06");
+wide("w07");
+wide("w08");
+wide("w09");
+wide("w10");
+wide("w11");
+wide("w12");
+wide("w13");
+wide("w14");
+wide("w15");
+wide("w16");
+wide("w17");

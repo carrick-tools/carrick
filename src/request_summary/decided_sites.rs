@@ -55,7 +55,7 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use super::resolve::{Resolver, TextValue};
+use super::resolve::{Hop, PartValue, PiecedText, Resolver, SpanAt, TextPart, TextValue};
 use super::row_calls::Reach;
 use super::stop::Stop;
 use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
@@ -980,6 +980,10 @@ pub struct Decided {
     /// to send, where nothing in the service calls the function
     /// (carrick#3470, [`super::descriptors`]).
     pub descriptors: Vec<super::descriptors::Descriptor>,
+    /// How the resolver's pieces read of each labelled call's name slot
+    /// compares with the site path's own (carrick#3504 B10-2a2): log-only,
+    /// nothing reads it.
+    pub dry_run_names: crate::name_census::DryRunNames,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -1600,6 +1604,133 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
         }
         _ => vec![Piece::Unknown],
     }
+}
+
+/// The pieces the request summaries read one part of a name as, where the
+/// body `level` functions out from the labelled call's own reads it
+/// (carrick#3504 B10-2a2, Q4): the parameter read the part went through at
+/// that level, down its keys as [`keyed`] reads one, where it went through
+/// more than `level` parameters; else what the summaries read at the term
+/// it was read at ([`super::FileIr::arg_pieces`]); else its text; else
+/// nothing they read.
+fn part_pieces(resolver: &Resolver<'_>, part: &TextPart, level: usize) -> Vec<Piece> {
+    let at = |span: &SpanAt| {
+        resolver
+            .inputs_for(&span.file)
+            .files
+            .get(&span.file)
+            .and_then(|ir| ir.arg_pieces.get(&(span.lo, span.hi)))
+            .cloned()
+    };
+    if let Some(hop) = part.through.get(level) {
+        let mut pieces = at(&hop.read).unwrap_or_else(|| vec![Piece::Unknown]);
+        for key in &hop.keys {
+            pieces = keyed(&pieces, key).map_or_else(|| vec![Piece::Unknown], |piece| vec![piece]);
+        }
+        return pieces;
+    }
+    if let Some(pieces) = part.at.as_ref().and_then(at) {
+        return pieces;
+    }
+    match &part.value {
+        PartValue::Lit { text, .. } => vec![Piece::Lit(text.clone())],
+        PartValue::Hole(_) => vec![Piece::Unknown],
+    }
+}
+
+/// A name the resolver read as parts through callers
+/// ([`Resolver::pieces_through_callers`]), spelled as the request summaries
+/// spell it where the body `level` functions out from the labelled call's
+/// own reads it (carrick#3504 B10-2a2, Q4; level 0 is the labelled call's
+/// own function). Parts passed through one parameter read at that level are
+/// that read, once.
+pub(super) fn rendered(resolver: &Resolver<'_>, value: &PiecedText, level: usize) -> Vec<Piece> {
+    let mut out: Vec<Vec<Piece>> = Vec::new();
+    let mut last: Option<&Hop> = None;
+    for part in &value.parts {
+        let hop = part.through.get(level);
+        if hop.is_some() && hop == last {
+            continue;
+        }
+        last = hop;
+        out.push(part_pieces(resolver, part, level));
+    }
+    concat(out)
+}
+
+/// Whether `pieces` read a parameter of the function they are read in.
+fn reads_param(pieces: &[Piece]) -> bool {
+    pieces.iter().any(|piece| {
+        matches!(
+            piece,
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..)
+        )
+    })
+}
+
+/// The resolver's pieces read of the labelled call's name slot, beside the
+/// site path's own (`today`), counted (carrick#3504 B10-2a2, the dry run):
+/// whether it spells the name at the labelled call's own function as the
+/// site path does, whether a value would fall back to today's walk there (a
+/// part through no parameter that still reads one: the resolver stopped
+/// at a parameter, or a builder is handed one), and whether a chain was
+/// capped. Nothing reads the result.
+fn dry_run_name(
+    resolver: &Resolver<'_>,
+    file: &Path,
+    call: &CallIr,
+    slot: &ArgSlot,
+    today: &[Piece],
+    out: &mut crate::name_census::DryRunNames,
+) {
+    let written = call.arg_texts.get(slot.arg).cloned().flatten();
+    let term = match (&slot.key, written) {
+        (_, None) => None,
+        (None, Some(term)) => Some(term),
+        (Some(key), Some(term)) => super::resolve::handed(&term, std::slice::from_ref(key)),
+    };
+    let values = term.map_or_else(Vec::new, |term| {
+        resolver.pieces_through_callers(file, &term)
+    });
+    let mut renders: Vec<Vec<Piece>> = Vec::new();
+    for value in &values {
+        let render = rendered(resolver, value, 0);
+        if !renders.contains(&render) {
+            renders.push(render);
+        }
+    }
+    // No term (a spread, a key the object omits) is nothing read, as the
+    // site path reads it.
+    if renders.is_empty() {
+        renders.push(vec![Piece::Unknown]);
+    }
+    let same = renders.iter().all(|render| render.as_slice() == today);
+    let fallback = values.iter().find_map(|value| {
+        value.parts.iter().find_map(|part| {
+            (part.through.is_empty() && reads_param(&part_pieces(resolver, part, 0))).then(|| {
+                match &part.value {
+                    PartValue::Hole(reason) => Stop::from(*reason).as_str(),
+                    PartValue::Lit { .. } => "stated",
+                }
+            })
+        })
+    });
+    let capped = values.iter().any(|value| {
+        value
+            .parts
+            .iter()
+            .any(|part| part.value == PartValue::Hole(super::HoleReason::FanOutCap))
+    });
+    if !same {
+        tracing::debug!(
+            file = %file.display(),
+            call = call.site.lo,
+            today = ?today,
+            pieces = ?renders,
+            "site-path names (dry run): differs"
+        );
+    }
+    out.note(same, fallback, capped);
 }
 
 /// Where the payload `slot` names at the labelled call (the last of `down`)
@@ -3016,6 +3147,9 @@ fn decide(
         .iter()
         .map(|site| bound_calls(&calls, root, site))
         .collect();
+    // The dry run's own resolver (carrick#3504 B10-2a2): its queries leave
+    // the walk's resolver as it was.
+    let dry_run = Resolver::new(inputs, &calls.siblings);
     let mut walk = Walk {
         calls: &calls,
         inputs,
@@ -3157,6 +3291,14 @@ fn decide(
             continue;
         }
         let at_end = slot_value(last.call, slot);
+        dry_run_name(
+            &dry_run,
+            last.file,
+            last.call,
+            slot,
+            &at_end,
+            &mut walk.out.dry_run_names,
+        );
         if last_is_own && walk.settles(&last, &at_end, end) {
             walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
             through_to_last(&mut walk);
@@ -3586,7 +3728,9 @@ fn agreed_text(values: &[TextValue]) -> MadeBase {
             TextValue::Text { text, callers, .. } if callers.is_empty() => {
                 texts.insert(text);
             }
-            TextValue::Text { .. } | TextValue::Hole { .. } => return MadeBase::Unstated,
+            TextValue::Text { .. } | TextValue::Hole { .. } | TextValue::Pieced(_) => {
+                return MadeBase::Unstated;
+            }
         }
     }
     let mut texts = texts.into_iter();

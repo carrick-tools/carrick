@@ -585,6 +585,17 @@ fn whole_of(set: Vec<TextValue>, hole: &Cell<Option<Stop>>) -> Option<Whole> {
                 note_hole(hole, Stop::from(reason));
                 return None;
             }
+            // A name read as parts is no whole text (carrick#3504 B10-2a2,
+            // Q5): its first hole's reason, else a text a caller decides.
+            TextValue::Pieced(pieced) => {
+                note_hole(
+                    hole,
+                    pieced
+                        .first_hole()
+                        .map_or(Stop::UnreadExpression, Stop::from),
+                );
+                return None;
+            }
         }
     }
     (!values.is_empty()).then_some(Whole { values, from_type })
