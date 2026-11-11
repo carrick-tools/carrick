@@ -138,6 +138,10 @@ pub struct Degraded {
     /// one (`check --recheck --no-rescan`): the edit needs a re-scan, and the
     /// caller will make it later, under its own budget.
     pub deferred: bool,
+    /// The re-scan or re-join ran past the budget and was stopped there
+    /// (carrick#3860): the answer is the indexed one because time ran out,
+    /// not because nothing needed reading.
+    pub deadline: bool,
     /// Which services were to be re-read, once that was decided.
     pub scope: Option<RecheckScope>,
 }
@@ -286,6 +290,7 @@ pub fn run(
                 elapsed: started.elapsed(),
                 known_miss: false,
                 deferred: false,
+                deadline: false,
                 scope: None,
             }));
         }
@@ -307,6 +312,7 @@ pub fn run(
             elapsed: started.elapsed(),
             known_miss: true,
             deferred: false,
+            deadline: false,
             scope: None,
         }));
     }
@@ -317,6 +323,7 @@ pub fn run(
             elapsed: started.elapsed(),
             known_miss: false,
             deferred: true,
+            deadline: false,
             scope: None,
         }));
     }
@@ -355,7 +362,8 @@ pub fn run(
             // re-read beside it is tried again on its own next edit, where a
             // miss is its own. A lost record costs one more re-check; a wrong
             // one switches a service off for the whole index.
-            if Instant::now() >= deadline {
+            let missed = Instant::now() >= deadline;
+            if missed {
                 ServiceMisses::record(
                     &misses,
                     index_generation,
@@ -368,6 +376,7 @@ pub fn run(
                 elapsed: started.elapsed(),
                 known_miss: false,
                 deferred: false,
+                deadline: missed,
                 scope: Some(plan.scope.clone()),
             }))
         }

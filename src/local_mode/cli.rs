@@ -1928,21 +1928,26 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
                 crate::out!("{}", output.render());
             }
             // A re-check that could not read the library store (no sign-in, or
-            // not reachable) covered nothing, as `check --changed` does (carrick#3249).
-            let signed_out = matches!(mode, Mode::Check)
+            // not reachable) covered nothing, as `check --changed` does
+            // (carrick#3249). Nor did one that ran out of time, now or on an
+            // earlier edit against this index: its rows are from before the
+            // edit, so a clean exit would read as a check (carrick#3860).
+            let not_covered = matches!(mode, Mode::Check)
                 && output.recheck.as_ref().is_some_and(|recheck| {
-                    matches!(
-                        recheck.reason.as_deref(),
-                        Some(
-                            super::recheck::LIBRARY_NOT_SIGNED_IN
-                                | super::recheck::LIBRARY_UNREACHABLE
+                    recheck.not_checked()
+                        || matches!(
+                            recheck.reason.as_deref(),
+                            Some(
+                                super::recheck::LIBRARY_NOT_SIGNED_IN
+                                    | super::recheck::LIBRARY_UNREACHABLE
+                            )
                         )
-                    ) || recheck
-                        .reason
-                        .as_deref()
-                        .is_some_and(super::query::is_answers_unavailable)
+                        || recheck
+                            .reason
+                            .as_deref()
+                            .is_some_and(super::query::is_answers_unavailable)
                 });
-            if signed_out {
+            if not_covered {
                 super::changed::EXIT_NOTHING_COVERED
             } else {
                 0
@@ -2104,10 +2109,11 @@ USAGE:
                the code uses go on the wire, no source code, and the store
                builds nothing for the ask. It has ten seconds
                (CARRICK_RECHECK_BUDGET_MS); past that the answer is the indexed
-               one and says so. A repo whose re-check missed its budget is
-               remembered against that index (.carrick/recheck-misses.json):
-               later re-checks there answer at once from the index until the
-               next `carrick refresh`.
+               one, says "not checked" and exits 2. A repo whose re-check missed
+               its budget is remembered against that index
+               (.carrick/recheck-misses.json): later re-checks there answer at
+               once from the index, the same way, until the next `carrick
+               refresh`.
                --no-rescan (with --recheck) never starts that re-scan: a file
                that needs none is answered as usual, and one that does comes
                back with `recheck.deferred` true and the indexed rows.
