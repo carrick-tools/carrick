@@ -13687,7 +13687,11 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         use super::super::pair_settle::JoinMiss;
         let (c8, outcome) = join_c8();
         let miss = |blobs: &[CloudRepoData]| join_from(blobs).join_settled(&c8).err();
-        assert_eq!(miss(&main_blobs(&[outcome.clone()])), None, "the control");
+        assert_eq!(
+            miss(&main_blobs(std::slice::from_ref(&outcome))),
+            None,
+            "the control"
+        );
 
         let mut moved = outcome.clone();
         moved.spec_hash = "another".to_string();
@@ -13699,7 +13703,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         };
         assert_eq!(miss(&main_blobs(&[unjudged])), Some(JoinMiss::NotJudged));
 
-        let mut other_build = main_blobs(&[outcome.clone()]);
+        let mut other_build = main_blobs(std::slice::from_ref(&outcome));
         other_build[1].pair_outcomes.as_mut().unwrap().scanner_build =
             Some(crate::cloud_storage::ScannerBuild {
                 commit: "another".to_string(),
@@ -13707,23 +13711,23 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             });
         assert_eq!(miss(&other_build), Some(JoinMiss::OtherBuild));
 
-        let mut other_commit = main_blobs(&[outcome.clone()]);
+        let mut other_commit = main_blobs(std::slice::from_ref(&outcome));
         other_commit[1].commit_hash = "newer".to_string();
         assert_eq!(miss(&other_commit), Some(JoinMiss::Unreadable));
 
-        let mut twice = main_blobs(&[outcome.clone()]);
+        let mut twice = main_blobs(std::slice::from_ref(&outcome));
         let record = twice[1].pair_outcomes.as_mut().unwrap();
         record.outcomes.push(record.outcomes[0].clone());
         assert_eq!(miss(&twice), Some(JoinMiss::Unreadable));
 
-        let mut old_format = main_blobs(&[outcome.clone()]);
+        let mut old_format = main_blobs(std::slice::from_ref(&outcome));
         old_format[1].pair_outcomes.as_mut().unwrap().version = 0;
         assert_eq!(miss(&old_format), Some(JoinMiss::Unreadable));
 
-        let blobs = main_blobs(&[outcome.clone()]);
+        let blobs = main_blobs(std::slice::from_ref(&outcome));
         assert_eq!(miss(&blobs[1..]), Some(JoinMiss::NoProducer));
 
-        let mut doubled = main_blobs(&[outcome.clone()]);
+        let mut doubled = main_blobs(std::slice::from_ref(&outcome));
         doubled.push(doubled[1].clone());
         assert_eq!(
             miss(&doubled),
@@ -13753,17 +13757,17 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         }
         crate::cloud_storage::attach_pair_outcomes(
             &mut analysed,
-            &[outcome.clone()],
+            std::slice::from_ref(&outcome),
             "head",
             build.as_ref(),
         );
         assert!(settles(&analysed), "analysed");
 
         // Carried and rewritten: the stored blob restamped at head, dirty.
-        let mut rewritten = main_blobs(&[outcome.clone()]);
+        let mut rewritten = main_blobs(std::slice::from_ref(&outcome));
         crate::cloud_storage::attach_pair_outcomes(
             &mut rewritten,
-            &[outcome.clone()],
+            std::slice::from_ref(&outcome),
             "head",
             build.as_ref(),
         );
@@ -13772,7 +13776,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
 
         // Carried and not rewritten: the index's blob and record as stored,
         // at an older commit than the producer's.
-        let mut kept = main_blobs(&[outcome.clone()]);
+        let mut kept = main_blobs(std::slice::from_ref(&outcome));
         kept[0].commit_hash = "head".to_string();
         kept[0].dirty = Some(true);
         assert!(settles(&kept), "carried, not rewritten, same build");
