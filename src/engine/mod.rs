@@ -8608,6 +8608,17 @@ struct LibrarySiteIndex {
     /// namespaced row's entry could be judged in a pair the matcher never
     /// makes; those rows get none.
     global_pubsub: Vec<(PathBuf, u32, String, crate::operation::PubsubRole)>,
+    /// The socket rows whose name is global with no namespace, sorted by
+    /// file, line and name, with direction and side: the rows a socket
+    /// type-manifest entry anchors whether or not the socket pass read the
+    /// site (carrick#3255). Scoped like [`Self::global_pubsub`].
+    global_socket: Vec<(
+        PathBuf,
+        u32,
+        String,
+        crate::operation::SocketDirection,
+        bool,
+    )>,
 }
 
 impl LibrarySiteIndex {
@@ -8643,6 +8654,18 @@ impl LibrarySiteIndex {
                     direction,
                     listener,
                 } => {
+                    if row.name_scope.as_ref().is_some_and(|scope| {
+                        scope.scope == crate::services::type_sidecar::NameScopeKind::Global
+                            && scope.namespace.is_none()
+                    }) {
+                        index.global_socket.push((
+                            file.clone(),
+                            row.line,
+                            row.name.clone(),
+                            direction,
+                            listener,
+                        ));
+                    }
                     index
                         .socket
                         .insert((file, row.line, row.name.clone(), direction, listener));
@@ -8667,6 +8690,10 @@ impl LibrarySiteIndex {
                 ))
         });
         index.global_pubsub.dedup();
+        index
+            .global_socket
+            .sort_by(|a, b| (&a.0, a.1, &a.2, a.4).cmp(&(&b.0, b.1, &b.2, b.4)));
+        index.global_socket.dedup();
         index
     }
 
@@ -9703,6 +9730,34 @@ fn append_protocol_manifest_entries(
             op.line,
             op.payload_type_symbol.clone(),
             // Same deferred fan-in caveat as the graphql consumer above (#291).
+            None,
+        );
+    }
+    // The library socket rows (carrick#3255): a stated global row the pass
+    // did not read gets the entry the pass's op would have had, keyed
+    // `OperationKey::socket(name, direction)` with no site id, as the pass's
+    // are. Where the pass wrote that alias, its entry (and symbol anchor)
+    // stands and no second one is written. The fact layer's slot types it.
+    for (file, line, name, direction, listener) in &library.global_socket {
+        let key = OperationKey::socket(name.clone(), *direction);
+        let role = if *listener {
+            ManifestRole::Producer
+        } else {
+            ManifestRole::Consumer
+        };
+        if entries
+            .iter()
+            .any(|entry| entry.key == key && entry.role == role)
+        {
+            continue;
+        }
+        add_protocol_manifest_entry(
+            entries,
+            &key,
+            role,
+            &file.to_string_lossy(),
+            (*line).max(1),
+            None,
             None,
         );
     }
@@ -30750,6 +30805,117 @@ io.on("bare:in", (event) => {});
         );
         assert_eq!(manifest_alias, expected);
         assert_eq!(request.alias.as_deref(), Some(expected.as_str()));
+    }
+
+    /// carrick#3255: a global library socket row the socket pass did not read
+    /// (a made-up `@fixture/realtime` whose members are `listen` and `send`)
+    /// gets one entry, a listener's a producer and a send's a consumer, both
+    /// without a site id; where the pass wrote that alias its entry stands
+    /// and no second one is written; a service-scoped row gets none.
+    #[test]
+    fn a_global_library_socket_row_gets_one_manifest_entry() {
+        use crate::library_claims::LibraryRowKind;
+        use crate::operation::SocketDirection;
+
+        let global =
+            |line: u32, name: &str, direction, listener| crate::library_claims::LibraryRow {
+                name_scope: Some(crate::services::type_sidecar::NameScope {
+                    scope: crate::services::type_sidecar::NameScopeKind::Global,
+                    namespace: None,
+                }),
+                ..library_row(
+                    "/repo/src/live.ts",
+                    line,
+                    name,
+                    LibraryRowKind::Socket {
+                        direction,
+                        listener,
+                    },
+                )
+            };
+        let library = LibrarySiteIndex::of(
+            &crate::library_claims::LibraryRows {
+                rows: vec![
+                    global(4, "live:tick", SocketDirection::ClientToServer, true),
+                    global(9, "live:push", SocketDirection::ServerToClient, false),
+                    // The pass read this one: its entry stays, none is added.
+                    global(14, "live:read", SocketDirection::ClientToServer, true),
+                    library_row(
+                        "/repo/src/live.ts",
+                        20,
+                        "live:scoped",
+                        LibraryRowKind::Socket {
+                            direction: SocketDirection::ClientToServer,
+                            listener: true,
+                        },
+                    ),
+                ],
+                ..Default::default()
+            },
+            "/repo",
+        );
+        let mut read = socket_op(
+            "live:read",
+            SocketDirection::ClientToServer,
+            Some("Tick"),
+            Some("./types"),
+        );
+        read.line = 14;
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql: crate::graphql::GraphqlExtraction::default(),
+            sockets: crate::socket_io::SocketExtraction {
+                listeners: vec![read],
+                emitters: vec![],
+            },
+            library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
+        };
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions, &library);
+        let found: Vec<(String, ManifestRole, u32, Option<&str>)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.canonical(),
+                    entry.role,
+                    entry.line_number,
+                    entry.primary_type_symbol.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "socket|CLIENT->SERVER|live:read".to_string(),
+                    ManifestRole::Producer,
+                    14,
+                    Some("Tick")
+                ),
+                (
+                    "socket|CLIENT->SERVER|live:tick".to_string(),
+                    ManifestRole::Producer,
+                    4,
+                    None
+                ),
+                (
+                    "socket|SERVER->CLIENT|live:push".to_string(),
+                    ManifestRole::Consumer,
+                    9,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(
+            entries[2].type_alias,
+            crate::type_manifest::build_manifest_type_alias(
+                &OperationKey::socket("live:push", SocketDirection::ServerToClient),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            )
+        );
     }
 
     /// A library pub/sub row at `file:line` whose name is global, in
