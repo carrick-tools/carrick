@@ -25,14 +25,6 @@ declare module "graphql-request" {
   }
 }
 
-declare module "socket.io-client" {
-  export interface ClientSocket {
-    emit(event: string, payload: unknown): void;
-    on(event: string, handler: (payload: unknown) => void): void;
-  }
-  export function io(url?: string): ClientSocket;
-}
-
 declare module "msw" {
   export interface HttpHandler {
     readonly __mswHandler: true;

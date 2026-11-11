@@ -16,12 +16,3 @@ declare module "graphql-request" {
     request<T = unknown>(document: unknown, variables?: unknown): Promise<T>;
   }
 }
-
-// socket.io-client: `io(url)` returns a client socket used by lib/realtime.ts.
-declare module "socket.io-client" {
-  export interface Socket {
-    on(event: string, handler: (...args: unknown[]) => void): void;
-    emit(event: string, ...args: unknown[]): void;
-  }
-  export function io(url?: string): Socket;
-}

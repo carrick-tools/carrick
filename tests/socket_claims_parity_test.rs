@@ -13,10 +13,11 @@
 //! `socket_type_alias_test.rs`, `socket_namespace_test.rs`), so the old test
 //! and its twin say the same thing today and the twin is the regression test
 //! once the old rules go. The two cross-service corpora keep their sources and
-//! `expected.json` byte-identical: the test copies their socket repos, adds the
-//! stub lockfiles and the library-claims cassette from
-//! `tests/fixtures/socket-claims-xrepo/`, and asserts `expected.json`'s
-//! `socket_events`.
+//! `expected.json` unchanged: the corpora are install-shaped (a stub socket
+//! package under `node_modules`, a lockfile entry, no ambient `declare module`
+//! for the package); the test copies their socket repos, adds the
+//! library-claims cassette from `tests/fixtures/socket-claims-xrepo/`, and
+//! asserts every `expected.json` `socket_events` row is a fact-layer row.
 //!
 //! Drives the real scanner binary on `.`, offline, over a committed copy of
 //! each fixture, with the fixture's cassettes.
@@ -203,7 +204,10 @@ fn scan_fixture(name: &str) -> Scan {
 }
 
 /// A cross-service corpus repo: the corpus's copy of `<corpus>/<repo>`, with
-/// the overlay's files (lockfile, cassettes) added, scanned as its own repo.
+/// the overlay's cassettes added, scanned as its own repo. The corpus is an
+/// installed checkout (a stub package under `node_modules`, a lockfile entry,
+/// no ambient `declare module` for the socket package); the overlay adds only
+/// the store's answers, which a scan reads from outside the repo's sources.
 fn scan_corpus_repo(corpus: &str, repo_name: &str) -> Vec<Row> {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join(repo_name);
@@ -447,6 +451,15 @@ fn assert_corpus_socket_events(corpus: &str, repos: [&str; 2]) {
         assert!(
             has(&rows, side, key, source),
             "{side} {key} in {source}: {rows:#?}"
+        );
+        // Stated by the fact layer itself: an ambient `declare module` for the
+        // socket package would leave it to the old socket rules.
+        assert!(
+            rows.iter().any(|row| row.side == *side
+                && row.key == *key
+                && row.file.ends_with(source.as_str())
+                && row.source.as_deref() == Some("library_claim")),
+            "{side} {key} in {source} is a fact-layer row: {rows:#?}"
         );
     }
     let keys: BTreeSet<&String> = expected.iter().map(|(_, key, _)| key).collect();

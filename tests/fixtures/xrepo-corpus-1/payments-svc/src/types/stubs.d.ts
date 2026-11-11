@@ -54,20 +54,6 @@ declare module "@aws-sdk/client-dynamodb" {
   }
 }
 
-// Socket.IO server stub — referenced by realtime/server.ts (WebSocket producer).
-declare module "socket.io" {
-  export interface Socket {
-    id: string;
-    on(event: string, handler: (...args: unknown[]) => void): void;
-    emit(event: string, ...args: unknown[]): void;
-  }
-  export class Server {
-    constructor(httpServer?: unknown);
-    on(event: "connection", handler: (socket: Socket) => void): void;
-    emit(event: string, ...args: unknown[]): void;
-  }
-}
-
 declare module "http" {
   export interface HttpServer {
     listen(port: number, callback?: () => void): void;
