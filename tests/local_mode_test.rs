@@ -3954,10 +3954,12 @@ fn check_changed_does_not_name_untouched_socket_emits_for_an_unrelated_new_file(
 
     let (code, text) = check_changed(root, false);
     assert!(
-        !text.contains("payment:settled")
-            && !text.contains("realtime")
-            && !text.contains("no route"),
+        !text.contains("payment:settled") && !text.contains("realtime"),
         "the untouched emits are not named:\n{text}"
+    );
+    assert!(
+        text.contains(": 0 incompatible, 0 reach no route"),
+        "and nothing is left with no route:\n{text}"
     );
     assert_eq!(code, Some(0), "{text}");
 }
