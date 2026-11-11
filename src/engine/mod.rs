@@ -26475,6 +26475,7 @@ unfollowed_member_calls_total: 0,
             event: event.to_string(),
             file_path: PathBuf::from("src/bus.ts"),
             line: 4,
+            member_start: 0,
         };
         let extractions = ProtocolExtractions {
             graphql: crate::graphql::GraphqlExtraction {
@@ -27821,6 +27822,7 @@ unfollowed_member_calls_total: 0,
             event: "ready".to_string(),
             file_path: PathBuf::from("svc/src/events.ts"),
             line,
+            member_start: 0,
         };
         let extractions = ProtocolExtractions {
             event_bus: crate::event_emitter::BusExtraction {
@@ -29346,6 +29348,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             event: event.to_string(),
             file_path: PathBuf::from(file),
             line: 4,
+            member_start: 0,
         };
         let extractions = ProtocolExtractions {
             graphql: crate::graphql::GraphqlExtraction {
@@ -31515,6 +31518,7 @@ io.on("bare:in", (event) => {});
             event: event.to_string(),
             file_path: PathBuf::from(file),
             line,
+            member_start: 0,
         };
         let extractions = ProtocolExtractions {
             event_bus: crate::event_emitter::BusExtraction {
@@ -31651,6 +31655,7 @@ io.on("bare:in", (event) => {});
                     event: "workerNotification".to_string(),
                     file_path: discovered(emit_file),
                     line: 389,
+                    member_start: 0,
                 }],
             },
             sockets: crate::socket_io::SocketExtraction {

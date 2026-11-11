@@ -211,3 +211,33 @@ fn a_model_pubsub_twin_folds_onto_a_socket_site_row() {
         "the model's pub/sub twin folded: {rows:#?}"
     );
 }
+
+/// A socket emit written across three lines is one call: the socket row
+/// stands and the event pass's publisher for the same call gives way, though
+/// its line (the member's) is not the call's first line.
+#[test]
+fn a_socket_emit_chained_across_lines_is_not_also_a_pubsub_row() {
+    let rows = scanned();
+    assert!(
+        rows.iter()
+            .any(|row| row.key == "socket|client_to_server|chat.multi"
+                && row.file_path.starts_with("src/broadcast.ts")),
+        "the chained emit is a socket call: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.key == "pubsub|chat.multi"),
+        "no pub/sub row for the chained socket call: {rows:#?}"
+    );
+}
+
+/// The same chain on a receiver no claim labels is a real publish and keeps
+/// its pub/sub row.
+#[test]
+fn a_pubsub_publish_chained_across_lines_keeps_its_row() {
+    let rows = scanned();
+    assert!(
+        rows.iter()
+            .any(|row| row.key == "pubsub|job.done" && row.file_path.starts_with("src/jobs.ts")),
+        "the chained publish stays a pub/sub row: {rows:#?}"
+    );
+}

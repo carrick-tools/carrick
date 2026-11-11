@@ -11,7 +11,9 @@
 //! Two readers:
 //!
 //! - [`SocketSites::yield_bus`] drops every event-bus op at a socket site's
-//!   file, line and event, before [`super::classify_in_process_pubsub`] reads
+//!   file, line and event, or, where the site carries a call span, whose
+//!   call span holds the op's member (a call chained across lines puts the
+//!   site row on the call's first line and the op on the member's), before [`super::classify_in_process_pubsub`] reads
 //!   the bus ops as the other side of a topic and before the append. The bus
 //!   pass's rows carry no source, so the site fold keeps one and drops a
 //!   socket site row at the same line (`site_rows::fold_rows`); without this
@@ -45,6 +47,11 @@ pub(super) struct SocketSites {
     repo_root: PathBuf,
     /// `(file, line, event)`, the file relative to the repo root.
     sites: HashSet<(PathBuf, u32, String)>,
+    /// `(file, call span start, call span end, event)` of the socket sites
+    /// that carry a call span (library rows and site rows), the span in SWC
+    /// file-local numbering. A call chained across lines has its row's line
+    /// and the bus op's member line apart; the span says it is one call.
+    spans: Vec<(PathBuf, u32, u32, String)>,
     /// File → every event a socket row names in it.
     events: HashMap<PathBuf, HashSet<String>>,
     /// The bus ops [`Self::yield_bus`] dropped, for the bus debug line.
@@ -69,6 +76,7 @@ impl SocketSites {
         for row in &stated.rows {
             if matches!(row.kind, LibraryRowKind::Socket { .. }) {
                 sites.insert(&row.file, row.line, &row.name);
+                sites.insert_span(&row.file, row.span_start, row.span_end, &row.name);
             }
         }
         for row in &extractions.site.rows {
@@ -76,6 +84,12 @@ impl SocketSites {
                 && row.stands()
             {
                 sites.insert(Path::new(&row.file), row.line, event);
+                sites.insert_span(
+                    Path::new(&row.file),
+                    row.lead.span_start,
+                    row.lead.span_end,
+                    event,
+                );
             }
         }
         sites
@@ -90,13 +104,23 @@ impl SocketSites {
         self.sites.insert((file, line, event.to_string()));
     }
 
-    /// Whether a socket row stands at `file`, `line` for `event`.
-    fn holds(&self, file: &Path, line: u32, event: &str) -> bool {
-        self.sites.contains(&(
-            super::protocol_relative(&self.repo_root, file),
-            line,
-            event.to_string(),
-        ))
+    fn insert_span(&mut self, file: &Path, start: u32, end: u32, event: &str) {
+        if end > start {
+            let file = super::protocol_relative(&self.repo_root, file);
+            self.spans.push((file, start, end, event.to_string()));
+        }
+    }
+
+    /// Whether a socket row stands for the bus op: at its `file`, `line` for
+    /// `event`, or, for a row that carries a call span, on a call whose span
+    /// holds the op's member (a call chained across lines).
+    fn holds(&self, op: &crate::event_emitter::BusOp) -> bool {
+        let file = super::protocol_relative(&self.repo_root, &op.file_path);
+        let at = op.member_start;
+        self.spans
+            .iter()
+            .any(|(f, lo, hi, e)| *f == file && *e == op.event && (*lo..*hi).contains(&at))
+            || self.sites.contains(&(file, op.line, op.event.clone()))
     }
 
     /// Whether a socket row in `file` names `topic`: a pub/sub row there for
@@ -111,8 +135,7 @@ impl SocketSites {
     /// Returns how many went, and counts them in [`Self::yielded`].
     pub(super) fn yield_bus(&mut self, bus: &mut crate::event_emitter::BusExtraction) -> usize {
         let before = bus.subscribers.len() + bus.publishers.len();
-        let stays =
-            |op: &crate::event_emitter::BusOp| !self.holds(&op.file_path, op.line, &op.event);
+        let stays = |op: &crate::event_emitter::BusOp| !self.holds(op);
         bus.subscribers.retain(stays);
         bus.publishers.retain(stays);
         let gone = before - bus.subscribers.len() - bus.publishers.len();
@@ -136,6 +159,7 @@ mod tests {
             event: event.to_string(),
             file_path: PathBuf::from(file),
             line,
+            member_start: 0,
         }
     }
 
@@ -197,6 +221,38 @@ mod tests {
         let mut bus = bus();
         assert_eq!(sites_of(site_row(None, false)).yield_bus(&mut bus), 2);
         assert_eq!(left(&bus), vec![(7, "typing"), (9, "chat")]);
+    }
+
+    /// A call chained across lines: the site row is on the call's first line
+    /// (7) and holds a call span; the bus op sits on a later line, inside it.
+    #[test]
+    fn a_bus_op_inside_the_call_span_of_a_site_row_goes() {
+        let mut row = site_row(None, false);
+        (row.lead.span_start, row.lead.span_end) = (100, 160);
+        let sites = sites_of(row);
+        let mut bus = BusExtraction {
+            subscribers: vec![],
+            publishers: vec![
+                // Two lines below the site, inside the call.
+                BusOp {
+                    member_start: 140,
+                    ..bus_op("/repo/src/server-socket.ts", 9, "chat")
+                },
+                // The next call, on the next line.
+                BusOp {
+                    member_start: 170,
+                    ..bus_op("/repo/src/server-socket.ts", 10, "chat")
+                },
+                // Inside the span, another event.
+                BusOp {
+                    member_start: 140,
+                    ..bus_op("/repo/src/server-socket.ts", 9, "typing")
+                },
+            ],
+        };
+        let mut sites = sites;
+        assert_eq!(sites.yield_bus(&mut bus), 1);
+        assert_eq!(left(&bus), vec![(10, "chat"), (9, "typing")]);
     }
 
     #[test]
