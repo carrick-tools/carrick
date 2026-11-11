@@ -31,8 +31,9 @@ use std::collections::HashMap;
 
 use crate::{
     ANY_METHOD, DispatchOutcome, MatchEvidence, MatchRelationship, MatchVerdict, NameScope,
-    ScopedRow, classify_relationship, dispatch_outcome, is_literal_segment, is_param_segment,
-    is_unknown_call_path, match_agreement, match_verdict_with_dispatch, names_pair,
+    ScopedRow, SplitPath, agreement, classify_relationship, dispatch_outcome, fold_dispatch,
+    is_literal_segment, is_param_segment, is_unknown_call_path, names_pair, owned_segments,
+    path_verdict, segments,
 };
 
 /// The protocol label of an HTTP row. Every other label pairs by exact key.
@@ -216,6 +217,9 @@ impl Pairing {
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PairingPool {
     producers: Vec<Producer>,
+    /// Each producer's `path` split on `/`, by input index, split once here
+    /// so that no call splits a route again. `None` where `path` is.
+    route_segments: Vec<Option<Box<[Box<str>]>>>,
     /// HTTP producers by upper-cased method, in input order. [`ANY_METHOD`]
     /// is one of the keys.
     http_by_method: HashMap<String, Vec<usize>>,
@@ -259,8 +263,13 @@ impl PairingPool {
                     .push(index);
             }
         }
+        let route_segments = producers
+            .iter()
+            .map(|producer| producer.path.as_deref().map(owned_segments))
+            .collect();
         PairingPool {
             producers,
+            route_segments,
             http_by_method,
             by_key,
             by_procedure,
@@ -290,7 +299,7 @@ impl PairingPool {
             .get(procedure)
             .into_iter()
             .flatten()
-            .map(|&index| self.winner(index, call, MatchVerdict::Matched, None))
+            .map(|&index| self.winner(index, call, MatchVerdict::Matched, None, None))
             .collect();
         let outcome = if winners.is_empty() {
             PairOutcome::ProcedureUnserved
@@ -329,7 +338,7 @@ impl PairingPool {
                     },
                 )
             })
-            .map(|index| self.winner(index, call, MatchVerdict::Matched, None))
+            .map(|index| self.winner(index, call, MatchVerdict::Matched, None, None))
             .collect();
         let outcome = if winners.is_empty() {
             PairOutcome::NoRoute
@@ -373,12 +382,15 @@ impl PairingPool {
         let Some(call_method) = &call.method else {
             return Pairing::empty(PairOutcome::NoRoute);
         };
+        // The call is split once here, each route once in `new`.
+        let call_segments = segments(call_path);
+        let call_split = SplitPath::new(call_path, &call_segments);
         let scored: Vec<(usize, u32)> = self
             .http_candidates(call_method)
             .into_iter()
             .filter_map(|index| {
-                let path = self.producers[index].path.as_deref()?;
-                match_agreement(path, call_path).map(|agreement| (index, agreement))
+                let route = self.route(index)?;
+                agreement(&route, &call_split).map(|agreement| (index, agreement))
             })
             .collect();
         let Some(best) = scored.iter().map(|&(_, agreement)| agreement).max() else {
@@ -390,11 +402,12 @@ impl PairingPool {
         let mut case_unknown = Vec::new();
         let mut case_mismatched = 0u32;
         for (index, agreement) in scored.into_iter().filter(|&(_, a)| a == best) {
-            let producer = &self.producers[index];
-            let verdict = match_verdict_with_dispatch(
-                producer.path.as_deref().unwrap_or(""),
-                call_path,
-                producer.dispatch.clone(),
+            // Every scored producer has a route (`filter_map` above).
+            let route = self.route(index).expect("a scored producer has a path");
+            // `match_verdict_with_dispatch`, with the agreement just scored.
+            let verdict = fold_dispatch(
+                path_verdict(&route, &call_split, || Some(agreement)),
+                self.producers[index].dispatch.clone(),
                 call.dispatch.clone(),
             );
             routed.push(Routed {
@@ -402,13 +415,22 @@ impl PairingPool {
                 verdict,
                 agreement,
             });
+            let param_over_literal = Some(call_param_over_route_literal(&route, &call_split));
             match verdict {
-                MatchVerdict::Matched => {
-                    matched.push(self.winner(index, call, verdict, Some(agreement)))
-                }
-                MatchVerdict::DispatchValueUnknown => {
-                    case_unknown.push(self.winner(index, call, verdict, Some(agreement)))
-                }
+                MatchVerdict::Matched => matched.push(self.winner(
+                    index,
+                    call,
+                    verdict,
+                    Some(agreement),
+                    param_over_literal,
+                )),
+                MatchVerdict::DispatchValueUnknown => case_unknown.push(self.winner(
+                    index,
+                    call,
+                    verdict,
+                    Some(agreement),
+                    param_over_literal,
+                )),
                 MatchVerdict::DispatchValueMismatch => case_mismatched += 1,
                 _ => {}
             }
@@ -430,21 +452,25 @@ impl PairingPool {
         }
     }
 
+    /// Producer `index`'s path and its stored segments, when it has a path.
+    fn route(&self, index: usize) -> Option<SplitPath<'_, Box<str>>> {
+        let path = self.producers[index].path.as_deref()?;
+        let segments = self.route_segments[index].as_deref()?;
+        Some(SplitPath::new(path, segments))
+    }
+
+    /// `call_param_over_route_literal` is the HTTP arm's flag
+    /// ([`Winner::call_param_over_route_literal`]); every other arm passes
+    /// `None`.
     fn winner(
         &self,
         index: usize,
         call: &Call,
         verdict: MatchVerdict,
         agreement: Option<u32>,
+        call_param_over_route_literal: Option<bool>,
     ) -> Winner {
         let producer = &self.producers[index];
-        let call_param_over_route_literal = (call.procedure.is_none() && producer.protocol == HTTP)
-            .then(|| {
-                call_param_over_route_literal(
-                    producer.path.as_deref().unwrap_or(""),
-                    call.path.as_deref().unwrap_or(""),
-                )
-            });
         Winner {
             producer: index,
             verdict,
@@ -465,10 +491,14 @@ pub fn pair_winners(producers: &[Producer], call: &Call) -> Pairing {
 /// Whether the call has a placeholder at a position where the route states
 /// a literal (carrick#2004): the call's value there is unknown, so the route
 /// is reached but its literal is not confirmed.
-fn call_param_over_route_literal(route_path: &str, call_path: &str) -> bool {
-    route_path
-        .split('/')
-        .zip(call_path.split('/'))
+fn call_param_over_route_literal(
+    route: &SplitPath<'_, Box<str>>,
+    call: &SplitPath<'_, &str>,
+) -> bool {
+    route
+        .segments()
+        .iter()
+        .zip(call.segments())
         .any(|(route, call)| {
             is_param_segment(call) && is_literal_segment(route.trim_end_matches('?'))
         })
