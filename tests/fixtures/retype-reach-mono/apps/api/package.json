@@ -1,0 +1,7 @@
+{
+  "name": "api",
+  "private": true,
+  "dependencies": {
+    "@remix-run/node": "^2.0.0"
+  }
+}
