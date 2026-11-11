@@ -509,9 +509,38 @@ fn producers(rng: &mut Rng) -> Vec<Producer> {
     producers
 }
 
-fn calls(rng: &mut Rng) -> Vec<Call> {
+/// Calls aimed at a route: the route as written, with its trailing slash
+/// toggled, with every placeholder and wildcard made a concrete value, and
+/// that with one more segment (what a catch-all absorbs). Drawn calls
+/// rarely land on a route; these do, so every arm is reached on a route
+/// that pairs.
+fn aimed_at(route: &str) -> [String; 4] {
+    let toggled = match route.strip_suffix('/') {
+        Some(stripped) => stripped.to_string(),
+        None => format!("{route}/"),
+    };
+    let concrete = route
+        .split('/')
+        .map(|seg| match seg.trim_end_matches('?') {
+            seg if carrick_match::is_param_segment(seg) => "123",
+            "*" | "**" | "(.*)" => "x",
+            _ => seg,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let longer = format!("{concrete}/tail");
+    [route.to_string(), toggled, concrete, longer]
+}
+
+fn calls(rng: &mut Rng, producers: &[Producer]) -> Vec<Call> {
+    let aimed = producers
+        .iter()
+        .filter_map(|producer| producer.path.as_deref())
+        .step_by(2)
+        .flat_map(aimed_at);
     paths(rng, CALL_SEGMENTS, 240)
         .into_iter()
+        .chain(aimed)
         .enumerate()
         .map(|(index, path)| Call {
             service: if index % 3 == 0 { "svc-a" } else { "svc-c" }.into(),
@@ -526,7 +555,9 @@ fn calls(rng: &mut Rng) -> Vec<Call> {
 
 fn fixture() -> (Vec<Producer>, Vec<Call>) {
     let mut rng = Rng(0x5eed_0f_c8c6_54a7);
-    (producers(&mut rng), calls(&mut rng))
+    let producers = producers(&mut rng);
+    let calls = calls(&mut rng, &producers);
+    (producers, calls)
 }
 
 #[test]
