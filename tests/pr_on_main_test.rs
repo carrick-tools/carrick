@@ -2709,12 +2709,12 @@ fn every_protocol_keeps_a_reach_pair_seed() {
         .iter()
         .filter(|s| !seed_stages::is_retired(s))
         .collect();
-    // `dependency` seeds score the comment's Dependencies section: no
-    // operation, so no type-reach decision to compare.
+    // `dependency` and `reuse` seeds score a section of the comment that is
+    // not an operation, so there is no type-reach decision to compare.
     let protocols: std::collections::BTreeSet<&str> = live
         .iter()
         .map(|s| s["protocol"].as_str().unwrap())
-        .filter(|p| *p != "dependency")
+        .filter(|p| !matches!(*p, "dependency" | "reuse"))
         .collect();
     let sampled: std::collections::BTreeSet<&str> = REACH_SAMPLE.iter().map(|(p, _)| *p).collect();
     assert_eq!(protocols, sampled, "a protocol has no reach-pair seed");
@@ -3757,6 +3757,35 @@ async fn seed_copied_helper() {
     let payload = manifest_seed_payload("copied-helper").await;
     assert!(
         changed_functions(&payload).contains(&"src/money.ts:formatMinor:added".to_string()),
+        "{payload:#}"
+    );
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+/// A reworded copy of another service's helper: the payload carries exactly
+/// one added function (the comparison's input) and no finding. The reuse row
+/// itself is the cloud renderer's.
+#[tokio::test]
+async fn seed_reuse_duplicate_added() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("reuse-duplicate-added").await;
+    assert_eq!(
+        changed_functions(&payload),
+        vec!["src/format.ts:renderAmount:added".to_string()],
+        "{payload:#}"
+    );
+    assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+/// A similar name with the opposite behaviour: also exactly one added
+/// function, so `compared.added == 1` proves the comparison ran.
+#[tokio::test]
+async fn seed_reuse_similar_not_duplicate() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("reuse-similar-not-duplicate").await;
+    assert_eq!(
+        changed_functions(&payload),
+        vec!["src/money-parse.ts:parseMinor:added".to_string()],
         "{payload:#}"
     );
     assert!(findings_of(&payload).is_empty(), "{payload:#}");
