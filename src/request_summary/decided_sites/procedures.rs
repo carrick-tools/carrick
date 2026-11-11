@@ -594,7 +594,13 @@ impl Pass<'_, '_> {
     fn binding(&self, declared: &Path, line: u32, name: &str) -> Option<Binding> {
         let ir = self.calls.file_ir(declared)?;
         let key = (line, name.to_string());
-        let binding = match ir.module_bindings.get(&key) {
+        // A block-scoped or nested local is in the table, and the walk does
+        // not read it from there yet (carrick#3794): it reads the fallback.
+        let held = ir
+            .module_bindings
+            .get(&key)
+            .filter(|binding| !binding.scoped_entry());
+        let binding = match held {
             Some(binding) => {
                 let plain = binding.plain
                     && matches!(
@@ -608,7 +614,7 @@ impl Pass<'_, '_> {
                     init: binding.init.clone(),
                     constant: binding.kind == BindingKind::Const,
                     fallback: false,
-                    local: binding.declared_in.is_some(),
+                    local: !binding.declared.module_scope(),
                 }
             }
             // FALLBACK (carrick#3794): delete once block-scoped and

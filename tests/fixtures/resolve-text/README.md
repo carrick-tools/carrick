@@ -161,3 +161,25 @@ and the calls of the parameters it was passed through (innermost first).
 
 Read at the labelled call's own function, each `p_local`, `p_target` and
 `p_renamed` value spells what the summaries read at the call's argument.
+
+## Block and nested locals (`blocks.ts`, carrick#3794)
+
+The binding table holds a declaration below a body's top level and in a
+function written inside a body, under the scope that owns it. Each probe is a
+call of a `p_*` function; every literal is annotated `string`, so the
+compiler's literal type does not answer before the table does.
+
+| Name | Entry |
+|---|---|
+| `inIf`, `inTry`, `inCase`, `bare`, `inLoop`, `moved` | a block of `blocks`; `moved` is written again, and the write is placed |
+| `atModule` | a block at module scope |
+| `inCallback`, `inHandler` | a function written inside a body, top level (text only) |
+| `deeper` | a block of such a function |
+| `nestedMoved` | such a function's `let` written again: its write is never placed |
+| `inner`, `innerInCallback` | a function declared in a body, in `blocks` and in a callback |
+| `pair` (two module blocks, one line) | one entry, unplaceable; the same two blocks in a body are a shadow and have none |
+| `item` (loop heads), `err` (`catch`), `same` (declared twice), `n` (a nested parameter's default) | no entry |
+
+No reader reads an entry of these classes yet: every probe above still reads
+as before (`outside_service`). The steps that open each reader replace that
+answer.
