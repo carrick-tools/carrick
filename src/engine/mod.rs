@@ -5352,8 +5352,12 @@ async fn analyze_current_repo_incremental(
             // Asked once, before the intents start, and read by every walk
             // below: the fact layer's and the call graph's (carrick#2432
             // slice B).
-            let implementations =
-                implementations_for(&request_inputs, sidecar, Path::new(repo_path));
+            let implementations = implementations_for(
+                &request_inputs,
+                sidecar,
+                Path::new(repo_path),
+                crate::phase_timing::Phase::Cache,
+            );
             let intents = IntentsInFlight::start(
                 AgentService::new(),
                 function_definitions,
@@ -7167,6 +7171,7 @@ fn implementations_for(
     inputs: &crate::request_summary::RequestSummaryInputs,
     sidecar: Option<&TypeSidecar>,
     scan_root: &Path,
+    before: crate::phase_timing::Phase,
 ) -> crate::request_summary::implementations::Implementations {
     use crate::request_summary::implementations::{Implementations, implementations_of};
     let Some(sidecar) = sidecar else {
@@ -7176,8 +7181,10 @@ fn implementations_for(
         return Implementations::default();
     }
     let started = Instant::now();
-    let found = implementations_of(inputs, |queries| {
-        sidecar.implementations(queries, scan_root)
+    let found = crate::phase_timing::implementations_ask(before, || {
+        implementations_of(inputs, |queries| {
+            sidecar.implementations(queries, scan_root)
+        })
     });
     debug!(
         asked = found.asked,
@@ -13649,7 +13656,12 @@ async fn analyze_current_repo(
     );
     // Asked once, before the intents start, and read by every walk below:
     // the fact layer's and the call graph's (carrick#2432 slice B).
-    let implementations = implementations_for(&request_inputs, sidecar, Path::new(repo_path));
+    let implementations = implementations_for(
+        &request_inputs,
+        sidecar,
+        Path::new(repo_path),
+        crate::phase_timing::Phase::Model,
+    );
     let intents = IntentsInFlight::start(
         AgentService::new(),
         function_definitions,
