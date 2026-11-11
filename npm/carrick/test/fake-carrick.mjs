@@ -21,6 +21,12 @@
 //   CARRICK_FAKE_FULL_DELAY_MS
 //                         milliseconds to wait before printing, on calls
 //                         WITHOUT `--no-rescan` only (the full re-check)
+//   CARRICK_FAKE_PROBE_DELAY_MS
+//                         milliseconds to wait before printing, on calls
+//                         WITH `--no-rescan` only (the post-edit probe)
+//   CARRICK_FAKE_PID_LOG  file to append this process's pid to, and, with it,
+//                         the process ignores SIGTERM (so only SIGKILL ends a
+//                         call that is past its limit)
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
 //   CARRICK_FAKE_INVOKER_LOG
@@ -43,6 +49,11 @@ const argv = process.argv.slice(2);
 const argvLog = process.env.CARRICK_FAKE_ARGV_LOG;
 if (argvLog) {
   fs.appendFileSync(argvLog, `${JSON.stringify({ argv, cwd: process.cwd() })}\n`);
+}
+
+if (process.env.CARRICK_FAKE_PID_LOG) {
+  fs.appendFileSync(process.env.CARRICK_FAKE_PID_LOG, `${process.pid}\n`);
+  process.on("SIGTERM", () => {});
 }
 
 const invokerLog = process.env.CARRICK_FAKE_INVOKER_LOG;
@@ -110,7 +121,8 @@ const answer = (file) => {
 
 const delay =
   (process.env.CARRICK_FAKE_DELAY_MS ? Number(process.env.CARRICK_FAKE_DELAY_MS) : 0) +
-  (!probe && process.env.CARRICK_FAKE_FULL_DELAY_MS ? Number(process.env.CARRICK_FAKE_FULL_DELAY_MS) : 0);
+  (!probe && process.env.CARRICK_FAKE_FULL_DELAY_MS ? Number(process.env.CARRICK_FAKE_FULL_DELAY_MS) : 0) +
+  (probe && process.env.CARRICK_FAKE_PROBE_DELAY_MS ? Number(process.env.CARRICK_FAKE_PROBE_DELAY_MS) : 0);
 const print = () => {
   // `check --each a b --json`: one array, one answer per file, in order.
   const body = argv.includes("--each")

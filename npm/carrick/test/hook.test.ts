@@ -16,6 +16,7 @@ import {
 } from "./helpers.ts";
 import { invokerValue } from "../src/hook/invoker.ts";
 import { readSession } from "../src/hook/reuse.ts";
+import { probeEdits, probeTimeoutMs } from "../src/hook/probe.ts";
 
 test("an edit gets its problems as additionalContext", async (t) => {
   const workspace = makeWorkspace();
@@ -1186,4 +1187,42 @@ test("a queued edit with a lead prints the lead alone, and names another repo", 
     "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.",
   ]);
   await waitForAnswers(home, "sess-lead-q", 1);
+});
+
+test("the probe's limit is 600 ms whatever the file count", () => {
+  assert.ok(probeTimeoutMs() <= 600);
+});
+
+test("a probe past its limit is killed even when it ignores SIGTERM, and reads as deferred", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const pidLog = path.join(workspace.root, "pids.log");
+  const env = fakeEnv({ CARRICK_FAKE_PROBE_DELAY_MS: "3000", CARRICK_FAKE_PID_LOG: pidLog });
+  delete env["CARRICK_TIMEOUT_MS"];
+  const files = ["user-service/src/routes/users.ts", "order-service/src/server.ts"];
+  for (const relatives of [files.slice(0, 1), files]) {
+    const answer = await probeEdits(relatives, workspace.root, env);
+    assert.ok(answer.ms < 1500, `the probe of ${relatives.length} file(s) waited ${answer.ms}ms`);
+    assert.ok(answer.results.every((result) => result === null), "no answer: the edit is deferred");
+  }
+  const pids = fs.readFileSync(pidLog, "utf8").trim().split("\n").map(Number);
+  assert.equal(pids.length, 2);
+  for (const pid of pids) {
+    assert.throws(() => process.kill(pid, 0), /ESRCH/, `probe ${pid} was left running`);
+  }
+});
+
+test("a slow probe leaves the edit queued and the hook back in under a second", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_PROBE_DELAY_MS: "3000", CARRICK_FAKE_FULL_DELAY_MS: "200" });
+  delete env["CARRICK_TIMEOUT_MS"];
+
+  const run = await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-nw1" }, env });
+  assert.equal(run.code, 0);
+  assert.ok(run.ms < 1000, `the hook waited ${run.ms}ms for a probe that takes 3 s`);
+  assert.equal(run.stdout, "", "a queued edit says nothing now");
+  // Queued: the runner ran the full re-check and wrote its answer for the next hook to carry.
+  await waitForAnswers(home, "sess-nw1", 1);
 });
