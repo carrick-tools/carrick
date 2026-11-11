@@ -1489,6 +1489,27 @@ impl SchemaCatalogue {
         count
     }
 
+    /// Record the vote of a service `--changed-only` carries, which is never
+    /// settled by [`Self::settle_walked_schemas`]: it serves every undeclared
+    /// file its walk (`roots`, as the catalogue was built from) reads. Called
+    /// only with evidence from its stored generation; with none, it is left
+    /// unheard, and what waits on it stays `Served` ([`Self::settle_held`]).
+    pub fn settle_carried(&self, service: &str, roots: &[WalkRoot]) {
+        let mut verdicts = self
+            .walked_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for path in graphql_files_under(roots) {
+            let file = repo_relative(&self.repo_root, &path);
+            if self.declared.contains(&file) {
+                continue;
+            }
+            let votes = verdicts.entry(file).or_default();
+            votes.serves = true;
+            votes.heard.insert(service.to_string());
+        }
+    }
+
     /// Repository-relative form of a path from a service's scan, which runs
     /// under the canonical root rather than the root the catalogue was given.
     fn scanned_relative(&self, path: &Path) -> PathBuf {
@@ -1638,13 +1659,15 @@ impl SchemaCatalogue {
     /// Decide the documents `service`'s attribution held, now that every
     /// service is settled ([`Self::attribute`]): each identity is read from
     /// the votes heard, as it would have been had every service that walks
-    /// its files voted first. A held document that is not served has its
-    /// rows removed from `calls` (the service's call rows), with the consumer
-    /// entries `manifest` holds at the same site and key, so no type is
-    /// compared for a call the index does not hold. Each is counted in the
-    /// service's record, so the report reads the same whatever order the
-    /// services were scanned in. Returns how many held rows were found not
-    /// served.
+    /// its files voted first. A document against a file some service that
+    /// walks it has still not voted on (it was carried with no endpoints,
+    /// failed, read no source, or excludes the file) stays `Served`: a pass
+    /// that removes rows fails closed (carrick#3888). A held document that is
+    /// not served has its rows removed from `calls` (the service's call rows),
+    /// each with the one consumer entry `manifest` holds for it, so no type is
+    /// compared for a call the index does not hold. Each row removed is
+    /// counted in the service's record, so the report reads the same whatever
+    /// order the services were scanned in. Returns how many rows were removed.
     pub fn settle_held(
         &self,
         service: &str,
@@ -1664,14 +1687,17 @@ impl SchemaCatalogue {
                 .iter()
                 .filter(|s| row.document.covering.contains(&s.file))
                 .collect();
-            match self.identity_from(row.document.own_covers, &covering, || {
+            if covering.iter().any(|s| self.awaits_walker(s)) {
+                continue;
+            }
+            let identity = self.identity_from(row.document.own_covers, &covering, || {
                 row.document.transport
-            }) {
-                DocumentIdentity::External(files) => {
-                    *decided.external.entry(files).or_default() += 1;
-                }
-                DocumentIdentity::Unresolved => decided.unresolved += 1,
-                DocumentIdentity::Served | DocumentIdentity::NoLocalSchema => continue,
+            });
+            if matches!(
+                identity,
+                DocumentIdentity::Served | DocumentIdentity::NoLocalSchema
+            ) {
+                continue;
             }
             let Some(at) = calls.iter().position(|call| self.is_row_of(call, &row)) else {
                 continue;
@@ -1679,13 +1705,21 @@ impl SchemaCatalogue {
             let call = calls.remove(at);
             let (file, line) =
                 crate::type_manifest::parse_file_location(&call.file_path.to_string_lossy());
-            if let Some(entries) = manifest.as_mut() {
-                entries.retain(|entry| {
-                    !(entry.role == crate::cloud_storage::ManifestRole::Consumer
+            if let Some(entries) = manifest.as_mut()
+                && let Some(entry) = entries.iter().position(|entry| {
+                    entry.role == crate::cloud_storage::ManifestRole::Consumer
                         && entry.key == call.key
                         && entry.file_path == file
-                        && entry.line_number == line)
-                });
+                        && entry.line_number == line
+                })
+            {
+                entries.remove(entry);
+            }
+            match identity {
+                DocumentIdentity::External(files) => {
+                    *decided.external.entry(files).or_default() += 1;
+                }
+                _ => decided.unresolved += 1,
             }
         }
         let count = decided.external.values().sum::<usize>() + decided.unresolved;
@@ -4134,6 +4168,185 @@ export const typeDefs = gql`
         assert!(catalogue.is_served(schema));
     }
 
+    /// The call rows the engine writes for `extraction`'s consumers: one per
+    /// operation at its file and line, read from its document, bound as the
+    /// attribution bound it.
+    fn document_call_rows(
+        extraction: &GraphqlExtraction,
+    ) -> Vec<crate::analyzer::ApiEndpointDetails> {
+        extraction
+            .consumers
+            .iter()
+            .map(|op| {
+                serde_json::from_value(serde_json::json!({
+                    "owner": null,
+                    "key": op.key,
+                    "params": [],
+                    "request_body": null,
+                    "response_body": null,
+                    "handler_name": null,
+                    "request_type": null,
+                    "response_type": null,
+                    "file_path": format!("{}:{}", op.file_path.display(), op.line),
+                    "resolution_source":
+                        crate::agents::file_analyzer_agent::ResolutionSource::GraphqlDocument,
+                    "schema_binding": op.schema_binding,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// carrick#3888: a held document's row is removed with its own consumer
+    /// entry only. Two rows at one site and key (one call that runs either of
+    /// two documents) keep the other row's entry; a held row no call row
+    /// matches is not counted in the report.
+    #[test]
+    fn a_decided_row_takes_only_its_own_manifest_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write("shared/schema.graphql", "type Query { accounts: [String] }");
+        write("b/src/index.ts", "export const b = 1;\n");
+        write("c/src/accounts.gql", "query Accounts { accounts }");
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("b"), root.join("shared")]),
+                    declared: vec![],
+                },
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("c")]),
+                    declared: vec![],
+                },
+            ],
+        );
+        // `c` attributes before the lone walker `b` votes: held.
+        let mut extraction = scan_repo(&[root.join("c")], &[], &[]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+        let summary = attribution.apply(&mut extraction);
+        catalogue.hold("c", &attribution, &extraction);
+        catalogue.record("c", summary);
+        let mut walker = scan_repo(&[root.join("b"), root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("b", &mut walker, false);
+
+        let row = document_call_rows(&extraction).remove(0);
+        let (file, line) =
+            crate::type_manifest::parse_file_location(&row.file_path.to_string_lossy());
+        use crate::cloud_storage::{
+            ManifestRole, ManifestTypeKind, ManifestTypeState, TypeEvidence, TypeManifestEntry,
+        };
+        let entry = TypeManifestEntry {
+            key: row.key.clone(),
+            role: ManifestRole::Consumer,
+            type_kind: ManifestTypeKind::Response,
+            type_alias: "Accounts".to_string(),
+            file_path: file.clone(),
+            line_number: line,
+            is_explicit: false,
+            type_state: ManifestTypeState::Unknown,
+            evidence: TypeEvidence {
+                file_path: file,
+                span_start: None,
+                span_end: None,
+                expression_text: None,
+                expression_line: None,
+                line_number: line,
+                infer_kind: crate::services::type_sidecar::InferKind::CallResult,
+                is_explicit: false,
+                type_state: ManifestTypeState::Unknown,
+            },
+            resolved_definition: None,
+            expanded_definition: None,
+            primary_type_symbol: None,
+            defined_in: None,
+            any_provenance: Vec::new(),
+            unwidened_definition: None,
+            unwidened_out_of_budget: false,
+            response_modes: None,
+            stated_values: Default::default(),
+            v1_state_before_demotion: None,
+        };
+        let mut calls = vec![row.clone(), row];
+        let mut manifest = Some(vec![entry.clone(), entry]);
+        assert_eq!(catalogue.settle_held("c", &mut calls, &mut manifest), 1);
+        assert_eq!(calls.len(), 1, "one held row, one removed");
+        assert_eq!(
+            manifest.as_ref().map(Vec::len),
+            Some(1),
+            "the other row keeps its entry"
+        );
+
+        // Held again, with no call row left at its site: nothing removed and
+        // nothing counted.
+        catalogue.hold("c", &attribution, &extraction);
+        assert_eq!(catalogue.settle_held("c", &mut Vec::new(), &mut None), 0);
+        assert_eq!(
+            catalogue.notices(),
+            vec![
+                "Service 'b': 1 GraphQL schema field(s) in 'shared/schema.graphql' are not \
+                 indexed as operations it serves. The file sits in its directory, but the \
+                 service serves no HTTP route and no resolver was found for its fields, so it \
+                 is read as another API's schema. If this service serves it, name the file in \
+                 its `graphqlSchemas`."
+                    .to_string(),
+                "Service 'c': 1 GraphQL document operation(s) are written against \
+                 'shared/schema.graphql', which no service in this repository serves, so they \
+                 are read as calls to an external API and not indexed. If a service here serves \
+                 that schema, name the file in its `graphqlSchemas`."
+                    .to_string(),
+            ],
+            "the report counts the one row removed"
+        );
+    }
+
+    /// carrick#3888: a document against a file some walker never votes on (a
+    /// service that excludes the file, fails, or reads no source) stays
+    /// served, whoever else voted.
+    #[test]
+    fn a_walker_never_heard_keeps_the_document_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        };
+        write("shared/schema.graphql", "type Query { accounts: [String] }");
+        write("c/src/accounts.gql", "query Accounts { accounts }");
+        let walker = || ServedSchemaSources {
+            roots: whole(vec![root.join("shared")]),
+            declared: vec![],
+        };
+        let catalogue = SchemaCatalogue::build(
+            root,
+            &[
+                walker(),
+                walker(),
+                ServedSchemaSources {
+                    roots: whole(vec![root.join("c")]),
+                    declared: vec![],
+                },
+            ],
+        );
+        let mut extraction = scan_repo(&[root.join("c")], &[], &[]);
+        let attribution = catalogue.attribute(&extraction, |_| TransportOrigin::Unknown);
+        let summary = attribution.apply(&mut extraction);
+        catalogue.hold("c", &attribution, &extraction);
+        catalogue.record("c", summary);
+        // One walker votes that it serves nothing; the other is never heard.
+        let mut walked = scan_repo(&[root.join("shared")], &[], &[]);
+        catalogue.settle_walked_schemas("b", &mut walked, false);
+        let mut calls = document_call_rows(&extraction);
+        assert_eq!(catalogue.settle_held("c", &mut calls, &mut None), 0);
+        assert_eq!(calls.len(), 1, "the row stays served");
+    }
+
     /// carrick#3663: a document's identity is what it would be had every
     /// service that walks a schema file covering it voted first. Each service
     /// is settled, then attributes its own documents, in every order; the
@@ -4186,6 +4399,7 @@ export const typeDefs = gql`
                             })
                             .collect::<Vec<_>>(),
                     );
+                    let mut calls = BTreeMap::new();
                     for &i in order {
                         let (name, dirs, serves) = &services[i];
                         let mut extraction = scan_repo(dirs, &[], &[]);
@@ -4195,9 +4409,10 @@ export const typeDefs = gql`
                         let summary = attribution.apply(&mut extraction);
                         catalogue.hold(name, &attribution, &extraction);
                         catalogue.record(name, summary);
+                        calls.insert(*name, document_call_rows(&extraction));
                     }
-                    for (name, _, _) in &services {
-                        catalogue.settle_held(name, &mut Vec::new(), &mut None);
+                    for (name, rows) in &mut calls {
+                        catalogue.settle_held(name, rows, &mut None);
                     }
                     catalogue.notices()
                 })

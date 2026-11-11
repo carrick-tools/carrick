@@ -1523,6 +1523,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         .filter(|(_, at)| at.is_some())
         .map(|(service, _)| service.clone())
         .collect();
+    // A carried service is never settled, so it votes on the schema files
+    // its walk reads from its stored generation, before any analysed service
+    // attributes a document against them (carrick#3888).
+    for (service, at) in services.iter().zip(&scan_index) {
+        if at.is_none()
+            && previous_generation(previous_generations, &repo_name, service)
+                .is_some_and(|stored| carried_serves_schema(service, stored))
+        {
+            graphql_schemas.settle_carried(
+                service.service_name.as_deref().unwrap_or("(root)"),
+                &service_graphql_roots(repo_path, service),
+            );
+        }
+    }
     type_compat_v2::clear_type_reach();
     // A pull request's comparison with main reads the same listing against
     // its base (carrick#3170).
@@ -1778,6 +1792,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // error is the first-declared service's that failed.
         logging::finish_spinner_warn(&sp, "Analysis stopped");
         if should_upload && !upload_blocked {
+            // What lands is decided as at the end of a run: the documents a
+            // finished service held are decided on the votes heard, and one
+            // the stopped service walks stays `Served` (carrick#3888).
+            settle_held_graphql_documents(&scan.graphql_schemas, &mut runs);
             let finished: Vec<&CloudRepoData> = runs
                 .iter()
                 // A carried service's data is its stored blob, which has
@@ -2186,22 +2204,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // with every service settled, so the order they were scanned in does not
     // matter; a service held back keeps the generation the index serves.
     // First, every GraphQL document that waited on a walked schema file's
-    // vote is decided, with every service settled (carrick#3663). A carried
-    // service was never settled, so it holds none.
+    // vote is decided, with every service settled (carrick#3663).
+    settle_held_graphql_documents(&scan.graphql_schemas, &mut runs);
     for run in &mut runs {
-        let not_served = scan.graphql_schemas.settle_held(
-            &run.label,
-            &mut run.data.calls,
-            &mut run.data.type_manifest,
-        );
-        if not_served > 0 {
-            info!(
-                "GraphQL documents in {}: {not_served} operation(s) decided once every service \
-                 was settled are not served (another API's schema, or unresolved); not indexed \
-                 as calls",
-                run.label
-            );
-        }
         let marked = scan
             .graphql_schemas
             .mark_printed_from_code(&mut run.data.calls);
@@ -3189,6 +3194,39 @@ const _: fn() = || {
     sendable::<ServiceRun>();
     shared::<ServiceScan>();
 };
+
+/// Decide every GraphQL document a run's services held on a walked schema
+/// file's vote (carrick#3663), with every service that will be heard settled:
+/// at the end of the run, and before the services that finished land when
+/// another stopped the run. A document some walker was never heard on stays
+/// `Served` (`SchemaCatalogue::settle_held`). A carried service was never
+/// settled, so it holds none.
+fn settle_held_graphql_documents(
+    catalogue: &crate::graphql::SchemaCatalogue,
+    runs: &mut [ServiceRun],
+) {
+    for run in runs {
+        let not_served =
+            catalogue.settle_held(&run.label, &mut run.data.calls, &mut run.data.type_manifest);
+        if not_served > 0 {
+            info!(
+                "GraphQL documents in {}: {not_served} operation(s) decided once every service \
+                 was settled are not served (another API's schema, or unresolved); not indexed \
+                 as calls",
+                run.label
+            );
+        }
+    }
+}
+
+/// Whether a carried service's stored generation shows it serves a schema,
+/// the evidence [`settle_graphql_documents`] reads live: it declares one, or
+/// its stored generation holds endpoints (HTTP routes, or GraphQL fields a
+/// resolver served). With none it does not vote, and what its vote decides
+/// stays `Served` (`SchemaCatalogue::settle_held`, carrick#3888).
+fn carried_serves_schema(service: &Config, stored: &CloudRepoData) -> bool {
+    !service.graphql_schemas.is_empty() || !stored.endpoints.is_empty()
+}
 
 /// Register a carried service as a local consumer, as its capture would
 /// have, so the check retypes its calls as a full scan does (carrick#2567).
