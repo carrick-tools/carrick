@@ -627,6 +627,16 @@ fn hosted_only_counterpart_keeps_real_type_verdict_and_has_no_local_navigation()
     // and the LSP server over stdio.
     use std::io::Write;
     let status = run(root, &["status", "--workspace", ".", "--json"], Some(TOKEN));
+    // Per-service boundary detail is `carrick status`'s to print; the session
+    // start no longer carries it (carrick#3871).
+    let status_text = run(root, &["status", "--workspace", "."], Some(TOKEN));
+    assert!(
+        status_text
+            .as_str()
+            .unwrap()
+            .contains(status["services"][0]["boundary_lines"][0].as_str().unwrap()),
+        "carrick status lost the boundary line: {status_text}"
+    );
     let mut node = Command::new("node")
         .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hosted-consumer.mjs"))
         .env(

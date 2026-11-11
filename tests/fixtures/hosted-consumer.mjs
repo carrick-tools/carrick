@@ -29,7 +29,7 @@ assert.ok(!(renderPostToolUse(decoded) ?? '').includes(check.boundary_lines[0]),
 const decodedStatus = parseStatusResult(JSON.stringify(status));
 assert.ok(decodedStatus);
 assert.equal(decodedStatus.services.length, status.services.length);
-assert.ok(renderSessionStart(decodedStatus).includes(status.services[0].boundary_lines[0]));
+assert.ok(!renderSessionStart(decodedStatus).includes(status.services[0].boundary_lines[0]), 'session start carries the per-service boundary');
 
 const scratch = fs.mkdtempSync(path.join(root, '.carrick', 'consumer-'));
 try {
@@ -45,7 +45,7 @@ try {
   assert.equal(edited.stdout.trim(), '', edited.stdout);
   const session = await runHook('session-start.ts', { env: { ...env, CARRICK_FAKE_FIXTURE: statusFile }, cwd: root });
   assert.equal(session.code, 0, session.stderr);
-  assert.ok(session.stdout.includes(status.services[0].boundary_lines[0]));
+  assert.ok(!session.stdout.includes(status.services[0].boundary_lines[0]), 'session start carries the per-service boundary');
   const client = new LspClient({ env: { ...env, CARRICK_CHANNEL: 'lsp' } });
   try {
     await client.initialize(root);
