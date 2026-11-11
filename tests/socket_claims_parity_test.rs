@@ -517,14 +517,14 @@ fn a_detected_socket_io_import_states_no_unknown_socket_row() {
     }
     std::fs::write(
         repo.join("__llm__/framework-detect/framework-detect.json"),
-        r#"{
-  "frameworks": [],
-  "data_fetchers": [],
-  "messaging_clients": [],
-  "socket_clients": ["socket.io", "socket.io-client"],
-  "notes": ""
-}
-"#,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "frameworks": [],
+            "data_fetchers": [],
+            "messaging_clients": [],
+            "socket_clients": ["socket.io", "socket.io-client"],
+            "notes": "",
+        }))
+        .unwrap(),
     )
     .unwrap();
     run_git(&repo, &["init", "-q"]);
