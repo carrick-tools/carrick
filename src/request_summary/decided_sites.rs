@@ -1037,6 +1037,11 @@ pub struct Decided {
     /// compares with the site path's own (carrick#3504 B10-2a2): log-only,
     /// nothing reads it.
     pub dry_run_names: crate::name_census::DryRunNames,
+    /// HTTP sites kept beside the summaries' rows for their request
+    /// ([`Self::yield_to_summaries`], C11 T1): no row placed for the request
+    /// is composed through the site's line, by `file:line`. Counted in the
+    /// run log.
+    pub kept_beside_summaries: Vec<String>,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -3985,10 +3990,39 @@ fn route_ways(
     texts.into_iter().collect()
 }
 
+/// A request's file and span start, or a row's file and line.
+type At = (PathBuf, u32);
+
 /// Where the request summaries state each request's rows
 /// ([`super::RequestSummaryIndex::placements`]): the request's file and span
-/// start to the file and line of every row stated for it.
-pub type SummaryPlacements = HashMap<(PathBuf, u32), HashSet<(PathBuf, u32)>>;
+/// start to the file and line of every row stated for it, and the calls each
+/// row was composed through (C11 T1).
+#[derive(Debug, Default)]
+pub struct SummaryPlacements {
+    rows: HashMap<At, HashSet<At>>,
+    /// Per request and row: the file and line of every call the row was
+    /// composed through, the row's own call and the request's included.
+    /// A row with no entry records none.
+    through: HashMap<(At, At), BTreeSet<At>>,
+}
+
+impl SummaryPlacements {
+    /// A row stated for `request` at `row`, composed through `through`.
+    pub fn place(&mut self, request: At, row: At, through: Option<&BTreeSet<At>>) {
+        if let Some(through) = through {
+            self.through
+                .entry((request.clone(), row.clone()))
+                .or_default()
+                .extend(through.iter().cloned());
+        }
+        self.rows.entry(request).or_default().insert(row);
+    }
+
+    /// Each request and the file and line of every row stated for it.
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, At, HashSet<At>> {
+        self.rows.iter()
+    }
+}
 
 /// The base an instance's maker was handed, read through the maker's claim
 /// ([`Decided::carry_instance_bases`]).
@@ -4258,30 +4292,55 @@ fn receiver_written(
 }
 
 impl Decided {
-    /// One request, one row (carrick#2524): an HTTP site whose request the
-    /// summaries already state a row for stands only where one of those
-    /// rows stands. Placement follows the summaries, which put a request's
-    /// row where its last hole is filled; a site anywhere else would be a
-    /// second key for the same request. Returns how many sites yielded.
+    /// One request, one row (carrick#2524): an HTTP site yields to a row the
+    /// summaries state for its request further up the site's own chain.
+    /// Placement follows the summaries, which put a request's row where its
+    /// last hole is filled; the site, stopped lower on the same chain, would
+    /// be a second key for the same request. A row is up the site's chain
+    /// when it was composed through the site's call
+    /// (as [`SummaryPlacements`] records it), and every row of a request is up
+    /// the chain of a site at the request itself. Any other site stands,
+    /// beside the rows (C11 T1): it is a caller the summaries did not
+    /// compose, and dropping it would lose its row. A site that sits where
+    /// one of the rows stands also stands. Returns how many sites yielded;
+    /// the sites kept beside rows are [`Self::kept_beside_summaries`].
     pub fn yield_to_summaries(&mut self, root: &Path, placed: &SummaryPlacements) -> usize {
-        let placed: HashMap<(String, u32), HashSet<(String, u32)>> = placed
-            .iter()
-            .map(|((file, span), rows)| {
-                (
-                    (relative(root, file), *span),
-                    rows.iter()
-                        .map(|(file, line)| (relative(root, file), *line))
-                        .collect(),
-                )
-            })
-            .collect();
+        type Rel = (String, u32);
+        let rel = |(file, at): &At| (relative(root, file), *at);
+        // Per request: each row's place and the calls it was composed through.
+        let mut rows: HashMap<Rel, Vec<(Rel, HashSet<Rel>)>> = HashMap::new();
+        for (request, placed_rows) in &placed.rows {
+            let entry = rows.entry(rel(request)).or_default();
+            for row in placed_rows {
+                let through = placed
+                    .through
+                    .get(&(request.clone(), row.clone()))
+                    .map(|through| through.iter().map(rel).collect())
+                    .unwrap_or_default();
+                entry.push((rel(row), through));
+            }
+        }
         let before = self.sites.len();
+        let mut kept = Vec::new();
         self.sites.retain(|site| {
-            site.end.role != "http_client"
-                || placed
-                    .get(&(site.end.file.clone(), site.end.span_start))
-                    .is_none_or(|rows| rows.contains(&(site.file.clone(), site.line)))
+            if site.end.role != "http_client" {
+                return true;
+            }
+            let Some(rows) = rows.get(&(site.end.file.clone(), site.end.span_start)) else {
+                return true;
+            };
+            let at = (site.file.clone(), site.line);
+            if rows.iter().any(|(row, _)| *row == at) {
+                return true;
+            }
+            let at_request = site.file == site.end.file && site.span_start == site.end.span_start;
+            if at_request || rows.iter().any(|(_, through)| through.contains(&at)) {
+                return false;
+            }
+            kept.push(format!("{}:{}", site.file, site.line));
+            true
         });
+        self.kept_beside_summaries.extend(kept);
         before - self.sites.len()
     }
 

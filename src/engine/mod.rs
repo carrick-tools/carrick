@@ -7823,12 +7823,13 @@ fn site_records_of(
     let bases_options_unread = based.map_or(0, |based| based.options_unread);
     debug!(
         yielded,
+        kept = decided.kept_beside_summaries.len(),
         unbased,
         bases_options_unread,
         ran = decided.ran.len(),
         reserved = decided.reserved.len(),
         unplaced = decided.unplaced.len(),
-        "site questions: sites left to the summaries, sites with an unstated instance base, makers handed an options object the resolver does not read, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
+        "site questions: sites left to the summaries, sites kept beside a summary row no chain of theirs reaches, sites with an unstated instance base, makers handed an options object the resolver does not read, calls that hand a maker its function, sites named a reserved name, labelled calls the call index holds no call for"
     );
     let records = crate::request_summary::site_record::site_records(
         inputs,

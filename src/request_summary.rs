@@ -10036,6 +10036,14 @@ fn held_strings(obj: &ObjValue) -> Option<(usize, BTreeMap<String, Vec<Piece>>)>
 #[derive(Debug, Clone, Default)]
 struct Summary {
     effects: BTreeSet<Effect>,
+    /// The calls each effect was composed through, as `(file, line)`: the
+    /// request's own call and every call between it and this body (C11 T1).
+    /// Kept out of [`Effect`], which is compared and deduplicated: two
+    /// chains to one request are one effect, and their lines are joined.
+    /// A row stated from the effect passes through these lines
+    /// ([`RequestSummaryIndex::placements`]), which is what a decided site
+    /// on one of them yields to ([`decided_sites::Decided::yield_to_summaries`]).
+    through: BTreeMap<Effect, BTreeSet<(PathBuf, u32)>>,
     /// Every call in the body resolved, every callee is complete, and every
     /// callback went to a callee that says what it does with it.
     complete: bool,
@@ -10055,6 +10063,30 @@ struct Summary {
     /// route into what it hands out, so that call is never silent
     /// ([`is_silent`]).
     hands_out: bool,
+}
+
+impl Summary {
+    /// Add `effect`, composed through the calls at `through` ([`Self::through`]).
+    fn state(&mut self, effect: Effect, through: BTreeSet<(PathBuf, u32)>) {
+        self.through
+            .entry(effect.clone())
+            .or_default()
+            .extend(through);
+        self.effects.insert(effect);
+    }
+
+    /// The calls `effect` was composed through; empty for one never stated.
+    fn through_of(&self, effect: &Effect) -> BTreeSet<(PathBuf, u32)> {
+        self.through.get(effect).cloned().unwrap_or_default()
+    }
+
+    /// The calls `effect` was composed through, and the call at `line` of
+    /// `file` that reaches it.
+    fn through_call(&self, effect: &Effect, file: &Path, line: u32) -> BTreeSet<(PathBuf, u32)> {
+        let mut through = self.through_of(effect);
+        through.insert((file.to_path_buf(), line));
+        through
+    }
 }
 
 /// A row this pass states at one call site.
@@ -10873,7 +10905,16 @@ pub struct RequestSummaryIndex {
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
+    /// The calls each row at a caller was composed through (C11 T1,
+    /// [`Summary::through`]), the row's own call included: keyed by the
+    /// row's request ([`SummaryRow::request_at`]) and the row's file and
+    /// line. Read by [`Self::placements`].
+    through: HashMap<RowAt, BTreeSet<(PathBuf, u32)>>,
 }
+
+/// A summary row by its request ([`SummaryRow::request_at`]) and its own
+/// file and line.
+type RowAt = ((PathBuf, u32), (PathBuf, u32));
 
 /// The verb a call settles for the requests it reaches, where none of their
 /// URLs is closed at the call (carrick#2676): `openPoll({ url, request })`
@@ -10965,15 +11006,15 @@ impl RequestSummaryIndex {
 
     /// Where the rows of each request stand (carrick#2524): the request's
     /// file and span start ([`SummaryRow::request_at`]) to the file and line
-    /// of every row stated for it.
+    /// of every row stated for it, with the calls each row at a caller was
+    /// composed through (C11 T1).
     pub fn placements(&self) -> decided_sites::SummaryPlacements {
-        let mut placed = decided_sites::SummaryPlacements::new();
+        let mut placed = decided_sites::SummaryPlacements::default();
         for (file, sites) in &self.rows {
             for row in sites.values().flatten() {
-                placed
-                    .entry(row.request_at.clone())
-                    .or_default()
-                    .insert((file.clone(), row.line));
+                let at = (file.clone(), row.line);
+                let through = self.through.get(&(row.request_at.clone(), at.clone()));
+                placed.place(row.request_at.clone(), at, through);
             }
         }
         placed
@@ -11180,6 +11221,7 @@ impl Composer<'_> {
     fn compose(&mut self, file: &Path, ir: &FnIr) -> Summary {
         let mut summary = Summary {
             effects: BTreeSet::new(),
+            through: BTreeMap::new(),
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
             passes_body: false,
@@ -11188,7 +11230,7 @@ impl Composer<'_> {
         // What the functions written in this body send through its
         // parameters (carrick#1949), kept apart until `passes_body` is read:
         // that is a statement about the body's own request.
-        let mut lifted: BTreeSet<Effect> = BTreeSet::new();
+        let mut lifted: Lifted = BTreeMap::new();
         for call in &ir.calls {
             if call.invokes_param.is_some() {
                 continue;
@@ -11200,18 +11242,20 @@ impl Composer<'_> {
                 // were while an element read as nothing (carrick#1949).
                 Some((_, callee)) if call.jsx => {
                     for effect in callee.effects.iter().filter(|effect| effect.has_params()) {
-                        summary
-                            .effects
-                            .insert(ir.settle_forward(effect.at_call(call, file)));
+                        summary.state(
+                            ir.settle_forward(effect.at_call(call, file)),
+                            callee.through_call(effect, file, call.site.line),
+                        );
                     }
                 }
                 Some((_, callee)) => {
                     summary.complete &= callee.complete;
                     summary.hands_out |= callee.hands_out;
                     for effect in &callee.effects {
-                        summary
-                            .effects
-                            .insert(ir.settle_forward(effect.at_call(call, file)));
+                        summary.state(
+                            ir.settle_forward(effect.at_call(call, file)),
+                            callee.through_call(effect, file, call.site.line),
+                        );
                     }
                     for (index, arg) in call.args.iter().enumerate() {
                         match arg {
@@ -11219,15 +11263,18 @@ impl Composer<'_> {
                                 let callback = self.compose(file, &ir.nested[*nested]);
                                 summary.complete &= callback.complete;
                                 summary.hands_out |= callback.hands_out;
-                                summary.effects.extend(
-                                    callback
-                                        .effects
-                                        .iter()
-                                        .map(|effect| effect.detached().lifted()),
-                                );
+                                for effect in &callback.effects {
+                                    summary.state(
+                                        effect.detached().lifted(),
+                                        callback.through_of(effect),
+                                    );
+                                }
                             }
                             Value::Callback(nested) => {
-                                lifted.extend(self.lifted_from(file, &ir.nested[*nested]));
+                                join_lifted(
+                                    &mut lifted,
+                                    self.lifted_from(file, &ir.nested[*nested]),
+                                );
                             }
                             Value::Str(pieces) if callee.invokes.contains(&index) => {
                                 if let [Piece::Param(param, _)] = pieces.as_slice() {
@@ -11241,11 +11288,14 @@ impl Composer<'_> {
                 None if call.jsx => {}
                 None => {
                     if let Some(request) = self.request_of(file, call) {
-                        summary.effects.extend(
+                        for effect in
                             Effect::from_shape(&request, file, call.site, &ir.key_defaults)
-                                .into_iter()
-                                .map(|effect| ir.settle_forward(effect)),
-                        );
+                        {
+                            summary.state(
+                                ir.settle_forward(effect),
+                                BTreeSet::from([(file.to_path_buf(), call.site.line)]),
+                            );
+                        }
                         if self.unknown(file, call) {
                             summary.complete = false;
                         }
@@ -11262,7 +11312,7 @@ impl Composer<'_> {
                             if !callback.effects.is_empty() || !callback.complete {
                                 summary.complete = false;
                             }
-                            lifted.extend(lift_outer(&callback));
+                            join_lifted(&mut lifted, lift_outer(&callback));
                         }
                     }
                 }
@@ -11278,21 +11328,21 @@ impl Composer<'_> {
         for detached in &ir.detached {
             let written = self.compose(file, detached);
             summary.hands_out |= !written.complete || !written.effects.is_empty();
-            lifted.extend(lift_outer(&written));
+            join_lifted(&mut lifted, lift_outer(&written));
         }
         summary.passes_body = summary.effects.len() == 1
             && ir
                 .return_shape
                 .is_some_and(|shape| self.hands_back_body(file, ir, shape));
-        summary
-            .effects
-            .extend(lifted.into_iter().map(|effect| ir.settle_forward(effect)));
+        for (effect, through) in lifted {
+            summary.state(ir.settle_forward(effect), through);
+        }
         summary
     }
 
     /// What a function written inside another sends through the enclosing
     /// function's parameters (carrick#1949).
-    fn lifted_from(&mut self, file: &Path, nested: &FnIr) -> Vec<Effect> {
+    fn lifted_from(&mut self, file: &Path, nested: &FnIr) -> Lifted {
         lift_outer(&self.compose(file, nested))
     }
 }
@@ -11301,14 +11351,29 @@ impl Composer<'_> {
 /// enclosing function's parameters, as the enclosing function sends them
 /// (carrick#1949). The inner function's own parameters are no caller's to
 /// fill in: nothing here calls it.
-fn lift_outer(summary: &Summary) -> Vec<Effect> {
-    summary
-        .effects
-        .iter()
-        .map(Effect::detached)
-        .filter(Effect::has_outer)
-        .map(|effect| effect.lifted())
-        .collect()
+fn lift_outer(summary: &Summary) -> Lifted {
+    let mut lifted = Lifted::new();
+    for effect in &summary.effects {
+        let detached = effect.detached();
+        if detached.has_outer() {
+            lifted
+                .entry(detached.lifted())
+                .or_default()
+                .extend(summary.through_of(effect));
+        }
+    }
+    lifted
+}
+
+/// Lifted effects ([`lift_outer`]) with the calls each was composed through
+/// ([`Summary::through`]).
+type Lifted = BTreeMap<Effect, BTreeSet<(PathBuf, u32)>>;
+
+/// Join `more` into `lifted`, the calls of an effect both hold joined.
+fn join_lifted(lifted: &mut Lifted, more: Lifted) {
+    for (effect, through) in more {
+        lifted.entry(effect).or_default().extend(through);
+    }
 }
 
 impl Composer<'_> {
@@ -11590,7 +11655,14 @@ fn emit(
                         (None, _) => None,
                     };
                     match row(&instantiated, file, files, call, reaches, at, call_body) {
-                        Some(row) => rows.push(row),
+                        Some(row) => {
+                            index
+                                .through
+                                .entry((row.request_at.clone(), (file.to_path_buf(), row.line)))
+                                .or_default()
+                                .extend(callee.through_call(effect, file, call.site.line));
+                            rows.push(row);
+                        }
                         None => {
                             index.undetermined += 1;
                             // The request is closed at this caller and does
