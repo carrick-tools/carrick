@@ -373,7 +373,13 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
             }
             match procedure_route(site, procedure, record) {
                 Ok(route) => out.routes.push(route),
-                Err(reason) => *out.untraced.entry(reason).or_default() += 1,
+                // A procedure that reached a path and whose method the label
+                // does not state is a procedure row the walk could not
+                // write: a stop, so a removal of it is not proven (R5).
+                Err(reason) => {
+                    out.procedure_stopped = true;
+                    *out.untraced.entry(reason).or_default() += 1;
+                }
             }
             continue;
         }
