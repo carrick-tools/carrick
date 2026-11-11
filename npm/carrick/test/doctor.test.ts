@@ -374,7 +374,7 @@ test("a settings file holding last version's entries is a finding, not a pass", 
   // The Read hook (carrick#2069) is missing from this file too, and named first.
   assert.match(lines[0]!.text, /not the ones this version installs: PostToolUse `carrick hook post-read`/);
   assert.match(lines[0]!.text, /SessionStart `carrick hook session-start`/);
-  assert.match(lines[0]!.text, /Stop `carrick hook stop --wait-s 200`/);
+  assert.match(lines[0]!.text, /Stop `carrick hook stop`/);
 
   // A matcher that no longer covers every editing tool is the same failure:
   // the entry is ours, it runs, and it never fires on a MultiEdit.

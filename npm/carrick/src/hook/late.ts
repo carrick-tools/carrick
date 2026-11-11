@@ -63,3 +63,13 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
   }
   return contexts;
 }
+
+/** The one JSON object a PostToolUse hook prints (the host attaches it to the tool result), or nothing when there are no lines. */
+export function emitPostToolUse(contexts: readonly string[]): void {
+  if (contexts.length === 0) return;
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: contexts.join("\n\n") },
+    }),
+  );
+}

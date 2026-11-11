@@ -15,24 +15,12 @@ import { currentVersion } from "../update.ts";
 import { markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { leadLines } from "./lead.ts";
 import type { LeadLines } from "./lead.ts";
-import { deliverLate } from "./late.ts";
+import { deliverLate, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 
 const log = createLogger("carrick-hook");
-
-/** Print one `additionalContext` object, which the host attaches to the tool result. */
-export function emit(context: string): void {
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        additionalContext: context,
-      },
-    }),
-  );
-}
 
 /**
  * Check `edited` (absolute paths, at least one) as the post-edit hook does and
@@ -162,5 +150,5 @@ export async function editFlow(
   if (told.length > 0 && session) markTold(session, told);
   if (led.length > 0 && session) markLed(session, led);
   contexts.unshift(...extra);
-  if (contexts.length > 0) emit(contexts.join("\n\n"));
+  emitPostToolUse(contexts);
 }

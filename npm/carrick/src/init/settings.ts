@@ -17,7 +17,7 @@ import path from "node:path";
 
 import { sameText } from "./files.ts";
 import { packageRoot } from "../native.ts";
-import { STOP_TIMEOUT_S, STOP_WAIT_S } from "../hook/rechecks.ts";
+import { STOP_TIMEOUT_S } from "../hook/rechecks.ts";
 
 /**
  * The entry point in this package, for a settings file that must name a path.
@@ -106,20 +106,19 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
       },
     ],
     // The end of a task: delivers what the background re-checks of this
-    // session's edits answered and waits for the ones still running (B3,
-    // carrick#3198). It names no function the task added (carrick#3436). Its
-    // timeout sits above that wait (`STOP_WAIT_S`): a hook that reaches its
-    // timeout is cancelled and its output dropped.
+    // session's edits answered and names the ones still running, without
+    // waiting for them (hook-wording audit T2). It names no function the task
+    // added (carrick#3436).
     Stop: [
       {
-        hooks: [
-          {
-            type: "command",
-            command: `${command} hook stop --wait-s ${STOP_WAIT_S}`,
-            timeout: STOP_TIMEOUT_S,
-            statusMessage: "Carrick: waiting for the re-check of your last edit",
-          },
-        ],
+        hooks: [{ type: "command", command: `${command} hook stop`, timeout: STOP_TIMEOUT_S }],
+      },
+    ],
+    // A re-check that answered after Stop returned reaches the model with the
+    // next prompt, when no tool hook has carried it first (`late.ts`).
+    UserPromptSubmit: [
+      {
+        hooks: [{ type: "command", command: `${command} hook user-prompt`, timeout: 5 }],
       },
     ],
   };

@@ -41,16 +41,10 @@ const log = createLogger("carrick-recheck");
 export const BACKGROUND_CAP_MS = 180_000;
 
 /**
- * How long a Stop hook waits for a running re-check, in seconds: one full
- * background call (the cap) plus the runner's own start. The Stop entry
- * carries it as `--wait-s`, and its timeout sits `STOP_TIMEOUT_S` above it,
- * because a command hook that reaches its timeout is cancelled and its output
- * discarded, which would drop the late answer with it.
+ * The Stop entry's timeout, in seconds. Stop never waits for a re-check
+ * (`stop-wait.ts`): this only bounds its own reads of the session's files.
  */
-export const STOP_WAIT_S = BACKGROUND_CAP_MS / 1000 + 20;
-
-/** The Stop entry's timeout: the wait plus the hook's own work. */
-export const STOP_TIMEOUT_S = STOP_WAIT_S + 10;
+export const STOP_TIMEOUT_S = 10;
 
 /** The runner's own deadline for one call: the binary's budget ends it first. */
 const CALL_SLACK_MS = 15_000;

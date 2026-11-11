@@ -19,7 +19,7 @@ import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { wasRead } from "./reuse.ts";
 import { markInvoker } from "./invoker.ts";
-import { deliverLate } from "./late.ts";
+import { deliverLate, emitPostToolUse as emit } from "./late.ts";
 import { answerRead } from "./read-answer.ts";
 
 const log = createLogger("carrick-hook");
@@ -31,16 +31,6 @@ type Payload = {
   session_id?: string;
   tool_input?: { file_path?: string };
 };
-
-/** The one JSON object this hook prints, or nothing when there are no lines. */
-function emit(contexts: string[]): void {
-  if (contexts.length === 0) return;
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: contexts.join("\n\n") },
-    }),
-  );
-}
 
 async function main(): Promise<void> {
   markInvoker("post-read");

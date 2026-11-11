@@ -446,15 +446,6 @@ export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: strin
   return `Carrick did not check the whole change: ${named}. A background \`carrick check --changed\` is queued; its answer comes with the next Carrick line.`;
 }
 
-/**
- * The Stop hook's line when the whole-change check it waited for did not
- * answer inside the wait: the files not checked, and the command that does.
- */
-export function notFinishedLine(gaps: ReadonlyArray<{ file: string; reason: string }>): string {
-  const named = gaps.map((gap) => `${gap.file}: ${gap.reason.trim().replace(/\.+$/, "")}`).join("; ");
-  return `Carrick could not finish checking this session's change in time: ${named}. Run \`carrick check --changed\` to see the answer.`;
-}
-
 /** What a background `check --changed` found: its problem lines, or "" when it found none. */
 export function changedLines(changed: ChangedResult): string {
   const head = "Carrick ran `carrick check --changed` for this session's change";

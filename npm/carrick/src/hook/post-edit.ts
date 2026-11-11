@@ -24,8 +24,8 @@ import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { patchedFiles } from "./apply-patch.ts";
 import { markInvoker } from "./invoker.ts";
-import { deliverLate } from "./late.ts";
-import { editFlow, emit } from "./edit-flow.ts";
+import { deliverLate, emitPostToolUse } from "./late.ts";
+import { editFlow } from "./edit-flow.ts";
 import { createLogger } from "../log.ts";
 
 const log = createLogger("carrick-hook");
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     // is still owed to the model (B3: every carrier delivers).
     if (channel.channel === "hook") {
       const late = deliverLate(session);
-      if (late.length > 0) emit(late.join("\n\n"));
+      emitPostToolUse(late);
     }
     return;
   }

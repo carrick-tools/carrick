@@ -157,11 +157,12 @@ test("the host manifests name this CLI's commands, and travel with the package",
     "carrick hook post-edit",
     "carrick hook post-read",
     "carrick hook session-start",
-    "carrick hook stop --wait-s 200",
+    "carrick hook stop",
+    "carrick hook user-prompt",
   ]);
-  // Stop waits for the background re-check of the last edit, so the plugin's
-  // entry is the one `carrick init` writes: same wait, timeout and message.
+  // The plugin's Stop and prompt entries are the ones `carrick init` writes.
   assert.deepEqual(hooks["hooks"]["Stop"], carrickHooks()["Stop"]);
+  assert.deepEqual(hooks["hooks"]["UserPromptSubmit"], carrickHooks()["UserPromptSubmit"]);
   const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);
