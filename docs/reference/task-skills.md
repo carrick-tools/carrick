@@ -227,7 +227,15 @@ nothing about them. A function added after a nudge is pending on its own.
 
 **The line is short and says where it came from.** It reads "Carrick: this task
 added N new functions (a, b and N-2 more). Check them for existing copies with
-one find_similar call, then tell the user in one line what Carrick found." Names
+one find_similar call, passing `project: "<slug>"` and `functions`, one
+`{ description }` per new function: one plain sentence saying what it does (new
+functions are not in the index yet, so a name is not found). Where it names an
+existing function that does the same job, or most of it, call that function
+instead: delete your copy, or, when the task asked for your function by name,
+keep the function but make its body call the existing one and add only what it
+lacks. Then tell the user in one line what Carrick found and what you changed."
+The project clause appears when the workspace's hosted snapshot names exactly
+one project. Names
 only, at most two, no paths; one and two functions read "(a)" and "(a and b)".
 Test, spec and story files are never recorded (`isCheckedSource`), and a
 function is keyed by its path relative to the nearest checkout top, so an edit
