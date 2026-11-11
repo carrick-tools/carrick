@@ -250,6 +250,8 @@
               }
             },
             "candidates_awaiting_model": { "type": "integer", "minimum": 0 },
+            "unemitted_literal_candidates": { "type": "integer", "minimum": 0, "description": "Retired (carrick#3762): always 0." },
+            "unemitted_literal_sites": { "type": "array", "items": { "type": "string" }, "description": "Retired (carrick#3762): always empty." },
             "type_extraction_status": { "type": "string" },
             "time_limits_run_out": {
               "type": "object",
