@@ -1,10 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  BOUNDARY_POINTER,
-  LISTED_SERVICES,
   MAX_EDIT_LINE_CHARS,
-  CHECK_BEFORE_DONE,
   answersTheEdit,
   boundaryFor,
   boundaryLines,
@@ -398,13 +395,6 @@ test("without the CLI's lines the note leads the counts", () => {
   ]);
 });
 
-test("the session line ends with each service's boundary lines, verbatim", () => {
-  const status = statusFixture("status-workspace.json");
-  const rendered = renderSessionStart(status).split("\n");
-  const expected = status.services.flatMap((service) => service.boundary_lines ?? []);
-  assert.deepEqual(rendered.slice(-expected.length), expected);
-});
-
 test("a local index dispatches nothing, so the header drops the analyzer count", () => {
   const lines = boundaryLines({ commit_hash: "abc1234def", files_attempted: 0 }, "webapp");
   assert.deepEqual(lines, ["webapp at abc1234"]);
@@ -461,109 +451,25 @@ test("a boundary with a degraded type stage says which stage", () => {
   );
 });
 
-test("the session line is one line per service, with what it holds and how far it has moved", () => {
-  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
-  assert.match(
-    lines[0] ?? "",
-    /^Carrick indexed 3 service\(s\) in \/workspace at 2026-09-06T21:14:03Z, scanner 0\.3\.41\.$/,
-  );
-  assert.match(
-    lines[1] ?? "",
-    /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7$/,
-  );
-  assert.match(lines[3] ?? "", /^- order-service at 9988776: 40 route\(s\), 61 call\(s\), changed since index: 120$/);
+test("a healthy, fresh index prints nothing at session start", () => {
+  assert.equal(renderSessionStart(statusFixture("status-workspace.json")), "");
 });
 
-// A workspace of fifteen services printed about ninety lines into every
-// session: each service, then each service's boundary report. Above three
-// services the session gets the total, the services with something to do about
-// them, and the command that prints the rest (carrick#1365).
-test("a large workspace gets one count and the services worth acting on, and a pointer to the rest", () => {
+test("a large workspace names only the services with something to act on", () => {
   const base = statusFixture("status-workspace.json");
   const template = base.services[0]!;
   const services = Array.from({ length: 15 }, (_, index) => ({
     ...template,
     service: `svc-${index}`,
-    routes: 2,
-    calls: 1,
     changed_since_index: index < 10 ? 1 : 0,
-    stale_files: index < 10 ? ["src/a.ts"] : [],
-    stale_files_total: index < 10 ? 1 : 0,
     // Two of them wait on the cloud scan; the others have nothing to act on.
     boundary: index < 2 ? { ...template.boundary, candidates_awaiting_model: 4 } : undefined,
     hosted_state: index < 2 ? ("no_index_yet" as const) : ("enriched" as const),
-    boundary_lines: ["boundary line nobody acts on at session start"],
   }));
   const lines = renderSessionStart({ ...base, services, repos: [] }).split("\n");
-  assert.match(lines[0] ?? "", /^Carrick indexed 15 service\(s\).*: 30 route\(s\), 15 call\(s\)\.$/);
-  assert.equal(lines[1], "10 services have local changes since the index; `carrick status` lists them.");
-  // Only the two with something to act on are named; the eight that merely
-  // moved are in the count, and no boundary report prints.
   assert.deepEqual(
-    lines.filter((line) => line.startsWith("- svc-")).map((line) => line.split(" ")[1]),
+    lines.map((line) => line.split(" ")[1]),
     ["svc-0", "svc-1"],
-  );
-  assert.ok(!lines.some((line) => line.includes("src/a.ts")));
-  assert.ok(!lines.some((line) => line.includes("boundary line nobody acts on")));
-  assert.equal(lines.at(-1), BOUNDARY_POINTER);
-  assert.equal(lines.length, 1 + 1 + 2 + 1);
-});
-
-test("services past the listing cap are counted, not named", () => {
-  const base = statusFixture("status-workspace.json");
-  const template = base.services[0]!;
-  const services = Array.from({ length: LISTED_SERVICES + 2 }, (_, index) => ({
-    ...template,
-    service: `svc-${index}`,
-    changed_since_index: 0,
-    hosted_state: "no_index_yet" as const,
-  }));
-  const lines = renderSessionStart({ ...base, services, repos: [] }).split("\n");
-  assert.equal(lines.filter((line) => line.startsWith("- svc-")).length, LISTED_SERVICES);
-  assert.ok(lines.includes("- +2 more service(s) with something to act on"));
-});
-
-// One edit to a shared file moves every service that reads it. Session start
-// printed the same five paths on each of eight service lines (carrick#3477).
-test("one shared file edited under eight services names no path and is three lines", () => {
-  const base = statusFixture("status-workspace.json");
-  const template = base.services[0]!;
-  const services = Array.from({ length: 8 }, (_, index) => ({
-    ...template,
-    service: `lambda-${index}`,
-    changed_since_index: 1,
-    stale_files: ["_shared/db/client.ts"],
-    stale_files_total: 1,
-    boundary: undefined,
-    hosted_state: "enriched" as const,
-  }));
-  const repos = [
-    { repo: "/repos/mono", name: "mono", changed_since_index: 1, outside_every_service: 0, stale_files: [] },
-  ];
-  const rendered = renderSessionStart({ ...base, services, repos });
-  const lines = rendered.split("\n");
-  assert.doesNotMatch(rendered, /\.ts|_shared/, "no file path");
-  assert.equal(lines.length, 3);
-  assert.equal(lines[1], "8 services have local changes since the index; `carrick status` lists them.");
-  assert.equal(lines[2], BOUNDARY_POINTER);
-});
-
-test("a small workspace's service lines carry counts and no file paths", () => {
-  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
-  assert.match(lines[1] ?? "", /changed since index: 7$/);
-  assert.match(lines[3] ?? "", /changed since index: 120$/, "the count comes from changed_since_index");
-  assert.ok(!lines.slice(1, 4).some((line) => line.includes("src/")));
-});
-
-test("every service states the count of what its own scan reads", () => {
-  // Services of one repo no longer share a changed-file count: each is told
-  // about the files it reads, and the repo carries the rest (carrick#997).
-  const lines = renderSessionStart(statusFixture("status-workspace.json")).split("\n");
-  assert.match(lines[2] ?? "", /^- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\), changed since index: /);
-  assert.equal(
-    (lines[2] ?? "").includes("Same repo as"),
-    false,
-    "no service points at another service's count",
   );
 });
 
@@ -590,27 +496,6 @@ test("a service answered by the hosted index says nothing about candidates waiti
   assert.equal(serviceLine({ ...counted, hosted_state: "enriched" }).includes("candidate"), false);
   assert.match(serviceLine({ ...counted, hosted_state: "no_index_yet" }), /8 candidate\(s\) waiting/);
   assert.equal(hasSomethingToDo({ ...counted, changed_since_index: 0, hosted_state: "enriched" }), false);
-});
-
-test("files outside every service are the repo's line, not each service's", () => {
-  const status = statusFixture("status-workspace.json");
-  const rendered = renderSessionStart({
-    ...status,
-    repos: [
-      {
-        repo: "/repos/monorepo",
-        name: "monorepo",
-        changed_since_index: 9,
-        outside_every_service: 2,
-        stale_files: ["carrick.json", ".github/workflows/carrick.yml"],
-      },
-    ],
-  });
-  assert.match(
-    rendered,
-    /- monorepo: 2 file\(s\) changed outside every service$/m,
-  );
-  assert.doesNotMatch(rendered, /carrick\.json|workflows/, "the repo line counts files, it does not name them");
 });
 
 test("no index gives one line and the command that reads one in", () => {
@@ -890,13 +775,6 @@ test("a payload without uses lines renders exactly as before", () => {
     assert.equal(parsed.uses_lines, undefined, name);
     assert.equal(renderPostToolUse(parsed), renderPostToolUse(parsed, undefined, { uses: true }), name);
   }
-});
-
-test("the session-start check line is short and names both exit codes", () => {
-  assert.equal(
-    CHECK_BEFORE_DONE,
-    "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.",
-  );
 });
 
 test("an edit names the rows outside the file that it moved, and calls an unjudged one no break", () => {

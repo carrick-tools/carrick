@@ -201,7 +201,7 @@ test("the hook stays quiet when the LSP owns delivery", async (t) => {
   }
 });
 
-test("the session line asks status about the workspace, and states what it holds", async (t) => {
+test("the session start asks status about the workspace, and prints a problem it finds", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const argvLog = path.join(workspace.root, "argv.log");
@@ -209,23 +209,38 @@ test("the session line asks status about the workspace, and states what it holds
   const run = await runHook("session-start.ts", {
     cwd: workspace.root,
     env: fakeEnv({
-      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace-waiting.json"),
       CARRICK_FAKE_ARGV_LOG: argvLog,
     }),
   });
   assert.equal(run.code, 0);
-  assert.match(run.stdout, /^Carrick indexed 3 service\(s\) in \S+ at 2026-09-06T21:14:03Z/);
-  // A line a developer runs by hand, so it ends like one (#838).
-  assert.ok(run.stdout.endsWith("\n"), "the session line ends with a newline");
-  assert.ok(!run.stdout.endsWith("\n\n"), "and with exactly one");
-  assert.match(run.stdout, /\n- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7\n/);
-  // Each service states the count of what its own scan reads (carrick#997).
-  assert.match(run.stdout, /\n- user-admin at 6a1b2c3: 12 route\(s\), 3 call\(s\), changed since index: 7\n/);
+  assert.match(run.stdout, /^- user-service at 6a1b2c3: 157 route\(s\), 12 call\(s\), changed since index: 7\n/);
   const call = firstCall(argvLog);
   assert.ok(call);
   assert.deepEqual(call.argv.slice(0, 2), ["status", "--workspace"]);
   assert.equal(call.argv.at(-1), "--json");
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(workspace.root));
+});
+
+test("a healthy, fresh index prints nothing at session start", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json") }),
+  });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "");
+});
+
+test("a failed scan prints its line", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const run = await runHook("session-start.ts", {
+    cwd: workspace.root,
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace-failed-scan.json") }),
+  });
+  assert.equal(run.stdout, "- scan abc12345 failed: the scan of api failed: no credentials\n");
 });
 
 // What Codex's own parser takes from a SessionStart hook
@@ -236,14 +251,14 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const env = (extra: Record<string, string>) =>
-    fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"), ...extra });
+    fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("status-workspace-waiting.json"), ...extra });
 
   const plain = await runHook("session-start.ts", {
     cwd: workspace.root,
     payload: { hook_event_name: "SessionStart" },
     env: env({ CLAUDE_PROJECT_DIR: workspace.root }),
   });
-  assert.match(plain.stdout, /^Carrick indexed 3 service\(s\)/);
+  assert.match(plain.stdout, /^- user-service at /);
 
   const codex = await runHook("session-start.ts", {
     cwd: workspace.root,
@@ -255,10 +270,8 @@ test("under Codex the session line goes out as additionalContext; Claude Code ke
   assert.deepEqual(Object.keys(wire), ["hookSpecificOutput"]);
   const output = wire["hookSpecificOutput"] as { hookEventName: string; additionalContext: string };
   assert.equal(output.hookEventName, "SessionStart");
-  // Both carry the finish-line check.
-  assert.match(plain.stdout, /\nWhen your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done\. Exit 1 is a contract problem; exit 2 means nothing could be checked\.\n$/);
-  // The same text Claude Code is given, byte for byte.
-  assert.equal(`${output.additionalContext}\n`, plain.stdout);
+  // The same service line Claude Code is given, byte for byte (the background-refresh line is claimed by the first run only).
+  assert.equal(`${output.additionalContext}\n`, plain.stdout.split("\n").slice(0, 1).join("\n") + "\n");
 });
 
 test("no index gives the session one line and no session fails on it", async (t) => {
@@ -288,16 +301,16 @@ test("the session line is printed whichever channel delivers verdicts", async (t
     cwd: workspace.root,
     env: fakeEnv({
       CARRICK_CHANNEL: "lsp",
-      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace-waiting.json"),
     }),
   });
-  assert.match(lsp.stdout, /^Carrick indexed/);
+  assert.match(lsp.stdout, /^- user-service at /);
 
   const off = await runHook("session-start.ts", {
     cwd: workspace.root,
     env: fakeEnv({
       CARRICK_CHANNEL: "off",
-      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("status-workspace-waiting.json"),
     }),
   });
   assert.equal(off.stdout, "");

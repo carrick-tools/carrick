@@ -15,7 +15,6 @@ import {
   type Counted,
   type Counterpart,
   type RunningScan,
-  type StatusRepo,
   type StatusResult,
   type StatusService,
   type UnreadItem,
@@ -640,16 +639,6 @@ export function renderPostRead(result: CheckResult, displayFile?: string): strin
 }
 
 /**
- * The boundary for one service in a status answer, same preference as a check.
- */
-export function serviceBoundary(service: StatusService): string[] {
-  if (service.boundary_lines?.length) return service.boundary_lines;
-  const counts = boundaryLines(service.boundary, service.service);
-  if (service.boundary_note) return [service.boundary_note, ...counts];
-  return counts;
-}
-
-/**
  * Candidates only `carrick index` resolves, or 0 when the hosted index is the
  * index answering for this service: an index read in from the hosted rows
  * (`hosted_state` "enriched") was built with the model, so the local
@@ -708,16 +697,6 @@ export function runningScanLine(scan: RunningScan): string {
   return `- scan ${scan.scan_id} is running${where}${counts}${slow}. Its output is in .carrick/scan-${scan.scan_id}.log`;
 }
 
-/**
- * One line per repo, for the files no service in it reads: a workflow, a
- * lockfile, an editor's settings. Empty when there are none, because a repo
- * whose every change is inside a service has nothing to add.
- */
-export function repoLine(repo: StatusRepo): string | null {
-  if (!repo.outside_every_service) return null;
-  return `- ${repo.name}: ${repo.outside_every_service} file(s) changed outside every service`;
-}
-
 /** `2 h ago`, `8 days ago`: how long before `now` the time `iso` was. */
 export function ago(iso: string, now: number): string | null {
   const then = Date.parse(iso);
@@ -760,14 +739,13 @@ const STALE_RECORD_MS = 60 * 60_000;
  * every answer.
  */
 export function hostedLine(sync: SyncRecord, now: number): string | null {
-  if (!sync.repos.length) return null;
+  const older = sync.repos.filter((repo) => repo.copy_commit !== repo.hosted_commit);
+  // A copy at the hosted commit is a fresh index: nothing to say.
+  if (!older.length) return null;
   const hosted = sync.repos.map((repo) => indexAt(repo, repo.hosted_commit, repo.hosted_scanned_at, now));
   let line = `Carrick's MCP tools answer from the hosted index: ${named(hosted)}.`;
-  const older = sync.repos.filter((repo) => repo.copy_commit !== repo.hosted_commit);
-  if (older.length) {
-    const copies = older.map((repo) => indexAt(repo, repo.copy_commit, repo.copy_scanned_at, now));
-    line += ` The hooks and \`carrick check\` compare against this machine's older copy: ${named(copies)}.`;
-  }
+  const copies = older.map((repo) => indexAt(repo, repo.copy_commit, repo.copy_scanned_at, now));
+  line += ` The hooks and \`carrick check\` compare against this machine's older copy: ${named(copies)}.`;
   const checked = Date.parse(sync.at);
   if (Number.isFinite(checked) && now - checked > STALE_RECORD_MS) {
     line += ` Last checked ${ago(sync.at, now)}.`;
@@ -810,10 +788,7 @@ export function heldLine(sync: SyncRecord): string | null {
  * indexed and what each service could not classify, and nothing about whether a
  * contract holds.
  */
-export function renderSessionStart(
-  status: StatusResult,
-  options: { afterHostedLine?: boolean } = {},
-): string {
+export function renderSessionStart(status: StatusResult): string {
   const scans = [...(status.running_scans ?? []).map(runningScanLine), ...(status.analysing ?? [])];
   if (status.error === "not_indexed") {
     // A first index being built right now is the answer, not "there is none":
@@ -840,84 +815,22 @@ export function renderSessionStart(
     return `Carrick has an index at ${status.workspace ?? "this workspace"} and it holds no services.`;
   }
 
-  const version = status.scanner_version ? `, scanner ${status.scanner_version}` : "";
-  const where = status.workspace ? ` in ${status.workspace}` : "";
-  // Below a hosted line this date is the one beside the MCP's, so it says
-  // whose it is (carrick#3432).
-  const machine = options.afterHostedLine ? " on this machine" : "";
-  const when = status.indexed_at ? `${machine} at ${status.indexed_at}` : "";
-
-  // Every service, with its boundary, is what this printed: on a workspace of
-  // fifteen that was about ninety lines in every session's context, most of
-  // them counts of things nobody acts on when a session opens — SDK calls that
-  // produced no edge, examples of types that did not resolve, rows the model
-  // alone states (carrick#1365). A small workspace keeps all of it, because
-  // there it IS the orientation; a large one gets the services with something
-  // to do about them, and one line naming the command that prints the rest.
-  // The totals go on the first line only where the services below it are the
-  // exceptions; where every service is listed, each line carries its own.
-  const detailed = status.services.length <= DETAILED_SERVICES;
-  const lines: string[] = [
-    `Carrick indexed ${status.services.length} service(s)${where}${when}${version}${detailed ? "" : totals(status)}.`,
-    ...scans,
-  ];
-  // Said once for the whole index, ahead of the services: every verdict below
-  // is missing, and an agent that reads "no contract problem" later would
-  // otherwise take that as an answer (carrick#3204).
+  // A healthy, fresh index prints nothing: the counts, the per-service block
+  // and the rule line are `carrick status` and AGENTS.md's to give. What is
+  // left is what an agent can act on now.
+  const lines: string[] = [...scans];
+  // Said once for the whole index: every verdict is missing, and an agent that
+  // reads "no contract problem" later would otherwise take that as an answer
+  // (carrick#3204).
   if (status.type_check && !status.type_check.ran) {
     const reason = status.type_check.reason?.replace(/\.+$/, "") ?? "no reason recorded";
     lines.push(
       `Types were not checked for this index (${reason}), so no pair has a type verdict.`,
     );
   }
-  if (detailed) {
-    for (const service of status.services) lines.push(serviceLine(service));
-  } else {
-    // One count for the services that moved, never their files: an edit to a
-    // shared file moved every service that reads it, and the same paths on
-    // each line were not something to act on at session start (carrick#3477).
-    const moved = status.services.filter((service) => service.changed_since_index > 0).length;
-    if (moved > 0) {
-      lines.push(
-        `${moved} service${moved === 1 ? " has" : "s have"} local changes since the index; \`carrick status\` lists them.`,
-      );
-    }
-    const actionable = status.services.filter(hasSomethingToDo);
-    for (const service of actionable.slice(0, LISTED_SERVICES)) lines.push(serviceLine(service));
-    if (actionable.length > LISTED_SERVICES) {
-      lines.push(`- +${actionable.length - LISTED_SERVICES} more service(s) with something to act on`);
-    }
-  }
-  for (const repo of status.repos ?? []) {
-    const line = repoLine(repo);
-    if (line) lines.push(line);
-  }
-  if (detailed) {
-    for (const service of status.services) {
-      for (const line of serviceBoundary(service)) lines.push(line);
-    }
-  } else {
-    lines.push(BOUNDARY_POINTER);
-  }
+  for (const service of status.services.filter(hasSomethingToDo)) lines.push(serviceLine(service));
   return lines.join("\n");
 }
-
-/**
- * The one instruction a session start gives about finishing work. The
- * AGENTS.md section alone did not get the check run (proof run: 1 of 6).
- */
-export const CHECK_BEFORE_DONE =
-  "When your change touches a route, a call to another service, an event or a type another service reads, run `carrick check --changed` before you call it done. Exit 1 is a contract problem; exit 2 means nothing could be checked.";
-
-/** Up to this many services, a session start states every one of them. */
-export const DETAILED_SERVICES = 3;
-
-/** Above that, at most this many of the ones with something to do. */
-export const LISTED_SERVICES = 8;
-
-/** Where the per-service boundary report lives, for the session that wants it. */
-export const BOUNDARY_POINTER =
-  "Per-service detail, including what each scan could not classify: `carrick status`.";
 
 /**
  * Whether a service is worth a line at the start of a session.
@@ -931,11 +844,4 @@ export const BOUNDARY_POINTER =
 export function hasSomethingToDo(service: StatusService): boolean {
   if (candidatesWaiting(service) > 0) return true;
   return service.hosted_state !== undefined && service.hosted_state !== "enriched";
-}
-
-/** What the whole index holds, so the services below it can be the exceptions. */
-function totals(status: StatusResult): string {
-  const sum = (pick: (service: StatusService) => number): number =>
-    status.services.reduce((total, service) => total + pick(service), 0);
-  return `: ${sum((service) => service.routes)} route(s), ${sum((service) => service.calls)} call(s)`;
 }
