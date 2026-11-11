@@ -398,6 +398,7 @@ pub(crate) fn of_own_decorators(
             labelled_end: Some(found.end.clone()),
             kind: found.kind.clone(),
             role: found.role.clone(),
+            ends: Vec::new(),
             listed: false,
         });
     }
