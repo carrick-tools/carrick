@@ -41,6 +41,7 @@ use tracing::warn;
 
 use crate::name_census::{LibraryNames, NameOutcome};
 use crate::operation::{GraphqlOperationKind, PubsubRole, SocketDirection};
+use crate::request_summary::decided_sites::reserved_on;
 use crate::request_summary::{
     LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector, SiteMaker,
     SiteReceiver,
@@ -1125,7 +1126,7 @@ impl Reading<'_> {
         let name = self
             .site
             .literal(slot_arg(name_slot), slot_key(name_slot))?;
-        if !self.name_ok(name, None) {
+        if !self.name_ok(name, (Some(ClaimOn::Export), &None)) {
             return None;
         }
         Some(self.stated(
@@ -1254,7 +1255,7 @@ impl Reading<'_> {
                     return None;
                 }
             };
-            if !self.name_ok(text, Some(&receiver)) {
+            if !self.name_ok(text, (*on, of)) {
                 return None;
             }
             // A `by_origin` export has no side of its own (see `row_kind`).
@@ -1283,9 +1284,10 @@ impl Reading<'_> {
     }
 
     /// A name one row can state: not empty, no wildcard character of the
-    /// library's, and not a name the library emits itself on this receiver
-    /// (`receiver`; a definition is on the export).
-    fn name_ok(&self, name: &str, receiver: Option<&str>) -> bool {
+    /// library's, and not a name the library emits itself where the op
+    /// claimed on `selector` acts (a definition is on the export), as the
+    /// site labels answer it ([`reserved_on`]).
+    fn name_ok(&self, name: &str, selector: (Option<ClaimOn>, &Option<String>)) -> bool {
         if name.is_empty()
             || self
                 .export
@@ -1295,14 +1297,14 @@ impl Reading<'_> {
         {
             return false;
         }
-        let receiver = receiver.unwrap_or("export");
-        !self.claims.iter().any(|(id, claim)| {
-            matches!(claim, LibraryClaim::Reserved { member, name: reserved, path, .. }
-                if reserved == name
-                    && Some(member) == self.site.member.as_ref()
-                    && *path == self.site.path)
-                && self.verified(id, receiver)
-        })
+        !reserved_on(
+            &self.export.claims,
+            self.site.member.as_deref(),
+            &self.site.path,
+            selector,
+        )
+        .iter()
+        .any(|reserved| reserved == name)
     }
 }
 

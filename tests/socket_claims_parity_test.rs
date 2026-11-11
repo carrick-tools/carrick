@@ -71,9 +71,18 @@ struct Row {
     source: Option<String>,
 }
 
-/// The socket rows of a scan of `repo` (a directory already copied and
-/// committed), one scan of the whole directory as the Action runs it.
-fn scan_dir(repo: &Path) -> Vec<Row> {
+/// What one scan stores for its sockets.
+struct Scan {
+    rows: Vec<Row>,
+    /// Each socket site the scan could not read, `<file>:<line> <slot>
+    /// <reason>`, as `unread_sites` saves it.
+    unread: Vec<String>,
+}
+
+/// The socket rows and unread socket sites of a scan of `repo` (a directory
+/// already copied and committed), one scan of the whole directory as the
+/// Action runs it.
+fn scan_dir(repo: &Path) -> Scan {
     let tmp = tempfile::tempdir().unwrap();
     let (storage, home, cache) = (
         tmp.path().join("storage"),
@@ -127,6 +136,7 @@ fn scan_dir(repo: &Path) -> Vec<Row> {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut rows = Vec::new();
+    let mut unread = Vec::new();
     for entry in std::fs::read_dir(&storage).expect("storage dir") {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -162,14 +172,27 @@ fn scan_dir(repo: &Path) -> Vec<Row> {
                 });
             }
         }
+        for site in blob["unread_sites"].as_array().into_iter().flatten() {
+            if site["kind"] != "socket" {
+                continue;
+            }
+            unread.push(format!(
+                "{}:{} {} {}",
+                site["file"].as_str().unwrap(),
+                site["line"],
+                site["slot"].as_str().unwrap(),
+                site["reason"].as_str().unwrap()
+            ));
+        }
     }
     rows.sort();
-    rows
+    unread.sort();
+    Scan { rows, unread }
 }
 
 /// A committed copy of `tests/fixtures/<name>` (plus the overlay of the
 /// corpora), in a fresh temp dir; scanned as one repo.
-fn scan_fixture(name: &str) -> Vec<Row> {
+fn scan_fixture(name: &str) -> Scan {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(&fixtures().join(name), &repo);
@@ -196,7 +219,7 @@ fn scan_corpus_repo(corpus: &str, repo_name: &str) -> Vec<Row> {
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A", "-f"]);
     run_git(&repo, &["commit", "-q", "-m", "init"]);
-    let mut rows = scan_dir(&repo);
+    let mut rows = scan_dir(&repo).rows;
     // One repo, one service: the service is the repo.
     for row in &mut rows {
         row.service = repo_name.to_string();
@@ -222,18 +245,10 @@ fn pairs(rows: &[Row], key: &str) -> bool {
     })
 }
 
-/// The two rows the fact layer states where the old rules state none (see
-/// `the_fact_layer_states_two_rows_the_old_rules_skip`): a client's lifecycle
-/// `connect` on a socket made by a call-form factory, and an event whose name is
-/// a template over a runtime value.
-fn is_extra(row: &Row) -> bool {
-    row.key.ends_with("|connect") || row.key.contains("${")
-}
-
 fn keys(rows: &[Row], side: &str) -> Vec<String> {
     let mut keys: Vec<String> = rows
         .iter()
-        .filter(|row| row.side == side && !is_extra(row))
+        .filter(|row| row.side == side)
         .map(|row| row.key.clone())
         .collect();
     keys.sort();
@@ -256,7 +271,7 @@ fn assert_all_fact_rows(rows: &[Row]) {
 /// client, import-anchored, reserved events filtered, dynamic names skipped.
 #[test]
 fn a_socket_service_states_its_directional_contract() {
-    let rows = scan_fixture("socket-service-claims");
+    let rows = scan_fixture("socket-service-claims").rows;
     assert_all_fact_rows(&rows);
     assert_eq!(
         keys(&rows, "endpoints"),
@@ -282,32 +297,37 @@ fn a_socket_service_states_its_directional_contract() {
     );
 }
 
-/// Two rows the old rules do not state and the fact layer does (both read on
-/// the first run of this file against main; D3 does not lose them, it keeps
-/// them): `connect` on a client socket made by `io(url)` at module level, where
-/// the label reserves it (the old rules drop `RESERVED_EVENTS`), and an emit
-/// whose name is a template over a runtime value (the old rules skip dynamic
-/// names). Pinned so a fix flips this test; neither row is a lost row.
+/// `connect` on a client socket made by `io(url)` at module level is a name
+/// the library emits itself, as it is on the class-field twin: the library
+/// reader and the site labels read one answer to "is this name reserved"
+/// (`decided_sites::reserved_on`), whether or not the verifier found the name
+/// in the package's declarations (this stub declares `on(event: string)`).
 #[test]
-fn the_fact_layer_states_two_rows_the_old_rules_skip() {
-    let rows = scan_fixture("socket-service-claims");
+fn a_reserved_event_on_a_module_level_client_socket_states_no_row() {
+    let rows = scan_fixture("socket-service-claims").rows;
     assert!(
-        has(
-            &rows,
-            "endpoints",
-            "socket|SERVER->CLIENT|connect",
-            "client.ts"
-        ),
+        !rows.iter().any(|row| row.key.ends_with("|connect")),
         "{rows:#?}"
     );
+}
+
+/// An emit whose event name is a template over an environment read names an
+/// event the code chooses at run time: it states no row, and the site is
+/// saved as unread with its reason (a socket event has no placeholder form;
+/// it pairs by its whole text).
+#[test]
+fn an_emit_named_by_a_runtime_template_is_an_unread_site() {
+    let scan = scan_fixture("socket-service-claims");
     assert!(
-        has(
-            &rows,
-            "calls",
-            "socket|CLIENT->SERVER|metrics:${process.env.SHARD}",
-            "client.ts"
-        ),
-        "{rows:#?}"
+        !scan.rows.iter().any(|row| row.key.contains("metrics")),
+        "{:#?}",
+        scan.rows
+    );
+    assert!(
+        scan.unread
+            .contains(&"src/client.ts:17 name unresolved_import".to_string()),
+        "{:#?}",
+        scan.unread
     );
 }
 
@@ -315,7 +335,7 @@ fn the_fact_layer_states_two_rows_the_old_rules_skip() {
 /// per-connection socket on a constructor parameter property.
 #[test]
 fn a_socket_held_on_a_class_field_is_stated_on_both_sides() {
-    let rows = scan_fixture("socket-class-field-claims");
+    let rows = scan_fixture("socket-class-field-claims").rows;
     assert_all_fact_rows(&rows);
     for event in ["run:subscribe", "run:unsubscribe"] {
         let key = format!("socket|CLIENT->SERVER|{event}");
@@ -342,7 +362,7 @@ fn a_socket_held_on_a_class_field_is_stated_on_both_sides() {
 /// package's socket type, one of them imported from the declaring module.
 #[test]
 fn a_socket_declared_through_a_type_alias_is_stated() {
-    let rows = scan_fixture("socket-type-alias-claims");
+    let rows = scan_fixture("socket-type-alias-claims").rows;
     assert_all_fact_rows(&rows);
     for event in ["run:start", "run:stop"] {
         let key = format!("socket|CLIENT->SERVER|{event}");
@@ -370,7 +390,7 @@ fn a_socket_declared_through_a_type_alias_is_stated() {
 /// the server, beside a default-namespace handler in the same file.
 #[test]
 fn a_namespaced_handler_is_stated_and_meets_its_publishers() {
-    let rows = scan_fixture("socket-namespace-claims");
+    let rows = scan_fixture("socket-namespace-claims").rows;
     assert_all_fact_rows(&rows);
     for event in ["run:subscribe", "run:unsubscribe"] {
         let key = format!("socket|CLIENT->SERVER|{event}");

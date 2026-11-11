@@ -641,14 +641,19 @@ fn expr_written_as(parsed: &Parsed, exprs: &[&Expr], text: &str) -> Option<Expr>
 /// The whole values a slot's composed value (`pieces`) states: its text
 /// when every piece is literal, or when it is one value this pass does not
 /// read, the values of the expression the call writes for it among `exprs`.
+/// With `env_bases`, a text an environment read starts or joins is stated
+/// by name ([`env_based_text`]).
 fn stated_whole(
     parsed: Option<&Parsed>,
     pieces: &[super::Piece],
     exprs: &[&Expr],
     literals: &dyn Fn(&str) -> Vec<String>,
     choices: &Choices<'_, '_>,
+    env_bases: bool,
 ) -> Option<Whole> {
-    if let Some(text) = literal_text(pieces).or_else(|| env_based_text(pieces)) {
+    if let Some(text) =
+        literal_text(pieces).or_else(|| env_bases.then(|| env_based_text(pieces)).flatten())
+    {
         return Some(Whole::one(text));
     }
     // A name written as one choice: the summaries' pieces keep one side of
@@ -2017,6 +2022,11 @@ fn record(
         .iter()
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
+    // An environment read is a base the request rows write by name
+    // (`${process.env.API}/items`). A socket event matches its listener by
+    // its whole text and has no base: a name that reads one is a value the
+    // code chooses at run time, so it states no name here (C06 R-D3b).
+    let env_bases = label.role != "socket";
     let whole_names: Option<Whole> = match (&site.key, label.reads_name_of(site)) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
@@ -2025,7 +2035,7 @@ fn record(
         (None, true) => {
             if let Some(text) = literal_text(&site.name) {
                 stated.value(&text, place(PlaceFrom::StringLiteral, &at));
-            } else if let Some(text) = env_based_text(&site.name) {
+            } else if let Some(text) = env_bases.then(|| env_based_text(&site.name)).flatten() {
                 stated.value(&text, place(PlaceFrom::TemplateLiteral, &at));
             }
             // Else, for HTTP, the target the request summaries compose from
@@ -2053,6 +2063,7 @@ fn record(
                     in_place: true,
                     hole: &name_hole,
                 },
+                env_bases,
             ) {
                 Some(values) => Some(values),
                 None => read_through
@@ -2230,6 +2241,7 @@ fn record(
                             in_place: false,
                             hole: &Cell::new(None),
                         },
+                        true,
                     )
                     .map(|whole| whole.values)
                 }
