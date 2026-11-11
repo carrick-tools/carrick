@@ -979,6 +979,16 @@ struct CallIr {
     /// which ends the list; empty for a JSX element, whose props are no
     /// positional argument. Read by the text reader's caller mode (B10-1b).
     arg_texts: Vec<Option<ValueAt>>,
+    /// What each argument after the first spread may hold, a spread an
+    /// empty entry ([`Reader::rest_values`]): a member that merges every
+    /// argument from a slot on reads them past a spread (carrick#3538).
+    /// Read by the procedures walk alone.
+    rest_values: Vec<Vec<ValueAt>>,
+    /// Each argument's span before the first spread, read past parentheses,
+    /// type assertions and an `await` ([`arg_spans`]): which expression is
+    /// written in place at a position. Read by the procedures walk alone
+    /// (carrick#3538).
+    arg_spans: Vec<(u32, u32)>,
     /// The call is what an `if`, a ternary or a `&&` tests: the branch its
     /// result guards.
     tested: Option<Tested>,
@@ -1685,6 +1695,23 @@ pub struct FileIr {
     /// `super(…)`, which names the class, joins the constructor it runs
     /// (carrick#3527, [`Self::constructor_at`]).
     constructor_keys: HashMap<u32, Vec<(String, String)>>,
+    /// Each function-local binding [`Scope::held`] holds, by its
+    /// initialiser's span (discovery numbering, the initialiser read past
+    /// an `await`): a use of the name is read as the initialiser's values,
+    /// so these say which binding a value the procedures walk reaches is
+    /// held in (carrick#3538 M1). Read by that walk alone.
+    held_inits: HashMap<(u32, u32), HeldInit>,
+    /// FALLBACK (carrick#3794, deleted when block-scoped and nested-function
+    /// locals are in the one binding table): each plain declarator written
+    /// in a nested block, by the line its name is declared on and the name,
+    /// which [`Self::module_bindings`] does not hold. Read by the
+    /// procedures walk alone, and each read is counted.
+    block_bindings: HashMap<(u32, String), BlockBinding>,
+    /// FALLBACK (carrick#3794): what each named function of the file returns
+    /// (a declaration, or a declarator whose initialiser is a function), by
+    /// the line its name is declared on and the name: for a function no
+    /// definition key joins. Read by the procedures walk alone, counted.
+    block_returns: HashMap<(u32, String), Vec<ValueAt>>,
 }
 
 /// Text a link resolves to, and what a binding hands an importer where it
@@ -2004,6 +2031,9 @@ pub fn extract_file_ir(
             .collect(),
         recording_depth: std::cell::Cell::new(0),
         arg_pieces: std::cell::RefCell::new(HashMap::new()),
+        held_inits: Default::default(),
+        block_bindings: Default::default(),
+        function_returns: Default::default(),
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
@@ -2482,6 +2512,15 @@ pub fn extract_file_ir(
         );
     }
     file.arg_pieces = reader.arg_pieces.take();
+    file.held_inits = reader.held_inits.take();
+    file.block_bindings = reader.block_bindings.take();
+    // FALLBACK (carrick#3794): each named function's returns, by its name's
+    // line and its name.
+    let returns = reader.function_returns.take();
+    file.block_returns = named_functions(module, source_map)
+        .into_iter()
+        .filter_map(|(start, at)| Some((at, returns.get(&start)?.clone())))
+        .collect();
     // What a row stated in another module needs to say about a client's
     // base the way this module's own rows say it (carrick#1568). Any file
     // that imports a package's client may build one.
@@ -2492,6 +2531,60 @@ pub fn extract_file_ir(
             .collect();
     }
     file
+}
+
+/// Each argument's span (discovery numbering) before the first spread, read
+/// past parentheses, type assertions and an `await` ([`CallIr::arg_spans`]).
+fn arg_spans(args: &[ExprOrSpread]) -> Vec<(u32, u32)> {
+    args.iter()
+        .take_while(|arg| arg.spread.is_none())
+        .map(|arg| {
+            let span = unwrap_value(&arg.expr).span();
+            (span.lo.0, span.hi.0)
+        })
+        .collect()
+}
+
+/// FALLBACK (carrick#3794): every function declaration, and every plain
+/// declarator whose initialiser is a function, at any depth, by where its
+/// function node starts, with the line its name is declared on and the name.
+fn named_functions(module: &Module, source_map: &Lrc<SourceMap>) -> HashMap<u32, (u32, String)> {
+    struct Find<'s> {
+        source_map: &'s Lrc<SourceMap>,
+        found: HashMap<u32, (u32, String)>,
+    }
+    impl Find<'_> {
+        fn line(&self, span: Span) -> u32 {
+            self.source_map.lookup_char_pos(span.lo).line as u32
+        }
+    }
+    impl Visit for Find<'_> {
+        fn visit_fn_decl(&mut self, decl: &FnDecl) {
+            let at = (self.line(decl.ident.span), decl.ident.sym.to_string());
+            self.found.insert(decl.function.span.lo.0, at);
+            decl.visit_children_with(self);
+        }
+        fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+            if let Pat::Ident(binding) = &declarator.name {
+                let start = match declarator.init.as_deref().map(unwrap_value) {
+                    Some(Expr::Arrow(arrow)) => Some(arrow.span.lo.0),
+                    Some(Expr::Fn(function)) => Some(function.function.span.lo.0),
+                    _ => None,
+                };
+                if let Some(start) = start {
+                    let at = (self.line(binding.id.span), binding.id.sym.to_string());
+                    self.found.insert(start, at);
+                }
+            }
+            declarator.visit_children_with(self);
+        }
+    }
+    let mut find = Find {
+        source_map,
+        found: HashMap::new(),
+    };
+    module.visit_with(&mut find);
+    find.found
 }
 
 /// A function an object literal holds as one of its entries.
@@ -5145,6 +5238,32 @@ struct Reader<'a> {
     recording_depth: std::cell::Cell<usize>,
     /// What [`FileIr::arg_pieces`] keeps, gathered as the file is read.
     arg_pieces: std::cell::RefCell<HashMap<(u32, u32), Vec<Piece>>>,
+    /// Each function-local binding the scope holds ([`Scope::held`]), by
+    /// its initialiser's span ([`FileIr::held_inits`], carrick#3538 M1).
+    held_inits: std::cell::RefCell<HashMap<(u32, u32), HeldInit>>,
+    /// Each declarator a nested block writes ([`FileIr::block_bindings`],
+    /// carrick#3794).
+    block_bindings: std::cell::RefCell<HashMap<(u32, String), BlockBinding>>,
+    /// What each function returns, by where its node starts
+    /// ([`FileIr::block_returns`], carrick#3794).
+    function_returns: std::cell::RefCell<HashMap<u32, Vec<ValueAt>>>,
+}
+
+/// The binding a function-local value is held in, for the procedures walk
+/// (carrick#3538 M1): the name, and whether it is a `const` (one that is
+/// not is never named a router's key path from).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldInit {
+    name: String,
+    constant: bool,
+}
+
+/// A declarator no binding table row holds (carrick#3794): what its
+/// initialiser may hold and whether it is a `const`.
+#[derive(Debug, Clone)]
+struct BlockBinding {
+    init: Vec<ValueAt>,
+    constant: bool,
 }
 
 impl Reader<'_> {
@@ -6041,7 +6160,18 @@ impl Reader<'_> {
             None => ir.bodyless = true,
         }
         ir.settle_returned(function.is_async, function.is_generator);
+        self.keep_returns(function.span.lo.0, &ir);
         ir
+    }
+
+    /// FALLBACK (carrick#3794): what the function starting at `start`
+    /// returns, for [`FileIr::block_returns`].
+    fn keep_returns(&self, start: u32, ir: &FnIr) {
+        if !ir.returned_values.is_empty() {
+            self.function_returns
+                .borrow_mut()
+                .insert(start, ir.returned_values.clone());
+        }
     }
 
     fn arrow(
@@ -6112,6 +6242,7 @@ impl Reader<'_> {
             }
         }
         ir.settle_returned(arrow.is_async, arrow.is_generator);
+        self.keep_returns(arrow.span.lo.0, &ir);
         ir
     }
 
@@ -6181,6 +6312,16 @@ impl Reader<'_> {
                             !matches!(value, ValueAt::Unread | ValueAt::Constructed { .. })
                         }) {
                             scope.held.insert(ident_key(&ident.id), values);
+                            // Which binding a value read through the name
+                            // is held in (carrick#3538 M1).
+                            let at = unwrap_value(init).span();
+                            self.held_inits.borrow_mut().insert(
+                                (at.lo.0, at.hi.0),
+                                HeldInit {
+                                    name: ident.id.sym.to_string(),
+                                    constant: var.kind == VarDeclKind::Const,
+                                },
+                            );
                         }
                     }
                     // One the body writes again is every value written to
@@ -6213,6 +6354,7 @@ impl Reader<'_> {
                                 .as_deref()
                                 .map(|init| resolve::text_of(init, &|lo| lo)),
                             reassigned: reassigned.names.contains(ident.id.sym.as_ref()),
+                            plain: declarator.init.is_some(),
                         });
                     }
                     // `const { a, b: name } = init`: each plain key is a local
@@ -6240,6 +6382,7 @@ impl Reader<'_> {
                                 kind: var.kind.into(),
                                 text: Some(member.text(init, &|lo| lo)),
                                 reassigned: reassigned.names.contains(name),
+                                plain: false,
                             });
                         }
                     }
@@ -8007,6 +8150,8 @@ impl Visit for CallWalker<'_, '_, '_> {
             callee_key,
             arg_values,
             arg_texts,
+            rest_values: self.reader.rest_values(&call.args, self.scope, bound),
+            arg_spans: arg_spans(&call.args),
             tested: self.guard.tested(call.span),
             handed,
             names,
@@ -8094,6 +8239,8 @@ impl Visit for CallWalker<'_, '_, '_> {
                 callee_key: None,
                 arg_values: Vec::new(),
                 arg_texts: Vec::new(),
+                rest_values: Vec::new(),
+                arg_spans: Vec::new(),
                 tested: None,
                 handed: Vec::new(),
                 names: Vec::new(),
@@ -8267,6 +8414,32 @@ impl Visit for CallWalker<'_, '_, '_> {
     fn visit_member_expr(&mut self, member: &MemberExpr) {
         self.read_table_key(member);
         member.visit_children_with(self);
+    }
+
+    // FALLBACK (carrick#3794): a declarator a nested block writes, which no
+    // binding table row holds, for the procedures walk alone. A body's own
+    // top-level declarators are read by `body`, never visited here.
+    fn visit_var_decl(&mut self, var: &VarDecl) {
+        for declarator in &var.decls {
+            if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
+                let line = self
+                    .reader
+                    .source_map
+                    .lookup_char_pos(ident.id.span.lo)
+                    .line as u32;
+                let init = self
+                    .reader
+                    .value_of(init, self.scope, &guards::Bound::default());
+                self.reader.block_bindings.borrow_mut().insert(
+                    (line, ident.id.sym.to_string()),
+                    BlockBinding {
+                        init,
+                        constant: var.kind == VarDeclKind::Const,
+                    },
+                );
+            }
+        }
+        var.visit_children_with(self);
     }
 
     fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
