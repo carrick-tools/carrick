@@ -31,6 +31,7 @@ use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
 use crate::operation::{Protocol, PubsubRole};
 use crate::parser::parse_file;
 use crate::type_manifest::is_http_method;
+use crate::uri_versioning::{RawVersion, RouteVersion, controller_version, handler_version};
 use crate::wrapper_request_shape::{RequestShapeSignal, call_request_shape};
 
 /// A candidate API call site detected by the SWC scanner.
@@ -510,6 +511,12 @@ pub struct DecoratorRoute {
     pub span_start: u32,
     /// End byte offset of the method.
     pub span_end: u32,
+    /// The module the verb decorator came from. The service's versioning
+    /// statements count only when they come from one of these.
+    pub origin: String,
+    /// The version the handler or the controller states for this route
+    /// (carrick#3422). See [`crate::uri_versioning`].
+    pub version: crate::uri_versioning::RouteVersion,
 }
 
 /// A route bound to an imported handler in a route table
@@ -1346,7 +1353,7 @@ pub(crate) fn parse_standalone_module(
 /// Local binding name -> the module specifier it was imported from, for every
 /// value import in `module`. Type-only imports bind nothing at runtime, so a
 /// route can never be bound to one.
-fn collect_import_locals(module: &Module) -> HashMap<String, String> {
+pub(crate) fn collect_import_locals(module: &Module) -> HashMap<String, String> {
     let mut imports = HashMap::new();
     for item in &module.body {
         let ModuleItem::ModuleDecl(ModuleDecl::Import(decl)) = item else {
@@ -1684,7 +1691,7 @@ fn may_declare_decorators(content: &str) -> bool {
 /// A decorator's callee name and its arguments, for the `@Name(args)` form.
 /// A decorator that is a bare identifier (`@Injectable`) or a member
 /// expression states nothing this reads.
-fn decorator_call(decorator: &Decorator) -> Option<(String, &[ExprOrSpread])> {
+pub(crate) fn decorator_call(decorator: &Decorator) -> Option<(String, &[ExprOrSpread])> {
     let Expr::Call(call) = &*decorator.expr else {
         return None;
     };
@@ -1709,7 +1716,7 @@ fn decorator_string_argument(args: &[ExprOrSpread]) -> Option<String> {
 
 /// The text of a string literal or of a template literal with no
 /// substitution, `None` for any other expression.
-fn literal_string(expr: &Expr) -> Option<String> {
+pub(crate) fn literal_string(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
         Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => tpl.quasis[0]
@@ -1805,6 +1812,8 @@ struct VerbDecoratedMethod {
     returns_no_payload: bool,
     span_start: u32,
     span_end: u32,
+    /// What `@Version(...)` on the method states (carrick#3422).
+    version: RawVersion,
 }
 
 impl DecoratorRouteVisitor {
@@ -1840,10 +1849,17 @@ impl DecoratorRouteVisitor {
                 let Some(path) = decorator_string_argument(args) else {
                     continue;
                 };
+                let decorator_origin = self.origin(&decorator_name);
+                let version = handler_version(
+                    &method.function.decorators,
+                    &self.imports,
+                    &decorator_origin,
+                    |name| self.origin(name),
+                );
                 methods.push(VerbDecoratedMethod {
                     http_method,
                     path,
-                    decorator_origin: self.origin(&decorator_name),
+                    decorator_origin,
                     name: name.clone(),
                     // The method's NAME, not its span: the span opens at the
                     // first decorator, which would report the route a line or
@@ -1853,6 +1869,7 @@ impl DecoratorRouteVisitor {
                     returns_no_payload: declares_no_payload_return(&method.function),
                     span_start: method.span.lo.0,
                     span_end: method.span.hi.0,
+                    version,
                 });
             }
         }
@@ -1907,7 +1924,7 @@ impl DecoratorRouteVisitor {
         &self,
         class: &'a Class,
         methods: &[VerbDecoratedMethod],
-    ) -> Option<String> {
+    ) -> Option<(String, RawVersion)> {
         let verb_origins: HashSet<&str> = methods
             .iter()
             .map(|method| method.decorator_origin.as_str())
@@ -1918,7 +1935,7 @@ impl DecoratorRouteVisitor {
                 .contains(self.origin(&name).as_str())
                 .then_some(args)
         };
-        let stated: Vec<String> = class
+        let stated: Vec<(String, RawVersion)> = class
             .decorators
             .iter()
             .filter_map(same_origin_arguments)
@@ -1927,7 +1944,9 @@ impl DecoratorRouteVisitor {
                     return None;
                 };
                 match class_prefix_statement(arg)? {
-                    ClassPrefixStatement::Stated(text) => Some(text),
+                    ClassPrefixStatement::Stated(text) => {
+                        Some((text, controller_version(arg, &self.imports)))
+                    }
                     ClassPrefixStatement::Empty => None,
                 }
             })
@@ -1937,15 +1956,15 @@ impl DecoratorRouteVisitor {
                 .decorators
                 .iter()
                 .filter_map(same_origin_arguments)
-                .filter(|args| match args {
-                    [] => true,
+                .filter_map(|args| match args {
+                    [] => Some((String::new(), RawVersion::Absent)),
                     [arg] => matches!(
                         class_prefix_statement(arg),
                         Some(ClassPrefixStatement::Empty)
-                    ),
-                    _ => false,
+                    )
+                    .then(|| (String::new(), controller_version(arg, &self.imports))),
+                    _ => None,
                 })
-                .map(|_| String::new())
                 .collect()
         } else {
             stated
@@ -1972,11 +1991,16 @@ impl Visit for DecoratorRouteVisitor {
         if methods.is_empty() {
             return;
         }
-        let Some(prefix) = self.class_prefix(&node.class, &methods) else {
+        let Some((prefix, class_version)) = self.class_prefix(&node.class, &methods) else {
             return;
         };
         let class_name = node.ident.sym.to_string();
         for method in methods {
+            // The nearest statement wins: the handler's, then the controller's.
+            let version = match method.version.for_origin(&method.decorator_origin) {
+                RouteVersion::Inherit => class_version.for_origin(&method.decorator_origin),
+                stated => stated,
+            };
             self.routes.push(DecoratorRoute {
                 path: join_decorator_path(&prefix, &method.path),
                 method: method.http_method,
@@ -1987,6 +2011,8 @@ impl Visit for DecoratorRouteVisitor {
                 returns_no_payload: method.returns_no_payload,
                 span_start: method.span_start,
                 span_end: method.span_end,
+                origin: method.decorator_origin,
+                version,
             });
         }
     }

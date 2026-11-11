@@ -670,6 +670,19 @@ pub struct ProcessingStats {
     /// a literal (carrick#2092). Each is logged with its site; the scope's
     /// routes are served without a prefix rather than under a guessed one.
     pub mount_prefixes_unread: usize,
+    /// Decorator routes whose URI version was stated and could not be read
+    /// (an array, an identifier from elsewhere): their path is left without a
+    /// version segment (carrick#3422).
+    pub uri_version_unread: usize,
+    /// Services whose `enableVersioning` prefix could not be read at all, so
+    /// no route of theirs takes a version segment (carrick#3422).
+    pub uri_version_prefix_unread: usize,
+    /// Services whose prefix has an unread piece before its literal tail and
+    /// was read as the tail (carrick#3422).
+    pub uri_version_prefix_unread_lead: usize,
+    /// Services whose URI `enableVersioning` calls disagree, so none applies
+    /// (carrick#3422).
+    pub uri_versioning_conflicts: usize,
     /// Of those, the ones whose prefix was read after all: the registration's
     /// other arguments read to one route path, and the service's own route
     /// descriptors state the scope's routes under it (carrick#2092).
@@ -2859,6 +2872,12 @@ impl FileOrchestrator {
         // resolved after the whole pass: the endpoints belong to the CONTROLLER
         // modules, whose own results are not final until then.
         let mut controller_route_bindings: Vec<(PathBuf, Vec<ControllerRouteBinding>)> = Vec::new();
+        // carrick#3422: the service's URI versioning statements and each file's
+        // decorator routes with the version they state. Applied once every
+        // file is in, because the bootstrap that enables versioning is another
+        // file than the controllers it versions.
+        let mut uri_statements: Vec<crate::uri_versioning::AppVersioning> = Vec::new();
+        let mut versioned_routes: Vec<(String, Vec<DecoratorRoute>)> = Vec::new();
         // carrick#656, filled per file and read once every file is in.
         // `member_deficits` counts, per member name, the sites that named it
         // and did not resolve to it; `resolved_member_rows` says which spans in
@@ -3094,8 +3113,12 @@ impl FileOrchestrator {
             // scanner raises for the same class are deliberately KEPT: the
             // model reading them is what supplies the owner and the type
             // anchors, and its rows fold onto these as twins.
-            let decorator_endpoints =
-                Self::decorator_route_endpoints(&self.swc_scanner, file_path, &content);
+            let decorator_routes = self.swc_scanner.decorator_routes(file_path, &content);
+            uri_statements.extend(crate::uri_versioning::app_versioning(file_path, &content));
+            let decorator_endpoints = Self::decorator_route_endpoints(decorator_routes.clone());
+            if !decorator_routes.is_empty() {
+                versioned_routes.push((file_path.to_string_lossy().into_owned(), decorator_routes));
+            }
 
             // Class-controller routes (#580 part b): a route table binding a
             // literal path to an imported handler. Collected before any of the
@@ -4696,6 +4719,13 @@ impl FileOrchestrator {
             &mut stats.deterministic_rows_emitted,
         );
         stats.total_endpoints += class_controller_added;
+
+        Self::apply_uri_versioning(
+            &mut file_results,
+            &uri_statements,
+            &versioned_routes,
+            &mut stats,
+        );
 
         debug!("\n=== FILE PROCESSING COMPLETE ===");
         debug!("  - Files processed: {}", stats.files_processed);
@@ -7779,13 +7809,8 @@ impl FileOrchestrator {
     /// itself on, and a no-payload claim where the method's annotation states
     /// it returns no value. Without them the row's only anchor is the method's
     /// span, which resolves the declaring CLASS.
-    fn decorator_route_endpoints(
-        scanner: &SwcScanner,
-        file_path: &Path,
-        content: &str,
-    ) -> Vec<EndpointResult> {
-        scanner
-            .decorator_routes(file_path, content)
+    fn decorator_route_endpoints(routes: Vec<DecoratorRoute>) -> Vec<EndpointResult> {
+        routes
             .into_iter()
             .map(|route: DecoratorRoute| EndpointResult {
                 view_module: false,
@@ -7811,6 +7836,68 @@ impl FileOrchestrator {
                 resolution_source: None,
             })
             .collect()
+    }
+
+    /// Put the version segment a service's URI versioning serves its decorator
+    /// routes under into their paths (carrick#3422).
+    ///
+    /// Runs after every file is in: the statement that enables versioning is
+    /// in the bootstrap file and the versions are on the controllers. It
+    /// corrects, on the same span, every decorator-route row whose method and
+    /// path are a route's own, so a row the model twinned onto the route moves
+    /// with it and no row is added or removed. `analyze_files` runs once per
+    /// service, so one app's statement never versions a sibling service.
+    /// See [`crate::uri_versioning`] for what is read and why.
+    fn apply_uri_versioning(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        statements: &[crate::uri_versioning::AppVersioning],
+        routes: &[(String, Vec<DecoratorRoute>)],
+        stats: &mut ProcessingStats,
+    ) {
+        if statements.is_empty() {
+            return;
+        }
+        let origins: HashSet<String> = routes
+            .iter()
+            .flat_map(|(_, file_routes)| file_routes.iter().map(|route| route.origin.clone()))
+            .collect();
+        let resolution = crate::uri_versioning::resolve(statements, &origins);
+        stats.uri_versioning_conflicts += resolution.conflicts;
+        stats.uri_version_prefix_unread += resolution.prefix_unread;
+        stats.uri_version_prefix_unread_lead += resolution.prefix_unread_lead;
+        let Some(service) = resolution.versioning else {
+            return;
+        };
+        for (key, file_routes) in routes {
+            let Some(result) = file_results.get_mut(key) else {
+                continue;
+            };
+            for route in file_routes {
+                let (versioned, unread) =
+                    crate::uri_versioning::versioned_path(&service, &route.version, &route.path);
+                if unread {
+                    stats.uri_version_unread += 1;
+                    continue;
+                }
+                if versioned == route.path {
+                    continue;
+                }
+                for row in &mut result.endpoints {
+                    let inside = matches!(
+                        (row.call_expression_span_start, row.call_expression_span_end),
+                        (Some(start), Some(end))
+                            if route.span_start <= start && end <= route.span_end
+                    );
+                    if inside
+                        && row.resolution_source == Some(ResolutionSource::DecoratorRoute)
+                        && row.method == route.method
+                        && row.path == route.path
+                    {
+                        row.path.clone_from(&versioned);
+                    }
+                }
+            }
+        }
     }
 
     /// Build the endpoints a route table declares by binding a path to an
