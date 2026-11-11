@@ -358,12 +358,19 @@ pub struct ReturnShape {
 /// Every function of `module`, by the span of its node, with what it returns:
 /// `Some` where every `return` but the ones that hand back no body
 /// (`undefined`, `null`, `void 0`, a bare `return;`) is one and the same call's
-/// value, whole, parsed or one member of it. `None` for anything else: an
-/// object or array, a template, an operator, a conditional, two members read,
-/// two returns, or none. In source order.
+/// value, whole, parsed or one member of it. Several returns are one shape
+/// when each hands back the same call's value whole, or each its parse.
+/// `None` for anything else: an object or array, a template, an operator, a
+/// conditional, two members read, two member returns, returns that read
+/// different calls or read one call differently, or none.
+/// In source order.
 ///
 /// A returned name is followed to the one value it is given: its
 /// initialiser, or the single assignment of a name declared without one.
+///
+/// Two readers ask it, so "does this function hand back its request's body"
+/// has one answer (carrick#3823): [`crate::call_through`] for model rows,
+/// and the request summaries' `passes_body` for summary rows.
 pub fn return_shapes(module: &swc_ecma_ast::Module) -> Vec<(Span, Option<ReturnShape>)> {
     let mut reader = ShapeReader::default();
     module.visit_with(&mut reader);
@@ -475,8 +482,17 @@ fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
             Returned::Shape(shape) => shapes.push(shape),
         }
     }
-    match shapes.as_slice() {
-        [one] => Some(*one),
+    // Several returns that hand back the same call's value, or its parse,
+    // are one shape (carrick#3823): `if (ok) return (await res.json()) as T;
+    // return res.json();` hands back one parse. Two member reads stay two:
+    // a shape does not say which member.
+    match shapes.split_first() {
+        Some((first, [])) => Some(*first),
+        Some((first, rest))
+            if first.kind != ShapeKind::Member && rest.iter().all(|shape| shape == first) =>
+        {
+            Some(*first)
+        }
         _ => None,
     }
 }
@@ -778,6 +794,22 @@ mod tests {
         );
     }
 
+    /// carrick#3823: two returns that each parse the one response, or each
+    /// hand back the one value, are one shape.
+    #[test]
+    fn returns_that_read_one_call_the_same_way_are_one_shape() {
+        assert_eq!(
+            shape(
+                "async function f<T>(u) { const r = await fetch(u); if (r.status === 200) { return (await r.json()) as T; } return (await r.json()) as T; }"
+            ),
+            of(ShapeKind::Parsed, "fetch(u)")
+        );
+        assert_eq!(
+            shape("async function f(u) { const r = await call(u); if (u) return r; return r; }"),
+            of(ShapeKind::Value, "call(u)")
+        );
+    }
+
     #[test]
     fn anything_else_returned_is_no_shape() {
         for source in [
@@ -790,6 +822,8 @@ mod tests {
             "async function f(o) { return (await fetch(o)).json().data; }",
             "async function f(o) { return (await sdk(o)).data.json(); }",
             "async function f(o) { if (o) return sdk(1); return sdk(2); }",
+            "async function f(o) { const r = await sdk(o); if (o) return r.data; return r.items; }",
+            "async function f(o) { const r = await fetch(o); if (o) return r.json(); return r; }",
             "async function f(o) { await sdk(o); }",
             "async function f(o) { return o.data; }",
             "async function f(o) { let r = sdk(1); r = sdk(2); return r.data; }",
