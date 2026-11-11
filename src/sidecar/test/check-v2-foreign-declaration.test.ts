@@ -35,6 +35,8 @@ import * as path from 'node:path';
 import { captureStub, runCheck } from '../src/capture/index.js';
 import { buildProbe } from '../src/capture/check-probe.js';
 import { classifyPair } from '../src/capture/check-classify.js';
+import { assembleWorkspace } from '../src/capture/check-workspace.js';
+import { pairForeignFindings } from '../src/capture/check-deep.js';
 import type {
   CaptureAnchorRequest,
   CaptureStubResult,
@@ -270,6 +272,21 @@ describe('check phase: a type that reads another service declaration (carrick#10
   it('z own pair reads its own declaration only, so it is judged as on main', () => {
     assert.strictEqual(verdict('R-both', 'z').bucket, 'compatible');
     assert.strictEqual(verdict('R-both', 'z').gate, undefined);
+  });
+
+  it('no program to walk in: a side with another stub global-scope file on disk is unwalked', () => {
+    const ws = assembleWorkspace({
+      stubs: ['x', 'web'].map((s) => ({ service_name: s, stub_dir: stubs.get(s)!.stub_dir })),
+    });
+    try {
+      const plan = buildProbe(X, ws.packageOf);
+      // x reads web's tree, which has no global-scope file; web reads x's.
+      assert.deepStrictEqual(pairForeignFindings(undefined, [plan], ws).get(plan.pairId), {
+        consumer: 'unwalked',
+      });
+    } finally {
+      fs.rmSync(ws.workspaceDir, { recursive: true, force: true });
+    }
   });
 
   it('copy: a sibling declaration with the same text as x own is not foreign', () => {

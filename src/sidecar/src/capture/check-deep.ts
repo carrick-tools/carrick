@@ -284,7 +284,7 @@ function globalScopeDirsOnDisk(ws: AssembledWorkspace): Set<string> {
   for (const stub of ws.stubs) {
     const typesDir = path.join(ws.workspaceDir, 'packages', stub.packageDir, 'types');
     const files = fs.existsSync(typesDir)
-      ? (fs.readdirSync(typesDir, { recursive: true }) as string[]).filter((f) => f.endsWith('.ts'))
+      ? (fs.readdirSync(typesDir, { recursive: true }) as string[]).filter((f) => /\.[cm]?ts$/.test(f))
       : [];
     for (const rel of files) {
       const abs = path.join(typesDir, rel);
