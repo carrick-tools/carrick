@@ -25,6 +25,11 @@
  *  - O {x}: x `compatible` (the leak).
  *  - Copy {x, zc}: x `incompatible`, codes [2741]; zc `compatible`.
  * (xp, `{ p: Partial<Shared> }`, was added after step 0.)
+ *
+ * Built-in globals (review of #3889): ga, a third service, augments `Array`,
+ * `Date` and `Shared`. xi (`{ items: string[]; at: Date }`, x to web) read
+ * `foreign:producer` naming ga on head 65367f00, the false abstention the
+ * review found.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -37,6 +42,8 @@ import { buildProbe } from '../src/capture/check-probe.js';
 import { classifyPair } from '../src/capture/check-classify.js';
 import { assembleWorkspace } from '../src/capture/check-workspace.js';
 import { pairForeignFindings } from '../src/capture/check-deep.js';
+import { findForeignDeclarationPositions } from '../src/capture/deep-walk.js';
+import ts from 'typescript';
 import type {
   CaptureAnchorRequest,
   CaptureStubResult,
@@ -63,6 +70,7 @@ const SERVICES: Record<string, { files: Record<string, string>; anchors: Capture
         'export type XPayload = Shared;',
         'export type X2Payload = { a: string };',
         'export type XPartial = { p: Partial<Shared> };',
+        'export type XItems = { items: string[]; at: Date };',
         "export function handler(): Shared { return { a: 'x' } as Shared; }",
         '',
       ].join('\n'),
@@ -71,6 +79,28 @@ const SERVICES: Record<string, { files: Record<string, string>; anchors: Capture
       { kind: 'symbol', alias: 'X_Sent', symbol_name: 'XPayload', source_file: 'src/handler.ts', anchor_origin: 'llm-symbol' },
       { kind: 'symbol', alias: 'X2_Sent', symbol_name: 'X2Payload', source_file: 'src/handler.ts', anchor_origin: 'llm-symbol' },
       { kind: 'symbol', alias: 'XP_Sent', symbol_name: 'XPartial', source_file: 'src/handler.ts', anchor_origin: 'llm-symbol' },
+      { kind: 'symbol', alias: 'XI_Sent', symbol_name: 'XItems', source_file: 'src/handler.ts', anchor_origin: 'llm-symbol' },
+    ],
+  },
+  ga: {
+    files: {
+      'src/aug.ts': [
+        'export interface GaMark { c: number }',
+        'declare global {',
+        '  interface Array<T> { extra(): T }',
+        '  interface Date { extra2(): number }',
+        '  interface Shared { b: number }',
+        '}',
+        '',
+      ].join('\n'),
+      'src/handler.ts': [
+        "import type { GaMark } from './aug.js';",
+        'export type GaPayload = { items: string[]; mark: GaMark };',
+        '',
+      ].join('\n'),
+    },
+    anchors: [
+      { kind: 'symbol', alias: 'GA_Sent', symbol_name: 'GaPayload', source_file: 'src/handler.ts', anchor_origin: 'llm-symbol' },
     ],
   },
   z: {
@@ -118,6 +148,8 @@ const SERVICES: Record<string, { files: Record<string, string>; anchors: Capture
         'export type X2Exp = { a: string };',
         'export type ZExp = { b: number };',
         'export type XPExp = { p: { a?: string; b?: number } };',
+        'export type XIExp = { items: string[]; at: Date };',
+        'export type GAExp = { items: string[]; mark: { c: number } };',
         '',
       ].join('\n'),
     },
@@ -126,6 +158,8 @@ const SERVICES: Record<string, { files: Record<string, string>; anchors: Capture
       { kind: 'symbol', alias: 'X2_Exp', symbol_name: 'X2Exp', source_file: 'src/client.ts', anchor_origin: 'llm-symbol' },
       { kind: 'symbol', alias: 'Z_Exp', symbol_name: 'ZExp', source_file: 'src/client.ts', anchor_origin: 'llm-symbol' },
       { kind: 'symbol', alias: 'XP_Exp', symbol_name: 'XPExp', source_file: 'src/client.ts', anchor_origin: 'llm-symbol' },
+      { kind: 'symbol', alias: 'XI_Exp', symbol_name: 'XIExp', source_file: 'src/client.ts', anchor_origin: 'llm-symbol' },
+      { kind: 'symbol', alias: 'GA_Exp', symbol_name: 'GAExp', source_file: 'src/client.ts', anchor_origin: 'llm-symbol' },
     ],
   },
   webo: {
@@ -213,6 +247,8 @@ describe('check phase: a type that reads another service declaration (carrick#10
   const Z = pair('z', 'z', 'Z_Sent', 'web', 'Z_Exp');
   const ZC = pair('zc', 'zc', 'Z_Sent', 'web', 'Z_Exp');
   const XO = pair('x', 'x', 'X_Sent', 'webo', 'X_Exp');
+  const XI = pair('xi', 'x', 'XI_Sent', 'web', 'XI_Exp');
+  const GA = pair('ga', 'ga', 'GA_Sent', 'web', 'GA_Exp');
 
   before(async () => {
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1047-foreign-')));
@@ -222,6 +258,7 @@ describe('check phase: a type that reads another service declaration (carrick#10
       judge('R-alone', ['x', 'z', 'web'], [X, X2]),
       judge('O', ['x', 'webo'], [XO]),
       judge('copy', ['x', 'zc', 'web'], [X, ZC]),
+      judge('L', ['x', 'ga', 'web'], [X, XI, GA]),
     ]);
     if (process.env.CARRICK_FOREIGN_DUMP) {
       for (const [run, verdicts] of runs) {
@@ -289,6 +326,29 @@ describe('check phase: a type that reads another service declaration (carrick#10
     }
   });
 
+  it('L: a third service augments Array and Date, so a pair reading string[] and Date stays judged', () => {
+    const v = verdict('L', 'xi');
+    assert.strictEqual(v.bucket, 'compatible');
+    assert.strictEqual(v.gate, undefined);
+    assert.strictEqual(v.resolved, true);
+  });
+
+  it('L: the producer augments Array; its own side has no finding, the consumer reading string[] is foreign', () => {
+    // The consumer's own compile has no `extra` on its string[].
+    const v = verdict('L', 'ga');
+    assert.strictEqual(v.gate, 'foreign:consumer');
+    assert.strictEqual(v.unresolved_side, 'consumer');
+    assert.strictEqual(v.foreign_kind, 'hit');
+    assert.match(v.unresolved_reason ?? '', /\bga\b/);
+  });
+
+  it('L: the same third service merges into a non-library global the pair reads, so it stays foreign', () => {
+    const v = verdict('L', 'x');
+    assert.strictEqual(v.gate, 'foreign:producer');
+    assert.strictEqual(v.foreign_kind, 'hit');
+    assert.match(v.unresolved_reason ?? '', /\bga\b/);
+  });
+
   it('copy: a sibling declaration with the same text as x own is not foreign', () => {
     const v = verdict('copy', 'x');
     assert.strictEqual(v.bucket, 'incompatible');
@@ -314,6 +374,12 @@ describe('step 1b of the classifier: foreign:<side> (carrick#1047 J1-1)', () => 
     assert.strictEqual(v.gate, 'foreign:consumer');
     assert.strictEqual(v.unresolved_side, 'consumer');
     assert.strictEqual(v.unresolved_reason, "the consumer type is too deep or wide to verify at 'items<0>'");
+    assert.strictEqual(v.foreign_kind, 'budget');
+  });
+
+  it('a walk out of budget at the root says so', () => {
+    const v = classify({ producer: { exhaustedAt: '<root>' } });
+    assert.strictEqual(v.unresolved_reason, 'the producer type is too deep or wide to verify at its root');
   });
 
   it('no program to walk in fails closed', () => {
@@ -321,6 +387,7 @@ describe('step 1b of the classifier: foreign:<side> (carrick#1047 J1-1)', () => 
     assert.strictEqual(v.gate, 'foreign:producer');
     assert.strictEqual(v.resolved, false);
     assert.strictEqual(v.unresolved_reason, 'the producer type may use declarations from another service');
+    assert.strictEqual(v.foreign_kind, 'no_program');
   });
 
   it('both sides hit: the producer is named first', () => {
@@ -346,5 +413,25 @@ describe('step 1b of the classifier: foreign:<side> (carrick#1047 J1-1)', () => 
   it('no finding leaves the verdict alone', () => {
     assert.strictEqual(classify(undefined).bucket, 'compatible');
     assert.strictEqual(classify({}).bucket, 'compatible');
+    assert.strictEqual(classify(undefined).foreign_kind, undefined);
+  });
+});
+
+describe('the foreign walk at the root (carrick#1047 J1-1)', () => {
+  it('a root union wider than the node budget runs out at <root>', () => {
+    const members = Array.from({ length: 4200 }, (_, i) => `'m${i}'`).join(' | ');
+    const file = path.join(os.tmpdir(), 'carrick-1047-root-union.ts');
+    const host = ts.createCompilerHost({ strict: true });
+    const read = host.readFile;
+    host.readFile = (f) => (f === file ? `export type Wide = ${members};` : read(f));
+    host.fileExists = ((exists) => (f: string) => f === file || exists(f))(host.fileExists);
+    const program = ts.createProgram([file], { strict: true, noEmit: true }, host);
+    const checker = program.getTypeChecker();
+    const alias = program.getSourceFile(file)!.statements[0] as ts.TypeAliasDeclaration;
+    const type = checker.getTypeAtLocation(alias.name);
+    assert.deepStrictEqual(
+      findForeignDeclarationPositions(type, program, checker, alias.name, () => undefined),
+      { exhaustedAt: '<root>' }
+    );
   });
 });

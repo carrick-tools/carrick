@@ -211,18 +211,22 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     const found = input.foreign?.[side];
     if (!found) continue;
     const service = plan.spec[side].service_name;
-    const reason =
+    const [kind, reason] =
       found === 'unwalked'
-        ? foreignUnwalkedReason(side)
+        ? (['no_program', foreignUnwalkedReason(side)] as const)
         : 'exhaustedAt' in found
-          ? `the ${side} type is too deep or wide to verify at ${found.exhaustedAt === '<root>' ? 'its root' : `'${found.exhaustedAt}'`}`
-          : foreignHitReason(side, found.service);
+          ? ([
+              'budget',
+              `the ${side} type is too deep or wide to verify at ${found.exhaustedAt === '<root>' ? 'its root' : `'${found.exhaustedAt}'`}`,
+            ] as const)
+          : (['hit', foreignHitReason(side, found.service)] as const);
     return {
       ...base,
       bucket: 'unverifiable',
       gate: `foreign:${side}`,
       diagnostic: foreignDiagnostic(service, typeof found !== 'string' && 'service' in found ? found.service : undefined),
       ...notAFact(reason, side),
+      foreign_kind: kind,
     };
   }
 

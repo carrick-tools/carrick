@@ -156,8 +156,8 @@ function importedAliasType(
 /**
  * What one side of a pair reads of another service's declarations
  * (carrick#1047 J1-1): the first position and the service that declares it,
- * where the walk ran out of budget when the walk ran out of budget before it could rule one out,
- * and `unwalked` when no program could be built to walk it in.
+ * where the walk ran out of budget before it could rule one out, or
+ * `unwalked` when no program could be built to walk it in.
  */
 export type SideForeign = { service: string; path: string } | { exhaustedAt: string } | 'unwalked';
 
@@ -180,6 +180,13 @@ export type PairForeignFindings = Partial<Record<Side, SideForeign>>;
  * A declaration in another stub's tree is not foreign when its text equals a
  * declaration of the same symbol in the side's own tree: a typing file two
  * services both carry says the same thing in each.
+ *
+ * Nor is one that merges into a built-in global, one TypeScript's default
+ * library declares (`interface Array<T>`, `Date`, `Promise`), unless it lies
+ * in the tree of the pair's other side. Both sides read the same built-in in
+ * the judge's program, so a third service's augmentation of it cannot move
+ * the verdict; the other side's can, as that side's own compile has it and
+ * this side's does not.
  *
  * Fails closed. A walk out of budget is `exhaustedAt`; a run with no program
  * whose workspace holds another stub's global-scope file is `unwalked`.
@@ -234,6 +241,14 @@ export function pairForeignFindings(
 
   const { program, checker, probesDir } = opened;
   const normalText = (d: ts.Declaration): string => d.getText().replace(/\s+/g, ' ');
+  /** Whether `d`, or the interface or class it is a member of,
+   * merges into a symbol the default library declares. */
+  const mergesIntoDefaultLibrary = (d: ts.Declaration): boolean => {
+    const owner = ts.isInterfaceDeclaration(d.parent) || ts.isClassDeclaration(d.parent) ? d.parent : d;
+    const name = (owner as ts.NamedDeclaration).name;
+    const merged = name ? checker.getSymbolAtLocation(name) : undefined;
+    return (merged?.declarations ?? []).some((x) => program.isSourceFileDefaultLibrary(x.getSourceFile()));
+  };
   for (const plan of plans) {
     const file = program.getSourceFile(path.join(probesDir, 'probes', plan.fileName));
     if (!file) continue;
@@ -241,6 +256,7 @@ export function pairForeignFindings(
     for (const side of ['producer', 'consumer'] as const) {
       const own = dirOfService.get(sideOf(plan, side));
       if (!reachable(own)) continue;
+      const other = dirOfService.get(sideOf(plan, side === 'producer' ? 'consumer' : 'producer'));
       const foreignOf = (symbol: ts.Symbol): string | undefined => {
         const declarations = symbol.declarations ?? [];
         const ownTexts = new Set(
@@ -249,6 +265,7 @@ export function pairForeignFindings(
         for (const d of declarations) {
           const dir = stubDirOf(d.getSourceFile().fileName);
           if (dir === undefined || dir === own || ownTexts.has(normalText(d))) continue;
+          if (dir !== other && mergesIntoDefaultLibrary(d)) continue;
           return ws.serviceOfPackageDir(dir) ?? dir;
         }
         return undefined;
