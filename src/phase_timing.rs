@@ -35,6 +35,9 @@ pub enum Phase {
     Discover,
     /// Reading the previous scan's answers and deciding what is reusable.
     Cache,
+    /// The compiler engine's `implementations` ask: the interface members the
+    /// service's calls pass through, read once before the walks (carrick#3861).
+    Implementations,
     /// The file-analyzer stage: deterministic emission, the model calls this
     /// scan dispatches, and the join of the two.
     Model,
@@ -67,9 +70,10 @@ pub enum Phase {
 }
 
 impl Phase {
-    const ORDER: [Phase; 13] = [
+    const ORDER: [Phase; 14] = [
         Phase::Discover,
         Phase::Cache,
+        Phase::Implementations,
         Phase::Model,
         Phase::Graph,
         Phase::Protocols,
@@ -97,6 +101,7 @@ impl Phase {
         match self {
             Phase::Discover => "discover",
             Phase::Cache => "cache",
+            Phase::Implementations => "implementations",
             Phase::Model => "model",
             Phase::Graph => "graph",
             Phase::Protocols => "protocols",
@@ -156,6 +161,16 @@ pub fn mark(phase: Phase) {
         *recorder.totals.entry(phase).or_insert(0.0) += elapsed;
         recorder.last = now;
     });
+}
+
+/// Run `ask`, attributing the time before it to `before` and the ask itself to
+/// [`Phase::Implementations`], so the ask is not counted inside whichever
+/// stage's mark follows it (carrick#3861).
+pub fn implementations_ask<Answer>(before: Phase, ask: impl FnOnce() -> Answer) -> Answer {
+    mark(before);
+    let answer = ask();
+    mark(Phase::Implementations);
+    answer
 }
 
 /// One service's recorded stages, read two ways: the line the log states, and
@@ -230,6 +245,26 @@ mod tests {
         // mark is this machine's work, and nothing was spent on the model.
         assert!(totals.local_secs() > 0.0, "discover is local work");
         assert_eq!(totals.model_secs(), 0.0);
+    }
+
+    /// The implementations ask has a stage of its own: its time is not in the
+    /// stage that follows it, and the line prints it (carrick#3861).
+    #[tokio::test]
+    async fn implementations_ask_time_is_not_inside_cache() {
+        let ((), totals) = record(async {
+            implementations_ask(Phase::Cache, || {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            });
+            mark(Phase::Cache);
+        })
+        .await;
+        let secs = |name: &str| -> f64 {
+            let line = totals.line();
+            let at = line.find(&format!("{name} ")).expect("phase on line") + name.len() + 1;
+            line[at..].split('s').next().unwrap().parse().unwrap()
+        };
+        assert!(secs("implementations") >= 0.05, "{}", totals.line());
+        assert!(secs("cache") < 0.05, "{}", totals.line());
     }
 
     /// Two services analysed side by side, their awaits interleaving, each
