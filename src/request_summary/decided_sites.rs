@@ -608,7 +608,13 @@ fn receivers(on: Option<crate::services::type_sidecar::ClaimOn>, of: Option<&str
 /// (carrick#2426): the reserved claims of the same member and path whose
 /// receivers overlap the op's, so one claimed on another receiver never hides
 /// a name.
-fn reserved_on(
+///
+/// The one answer to "is this name reserved": the site labels read it here,
+/// and the library reader reads it through `Reading::name_ok`
+/// (`library_claims.rs`). A reserved claim only ever removes rows, so it
+/// hides a name whether or not the verifier found the name in the
+/// declarations (the sidecar's `judgeReserved` verdict is for the record).
+pub(crate) fn reserved_on(
     claims: &[crate::services::type_sidecar::LibraryClaim],
     member: Option<&str>,
     path: &[String],
