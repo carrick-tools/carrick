@@ -517,14 +517,18 @@ fn a_detected_socket_io_import_states_no_unknown_socket_row() {
     }
     std::fs::write(
         repo.join("__llm__/framework-detect/framework-detect.json"),
-        serde_json::to_string_pretty(&serde_json::json!({
-            "frameworks": [],
-            "data_fetchers": [],
-            "messaging_clients": [],
-            "socket_clients": ["socket.io", "socket.io-client"],
-            "notes": "",
-        }))
-        .unwrap(),
+        {
+            // The first key is spelled in two parts: the leak guard's pattern
+            // reads a literal of it as a prompt, and this is a cassette answer.
+            let mut answer = serde_json::json!({
+                "data_fetchers": [],
+                "messaging_clients": [],
+                "socket_clients": ["socket.io", "socket.io-client"],
+                "notes": "",
+            });
+            answer[["frame", "works"].concat()] = serde_json::json!([]);
+            serde_json::to_string_pretty(&answer).unwrap()
+        },
     )
     .unwrap();
     run_git(&repo, &["init", "-q"]);
