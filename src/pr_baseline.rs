@@ -51,7 +51,7 @@ use crate::packages::{PackageInfo, Packages};
 mod lost_pairings;
 pub use lost_pairings::{
     MainConsumer, MainPairing, MainProducer, MainRemovals, RemovedOperation, RemovedSend,
-    RunUnpaired, UnpairedCall, UnpairedReceiver, mark_lost_pairings,
+    RunUnpaired, UnpairedCall, UnpairedReceiver, mark_lost_pairings, procedure_consumer_key,
 };
 
 /// A comparison bucket: kind, pairing, and the consumer file of one site.

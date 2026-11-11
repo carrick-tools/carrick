@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::agents::file_analyzer_agent::ResolutionSource;
 use crate::analyzer::{CrossRepoMatch, location_file};
@@ -49,6 +49,23 @@ fn service_id(service_name: &Option<String>, repo_name: &str) -> String {
         .unwrap_or_else(|| repo_name.to_string())
 }
 
+/// The services (by `service_name`, `None` for a root service) whose
+/// procedure walk stopped anywhere in this run
+/// ([`crate::site_rows::TracedRoutes::procedure_stopped`]).
+pub(super) type ProcedureStops = HashSet<Option<String>>;
+
+/// Whether the removal of a main row of `service` is not proven (carrick#3778
+/// R5): it is a procedure row, and this run's procedure walk stopped in that
+/// service, so the row may still be there, unread. The break row a removal
+/// gives and the delta row that lists it read this one answer.
+pub(super) fn procedure_removal_in_doubt(
+    stopped: &ProcedureStops,
+    service: &Option<String>,
+    procedure: bool,
+) -> bool {
+    procedure && stopped.contains(service)
+}
+
 /// What the PR removed of main's copy, each removal placed or not.
 #[derive(Debug, Default)]
 pub(super) struct Removals {
@@ -70,7 +87,8 @@ impl Removals {
 
     /// The removals of `main_self` (main's copy of this repo) that `current`
     /// (this run's services) no longer states, placed through the diff from
-    /// `base` when the run knows it.
+    /// `base` when the run knows it. A removed procedure row of a service in
+    /// `stopped` is in doubt ([`procedure_removal_in_doubt`]).
     pub(super) fn of(
         repo_path: &str,
         base: Option<&str>,
@@ -78,8 +96,9 @@ impl Removals {
         current: &[CloudRepoData],
         services: &[Config],
         changes: Option<&crate::change_scope::ChangedSince>,
+        stopped: &ProcedureStops,
     ) -> Self {
-        let mut operations = removed_operations(main_self, current);
+        let mut operations = removed_operations(main_self, current, stopped);
         let mut sends = removed_sends(main_self, current);
         let Some(base) = base else {
             if !operations.is_empty() || !sends.is_empty() {
@@ -234,6 +253,7 @@ fn place<R: Placeable>(
 fn removed_operations(
     main_self: &[CloudRepoData],
     current: &[CloudRepoData],
+    stopped: &ProcedureStops,
 ) -> Vec<Removed<RemovedOperation>> {
     let current_keys: HashSet<ServiceEndpointKey> = current
         .iter()
@@ -245,8 +265,8 @@ fn removed_operations(
         .collect();
     // Main's spelling of each key, as the delta keeps it, beside each row.
     let mut spelled: HashMap<ServiceEndpointKey, DeltaRow> = HashMap::new();
-    let mut rows: HashMap<ServiceEndpointKey, Vec<(String, String, Option<ResolutionSource>)>> =
-        HashMap::new();
+    type Row = (String, String, Option<ResolutionSource>, bool);
+    let mut rows: HashMap<ServiceEndpointKey, Vec<Row>> = HashMap::new();
     for repo in main_self {
         for row in &repo.endpoints {
             let id = (repo.service_name.clone(), delta_identity(&row.key));
@@ -258,6 +278,7 @@ fn removed_operations(
                 service_id(&repo.service_name, &repo.repo_name),
                 row.file_path.to_string_lossy().into_owned(),
                 row.resolution_source,
+                procedure_removal_in_doubt(stopped, &repo.service_name, row.procedure.is_some()),
             ));
         }
     }
@@ -269,11 +290,11 @@ fn removed_operations(
             Removed {
                 places: rows
                     .iter()
-                    .map(|(_, place, _)| Place::parse(&id.0, place))
+                    .map(|(_, place, _, _)| Place::parse(&id.0, place))
                     .collect(),
                 rows: rows
                     .into_iter()
-                    .map(|(service, place, source)| RemovedOperation {
+                    .map(|(service, place, source, in_doubt)| RemovedOperation {
                         service,
                         key: key.clone(),
                         method: method.clone(),
@@ -281,6 +302,7 @@ fn removed_operations(
                         place,
                         placed: false,
                         source,
+                        in_doubt,
                     })
                     .collect(),
             }
@@ -372,13 +394,64 @@ fn removed_sends(
 /// against the same peers, each side keyed as this run's removals and
 /// unpaired rows are: the producer by its delta identity, the consumer by
 /// its key as the match spells it and its file.
-pub(super) fn main_pairings(matches: &[CrossRepoMatch]) -> Vec<MainPairing> {
+///
+/// A procedure call's edge states no consumer path (carrick#3778): its
+/// consumer key takes the procedure of the producer row it paired with, read
+/// from `endpoints` (main's route rows, keyed as the edge keys its producer),
+/// as this run's unpaired call takes its own. Where main has rows of two
+/// different procedures under the producer's key, which one the call paired
+/// with is not known, so that pairing is left out. Every other edge keeps
+/// its key.
+pub(super) fn main_pairings(
+    matches: &[CrossRepoMatch],
+    endpoints: &[crate::mount_graph::ResolvedEndpoint],
+) -> Vec<MainPairing> {
+    let mut procedures: HashMap<(String, String), HashSet<&carrick_match::ProcedureKey>> =
+        HashMap::new();
+    for endpoint in endpoints {
+        let (Some(service), Some(procedure)) = (
+            endpoint
+                .service_name
+                .as_ref()
+                .or(endpoint.repo_name.as_ref()),
+            endpoint.procedure.as_ref(),
+        ) else {
+            continue;
+        };
+        procedures
+            .entry((
+                service.clone(),
+                OperationKey::http(&endpoint.method, endpoint.full_path.clone()).canonical(),
+            ))
+            .or_default()
+            .insert(procedure);
+    }
     matches
         .iter()
         .filter(|edge| edge.relationship == carrick_match::MatchRelationship::ProducerConsumer)
         .filter_map(|edge| {
             let producer = OperationKey::from_canonical(&edge.producer_key)?;
             let (method, _) = producer.display_labels();
+            let states_no_path = OperationKey::from_canonical(&edge.consumer_key)
+                .as_ref()
+                .and_then(OperationKey::as_http)
+                .is_some_and(|(_, path)| path.is_empty());
+            let consumer_key = if states_no_path {
+                let mut held = procedures
+                    .get(&(edge.producer_repo.clone(), edge.producer_key.clone()))?
+                    .iter();
+                let (Some(procedure), None) = (held.next(), held.next()) else {
+                    debug!(
+                        "Main's pairing of {} with {} is left out: its key holds more than one \
+                         procedure",
+                        edge.producer_key, edge.consumer_repo
+                    );
+                    return None;
+                };
+                crate::pr_baseline::procedure_consumer_key(&edge.consumer_key, procedure)
+            } else {
+                edge.consumer_key.clone()
+            };
             Some(MainPairing {
                 protocol: producer.protocol(),
                 producer: MainProducer {
@@ -388,7 +461,7 @@ pub(super) fn main_pairings(matches: &[CrossRepoMatch]) -> Vec<MainPairing> {
                 },
                 consumer: MainConsumer {
                     service: edge.consumer_repo.clone(),
-                    key: edge.consumer_key.clone(),
+                    key: consumer_key,
                     file: location_file(edge.consumer_location.as_deref()?),
                 },
             })
@@ -420,7 +493,7 @@ mod tests {
     /// the route's parameters are called, and its consumer by file alone.
     #[test]
     fn a_pairing_is_keyed_as_the_removal_and_the_unpaired_call_are() {
-        let pairings = main_pairings(&[http_edge("/orders/:orderId", "src/checkout.ts:4")]);
+        let pairings = main_pairings(&[http_edge("/orders/:orderId", "src/checkout.ts:4")], &[]);
         assert_eq!(pairings.len(), 1);
         let pairing = &pairings[0];
         assert_eq!(pairing.protocol, Protocol::Http);
@@ -441,6 +514,241 @@ mod tests {
     fn a_shared_contract_is_no_pairing() {
         let mut edge = http_edge("/orders/:orderId", "src/checkout.ts:4");
         edge.relationship = carrick_match::MatchRelationship::SharedExternalContract;
-        assert!(main_pairings(&[edge]).is_empty());
+        assert!(main_pairings(&[edge], &[]).is_empty());
+    }
+
+    // ---- Procedure calls (carrick#3778) ----------------------------------
+
+    const SHELF_FILE: &str = "web/src/shelf.ts";
+
+    fn shelf_procedure(path: &str) -> carrick_match::ProcedureKey {
+        carrick_match::ProcedureKey {
+            path: path.into(),
+            router: carrick_match::RouterId {
+                repo: "shop".into(),
+                file: "api/src/router.ts".into(),
+                binding: "appRouter".into(),
+            },
+        }
+    }
+
+    /// A route row of `api` serving `procedure` (when given) at
+    /// `GET /api/rpc/<path>`. `service` `None` is a row named by its repo
+    /// alone, as a peer repo's blob is.
+    fn shelf_row(
+        service: Option<&str>,
+        path: &str,
+        procedure: Option<&str>,
+    ) -> crate::mount_graph::ResolvedEndpoint {
+        serde_json::from_value(serde_json::json!({
+            "method": "GET",
+            "path": format!("/{path}"),
+            "full_path": format!("/api/rpc/{path}"),
+            "handler": null,
+            "owner": "app",
+            "file_location": "api/src/router.ts:5",
+            "middleware_chain": [],
+            "repo_name": "shop-api",
+            "service_name": service,
+            "procedure": procedure.map(|p| serde_json::to_value(shelf_procedure(p)).unwrap()),
+        }))
+        .unwrap()
+    }
+
+    /// Main's edge of a call at `SHELF_FILE:<line>` to `GET /api/rpc/<path>`,
+    /// with the call's own path `consumer_path` (empty for a procedure call).
+    fn shelf_edge(producer: &str, path: &str, consumer_path: &str, line: u32) -> CrossRepoMatch {
+        CrossRepoMatch {
+            producer_repo: producer.into(),
+            producer_key: OperationKey::http("GET", format!("/api/rpc/{path}")).canonical(),
+            consumer_repo: "web".into(),
+            consumer_key: OperationKey::http("GET", consumer_path).canonical(),
+            relationship: carrick_match::MatchRelationship::ProducerConsumer,
+            consumer_location: Some(format!("{SHELF_FILE}:{line}")),
+            match_score: 1.0,
+            type_compatible: None,
+            type_verdict: None,
+            mismatch_reason: None,
+            producer_provenance: Default::default(),
+        }
+    }
+
+    /// This run's unpaired procedure call at `SHELF_FILE:<line>`, keyed as
+    /// the analyzer keys it.
+    fn shelf_call(path: &str, line: u32) -> crate::pr_baseline::UnpairedCall {
+        crate::pr_baseline::UnpairedCall {
+            service: "web".into(),
+            key: crate::pr_baseline::procedure_consumer_key(
+                &OperationKey::http("GET", "").canonical(),
+                &shelf_procedure(path),
+            ),
+            file: SHELF_FILE.into(),
+            method: "GET".into(),
+            path: String::new(),
+            sites: vec![format!("{SHELF_FILE}:{line}")],
+            source: Some(ResolutionSource::RequestSpec),
+        }
+    }
+
+    /// Main's `api` row of `shelf.get`, removed by the PR and placed.
+    fn removed_get(service: &str) -> RemovedOperation {
+        RemovedOperation {
+            service: service.into(),
+            key: operation_identity(&OperationKey::http("GET", "/api/rpc/shelf.get")),
+            method: "GET".into(),
+            path: "/api/rpc/shelf.get".into(),
+            place: "api/src/router.ts:5".into(),
+            placed: true,
+            source: Some(ResolutionSource::RequestSpec),
+            in_doubt: false,
+        }
+    }
+
+    /// The break rows `mark_lost_pairings` writes for main's `pairings`,
+    /// the removal of `shelf.get` and this run's unpaired `calls`, as
+    /// `<removed path> <service> <sites>`.
+    fn marked(
+        pairings: Vec<MainPairing>,
+        removed: RemovedOperation,
+        calls: Vec<crate::pr_baseline::UnpairedCall>,
+    ) -> Vec<String> {
+        let mut pr = Vec::new();
+        crate::pr_baseline::mark_lost_pairings(
+            &mut pr,
+            &crate::pr_baseline::MainRemovals {
+                pairings,
+                operations: vec![removed],
+                sends: vec![],
+            },
+            &crate::pr_baseline::RunUnpaired {
+                calls,
+                receivers: vec![],
+            },
+            crate::pr_baseline::MainCopy::Current,
+            None,
+        );
+        pr.iter()
+            .map(|finding| {
+                let v = serde_json::to_value(finding).unwrap();
+                format!(
+                    "{} {} {}",
+                    v["removed"]["path"], v["service"], v["call_sites"]
+                )
+            })
+            .collect()
+    }
+
+    /// A procedure edge states no consumer path: its consumer key takes the
+    /// procedure of the row it paired with, as the run's unpaired call does.
+    #[test]
+    fn a_procedure_edge_keys_its_consumer_by_procedure() {
+        let pairings = main_pairings(
+            &[shelf_edge("api", "shelf.get", "", 8)],
+            &[shelf_row(Some("api"), "shelf.get", Some("shelf.get"))],
+        );
+        assert_eq!(pairings.len(), 1);
+        assert_eq!(pairings[0].consumer.key, shelf_call("shelf.get", 8).key);
+        assert_ne!(
+            pairings[0].consumer.key,
+            OperationKey::http("GET", "").canonical()
+        );
+    }
+
+    /// A plain call of a procedure's route states its path, so its key is
+    /// the key it has today, whatever procedure the route serves.
+    #[test]
+    fn a_plain_call_to_a_procedure_route_keeps_its_key() {
+        let pairings = main_pairings(
+            &[shelf_edge("api", "shelf.get", "/api/rpc/shelf.get", 8)],
+            &[shelf_row(Some("api"), "shelf.get", Some("shelf.get"))],
+        );
+        assert_eq!(pairings.len(), 1);
+        assert_eq!(
+            pairings[0].consumer.key,
+            OperationKey::http("GET", "/api/rpc/shelf.get").canonical()
+        );
+    }
+
+    /// Two procedures under one key of one service (two routers at one
+    /// mount): which one the call paired with is not known, so the pairing
+    /// is left out, never guessed. A row with no procedure there adds none.
+    #[test]
+    fn two_procedures_under_one_key_skip_the_pairing() {
+        let mut other = shelf_row(Some("api"), "shelf.get", Some("shelf.get"));
+        other.procedure.as_mut().unwrap().router.binding = "otherRouter".into();
+        let edge = shelf_edge("api", "shelf.get", "", 8);
+        assert!(
+            main_pairings(
+                std::slice::from_ref(&edge),
+                &[
+                    shelf_row(Some("api"), "shelf.get", Some("shelf.get")),
+                    other
+                ],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            main_pairings(
+                std::slice::from_ref(&edge),
+                &[
+                    shelf_row(Some("api"), "shelf.get", Some("shelf.get")),
+                    shelf_row(Some("api"), "shelf.get", None),
+                ],
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The never-served `shelf.gone` call shares its file and its HTTP key
+    /// (`http|GET|`) with the call of the removed `shelf.get`, but not its
+    /// procedure, so it stays out of the break row.
+    #[test]
+    fn a_never_served_procedure_call_in_the_file_of_a_removed_one_stays_out_of_its_row() {
+        let pairings = main_pairings(
+            &[shelf_edge("api", "shelf.get", "", 8)],
+            &[shelf_row(Some("api"), "shelf.get", Some("shelf.get"))],
+        );
+        assert_eq!(
+            marked(
+                pairings,
+                removed_get("api"),
+                vec![shelf_call("shelf.get", 8), shelf_call("shelf.gone", 10)],
+            ),
+            [r#""/api/rpc/shelf.get" "web" ["web/src/shelf.ts:8"]"#]
+        );
+    }
+
+    /// A producer carried in a peer blob is named by its repo alone, as the
+    /// edge names it: main's pairing through it is found and marked.
+    #[test]
+    fn a_procedure_pairing_main_had_through_a_peer_blob_is_marked() {
+        let pairings = main_pairings(
+            &[shelf_edge("shop-api", "shelf.get", "", 8)],
+            &[shelf_row(None, "shelf.get", Some("shelf.get"))],
+        );
+        assert_eq!(
+            marked(
+                pairings,
+                removed_get("shop-api"),
+                vec![shelf_call("shelf.get", 8)],
+            ),
+            [r#""/api/rpc/shelf.get" "web" ["web/src/shelf.ts:8"]"#]
+        );
+    }
+
+    /// The doubt predicate: a procedure row of a service whose walk stopped.
+    #[test]
+    fn a_removal_is_in_doubt_only_for_a_procedure_row_of_a_stopped_service() {
+        let stopped: ProcedureStops = [Some("api".to_string())].into_iter().collect();
+        let api = Some("api".to_string());
+        assert!(procedure_removal_in_doubt(&stopped, &api, true));
+        assert!(!procedure_removal_in_doubt(&stopped, &api, false));
+        assert!(!procedure_removal_in_doubt(
+            &stopped,
+            &Some("web".to_string()),
+            true
+        ));
+        assert!(!procedure_removal_in_doubt(&stopped, &None, true));
     }
 }

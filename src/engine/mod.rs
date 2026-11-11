@@ -487,6 +487,8 @@ struct DeltaRow {
     /// row with no handler of its own
     /// ([`FileOrchestrator::is_documentation_route`]).
     documentation: Vec<bool>,
+    /// Whether any of its rows is a procedure of an RPC router (carrick#3778).
+    procedure: bool,
 }
 
 impl DeltaRow {
@@ -517,7 +519,9 @@ fn keep_first_spelling(
             commit: commit.to_string(),
             sources: Vec::new(),
             documentation: Vec::new(),
+            procedure: false,
         });
+    row.procedure |= endpoint.procedure.is_some();
     if endpoint.key.display_labels() < row.key.display_labels() {
         row.key = endpoint.key.clone();
     }
@@ -598,6 +602,8 @@ struct DeltaItem {
     serving: Vec<crate::pr_delta_anchor::Place>,
     /// One of [`DeltaCandidates::documented`]: never listed as removed.
     documented: bool,
+    /// Whether its operation is a procedure of an RPC router (carrick#3778).
+    procedure: bool,
 }
 
 /// The delta's candidates: the operations `current` states that `previous`
@@ -653,6 +659,7 @@ fn delta_candidates(
                 },
                 serving,
                 documented,
+                procedure: row.procedure,
             },
             places: places
                 .into_iter()
@@ -703,16 +710,31 @@ fn delta_candidates(
 /// serve it and whose path this scan could not read (`unread_written`, the
 /// sites `pr_delta_anchor` finds on a line the PR added or changed), the
 /// registration may still be there, so the row is a candidate whatever its
-/// rows on main were (carrick#3222). Every other row keeps its fold.
+/// rows on main were (carrick#3222). So is a removed procedure row of a
+/// service whose procedure walk stopped in this run
+/// ([`pr_removals::procedure_removal_in_doubt`], carrick#3778 R5). Every
+/// other row keeps its fold.
 fn removed_rows(
     removed: Vec<DeltaItem>,
     unread_written: &[crate::pr_delta_anchor::Place],
+    procedure_stopped: &pr_removals::ProcedureStops,
 ) -> Vec<crate::findings::EndpointRef> {
     removed
         .into_iter()
         .map(|item| {
             let mut endpoint = item.endpoint;
-            if let Some(site) = item
+            if pr_removals::procedure_removal_in_doubt(
+                procedure_stopped,
+                &endpoint.service,
+                item.procedure,
+            ) {
+                debug!(
+                    "PR delta: removed {} {} is a candidate: this scan's procedure walk stopped \
+                     in its service",
+                    endpoint.method, endpoint.path
+                );
+                endpoint.edge_source = Some(crate::findings::EdgeSource::Candidate);
+            } else if let Some(site) = item
                 .serving
                 .iter()
                 .find(|place| unread_written.contains(place))
@@ -853,6 +875,7 @@ fn anchored_delta(
     changes: Option<&crate::change_scope::ChangedSince>,
     unread: &[UnreadRoute],
     unread_sources: &[UnreadSource],
+    procedure_stopped: &pr_removals::ProcedureStops,
 ) -> Option<crate::findings::PrDelta> {
     let Some(base) = base else {
         info!(
@@ -936,7 +959,11 @@ fn anchored_delta(
             }
             let mut delta = delta_of(
                 anchored.new.into_iter().map(|item| item.endpoint).collect(),
-                removed_rows(anchored.removed, &anchored.unread_written),
+                removed_rows(
+                    anchored.removed,
+                    &anchored.unread_written,
+                    procedure_stopped,
+                ),
             );
             delta.files_not_read = not_read;
             Some(delta)
@@ -2349,6 +2376,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         )
     });
     let pr_base = is_pr_run.then(|| pr_base_commit(repo_path)).flatten();
+    // The services this run analysed whose procedure walk stopped
+    // (carrick#3778 R5). A held-back service is represented by its served
+    // generation and a carried one by its stored one, so neither counts.
+    let procedure_stopped: pr_removals::ProcedureStops = runs
+        .iter()
+        .filter(|run| !run.held_back && !run.carried && run.procedure_stopped)
+        .map(|run| run.data.service_name.clone())
+        .collect();
     // Main's copy by commit, read here because the copy moves into the
     // baseline input below (carrick#2284).
     let main_index = crate::pr_baseline::main_index(&main_self_data);
@@ -2383,6 +2418,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     &current_services_data,
                     &services,
                     pr_changes.as_deref(),
+                    &procedure_stopped,
                 )
             };
             MainBaselineInput {
@@ -2542,6 +2578,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 pr_changes.as_deref(),
                 &unread,
                 &unread_sources,
+                &procedure_stopped,
             )
         }
         DeltaBaseline::OtherScanner(versions) => {
@@ -3128,6 +3165,9 @@ struct ServiceRun {
     /// Its route sites whose path the receiver trace could not read, for a
     /// PR's endpoint delta (carrick#3222). Empty for a carried service.
     unread_routes: Vec<crate::site_rows::GuessedRoute>,
+    /// Whether its procedure walk stopped anywhere, for a PR's removals
+    /// (carrick#3778). `false` for a carried service.
+    procedure_stopped: bool,
     /// The call edges its discovery walk entered, written once every
     /// service's call-through is settled. Empty for a carried service, whose
     /// stored definitions hold them already.
@@ -3160,6 +3200,7 @@ impl ServiceRun {
             fallbacks: None,
             type_reach: None,
             unread_routes: Vec::new(),
+            procedure_stopped: false,
             discovered_edges: Default::default(),
         }
     }
@@ -3698,6 +3739,7 @@ impl ServiceScan {
             fallbacks: analysis.fallbacks,
             type_reach: analysis.type_reach,
             unread_routes: analysis.unread_routes,
+            procedure_stopped: analysis.procedure_stopped,
             discovered_edges: analysis.discovered_edges,
         })
     }
@@ -5808,6 +5850,7 @@ async fn analyze_current_repo_incremental(
             let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
             let unread_routes = std::mem::take(&mut protocol_extractions.site.traced.guessed);
+            let procedure_stopped = protocol_extractions.site.traced.procedure_stopped;
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -6177,6 +6220,7 @@ async fn analyze_current_repo_incremental(
                 fallbacks: Some(fallbacks),
                 type_reach,
                 unread_routes,
+                procedure_stopped,
                 discovered_edges: discovered_edges
                     .relativized(|file| repo_relative(file, repo_path)),
             });
@@ -13909,6 +13953,7 @@ async fn analyze_current_repo(
     let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
     let unread_routes = std::mem::take(&mut protocol_extractions.site.traced.guessed);
+    let procedure_stopped = protocol_extractions.site.traced.procedure_stopped;
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
@@ -14185,6 +14230,7 @@ async fn analyze_current_repo(
         fallbacks: Some(fallbacks),
         type_reach,
         unread_routes,
+        procedure_stopped,
         discovered_edges: discovered_edges.relativized(|file| repo_relative(file, repo_path)),
     })
 }
@@ -14462,7 +14508,10 @@ async fn main_side_findings(
     let mut findings = main_results.findings;
     findings.extend(crate::sdk_edges::type_mismatch_findings(sdk_join.edges()));
     Ok(crate::pr_baseline::MainSide {
-        pairings: pr_removals::main_pairings(&main_results.cross_repo_matches),
+        pairings: pr_removals::main_pairings(
+            &main_results.cross_repo_matches,
+            analyzer.resolved_endpoints(),
+        ),
         findings,
         recomputed: analyzer.type_sites(),
         stored,
@@ -32335,6 +32384,7 @@ io.on("bare:in", (event) => {});
                 None,
                 &[],
                 sources,
+                &Default::default(),
             )
             .expect("git reads the diff")
         };
@@ -32421,6 +32471,7 @@ io.on("bare:in", (event) => {});
                 None,
                 &[],
                 sources,
+                &Default::default(),
             )
             .expect("the diff reads")
         };
@@ -32483,6 +32534,7 @@ io.on("bare:in", (event) => {});
                 None,
                 &[],
                 &[],
+                &Default::default(),
             )
             .expect("git reads the diff")
         };
@@ -32753,7 +32805,7 @@ io.on("bare:in", (event) => {});
 
         let sources = |written: &[Place]| -> Vec<(String, Option<EdgeSource>)> {
             let mut rows: Vec<(String, Option<EdgeSource>)> =
-                removed_rows(removed.clone(), written)
+                removed_rows(removed.clone(), written, &Default::default())
                     .into_iter()
                     .map(|row| (format!("{} {}", row.method, row.path), row.edge_source))
                     .collect();

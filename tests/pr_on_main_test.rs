@@ -3478,21 +3478,39 @@ fn assert_called_procedure_break(payload: &serde_json::Value, removed: (&str, &s
     assert_marks(row, Some(false), Some("fact"), Some("not_checked"));
 }
 
-/// A procedure a client calls is deleted from the router.
+/// The break rows of a payload, as `<removed method> <removed path> <service>`:
+/// the never-served `shelf.gone` call joins none (carrick#3778).
+fn break_rows(payload: &serde_json::Value) -> Vec<String> {
+    let mut rows: Vec<String> = findings_of(payload)
+        .iter()
+        .filter(|f| f["removed"].is_object())
+        .map(|f| {
+            format!(
+                "{} {} {} {}",
+                f["removed"]["method"].as_str().unwrap_or_default(),
+                f["removed"]["path"].as_str().unwrap_or_default(),
+                f["service"].as_str().unwrap_or_default(),
+                serde_json::to_string(&f["call_sites"]).unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A procedure a client calls is deleted from the router: the call is a
+/// break, and the never-served `shelf.gone` call in the same file is not.
 #[tokio::test]
 async fn seed_trpc_called_procedure_removed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-called-procedure-removed").await;
     assert_manifest_delta(&payload, "trpc-called-procedure-removed");
     assert_removed_rows_are_facts(&payload);
-}
-
-#[tokio::test]
-#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
-async fn seed_trpc_called_procedure_removed_marking() {
-    let _serial = SERIAL.lock().await;
-    let payload = manifest_seed_payload("trpc-called-procedure-removed").await;
     assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.get"));
+    assert_eq!(
+        break_rows(&payload),
+        [r#"GET /api/rpc/shelf.get web ["web/src/shelf.ts:8"]"#]
+    );
 }
 
 /// A procedure a client calls is renamed in the router only.
@@ -3502,14 +3520,11 @@ async fn seed_trpc_called_procedure_renamed() {
     let payload = manifest_seed_payload("trpc-called-procedure-renamed").await;
     assert_manifest_delta(&payload, "trpc-called-procedure-renamed");
     assert_removed_rows_are_facts(&payload);
-}
-
-#[tokio::test]
-#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
-async fn seed_trpc_called_procedure_renamed_marking() {
-    let _serial = SERIAL.lock().await;
-    let payload = manifest_seed_payload("trpc-called-procedure-renamed").await;
     assert_called_procedure_break(&payload, ("GET", "/api/rpc/shelf.get"));
+    assert_eq!(
+        break_rows(&payload),
+        [r#"GET /api/rpc/shelf.get web ["web/src/shelf.ts:8"]"#]
+    );
 }
 
 /// A procedure is added beside the called ones.
@@ -3560,7 +3575,10 @@ async fn seed_trpc_router_binding_renamed() {
 }
 
 /// The router's keys are written so the reader cannot read them: no contract
-/// change, but main's rows read as removed.
+/// change. Main's rows read as removed, but the procedure walk stopped in
+/// `api`, so no removal there is proven (carrick#3778 R5): every removed row
+/// is a candidate, which the PR comment does not post, and no break row is
+/// marked.
 #[tokio::test]
 async fn seed_trpc_router_rewritten_unread() {
     let _serial = SERIAL.lock().await;
@@ -3570,14 +3588,14 @@ async fn seed_trpc_router_rewritten_unread() {
             .iter()
             .any(|f| f["removed"].is_object())
     );
-}
-
-#[tokio::test]
-#[ignore = "carrick#3778: a removal under a router the PR rewrote so its keys are unread is posted as a fact"]
-async fn seed_trpc_router_rewritten_unread_marking() {
-    let _serial = SERIAL.lock().await;
-    let payload = manifest_seed_payload("trpc-router-rewritten-unread").await;
-    assert_manifest_delta(&payload, "trpc-router-rewritten-unread");
+    let removed = payload["delta"]["removed_endpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!removed.is_empty(), "no removed row: {payload:#}");
+    for row in removed {
+        assert_eq!(row["edge_source"], "candidate", "{row:#}");
+    }
 }
 
 // ---- GraphQL -----------------------------------------------------------

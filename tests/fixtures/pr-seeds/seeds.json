@@ -427,8 +427,7 @@
           {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
           {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
         ]
-      },
-      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "trpc-called-procedure-renamed",
@@ -446,8 +445,7 @@
           {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
           {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
         ]
-      },
-      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "trpc-procedure-added-beside-calls",
@@ -543,8 +541,7 @@
         "conclusion": "success",
         "quiet": true,
         "rows": []
-      },
-      "known_miss": {"stage": "finding", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "graphql-field-rename",
