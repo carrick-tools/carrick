@@ -5222,7 +5222,7 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             .module_bindings
             .iter()
             .find(|((_, name), binding)| {
-                name == "url" && binding.declared_in.as_deref() == Some("local")
+                name == "url" && binding.declared == Declared::Body("local".to_string())
             })
             .and_then(|(_, binding)| binding.text.clone())
             .expect("the local's initialiser");

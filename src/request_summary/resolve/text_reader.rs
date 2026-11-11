@@ -563,7 +563,7 @@ impl<'a> Resolver<'a> {
             BindingKind::Let => binding.writes.is_empty() && !binding.unplaceable,
             _ => false,
         };
-        if binding.declared_in.is_none() || !once {
+        if !matches!(binding.declared, Declared::Body(_)) || !once {
             return None;
         }
         let text = binding.text.as_ref()?;
