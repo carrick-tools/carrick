@@ -7041,6 +7041,15 @@ async fn site_rows_of(
     });
     // The calls the walks stopped at, but none in a mock or test tree: such
     // a call is no call of the service (carrick#3688 U3).
+    let mut unread = unread;
+    let own_decorators = crate::unread_sites::of_own_decorators(
+        &crate::request_summary::own_decorators::of(inputs),
+        claims,
+        &unread,
+        &rows.leads,
+        root,
+    );
+    unread.extend(own_decorators);
     rows.unread = unread
         .into_iter()
         .filter(|site| {

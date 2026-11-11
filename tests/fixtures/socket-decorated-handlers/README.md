@@ -28,3 +28,5 @@ Two services, `lobby` and `player`. Answer key:
 | `lobby/src/gateway.ts:16` | nothing: `@Traced("lobby.idle")` is not labelled |
 | `player/src/client.ts:6` | call `CLIENT->SERVER` `lobby.enter` |
 | `player/src/client.ts:10` | call `CLIENT->SERVER` `lobby.chat` |
+| `lobby/src/wrapped.ts:20` | no row; one unread site (`own_function`, slot `name`, callee `Handles`): the method is decorated through an in-repo factory whose body applies `OnMessage` (carrick#3688 C1) |
+| `lobby/src/wrapped.ts:23` | nothing: `Tagged` wraps the unlabelled `Traced`, so its body holds no labelled site |

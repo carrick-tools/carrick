@@ -232,6 +232,9 @@ pub use rows_join::ROWS_JOIN_BUDGET;
 // census read it so far, so the binary sees it as unused.
 #[allow(dead_code)]
 pub(crate) mod discovery;
+/// Method decorators that call an in-repo decorator factory
+/// (carrick#3688 C1): `src/request_summary/own_decorators.rs`.
+pub(crate) mod own_decorators;
 
 // The implementations of an interface member a call goes through, asked of
 // the analysis sidecar and read by discovery (carrick#2432 slice B).
@@ -1320,6 +1323,10 @@ struct FnIr {
     local_bindings: Vec<resolve::LocalBinding>,
     /// Parameters the body calls (`produce()`), by position.
     invoked_params: BTreeSet<usize>,
+    /// The decorators on this method that call a name no library export
+    /// answers to, written as the call `@Name(…)`
+    /// ([`own_decorators::OwnDecorator`], carrick#3688 C1).
+    own_decorators: Vec<own_decorators::OwnDecorator>,
     /// Function expressions passed as call arguments, referenced from a
     /// [`Value::Callback`] argument.
     nested: Vec<FnIr>,
@@ -1657,6 +1664,10 @@ pub struct FileIr {
     /// those tables key it by ([`module_declarations`]): where a compiler
     /// row's declaration joins this file (carrick#2413 slice B).
     declared_at: HashMap<String, (u32, String)>,
+    /// Each module-scope function's span (`span_start`, `span_end`, in the
+    /// file's own SWC numbering), by binding: where a decorator factory's
+    /// body is ([`own_decorators`], carrick#3688 C1).
+    function_spans: HashMap<String, (u32, u32)>,
     /// The file loads a module by a specifier it computes (`require(name)`,
     /// `import(name)`), which may be any module of the service
     /// ([`module_loads`]).
@@ -2307,6 +2318,9 @@ pub fn extract_file_ir(
                 let ir = reader.function(&fn_decl.function, None, module_scope, &none);
                 let name = fn_decl.ident.sym.to_string();
                 bound.insert(name.clone(), declared_exported);
+                let at = reader.site(fn_decl.function.span);
+                file.function_spans
+                    .insert(name.clone(), (at.span_start, at.span_end));
                 file.functions.insert(name, ir);
             }
             Some(Decl::Var(var)) => {
@@ -2318,9 +2332,14 @@ pub fn extract_file_ir(
                     // A wrapper that only states a type (`(async () => {})
                     // satisfies ActionFunction`, `as`, `!`, parentheses) still
                     // binds the function itself (carrick#2740).
+                    let span;
                     let ir = match crate::graphql_document_sites::unwrap_expression(init) {
-                        Expr::Arrow(arrow) => reader.arrow(arrow, None, module_scope, &none),
+                        Expr::Arrow(arrow) => {
+                            span = arrow.span;
+                            reader.arrow(arrow, None, module_scope, &none)
+                        }
                         Expr::Fn(fn_expr) => {
+                            span = fn_expr.function.span;
                             reader.function(&fn_expr.function, None, module_scope, &none)
                         }
                         // The functions a constant object holds (carrick#3356).
@@ -2360,6 +2379,9 @@ pub fn extract_file_ir(
                     };
                     let name = ident.id.sym.to_string();
                     bound.insert(name.clone(), declared_exported);
+                    let at = reader.site(span);
+                    file.function_spans
+                        .insert(name.clone(), (at.span_start, at.span_end));
                     file.functions.insert(name, ir);
                 }
             }
@@ -5492,6 +5514,16 @@ impl Reader<'_> {
                 site.op_line = self.line(name);
                 site.decorated = decorated.map(str::to_string);
                 ir.library.push(site);
+            } else if let Expr::Ident(factory) =
+                crate::graphql_document_sites::unwrap_expression(callee)
+            {
+                // No export answers to the name: it may be a function of
+                // the service that composes one ([`own_decorators`]).
+                ir.own_decorators.push(own_decorators::OwnDecorator {
+                    callee: factory.sym.to_string(),
+                    call: self.site(call.span),
+                    line: self.line(name),
+                });
             }
         }
     }

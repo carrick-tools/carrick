@@ -75,7 +75,7 @@ fn row(side: &str, key: &str, file_path: &str) -> Row {
 }
 
 /// The socket rows of each service of a scan of the fixture, sorted.
-fn scan() -> BTreeMap<String, Vec<Row>> {
+fn scan() -> Scanned {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir(), &repo);
@@ -134,6 +134,7 @@ fn scan() -> BTreeMap<String, Vec<Row>> {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut services = BTreeMap::new();
+    let mut unread = BTreeMap::new();
     for entry in std::fs::read_dir(&storage).expect("storage dir") {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -164,19 +165,35 @@ fn scan() -> BTreeMap<String, Vec<Row>> {
             }
         }
         rows.sort();
-        services.insert(blob["service_name"].as_str().unwrap().to_string(), rows);
+        let name = blob["service_name"].as_str().unwrap().to_string();
+        unread.insert(
+            name.clone(),
+            blob["unread_sites"].as_array().cloned().unwrap_or_default(),
+        );
+        services.insert(name, rows);
     }
     assert_eq!(
         services.keys().map(String::as_str).collect::<Vec<_>>(),
         ["lobby", "player"],
         "every service uploads one blob"
     );
-    services
+    Scanned { services, unread }
+}
+
+/// What a scan of the fixture wrote, by service: the socket rows and the
+/// blob's `unread_sites`.
+struct Scanned {
+    services: BTreeMap<String, Vec<Row>>,
+    unread: BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+fn scan_once() -> &'static Scanned {
+    static SCAN: OnceLock<Scanned> = OnceLock::new();
+    SCAN.get_or_init(scan)
 }
 
 fn scanned() -> &'static BTreeMap<String, Vec<Row>> {
-    static ROWS: OnceLock<BTreeMap<String, Vec<Row>>> = OnceLock::new();
-    ROWS.get_or_init(scan)
+    &scan_once().services
 }
 
 /// A method decorated with the labelled decorator is the listener of the
@@ -233,4 +250,35 @@ fn a_decorator_whose_name_is_an_unbounded_type_parameter_states_nothing() {
         lobby.iter().all(|row| !row.key.ends_with("lobby.nothing")),
         "{lobby:#?}"
     );
+}
+
+/// A method decorated through an in-repo decorator factory (carrick#3688,
+/// the stop half of #3781): the factory's body holds the labelled
+/// decorator's call, so the method saves one unread site at its name, with
+/// the factory as the callee, and states no row. A factory over a
+/// decorator the store does not label saves nothing at its method.
+#[test]
+fn a_method_decorated_through_an_in_repo_factory_saves_a_stop_at_the_method() {
+    let scan = scan_once();
+    let lobby = &scan.services["lobby"];
+    assert!(
+        lobby.iter().all(|row| !row.key.ends_with("w:wrapped")),
+        "no row is stated for the wrapped handler: {lobby:#?}"
+    );
+    let wrapped: Vec<_> = scan.unread["lobby"]
+        .iter()
+        .filter(|site| site["file"] == "services/lobby/src/wrapped.ts")
+        .filter(|site| site["line"] == 20 || site["line"] == 23)
+        .collect();
+    assert_eq!(
+        wrapped.len(),
+        1,
+        "{wrapped:#?} of {:#?}",
+        scan.unread["lobby"]
+    );
+    let site = wrapped[0];
+    assert_eq!(site["line"], 20, "{site}");
+    assert_eq!(site["slot"], "name", "{site}");
+    assert_eq!(site["reason"], "own_function", "{site}");
+    assert_eq!(site["callee"], "Handles", "{site}");
 }
