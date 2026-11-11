@@ -1157,6 +1157,20 @@ impl CallIr {
         )
     }
 
+    /// The text the function this call runs receives at `index`, as
+    /// [`Self::passed_arg`] reads the value there: past the arguments a
+    /// `bind` filled, shifted past `this` for a decided `call`, an element
+    /// of a decided `apply`. `None` where nothing is written there, a spread
+    /// moves it, or a `bind` filled it (its text is no term of this call).
+    fn passed_text(&self, index: usize) -> Option<&ValueAt> {
+        let index = index.checked_sub(self.bound.len())?;
+        let texts = self.passed_texts();
+        if texts.iter().take(index + 1).any(Option::is_none) {
+            return None;
+        }
+        texts.get(index)?.as_ref()
+    }
+
     /// One per-argument list of this call, `own`, as the function a decided
     /// `call` or `apply` runs receives it: an `apply`'s elements, or a
     /// `call`'s own past `this`. `spread` says an entry is a spread, which
@@ -12227,6 +12241,50 @@ mod tests {
         );
         let module = crate::parser::parse_file(&path, &cm, &handler).expect("parsed module");
         extract_file_ir(&module, &cm, &HashSet::new())
+    }
+
+    /// carrick#3504 B10-2a2: the dry run's name census reads the term the
+    /// site path reads: past `this` for a decided `call`, past the arguments
+    /// a `bind` filled.
+    #[test]
+    fn the_dry_run_reads_the_argument_the_site_path_reads() {
+        use decided_sites::{ArgSlot, dry_run_term};
+        let file = file_ir_of(
+            "declare const send: (p: string, q: string) => void;\n\
+             export function viaCall(name: string) { send.call(this, name, 'x'); }\n\
+             export function viaBind(name: string) { send('/p', name); }\n",
+        );
+        let slot = |arg| ArgSlot { arg, key: None };
+
+        let mut call = file.functions["viaCall"]
+            .read_calls()
+            .map(|(call, _)| call.clone())
+            .find(|call| call.language_call.is_some())
+            .expect("the call");
+        call.language_call.as_mut().expect("language call").decided = true;
+        assert_eq!(
+            dry_run_term(&call, &slot(0)).as_ref(),
+            call.arg_texts[1].as_ref(),
+            "slot 0 of a decided `call` is the argument after `this`"
+        );
+        assert_eq!(
+            call.passed_arg(0).is_some(),
+            dry_run_term(&call, &slot(0)).is_some()
+        );
+
+        // `send.bind(null, '/p')(name)`: one argument bound ahead.
+        let mut call = file.functions["viaBind"]
+            .read_calls()
+            .map(|(call, _)| call.clone())
+            .find(|call| call.arg_texts.len() == 2)
+            .expect("the call");
+        call.bound = vec![Value::Str(vec![lit("/p")])];
+        assert_eq!(dry_run_term(&call, &slot(0)), None, "bound, not written");
+        assert_eq!(
+            dry_run_term(&call, &slot(1)).as_ref(),
+            call.arg_texts[0].as_ref(),
+            "slot 1 is the call's first own argument"
+        );
     }
 
     /// carrick#3559 (R2): without the resolver every binding key is

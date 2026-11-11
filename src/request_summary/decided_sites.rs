@@ -1674,6 +1674,21 @@ fn reads_param(pieces: &[Piece]) -> bool {
     })
 }
 
+/// The term the labelled call writes at its name slot, the argument the
+/// function it runs receives there, as the site path reads it
+/// ([`slot_value`], [`CallIr::passed_arg`]); `None` where none is written or
+/// the slot's key is not in it.
+pub(in crate::request_summary) fn dry_run_term(
+    call: &CallIr,
+    slot: &ArgSlot,
+) -> Option<super::resolve::ValueAt> {
+    let written = call.passed_text(slot.arg).cloned()?;
+    match &slot.key {
+        None => Some(written),
+        Some(key) => super::resolve::handed(&written, std::slice::from_ref(key)),
+    }
+}
+
 /// The resolver's pieces read of the labelled call's name slot, beside the
 /// site path's own (`today`), counted (carrick#3504 B10-2a2, the dry run):
 /// whether it spells the name at the labelled call's own function as the
@@ -1689,12 +1704,8 @@ fn dry_run_name(
     today: &[Piece],
     out: &mut crate::name_census::DryRunNames,
 ) {
-    let written = call.arg_texts.get(slot.arg).cloned().flatten();
-    let term = match (&slot.key, written) {
-        (_, None) => None,
-        (None, Some(term)) => Some(term),
-        (Some(key), Some(term)) => super::resolve::handed(&term, std::slice::from_ref(key)),
-    };
+    let term = dry_run_term(call, slot);
+    let term_present = term.is_some();
     let values = term.map_or_else(Vec::new, |term| {
         resolver.pieces_through_callers(file, &term)
     });
@@ -1733,6 +1744,8 @@ fn dry_run_name(
             call = call.site.lo,
             today = ?today,
             pieces = ?renders,
+            term = if term_present { "present" } else { "absent" },
+            values = values.len(),
             "site-path names (dry run): differs"
         );
     }
