@@ -49,5 +49,6 @@
   "procedure_router_outside_repo": "the procedure's router is declared outside this repository's source, so Carrick can't name it",
   "procedure_router_ambiguous": "the procedure's first key is declared in more than one place, so Carrick can't name its router",
   "procedure_path_unread": "part of the procedure's key path is not written as a name Carrick can read",
-  "parameter_unread": "the value comes from a parameter this function's callers fill, and this reader does not read through callers"
+  "parameter_unread": "the value comes from a parameter this function's callers fill, and this reader does not read through callers",
+  "env_value": "the name is read from the environment when the program runs"
 }

@@ -329,7 +329,7 @@ fn an_emit_named_by_a_runtime_template_is_an_unread_site() {
     );
     assert!(
         scan.unread
-            .contains(&"src/client.ts:17 name unresolved_import".to_string()),
+            .contains(&"src/client.ts:17 name env_value".to_string()),
         "{:#?}",
         scan.unread
     );
