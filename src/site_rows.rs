@@ -738,6 +738,34 @@ fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<S
     Some(Stop::OwnerUnknown)
 }
 
+/// Why a route site, whose router the site cannot name, stays a possible
+/// call: `owner_unknown`, unless every chain the trace walked up from its
+/// instance ended at a stop, and then that stop's reason (the first chain's),
+/// so the possible call says where the walk stopped (carrick#3688 U6).
+///
+/// Word only: it never adds or drops a possible call. A site keeps
+/// `owner_unknown` where any chain ends at the top (the path is composed
+/// elsewhere), where the trace left chains out at its cap, where a chain
+/// ends at a boundary the cross-service join may still continue
+/// (`entry_point`, `callback_option`: [`crate::engine`]'s
+/// `route_boundaries::settle` runs after this), where a chain ends in no
+/// stop (`handed`), and for a procedure's route.
+fn owner_stop(site: &DecidedSite) -> Stop {
+    if site.procedure.is_some() || site.composed_trimmed || site.composed.is_empty() {
+        return Stop::OwnerUnknown;
+    }
+    let ends: Option<Vec<Stop>> = site
+        .composed
+        .iter()
+        .map(|composed| {
+            Stop::parse(&composed.end)
+                .filter(|stop| !matches!(stop, Stop::EntryPoint | Stop::CallbackOption))
+        })
+        .collect();
+    ends.and_then(|ends| ends.first().copied())
+        .unwrap_or(Stop::OwnerUnknown)
+}
+
 /// Whether `record`'s row rests on a slot only the label forced, with a
 /// name the code does not state (carrick#2520, module docs).
 fn needs_reader(record: &SiteRecord) -> bool {
@@ -939,7 +967,7 @@ pub fn of(
         };
         let lead = |reason| crate::possible_calls::from_site(site, reason);
         if label_states_a_route(record) {
-            out.routes.push(lead(Stop::OwnerUnknown));
+            out.routes.push(lead(owner_stop(site)));
             continue;
         }
         let answered = answers.answered.get(&site_id(&record.anchors));
@@ -988,6 +1016,11 @@ pub fn of(
             .as_ref()
             .and_then(|namespace| namespace.text.clone());
         if let Some(reason) = unwritable_route(&kind_text, side, method.as_deref()) {
+            let reason = if reason == Stop::OwnerUnknown {
+                owner_stop(site)
+            } else {
+                reason
+            };
             out.routes.push(lead(reason));
             continue;
         }

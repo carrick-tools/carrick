@@ -1614,6 +1614,99 @@ fn a_route_site_with_no_reader_row_is_one_owner_unknown_lead() {
     }
 }
 
+/// The reason word of the one possible call a route site comes to, with no
+/// reader row at its line (carrick#3688 U6).
+fn route_lead_reason(ends: &[(&str, Option<&str>)], trimmed: bool) -> Stop {
+    let site = DecidedSite {
+        composed_trimmed: trimmed,
+        ..traced_site("src/stopped.ts", 100, ends)
+    };
+    let mut endpoints = Vec::new();
+    let fold = fold_route(
+        &site,
+        route_record(&site, Some("GET")),
+        &SiteAnswers::default(),
+        &mut endpoints,
+    );
+    assert!(endpoints.is_empty());
+    assert_eq!(fold.leads.len(), 1, "{:?}", fold.leads);
+    // Only the word moves: the call is the same one possible call.
+    assert_eq!(fold.leads[0].kind.as_deref(), Some("http"));
+    assert_eq!(fold.leads[0].role.as_deref(), Some("producer"));
+    fold.leads[0].unread.reason
+}
+
+/// A route whose every chain stops carries the stop's reason, not
+/// `owner_unknown`; any chain that does not stop, a boundary another
+/// service continues, and a walk cut at its cap keep `owner_unknown`.
+#[test]
+fn a_route_whose_chains_all_stop_carries_the_stop() {
+    assert_eq!(
+        route_lead_reason(&[("mount_unverified", None)], false),
+        Stop::MountUnverified
+    );
+    assert_eq!(
+        route_lead_reason(&[("mount_unverified", None), ("recursion", None)], false),
+        Stop::MountUnverified
+    );
+    assert_eq!(
+        route_lead_reason(&[("recursion", None)], false),
+        Stop::Recursion
+    );
+    // One chain served at the top.
+    assert_eq!(
+        route_lead_reason(&[("mount_unverified", None), ("top", Some("/v1"))], false),
+        Stop::OwnerUnknown
+    );
+    // A chain that leaves the service.
+    for boundary in ["entry_point", "callback_option"] {
+        assert_eq!(
+            route_lead_reason(&[("mount_unverified", None), (boundary, None)], false),
+            Stop::OwnerUnknown,
+            "{boundary}"
+        );
+    }
+    // Chains left out at the cap, none walked, an end that is no stop.
+    assert_eq!(
+        route_lead_reason(&[("mount_unverified", None)], true),
+        Stop::OwnerUnknown
+    );
+    assert_eq!(route_lead_reason(&[], false), Stop::OwnerUnknown);
+    assert_eq!(
+        route_lead_reason(&[("handed", None)], false),
+        Stop::OwnerUnknown
+    );
+}
+
+/// The same word where the model answered the route (a role the label left
+/// open): the stop, not `owner_unknown`, with the same one possible call.
+#[test]
+fn an_answered_route_with_stopped_chains_carries_the_stop() {
+    let file = "src/stopped.ts";
+    let site = traced_site(file, 100, &[("mount_unverified", None)]);
+    let record = record(&site, &[(Slot::Kind, "http")], &[Slot::Role, Slot::Name]);
+    let sure = |text: &str| SlotAnswer {
+        value: Some(SlotValue::Text(text.to_string())),
+        confidence: 1.0,
+        orders_agree: true,
+    };
+    let mut answers = SiteAnswers::default();
+    answers.answered.insert(
+        site_id(&record.anchors),
+        Answered {
+            role: Some(sure("handles")),
+            name: Some(sure("/items/:id")),
+            method: Some(sure("GET")),
+            ..Answered::default()
+        },
+    );
+    let mut endpoints = Vec::new();
+    let fold = fold_route(&site, record, &answers, &mut endpoints);
+    assert!(endpoints.is_empty());
+    assert_eq!(lead_reason(&fold.leads, file), Some(Stop::MountUnverified));
+    assert_eq!(fold.leads.len(), 1);
+}
+
 /// A site whose role the label leaves open is asked. When the model answers
 /// that it registers an HTTP route and names no method (or a word no route is
 /// registered under), no endpoint is written: with no reader row at the
