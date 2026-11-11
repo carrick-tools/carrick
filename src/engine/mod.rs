@@ -2186,18 +2186,19 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // with every service settled, so the order they were scanned in does not
     // matter; a service held back keeps the generation the index serves.
     // First, every GraphQL document that waited on a walked schema file's
-    // vote is decided, with every service settled (carrick#3663); a carried
-    // or held-back service's rows are the stored generation and are not
-    // edited, though its report still counts what it read.
+    // vote is decided, with every service settled (carrick#3663). A carried
+    // service was never settled, so it holds none.
     for run in &mut runs {
-        let writable = !run.carried && !run.held_back;
-        let not_served = scan
-            .graphql_schemas
-            .settle_held(&run.label, writable.then_some(&mut run.data.calls));
+        let not_served = scan.graphql_schemas.settle_held(
+            &run.label,
+            &mut run.data.calls,
+            &mut run.data.type_manifest,
+        );
         if not_served > 0 {
             info!(
-                "GraphQL documents in {}: {not_served} operation(s) read against a schema file \
-                 no service that walks it serves; not indexed as calls",
+                "GraphQL documents in {}: {not_served} operation(s) decided once every service \
+                 was settled are not served (another API's schema, or unresolved); not indexed \
+                 as calls",
                 run.label
             );
         }
@@ -26646,23 +26647,55 @@ unfollowed_member_calls_total: 0,
                     false,
                 );
                 let mut cloud_data = repo_with_bundle("repo", Some(name), "");
+                let extractions = ProtocolExtractions {
+                    graphql,
+                    ..ProtocolExtractions::default()
+                };
                 append_deterministic_protocol_operations(
                     &mut cloud_data,
-                    &ProtocolExtractions {
-                        graphql,
-                        ..ProtocolExtractions::default()
-                    },
+                    &extractions,
                     &HashMap::new(),
                     &crate::in_process_pubsub::InProcessPubsub::default(),
                     &repo_path,
                     &config,
                 );
+                let mut manifest = Vec::new();
+                append_protocol_manifest_entries(
+                    &mut manifest,
+                    &extractions,
+                    &LibrarySiteIndex::default(),
+                );
+                cloud_data.type_manifest = Some(manifest);
                 data.insert(name, cloud_data);
             }
             let rows: std::collections::BTreeMap<&str, Vec<String>> = data
                 .into_iter()
                 .map(|(name, mut cloud_data)| {
-                    catalogue.settle_held(name, Some(&mut cloud_data.calls));
+                    // The rows as the end of a service's analysis leaves
+                    // them: repository-relative.
+                    relativize_cloud_paths(
+                        &mut cloud_data,
+                        &repo_path,
+                        &served_paths::PathScrub::for_scan(&repo_path),
+                    );
+                    catalogue.settle_held(
+                        name,
+                        &mut cloud_data.calls,
+                        &mut cloud_data.type_manifest,
+                    );
+                    let consumer_entries = cloud_data
+                        .type_manifest
+                        .iter()
+                        .flatten()
+                        .filter(|entry| entry.role == ManifestRole::Consumer)
+                        .map(|entry| {
+                            format!(
+                                "type {} {}:{}",
+                                entry.key.canonical(),
+                                entry.file_path,
+                                entry.line_number
+                            )
+                        });
                     let rows = cloud_data
                         .calls
                         .iter()
@@ -26670,13 +26703,11 @@ unfollowed_member_calls_total: 0,
                             format!(
                                 "{} {} {:?}",
                                 call.key.canonical(),
-                                call.file_path
-                                    .strip_prefix(root)
-                                    .unwrap_or(&call.file_path)
-                                    .display(),
+                                call.file_path.display(),
                                 call.schema_binding
                             )
                         })
+                        .chain(consumer_entries)
                         .collect();
                     (name, rows)
                 })
@@ -26692,7 +26723,10 @@ unfollowed_member_calls_total: 0,
         let first = scan(&overlapping, &[0, 1, 2]);
         assert_eq!(
             first.0["c"],
-            vec!["graphql|query|accounts c/src/accounts.gql:1 Some(Served)".to_string()]
+            vec![
+                "graphql|query|accounts c/src/accounts.gql:1 Some(Served)".to_string(),
+                "type graphql|query|accounts c/src/accounts.gql:1".to_string()
+            ]
         );
         assert_eq!(scan(&overlapping, &[1, 2, 0]), first);
 
@@ -26700,6 +26734,29 @@ unfollowed_member_calls_total: 0,
         let walker_first = scan(&lone, &[0, 1]);
         assert!(walker_first.0["c"].is_empty(), "{:?}", walker_first.0["c"]);
         assert_eq!(scan(&lone, &[1, 0]), walker_first);
+
+        // A served schema also holds the field and the transport does not
+        // say which: unresolved, whenever the walkers vote.
+        write("api/schema.graphql", "type Query { accounts: [String] }");
+        let both_hold: [Service; 3] = [
+            ("a", &["api"], true),
+            ("b", &["b", "shared"], false),
+            ("c", &["c"], false),
+        ];
+        let walkers_first = scan(&both_hold, &[0, 1, 2]);
+        assert!(
+            walkers_first.0["c"].is_empty(),
+            "{:?}",
+            walkers_first.0["c"]
+        );
+        assert!(
+            walkers_first.1.iter().any(|line| line.starts_with(
+                "Service 'c': 1 GraphQL document operation(s) are not indexed because"
+            )),
+            "{:?}",
+            walkers_first.1
+        );
+        assert_eq!(scan(&both_hold, &[2, 1, 0]), walkers_first);
     }
 
     /// Variant of `graphql_consumer_op` with a caller-chosen `kind` and

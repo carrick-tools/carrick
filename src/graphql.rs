@@ -1639,14 +1639,17 @@ impl SchemaCatalogue {
     /// service is settled ([`Self::attribute`]): each identity is read from
     /// the votes heard, as it would have been had every service that walks
     /// its files voted first. A held document that is not served has its
-    /// rows removed from `calls`, when given, and counted in the service's
-    /// record, so the report reads the same whatever order the services were
-    /// scanned in. Pass `None` for a service whose rows are not written this
-    /// run. Returns how many held rows were found not served.
+    /// rows removed from `calls` (the service's call rows), with the consumer
+    /// entries `manifest` holds at the same site and key, so no type is
+    /// compared for a call the index does not hold. Each is counted in the
+    /// service's record, so the report reads the same whatever order the
+    /// services were scanned in. Returns how many held rows were found not
+    /// served.
     pub fn settle_held(
         &self,
         service: &str,
-        mut calls: Option<&mut Vec<crate::analyzer::ApiEndpointDetails>>,
+        calls: &mut Vec<crate::analyzer::ApiEndpointDetails>,
+        manifest: &mut Option<Vec<crate::cloud_storage::TypeManifestEntry>>,
     ) -> usize {
         let rows = self
             .held
@@ -1670,10 +1673,19 @@ impl SchemaCatalogue {
                 DocumentIdentity::Unresolved => decided.unresolved += 1,
                 DocumentIdentity::Served | DocumentIdentity::NoLocalSchema => continue,
             }
-            if let Some(calls) = calls.as_deref_mut()
-                && let Some(at) = calls.iter().position(|call| self.is_row_of(call, &row))
-            {
-                calls.remove(at);
+            let Some(at) = calls.iter().position(|call| self.is_row_of(call, &row)) else {
+                continue;
+            };
+            let call = calls.remove(at);
+            let (file, line) =
+                crate::type_manifest::parse_file_location(&call.file_path.to_string_lossy());
+            if let Some(entries) = manifest.as_mut() {
+                entries.retain(|entry| {
+                    !(entry.role == crate::cloud_storage::ManifestRole::Consumer
+                        && entry.key == call.key
+                        && entry.file_path == file
+                        && entry.line_number == line)
+                });
             }
         }
         let count = decided.external.values().sum::<usize>() + decided.unresolved;
@@ -4185,7 +4197,7 @@ export const typeDefs = gql`
                         catalogue.record(name, summary);
                     }
                     for (name, _, _) in &services {
-                        catalogue.settle_held(name, None);
+                        catalogue.settle_held(name, &mut Vec::new(), &mut None);
                     }
                     catalogue.notices()
                 })
