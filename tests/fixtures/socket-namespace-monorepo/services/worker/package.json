@@ -1,6 +1,0 @@
-{
-  "name": "@fixture/worker",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "src/worker.ts"
-}

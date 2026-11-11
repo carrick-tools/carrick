@@ -6,51 +6,37 @@
 //! are producers of the key for the direction they receive; emitters
 //! (`socket.emit("x", ...)`) are consumers for the direction they send.
 //!
-//! Two rules admit a socket root, and the difference between them is the whole
-//! shape of this module (carrick#1281):
+//! One rule admits a socket root (carrick#1281): **any package the
+//! framework-detect step labels a socket client**
+//! (`DetectionResult::socket_clients` — `ws`, channel clients, hub clients),
+//! whose imports say nothing about sides because the same symbol is used on
+//! both. A binding constructed from one of those imports, declared with a type
+//! imported from one, or returned by a method OF one, is a socket root of
+//! unknown direction, and its ops are keyed `SocketDirection::Unknown`. An
+//! unknown-direction listener and emitter share that key, so the two sides of
+//! one contract still match; they cannot match a directional row for the same
+//! event name, which is correct — they are not the same transport.
 //!
-//! - **Socket.IO**, whose imports say which side of the wire a binding is on:
-//!   `socket.io-client` factories make client sockets, `new Server(...)` from
-//!   `socket.io` makes server roots, and the first parameter of a `connection`
-//!   handler is a per-connection server socket. The direction is derived from
-//!   the side, and the key is precise.
-//! - **Any package the framework-detect step labels a socket client**
-//!   (`DetectionResult::socket_clients` — `ws`, channel clients, hub clients),
-//!   whose imports say nothing about sides because the same symbol is used on
-//!   both. A binding constructed from one of those imports, declared with a
-//!   type imported from one, or returned by a method OF one, is a socket root
-//!   of unknown direction, and its ops are keyed `SocketDirection::Unknown`.
-//!   An unknown-direction listener and emitter share that key, so the two
-//!   sides of one contract still match; they cannot match a Socket.IO row for
-//!   the same event name, which is correct — they are not the same transport.
-//!
-//! Nothing here reads a package NAME except `socket.io` / `socket.io-client`,
-//! whose two extra rules buy the direction. Every other library reaches this
-//! pass through the detector's list, so no library is special-cased and none
-//! has to be recognised in Rust.
+//! The rows of a library whose imports DO say which side a binding is on
+//! (Socket.IO: client factories, `new Server(...)`, per-connection sockets) are
+//! the fact layer's: the library store labels each receiver's side, and the
+//! row is stated from that (`library_claim`), not read here. The one package
+//! name this module reads is the guard in `RootCollector::visit_import_decl`,
+//! which keeps `socket.io` and `socket.io-client` out of the detected-client
+//! rule, because detection lists them and an unknown-direction root would put
+//! an `UNKNOWN` row beside the fact layer's.
 //!
 //! The key carries the event name and the direction, and nothing else. A
-//! custom namespace is therefore not part of operation identity here, and
-//! cannot be: the server names it in a `.of(...)` argument that is usually a
-//! variable, and the client names it in the path of the URL it connects with,
-//! built in some other method. Both sides are namespace-blind, so ops are
-//! recorded on a namespace exactly as they are on the default one.
-//!
-//! The imprecision that accepts, stated plainly: two namespaces of one server
-//! handling one event name produce two producer rows on one key. That is the
-//! same imprecision the model already accepts across files and services, where
-//! two listeners for one event have always shared a key, so a file-level skip
-//! bought nothing the key could express and only hid the ops (carrick#662).
+//! custom namespace is therefore not part of operation identity here.
 //!
 //! A long-lived socket is usually held on a class field rather than a local
-//! (`private socket?: Socket<…>`; `this.socket = this.#createSocket()`), and
-//! the emits that carry the contract sit in later methods, on `this.socket`
+//! (`private socket?: Socket<…>`; `this.socket = connect(url)`), and the emits
+//! that carry the contract sit in later methods, on `this.socket`
 //! (carrick#659). Those fields are roots too, by two structural rules that do
 //! not depend on how the field is initialized:
 //! - a binding — class field, private field, constructor parameter property,
-//!   `const`, or parameter — whose declared type is the `Socket` type imported
-//!   from `socket.io-client` (client) or the `Socket`/`Namespace` type
-//!   imported from `socket.io` (server side), or a type alias for one of those
+//!   `const`, or parameter — whose declared type is a type imported from a
+//!   detected package, or a type alias for one
 //!   (`type SupervisorSocket = Socket<…>`, which a file holding several
 //!   sockets declares once and then uses on every field). The alias may be
 //!   declared in the file or imported from a relative sibling, which is
@@ -58,20 +44,11 @@
 //!   the declaring module is then read with these same module-local rules, so
 //!   an alias of an imported alias stops there (carrick#670), and
 //! - `this.<field> = <expr>` where the right-hand side is already a socket
-//!   root (a factory call, `new Server(...)`, or another root binding).
+//!   root (a factory call, a constructor, or another root binding).
 //!
 //! Precision over recall, per the brittleness guardrails:
 //! - only string-literal event names count; dynamic names are skipped,
-//! - reserved lifecycle events (`connect`, `disconnect`, ...) never become
-//!   contract events,
-//! - a namespace reached only through the `Server` TYPE stays invisible: the
-//!   type rule admits the receivers (`Socket`, `Namespace`), while the server
-//!   root is created by `new Server(...)` alone,
-//! - CommonJS `require("socket.io")` bootstrapping is not traced (coverage
-//!   gap, not a false positive),
-//! - a field assigned the RETURN VALUE of a method that builds a socket
-//!   (`this.socket = this.#createSocket()`) is a root only via one of the two
-//!   rules above — method-return flow is not traced,
+//! - the transport's lifecycle events never become contract events,
 //! - a socket taken out of a container (`this.sockets.get(id).emit(…)`) is not
 //!   a root: the container's value type is never consulted (carrick#670),
 //! - a socket reached as a member off an IMPORTED VALUE
@@ -84,19 +61,18 @@
 //!   not full scope analysis, and is flat per file: two classes in one file
 //!   with same-named socket fields share a root.
 //!
-//! What the unknown-direction half adds, and what it accepts:
-//! - the call vocabulary widens to the protocol's own words — registration is
+//! What the unknown-direction rule reads, and what it accepts:
+//! - the call vocabulary is the protocol's own words — registration is
 //!   `on`/`once`/`addListener`/`bind`/`subscribe` AND a function-valued second
 //!   argument, sending is `emit`/`send`/`publish`/`trigger`. The callback
 //!   requirement is what tells `channel.subscribe("orders", handler)` (a
 //!   registration) from `client.subscribe("orders")` (a channel handle), which
 //!   no name list could,
-//! - a method-return IS traced, for unknown roots only: a channel client hands
-//!   its channel back from a call (`const channel = client.subscribe("orders")`)
-//!   and there is no other way to reach it. Socket.IO keeps its no-method-return
-//!   rule, where a typed field is the idiom instead,
-//! - the runtime's own event vocabulary is excluded as well as Socket.IO's
-//!   reserved names ([`crate::event_emitter::RUNTIME_EVENTS`]), because a
+//! - a method-return IS traced: a channel client hands its channel back from a
+//!   call (`const channel = client.subscribe("orders")`) and there is no other
+//!   way to reach it,
+//! - the runtime's own event vocabulary is excluded as well as the reserved
+//!   names ([`crate::event_emitter::RUNTIME_EVENTS`]), because a
 //!   `ws` socket's `message`/`close`/`open` are the transport's lifecycle, not
 //!   a contract, and a row on a name that generic would match any unrelated
 //!   row sharing it,
@@ -142,7 +118,7 @@
 //!   outside the binding map. They are tracked in carrick#1298,
 //! - an unknown-direction listener and emitter for one event in ONE service
 //!   match each other, because the key cannot express that they are the same
-//!   side. Socket.IO's directional key does not have this exposure.
+//!   side. A directional key does not have this exposure.
 
 use crate::import_bindings::BindingResolver;
 use crate::operation::{OperationKey, SocketDirection};
@@ -289,10 +265,9 @@ const TRANSPORT_RECEIVE_EVENTS: &[&str] = &["message"];
 /// Extract socket operations from the service's TS/JS files.
 ///
 /// `socket_clients` is `DetectionResult::socket_clients` — the packages the
-/// framework-detect step labelled socket/realtime clients. Socket.IO's rules do
-/// not consult it; it is the gate for every other library, so an empty slice
-/// (local mode, a repo whose detection predates the field) leaves this pass
-/// extracting exactly what it extracted before.
+/// framework-detect step labelled socket/realtime clients. It is the gate for
+/// every root, so an empty slice (local mode, a repo whose detection predates
+/// the field) extracts nothing.
 pub fn scan_files(service_files: &[PathBuf], socket_clients: &[String]) -> SocketExtraction {
     let mut extraction = SocketExtraction::default();
     // One resolver for the whole service: it caches each module's export
@@ -375,69 +350,66 @@ fn extract_from_ts_file(
 #[derive(Default)]
 struct AliasResolver {
     bindings: BindingResolver,
-    verdicts: HashMap<(PathBuf, String), Option<SocketKind>>,
+    verdicts: HashMap<(PathBuf, String), bool>,
 }
 
 impl AliasResolver {
-    /// What the type `exported_name` of `specifier`, as imported by
-    /// `importer`, resolves to — `None` when it is not a socket type, when the
-    /// specifier is not relative, or when the declaration cannot be reached.
+    /// Whether the type `exported_name` of `specifier`, as imported by
+    /// `importer`, is a socket type: false when it is not, when the specifier
+    /// is not relative, or when the declaration cannot be reached.
     ///
     /// ONE import hop. Re-export hops on the way to the declaring module are
     /// followed by the binding resolver, but if the declaring module's alias is
     /// ITSELF an imported alias it stops there: the declaring module is read
     /// with the module-local rules only.
-    fn kind_of_imported_type(
+    fn is_imported_socket_type(
         &mut self,
         importer: &Path,
         specifier: &str,
         exported_name: &str,
         socket_clients: &[String],
-    ) -> Option<SocketKind> {
+    ) -> bool {
         if !specifier.starts_with('.') {
-            return None;
+            return false;
         }
-        let declaring = self
+        let Some(declaring) = self
             .bindings
-            .resolve_type(importer, specifier, exported_name)?;
+            .resolve_type(importer, specifier, exported_name)
+        else {
+            return false;
+        };
         let key = (declaring.clone(), exported_name.to_string());
         if let Some(verdict) = self.verdicts.get(&key) {
             return *verdict;
         }
-        let verdict = declaring_module_kind(&declaring, exported_name, socket_clients);
+        let verdict = declaring_module_has_socket_type(&declaring, exported_name, socket_clients);
         self.verdicts.insert(key, verdict);
         verdict
     }
 }
 
 /// Read the module that declares the alias with the module-local rules and ask
-/// what its own collector made of the name.
-fn declaring_module_kind(
+/// whether its own collector made a socket type of the name.
+fn declaring_module_has_socket_type(
     file: &Path,
     exported_name: &str,
     socket_clients: &[String],
-) -> Option<SocketKind> {
+) -> bool {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let globals = Globals::new();
     GLOBALS.set(&globals, || {
-        let module = parse_file(file, &cm, &handler)?;
+        let Some(module) = parse_file(file, &cm, &handler) else {
+            return false;
+        };
         let mut roots = SocketRoots::for_clients(socket_clients);
         collect_roots(&module, &mut roots);
-        if roots.client_socket_types.contains(exported_name) {
-            Some(SocketKind::Client)
-        } else if roots.server_socket_types.contains(exported_name) {
-            Some(SocketKind::Server)
-        } else if roots.unknown_socket_types.contains(exported_name) {
-            Some(SocketKind::Unknown)
-        } else {
-            None
-        }
+        roots.unknown_socket_types.contains(exported_name)
     })
 }
 
-/// Run the root collector to fixpoint: a connection-handler socket needs the
-/// server root known first, and an alias may be declared after its use.
+/// Run the root collector to fixpoint: an alias may be declared after its use,
+/// and a root may be bound from one found later in the file.
 fn collect_roots(module: &Module, roots: &mut SocketRoots) {
     loop {
         let before = roots.size();
@@ -477,26 +449,17 @@ fn resolve_imported_aliases(
         let Some(type_name) = roots.declared_type_names.get(&key).cloned() else {
             continue;
         };
-        if roots.client_socket_types.contains(&type_name)
-            || roots.server_socket_types.contains(&type_name)
-            || roots.unknown_socket_types.contains(&type_name)
-        {
+        if roots.unknown_socket_types.contains(&type_name) {
             continue;
         }
         let Some((specifier, exported)) = roots.imported_types.get(&type_name).cloned() else {
             continue;
         };
         let socket_clients = roots.socket_clients.clone();
-        let Some(kind) =
-            resolver.kind_of_imported_type(file_path, &specifier, &exported, &socket_clients)
-        else {
+        if !resolver.is_imported_socket_type(file_path, &specifier, &exported, &socket_clients) {
             continue;
-        };
-        match kind {
-            SocketKind::Client => roots.client_socket_types.insert(type_name),
-            SocketKind::Server => roots.server_socket_types.insert(type_name),
-            SocketKind::Unknown => roots.unknown_socket_types.insert(type_name),
-        };
+        }
+        roots.unknown_socket_types.insert(type_name);
         admitted = true;
     }
     admitted
@@ -512,14 +475,13 @@ struct UnrootedCallRoots<'a> {
 impl UnrootedCallRoots<'_> {
     fn note(&mut self, member: &MemberExpr, args: &[ExprOrSpread]) {
         if let Some(prop) = member.prop.as_ident()
-            && (matches!(prop.sym.as_ref(), "on" | "once" | "emit")
-                || UNKNOWN_SUBSCRIBE_METHODS.contains(&prop.sym.as_ref())
+            && (UNKNOWN_SUBSCRIBE_METHODS.contains(&prop.sym.as_ref())
                 || UNKNOWN_PUBLISH_METHODS.contains(&prop.sym.as_ref()))
             && args
                 .first()
                 .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
             && let Some(root) = chain_root(&member.obj)
-            && self.roots.kind_of(&root).is_none()
+            && !self.roots.is_root(&root)
         {
             self.keys.insert(root);
         }
@@ -552,29 +514,12 @@ impl Visit for UnrootedCallRoots<'_> {
     }
 }
 
-/// Which side of the wire a socket-rooted binding sits on — or `Unknown`, for a
-/// library whose imports do not distinguish the sides (carrick#1281).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SocketKind {
-    Client,
-    Server,
-    Unknown,
-}
-
 #[derive(Default)]
 struct SocketRoots {
     /// `DetectionResult::socket_clients`: the packages whose value and type
-    /// imports admit an unknown-direction socket root. Empty → this file's
-    /// unknown-direction rules never fire.
+    /// imports admit a socket root, of unknown direction (carrick#1281).
+    /// Empty → this file's rules never fire.
     socket_clients: Vec<String>,
-    /// Local names of `socket.io-client` factories (`io`, `connect`, ...).
-    client_factories: HashSet<String>,
-    /// Local names of the `socket.io` `Server` class.
-    server_classes: HashSet<String>,
-    /// Local names of the `Socket` TYPE imported from `socket.io-client`.
-    /// A binding declared with it holds a client socket however it was
-    /// initialized (carrick#659).
-    client_socket_types: HashSet<String>,
     /// Local type name → (module specifier, name inside that module) for every
     /// named type-position import from a relative specifier. Feeds the
     /// imported-alias hop (carrick#670).
@@ -583,9 +528,6 @@ struct SocketRoots {
     /// declared with, when that name is not an admitted socket type. The
     /// imported-alias hop reads this to know WHICH name to follow.
     declared_type_names: HashMap<String, String>,
-    /// Local names of the `Socket` TYPE imported from `socket.io` — the
-    /// per-connection server socket, not the server root.
-    server_socket_types: HashSet<String>,
     /// Local names imported as VALUES from a `socket_clients` package: the
     /// constructors and factories that make an unknown-direction socket
     /// (`new WebSocket(url)`, `createClient(...)`). Both call and `new`
@@ -597,14 +539,9 @@ struct SocketRoots {
     /// `unknown_constructors` — an import specifier is admitted to both, since
     /// a value import and a type import are told apart by use, not by shape.
     unknown_socket_types: HashSet<String>,
-    /// Bindings holding client sockets (`const s = io(url)`). Class fields are
-    /// keyed `this.<name>` / `this.#<name>`.
-    client_sockets: HashSet<String>,
-    /// Bindings holding server roots (`const io = new Server(...)`) or
-    /// per-connection sockets (`io.on("connection", (socket) => ...)`).
-    server_sockets: HashSet<String>,
     /// Bindings holding a socket from a `socket_clients` package, whose
-    /// direction no rule can derive.
+    /// direction no rule can derive. Class fields are keyed `this.<name>` /
+    /// `this.#<name>`.
     unknown_sockets: HashSet<String>,
     /// Imported type symbols → their module specifier. Drives payload-anchor
     /// resolution (#245): an emitted/received payload typed as an imported
@@ -651,72 +588,42 @@ impl SocketRoots {
     }
 
     fn size(&self) -> usize {
-        self.client_factories.len()
-            + self.server_classes.len()
-            + self.client_socket_types.len()
-            + self.server_socket_types.len()
-            + self.client_sockets.len()
-            + self.server_sockets.len()
-            + self.unknown_constructors.len()
+        self.unknown_constructors.len()
             + self.unknown_socket_types.len()
             + self.unknown_sockets.len()
             + self.type_imports.len()
             + self.binding_types.len()
     }
 
-    fn record(&mut self, key: String, kind: SocketKind) {
-        match kind {
-            SocketKind::Client => self.client_sockets.insert(key),
-            SocketKind::Server => self.server_sockets.insert(key),
-            SocketKind::Unknown => self.unknown_sockets.insert(key),
-        };
+    fn record(&mut self, key: String) {
+        self.unknown_sockets.insert(key);
     }
 
-    fn kind_of(&self, key: &str) -> Option<SocketKind> {
-        if self.client_sockets.contains(key) {
-            Some(SocketKind::Client)
-        } else if self.server_sockets.contains(key) {
-            Some(SocketKind::Server)
-        } else if self.unknown_sockets.contains(key) {
-            Some(SocketKind::Unknown)
-        } else {
-            None
-        }
+    fn is_root(&self, key: &str) -> bool {
+        self.unknown_sockets.contains(key)
     }
 
-    /// Socket kind a declared type annotation implies, or `None` when the type
-    /// is not the socket.io `Socket` type. `Socket<ServerToClient,
-    /// ClientToServer>` and `Socket | undefined` both resolve — a generic
-    /// parameterization and an optional field are still that socket.
-    fn kind_of_type_ann(&self, type_ann: &TsTypeAnn) -> Option<SocketKind> {
-        self.kind_of_type(&type_ann.type_ann)
+    /// Whether a declared type annotation names a socket type of a detected
+    /// package. `Socket<ServerToClient, ClientToServer>` and `Socket |
+    /// undefined` both resolve — a generic parameterization and an optional
+    /// field are still that socket.
+    fn is_socket_type_ann(&self, type_ann: &TsTypeAnn) -> bool {
+        self.is_socket_type(&type_ann.type_ann)
     }
 
-    fn kind_of_type(&self, ty: &TsType) -> Option<SocketKind> {
+    fn is_socket_type(&self, ty: &TsType) -> bool {
         match ty {
             TsType::TsTypeRef(type_ref) => match &type_ref.type_name {
                 TsEntityName::Ident(ident) => {
-                    let name = ident.sym.as_ref();
-                    if self.client_socket_types.contains(name) {
-                        Some(SocketKind::Client)
-                    } else if self.server_socket_types.contains(name) {
-                        Some(SocketKind::Server)
-                    } else if self.unknown_socket_types.contains(name) {
-                        Some(SocketKind::Unknown)
-                    } else {
-                        None
-                    }
+                    self.unknown_socket_types.contains(ident.sym.as_ref())
                 }
-                TsEntityName::TsQualifiedName(_) => None,
+                TsEntityName::TsQualifiedName(_) => false,
             },
             TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(union)) => {
-                union
-                    .types
-                    .iter()
-                    .find_map(|member| self.kind_of_type(member))
+                union.types.iter().any(|member| self.is_socket_type(member))
             }
-            TsType::TsParenthesizedType(paren) => self.kind_of_type(&paren.type_ann),
-            _ => None,
+            TsType::TsParenthesizedType(paren) => self.is_socket_type(&paren.type_ann),
+            _ => false,
         }
     }
 
@@ -749,80 +656,38 @@ impl SocketRoots {
         }
     }
 
-    /// Socket kind of an expression that is being bound to a name: a client
-    /// factory call, a `new Server(...)`, or a reference to a binding already
-    /// known to be a root. Nothing else — a method call that happens to return
-    /// a socket is not traced (see the module docs).
-    fn kind_of_init(&self, expr: &Expr) -> Option<SocketKind> {
+    /// Whether an expression being bound to a name is a socket root: a call of
+    /// a detected package's factory, a `new` of its constructor, or a reference
+    /// to a binding already known to be a root. Nothing else.
+    fn is_root_init(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Call(call) => match &call.callee {
                 Callee::Expr(callee) => match &**callee {
-                    Expr::Ident(factory)
-                        if self.client_factories.contains(factory.sym.as_ref()) =>
-                    {
-                        Some(SocketKind::Client)
+                    Expr::Ident(factory) => {
+                        self.unknown_constructors.contains(factory.sym.as_ref())
                     }
-                    Expr::Ident(factory)
-                        if self.unknown_constructors.contains(factory.sym.as_ref()) =>
-                    {
-                        Some(SocketKind::Unknown)
-                    }
-                    // The method-return hop, for unknown roots only: a channel
-                    // client hands the object that carries the events back from
-                    // a call (`const channel = client.subscribe("orders")`), so
-                    // refusing to trace it would make the whole library
-                    // invisible. A Socket.IO root never reaches this arm.
+                    // The method-return hop: a channel client hands the object
+                    // that carries the events back from a call (`const channel
+                    // = client.subscribe("orders")`), so refusing to trace it
+                    // would make the whole library invisible.
                     Expr::Member(member) => {
-                        match member_root(member).map(|root| self.kind_of(&root)) {
-                            Some(Some(SocketKind::Unknown)) => Some(SocketKind::Unknown),
-                            _ => None,
-                        }
+                        member_root(member).is_some_and(|root| self.is_root(&root))
                     }
-                    _ => None,
+                    _ => false,
                 },
-                _ => None,
+                _ => false,
             },
             Expr::New(NewExpr { callee, .. }) => match &**callee {
-                Expr::Ident(class) if self.server_classes.contains(class.sym.as_ref()) => {
-                    Some(SocketKind::Server)
-                }
-                Expr::Ident(class) if self.unknown_constructors.contains(class.sym.as_ref()) => {
-                    Some(SocketKind::Unknown)
-                }
-                _ => None,
+                Expr::Ident(class) => self.unknown_constructors.contains(class.sym.as_ref()),
+                _ => false,
             },
-            Expr::Ident(ident) => self.kind_of(ident.sym.as_ref()),
-            Expr::Member(member) => member_root(member).and_then(|root| self.kind_of(&root)),
-            Expr::Paren(paren) => self.kind_of_init(&paren.expr),
-            Expr::Await(awaited) => self.kind_of_init(&awaited.arg),
-            Expr::TsNonNull(non_null) => self.kind_of_init(&non_null.expr),
-            Expr::TsAs(as_expr) => self.kind_of_init(&as_expr.expr),
-            _ => None,
-        }
-    }
-
-    fn direction_for(&self, root: &str, is_listener: bool) -> Option<SocketDirection> {
-        if self.client_sockets.contains(root) {
-            // A client listens to server→client messages and emits
-            // client→server messages.
-            Some(if is_listener {
-                SocketDirection::ServerToClient
-            } else {
-                SocketDirection::ClientToServer
-            })
-        } else if self.server_sockets.contains(root) {
-            Some(if is_listener {
-                SocketDirection::ClientToServer
-            } else {
-                SocketDirection::ServerToClient
-            })
-        } else if self.unknown_sockets.contains(root) {
-            // Nothing in the library said which side this binding is on, so
-            // neither does the key. Both roles land on one direction, which is
-            // what lets the two sides of the contract still meet.
-            Some(SocketDirection::Unknown)
-        } else {
-            None
+            Expr::Ident(ident) => self.is_root(ident.sym.as_ref()),
+            Expr::Member(member) => member_root(member).is_some_and(|root| self.is_root(&root)),
+            Expr::Paren(paren) => self.is_root_init(&paren.expr),
+            Expr::Await(awaited) => self.is_root_init(&awaited.arg),
+            Expr::TsNonNull(non_null) => self.is_root_init(&non_null.expr),
+            Expr::TsAs(as_expr) => self.is_root_init(&as_expr.expr),
+            _ => false,
         }
     }
 }
@@ -861,82 +726,35 @@ impl Visit for RootCollector<'_> {
             }
         }
         // FROZEN (old path, 2026-10-21): from here to the end of this function
-        // only: the widened detected-client branch (S2) and the rules that read
-        // one socket library by its package name (S1); the type-import table
+        // only: the widened detected-client branch (S2) and the guard that
+        // keeps it off `socket.io` / `socket.io-client`; the type-import table
         // above stays. Deletions and safety fixes only. Fixes for wrong or
         // missing rows go in the library store's socket claims (side from the
-        // classification, ops from the store). Delete when the socket parity
-        // gate passes (carrick#1667) with no true row lost (carrick#1670).
-        if source != "socket.io" && source != "socket.io-client" {
-            // Any import from a package the detector labelled a socket client
-            // admits its local names as unknown-direction roots. The specifier
-            // rule above wins: a detection that also lists `socket.io` leaves
-            // Socket.IO's precise directional rules in force, never replaced by
-            // the general ones.
-            if self.roots.is_socket_client(source) {
-                for specifier in &node.specifiers {
-                    let local = match specifier {
-                        ImportSpecifier::Default(default) => default.local.sym.to_string(),
-                        ImportSpecifier::Named(named) => named.local.sym.to_string(),
-                        // `import * as x from "ws"` binds a namespace, not a
-                        // socket: `x.WebSocket` is the constructor and member
-                        // roots are not traced here (see the module docs).
-                        ImportSpecifier::Namespace(_) => continue,
-                    };
-                    self.roots.unknown_constructors.insert(local.clone());
-                    self.roots.unknown_socket_types.insert(local);
-                }
-            }
-            return;
-        }
-        for specifier in &node.specifiers {
-            match specifier {
-                ImportSpecifier::Default(default) if source == "socket.io-client" => {
-                    self.roots
-                        .client_factories
-                        .insert(default.local.sym.to_string());
-                }
-                ImportSpecifier::Named(named) => {
-                    let imported = named
-                        .imported
-                        .as_ref()
-                        .map(|name| match name {
-                            ModuleExportName::Ident(ident) => ident.sym.to_string(),
-                            ModuleExportName::Str(s) => s.value.to_string_lossy().into_owned(),
-                        })
-                        .unwrap_or_else(|| named.local.sym.to_string());
-                    match (source, imported.as_str()) {
-                        ("socket.io-client", "io" | "connect" | "default") => {
-                            self.roots
-                                .client_factories
-                                .insert(named.local.sym.to_string());
-                        }
-                        ("socket.io", "Server") => {
-                            self.roots
-                                .server_classes
-                                .insert(named.local.sym.to_string());
-                        }
-                        // The socket TYPE on either side. A binding declared
-                        // with it is a socket root regardless of how it was
-                        // initialized (carrick#659).
-                        ("socket.io-client", "Socket") => {
-                            self.roots
-                                .client_socket_types
-                                .insert(named.local.sym.to_string());
-                        }
-                        // `Namespace` is the other server-side receiver: it
-                        // broadcasts server->client and hands per-connection
-                        // sockets to its `connection` handler, exactly as the
-                        // default namespace does (carrick#662).
-                        ("socket.io", "Socket" | "Namespace") => {
-                            self.roots
-                                .server_socket_types
-                                .insert(named.local.sym.to_string());
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
+        // classification, ops from the store). Delete with the guard when the
+        // envelope readers take their roots from the fact layer
+        // (carrick#1670).
+        //
+        // Any import from a package the detector labelled a socket client
+        // admits its local names as unknown-direction roots. The guard stays
+        // because detection lists `socket.io` and `socket.io-client` as socket
+        // clients: the fact layer states those packages' rows with their sides,
+        // and an unknown-direction root here would put an `UNKNOWN` row beside
+        // them.
+        if source != "socket.io"
+            && source != "socket.io-client"
+            && self.roots.is_socket_client(source)
+        {
+            for specifier in &node.specifiers {
+                let local = match specifier {
+                    ImportSpecifier::Default(default) => default.local.sym.to_string(),
+                    ImportSpecifier::Named(named) => named.local.sym.to_string(),
+                    // `import * as x from "ws"` binds a namespace, not a
+                    // socket: `x.WebSocket` is the constructor and member
+                    // roots are not traced here (see the module docs).
+                    ImportSpecifier::Namespace(_) => continue,
+                };
+                self.roots.unknown_constructors.insert(local.clone());
+                self.roots.unknown_socket_types.insert(local);
             }
         }
     }
@@ -947,13 +765,10 @@ impl Visit for RootCollector<'_> {
         // with the alias (carrick#670). The alias IS the admitted type, so it
         // joins the same set and every rule that reads a declared type sees it.
         // The fixpoint loop resolves declaration order and a chain of aliases.
-        if let Some(kind) = self.roots.kind_of_type(&node.type_ann) {
-            let name = node.id.sym.to_string();
-            match kind {
-                SocketKind::Client => self.roots.client_socket_types.insert(name),
-                SocketKind::Server => self.roots.server_socket_types.insert(name),
-                SocketKind::Unknown => self.roots.unknown_socket_types.insert(name),
-            };
+        if self.roots.is_socket_type(&node.type_ann) {
+            self.roots
+                .unknown_socket_types
+                .insert(node.id.sym.to_string());
         }
         node.visit_children_with(self);
     }
@@ -963,9 +778,9 @@ impl Visit for RootCollector<'_> {
         // server root.
         if let Pat::Ident(binding) = &node.name
             && let Some(init) = node.init.as_deref()
-            && let Some(kind) = self.roots.kind_of_init(init)
+            && self.roots.is_root_init(init)
         {
-            self.roots.record(binding.id.sym.to_string(), kind);
+            self.roots.record(binding.id.sym.to_string());
         }
         node.visit_children_with(self);
     }
@@ -976,22 +791,18 @@ impl Visit for RootCollector<'_> {
         // (carrick#659).
         if let PropName::Ident(name) = &node.key {
             let key = format!("this.{}", name.sym);
-            let kind = node
+            let is_root = node
                 .type_ann
                 .as_deref()
-                .and_then(|type_ann| self.roots.kind_of_type_ann(type_ann))
-                .or_else(|| {
-                    node.value
-                        .as_deref()
-                        .and_then(|value| self.roots.kind_of_init(value))
-                });
-            match kind {
-                Some(kind) => self.roots.record(key, kind),
-                None => {
-                    if let Some(type_ann) = node.type_ann.as_deref() {
-                        self.roots.note_declared_type(&key, type_ann);
-                    }
-                }
+                .is_some_and(|type_ann| self.roots.is_socket_type_ann(type_ann))
+                || node
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| self.roots.is_root_init(value));
+            if is_root {
+                self.roots.record(key);
+            } else if let Some(type_ann) = node.type_ann.as_deref() {
+                self.roots.note_declared_type(&key, type_ann);
             }
         }
         node.visit_children_with(self);
@@ -1000,22 +811,18 @@ impl Visit for RootCollector<'_> {
     fn visit_private_prop(&mut self, node: &PrivateProp) {
         // Same rule for `#socket`, which is a distinct AST node.
         let key = format!("this.#{}", node.key.name);
-        let kind = node
+        let is_root = node
             .type_ann
             .as_deref()
-            .and_then(|type_ann| self.roots.kind_of_type_ann(type_ann))
-            .or_else(|| {
-                node.value
-                    .as_deref()
-                    .and_then(|value| self.roots.kind_of_init(value))
-            });
-        match kind {
-            Some(kind) => self.roots.record(key, kind),
-            None => {
-                if let Some(type_ann) = node.type_ann.as_deref() {
-                    self.roots.note_declared_type(&key, type_ann);
-                }
-            }
+            .is_some_and(|type_ann| self.roots.is_socket_type_ann(type_ann))
+            || node
+                .value
+                .as_deref()
+                .is_some_and(|value| self.roots.is_root_init(value));
+        if is_root {
+            self.roots.record(key);
+        } else if let Some(type_ann) = node.type_ann.as_deref() {
+            self.roots.note_declared_type(&key, type_ann);
         }
         node.visit_children_with(self);
     }
@@ -1028,9 +835,10 @@ impl Visit for RootCollector<'_> {
             && let Some(type_ann) = ident.type_ann.as_deref()
         {
             let key = format!("this.{}", ident.id.sym);
-            match self.roots.kind_of_type_ann(type_ann) {
-                Some(kind) => self.roots.record(key, kind),
-                None => self.roots.note_declared_type(&key, type_ann),
+            if self.roots.is_socket_type_ann(type_ann) {
+                self.roots.record(key);
+            } else {
+                self.roots.note_declared_type(&key, type_ann);
             }
         }
         node.visit_children_with(self);
@@ -1043,41 +851,9 @@ impl Visit for RootCollector<'_> {
         if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &node.left
             && let Some(key) = member_root(member)
             && key.starts_with("this.")
-            && let Some(kind) = self.roots.kind_of_init(&node.right)
+            && self.roots.is_root_init(&node.right)
         {
-            self.roots.record(key, kind);
-        }
-        node.visit_children_with(self);
-    }
-
-    // FROZEN (old path, 2026-10-21): this function only, the connection-handler
-    // root rule (S1). Deletions and safety fixes only. Fixes for wrong or
-    // missing rows go in the library store's socket claims (side from the
-    // classification, ops from the store). Delete when the socket parity gate
-    // passes (carrick#1667) with no true row lost (carrick#1670).
-    fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
-        // io.on("connection", (socket) => ...) — the handler's first param
-        // is a per-connection server socket.
-        if let Callee::Expr(callee) = &node.callee
-            && let Expr::Member(member) = &**callee
-            && member
-                .prop
-                .as_ident()
-                .is_some_and(|prop| prop.sym.as_ref() == "on")
-            && let Some(receiver) = member_root(member)
-            && self.roots.server_sockets.contains(&receiver)
-            && let Some(first) = node.args.first()
-            && matches!(&*first.expr, Expr::Lit(Lit::Str(event)) if matches!(event.value.as_str(), Some("connection" | "connect")))
-            && let Some(handler) = node.args.get(1)
-        {
-            let param = match &*handler.expr {
-                Expr::Arrow(arrow) => arrow.params.first().and_then(|p| p.as_ident()),
-                Expr::Fn(func) => func.function.params.first().and_then(|p| p.pat.as_ident()),
-                _ => None,
-            };
-            if let Some(param) = param {
-                self.roots.server_sockets.insert(param.id.sym.to_string());
-            }
+            self.roots.record(key);
         }
         node.visit_children_with(self);
     }
@@ -1097,13 +873,12 @@ impl Visit for RootCollector<'_> {
             }
             // A local or parameter declared with the socket type is a root by
             // the same rule as a class field (carrick#659): `(socket: Socket)
-            // => …` on the server, `const socket: Socket<…> = connect()` on
-            // the client.
-            match self.roots.kind_of_type_ann(type_ann) {
-                Some(kind) => self.roots.record(ident.id.sym.to_string(), kind),
-                None => self
-                    .roots
-                    .note_declared_type(ident.id.sym.as_ref(), type_ann),
+            // => …`, `const socket: Socket<…> = connect()`.
+            if self.roots.is_socket_type_ann(type_ann) {
+                self.roots.record(ident.id.sym.to_string());
+            } else {
+                self.roots
+                    .note_declared_type(ident.id.sym.as_ref(), type_ann);
             }
         }
         node.visit_children_with(self);
@@ -1600,26 +1375,18 @@ impl OpCollector<'_> {
         let Some(root_name) = chain_root(&member.obj) else {
             return;
         };
-        let Some(kind) = self.roots.kind_of(&root_name) else {
+        if !self.roots.is_root(&root_name) {
             return;
-        };
+        }
         let method = prop.sym.as_ref();
         let line = self.cm.lookup_char_pos(prop.span.lo).line as u32;
 
-        // The vocabulary a root answers to. Socket.IO's two words are the
-        // directional half; an unknown-direction root reads the protocol
-        // vocabulary, because its library's word for "register a handler" is
-        // whatever that library chose.
-        let (is_listener, is_emitter) = match kind {
-            SocketKind::Client | SocketKind::Server => {
-                (matches!(method, "on" | "once"), method == "emit")
-            }
-            SocketKind::Unknown => (
-                UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
-                    && Self::handler_argument(args).is_some(),
-                UNKNOWN_PUBLISH_METHODS.contains(&method),
-            ),
-        };
+        // The vocabulary a root answers to: the protocol's own words, because
+        // its library's word for "register a handler" is whatever that
+        // library chose.
+        let is_listener =
+            UNKNOWN_SUBSCRIBE_METHODS.contains(&method) && Self::handler_argument(args).is_some();
+        let is_emitter = UNKNOWN_PUBLISH_METHODS.contains(&method);
 
         // `send(JSON.stringify({ type: "x", … }))`: the raw-WebSocket idiom,
         // where the event name is a field of the payload rather than an
@@ -1627,8 +1394,7 @@ impl OpCollector<'_> {
         // event name as an argument has one there, and reading an object it was
         // handed instead would key on whatever field happened to be called
         // `type`.
-        if kind == SocketKind::Unknown
-            && method == "send"
+        if method == "send"
             && !args
                 .first()
                 .is_some_and(|arg| matches!(&*arg.expr, Expr::Lit(Lit::Str(_))))
@@ -1653,8 +1419,7 @@ impl OpCollector<'_> {
         // delivers every message, so the contract names are inside the handler,
         // not in this call. The registration itself still records nothing — the
         // rows are the literals the handler discriminates on.
-        if kind == SocketKind::Unknown
-            && UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
+        if UNKNOWN_SUBSCRIBE_METHODS.contains(&method)
             && let Some(first) = args.first()
             && let Expr::Lit(Lit::Str(event)) = &*first.expr
             && event
@@ -1662,28 +1427,23 @@ impl OpCollector<'_> {
                 .as_str()
                 .is_some_and(|name| TRANSPORT_RECEIVE_EVENTS.contains(&name))
         {
-            if let Some(handler) = Self::handler_argument(args)
-                && let Some(direction) = self.roots.direction_for(&root_name, true)
-            {
-                self.record_envelope_listeners(handler, direction);
+            if let Some(handler) = Self::handler_argument(args) {
+                self.record_envelope_listeners(handler, SocketDirection::Unknown);
             }
             return;
         }
 
-        let reserved = |event: &str| match kind {
-            // An unknown-direction root's transport lifecycle (`message`,
-            // `close`, `open`) is not a contract either, and its names are
-            // generic enough to match anything.
-            SocketKind::Unknown => is_transport_event(event),
-            _ => RESERVED_EVENTS.contains(&event),
-        };
-
+        // The transport's lifecycle (`message`, `close`, `open`) is not a
+        // contract, and its names are generic enough to match anything.
         if (is_listener || is_emitter)
             && let Some(first) = args.first()
             && let Expr::Lit(Lit::Str(event)) = &*first.expr
-            && !reserved(&event.value.to_string_lossy())
-            && let Some(direction) = self.roots.direction_for(&root_name, is_listener)
+            && !is_transport_event(&event.value.to_string_lossy())
         {
+            // Nothing in the library said which side this binding is on, so
+            // neither does the key. Both roles land on one direction, which is
+            // what lets the two sides of the contract still meet.
+            let direction = SocketDirection::Unknown;
             let payload_symbol = if is_listener {
                 // Listener: the handler's first parameter is the received
                 // payload; read its type annotation directly.
@@ -1849,8 +1609,10 @@ impl OpCollector<'_> {
 mod tests {
     use super::*;
 
+    /// Extract with the invented detected socket-client package
+    /// `wire-transport`, which most tests here import from.
     fn extract(source: &str) -> SocketExtraction {
-        extract_with_clients(source, &[])
+        extract_with_clients(source, &["wire-transport"])
     }
 
     /// Extract with a detected socket-client list, for the unknown-direction
@@ -1900,7 +1662,11 @@ mod tests {
         for (name, source) in files {
             std::fs::write(dir.join(name), source).unwrap();
         }
-        let result = extract_from_ts_file(&dir.join("main.ts"), &mut AliasResolver::default(), &[]);
+        let result = extract_from_ts_file(
+            &dir.join("main.ts"),
+            &mut AliasResolver::default(),
+            &["wire-transport".to_string()],
+        );
         std::fs::remove_dir_all(&dir).ok();
         result
     }
@@ -1911,43 +1677,10 @@ mod tests {
         keys
     }
 
-    #[test]
-    fn server_listeners_and_emitters() {
-        let result = extract(
-            r#"
-import { Server } from "socket.io";
-const io = new Server(httpServer);
-io.on("connection", (socket) => {
-  socket.on("chat:message", (msg) => { io.emit("chat:broadcast", msg); });
-  socket.emit("welcome", { ok: true });
-  socket.broadcast.emit("user:joined", socket.id);
-  io.to("room").emit("room:update", {});
-  socket.on("disconnect", () => {});
-});
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|chat:message"],
-            "server listener is a producer of client->server"
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec![
-                "socket|SERVER->CLIENT|chat:broadcast",
-                "socket|SERVER->CLIENT|room:update",
-                "socket|SERVER->CLIENT|user:joined",
-                "socket|SERVER->CLIENT|welcome",
-            ],
-            "server emits (incl. broadcast/to chains) are consumers of server->client"
-        );
-    }
-
     /// carrick#1626: an op written across lines sits on the line of its
     /// method name, not the line its receiver chain starts on, for every
-    /// rule of the pass: a Socket.IO listener and emitter, an
-    /// unknown-direction client's chained registration and send, and a raw
-    /// socket's envelope send.
+    /// rule of the pass: an unknown-direction client's chained registration
+    /// and send, and a raw socket's envelope send.
     #[test]
     fn a_chained_op_sits_on_its_method_line() {
         let lines = |ops: &[SocketOp]| -> Vec<(String, u32)> {
@@ -1956,27 +1689,6 @@ io.on("connection", (socket) => {
             lines.sort();
             lines
         };
-
-        let socket_io = extract(
-            r#"
-import { Server } from "socket.io";
-const io = new Server(httpServer);
-io.on("connection", (socket) => {
-  socket
-    .on("chat:send", (msg: string) => void msg);
-  socket
-    .emit("chat:ack", { ok: true });
-});
-"#,
-        );
-        assert_eq!(
-            lines(&socket_io.listeners),
-            vec![("socket|CLIENT->SERVER|chat:send".to_string(), 6)]
-        );
-        assert_eq!(
-            lines(&socket_io.emitters),
-            vec![("socket|SERVER->CLIENT|chat:ack".to_string(), 8)]
-        );
 
         let unknown = extract_with_clients(
             r#"
@@ -2008,46 +1720,11 @@ raw
     }
 
     #[test]
-    fn client_listeners_and_emitters() {
-        let result = extract(
-            r#"
-import { io } from "socket.io-client";
-const socket = io("https://chat.internal");
-socket.on("chat:broadcast", (msg) => console.log(msg));
-socket.emit("chat:message", "hello");
-socket.on("connect", () => {});
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|chat:broadcast"]
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|CLIENT->SERVER|chat:message"]
-        );
-    }
-
-    #[test]
-    fn unrelated_on_calls_are_ignored() {
-        let result = extract(
-            r#"
-import { Server } from "socket.io";
-const io = new Server(httpServer);
-process.on("exit", () => {});
-emitter.on("data", () => {});
-emitter.emit("data", 1);
-"#,
-        );
-        assert!(result.is_empty(), "non-socket .on/.emit must not match");
-    }
-
-    #[test]
     fn dynamic_event_names_are_skipped() {
         let result = extract(
             r#"
-import { io } from "socket.io-client";
-const socket = io(url);
+import { connect } from "wire-transport";
+const socket = connect(url);
 socket.emit(EVENTS.USER_CREATED, payload);
 socket.on(`chat:${kind}`, handler);
 "#,
@@ -2056,81 +1733,7 @@ socket.on(`chat:${kind}`, handler);
     }
 
     #[test]
-    fn namespace_files_are_recorded_under_the_plain_event_key() {
-        // A file that carves a namespace off its server used to be dropped
-        // whole. The key has no namespace component and neither side of the
-        // wire can supply one, so the ops are recorded and the namespace is
-        // simply not part of their identity (carrick#662).
-        //
-        // The accepted imprecision: two namespaces of one server handling one
-        // event name produce two producer rows on one key, the same
-        // imprecision the model already accepts across files and services.
-        let result = extract(
-            r#"
-import type { Namespace } from "socket.io";
-import { Server } from "socket.io";
-const io = new Server(httpServer);
-const chat: Namespace = io.of("/chat");
-chat.on("connection", (socket) => {
-  socket.on("chat:message", handler);
-});
-io.on("connection", (socket) => {
-  socket.on("chat:message", handler);
-  socket.on("presence:ping", handler);
-});
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec![
-                // One event name handled on two namespaces: two producer rows,
-                // one key. This is the imprecision above, asserted rather than
-                // avoided.
-                "socket|CLIENT->SERVER|chat:message",
-                "socket|CLIENT->SERVER|chat:message",
-                "socket|CLIENT->SERVER|presence:ping",
-            ],
-            "ops on a namespace and on the default namespace are both recorded"
-        );
-    }
-
-    #[test]
-    fn namespace_typed_binding_is_a_server_root() {
-        // The namespace is carved off a server the pass cannot see (a function
-        // return here), so its declared type is the only thing that roots it,
-        // and the connection handler's socket follows from that.
-        let result = extract(
-            r#"
-import type { Namespace, Socket } from "socket.io";
-import { Server } from "socket.io";
-
-function createWorkerNamespace({ io, namespace }: { io: Server; namespace: string }) {
-  const worker: Namespace<ClientToServer, ServerToClient> = io.of(namespace);
-
-  worker.on("connection", async (socket) => {
-    socket.on("run:subscribe", async ({ runIds }) => {});
-    socket.on("disconnect", () => {});
-  });
-
-  worker.emit("run:notify", { version: "1" });
-
-  return worker;
-}
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|run:subscribe"]
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|SERVER->CLIENT|run:notify"],
-            "a namespace broadcast is a server->client consumer"
-        );
-    }
-
-    #[test]
-    fn files_without_socket_io_imports_are_ignored() {
+    fn files_without_a_detected_package_import_are_ignored() {
         let result = extract(
             r#"
 const socket = connectSomething();
@@ -2154,33 +1757,31 @@ socket.emit("chat:message", "hi");
         // and `Payment` is imported — the corpus's resolvable case.
         let result = extract(
             r#"
-import { io } from "socket.io-client";
+import { connect } from "wire-transport";
 import type { Payment } from "./types/payment";
-const socket = io("https://payments.internal");
+const socket = connect("https://payments.internal");
 const settle = (payment: Payment) => {
   socket.emit("payment:settled", payment);
 };
 "#,
         );
-        let op = find(&result.emitters, "socket|CLIENT->SERVER|payment:settled");
+        let op = find(&result.emitters, "socket|UNKNOWN|payment:settled");
         assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
         assert_eq!(op.payload_type_source.as_deref(), Some("./types/payment"));
     }
 
     #[test]
     fn typed_listener_payload_captures_handler_param_type() {
-        // server `io.on("connection", socket => socket.on("event", (p: Payment) => …))`
+        // `socket.on("event", (p: Payment) => …)`
         let result = extract(
             r#"
-import { Server } from "socket.io";
+import { connect } from "wire-transport";
 import type { Payment } from "./types/payment";
-const io = new Server(httpServer);
-io.on("connection", (socket) => {
-  socket.on("payment:received", (payment: Payment) => { void payment; });
-});
+const socket = connect(httpServer);
+socket.on("payment:received", (payment: Payment) => { void payment; });
 "#,
         );
-        let op = find(&result.listeners, "socket|CLIENT->SERVER|payment:received");
+        let op = find(&result.listeners, "socket|UNKNOWN|payment:received");
         assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
         assert_eq!(op.payload_type_source.as_deref(), Some("./types/payment"));
     }
@@ -2192,15 +1793,15 @@ io.on("connection", (socket) => {
         // emitting file).
         let result = extract(
             r#"
-import { io } from "socket.io-client";
+import { connect } from "wire-transport";
 interface Payment { id: string }
-const socket = io("https://payments.internal");
+const socket = connect("https://payments.internal");
 const settle = (payment: Payment) => {
   socket.emit("payment:settled", payment);
 };
 "#,
         );
-        let op = find(&result.emitters, "socket|CLIENT->SERVER|payment:settled");
+        let op = find(&result.emitters, "socket|UNKNOWN|payment:settled");
         assert_eq!(op.payload_type_symbol.as_deref(), Some("Payment"));
         assert_eq!(op.payload_type_source, None);
     }
@@ -2209,9 +1810,9 @@ const settle = (payment: Payment) => {
     fn untyped_and_inline_payloads_have_no_symbol() {
         let result = extract(
             r#"
-import { io } from "socket.io-client";
+import { connect } from "wire-transport";
 import type { Payment } from "./types/payment";
-const socket = io("https://chat.internal");
+const socket = connect("https://chat.internal");
 socket.emit("chat:message", "hello");
 socket.emit("chat:object", { ok: true });
 socket.on("chat:broadcast", (msg) => console.log(msg));
@@ -2219,9 +1820,9 @@ const settle = (payment: Payment[]) => { socket.emit("chat:array", payment); };
 "#,
         );
         for canonical in [
-            "socket|CLIENT->SERVER|chat:message",
-            "socket|CLIENT->SERVER|chat:object",
-            "socket|CLIENT->SERVER|chat:array",
+            "socket|UNKNOWN|chat:message",
+            "socket|UNKNOWN|chat:object",
+            "socket|UNKNOWN|chat:array",
         ] {
             let op = find(&result.emitters, canonical);
             assert_eq!(
@@ -2230,7 +1831,7 @@ const settle = (payment: Payment[]) => { socket.emit("chat:array", payment); };
             );
             assert_eq!(op.payload_type_source, None);
         }
-        let listener = find(&result.listeners, "socket|SERVER->CLIENT|chat:broadcast");
+        let listener = find(&result.listeners, "socket|UNKNOWN|chat:broadcast");
         assert_eq!(listener.payload_type_symbol, None);
     }
 
@@ -2242,24 +1843,21 @@ const settle = (payment: Payment[]) => { socket.emit("chat:array", payment); };
         // review of #245 Phase 1.
         let result = extract(
             r#"
-import { io } from "socket.io-client";
-const socket = io("https://chat.internal");
+import { connect } from "wire-transport";
+const socket = connect("https://chat.internal");
 const a = (p: Object) => { socket.emit("e:object", p); };
 const b = (p: String) => { socket.emit("e:string", p); };
 socket.on("e:fn", (p: Function) => p());
 "#,
         );
-        for canonical in [
-            "socket|CLIENT->SERVER|e:object",
-            "socket|CLIENT->SERVER|e:string",
-        ] {
+        for canonical in ["socket|UNKNOWN|e:object", "socket|UNKNOWN|e:string"] {
             let op = find(&result.emitters, canonical);
             assert_eq!(
                 op.payload_type_symbol, None,
                 "{canonical} (global type) must not be anchored"
             );
         }
-        let listener = find(&result.listeners, "socket|SERVER->CLIENT|e:fn");
+        let listener = find(&result.listeners, "socket|UNKNOWN|e:fn");
         assert_eq!(listener.payload_type_symbol, None);
     }
 
@@ -2271,14 +1869,14 @@ socket.on("e:fn", (p: Function) => p());
         // the assignment goes through a method return, which is not traced.
         let result = extract(
             r#"
-import type { Socket } from "socket.io-client";
-import { io } from "socket.io-client";
+import type { Socket } from "wire-transport";
+import { connect } from "wire-transport";
 
 class Supervisor {
   private notifications?: Socket<ServerToClient, ClientToServer>;
 
   private createSocket() {
-    const socket = io(this.url);
+    const socket = connect(this.url);
     socket.on("run:notify", (msg) => this.handle(msg));
     return socket;
   }
@@ -2300,48 +1898,15 @@ class Supervisor {
         assert_eq!(
             keys(&result.emitters),
             vec![
-                "socket|CLIENT->SERVER|run:subscribe",
-                "socket|CLIENT->SERVER|run:unsubscribe",
+                "socket|UNKNOWN|run:subscribe",
+                "socket|UNKNOWN|run:unsubscribe"
             ],
-            "emits on a typed client socket field are client->server consumers"
+            "emits on a typed socket field are read"
         );
         assert_eq!(
             keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|run:notify"],
+            vec!["socket|UNKNOWN|run:notify"],
             "the local-binding listener still resolves"
-        );
-    }
-
-    #[test]
-    fn typed_server_socket_param_and_field_are_roots() {
-        // The `socket.io` `Socket` type is the per-connection server socket, so
-        // its listeners produce client->server and its emits consume
-        // server->client — the mirror of the client field.
-        let result = extract(
-            r#"
-import type { Socket } from "socket.io";
-
-class Connection {
-  private socket: Socket;
-
-  constructor(socket: Socket) {
-    this.socket = socket;
-    socket.on("worker:ready", (msg) => this.ack(msg));
-  }
-
-  push() {
-    this.socket.emit("worker:task", { id: 1 });
-  }
-}
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|worker:ready"]
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|SERVER->CLIENT|worker:task"]
         );
     }
 
@@ -2352,7 +1917,7 @@ class Connection {
         // admitted type, so fields declared with it are roots.
         let result = extract(
             r#"
-import type { Socket } from "socket.io-client";
+import type { Socket } from "wire-transport";
 
 export type SupervisorSocket = Socket<ServerToClient, ClientToServer>;
 
@@ -2376,15 +1941,9 @@ class Controller {
         );
         assert_eq!(
             keys(&result.emitters),
-            vec![
-                "socket|CLIENT->SERVER|run:start",
-                "socket|CLIENT->SERVER|run:stop",
-            ]
+            vec!["socket|UNKNOWN|run:start", "socket|UNKNOWN|run:stop"]
         );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|run:notify"]
-        );
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|run:notify"]);
     }
 
     #[test]
@@ -2393,7 +1952,7 @@ class Controller {
         // declaration order and an alias of an alias both work.
         let result = extract(
             r#"
-import type { Socket } from "socket.io";
+import type { Socket } from "wire-transport";
 
 class Connection {
   private socket: WorkerSocket;
@@ -2409,7 +1968,7 @@ type ConnectedSocket = Socket<ClientToServer, ServerToClient>;
         );
         assert_eq!(
             keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|worker:ready"],
+            vec!["socket|UNKNOWN|worker:ready"],
             "an alias declared after use, and an alias of an alias, both resolve"
         );
     }
@@ -2420,9 +1979,9 @@ type ConnectedSocket = Socket<ClientToServer, ServerToClient>;
         // type; a same-named alias of anything else stays inert.
         let result = extract(
             r#"
-import type { Socket } from "socket.io-client";
-import { io } from "socket.io-client";
-const probe = io(url);
+import type { Socket } from "wire-transport";
+import { connect } from "wire-transport";
+const probe = connect(url);
 
 type SupervisorSocket = EventEmitter;
 
@@ -2451,7 +2010,7 @@ class Controller {
             (
                 "controller.ts",
                 r#"
-import type { Socket } from "socket.io-client";
+import type { Socket } from "wire-transport";
 export type SupervisorSocket = Socket<ServerToClient, ClientToServer>;
 "#,
             ),
@@ -2474,10 +2033,7 @@ export class RunNotifier {
 "#,
             ),
         ]);
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|run:notify"]
-        );
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|run:notify"]);
     }
 
     #[test]
@@ -2488,7 +2044,7 @@ export class RunNotifier {
             (
                 "socketTypes.ts",
                 r#"
-import type { Socket } from "socket.io";
+import type { Socket } from "wire-transport";
 export type WorkloadSocket = Socket<ClientToServer, ServerToClient>;
 "#,
             ),
@@ -2514,14 +2070,8 @@ class Connection {
 "#,
             ),
         ]);
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|run:start"]
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|SERVER->CLIENT|run:notify"]
-        );
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|run:start"]);
+        assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|run:notify"]);
     }
 
     #[test]
@@ -2585,7 +2135,7 @@ class RunNotifier {
         // and the parameter at once — a distinct AST node from a class prop.
         let result = extract(
             r#"
-import type { Socket } from "socket.io";
+import type { Socket } from "wire-transport";
 
 class WorkerConnection {
   constructor(private readonly socket: Socket) {}
@@ -2597,14 +2147,8 @@ class WorkerConnection {
 }
 "#,
         );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|CLIENT->SERVER|worker:ready"]
-        );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|SERVER->CLIENT|worker:task"]
-        );
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|worker:ready"]);
+        assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|worker:task"]);
     }
 
     #[test]
@@ -2613,15 +2157,15 @@ class WorkerConnection {
         // rule instead, including the private-field spelling.
         let result = extract(
             r#"
-import { io } from "socket.io-client";
+import { connect } from "wire-transport";
 
 class Client {
   #socket;
   socket;
 
-  connect() {
-    this.#socket = io(this.url);
-    this.socket = io(this.url);
+  open() {
+    this.#socket = connect(this.url);
+    this.socket = connect(this.url);
   }
 
   send() {
@@ -2633,10 +2177,7 @@ class Client {
         );
         assert_eq!(
             keys(&result.emitters),
-            vec![
-                "socket|CLIENT->SERVER|private:ping",
-                "socket|CLIENT->SERVER|public:ping",
-            ]
+            vec!["socket|UNKNOWN|private:ping", "socket|UNKNOWN|public:ping"]
         );
     }
 
@@ -2646,7 +2187,7 @@ class Client {
         // from a plain call; it must not silently drop the op.
         let result = extract(
             r#"
-import type { Socket } from "socket.io-client";
+import type { Socket } from "wire-transport";
 
 class Client {
   private socket?: Socket;
@@ -2658,14 +2199,8 @@ class Client {
 }
 "#,
         );
-        assert_eq!(
-            keys(&result.emitters),
-            vec!["socket|CLIENT->SERVER|run:subscribe"]
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|run:notify"]
-        );
+        assert_eq!(keys(&result.emitters), vec!["socket|UNKNOWN|run:subscribe"]);
+        assert_eq!(keys(&result.listeners), vec!["socket|UNKNOWN|run:notify"]);
     }
 
     #[test]
@@ -2674,8 +2209,8 @@ class Client {
         // socket root stays invisible — no phantom ops from `this.bus.emit`.
         let result = extract(
             r#"
-import { io } from "socket.io-client";
-const probe = io(url);
+import { connect } from "wire-transport";
+const probe = connect(url);
 
 class Client {
   private bus = new EventEmitter();
@@ -2698,12 +2233,12 @@ class Client {
     #[test]
     fn field_type_from_an_unrelated_module_is_not_a_root() {
         // The type name alone means nothing: `Socket` must come from a
-        // socket.io module for the field to be a root.
+        // detected socket package for the field to be a root.
         let result = extract(
             r#"
 import type { Socket } from "net";
-import { io } from "socket.io-client";
-const probe = io(url);
+import { connect } from "wire-transport";
+const probe = connect(url);
 
 class Client {
   private socket?: Socket;
@@ -2859,7 +2394,7 @@ link.on("message", (raw) => {
             packed.payload_type_source.as_deref(),
             Some("./types/parcel"),
             "the handler's parameter anchors the payload through the same import map \
-             a Socket.IO listener uses"
+             any other listener uses"
         );
         let shipped = find(&result.listeners, "socket|UNKNOWN|order.shipped");
         assert_eq!(
@@ -2969,30 +2504,6 @@ link.on("message", (raw) => {
     }
 
     #[test]
-    fn a_socket_io_root_does_not_read_its_message_handler() {
-        let result = extract(
-            r#"
-import { io } from "socket.io-client";
-const socket = io("https://example.test");
-socket.on("message", (raw) => {
-  const msg = JSON.parse(raw);
-  switch (msg.type) {
-    case "order.packed":
-      pack(msg);
-  }
-});
-"#,
-        );
-        assert_eq!(
-            keys(&result.listeners),
-            vec!["socket|SERVER->CLIENT|message"],
-            "a library whose sides are known names its event in the call — that name, \
-             whatever it is — and the envelope inside the handler is not read: doing \
-             both would key one site twice"
-        );
-    }
-
-    #[test]
     fn a_non_socket_object_in_a_gated_file_is_not_a_socket_root() {
         // The gate is the package a binding CAME FROM, not the file's imports:
         // an in-process bus beside a socket keeps its own channel, so its rows
@@ -3021,8 +2532,8 @@ link.emit("order.shipped", parcel);
     #[test]
     fn emitter_without_a_symbol_carries_its_payload_span() {
         let source = r#"
-import { Server } from "socket.io";
-const io = new Server();
+import { Hub } from "wire-transport";
+const io = new Hub();
 const named: Shipped = load();
 io.emit("inline:event", { a: 1 });
 io.emit("named:event", named);
@@ -3053,8 +2564,8 @@ io.emit("bare:event");
     #[test]
     fn listener_with_an_inline_parameter_type_carries_its_handler() {
         let source = r#"
-import { io } from "socket.io-client";
-const socket = io("http://localhost");
+import { connect } from "wire-transport";
+const socket = connect("http://localhost");
 socket.on("inline:event", (event: { id: string }) => {});
 socket.on("named:event", (event: Named) => {});
 socket.on("bare:event", (event) => {});

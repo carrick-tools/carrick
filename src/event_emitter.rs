@@ -1364,14 +1364,17 @@ bus
     #[test]
     fn a_chained_socket_listener_stays_claimed() {
         let source = r#"
-import { io } from "socket.io-client";
-const client = io("https://example.test");
+import { connect } from "@acme/broker";
+const client = connect("https://example.test");
 client
   .on("orderPlaced", handleOrder);
 "#;
         let repo = Repo::new(&[("src/client.ts", source)], None);
 
-        let sockets = crate::socket_io::scan_files(&[repo.path("src/client.ts")], &[]);
+        let sockets = crate::socket_io::scan_files(
+            &[repo.path("src/client.ts")],
+            &["@acme/broker".to_string()],
+        );
         let socket_lines: Vec<u32> = sockets.listeners.iter().map(|op| op.line).collect();
         assert_eq!(socket_lines, vec![5], "the socket row is on `.on(`");
 
@@ -1395,16 +1398,19 @@ client
     #[test]
     fn a_socket_claimed_span_is_not_indexed_twice() {
         let source = r#"
-            import { io } from "socket.io-client";
+            import { connect } from "@acme/broker";
             import { EventEmitter } from "node:events";
             const bus = new EventEmitter();
-            const client = io("https://example.test");
+            const client = connect("https://example.test");
             client.on("orderPlaced", handleOrder);
             bus.on("orderArchived", handleArchive);
         "#;
         let repo = Repo::new(&[("src/client.ts", source)], None);
 
-        let sockets = crate::socket_io::scan_files(&[repo.path("src/client.ts")], &[]);
+        let sockets = crate::socket_io::scan_files(
+            &[repo.path("src/client.ts")],
+            &["@acme/broker".to_string()],
+        );
         assert_eq!(
             sockets.listeners.len(),
             1,

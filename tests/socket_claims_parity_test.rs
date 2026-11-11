@@ -1,18 +1,17 @@
 //! The fact layer states every socket row the socket.io package-name rules
-//! (the socket pass's S1 arms) state (carrick#1670 parity, part 1; D3a).
+//! (the socket pass's S1 arms, deleted in C06 D3) stated (carrick#1670
+//! parity; D3a).
 //!
 //! Each fixture here is a twin of one the old pass's tests read: the same
 //! sources, with the socket package's import specifier swapped for an invented
 //! package (`@fixture/rt-server`, `@fixture/rt-client`) whose declarations are
-//! hand-written in the vendored `node_modules`. The old pass keys on the
-//! specifier `socket.io` / `socket.io-client`, so it reads nothing here: every
-//! row below is the fact layer's (library claims, labelled from the store's
-//! answer for the real package, mirrored in each `__llm__/library-claims`).
-//! Each test asserts the keys and files its old test asserts
-//! (`socket_extraction_test.rs`, `socket_class_field_test.rs`,
-//! `socket_type_alias_test.rs`, `socket_namespace_test.rs`), so the old test
-//! and its twin say the same thing today and the twin is the regression test
-//! once the old rules go. The two cross-service corpora keep their sources and
+//! hand-written in the vendored `node_modules`. Every row below is the fact
+//! layer's (library claims, labelled from the store's answer for the real
+//! package, mirrored in each `__llm__/library-claims`). Each test asserts the
+//! keys and files the old tests asserted (`socket_extraction_test.rs`,
+//! `socket_class_field_test.rs`, `socket_type_alias_test.rs`,
+//! `socket_namespace_test.rs`, now deleted), so the twin is their regression
+//! test. The two cross-service corpora keep their sources and
 //! `expected.json` unchanged: the corpora are install-shaped (a stub socket
 //! package under `node_modules`, a lockfile entry, no ambient `declare module`
 //! for the package); the test copies their socket repos, adds the
@@ -80,25 +79,15 @@ struct Scan {
     unread: Vec<String>,
 }
 
-/// The socket rows and unread socket sites of a scan of `repo` (a directory
-/// already copied and committed), one scan of the whole directory as the
-/// Action runs it.
-fn scan_dir(repo: &Path) -> Scan {
-    let tmp = tempfile::tempdir().unwrap();
-    let (storage, home, cache) = (
-        tmp.path().join("storage"),
-        tmp.path().join("home"),
-        tmp.path().join("cache"),
-    );
-    for dir in [&storage, &home, &cache] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
+/// The scanner on `.` of `repo` (a directory already copied and committed),
+/// offline, as the Action runs it, writing its blobs under `storage`.
+fn scan_command(repo: &Path, storage: &Path, home: &Path, cache: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
         .current_dir(repo)
-        .env("HOME", &home)
-        .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
-        .env("CARRICK_CACHE_DIR", &cache)
+        .env("HOME", home)
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage)
+        .env("CARRICK_CACHE_DIR", cache)
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
@@ -129,16 +118,42 @@ fn scan_dir(repo: &Path) -> Scan {
     ] {
         cmd.env_remove(var);
     }
+    cmd
+}
+
+/// Run `cmd`, require it to succeed, and return what it printed.
+fn run(mut cmd: Command) -> String {
     let output = cmd.output().expect("spawn carrick");
-    assert!(
-        output.status.success(),
-        "the scan failed:\n{}{}",
+    let printed = format!(
+        "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "the scan failed:\n{printed}");
+    printed
+}
+
+/// The socket rows and unread socket sites of one scan of `repo`, the whole
+/// directory as the Action runs it.
+fn scan_dir(repo: &Path) -> Scan {
+    let tmp = tempfile::tempdir().unwrap();
+    let (storage, home, cache) = (
+        tmp.path().join("storage"),
+        tmp.path().join("home"),
+        tmp.path().join("cache"),
+    );
+    for dir in [&storage, &home, &cache] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    run(scan_command(repo, &storage, &home, &cache));
+    read_scan(&storage)
+}
+
+/// The socket rows and unread socket sites the blobs under `storage` hold.
+fn read_scan(storage: &Path) -> Scan {
     let mut rows = Vec::new();
     let mut unread = Vec::new();
-    for entry in std::fs::read_dir(&storage).expect("storage dir") {
+    for entry in std::fs::read_dir(storage).expect("storage dir") {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -478,4 +493,94 @@ fn corpus_one_states_its_socket_events() {
 #[test]
 fn corpus_three_states_its_socket_events() {
     assert_corpus_socket_events("corpus-3", ["support-desk", "storefront-web"]);
+}
+
+/// Detection lists `socket.io` and `socket.io-client` as socket clients, and
+/// the sources import those real specifiers (the fixture's invented packages
+/// swapped back). The socket pass's detected-client rule must stay off them:
+/// the fact layer states those packages' rows with their sides, and a root of
+/// unknown direction would add an `UNKNOWN` row beside them. The cassette is
+/// written into the copy, so no committed fixture lists the package.
+#[test]
+fn a_detected_socket_io_import_states_no_unknown_socket_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixtures().join("socket-service-claims"), &repo);
+    for (file, from, to) in [
+        ("src/server.ts", "@fixture/rt-server", "socket.io"),
+        ("src/client.ts", "@fixture/rt-client", "socket.io-client"),
+    ] {
+        let path = repo.join(file);
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(source.contains(from), "{file} imports {from}");
+        std::fs::write(&path, source.replace(from, to)).unwrap();
+    }
+    std::fs::write(
+        repo.join("__llm__/framework-detect/framework-detect.json"),
+        r#"{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": [],
+  "socket_clients": ["socket.io", "socket.io-client"],
+  "notes": ""
+}
+"#,
+    )
+    .unwrap();
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let rows = scan_dir(&repo).rows;
+    assert!(
+        !rows.iter().any(|row| row.key.contains("|UNKNOWN|")),
+        "a detected socket.io import states no row of unknown direction: {rows:#?}"
+    );
+}
+
+/// A `--changed-only` scan states the socket rows a full scan of the same
+/// commit states: the fact layer's rows are written on every path that writes
+/// a blob, and the carried service keeps its own.
+#[test]
+fn a_changed_only_scan_states_the_socket_rows_a_full_scan_states() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixtures().join("socket-class-field-claims"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A", "-f"]);
+    run_git(&repo, &["commit", "-q", "-m", "A"]);
+
+    let storage = tmp.path().join("storage");
+    let cache = tmp.path().join("cache");
+    for dir in [&storage, &cache] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let home = |name: &str| {
+        let home = tmp.path().join(name);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    };
+    run(scan_command(&repo, &storage, &home("home-a"), &cache));
+
+    // Commit B edits one service only.
+    let session = repo.join("services/supervisor/src/session.ts");
+    let mut source = std::fs::read_to_string(&session).unwrap();
+    source.push_str("\n// A note, so the service is changed.\n");
+    std::fs::write(&session, source).unwrap();
+    run_git(&repo, &["commit", "-qam", "B"]);
+
+    let mut scoped = scan_command(&repo, &storage, &home("home-b"), &cache);
+    scoped.arg("--changed-only");
+    let printed = run(scoped);
+    assert!(
+        printed.contains("scope: supervisor analysed"),
+        "the edited service is analysed and the other carried:\n{printed}"
+    );
+    let scoped_rows = read_scan(&storage).rows;
+    let full_rows = scan_dir(&repo).rows;
+    assert!(!scoped_rows.is_empty(), "the services state socket rows");
+    assert_eq!(
+        scoped_rows, full_rows,
+        "a changed-only scan states the rows a full scan states"
+    );
 }
