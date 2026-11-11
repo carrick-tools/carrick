@@ -1608,12 +1608,29 @@ function normalizeLocatorText(text: string): string {
     .trim();
 }
 
+/** The innermost statement holding the first token of `line`, if any. */
+function statementHoldingLine(sourceFile: ts.SourceFile, line: number): ts.Statement | undefined {
+  const lineStarts = sourceFile.getLineStarts();
+  if (line < 1 || line > lineStarts.length) return undefined;
+  const start = lineStarts[line - 1];
+  const end = line < lineStarts.length ? lineStarts[line] : sourceFile.getEnd();
+  let found: ts.Statement | undefined;
+  const visit = (node: ts.Node) => {
+    if (node.getEnd() <= start || node.getStart(sourceFile) >= end) return;
+    if (ts.isStatement(node) && node.getStart(sourceFile) < end) found = node;
+    node.forEachChild(visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
   const wanted = normalizeLocatorText(text);
+  const holder = fromLine === undefined ? undefined : statementHoldingLine(sourceFile, fromLine);
   let best: ts.Node | undefined;
   const visit = (node: ts.Node) => {
     if (best) return;
@@ -1623,7 +1640,17 @@ function nodeByExpressionText(
         // On or after the line, or COVERING it: a chain broken before its dot
         // starts a line above the line the analyzer reports for the call.
         const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
-        if (fromLine === undefined || endLine >= fromLine) {
+        const startLine = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+        // A match starting below the stated line binds only inside the
+        // statement that holds that line (carrick#3855): a handler read
+        // stated at the registration line is still found, a same-text literal
+        // in an unrelated function further down is not.
+        const farOutside =
+          fromLine !== undefined &&
+          startLine > fromLine &&
+          holder !== undefined &&
+          !(node.getStart(sourceFile) >= holder.getStart(sourceFile) && node.getEnd() <= holder.getEnd());
+        if ((fromLine === undefined || endLine >= fromLine) && !farOutside) {
           best = node;
           return;
         }
