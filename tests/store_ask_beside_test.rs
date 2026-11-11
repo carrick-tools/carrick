@@ -13,7 +13,8 @@
 //!
 //! The answer key `tests/fixtures/store-ask-beside/expected.json` holds what
 //! the scanner at `23535eea` stated on every scan: every row, lead, unread
-//! site and verdict of each blob. Write it again only when a change is meant
+//! site and verdict of each blob, with each verdict's `scanner_version`
+//! masked (it is the release's, not the code's). Write it again only when a change is meant
 //! to move what the scan states, with `CARRICK_WRITE_EXPECTED=1`.
 
 use std::collections::BTreeMap;
@@ -182,10 +183,9 @@ fn scan_once(repo: &Path, storage: &Path, home: &Path, cache: &Path, lane: Lane)
         let text = serde_json::to_string(&fields)
             .unwrap()
             .replace(&repo_text, "<repo>");
-        stated.insert(
-            blob["service_name"].as_str().unwrap().to_string(),
-            serde_json::from_str(&text).unwrap(),
-        );
+        let mut fields: serde_json::Value = serde_json::from_str(&text).unwrap();
+        mask_scanner_version(&mut fields);
+        stated.insert(blob["service_name"].as_str().unwrap().to_string(), fields);
     }
     assert_eq!(
         stated.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -269,6 +269,25 @@ fn scan() -> Scans {
         ("incremental", incremental),
         ("incremental_no_lane", alone),
     ]
+}
+
+/// Every `scanner_version` in `value`, masked: a verdict names the release
+/// that judged it, which moves with every release on main and states nothing
+/// about the scanned code.
+fn mask_scanner_version(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, field) in map.iter_mut() {
+                if key == "scanner_version" && field.is_string() {
+                    *field = serde_json::Value::String("<scanner version>".to_string());
+                } else {
+                    mask_scanner_version(field);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_scanner_version),
+        _ => {}
+    }
 }
 
 /// The answer key, as JSON.

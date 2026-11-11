@@ -83,7 +83,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/cli/src/client.ts:4",
@@ -304,7 +304,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:18",
@@ -327,7 +327,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:9",
@@ -350,7 +350,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:23",
@@ -373,7 +373,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:13",
@@ -595,7 +595,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/cli/src/client.ts:4",
@@ -816,7 +816,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:18",
@@ -839,7 +839,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:9",
@@ -862,7 +862,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:23",
@@ -885,7 +885,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:13",
@@ -1107,7 +1107,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/cli/src/client.ts:4",
@@ -1328,7 +1328,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:18",
@@ -1351,7 +1351,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:9",
@@ -1374,7 +1374,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:23",
@@ -1397,7 +1397,7 @@
             "unresolved_reason": "the producer type is 'unknown'",
             "verdict": "unverifiable"
           },
-          "scanner_version": "0.3.153",
+          "scanner_version": "<scanner version>",
           "sites": [
             {
               "consumer_location": "services/srv/src/server.ts:13",
