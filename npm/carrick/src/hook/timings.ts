@@ -13,6 +13,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { initialisedRoot } from "../init/outdated.ts";
 import { writeAtomic } from "./reuse.ts";
 
@@ -135,17 +136,40 @@ export function slowHookLines(root: string, now: number = Date.now()): string[] 
 }
 
 /**
+ * Whether what a hook wrote gave the agent text: any text that is not an empty
+ * `additionalContext` emission or whitespace.
+ */
+export function gaveText(output: string): boolean {
+  const text = output.trim();
+  if (!text) return false;
+  try {
+    const context = (JSON.parse(text) as { hookSpecificOutput?: { additionalContext?: unknown } })
+      ?.hookSpecificOutput?.additionalContext;
+    if (typeof context === "string") return context.trim().length > 0;
+  } catch {
+    // Not JSON: plain text, which is text.
+  }
+  return true;
+}
+
+/**
  * Run one hook's `main` and write its timing line, whether it printed, stayed
  * silent or threw (the error is rethrown). What it printed is read off stdout,
- * so no hook has to report it.
+ * so no hook has to report it. The clock starts at `origin`, the process start
+ * by default, so Node's start-up and module loading count: the agent waits on
+ * them too.
  */
-export async function timed(hook: TimedHook, run: (timing: Timing) => Promise<void>): Promise<void> {
-  const started = Date.now();
+export async function timed(
+  hook: TimedHook,
+  run: (timing: Timing) => Promise<void>,
+  origin: number = performance.timeOrigin,
+): Promise<void> {
   const timing: Timing = { root: null, file: null, waitedMs: 0 };
-  let printed = false;
+  let output = "";
   const write = process.stdout.write;
   process.stdout.write = ((...args: Parameters<typeof write>) => {
-    printed = true;
+    const chunk = args[0];
+    output += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
     return write.apply(process.stdout, args);
   }) as typeof write;
   let failed = false;
@@ -161,10 +185,10 @@ export async function timed(hook: TimedHook, run: (timing: Timing) => Promise<vo
       if (root) {
         const record: TimingRecord = {
           hook,
-          start: new Date(started).toISOString(),
-          duration_ms: Date.now() - started,
+          start: new Date(origin).toISOString(),
+          duration_ms: Math.max(0, Math.round(Date.now() - origin)),
           waited_ms: Math.round(timing.waitedMs),
-          outcome: failed ? "error" : printed ? "printed" : "silent",
+          outcome: failed ? "error" : gaveText(output) ? "printed" : "silent",
         };
         if (timing.file) record.file = path.isAbsolute(timing.file) ? path.relative(root, timing.file) : timing.file;
         appendTiming(root, record);

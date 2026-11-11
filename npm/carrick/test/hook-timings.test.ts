@@ -14,6 +14,7 @@ import {
   hookSpeeds,
   MAX_LINES,
   readTimings,
+  timed,
   timingsPath,
   type TimingRecord,
 } from "../src/hook/timings.ts";
@@ -119,5 +120,32 @@ test("session start names a hook only when its p90 is above 1 s", async (t) => {
   assert.equal(
     (await start()).stdout,
     "Carrick's stop hook has taken 1.4 s (p90) in recent turns; run `carrick status`.\n",
+  );
+});
+
+test("the clock starts at the origin given, not at the call", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const origin = Date.now() - 5000;
+  await timed("stop", async (timing) => void (timing.root = workspace.root), origin);
+  const [record] = readTimings(workspace.root);
+  assert.equal(record!.start, new Date(origin).toISOString());
+  assert.ok(record!.duration_ms >= 5000 && record!.duration_ms < 8000);
+});
+
+test("an empty emission is silent, and one with text is printed", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const say = (context: string) => async (timing: { root: string | null }) => {
+    timing.root = workspace.root;
+    process.stdout.write(
+      JSON.stringify({ hookSpecificOutput: { hookEventName: "Stop", additionalContext: context } }),
+    );
+  };
+  await timed("stop", say(""));
+  await timed("stop", say("a late answer"));
+  assert.deepEqual(
+    readTimings(workspace.root).map((r) => r.outcome),
+    ["silent", "printed"],
   );
 });
