@@ -533,14 +533,8 @@ fn aimed_at(route: &str) -> [String; 4] {
 }
 
 fn calls(rng: &mut Rng, producers: &[Producer]) -> Vec<Call> {
-    let aimed = producers
-        .iter()
-        .filter_map(|producer| producer.path.as_deref())
-        .step_by(2)
-        .flat_map(aimed_at);
-    paths(rng, CALL_SEGMENTS, 240)
+    let drawn: Vec<Call> = paths(rng, CALL_SEGMENTS, 240)
         .into_iter()
-        .chain(aimed)
         .enumerate()
         .map(|(index, path)| Call {
             service: if index % 3 == 0 { "svc-a" } else { "svc-c" }.into(),
@@ -550,7 +544,38 @@ fn calls(rng: &mut Rng, producers: &[Producer]) -> Vec<Call> {
             dispatch: DISPATCHES[rng.next() % DISPATCHES.len()].map(String::from),
             ..Call::default()
         })
-        .collect()
+        .collect();
+    // Every route with a method gets the calls aimed at it, made with its
+    // own method, half with its own dispatch case and half with a drawn one.
+    let mut aimed = Vec::new();
+    for (index, producer) in producers.iter().enumerate() {
+        let (Some(path), Some(method)) = (&producer.path, &producer.method) else {
+            continue;
+        };
+        if producer.protocol != "http" {
+            continue;
+        }
+        for (form, call_path) in aimed_at(path).into_iter().enumerate() {
+            aimed.push(Call {
+                service: if (index + form) % 2 == 0 {
+                    "svc-a"
+                } else {
+                    "svc-c"
+                }
+                .into(),
+                protocol: "http".into(),
+                method: Some(method.clone()),
+                path: Some(call_path),
+                dispatch: if form % 2 == 0 {
+                    producer.dispatch.clone()
+                } else {
+                    DISPATCHES[rng.next() % DISPATCHES.len()].map(String::from)
+                },
+                ..Call::default()
+            });
+        }
+    }
+    drawn.into_iter().chain(aimed).collect()
 }
 
 fn fixture() -> (Vec<Producer>, Vec<Call>) {
