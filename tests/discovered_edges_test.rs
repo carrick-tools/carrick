@@ -225,3 +225,54 @@ fn discovered_edges_move_no_intent_hash() {
     // The edges are there all the same.
     assert!(edges_of(&blob).contains(&edge("runWith", "loadOrder", "src/values.ts", 7)));
 }
+
+/// A named function handed to a library call whose declared return is the
+/// result of the function it is handed (the compiler's "runs handed" row)
+/// is walked as a function written there is: the caller takes an edge to it
+/// at that call (carrick#3442).
+#[test]
+fn a_named_function_a_runner_is_handed_takes_an_edge() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let edges = edges_of(&scan_blob(false));
+    assert_eq!(
+        edges_from(&edges, "chained"),
+        vec![edge("chained", "handle", "src/runners.ts", 10)],
+        "`pending.then(handle)`: {edges:#?}"
+    );
+    assert_eq!(
+        edges_from(&edges, "traced"),
+        vec![edge("traced", "work", "src/runners.ts", 18)],
+        "`run(work)`: {edges:#?}"
+    );
+}
+
+/// A named function handed to a library call that keeps it (a listener
+/// registration: its row does not say it runs what it is handed) takes no
+/// edge; a named function an in-repo callee runs takes its edge at the
+/// callee's own call, as before, and none at the call that hands it over.
+#[test]
+fn a_named_listener_registration_takes_no_edge() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let edges = edges_of(&scan_blob(false));
+    assert_eq!(
+        edges_from(&edges, "subscribe"),
+        Vec::<Edge>::new(),
+        "{edges:#?}"
+    );
+    assert_eq!(
+        edges_from(&edges, "viaLocal"),
+        vec![edge("viaLocal", "runLocal", "src/runners.ts", 35)],
+        "{edges:#?}"
+    );
+    assert_eq!(
+        edges_from(&edges, "runLocal"),
+        vec![edge("runLocal", "work", "src/runners.ts", 31)],
+        "{edges:#?}"
+    );
+}

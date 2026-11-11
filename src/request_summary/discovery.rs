@@ -20,7 +20,9 @@
 //! call that hands it over. A function written at a call into a library is
 //! followed when the compiler's row says the call returns what the function
 //! returns (`FLAG_RUNS_HANDED`, carrick#2634): a tracing runner, a retry
-//! helper, `then`. Other library calls are not: a listener registration or
+//! helper, `then`. A function of the repository handed there by name
+//! (`then(handle)`) is followed the same way (carrick#3442). Other library
+//! calls are not: a listener registration or
 //! a store initialiser keeps what it is handed for later.
 //!
 //! A call into a function declared in a file of another service of the run
@@ -291,6 +293,9 @@ pub enum EnteredKind {
     Implementation,
     /// A function the call's callee, a value, may hold.
     Value,
+    /// A named function handed to a library call that runs what it is
+    /// handed (`FLAG_RUNS_HANDED`, carrick#3442).
+    Handed,
 }
 
 /// The labelled exports of the store's answer, by the store's package key
@@ -2474,6 +2479,7 @@ impl<'a> Walker<'a> {
                     .is_some_and(|row| !in_repo(row) && row.flags() & FLAG_RUNS_HANDED != 0) =>
             {
                 let mut out = self.handed(file, body, call, None, |_| true);
+                out.absorb(self.handed_by_name(file, call));
                 if !out.ends.is_empty() {
                     out.stop = None;
                 }
@@ -2550,6 +2556,57 @@ impl<'a> Walker<'a> {
                     inner = inner.under(hop.clone());
                 }
                 out.absorb(inner);
+            }
+        }
+        out
+    }
+
+    /// What the functions of the repository `call`, a library call that runs
+    /// what it is handed, is handed by name reach (carrick#3442): each
+    /// argument that is a name or member whose row names a definition of
+    /// the run (`then(handle)`, `run(work)`), walked as a function written
+    /// there is ([`Self::handed`]): under a `<callback>` hop at the call's
+    /// line, its own parameters filled by the library, which no caller here
+    /// states. Any other argument reads nothing here.
+    fn handed_by_name(&mut self, file: &'a Path, call: &'a CallIr) -> Outcome<'a> {
+        let mut out = Outcome::default();
+        for (index, values) in call.arg_values.iter().enumerate() {
+            if matches!(call.args.get(index), Some(Value::Callback(_))) {
+                continue;
+            }
+            for value in values {
+                let ValueAt::Read { lo, hi, member, .. } = value else {
+                    continue;
+                };
+                let kind = if *member { Kind::Member } else { Kind::Ident };
+                let Reach::Function(target, key) =
+                    self.inputs_for(file).row_names(file, *lo, *hi, kind)
+                else {
+                    continue;
+                };
+                self.enter(
+                    file,
+                    call,
+                    &target,
+                    EnteredFunction::Keyed(key.clone()),
+                    EnteredKind::Handed,
+                );
+                let hop = self.hop(&target, &key);
+                let id = (target, key);
+                let inner = match self.reading.get(&id) {
+                    Some(depth) => Outcome {
+                        cycle_at: Some(*depth),
+                        ..Outcome::stopped(Stop::Recursion)
+                    },
+                    None => self.definition(&id),
+                };
+                let written = ChainHop {
+                    function: CALLBACK_HOP.to_string(),
+                    file: self.rel(file),
+                    line: call.site.line,
+                    made: None,
+                };
+                out.absorb(self.lifted(inner).under(hop).under(written));
             }
         }
         out
