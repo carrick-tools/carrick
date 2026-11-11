@@ -212,6 +212,7 @@ impl UnreadSite {
             callee: callee(&caller.callee),
             stop_at: None,
             depth: 0,
+            cause: None,
             labelled_end: end.map(|end| LabelledEndRef {
                 package: end.package.clone(),
                 export: end.export.clone(),
