@@ -340,6 +340,17 @@ fn socket_anchors(data: &CloudRepoData) -> Vec<(String, u32)> {
     anchors
 }
 
+/// The anchors the stated socket rows hold: each library row's own entry
+/// (carrick#3255), and the row the pass states alone.
+fn stated_socket_anchors() -> Vec<(String, u32)> {
+    vec![
+        ("src/live.ts".to_string(), 5),
+        ("src/live.ts".to_string(), 10),
+        ("src/live.ts".to_string(), 14),
+        ("src/presence.ts".to_string(), 5),
+    ]
+}
+
 /// Every producer and call of the blob, of every protocol, as JSON: what a
 /// change to the library rows must leave alone.
 fn all_rows(data: &CloudRepoData) -> Vec<String> {
@@ -368,13 +379,11 @@ async fn the_store_s_claims_state_library_rows_and_fold_the_socket_pass_rows() {
     let data = scan(&repo, Some(&sidecar)).await;
     assert_eq!(store_requests() - before, 1, "one ask, nothing pending");
     assert_eq!(message_rows(&data, &repo), rows_with_claims());
-    // The folded rows' anchors went with their keys; the row that stands
-    // keeps its own. The typed emit's payload is resolved only while an
-    // operation has its key.
-    assert_eq!(
-        socket_anchors(&data),
-        vec![("src/presence.ts".to_string(), 5)]
-    );
+    // The folded rows' symbol anchors went with their keys, and a stated
+    // global row has its own entry whether or not the pass read its site
+    // (carrick#3255); the row that stands keeps its own. The typed emit's
+    // payload is resolved only while an operation has its key.
+    assert_eq!(socket_anchors(&data), stated_socket_anchors());
     let (without, typing) = typed_emit_without_claims(&repo, &sidecar).await;
     assert!(bundled(&without).contains(&typing), "{}", bundled(&without));
     assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
@@ -601,10 +610,7 @@ async fn an_incremental_scan_asks_again_and_states_the_same_rows() {
         "the store is asked on every scan"
     );
     assert_eq!(message_rows(&data, &repo), rows_with_claims());
-    assert_eq!(
-        socket_anchors(&data),
-        vec![("src/presence.ts".to_string(), 5)]
-    );
+    assert_eq!(socket_anchors(&data), stated_socket_anchors());
     let (_, typing) = typed_emit_without_claims(&repo, &sidecar).await;
     assert!(!bundled(&data).contains(&typing), "{}", bundled(&data));
 }
