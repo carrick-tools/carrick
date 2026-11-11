@@ -4,8 +4,10 @@
 //! Drives the real scanner binary on `.`, over a committed copy of the
 //! two-service fixture `tests/fixtures/socket-per-connection/`, offline, with
 //! the fixture's cassettes: a full scan, then a comment edit and the
-//! incremental scan that reads the first one's blobs, then a second edit and
-//! an incremental scan with no lane asking ahead. Both services ask the store
+//! incremental scan that reads the first one's blobs, with one service
+//! analysed at a time so the lane asks ahead for the second (`Lane::Ahead`),
+//! then a second edit and an incremental scan with no lane asking ahead. A
+//! fourth test scans its own copy, where the lane's store ask panics. Both services ask the store
 //! (each names a registry package) and both start a compiler engine of their
 //! own.
 //!
@@ -76,10 +78,12 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// What one scan left: each service's stated fields, and the run's log.
+/// What one scan left: each service's stated fields, the run's log and what
+/// the binary wrote to its standard error.
 struct Scanned {
     stated: BTreeMap<String, serde_json::Value>,
     log: String,
+    stderr: String,
 }
 
 /// The scans, in order and by name: the full one; the incremental one after
@@ -88,7 +92,21 @@ struct Scanned {
 /// own store ask before its implementations ask.
 type Scans = Vec<(&'static str, Scanned)>;
 
-fn scan_once(repo: &Path, storage: &Path, home: &Path, cache: &Path, lane: bool) -> Scanned {
+/// How a scan asks ahead.
+#[derive(Clone, Copy)]
+enum Lane {
+    /// No lane: each service sends its own store ask.
+    Off,
+    /// The lane on, every service admitted at once, as the machine allows.
+    /// Both services of this fixture then start together, so the lane is
+    /// never ahead of either and asks nothing.
+    Admitted,
+    /// The lane on, one service analysed at a time: the second service waits
+    /// its turn, and the lane asks ahead for it while the first is analysed.
+    Ahead,
+}
+
+fn scan_once(repo: &Path, storage: &Path, home: &Path, cache: &Path, lane: Lane) -> Scanned {
     let logs = home.join(".carrick/logs/runs");
     let before: Vec<PathBuf> = std::fs::read_dir(&logs)
         .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
@@ -125,13 +143,20 @@ fn scan_once(repo: &Path, storage: &Path, home: &Path, cache: &Path, lane: bool)
         "CARRICK_ALLOW_MISSING_TYPES",
         "CARRICK_LOCAL_STORAGE_ISOLATE",
         "CARRICK_ANSWERS_AHEAD",
+        "CARRICK_SERVICE_CONCURRENCY",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     ] {
         cmd.env_remove(var);
     }
-    if !lane {
-        cmd.env("CARRICK_ANSWERS_AHEAD", "0");
+    match lane {
+        Lane::Off => {
+            cmd.env("CARRICK_ANSWERS_AHEAD", "0");
+        }
+        Lane::Admitted => {}
+        Lane::Ahead => {
+            cmd.env("CARRICK_SERVICE_CONCURRENCY", "1");
+        }
     }
     let output = cmd.output().expect("spawn carrick");
     assert!(
@@ -174,42 +199,130 @@ fn scan_once(repo: &Path, storage: &Path, home: &Path, cache: &Path, lane: bool)
         .map(|path| std::fs::read_to_string(path).unwrap())
         .collect::<Vec<_>>()
         .join("\n");
-    Scanned { stated, log }
+    Scanned {
+        stated,
+        log,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
-fn scan() -> Scans {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("workspace");
-    copy_dir(&fixture_dir(), &repo);
-    run_git(&repo, &["init", "-q"]);
-    run_git(&repo, &["add", "-A", "-f"]);
-    run_git(&repo, &["commit", "-q", "-m", "init"]);
-    let (storage, home, cache) = (
-        tmp.path().join("storage"),
-        tmp.path().join("home"),
-        tmp.path().join("cache"),
-    );
-    for dir in [&storage, &home, &cache] {
-        std::fs::create_dir_all(dir).unwrap();
+/// A committed copy of the fixture, and the directories its scans write to.
+struct Tree {
+    _tmp: tempfile::TempDir,
+    repo: PathBuf,
+    storage: PathBuf,
+    home: PathBuf,
+    cache: PathBuf,
+}
+
+impl Tree {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("workspace");
+        copy_dir(&fixture_dir(), &repo);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "-A", "-f"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let (storage, home, cache) = (
+            tmp.path().join("storage"),
+            tmp.path().join("home"),
+            tmp.path().join("cache"),
+        );
+        for dir in [&storage, &home, &cache] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        Self {
+            _tmp: tmp,
+            repo,
+            storage,
+            home,
+            cache,
+        }
     }
-    let edit = |what: &str| {
-        let client = repo.join("services/cli/src/client.ts");
+
+    /// A comment at the end of cli's one file, committed alone: a fixture
+    /// file a test adds to the cassettes stays out of the commit, so every
+    /// commit id is the answer key's.
+    fn edit(&self, what: &str) {
+        let client = self.repo.join("services/cli/src/client.ts");
         let mut text = std::fs::read_to_string(&client).unwrap();
         text.push_str(&format!("// {what}: an edit that moves no line\n"));
         std::fs::write(&client, text).unwrap();
-        run_git(&repo, &["add", "-A", "-f"]);
-        run_git(&repo, &["commit", "-q", "-m", what]);
-    };
-    let full = scan_once(&repo, &storage, &home, &cache, true);
-    edit("first");
-    let incremental = scan_once(&repo, &storage, &home, &cache, true);
-    edit("second");
-    let alone = scan_once(&repo, &storage, &home, &cache, false);
+        run_git(&self.repo, &["add", "-f", "services/cli/src/client.ts"]);
+        run_git(&self.repo, &["commit", "-q", "-m", what]);
+    }
+
+    fn scan(&self, lane: Lane) -> Scanned {
+        scan_once(&self.repo, &self.storage, &self.home, &self.cache, lane)
+    }
+}
+
+fn scan() -> Scans {
+    let tree = Tree::new();
+    let full = tree.scan(Lane::Admitted);
+    tree.edit("first");
+    let incremental = tree.scan(Lane::Ahead);
+    tree.edit("second");
+    let alone = tree.scan(Lane::Off);
     vec![
         ("full", full),
         ("incremental", incremental),
         ("incremental_no_lane", alone),
     ]
+}
+
+/// The answer key, as JSON.
+fn expected() -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(expected_path()).expect("the answer key"))
+        .expect("the answer key parses")
+}
+
+/// The first field where `stated` and `expected` differ, named by scan,
+/// service and field, with both values cut short: what a failure prints.
+fn first_difference(stated: &serde_json::Value, expected: &serde_json::Value) -> Option<String> {
+    let cut = |value: &serde_json::Value| {
+        let text = value.to_string();
+        text.chars().take(1500).collect::<String>()
+    };
+    let scans: std::collections::BTreeSet<&String> = stated
+        .as_object()?
+        .keys()
+        .chain(expected.as_object()?.keys())
+        .collect();
+    for scan in scans {
+        for service in ["cli", "srv"] {
+            for field in STATED {
+                let (got, want) = (
+                    &stated[scan.as_str()][service][field],
+                    &expected[scan.as_str()][service][field],
+                );
+                if got != want {
+                    return Some(format!(
+                        "{scan} scan, {service}, {field}:\n  stated:   {}\n  expected: {}",
+                        cut(got),
+                        cut(want)
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// How many times `service`'s own analysis asked the store in `log`.
+fn own_store_asks(log: &str, service: &str) -> usize {
+    service_lines(log, service)
+        .iter()
+        .filter(|line| line.contains("Mock fixture hit for /library-claims"))
+        .count()
+}
+
+/// How many lines of `log` hold `needle`, colour codes stripped.
+fn lines_with(log: &str, needle: &str) -> usize {
+    log.lines()
+        .map(plain)
+        .filter(|line| line.contains(needle))
+        .count()
 }
 
 fn scanned() -> &'static Scans {
@@ -268,11 +381,13 @@ fn every_scan_states_what_it_stated_before() {
         std::fs::create_dir_all(expected_path().parent().unwrap()).unwrap();
         std::fs::write(expected_path(), &text).unwrap();
     }
-    let expected = std::fs::read_to_string(expected_path()).expect("the answer key");
+    let expected_text = std::fs::read_to_string(expected_path()).expect("the answer key");
     assert!(
-        text == expected,
-        "the scans state something else than the answer key; diff against {}",
-        expected_path().display()
+        text == expected_text,
+        "the scans state something else than the answer key {}; first difference: {}",
+        expected_path().display(),
+        first_difference(&serde_json::Value::Object(stated.clone()), &expected())
+            .unwrap_or_else(|| "none by value (the text differs)".to_string())
     );
 }
 
@@ -337,53 +452,105 @@ fn the_store_is_asked_before_the_implementations_with_no_lane() {
     }
 }
 
-/// Each service asks the store exactly once per scan, from its own analysis:
-/// the ask that now leaves early is the only one.
+/// Each service's store is asked exactly once per scan: the ask that now
+/// leaves early is the only one. Where the lane asks ahead for cli, the ask
+/// is the lane's (it logs under no service) and cli's analysis takes its
+/// answers instead of asking again.
 #[test]
 fn each_service_asks_the_store_once_per_scan() {
     for (scan, scanned) in scanned() {
-        for service in ["cli", "srv"] {
-            let asks = service_lines(&scanned.log, service)
-                .iter()
-                .filter(|line| line.contains("Mock fixture hit for /library-claims"))
-                .count();
-            assert_eq!(asks, 1, "{scan} scan, {service}: store asks");
-        }
-        let all = scanned
-            .log
-            .lines()
-            .filter(|line| line.contains("Mock fixture hit for /library-claims"))
-            .count();
-        assert_eq!(all, 2, "{scan} scan: store asks in the whole run");
+        let cli = if *scan == "incremental" { 0 } else { 1 };
+        assert_eq!(
+            own_store_asks(&scanned.log, "cli"),
+            cli,
+            "{scan} scan, cli: store asks"
+        );
+        assert_eq!(
+            own_store_asks(&scanned.log, "srv"),
+            1,
+            "{scan} scan, srv: store asks"
+        );
+        assert_eq!(
+            lines_with(&scanned.log, "Mock fixture hit for /library-claims"),
+            2,
+            "{scan} scan: store asks in the whole run"
+        );
     }
 }
 
 /// The lane ran in the incremental scan that has it: the run log says it
-/// asked the file reader ahead for the service whose file changed, and
-/// the scans without the lane say nothing of the kind.
+/// asked the file reader ahead for cli, the service that waits its turn and
+/// whose file changed, and that cli's analysis took its answer. The scans
+/// without it say nothing of the kind: with every service admitted at once
+/// (the full scan) the lane is never ahead, and with no lane nothing asks.
 #[test]
 fn the_lane_runs_in_the_scan_that_has_it() {
     for (scan, scanned) in scanned() {
-        let asked = scanned
-            .log
-            .lines()
-            .map(plain)
-            .filter(|line| line.contains("Asking the file reader ahead for cli:"))
-            .count();
+        let asked = lines_with(&scanned.log, "Asking the file reader ahead for cli:");
+        let taken = lines_with(
+            &scanned.log,
+            "Answers ahead for cli: asked 1 file(s), taken 1",
+        );
         if *scan == "incremental" {
             assert_eq!(
-                asked,
-                1,
-                "{scan} scan: the lane asked ahead for cli:\n{}",
-                scanned
-                    .log
-                    .lines()
-                    .filter(|line| line.contains("head"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                (asked, taken),
+                (1, 1),
+                "{scan} scan: the lane asked ahead for cli and its answer was taken"
             );
         } else {
             assert_eq!(asked, 0, "{scan} scan: no lane asks ahead");
         }
+    }
+}
+
+/// carrick#3869 review: the lane's store ask for cli panics. That is a miss,
+/// never a failed scan: cli's analysis asks the store for itself, the scan
+/// succeeds without a crash report, and it states what the scan with a lane
+/// that did not panic states.
+#[test]
+fn a_lane_store_ask_that_panics_is_asked_again_by_the_analysis() {
+    let tree = Tree::new();
+    tree.scan(Lane::Admitted);
+    std::fs::write(
+        tree.repo
+            .join("__llm__/library-claims/panics_when_asked_ahead.txt"),
+        "the lane's store ask panicked (carrick#3869 test)\n",
+    )
+    .unwrap();
+    tree.edit("first");
+    let scanned = tree.scan(Lane::Ahead);
+    // Three store requests: the lane's for cli, which panicked before its
+    // answer was logged (so the lane, with no store answer, asks the file
+    // reader nothing), srv's, and cli's own.
+    assert_eq!(
+        lines_with(&scanned.log, "library-claims 3"),
+        1,
+        "the lane asked the store for cli, and cli's analysis asked again"
+    );
+    assert_eq!(
+        own_store_asks(&scanned.log, "cli"),
+        1,
+        "cli's analysis asked the store for itself"
+    );
+    // The panic hook, for a panic nothing catches, prints Rust's own
+    // `panicked at` line and logs `panic at <place>: <message>`.
+    assert!(
+        !scanned.stderr.contains("panicked at"),
+        "the lane's panic is printed as the run dying:\n{}",
+        scanned.stderr
+    );
+    assert_eq!(
+        scanned
+            .log
+            .lines()
+            .filter(|line| line.contains("panic at ") && line.contains("carrick#3869 test"))
+            .count(),
+        0,
+        "the lane's panic is logged as the run dying"
+    );
+    let stated = serde_json::json!({ "incremental": scanned.stated });
+    let expected = serde_json::json!({ "incremental": expected()["incremental"] });
+    if let Some(difference) = first_difference(&stated, &expected) {
+        panic!("the scan states something else than one whose lane did not panic: {difference}");
     }
 }

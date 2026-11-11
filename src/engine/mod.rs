@@ -3882,9 +3882,13 @@ impl ServiceScan {
             let ask = std::sync::Arc::clone(library_ask.as_ref()?);
             let asked = ask.asked.clone();
             let (early, first_answer) = tokio::sync::oneshot::channel();
-            let settled = tokio::spawn(crate::current_service::asked_for(
-                service.service_name.clone(),
-                async move { settled_library_answer(Some(&ask), early).await },
+            // Quiet, as the lane is (`ask_ahead`): its own task is polled
+            // outside the lane's quiet future, and a panic here is a miss
+            // the analysis answers by asking for itself, not the run dying.
+            let settled = tokio::spawn(crate::panic_report::quiet(
+                crate::current_service::asked_for(service.service_name.clone(), async move {
+                    settled_library_answer(Some(&ask), early).await
+                }),
             ));
             let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled).by_lane();
             first = Some(handed.first());
