@@ -35,3 +35,11 @@ Answer key, with the switches on:
 With the switches off there are no site rows, and the scan states the event
 pass's `pubsub|chat.sent` publisher at `src/announce.ts:4` and the model's
 `pubsub|chat.read` subscriber at `src/twin.ts:5`.
+
+Chained calls (the event pass places a call at its member's line, a site row
+at the call's first line):
+
+| Site | Row |
+|---|---|
+| `src/broadcast.ts:4-6` | `socket|CLIENT->SERVER|chat.multi` call; the event pass's publisher on line 6 gives way by call span |
+| `src/jobs.ts:11-13` | `pubsub|job.done` publisher stays: the receiver is no labelled socket |

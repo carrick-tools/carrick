@@ -115,6 +115,11 @@ pub struct BusOp {
     pub event: String,
     pub file_path: PathBuf,
     pub line: u32,
+    /// Where the member name starts, as a file-local byte offset in SWC
+    /// numbering ([`crate::swc_scanner::SWC_SPAN_BASE`]): what a socket
+    /// site's call span is compared with when the call is chained across
+    /// lines and the two readers' lines differ.
+    pub member_start: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -458,6 +463,8 @@ impl BusCollector<'_> {
             event,
             file_path: self.file_path.to_path_buf(),
             line,
+            member_start: self.cm.lookup_byte_offset(prop.span.lo).pos.0
+                + crate::swc_scanner::SWC_SPAN_BASE,
         };
         if is_subscribe {
             self.pending.push(PendingSubscription {
