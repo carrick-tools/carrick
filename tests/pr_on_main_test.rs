@@ -3759,17 +3759,29 @@ async fn seed_copied_helper() {
     assert!(findings_of(&payload).is_empty(), "{payload:#}");
 }
 
+/// A package added at a major another service is not on is a conflict the
+/// PR introduces, with no `from`.
 #[tokio::test]
-async fn seed_major_bump() {
+async fn seed_dependency_added() {
     let _serial = SERIAL.lock().await;
-    let payload = seed_payload("orders-api", |repo| {
-        edit(
-            repo,
-            "package.json",
-            &[("\"zod\": \"^3.22.0\"", "\"zod\": \"^4.0.0\"")],
-        )
-    })
-    .await;
+    let payload = manifest_seed_payload("dependency-added").await;
+    let finding = findings_of(&payload)
+        .into_iter()
+        .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "@example/gql-client")
+        .unwrap_or_else(|| panic!("no dependency_conflict on @example/gql-client in {payload:#}"));
+    assert_eq!(finding["tier"], "major", "{finding:#}");
+    assert_eq!(
+        finding["changed_by_pr"],
+        serde_json::json!([{ "service": "orders-api", "from": null, "to": "^2.0.0" }]),
+        "{finding:#}"
+    );
+    assert_marks(&finding, Some(false), None, None);
+}
+
+#[tokio::test]
+async fn seed_dependency_major_bump() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("dependency-major-bump").await;
     let finding = findings_of(&payload)
         .into_iter()
         .find(|f| f["kind"] == "dependency_conflict" && f["package_name"] == "zod")
@@ -3783,6 +3795,25 @@ async fn seed_major_bump() {
     assert_marks(&finding, Some(false), None, None);
     assert_eq!(
         payload["checked"]["dependencies"]["changed"], 1,
+        "{payload:#}"
+    );
+}
+
+/// A `package.json` edit that leaves every dependency alone: no conflict is
+/// the PR's, and none changed.
+#[tokio::test]
+async fn seed_dependency_unchanged() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("dependency-unchanged").await;
+    assert!(
+        findings_of(&payload)
+            .iter()
+            .filter(|f| f["kind"] == "dependency_conflict")
+            .all(|f| f["on_main"] != false && f.get("changed_by_pr").is_none()),
+        "{payload:#}"
+    );
+    assert_eq!(
+        payload["checked"]["dependencies"]["changed"], 0,
         "{payload:#}"
     );
 }

@@ -78,7 +78,9 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `pubsub-subscriber-rename` | `payments.settled` to `payments.cleared` (`src/events.ts:9`) | `missing_endpoint` at `src/payments.ts:10`; delta | passes; `_marking` ignored, carrick#3092 |
 | `pubsub-publish-rename` | `orders.shipped` to `orders.dispatched` (`src/events.ts:15`) | `missing_endpoint` at the PR's publish, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
 | `copied-helper` | adds `src/money.ts`, a copy of `storefront`'s `formatMinor` | `functions.changed` has `src/money.ts:formatMinor:added`, no finding | passes |
-| `major-bump` | `zod` `^3.22.0` to `^4.0.0` | `dependency_conflict` `zod`, `major`, `changed_by_pr` | passes |
+| `dependency-added` | adds `@example/gql-client` `^2.0.0`; `storefront` is on 1 | `dependency_conflict` `@example/gql-client`, `major`, `changed_by_pr` with no `from` | passes |
+| `dependency-major-bump` | `zod` `^3.22.0` to `^4.0.0` | `dependency_conflict` `zod`, `major`, `changed_by_pr` | passes |
+| `dependency-unchanged` | `package.json` `version` `1.0.0` to `1.0.1` | no conflict the PR changed; `checked.dependencies.changed` 0 | passes |
 | `dev-only-split` | `typescript` `^5.4.0` to `^6.0.0` under `devDependencies` | no conflict on `typescript` | ignored, carrick#3093 |
 | `respell-param` | route param `orderId` to `id` | empty delta, no finding | passes |
 | `convention-copy` | route module copied to `api.v1.invoices.$invoiceId.ts` | `loader` added in the new file; delta new route | passes |
