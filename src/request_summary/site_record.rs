@@ -1128,6 +1128,19 @@ fn env_based_text(pieces: &[super::Piece]) -> Option<String> {
     (reads > 0).then_some(text)
 }
 
+/// Whether any piece of a name is an environment read.
+fn reads_env(pieces: &[super::Piece]) -> bool {
+    pieces.iter().any(|piece| {
+        matches!(
+            piece,
+            super::Piece::Opaque {
+                end: super::Root::Env { .. },
+                ..
+            }
+        )
+    })
+}
+
 /// A declaration file as the record names it: an installed package outside
 /// the repo (`pkg:<name>/<path>` in the rows) under `node_modules/`, as an
 /// installed package inside it is.
@@ -2023,10 +2036,14 @@ fn record(
         .filter_map(|index| parts.arg_exprs.get(*index))
         .collect();
     // An environment read is a base the request rows write by name
-    // (`${process.env.API}/items`). A socket event matches its listener by
-    // its whole text and has no base: a name that reads one is a value the
-    // code chooses at run time, so it states no name here (C06 R-D3b).
-    let env_bases = label.role != "socket";
+    // (`${process.env.API}/items`). A message name (a socket event, a topic,
+    // a bus event) matches its other side by its whole text and has no
+    // base: a name that reads one is a value the run chooses, so it states
+    // no name here and is an unread site (C06 R-D3b, carrick#3846).
+    let env_bases = matches!(label.role.as_str(), "http_client" | "server_framework");
+    if !env_bases && reads_env(&site.name) {
+        name_hole.set(Some(Stop::EnvValue));
+    }
     let whole_names: Option<Whole> = match (&site.key, label.reads_name_of(site)) {
         (Some(key), _) => {
             stated.value(key, place(PlaceFrom::ObjectKey, &at));
@@ -2867,6 +2884,40 @@ mod tests {
             let line = record(&records, bucket_site).anchors.call.line;
             assert!(in_choices.iter().all(|c| c.line_number != line));
         }
+    }
+
+    /// A broker topic built over an environment read is a value the run
+    /// chooses: a lead read `env_value`, no name stated and no possible-call
+    /// row; the literal topic beside it keeps its forced name (carrick#3846).
+    #[test]
+    fn a_topic_built_over_an_environment_read_is_an_unread_site() {
+        let (records, decided) = records_with_rows(&repo());
+        let regional = record(&records, "events.ts:10");
+        assert_eq!(regional.bucket, Bucket::Lead, "{:?}", regional.state);
+        assert_eq!(regional.unread, Some(Stop::EnvValue));
+        assert!(!regional.state.forced.contains_key(&Slot::Name));
+        assert!(
+            regional
+                .state
+                .stated
+                .names
+                .iter()
+                .all(|value| !value.text.contains("orders")),
+            "{:?}",
+            regional.state.stated
+        );
+        let found = crate::possible_calls::from_sites(&decided, &records);
+        let call = found
+            .iter()
+            .find(|call| call.line_number == regional.anchors.call.line)
+            .unwrap_or_else(|| panic!("{found:?}"));
+        assert_eq!(call.unread.reason, Stop::EnvValue);
+        // The literal topic beside it is unchanged.
+        let order = record(&records, "events.ts:6");
+        assert_eq!(
+            order.state.forced.get(&Slot::Name).map(String::as_str),
+            Some("orders.created")
+        );
     }
 
     /// Each bucket: a path constant from a sibling package is one stated

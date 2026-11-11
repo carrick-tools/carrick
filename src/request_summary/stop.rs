@@ -126,11 +126,13 @@ pub enum Stop {
     ProcedurePathUnread,
     /// A parameter whose callers fill it, read by a reader that does not read through callers.
     ParameterUnread,
+    /// A message name the code builds over an environment read: the run decides it.
+    EnvValue,
 }
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 51] = [
+    pub const ALL: [Stop; 52] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -182,6 +184,7 @@ impl Stop {
         Stop::ProcedureRouterAmbiguous,
         Stop::ProcedurePathUnread,
         Stop::ParameterUnread,
+        Stop::EnvValue,
     ];
 
     /// The word as it is written on the wire.
@@ -238,6 +241,7 @@ impl Stop {
             Stop::ProcedureRouterAmbiguous => "procedure_router_ambiguous",
             Stop::ProcedurePathUnread => "procedure_path_unread",
             Stop::ParameterUnread => "parameter_unread",
+            Stop::EnvValue => "env_value",
         }
     }
 

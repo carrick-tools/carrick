@@ -5015,6 +5015,7 @@ pub(crate) mod tests {
             ("deep.ts:26", Some("/deep")),
             ("emit.ts:13", Some("user.joined")),
             ("emit.ts:17", Some("user.left")),
+            ("events.ts:10", None),
             ("events.ts:6", Some("orders.created")),
             ("job-table.ts:5", Some("image.resize")),
             ("job-table.ts:9", Some("image.thumbnail")),
