@@ -3428,6 +3428,9 @@ const RETYPE_PROCESS_FLOOR_MB: u64 = 1024;
 const RETYPE_UNSENT: &str =
     "the retype check did not run: no sidecar process was left to send the call to";
 
+/// Set by the retype-reach test only: the check retypes no consumer call.
+const SKIP_RETYPE_FOR_TEST_ENV: &str = "CARRICK_TEST_SKIP_RETYPE";
+
 /// Judge every HTTP response pair whose CONSUMER left the verdict unresolved
 /// by retyping the consumer's call with the producer's response type and
 /// reading the consumer file's own type-check (carrick#1491).
@@ -3445,6 +3448,11 @@ fn retype_consumer_calls(
     local_consumers: &LocalConsumers,
     outcomes: &mut [PairCheckOutcome],
 ) {
+    // Test only: `tests/check_changed_retype_reach_test.rs` runs a check with
+    // and without the retype to see whether any printed line depends on it.
+    if std::env::var_os(SKIP_RETYPE_FOR_TEST_ENV).is_some() {
+        return;
+    }
     let (by_service, decided) = retype_items(pairs, consumer_blamed, local_consumers);
     let decided: HashMap<&str, &RetypeOutcome> = decided
         .iter()
