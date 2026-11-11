@@ -3132,7 +3132,11 @@ impl Builder {
 /// `throw`, blocks and `if` / `else`, and every path through it must end in a
 /// `return` or a `throw`. Any other statement (a loop, a `let`, a call that
 /// may change what a later line reads) states no value, and nor does a body
-/// with no `return`. The caller reads several different returns together
+/// with no `return`. One call statement is let through: a method call on a
+/// body-local `const` (`query.set(k, v)`), when every return reads that
+/// local only after the `?` that starts the query (see [`only_in_query`]). The
+/// query is never part of the route (carrick#1950), so the call changes
+/// nothing the route reads. The caller reads several different returns together
 /// ([`shared_written_tail`]). A local is replaced by its
 /// binding ([`ident_key`]), never by name, and a `const` a block or a branch
 /// declares is read only inside it, so a block that declares the name again
@@ -3149,15 +3153,20 @@ fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
         })
     }
 
-    /// Replaces each local `const`'s identifier by its initialiser.
-    struct Inline<'a>(&'a HashMap<BindingKey, Expr>);
+    /// Replaces each local `const`'s identifier by its initialiser, except
+    /// the locals a call statement acted on (`.1`): those stay names until
+    /// the return has been checked.
+    struct Inline<'a>(&'a HashMap<BindingKey, Expr>, &'a HashSet<BindingKey>);
     impl swc_ecma_visit::VisitMut for Inline<'_> {
         fn visit_mut_expr(&mut self, expr: &mut Expr) {
-            if let Expr::Ident(ident) = expr
-                && let Some(init) = self.0.get(&ident_key(ident))
-            {
-                *expr = init.clone();
-                return;
+            if let Expr::Ident(ident) = expr {
+                let key = ident_key(ident);
+                if !self.1.contains(&key)
+                    && let Some(init) = self.0.get(&key)
+                {
+                    *expr = init.clone();
+                    return;
+                }
             }
             swc_ecma_visit::VisitMutWith::visit_mut_children_with(expr, self);
         }
@@ -3166,6 +3175,7 @@ fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
     fn walk(
         stmts: &[Stmt],
         locals: &mut HashMap<BindingKey, Expr>,
+        touched: &mut HashSet<BindingKey>,
         returns: &mut Vec<Expr>,
     ) -> Option<()> {
         for stmt in stmts {
@@ -3179,28 +3189,71 @@ fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
                         let mut init = (**init).clone();
                         swc_ecma_visit::VisitMutWith::visit_mut_with(
                             &mut init,
-                            &mut Inline(locals),
+                            &mut Inline(locals, touched),
                         );
                         locals.insert(ident_key(&name.id), init);
                     }
                 }
                 Stmt::Return(ReturnStmt { arg: Some(arg), .. }) => {
                     let mut value = (**arg).clone();
-                    swc_ecma_visit::VisitMutWith::visit_mut_with(&mut value, &mut Inline(locals));
+                    swc_ecma_visit::VisitMutWith::visit_mut_with(
+                        &mut value,
+                        &mut Inline(locals, touched),
+                    );
+                    if !touched.is_empty() {
+                        if !only_in_query(&value, touched) {
+                            return None;
+                        }
+                        swc_ecma_visit::VisitMutWith::visit_mut_with(
+                            &mut value,
+                            &mut Inline(locals, &HashSet::new()),
+                        );
+                    }
                     returns.push(value);
                 }
                 Stmt::Throw(_) => {}
+                // `query.set(k, v)` on a body-local `const`: the local may
+                // change, so it is read only where the return puts it after
+                // the `?` (checked at each return).
+                Stmt::Expr(ExprStmt { expr, .. }) => {
+                    let Expr::Call(CallExpr {
+                        callee: Callee::Expr(callee),
+                        ..
+                    }) = &**expr
+                    else {
+                        return None;
+                    };
+                    let Expr::Member(MemberExpr { obj, .. }) =
+                        crate::graphql_document_sites::unwrap_expression(callee)
+                    else {
+                        return None;
+                    };
+                    let Expr::Ident(receiver) = &**obj else {
+                        return None;
+                    };
+                    let key = ident_key(receiver);
+                    if !locals.contains_key(&key) {
+                        return None;
+                    }
+                    touched.insert(key);
+                }
                 // A block's or a branch's `const` is visible only inside it:
                 // each walks its own copy of the locals declared so far.
-                Stmt::Block(block) => walk(&block.stmts, &mut locals.clone(), returns)?,
+                Stmt::Block(block) => walk(&block.stmts, &mut locals.clone(), touched, returns)?,
                 Stmt::If(branch) => {
                     walk(
                         std::slice::from_ref(&branch.cons),
                         &mut locals.clone(),
+                        touched,
                         returns,
                     )?;
                     if let Some(alt) = &branch.alt {
-                        walk(std::slice::from_ref(alt), &mut locals.clone(), returns)?;
+                        walk(
+                            std::slice::from_ref(alt),
+                            &mut locals.clone(),
+                            touched,
+                            returns,
+                        )?;
                     }
                 }
                 _ => return None,
@@ -3213,7 +3266,12 @@ fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
         return None;
     }
     let mut returns = Vec::new();
-    walk(stmts, &mut HashMap::new(), &mut returns)?;
+    walk(
+        stmts,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+        &mut returns,
+    )?;
     let mut distinct: Vec<Expr> = Vec::new();
     for value in returns {
         if !distinct
@@ -3224,6 +3282,51 @@ fn returned_values(stmts: &[Stmt]) -> Option<Vec<Expr>> {
         }
     }
     (!distinct.is_empty()).then_some(distinct)
+}
+
+/// Whether every mention of a local in `touched` in a returned value sits
+/// after a literal `?`: in a template after a quasi that holds one, or in a
+/// `+` chain after a string that does. Anything else (the local in the path,
+/// or a shape this does not read) is `false`, so the builder stands down.
+fn only_in_query(value: &Expr, touched: &HashSet<BindingKey>) -> bool {
+    struct Mentions<'a>(&'a HashSet<BindingKey>, bool);
+    impl swc_ecma_visit::Visit for Mentions<'_> {
+        fn visit_ident(&mut self, ident: &Ident) {
+            self.1 |= self.0.contains(&ident_key(ident));
+        }
+    }
+    fn mentions(expr: &Expr, touched: &HashSet<BindingKey>) -> bool {
+        let mut found = Mentions(touched, false);
+        swc_ecma_visit::VisitWith::visit_with(expr, &mut found);
+        found.1
+    }
+    fn clean(expr: &Expr, touched: &HashSet<BindingKey>, in_query: &mut bool) -> bool {
+        match crate::graphql_document_sites::unwrap_expression(expr) {
+            Expr::Lit(Lit::Str(text)) => {
+                *in_query |= text.value.to_string_lossy().contains('?');
+                true
+            }
+            Expr::Tpl(template) => {
+                for (index, quasi) in template.quasis.iter().enumerate() {
+                    *in_query |= quasi.raw.contains('?');
+                    if let Some(part) = template.exprs.get(index)
+                        && !clean(part, touched, in_query)
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            Expr::Bin(BinExpr {
+                op: BinaryOp::Add,
+                left,
+                right,
+                ..
+            }) => clean(left, touched, in_query) && clean(right, touched, in_query),
+            other => *in_query || !mentions(other, touched),
+        }
+    }
+    clean(value, touched, &mut false)
 }
 
 /// The written path every value ends in, when what comes before it is only
@@ -13443,6 +13546,54 @@ function build() { return {}; }
             );
             assert!(
                 matches!(url.first(), Some(Piece::Opaque { text, .. }) if text == "base()"),
+                "{body}: {url:?}"
+            );
+        }
+    }
+
+    /// A call statement on a body-local `const` (`query.set(k, v)`, guarded
+    /// or not) does not stop a builder when the return reads that local only
+    /// after the `?`: the route is the text before it.
+    #[test]
+    fn a_query_local_changed_before_the_return_keeps_the_builder() {
+        for body in [
+            "const query = new URLSearchParams(); if (flag()) { query.set(\"k\", \"v\"); } return `/a/${id}/b?${query}`;",
+            "const query = new URLSearchParams(); query.set(\"k\", \"v\"); return `/a/${id}/b?${query.toString()}`;",
+            "const query = new URLSearchParams(); query.set(\"k\", \"v\"); return \"/a/\" + id + \"/b?\" + query;",
+        ] {
+            let url = request_url(
+                &format!(
+                    "function url(id: string) {{ {body} }}\n\
+                     export function f(id: string) {{ return fetch(url(id)); }}\n"
+                ),
+                "f",
+            );
+            assert!(
+                matches!(url.first(), Some(Piece::Lit(text)) if text.starts_with("/a/")),
+                "{body}: {url:?}"
+            );
+        }
+    }
+
+    /// A call statement the path reads from, or on anything that is not a
+    /// body-local `const`, still states no value.
+    #[test]
+    fn a_statement_the_path_reads_still_stops_the_builder() {
+        for body in [
+            "const parts = [\"a\"]; parts.push(id); return `/${parts.join(\"/\")}`;",
+            "const query = new URLSearchParams(); query.set(\"k\", \"v\"); return `/a/${query}/b`;",
+            "const p = `/a/${id}`; console.log(p); return p;",
+            "const query = new URLSearchParams(); query.set(\"k\", \"v\"); const p = `/a/${query}`; return p;",
+        ] {
+            let url = request_url(
+                &format!(
+                    "function url(id: string) {{ {body} }}\n\
+                     export function f(id: string) {{ return fetch(url(id)); }}\n"
+                ),
+                "f",
+            );
+            assert!(
+                matches!(url.first(), Some(Piece::Opaque { text, .. }) if text.starts_with("url(")),
                 "{body}: {url:?}"
             );
         }
