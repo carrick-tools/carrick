@@ -1156,6 +1156,7 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                         reason: Stop::NameNeverBound,
                     },
                     trace_depth: 0,
+                    ends: Vec::new(),
                 },
                 needs_reader: false,
                 through: false,

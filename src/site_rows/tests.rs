@@ -1027,6 +1027,7 @@ fn lead_at(file: &str, line: u32, role: Option<&str>) -> PossibleCall {
             reason: Stop::NoOpClaim,
         },
         trace_depth: 0,
+        ends: Vec::new(),
     }
 }
 
