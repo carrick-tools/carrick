@@ -357,3 +357,28 @@ fn each_service_asks_the_store_once_per_scan() {
         assert_eq!(all, 2, "{scan} scan: store asks in the whole run");
     }
 }
+
+/// The lane ran in the incremental scan that has it: each service's analysis
+/// says what it was handed ("Answers ahead for <service>: asked ..."), and
+/// does not say it refused. The scans without it say nothing of the kind.
+#[test]
+fn the_lane_runs_in_the_scan_that_has_it() {
+    for (scan, scanned) in scanned() {
+        for service in ["cli", "srv"] {
+            let lines = service_lines(&scanned.log, service);
+            let ahead = lines
+                .iter()
+                .filter(|line| line.contains("Answers ahead for"))
+                .collect::<Vec<_>>();
+            if *scan == "incremental" {
+                assert!(!ahead.is_empty(), "{scan} scan, {service}: the lane ran");
+                assert!(
+                    ahead.iter().all(|line| !line.contains("refused")),
+                    "{scan} scan, {service}: {ahead:?}"
+                );
+            } else {
+                assert!(ahead.is_empty(), "{scan} scan, {service}: {ahead:?}");
+            }
+        }
+    }
+}

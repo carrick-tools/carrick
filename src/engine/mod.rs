@@ -3886,7 +3886,7 @@ impl ServiceScan {
                 service.service_name.clone(),
                 async move { settled_library_answer(Some(&ask), early).await },
             ));
-            let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled);
+            let handed = answers_ahead::LibraryHanded::new(asked, first_answer, settled).by_lane();
             first = Some(handed.first());
             Some(handed)
         });
@@ -5663,12 +5663,7 @@ async fn analyze_current_repo_incremental(
                     &semantics_root,
                     summaries_sender,
                 ),
-                async {
-                    match library_handed {
-                        Some(handed) => handed.settle(early_answer).await,
-                        None => settled_library_answer(library_ask.as_deref(), early_answer).await,
-                    }
-                },
+                async { settled_from(library_handed, library_ask.as_deref(), early_answer).await },
                 fact_files_of(
                     library_ask.as_deref(),
                     first_answer,
@@ -6862,6 +6857,28 @@ fn library_turn(
     }
 }
 
+/// The settled answer of the ask `handed` holds, or of the ask the analysis
+/// sends itself when nothing was handed to it, or when the lane's ask
+/// panicked (a miss, never a failed scan: [`answers_ahead::LibraryHanded::settle`]).
+async fn settled_from(
+    handed: Option<answers_ahead::LibraryHanded>,
+    ask: Option<&LibraryAsk>,
+    early: tokio::sync::oneshot::Sender<crate::library_store::FirstAnswer>,
+) -> crate::library_store::Settled {
+    match handed {
+        Some(handed) => match handed.settle(early).await {
+            Ok(settled) => settled,
+            Err(early) => {
+                // The first answer may already be sent; a spare channel
+                // takes the one this ask sends again.
+                let early = early.unwrap_or_else(|| tokio::sync::oneshot::channel().0);
+                settled_library_answer(ask, early).await
+            }
+        },
+        None => settled_library_answer(ask, early).await,
+    }
+}
+
 /// Send the service's own library-store `ask` on a task of its own, then ask
 /// the compiler engine for the implementations with `implementations`: the
 /// store's round trip runs beside that ask and whatever follows it, rather
@@ -6908,20 +6925,18 @@ where
     let task = match store {
         Some(store) => {
             let (begun, has_begun) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(crate::current_service::Carried::capture().future(
-                async move {
-                    let mut store = std::pin::pin!(store);
-                    let mut begun = Some(begun);
-                    std::future::poll_fn(|cx| {
-                        let polled = std::future::Future::poll(store.as_mut(), cx);
-                        if let Some(begun) = begun.take() {
-                            let _ = begun.send(());
-                        }
-                        polled
-                    })
-                    .await
-                },
-            ));
+            let task = crate::current_service::spawn(async move {
+                let mut store = std::pin::pin!(store);
+                let mut begun = Some(begun);
+                std::future::poll_fn(|cx| {
+                    let polled = std::future::Future::poll(store.as_mut(), cx);
+                    if let Some(begun) = begun.take() {
+                        let _ = begun.send(());
+                    }
+                    polled
+                })
+                .await
+            });
             let _ = has_begun.await;
             Some(task)
         }
@@ -13998,12 +14013,7 @@ async fn analyze_current_repo(
             &service_root,
             summaries_sender,
         ),
-        async {
-            match own_library {
-                Some(sent) => sent.settle(early_answer).await,
-                None => settled_library_answer(library_ask.as_deref(), early_answer).await,
-            }
-        },
+        async { settled_from(own_library, library_ask.as_deref(), early_answer).await },
         fact_files_of(
             library_ask.as_deref(),
             first_answer,
