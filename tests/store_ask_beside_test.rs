@@ -304,6 +304,39 @@ fn each_service_s_engine_gets_ready_beside_its_discovery() {
     }
 }
 
+/// Where no lane asks ahead, a service's store request is answered before its
+/// implementations ask is: the request left first. Two services that send
+/// the same request take turns, and the second waits for the first's answer,
+/// so at least one of them shows it in every scan; the scan with a lane keeps
+/// its ask where the lane's hand-off is claimed.
+#[test]
+fn the_store_is_asked_before_the_implementations_with_no_lane() {
+    for (scan, scanned) in scanned() {
+        if *scan == "incremental" {
+            continue;
+        }
+        let early: Vec<&str> = ["cli", "srv"]
+            .into_iter()
+            .filter(|service| {
+                let lines = service_lines(&scanned.log, service);
+                let asked = position(
+                    &lines,
+                    0,
+                    "Mock fixture hit for /library-claims",
+                    service,
+                    scan,
+                );
+                let implementations = position(&lines, 0, "implementations:", service, scan);
+                asked < implementations
+            })
+            .collect();
+        assert!(
+            !early.is_empty(),
+            "{scan} scan: no service's store request left before its implementations ask"
+        );
+    }
+}
+
 /// Each service asks the store exactly once per scan, from its own analysis:
 /// the ask that now leaves early is the only one.
 #[test]

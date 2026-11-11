@@ -110,7 +110,13 @@ impl LibraryHanded {
             let _ = early.send(first);
         }
         match self.settled.take() {
-            Some(settled) => settled.await.unwrap_or_default(),
+            // A panic in the ask ends the scan, as it does where the analysis
+            // awaits its ask itself; it is never read as no answer.
+            Some(settled) => match settled.await {
+                Ok(settled) => settled,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(_) => Settled::default(),
+            },
             None => Settled::default(),
         }
     }
