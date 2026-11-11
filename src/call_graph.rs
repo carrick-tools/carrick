@@ -862,6 +862,7 @@ pub fn plan_edges(
                         EnteredKind::Constructor => "constructor",
                         EnteredKind::Implementation => "implementation",
                         EnteredKind::Value => "value",
+                        EnteredKind::Handed => "handed",
                     };
                     *planned.by_kind.entry(kind).or_default() += 1;
                     planned.edges.push((caller.clone(), edge));
