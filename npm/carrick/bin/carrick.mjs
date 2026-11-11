@@ -431,25 +431,19 @@ switch (command) {
     process.stderr.write(extraHelp());
     process.exit(0);
   }
-  // The binary answers; this package adds the hooks' own timing line under
-  // it (`hook/timings.ts`), never to `--json`, which a hook parses.
-  case "status": {
-    if (rest.some((argument) => argument === "--json" || argument === "--help" || argument === "-h")) {
-      await runNative(argv);
-      break;
-    }
-    await runNative(argv, {
-      after: async () => {
-        const { statusTimingsLine } = await import("../dist/hook/timings.js");
-        const at = rest.indexOf("--workspace");
-        return statusTimingsLine((at >= 0 && rest[at + 1]) || process.cwd());
-      },
-    });
-    break;
-  }
   default: {
     const { isRendered } = await import("../dist/scan.js");
-    if (isRendered(command, rest)) await renderNative(argv);
+    // The binary answers `status`; this package adds the hooks' own timing line
+    // under it (`hook/timings.ts`), never to `--json`, which a hook parses.
+    if (command === "status" && !rest.some((a) => a === "--json" || a === "--help" || a === "-h")) {
+      await runNative(argv, {
+        after: async () => {
+          const { statusTimingsLine } = await import("../dist/hook/timings.js");
+          const at = rest.indexOf("--workspace");
+          return statusTimingsLine((at >= 0 && rest[at + 1]) || process.cwd());
+        },
+      });
+    } else if (isRendered(command, rest)) await renderNative(argv);
     else await runNative(argv);
   }
 }
