@@ -7037,8 +7037,13 @@ export class TypeInferrer {
 
   /** The annotation `extractExplicitTypeFromAncestor` prints, as a node. */
   private explicitTypeNodeFromAncestor(node: Node): Node | undefined {
+    // The walk stops at the first function boundary: past it, the annotation
+    // describes the object or value the function sits in, not this read.
     const varDecl = node.getFirstAncestorByKind(SyntaxKind.VariableDeclaration);
-    if (varDecl) {
+    const boundary = this.findContainingFunctionForNode(node);
+    const crossesBoundary =
+      !!varDecl && !!boundary && boundary.getStart() > varDecl.getStart();
+    if (varDecl && !crossesBoundary) {
       const typeNode = varDecl.getTypeNode();
       if (typeNode) {
         return typeNode;
