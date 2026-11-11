@@ -1872,6 +1872,87 @@ fn a_second_call_on_the_callers_line_keeps_its_row() {
     assert!(left[1].contains("/api/user"));
 }
 
+/// carrick#3822: a client module's functions each hand a literal path to a
+/// wrapper that writes its URL inline from a base and that path, and three
+/// places call those functions. The only row at each function's call of the
+/// wrapper is an old-path one, a reading of the call's spelling and not a
+/// fact, so a caller's reader row that disagrees with it is not that request
+/// read wrongly: it stands for `call_through::settle` to restate.
+#[test]
+fn a_disagreeing_caller_of_a_wrapper_keeps_its_row_over_an_old_path_site_row() {
+    let through = |line: u32, site_line: u32| Through {
+        file: "src/page.ts".to_string(),
+        line,
+        site_file: "src/client.ts".to_string(),
+        site_line,
+        other_call: false,
+    };
+    let wrapper = Some(ResolutionSource::SameFileWrapper);
+    let model = Some(ResolutionSource::Model);
+    let mut calls = vec![
+        // The wrapper lines: each function's call of the wrapper.
+        blob_row(
+            OperationKey::http("GET", "/v1/accounts"),
+            "src/client.ts",
+            10,
+            wrapper,
+        ),
+        blob_row(
+            OperationKey::http("POST", "/v1/orders"),
+            "src/client.ts",
+            14,
+            wrapper,
+        ),
+        blob_row(
+            OperationKey::http("GET", "/v1/orders/:param"),
+            "src/client.ts",
+            18,
+            wrapper,
+        ),
+        // The callers, each read with another path than its function's.
+        blob_row(
+            OperationKey::http("GET", "/accounts"),
+            "src/page.ts",
+            4,
+            model,
+        ),
+        blob_row(
+            OperationKey::http("POST", "/create"),
+            "src/page.ts",
+            6,
+            model,
+        ),
+        blob_row(
+            OperationKey::http("PUT", "/v1/order/:param"),
+            "src/page.ts",
+            8,
+            model,
+        ),
+    ];
+    let site = SiteRows {
+        enabled: true,
+        through: vec![through(4, 10), through(6, 14), through(8, 18)],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
+    let left: Vec<String> = calls
+        .iter()
+        .map(|row| row.file_path.to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        left,
+        [
+            "src/client.ts:10",
+            "src/client.ts:14",
+            "src/client.ts:18",
+            "src/page.ts:4",
+            "src/page.ts:6",
+            "src/page.ts:8",
+        ]
+    );
+    assert!(fold.through_folded.is_empty(), "{:?}", fold.through_folded);
+}
+
 /// carrick#2614: a reader row at a call above a decided site folds onto the
 /// row standing at the site when the two agree. carrick#2704: it folds as
 /// well when it disagrees with a fact there, and stands when it disagrees
