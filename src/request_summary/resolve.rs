@@ -162,9 +162,8 @@ impl ModuleBinding {
     /// walk) read this entry: an enum holds no value, a loop head is the
     /// text reader's alone, and a text-only local is held by its scope. A
     /// [`Self::scoped_entry`] is read here (carrick#3794 T3): a nested
-    /// function's own top-level local stays `text_only` (D2), the text
-    /// reader and the procedures walk still refuse the class at their own
-    /// choke points.
+    /// function's own top-level local stays `text_only` (D2), and the
+    /// procedures walk still refuses the class at its own choke point.
     pub(super) fn values_read(&self) -> bool {
         !matches!(
             self.kind,
