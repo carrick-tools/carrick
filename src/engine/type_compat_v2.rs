@@ -2259,18 +2259,8 @@ fn judge_key(build_key: &str, stubs: &[CheckStubInput], specs: &[CheckPairSpec])
 }
 
 /// Run `judge` unless an identical input already got a finished answer in
-/// the folder [`JUDGE_ANSWERS_ENV`] names.
-fn judge_once(
-    build_key: &str,
-    stubs: &[CheckStubInput],
-    specs: &[CheckPairSpec],
-    judge: impl FnOnce() -> Result<CheckV2Result, SidecarError>,
-) -> Result<CheckV2Result, SidecarError> {
-    let dir = std::env::var_os(JUDGE_ANSWERS_ENV).map(PathBuf::from);
-    judge_once_in(dir.as_deref(), build_key, stubs, specs, judge)
-}
-
-/// [`judge_once`], over a named folder. Only a check that ran to the end is
+/// the folder `dir` names (from [`JUDGE_ANSWERS_ENV`]; `None` keeps nothing).
+/// Only a check that ran to the end is
 /// kept; a failed one is judged again. An input that cannot be keyed, or an
 /// answer that cannot be read back, is judged, never guessed.
 fn judge_once_in(
@@ -2315,6 +2305,126 @@ fn judge_once_in(
     Ok(result)
 }
 
+/// Name of the variable that makes a judge run a second time over the first
+/// k probing pairs, to time a smaller judge (carrick#1047). Its verdicts are
+/// discarded; unset, nothing extra runs.
+pub(crate) const JUDGE_TIMING_SAMPLE_ENV: &str = "CARRICK_JUDGE_TIMING_SAMPLE";
+
+/// The time `run_check` spent before the judge, in milliseconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct PreJudgeMs {
+    build_and_hash: u64,
+    stubs: u64,
+}
+
+/// The `v2 check timing` log line. Agent- and log-facing only: it carries
+/// counts and times, no paths.
+fn judge_timing_line(
+    before: PreJudgeMs,
+    key_ms: u64,
+    phases: Option<crate::services::type_sidecar::CheckPhaseMs>,
+    pairs: usize,
+    stubs: usize,
+    sample: Option<usize>,
+) -> String {
+    let phase = |pick: fn(&crate::services::type_sidecar::CheckPhaseMs) -> u64| {
+        phases
+            .as_ref()
+            .map_or("n/a".to_string(), |p| format!("{} ms", pick(p)))
+    };
+    let sampled = sample.map_or(String::new(), |k| format!("sample {k}, "));
+    format!(
+        "v2 check timing: build+hash {} ms, stubs {} ms, key {} ms, assemble {}, probes {}, install {}, tsc {}, probe program {}, classify {} ({sampled}{pairs} pairs, {stubs} stubs)",
+        before.build_and_hash,
+        before.stubs,
+        key_ms,
+        phase(|p| p.assemble),
+        phase(|p| p.probes),
+        phase(|p| p.install),
+        phase(|p| p.tsc),
+        phase(|p| p.probe_program),
+        phase(|p| p.classify),
+    )
+}
+
+/// The ceiling on how many probing pairs a kept answer could ever serve: the
+/// ones whose both sides carry a surface hash.
+fn hash_ceiling_line(probing: &[&BuiltPair]) -> String {
+    let hashed = probing
+        .iter()
+        .filter(|p| p.producer_surface_hash.is_some() && p.consumer_surface_hash.is_some())
+        .count();
+    format!(
+        "{hashed} of {} probing pair(s) carry both side hashes",
+        probing.len()
+    )
+}
+
+/// The first `k` of `specs` by pair key.
+fn timing_sample(specs: &[CheckPairSpec], k: usize) -> Vec<CheckPairSpec> {
+    let mut sorted: Vec<CheckPairSpec> = specs.to_vec();
+    sorted.sort_by(|a, b| a.pair_key.cmp(&b.pair_key));
+    sorted.truncate(k);
+    sorted
+}
+
+/// The judge over `specs`, logging where its time went. When `sample` is set,
+/// it then runs `check` again over the first k specs, with every stub, only
+/// to log that run's timing; the sample's answer is dropped, so nothing
+/// downstream can read it. The returned answer is the first run's.
+fn judge_timed(
+    kept_dir: Option<&Path>,
+    build_key: &str,
+    stubs: &[CheckStubInput],
+    specs: &[CheckPairSpec],
+    before: PreJudgeMs,
+    sample: Option<usize>,
+    emit: impl Fn(&str),
+    check: impl Fn(&[CheckPairSpec]) -> Result<CheckV2Result, SidecarError>,
+) -> Result<CheckV2Result, SidecarError> {
+    use std::cell::Cell;
+    let ran_ms: Cell<Option<u64>> = Cell::new(None);
+    let started = std::time::Instant::now();
+    let result = judge_once_in(kept_dir, build_key, stubs, specs, || {
+        let run = std::time::Instant::now();
+        let answer = check(specs);
+        ran_ms.set(Some(run.elapsed().as_millis() as u64));
+        answer
+    });
+    if result.is_ok() {
+        // Time outside the compiler engine's own run: the key over every
+        // stub's files, and writing the kept answer. A reused kept answer
+        // was judged by an earlier process, so its phases are not this
+        // run's and are not printed.
+        let ran = ran_ms.get();
+        let key_ms = (started.elapsed().as_millis() as u64).saturating_sub(ran.unwrap_or(0));
+        let phases = ran.and_then(|_| result.as_ref().ok().and_then(|a| a.phase_ms));
+        emit(&judge_timing_line(
+            before,
+            key_ms,
+            phases,
+            specs.len(),
+            stubs.len(),
+            None,
+        ));
+    }
+    if let Some(k) = sample.filter(|k| *k > 0 && !specs.is_empty()) {
+        let subset = timing_sample(specs, k);
+        // The sample's verdicts are dropped on purpose.
+        if let Ok(answer) = check(&subset) {
+            emit(&judge_timing_line(
+                PreJudgeMs::default(),
+                0,
+                answer.phase_ms,
+                subset.len(),
+                stubs.len(),
+                Some(k),
+            ));
+        }
+    }
+    result
+}
+
 /// Run the v2 check over the built pairs and produce the analyzer's pair
 /// outcomes. Pairs with a pre-set verdict (no surface / unresolved side)
 /// never reach the sidecar. A check that failed part way (an install, an
@@ -2333,6 +2443,7 @@ pub(crate) fn run_check(
     local_consumers: &LocalConsumers,
     settle: Option<&super::pair_settle::SettleFrom>,
 ) -> Vec<PairCheckOutcome> {
+    let run_started = std::time::Instant::now();
     let all_pairs = build_check_pairs(all_repo_data);
     if all_pairs.is_empty() {
         return Vec::new();
@@ -2405,7 +2516,14 @@ pub(crate) fn run_check(
                 .unwrap_or(0)
         );
         let workspace_parent = std::env::temp_dir().join(unique);
+        let before_stubs = run_started.elapsed().as_millis() as u64;
+        let stubs_started = std::time::Instant::now();
         let stubs = materialize_stubs(all_repo_data, &workspace_parent);
+        let before = PreJudgeMs {
+            build_and_hash: before_stubs,
+            stubs: stubs_started.elapsed().as_millis() as u64,
+        };
+        info!("{}", hash_ceiling_line(&probing));
         let specs: Vec<CheckPairSpec> = probing.iter().map(|p| p.spec.clone()).collect();
 
         // Read around the check: its compiler is a child of the sidecar, in
@@ -2416,9 +2534,20 @@ pub(crate) fn run_check(
                 "no capture stubs available".to_string(),
             ))
         } else {
-            judge_once(&sidecar.build_key(), &stubs, &specs, || {
-                sidecar.check_v2(&stubs, &specs)
-            })
+            let sample = std::env::var(JUDGE_TIMING_SAMPLE_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok());
+            let kept_dir = std::env::var_os(JUDGE_ANSWERS_ENV).map(PathBuf::from);
+            judge_timed(
+                kept_dir.as_deref(),
+                &sidecar.build_key(),
+                &stubs,
+                &specs,
+                before,
+                sample,
+                |line| info!("{line}"),
+                |s| sidecar.check_v2(&stubs, s),
+            )
         };
         let oom_kills_rose = crate::services::type_sidecar::oom_kills_rose(
             oom_kills_before,
@@ -2530,6 +2659,7 @@ pub(crate) fn run_check(
     for outcome in &mut outcomes {
         outcome.left_to_consumer = consumer_blamed.contains(&outcome.pair_key);
     }
+    let retype_started = std::time::Instant::now();
     retype_consumer_calls(
         sidecar,
         &pairs,
@@ -2537,9 +2667,15 @@ pub(crate) fn run_check(
         local_consumers,
         &mut outcomes,
     );
+    let retype_ms = retype_started.elapsed().as_millis() as u64;
+    let passes_started = std::time::Instant::now();
     abstain_on_unstated_modes(&pairs, &mut outcomes);
     abstain_on_unwidened_out_of_budget(&pairs, &mut outcomes);
     hold_back_same_service_mismatches(&mut outcomes);
+    info!(
+        "v2 check after-judge timing: retype {retype_ms} ms, post-passes {} ms",
+        passes_started.elapsed().as_millis()
+    );
     let settled_keys: HashSet<String> = settled.iter().map(|o| o.pair_key.clone()).collect();
     outcomes.append(&mut settled);
 
@@ -10078,6 +10214,169 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "success": success, "isolation": "pnpm", "install_ok": true, "ts_version": ts,
         }))
         .unwrap()
+    }
+
+    /// An answer that names the pair keys it was asked about in `ts_version`,
+    /// so a test can tell which run's answer it was handed.
+    fn timed_answer(asked: &[CheckPairSpec]) -> CheckV2Result {
+        let asked: Vec<&str> = asked.iter().map(|s| s.pair_key.as_str()).collect();
+        serde_json::from_value(serde_json::json!({
+            "success": true, "isolation": "pnpm", "install_ok": true, "ts_version": asked.join(","),
+            "phase_ms": {
+                "assemble": 11, "probes": 12, "install": 13,
+                "tsc": 14, "probe_program": 15, "classify": 16
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_timing_line_names_every_phase_and_the_hash_line_counts_hashed_pairs() {
+        let answer = timed_answer(&[]);
+        let line = judge_timing_line(
+            PreJudgeMs {
+                build_and_hash: 1,
+                stubs: 2,
+            },
+            3,
+            answer.phase_ms,
+            7,
+            4,
+            None,
+        );
+        assert_eq!(
+            line,
+            "v2 check timing: build+hash 1 ms, stubs 2 ms, key 3 ms, assemble 11 ms, probes 12 ms, install 13 ms, tsc 14 ms, probe program 15 ms, classify 16 ms (7 pairs, 4 stubs)"
+        );
+        let sampled = judge_timing_line(PreJudgeMs::default(), 0, None, 2, 4, Some(2));
+        assert!(
+            sampled.contains("(sample 2, 2 pairs, 4 stubs)"),
+            "{sampled}"
+        );
+        assert!(sampled.contains("tsc n/a"), "{sampled}");
+
+        let mut hashed = built_pair_for_timing("a");
+        hashed.producer_surface_hash = Some("p".into());
+        hashed.consumer_surface_hash = Some("c".into());
+        let mut half = built_pair_for_timing("b");
+        half.producer_surface_hash = Some("p".into());
+        let none = built_pair_for_timing("c");
+        assert_eq!(
+            hash_ceiling_line(&[&hashed, &half, &none]),
+            "1 of 3 probing pair(s) carry both side hashes"
+        );
+    }
+
+    fn built_pair_for_timing(key: &str) -> BuiltPair {
+        BuiltPair {
+            spec: one_spec(key),
+            pseudo_method: "GET".into(),
+            identity: String::new(),
+            consumer_file: String::new(),
+            consumer_line: 0,
+            type_kind: ManifestTypeKind::Response,
+            producer_alias: "A".into(),
+            consumer_alias: "B".into(),
+            producer_service: "p".into(),
+            consumer_service: "c".into(),
+            pre_verdict: None,
+            pre_verdict_side: None,
+            producer_expanded: None,
+            producer_unwidened: None,
+            consumer_expanded: None,
+            unstated_mode: None,
+            unwidened_out_of_budget: false,
+            producer_surface_hash: None,
+            consumer_surface_hash: None,
+        }
+    }
+
+    #[test]
+    fn a_timing_sample_judges_the_first_k_pairs_again_and_changes_no_answer() {
+        let d = tempfile::tempdir().unwrap();
+        let stubs = [kept_stub(d.path(), "svc", "export type A = number;")];
+        let specs: Vec<CheckPairSpec> = ["c", "a", "d", "b"].iter().map(|k| one_spec(k)).collect();
+        let seen: std::cell::RefCell<Vec<Vec<String>>> = Default::default();
+        let lines: std::cell::RefCell<Vec<String>> = Default::default();
+        let run = |sample: Option<usize>| {
+            seen.borrow_mut().clear();
+            lines.borrow_mut().clear();
+            let out = judge_timed(
+                None,
+                "b",
+                &stubs,
+                &specs,
+                PreJudgeMs::default(),
+                sample,
+                |l| lines.borrow_mut().push(l.to_string()),
+                |s| {
+                    seen.borrow_mut()
+                        .push(s.iter().map(|p| p.pair_key.clone()).collect());
+                    Ok(timed_answer(s))
+                },
+            )
+            .unwrap();
+            (out, seen.borrow().clone(), lines.borrow().clone())
+        };
+        let (plain, plain_calls, plain_lines) = run(None);
+        assert_eq!(plain_calls.len(), 1, "unset: nothing extra runs");
+        assert_eq!(plain_lines.len(), 1, "{plain_lines:?}");
+        assert!(
+            plain_lines[0].contains("4 pairs, 1 stubs"),
+            "{plain_lines:?}"
+        );
+        assert!(plain_lines[0].contains("tsc 14 ms"), "{plain_lines:?}");
+
+        let (sampled, calls, lines) = run(Some(2));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), 4, "the normal judge sees every pair");
+        assert_eq!(calls[1], vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("sample 2, 2 pairs"), "{lines:?}");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&sampled).unwrap(),
+            "the returned answer is the normal judge's, byte for byte"
+        );
+        assert_eq!(sampled.ts_version, "c,a,d,b", "not the sample's answer");
+    }
+
+    #[test]
+    fn a_reused_kept_answer_logs_a_timing_line_without_its_old_phases() {
+        let kept = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let stubs = [kept_stub(d.path(), "svc", "export type A = number;")];
+        let specs = [one_spec("k")];
+        let lines: std::cell::RefCell<Vec<String>> = Default::default();
+        let judge = || {
+            judge_once_in(Some(kept.path()), "b", &stubs, &specs, || {
+                Ok(timed_answer(&specs))
+            })
+        };
+        judge().unwrap();
+        // The second run answers from the kept file: no phases of its own.
+        let reused = judge().unwrap();
+        assert!(
+            reused.phase_ms.is_some(),
+            "the kept file holds the old phases"
+        );
+        let out = judge_timed(
+            Some(kept.path()),
+            "b",
+            &stubs,
+            &specs,
+            PreJudgeMs::default(),
+            None,
+            |l| lines.borrow_mut().push(l.to_string()),
+            |_| panic!("a kept answer must not be judged again"),
+        );
+        out.unwrap();
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(
+            lines.borrow()[0].contains("tsc n/a"),
+            "{:?}",
+            lines.borrow()
+        );
     }
 
     #[test]

@@ -681,6 +681,20 @@ export interface CheckResult {
    * signal, or a non-zero exit with no parseable diagnostics): every pair is then
    * unverifiable, and this says whether it died of memory (carrick#2209). */
   compiler_end?: CompilerEnd;
+  /** Wall time of each phase of a check that ran to its end, in whole
+   * milliseconds. For the scanner's log only: no verdict reads it. Absent on
+   * every early return (carrick#1047). */
+  phase_ms?: CheckPhaseMs;
+}
+
+/** Where a check's time went (carrick#1047). */
+export interface CheckPhaseMs {
+  assemble: number;
+  probes: number;
+  install: number;
+  tsc: number;
+  probe_program: number;
+  classify: number;
 }
 
 /** How the check's compiler process ended. */

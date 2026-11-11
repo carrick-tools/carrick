@@ -452,12 +452,14 @@ export async function runCheck(
     };
   }
 
+  const t0 = Date.now();
   progress('assembling', 'assembling synthetic workspace');
   const ws = assembleWorkspace({
     stubs: opts.stubs,
     workspaceRoot: opts.workspaceRoot,
   });
 
+  const tAssembled = Date.now();
   const scrubCtx: ScrubContext = {
     workspaceRoot: ws.workspaceDir,
     workspaceRealRoot: fs.realpathSync(ws.workspaceDir),
@@ -495,6 +497,7 @@ export async function runCheck(
 
   const { preGated, probing } = preGate(plans, aliasRecords);
   writeProbes(ws, probing);
+  const tProbed = Date.now();
 
   const errors: string[] = [];
   const degraded: DegradedService[] = [];
@@ -552,6 +555,7 @@ export async function runCheck(
     };
   }
 
+  const tInstalled = Date.now();
   // ---- Judge (async, off the event loop) ----------------------------------
   progress('checking', `type-checking probes (judge: ${judge})`);
   const heap = childHeap(
@@ -565,6 +569,7 @@ export async function runCheck(
     ws.workspaceDir,
     { ...process.env, NODE_OPTIONS: heap.nodeOptions }
   );
+  const tTsc = Date.now();
   const diagnostics = parseTscOutput(tsc.stdout + '\n' + tsc.stderr);
 
   // Abnormal tsc termination: OOM/SIGKILL (exit code null), an internal
@@ -664,6 +669,7 @@ export async function runCheck(
   // carries a member-level any/unknown HERE — after install, where the capture
   // could not look (carrick#450). It sets `resolved` and nothing else; no
   // bucket depends on it.
+  const tAttributed = Date.now();
   const probeProgram = openProbeProgram(ws.probesDir, probing);
   const deepByPair = probeDeepFindings(probeProgram, probing);
   // The same program answers which FIELDS differ on a pair the judge called
@@ -673,6 +679,7 @@ export async function runCheck(
   // And which pairs compared a union the expected side takes only in part,
   // the rest failing by nothing but the weak-type check (carrick#1995).
   const unionsByPair = pairDispatchUnions(probeProgram, probing);
+  const tProbeProgram = Date.now();
 
   const verdicts = sortVerdicts([
     ...probing.map((plan) =>
@@ -691,6 +698,7 @@ export async function runCheck(
     ...unresolved,
   ]);
 
+  const tClassified = Date.now();
   const workspaceDirOut = cleanup ? '' : ws.workspaceDir;
   if (cleanup) safeRm(ws);
 
@@ -704,6 +712,14 @@ export async function runCheck(
     verdicts,
     degraded_services: dedupeDegraded(degraded),
     errors,
+    phase_ms: {
+      assemble: tAssembled - t0,
+      probes: tProbed - tAssembled,
+      install: tInstalled - tProbed,
+      tsc: tTsc - tInstalled,
+      probe_program: tProbeProgram - tAttributed,
+      classify: tClassified - tProbeProgram,
+    },
   };
 }
 
