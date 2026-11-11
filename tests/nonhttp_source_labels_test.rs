@@ -145,8 +145,9 @@ fn expected() -> Vec<Row> {
         row(
             "endpoints",
             "socket|client_to_server|chat:send",
-            "src/realtime.ts:7",
-            Some("socket_call"),
+            // line 7 -> 6: the call's first line (R4, ruling R-D3d follow-up).
+            "src/realtime.ts:6",
+            Some("library_claim"),
             "route",
         ),
     ];
@@ -154,8 +155,8 @@ fn expected() -> Vec<Row> {
     rows
 }
 
-/// The model's row says `model`; the socket pass's row says `socket_call`
-/// (carrick#3091); the rows the scanner backfilled state no source; a producer under a mock tree is tagged; a chained call sits on its
+/// The model's row says `model`; the socket row says `library_claim`
+/// (the fact layer states it); the rows the scanner backfilled state no source; a producer under a mock tree is tagged; a chained call sits on its
 /// method's line; a socket listener is not also a pub/sub row.
 #[test]
 fn each_row_states_its_source_provenance_and_line() {

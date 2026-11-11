@@ -7,7 +7,7 @@ Everything in it is invented. `socket.io` and `socket.io-client` 4.8.1 are
 named in `package-lock.json`; their declarations are hand-written in the
 vendored `node_modules`. The store's answer is the cassette
 `__llm__/library-claims/default.json`: `socket.io` `Socket` is the server's end
-and `Namespace` a client end, and `socket.io-client` `Socket` the client's end.
+and `Namespace` the server's end (as the store labels it), and `socket.io-client` `Socket` the client's end.
 `__llm__/framework-detect` lists no socket client, so only the socket pass
 (which reads the `socket.io` imports) and the fact layer read these files.
 

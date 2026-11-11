@@ -6,8 +6,7 @@
 //! `tests/fixtures/socket-per-connection/`, offline, with the fixture's
 //! cassettes. The fixture's `socket.io` / `socket.io-client` declarations are
 //! hand-written stubs; the store's answer labels `Socket` (server) and the
-//! client package's `Socket` by side, and `Namespace` as a client end, which
-//! the socket pass takes for the server's. The README is the answer key.
+//! client package's `Socket` by side, and `Namespace` as a server end. The README is the answer key.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -243,8 +242,9 @@ fn per_connection_socket_rows_are_the_fact_layers() {
     }
 }
 
-/// The fact layer reads `Namespace` as a client end, the socket pass as the
-/// server's: the socket pass's row stays, and the key is the one it gave.
+/// The store labels `Namespace` the server's end, so the fact layer states
+/// the same key and direction the socket pass gave: the one row stands, and
+/// its source is `library_claim`.
 #[test]
 fn a_disagreeing_socket_pass_row_stands_and_is_counted() {
     let server = &scanned()["srv"];
@@ -252,7 +252,7 @@ fn a_disagreeing_socket_pass_row_stands_and_is_counted() {
         "calls",
         "socket|server_to_client|chat.notice",
         &format!("{SERVER}:23"),
-        "socket_call",
+        "library_claim",
     );
     assert!(server.contains(&expected), "{expected:?} in {server:#?}");
     assert!(
