@@ -174,13 +174,13 @@ fn assert_row(site: &str, want: &str) {
 
 #[test]
 fn a_query_local_changed_before_the_return_keeps_the_builder() {
-    assert_row("src/use.ts:4", "GET /api/b/:id/guarded/:key");
-    assert_row("src/use.ts:5", "GET /api/b/plain/:key");
+    assert_row("src/builders.ts:35", "GET /api/b/:id/guarded/:key");
+    assert_row("src/builders.ts:36", "GET /api/b/plain/:key");
 }
 
 #[test]
 fn a_statement_the_path_reads_still_stops_the_builder() {
     let Some(rows) = rows() else { return };
-    assert_eq!(row_at(rows, "src/use.ts:6"), None, "{rows:#?}");
-    assert_eq!(row_at(rows, "src/use.ts:7"), None, "{rows:#?}");
+    assert_eq!(row_at(rows, "src/builders.ts:37"), None, "{rows:#?}");
+    assert_eq!(row_at(rows, "src/builders.ts:38"), None, "{rows:#?}");
 }
