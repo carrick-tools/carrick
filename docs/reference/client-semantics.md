@@ -169,15 +169,15 @@ an HTTP row.
   export(…)` and `new export.member(…)` build an instance, with whatever
   they are handed. Constructing the export does not contest it. An HTTP
   reading still reads only `export.member({ … })` with one object literal.
-- **A command object is a send.** A claim written in the `new` form (`form:
-  new`, member `None`) reads the construction of the export itself:
-  `new SendMessageCommand({ QueueUrl, MessageBody })` is a publisher row
-  named by the key the claim's `name` slot reads (a literal, as below), and a
-  plain call of the same export is not it. A name held in a parameter or read
-  from the environment states no row and stays a possible call, as every
-  other site whose name is not a literal. A name inside an array
-  (`Entries[].DetailType`: the PutEvents and batch classes) is not read yet
-  (carrick#3439, T1 covers SQS and SNS sends, pub/sub).
+- **A command object is a send.** A claim in the `new` form (`form: new`,
+  member `None`) reads the construction of the export itself. `new
+  SendMessageCommand({ QueueUrl, MessageBody })` is a publisher row named by
+  the key the claim's `name` slot reads (a literal, as in the next bullet),
+  and a plain call of the same export is not. A name held in a parameter or
+  read from the environment states no row and stays a possible call, like
+  any site whose name is not a literal. A name inside an array
+  (`Entries[].DetailType`, in the PutEvents and batch classes) is not read
+  yet (carrick#3439; T1 covers SQS and SNS sends, pub/sub).
 - **A literal is read by scope.** A name is a string or a template written
   at the call, or an identifier whose binding (by the resolver's scope, never
   by name) is a `const`, or a function's own binding that nothing assigns
