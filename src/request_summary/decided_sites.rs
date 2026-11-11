@@ -1585,15 +1585,13 @@ fn key_filled(
             let settled = !object.unsettled.contains(key) && !object.functions.contains(key);
             match &object.under_param {
                 // `{ version: 'v2', ...options }`: the caller's key, else the
-                // one written before the spread, else the default.
-                Some((position, before)) if settled && or.is_some() => {
+                // one written before the spread, else the default. A key the
+                // object never writes waits on the caller's caller alone
+                // (carrick#2448 T2).
+                Some((position, before)) if settled => {
                     let or = before.get(key).map(Value::pieces).or(or);
                     passed(*position, or)
                 }
-                Some((position, before)) if settled => match before.get(key) {
-                    Some(value) => passed(*position, Some(value.pieces())),
-                    None => unknown(),
-                },
                 None if settled && !object.open && object.under_rest.is_none() => {
                     or.unwrap_or_else(unknown)
                 }
@@ -2630,6 +2628,35 @@ impl<'a> Walk<'a, '_> {
             .any(|index| callers.iter().all(|caller| literal(caller, index)))
     }
 
+    /// The route's value where the function `placed` is written in has no
+    /// caller and its path is read from defaulted keys of a parameter alone
+    /// (`const { at = "/x" } = options || {}`, `({ at = "/x" }) => ...`): the
+    /// route is served at the defaults, as a local holding one is
+    /// (carrick#3191). `None` for any other end, any other open piece or a
+    /// key with no text default (a whole parameter's default stays
+    /// carrick#3616).
+    fn uncalled_key_defaults(
+        &self,
+        placed: &Placed<'a>,
+        own: &[Piece],
+        end: &LabelledEnd,
+    ) -> Option<Vec<Piece>> {
+        if end.op.as_deref() != Some("receive") {
+            return None;
+        }
+        let callee = (placed.file, placed.key);
+        let value: Option<Vec<Piece>> = own
+            .iter()
+            .map(|piece| match piece {
+                Piece::ParamKey(index, key, _) => {
+                    self.default_text(callee, *index, Some(key)).map(Piece::Lit)
+                }
+                other => Some(other.clone()),
+            })
+            .collect();
+        value.filter(|value| !holds_parameter(value) && decides(value, end))
+    }
+
     /// Walk up the call graph from `down[0]`, whose slot value `pieces` (as
     /// its own body reads it) is still open ([`decides`]): each caller of its
     /// definition fills it, and the lowest caller whose value decides it is
@@ -2653,7 +2680,10 @@ impl<'a> Walk<'a, '_> {
         };
         let callers = self.calls.callers_of(placed.file, key);
         if callers.is_empty() {
-            self.lead(&placed, end, Stop::NameNeverBound);
+            match self.uncalled_key_defaults(&placed, &own, end) {
+                Some(value) => self.site(down, end, value, BTreeSet::new()),
+                None => self.lead(&placed, end, Stop::NameNeverBound),
+            }
             return;
         }
         let here = (placed.file.to_path_buf(), key.to_string());
@@ -4475,8 +4505,8 @@ pub(crate) mod tests {
     /// all) is the callee's default; a key it writes is its own; with a
     /// spread of the caller's own options and no key after it, the key waits
     /// on that caller, falling back to the key written before the spread,
-    /// else the default. A key with no default the object leaves out stays
-    /// unknown.
+    /// else the default. A key with no default that a closed object leaves
+    /// out stays unknown.
     #[test]
     fn filled_takes_a_keys_default_when_the_object_omits_it() {
         let file = super::super::tests::file_ir_of(
@@ -4515,7 +4545,15 @@ pub(crate) mod tests {
         assert_eq!(fill("a", &none), [lit("/a/"), Piece::Unknown]);
         assert_eq!(fill("b", &none), [lit("/b/"), Piece::Unknown]);
         assert_eq!(fill("d", &none), [lit("/d/"), or("v2")]);
-        assert_eq!(fill("e", &none), [lit("/e/"), Piece::Unknown]);
+        // A spread of the caller's own options with the key written nowhere
+        // waits on the caller's caller (carrick#2448 T2).
+        assert_eq!(
+            fill("e", &none),
+            [
+                lit("/e/"),
+                Piece::ParamKey(0, "version".into(), "version".into())
+            ]
+        );
         // The fallback rides up: the next caller's closed object without
         // the key takes it.
         let up = [Piece::ParamKeyOr(
