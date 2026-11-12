@@ -8970,6 +8970,59 @@ export function listen(): void {
         assert!(last_op < first_scope, "{:#?}", ask.checks);
     }
 
+    /// The rows file of each service in `dir`, by the service the file's
+    /// header names. A rows file this build cannot read (another format
+    /// version) stops the census: it used to be skipped, and a census over
+    /// no rows read 0 of 43 services' files without saying so (carrick#1666).
+    fn positions_by_service(dir: &str) -> BTreeMap<String, PathBuf> {
+        let mut by_service = BTreeMap::new();
+        for dir_entry in std::fs::read_dir(dir).expect("the positions dir reads") {
+            let path = dir_entry.expect("dir entry").path();
+            if path.to_string_lossy().ends_with(".jsonl.gz") {
+                let rows = crate::position_rows::read_rows_file(&path)
+                    .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+                by_service.insert(rows.header.service.clone(), path);
+            }
+        }
+        by_service
+    }
+
+    /// A rows file of another format version stops the census instead of
+    /// being skipped, and a readable one joins by the service its header
+    /// names, not by its file name.
+    #[test]
+    fn the_census_stops_on_a_rows_file_it_cannot_read() {
+        use std::io::Write;
+        let write = |dir: &Path, name: &str, version: u32| {
+            let mut gz = flate2::write::GzEncoder::new(
+                std::fs::File::create(dir.join(name)).unwrap(),
+                flate2::Compression::fast(),
+            );
+            writeln!(
+                gz,
+                "{{\"v\":{version},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":0}}"
+            )
+            .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "repo__api.jsonl.gz",
+            crate::position_rows::FORMAT_VERSION,
+        );
+        let joined = positions_by_service(dir.path().to_str().unwrap());
+        assert_eq!(joined.keys().collect::<Vec<_>>(), vec!["api"]);
+        write(
+            dir.path(),
+            "repo__old.jsonl.gz",
+            crate::position_rows::FORMAT_VERSION - 1,
+        );
+        let stopped = std::panic::catch_unwind(|| {
+            positions_by_service(dir.path().to_str().unwrap());
+        });
+        assert!(stopped.is_err());
+    }
+
     /// The offline census over flag-on rows: every site per repo, by role,
     /// with the stops, written as JSON.
     ///
@@ -9005,20 +9058,22 @@ export function listen(): void {
             } else {
                 vec![crate::config::Config::default()]
             };
-            let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
-            for dir_entry in std::fs::read_dir(positions).expect("the positions dir reads") {
-                let path = dir_entry.expect("dir entry").path();
-                if path.to_string_lossy().ends_with(".jsonl.gz")
-                    && let Ok(rows) = crate::position_rows::read_rows_file(&path)
-                {
-                    by_service.insert(rows.header.service.clone(), path);
-                }
-            }
+            let by_service = positions_by_service(positions);
             let mut sites: Vec<DiscoverySite> = Vec::new();
             let mut unfollowed: Vec<DiscoverySite> = Vec::new();
             let mut finished: Vec<(String, u32, u32)> = Vec::new();
             let mut missed_inside: Vec<(String, u32, u32)> = Vec::new();
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            let joined = services
+                .iter()
+                .filter(|service| {
+                    by_service.contains_key(service.service_name.as_deref().unwrap_or("(root)"))
+                })
+                .count();
+            crate::outln!(
+                "== {label}: {joined} of {} service(s) joined a rows file",
+                services.len()
+            );
             // Every service's inputs are kept: each walk reads the others'
             // files with their own IR and rows (carrick#2618).
             let service_inputs: Vec<RequestSummaryInputs> = services
@@ -9122,15 +9177,7 @@ export function listen(): void {
             } else {
                 vec![crate::config::Config::default()]
             };
-            let mut by_service: BTreeMap<String, PathBuf> = BTreeMap::new();
-            for dir_entry in std::fs::read_dir(positions).expect("the positions dir reads") {
-                let path = dir_entry.expect("dir entry").path();
-                if path.to_string_lossy().ends_with(".jsonl.gz")
-                    && let Ok(rows) = crate::position_rows::read_rows_file(&path)
-                {
-                    by_service.insert(rows.header.service.clone(), path);
-                }
-            }
+            let by_service = positions_by_service(positions);
             for service in &services {
                 let name = service
                     .service_name
