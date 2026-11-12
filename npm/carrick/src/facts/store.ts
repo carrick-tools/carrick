@@ -63,7 +63,8 @@ export type NameRow = { name: string; repo: string; file: string; line: number; 
 /** A package two or more services declare (`k: "pkg"`), as the wire states it. */
 export type PkgRow = {
   package: string;
-  services: Array<{ repo: string; service: string; spec: string; manifest: string }>;
+  /** `others_text`: the row's sentence without this service (absent in a file an older cloud wrote). */
+  services: Array<{ repo: string; service: string; spec: string; manifest: string; others_text?: string }>;
   text: string;
 };
 

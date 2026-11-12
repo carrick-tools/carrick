@@ -109,7 +109,11 @@ export function packageLines(
       const base = where.get(service.repo);
       return base ? [path.join(base, service.manifest)] : [];
     });
-    out.push({ key: `pkg::${name}`, text: row.text, named });
+    // The edited manifest's own entry carries the sentence without it, which
+    // would otherwise state its old spec; an entry with none (an older file)
+    // and a manifest the row does not hold print the row's sentence.
+    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
+    out.push({ key: `pkg::${name}`, text: own?.others_text ?? row.text, named });
   }
   return out;
 }

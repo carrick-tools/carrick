@@ -436,6 +436,23 @@ test("pkg: silent when the file does not parse", async (t) => {
   assert.equal(text, "");
 });
 
+test("pkg: a service that bumps its own spec is not told its old spec", async (t) => {
+  const row = {
+    ...ZOD,
+    services: ZOD.services.map((entry) => ({ ...entry, others_text: entry.repo === "api" ? "zod is ^3.23.8 in web" : "zod is ^3.22.0 in api" })),
+  };
+  const own = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row]);
+  // An older fact file: no others_text on the entry, so the row's sentence.
+  const older = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD]);
+  assert.deepEqual([own.text, older.text], ["zod is ^3.23.8 in web", ZOD.text]);
+});
+
+test("pkg: a manifest the row does not hold prints the row's sentence", async (t) => {
+  const row = { ...ZOD, services: ZOD.services.map((entry) => ({ ...entry, manifest: "packages/core/package.json", others_text: "not this" })) };
+  const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row]);
+  assert.equal(text, ZOD.text);
+});
+
 test("pkg: silent for a package moved to another section with the same spec, and for a manifest under node_modules", async (t) => {
   const TS = pkgRow("typescript", [
     ["api", "^5.0.0", "package.json"],
