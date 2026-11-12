@@ -135,6 +135,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
       onRouter('router-plain-pathless', scope('use', { mounts: { arg: 0 } })),
       onRouter('router-handle-false', scope('use', { name: { arg: 0 }, mounts: { arg: 1, handle: false } })),
       onApp('app-handle-pathless', scope('use', { mounts: { arg: 0, handle: true } })),
+      onRouter('router-handle-past-path', scope('use', { mounts: { arg: 1, handle: true } })),
     ]);
     assert.deepStrictEqual(
       [
@@ -144,6 +145,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
         read['router-plain-pathless'],
         read['router-handle-false'],
         read['app-handle-pathless'],
+        read['router-handle-past-path'],
       ],
       [
         'verified', // use(middleware): a declared function
@@ -152,6 +154,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
         'failed mounts_not_instance', // name-less, still the instance rule
         'failed mounts_not_instance', // handle: false is no flag
         'verified',
+        'unchecked claim_invalid', // name-less past a path: the path would go unread
       ]
     );
   });

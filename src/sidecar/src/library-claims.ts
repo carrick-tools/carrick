@@ -2749,6 +2749,7 @@ class DeclarationReader {
     ).length;
     // Exactly one carries the scope; a scope that binds may carry none (K1a).
     if (carried > 1 || (carried === 0 && !binds)) return { outcome: unchecked('claim_invalid') };
+    const namelessMount = carried === 0 && claim.mounts !== undefined;
     if (
       (claim.collects !== undefined || claim.merges !== undefined) &&
       (claim.runs !== undefined || claim.mounts !== undefined)
@@ -2772,9 +2773,20 @@ class DeclarationReader {
     const holding: ts.Signature[] = [];
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
-      // A pass-through's call takes no string the claim leaves unread (D2,
-      // `nameSiblings`): one taking a path would serve under it.
-      let result = this.messageSignatureOutcome(signature, layout.value, labels, undefined, passes ? [] : undefined);
+      // A pass-through's call, and a name-less mount's, takes no string the
+      // claim leaves unread (D2, `nameSiblings`): one taking a path would
+      // serve under it. For the mount that is `claim_invalid` (K1a ruling).
+      let result = this.messageSignatureOutcome(
+        signature,
+        layout.value,
+        labels,
+        undefined,
+        passes || namelessMount ? [] : undefined
+      );
+      if (namelessMount && result.outcome.verdict === 'failed' && result.outcome.reason === 'name_ambiguous') {
+        // Above every other overload's failure: the claim is the wrong spelling.
+        result = { rank: 7, outcome: unchecked('claim_invalid') };
+      }
       if (result.rank === Infinity && claim.yields !== undefined) {
         const given = this.yieldsOutcome(signature, claim.runs!, claim.yields, receiver);
         if (given) result = { rank: 5, outcome: given };
