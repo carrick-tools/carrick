@@ -14,6 +14,13 @@
 //!
 //! Its own test binary, `#[serial]`: the request counters, the injected
 //! answers, the scan-health registry and the environment are process-globals.
+//!
+//! T1 and T2's route files register on a table an installed package builds,
+//! and each analysis is handed the fact layer's files as a scan hands them
+//! (carrick#3711): the routes are the calls the fact layer lists.
+
+#[path = "support/fact_files.rs"]
+mod fact_files;
 
 use async_trait::async_trait;
 use carrick::agent_service::{self, AgentService};
@@ -96,6 +103,7 @@ impl Routes {
     fn of(sources: Vec<(String, String)>) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
+        fact_files::install_table_package(&root);
         let mut files = Vec::new();
         for (name, source) in sources {
             let path = root.join(format!("src/{name}.ts"));
@@ -114,7 +122,7 @@ impl Routes {
 
     fn source(tag: &str, name: &str) -> String {
         format!(
-            "declare function makeTable(): any;\nconst table = makeTable();\n\
+            "import makeTable from \"fixture-table\";\nconst table = makeTable();\n\
              table.get(\"/{tag}/{name}\", (req: any, res: any) => res.send({{ ok: true }}));\n"
         )
     }
@@ -132,7 +140,9 @@ impl Routes {
     }
 
     async fn analyze(&self, ahead: AheadRole) -> FileCentricAnalysisResult {
+        let facts = fact_files::walked(&self.root).await;
         FileOrchestrator::new(AgentService::new())
+            .with_fact_files(fact_files::source(&facts))
             .with_answers_ahead(ahead)
             .analyze_files(
                 &self.files,
@@ -383,7 +393,8 @@ async fn a_lane_ask_is_one_request_and_never_cut_or_retried() {
 async fn a_file_asked_in_parts_is_asked_ahead_each_part_once() {
     offline();
     let pad = "x".repeat(700);
-    let mut source = "declare function makeTable(): any;\nconst table = makeTable();\n".to_string();
+    let mut source =
+        "import makeTable from \"fixture-table\";\nconst table = makeTable();\n".to_string();
     for at in 0..400 {
         source.push_str(&format!(
             "table.get(\"/parts/r{at}\", (req: any, res: any) => res.send({{ pad: \"{pad}\" }}));\n"
