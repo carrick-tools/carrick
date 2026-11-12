@@ -12,9 +12,15 @@ import { check, checkEach } from "../cli.ts";
 import type { CheckResult } from "../contract.ts";
 import { backgroundCapMs } from "./rechecks.ts";
 
-/** The limit on a probe: 5 s, and half a second more for each further file of a patch, to 40 s. */
-export function probeTimeoutMs(files: number): number {
-  return Math.min(5000 + 500 * Math.max(files - 1, 0), 40_000);
+/**
+ * The limit on a probe, whatever the file count: the agent is never made to
+ * wait for the binary (David, 2026-11-11: "we can't ever stop the agent. We can
+ * only deliver the results later"). A probe past it is killed and reads as
+ * deferred, so the edit goes to the background runner and its answer arrives
+ * late (`late.ts`), as Stop's does.
+ */
+export function probeTimeoutMs(): number {
+  return 600;
 }
 
 /** Whether the probe left this edit for the background re-check: no answer, or `deferred`. */
@@ -38,7 +44,9 @@ export async function probeEdits(
     env: probeEnv,
     recheck: true as const,
     noRescan: true,
-    limitMs: probeTimeoutMs(relatives.length),
+    limitMs: probeTimeoutMs(),
+    // The limit ends the call for good: a probe that ignores SIGTERM is not left running.
+    killSignal: "SIGKILL" as const,
   };
   if (relatives.length === 1) {
     const outcome = await check(relatives[0]!, options);

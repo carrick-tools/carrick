@@ -44,6 +44,12 @@ export type RunOptions = {
    * (the environment's own value always wins). Absent: five seconds.
    */
   limitMs?: number;
+  /**
+   * The signal that ends a call past its limit. Absent: SIGTERM, which lets the
+   * binary clean up. The hook's probe states SIGKILL, so a binary that ignores
+   * SIGTERM is not left running behind the edit.
+   */
+  killSignal?: NodeJS.Signals;
 };
 
 /**
@@ -70,6 +76,7 @@ async function run<T>(
         cwd: options.cwd,
         env,
         timeout: env["CARRICK_TIMEOUT_MS"] ? timeoutMs(env) : (options.limitMs ?? timeoutMs(env)),
+        killSignal: options.killSignal ?? "SIGTERM",
         maxBuffer: 32 * 1024 * 1024,
         encoding: "utf8",
       },
