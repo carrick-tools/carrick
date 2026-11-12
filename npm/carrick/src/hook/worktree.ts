@@ -22,6 +22,29 @@ function checkoutOf(start: string): { top: string; linked: boolean } | null {
   }
 }
 
+/**
+ * The git directory every worktree of the checkout at `top` shares: `top/.git`
+ * itself, or for a linked worktree the one its `.git` file and `commondir`
+ * point at. Read from the files, no git run. Null when there is none.
+ */
+export function commonGitDir(top: string): string | null {
+  try {
+    const dotGit = path.join(top, ".git");
+    if (fs.statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!pointer) return null;
+    const gitdir = path.resolve(top, pointer);
+    try {
+      return path.resolve(gitdir, fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim());
+    } catch {
+      const at = gitdir.lastIndexOf(`${path.sep}worktrees${path.sep}`);
+      return at >= 0 ? gitdir.slice(0, at) : null;
+    }
+  } catch {
+    return null;
+  }
+}
+
 /** The top folder of the linked worktree `file` sits in, or null in the main checkout or none (carrick#3595). */
 export function linkedCheckoutTop(file: string): string | null {
   const own = checkoutOf(path.dirname(file));

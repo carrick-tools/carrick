@@ -19,7 +19,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
-import { linkedCheckoutTop } from "../hook/worktree.ts";
+import { commonGitDir, linkedCheckoutTop } from "../hook/worktree.ts";
 import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
 import type { CallSpan } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
@@ -97,21 +97,8 @@ const KINDS = ["op", "fn", "name", "pkg"] as const;
 
 /** The main checkout a linked worktree belongs to, from its `.git` file. */
 function mainCheckoutOf(worktreeTop: string): string | null {
-  try {
-    const pointer = fs.readFileSync(path.join(worktreeTop, ".git"), "utf8").match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-    if (!pointer) return null;
-    const gitdir = path.resolve(worktreeTop, pointer);
-    let common: string | null = null;
-    try {
-      common = path.resolve(gitdir, fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim());
-    } catch {
-      const at = gitdir.lastIndexOf(`${path.sep}worktrees${path.sep}`);
-      common = at >= 0 ? gitdir.slice(0, at) : null;
-    }
-    return common ? path.dirname(common) : null;
-  } catch {
-    return null;
-  }
+  const common = commonGitDir(worktreeTop);
+  return common ? path.dirname(common) : null;
 }
 
 function real(dir: string): string {
@@ -250,12 +237,13 @@ export async function factLines(
     const commits = commitsOf(store.meta);
     const proofs: PeerContext["proofs"] = new Map();
     const missing: PeerContext["missing"] = new Set();
+    const partial: PeerContext["partial"] = new Map();
     // A peer-proof git call that ran out of time, shared across the call's edited files.
     const git = { failed: false };
     // Where each repo is checked out here, for every kind (R36.2).
     const checkouts = localCheckouts(root, store.meta, where);
     const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
-      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, gitFailed: git.failed };
+      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, partial, gitFailed: git.failed };
       const answer = peersUnchanged(others, ctx);
       git.failed = ctx.gitFailed;
       return answer;

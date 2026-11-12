@@ -1181,6 +1181,44 @@ test("R36.3: lines said earlier in the session are not failed proofs", async (t)
   assert.deepEqual(second.lines, rows.slice(3, 6).map((row) => row["text"]));
 });
 
+test("R36.4: a partial clone lacking the index commit gets no peer proof and fetches nothing", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, null);
+  commitAll(ws.at("api"));
+  // web's origin, then a blob:none clone of it as the checkout here.
+  const origin = path.join(ws.root, "web-origin");
+  fs.mkdirSync(path.join(origin, "src"), { recursive: true });
+  fs.writeFileSync(path.join(origin, "src/page.ts"), PAGE);
+  commitAll(origin);
+  gitIn(origin, "config", "uploadpack.allowFilter", "true");
+  gitIn(ws.root, "clone", "-q", "--filter=blob:none", `file://${origin}`, ws.at("web"));
+  // The index commit is one the clone never fetched.
+  fs.writeFileSync(path.join(origin, "src/other.ts"), "export {};\n");
+  const later = commitAll(origin);
+  const api = spawnSync("git", ["-C", ws.at("api"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  await rebuild(ws, [FN_PEER], { api, web: later });
+  const packs = () => fs.readdirSync(path.join(ws.at("web"), ".git", "objects", "pack")).length;
+  const before = packs();
+  const git = countingGit(t);
+  const lines = await withPath(git.path, () => factLines(ws.root, [inLoadOrder(ws)], undefined));
+  assert.deepEqual(lines.lines, []);
+  assert.equal(packs(), before, "no pack fetched into the clone");
+  assert.equal(git.calls(/ls-tree/), 0);
+});
+
+test("R36.4: the facts git runner never lets git fetch or prompt", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-env-"));
+  t.after(() => fs.rmSync(shim, { recursive: true, force: true }));
+  const log = path.join(shim, "env.log");
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\necho "lazy=$GIT_NO_LAZY_FETCH prompt=$GIT_TERMINAL_PROMPT $*" >> ${log}\nexec ${real} "$@"\n`, { mode: 0o755 });
+  const lines = await withPath(`${shim}${path.delimiter}${process.env["PATH"] ?? ""}`, () => factLines(ws.root, [inLoadOrder(ws)], undefined));
+  assert.deepEqual(lines.lines, [LOAD_LINE]);
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n");
+  assert.ok(calls.some((line) => line.includes("ls-tree")), calls.join("\n"));
+  for (const line of calls) assert.match(line, /^lazy=1 prompt=0 /);
+});
+
 test("R33.2: git slower than its budget is silent, and the hook exits 0", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
   // A git that takes 3 s to list a tree, and is the real one otherwise.

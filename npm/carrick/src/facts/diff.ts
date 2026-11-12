@@ -37,7 +37,9 @@ export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean
  * (`peers.ts`) both run through it.
  */
 export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env): string | null {
-  return git(dir, args, factsGitBudgetMs(env));
+  // No network from a hook, ever (R36.4): no lazy fetch of a missing object
+  // (git 2.44 and later) and no credential prompt.
+  return git(dir, args, factsGitBudgetMs(env), { ...process.env, ...env, GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" });
 }
 
 /** How long each of the fact path's git calls may take. */
