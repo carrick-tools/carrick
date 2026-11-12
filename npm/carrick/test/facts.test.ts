@@ -51,7 +51,6 @@ async function factsWorkspace(
       factsPath(root),
       local.map((repo) => ({ repo, path: path.join(root, repo) })),
       options.fetchedAt ?? new Date().toISOString(),
-      0,
     );
   }
   return { root, home, at: (rel) => path.join(root, rel) };
@@ -98,8 +97,9 @@ const header = (repos: string[]) =>
   });
 
 const row = (fields: Record<string, unknown>) =>
-  // A peer in a repo not checked out here: ingest skips an op row with `others: []`.
-  JSON.stringify({ k: "op", service: fields["repo"], others: [{ service: "other", repo: "other", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", ...fields });
+  // A peer in the row's own repo, a committed fixture checkout (`commitRepos`
+  // writes the file): ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"], others: [{ service: fields["repo"], repo: fields["repo"], file: "src/peer.ts", line: 1 }], total: 0, source: "handler", ...fields });
 
 test("the wire fixture is the pinned one", () => {
   const pinned = fs.readFileSync(path.join(testDir, "facts-fixture.sha256"), "utf8").split(/\s+/)[0];
@@ -168,9 +168,11 @@ test("naming rule 1: a declared function and a const-bound arrow are found by na
 
 test("naming rule 2: a class method and a class field holding an arrow are Class.member", async (t) => {
   const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "web-app/src/billing/client.ts", "await this.http.post("), [
-    "POST /events {type=refund} is served at billing-api/src/routes/events.ts:7",
-  ]);
+  // The producer sits in billing-api, which this workspace does not check out:
+  // silent (R40.2). The method is still named Class.member.
+  assert.deepEqual(await linesFor(ws, "web-app/src/billing/client.ts", "await this.http.post("), []);
+  const billing = scanSource(fs.readFileSync(ws.at("web-app/src/billing/client.ts"), "utf8"));
+  assert.ok(billing.spans.some((span) => span.name === "BillingClient.refund"));
   assert.deepEqual(await linesFor(ws, "web-app/src/chat/client.ts", 'this.socket.emit("chat:send", { text });'), [
     "CLIENT->SERVER chat:send is handled at gateway/src/chat.ts:4",
   ]);
@@ -846,7 +848,7 @@ test("a failed build leaves no temp file behind", async (t) => {
   const ws = await factsWorkspace(t, { ndjson: null });
   const dest = factsPath(ws.root);
   const bad = `${header(["orders-api"])}\n{"k":"op", not json\n`;
-  await assert.rejects(buildFacts(bad, dest, [], new Date().toISOString(), 0));
+  await assert.rejects(buildFacts(bad, dest, [], new Date().toISOString()));
   assert.deepEqual(fs.readdirSync(path.dirname(dest)), []);
 });
 

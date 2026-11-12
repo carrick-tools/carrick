@@ -30,8 +30,9 @@ const header = JSON.stringify({
 });
 
 const row = (fields: Record<string, unknown>) =>
-  // A peer in a repo not checked out here: ingest skips an op row with `others: []`.
-  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [{ service: "other", repo: "other", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
+  // A peer in a mapped, committed fixture repo (`commitRepos` writes the
+  // file): ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [{ service: "web-app", repo: "web-app", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
 
 /** The fixture repos in a fresh workspace, the fact file built from the wire fixture plus `extra` rows. */
 async function workspace(t: { after: (fn: () => void) => void }, extra: string[] = [], files: Record<string, string> = {}): Promise<Ws> {
@@ -49,7 +50,7 @@ async function workspace(t: { after: (fn: () => void) => void }, extra: string[]
   const body = [header, ...wire.split("\n").slice(1).filter((line) => line.trim() !== ""), ...extra].join("\n");
   // The peer repos are committed checkouts at the index commit; the edited
   // repo, `orders-api`, is left for each test to make a repository or not.
-  await buildFacts(`${commitRepos(root, body, REPOS.filter((repo) => repo !== "orders-api"))}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString(), 0);
+  await buildFacts(`${commitRepos(root, body, REPOS.filter((repo) => repo !== "orders-api"))}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
   return { root, home, at: (rel) => path.join(root, rel) };
 }
 

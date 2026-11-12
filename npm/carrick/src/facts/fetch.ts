@@ -185,13 +185,7 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const text = (gzipped ? zlib.gunzipSync(bytes) : bytes).toString("utf8");
     const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown }> };
     const names = (header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string");
-    const local = localRepos(root);
-    const mapped = matchRepos(names, local);
-    // Local repos left unmapped (a fork's origin, a renamed repo, a folder
-    // name that differs): while any exists, a peer in an unmapped repo may be
-    // checked out here, so it is never stated from the index (R36.2).
-    const unmapped = local.filter((entry) => !mapped.some((one) => one.path === entry.path)).length;
-    const built = await buildFacts(text, factsPath(root), mapped, now, unmapped);
+    const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now);
     return built ? "written" : "none";
   } catch (error) {
     log("fact refresh failed", String(error));

@@ -1,9 +1,9 @@
 // Whether the peer files an op or fn line names (its `others`) still read as
 // they did at the index commit (plan section 33, R33.1 and R33.2). The line
 // states where things sit in those files from the index; it prints only when
-// every such file, in a repo checked out here, is byte-identical to its blob
-// at that repo's index commit. A peer in a repo with no checkout here is
-// stated from the index: it cannot have changed here.
+// every such file is in a repo checked out here and byte-identical to its
+// blob at that repo's index commit. A peer in a repo with no checkout here
+// makes the line silent (R40.2).
 //
 // Each file's git blob id is hashed in process and compared with one
 // `git ls-tree <commit> -- <files>` per repo, run by `diff.ts`'s git runner
@@ -25,44 +25,21 @@ import { commonGitDir } from "../hook/worktree.ts";
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
- * Where a row's repo is, for every kind of line (R33.1, R36.2): its checkout
- * here (`top`; the edited file's own repo is read in the edited file's
- * checkout), `"index"` when it is proven not checked out here (stated from
- * the index), or null when that is not known (the line is silent).
+ * Where a row's repo is, for every kind of line: its checkout here (`top`;
+ * the edited file's own repo is read in the edited file's checkout), or null
+ * when the store mapped it to none (the line is silent, R40.2).
  */
-export type Place = { top: string } | "index" | null;
+export type Place = { top: string } | null;
 
 export type LocalCheckouts = { place: (repo: string, at: { repo: string; top: string }) => Place };
 
-/**
- * The one answer to "is this repo checked out here" for a fact file under
- * `root`. A repo the store did not map is proven absent only when, at build,
- * every repo of the local index mapped to a header repo (`meta.local_unmapped`
- * is 0) and `.carrick/index.json` has not changed since (`meta.mapped_at`): a
- * fork's origin, a renamed repo or a repo added later is otherwise unmapped
- * yet checked out. A store without those values proves nothing absent.
- */
-export function localCheckouts(root: string, meta: Readonly<Record<string, string>>, where: ReadonlyMap<string, string>): LocalCheckouts {
-  let proven: boolean | undefined;
-  const absentProven = (): boolean => {
-    if (proven !== undefined) return proven;
-    proven = false;
-    const mappedAt = Date.parse(meta["mapped_at"] ?? "");
-    if (meta["local_unmapped"] !== "0" || !Number.isFinite(mappedAt)) return proven;
-    try {
-      proven = fs.statSync(path.join(root, ".carrick", "index.json")).mtimeMs <= mappedAt;
-    } catch (error) {
-      // No local index at all: no repo of it can be checked out unmapped.
-      proven = (error as NodeJS.ErrnoException).code === "ENOENT";
-    }
-    return proven;
-  };
+/** The one answer to "where is this repo checked out here", from the store's repo mapping. */
+export function localCheckouts(where: ReadonlyMap<string, string>): LocalCheckouts {
   return {
     place: (repo, at) => {
       if (repo === at.repo) return { top: at.top };
       const top = where.get(repo);
-      if (top !== undefined) return { top };
-      return absentProven() ? "index" : null;
+      return top === undefined ? null : { top };
     },
   };
 }
@@ -178,8 +155,6 @@ export function peersUnchanged(others: ReadonlyArray<{ repo: string; file: strin
     for (const [repo, files] of byRepo) {
       const place = ctx.checkouts.place(repo, ctx.at);
       if (place === null) return false;
-      // Proven not checked out here: stated from the index.
-      if (place === "index") continue;
       const commit = ctx.commits?.[repo];
       if (typeof commit !== "string" || !OBJECT_ID.test(commit)) return false;
       if (!sameAsCommit(ctx, place.top, commit, [...files].sort())) return false;

@@ -22,8 +22,8 @@ import { readTimings } from "../src/hook/timings.ts";
 import { markFacts } from "../src/hook/reuse.ts";
 
 const SLUG = "kinds-demo";
-/** A peer in a repo not checked out here: an op row needs one (ingest skips `others: []`). */
-const ELSEWHERE = { service: "other", repo: "other", file: "src/peer.ts", line: 1 };
+/** A peer in the mapped, committed `api` repo (`commitRepos` writes the file): an op row needs one (ingest skips `others: []`). */
+const ELSEWHERE = { service: "api", repo: "api", file: "src/peer.ts", line: 1 };
 const REPOS = ["api", "web"];
 
 type Ws = { root: string; home: string; at: (rel: string) => string };
@@ -66,7 +66,7 @@ async function workspace(
     // Only a repo folder the test wrote is a checkout here, as `matchRepos`
     // maps only what it finds; each is committed and the header names it.
     const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
-    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString(), 0);
+    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
   }
   return { root, home, at: (rel) => path.join(root, rel) };
 }
@@ -126,7 +126,8 @@ const fnRow = (name: string, text: string, file = "src/orders.ts") => ({
   file,
   line: 1,
   name,
-  others: [{ repo: "web", file: "src/page.ts", line: 4, name: "render" }],
+  // A peer in the mapped, committed `api` repo (`commitRepos` writes the file); the text is the row's own.
+  others: [{ repo: "api", file: "src/caller.ts", line: 4, name: "render" }],
   total: 1,
   text,
 });
@@ -297,10 +298,10 @@ test("an old local fact file without the new tables is rebuilt, not read", async
   }
   db.close();
   assert.notEqual(factsPath(ws.root), old);
-  // Only `api` is checked out here; `web`, where the caller sits, is not.
+  // `api`, where the caller sits too, is the one checkout here, committed at the index commit.
+  fs.writeFileSync(ws.at("api/src/caller.ts"), "// a peer file the test rows name\n");
+  const api = commitAll(ws.at("api"));
   fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: [] }] }));
-  // Written before the refresh, as `carrick refresh` does (not within the same millisecond).
-  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
   const { gzipSync } = await import("node:zlib");
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (url: string, init?: RequestInit) => {
@@ -310,7 +311,7 @@ test("an old local fact file without the new tables is rebuilt, not read", async
       if (body["known_digest"]) return new Response(JSON.stringify({ unchanged: true }));
       return new Response(JSON.stringify({ staged_url: "https://facts.s3.eu-west-1.amazonaws.com/x?sig=1", digest: "d1", schema: 1, writer: 1, bytes: 1 }));
     }
-    return new Response(gzipSync(ndjson([fnRow("loadOrder", LOAD_LINE)])));
+    return new Response(gzipSync(ndjson([fnRow("loadOrder", LOAD_LINE)], { api, web: null })));
   }) as typeof fetch;
   assert.equal(await refreshFacts(ws.root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } }), "written");
   // The old file's digest is never offered, so the cloud sends the whole file.
@@ -427,11 +428,11 @@ test("R33.3: name is silent when the other file's declaration no longer starts o
   assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
 });
 
-test("R33.1: name in a repo not checked out here is stated from the index", async (t) => {
+test("R40.2: name in a repo not checked out here is silent", async (t) => {
   const ws = await workspace(t, { "api/src/hook.ts": HOOK }, [nameRow("readStdin", "web", "src/stdin.ts")]);
   assert.equal(fs.existsSync(ws.at("web")), false);
   const { file, hunk } = addFunction(ws, "api/src/hook.ts");
-  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), STDIN_LINE);
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
 });
 
 test("name: silent when the other file does not scan cleanly", async (t) => {
@@ -630,12 +631,12 @@ test("R33.4: in a single-repo monorepo the edited manifest's entry prints the ot
   assert.equal(again, "");
 });
 
-test("R33.4: pkg states a service in a repo not checked out here from the index", async (t) => {
+test("R40.2: pkg with a service in a repo not checked out here is silent", async (t) => {
   const ws = await workspace(t, { "api/package.json": MANIFEST(['    "zod": "^3.22.0"']), "api/src/orders.ts": ORDERS }, [ZOD]);
   assert.equal(fs.existsSync(ws.at("web")), false);
   const file = ws.at("api/package.json");
   const run = await patchEdit(ws, file, [manifestHunk(file, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']))]);
-  assert.equal(context(run.stdout), ZOD_FOR_API);
+  assert.equal(context(run.stdout), "");
 });
 
 test("pkg: silent for a package moved to another section with the same spec, and for a manifest under node_modules", async (t) => {
@@ -966,7 +967,7 @@ function inLoadOrder(ws: Ws): { file: string; lines: number[]; removed: number[]
 /** Build the fact file again from `rows`, the header naming `commits` (a repo mapped to null left out). */
 async function rebuild(ws: Ws, rows: Array<Record<string, unknown>>, commits: Record<string, string | null>): Promise<void> {
   const local = REPOS.filter((repo) => fs.existsSync(ws.at(repo)));
-  await buildFacts(ndjson(rows, commits), factsPath(ws.root), local.map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString(), 0);
+  await buildFacts(ndjson(rows, commits), factsPath(ws.root), local.map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
 }
 
 test("R33.2: op and fn lines print while the peer file reads as at the index commit, and not once it is edited", async (t) => {
@@ -1011,7 +1012,7 @@ test("R33.2: a repo whose services name different commits has no index commit, s
   for (const pair of [[real, other], [other, real]]) {
     head.repos = [...head.repos.filter((entry) => entry.repo !== "web"), ...pair];
     const body = `${[JSON.stringify(head), JSON.stringify(OP_PEER), JSON.stringify(FN_PEER)].join("\n")}\n`;
-    await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString(), 0);
+    await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
     assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], pair[0]!.service);
   }
 });
@@ -1213,30 +1214,18 @@ test("R36.2: a local repo whose origin is a fork is not mapped, and its peers ar
   assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
 });
 
-test("R36.2: a repo added to the local index after the store was built is not proven absent", async (t) => {
+test("R40.2: a repo cloned after the store was built is silent while the store does not map it", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER]);
-  // Proven absent while the local index lists only api.
-  fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: [] }] }));
-  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
-  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
-  // web cloned and added afterwards: the store still maps only api.
   fs.mkdirSync(ws.at("web/src"), { recursive: true });
   fs.writeFileSync(ws.at("web/src/page.ts"), `// moved\n${PAGE}`);
   fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: ["api", "web"].map((name) => ({ name, path: ws.at(name), services: [] })) }));
-  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
   assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
 });
 
-test("R36.2: a store built before the unmapped count was kept proves no repo absent", async (t) => {
-  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER, nameRow("readStdin", "web", "src/stdin.ts")]);
-  await plant(ws, "DELETE FROM meta WHERE key = 'local_unmapped'");
-  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
-});
-
-test("R33.1: a peer in a repo not checked out here is stated from the index", async (t) => {
+test("R40.2: an op or fn peer in a repo not checked out here is silent", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER]);
   assert.equal(fs.existsSync(ws.at("web")), false);
-  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
 });
 
 test("R33.2: a peer in the edited file's own repo is proven in its checkout", async (t) => {

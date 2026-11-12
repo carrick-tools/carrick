@@ -131,26 +131,19 @@ export function packageLines(
     const text = own ? own.others_text : row.text;
     if (!text) continue;
     // A service of the edited repo is read in the edited manifest's checkout;
-    // one whose repo may be checked out unmapped makes the line silent (R36.2).
+    // one whose repo is not checked out here makes the line silent (R40.2).
     const places = others.map((service) => checkouts.place(service.repo, at));
     if (places.includes(null)) continue;
     // A manifest path that leaves its repo is never read (R36.6).
     const manifests = others.map((service) => inRepo(service.manifest));
     if (manifests.includes(null)) continue;
-    const named = others.flatMap((_, index) => {
-      const place = places[index]!;
-      return place === "index" || place === null ? [] : [path.join(place.top, manifests[index]!)];
-    });
-    // Each other service checked out here must still hold the stated spec on
-    // disk (R33.1, R33.4): the package named in at least one of the four
-    // sections, and every section naming it at exactly that spec (R36.6).
-    // One proven not checked out is stated from the index.
+    const named = others.map((_, index) => path.join(places[index]!.top, manifests[index]!));
+    // Each other service must still hold the stated spec on disk (R33.1,
+    // R33.4): the package named in at least one of the four sections, and
+    // every section naming it at exactly that spec (R36.6).
     const holds = (): boolean =>
       others.every((service, index) => {
-        const place = places[index]!;
-        if (place === "index") return true;
-        if (place === null) return false;
-        const manifest = memo.text(path.join(place.top, manifests[index]!));
+        const manifest = memo.text(named[index]!);
         const parsed = manifest === null ? null : parse(manifest);
         if (parsed === null) return false;
         const specs = [...SECTIONS].map((section) => specIn(parsed, section, name)).filter((spec) => spec !== undefined);

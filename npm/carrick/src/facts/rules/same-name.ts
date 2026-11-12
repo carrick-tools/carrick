@@ -121,14 +121,8 @@ export function sameNameLines(
       const file = inRepo(row.file);
       if (file === null) continue;
       const place = checkouts.place(row.repo, at);
-      // Not known whether the repo is checked out here: silent (R36.2).
+      // The repo is not checked out here: silent (R40.2).
       if (place === null) continue;
-      // Proven not checked out here: stated from the index, which it cannot
-      // have changed since (R33.1).
-      if (place === "index") {
-        out.push({ key: `name::${name}`, text: row.text, named: [] });
-        continue;
-      }
       const other = path.join(place.top, file);
       // The other file must still declare exactly this name, read by the same
       // scanner, its name token on the line the row states (R33.3, R36.6): gone, rewritten,
