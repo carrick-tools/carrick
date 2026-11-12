@@ -18,7 +18,8 @@
 //! - routing family (the same rows with a `method_mismatch`): finding only
 //!   (a verb-mismatched producer is in neither `verified` nor `orphaned`, and
 //!   the verdict is a routing fact);
-//! - break family (`removed_still_called`): found, paired, finding;
+//! - break family (`removed_still_called`, and a `risk_introduced` row on a
+//!   removed route with no method mismatch): found, paired, finding;
 //! - delta family (`delta_new`, `delta_removed`): finding;
 //! - dependency family (`dependency`, a major conflict the PR introduces):
 //!   finding;
@@ -232,6 +233,18 @@ fn dependency_row(row: &Value, payload: &Value) -> Option<(usize, String)> {
     })
 }
 
+/// Whether the payload's delta removes the route `label` names and no
+/// method mismatch explains the removal (a verb change removes the old verb
+/// too, and its risk row is the routing family's).
+fn is_removed(label: &str, payload: &Value) -> bool {
+    array(&payload["delta"]["removed_endpoints"])
+        .iter()
+        .any(|e| names(label, &e["method"], &e["path"]))
+        && !array(&payload["findings"])
+            .iter()
+            .any(|f| f["kind"] == "method_mismatch" && names(label, &f["method"], &f["path"]))
+}
+
 fn still_called_row(label: &str, payload: &Value) -> Option<(usize, String)> {
     let removed = array(&payload["delta"]["removed_endpoints"])
         .iter()
@@ -259,6 +272,11 @@ pub fn wrong_scanner_stages(entry: &Value, payload: &Value) -> Vec<(usize, Strin
         let label = row["label"].as_str().unwrap_or_default();
         let site = row["site"].as_str();
         let found = match row["kind"].as_str().unwrap_or_default() {
+            // A removed route a client still calls posts as a risk row, but
+            // its stages are the break family's (no type verdict is involved).
+            "risk_introduced" | "risk_could_not_compare" if is_removed(label, payload) => {
+                still_called_row(label, payload)
+            }
             "risk_introduced" | "risk_could_not_compare" => risk_row(label, site, payload),
             kind @ ("delta_new" | "delta_removed") => delta_row(kind, label, payload),
             "removed_still_called" => still_called_row(label, payload),

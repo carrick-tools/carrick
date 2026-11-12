@@ -95,6 +95,8 @@
         "title": "not_clean",
         "conclusion": "failure",
         "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/checkout.ts:4"},
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/orders-client.ts:14", "optional": true},
           {"kind": "delta_new", "label": "GET /api/v1/purchases/:orderId"},
           {"kind": "delta_removed", "label": "GET /api/v1/orders/:orderId"},
           {"kind": "removed_still_called", "label": "GET /api/v1/orders/:orderId"}
@@ -114,6 +116,8 @@
         "title": "not_clean",
         "conclusion": "failure",
         "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/checkout.ts:4"},
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/orders-client.ts:14", "optional": true},
           {"kind": "delta_removed", "label": "GET /api/v1/orders/:orderId"},
           {"kind": "removed_still_called", "label": "GET /api/v1/orders/:orderId"}
         ]
