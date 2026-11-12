@@ -11056,10 +11056,7 @@ fn resolve_types_if_available(
                     let detail = match crate::scan_health::first_type_memory_death_of(
                         crate::current_service::name().as_deref(),
                     ) {
-                        Some(_) if false => String::new(),
-                        Some(_death) => String::from(
-                            "the compiler engine could not read types: it reported an error",
-                        ),
+                        Some(death) => type_compat_v2::resolution_memory_death(&death),
                         None => format!(
                             "the compiler engine could not read types: {}",
                             e.downcast_ref::<crate::services::type_sidecar::SidecarError>()
