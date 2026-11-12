@@ -21,6 +21,7 @@ import { factsSaid } from "../hook/reuse.ts";
 import { linkedCheckoutTop } from "../hook/worktree.ts";
 import { gapsOfLines, rangesOf, rangesOfLines, scanSource, touched } from "./match.ts";
 import type { CallSpan, Scan } from "./match.ts";
+import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 
@@ -184,7 +185,7 @@ export async function factLines(
   root: string,
   edits: readonly FactEdit[],
   session: string | undefined,
-  options: { home?: string; now?: number } = {},
+  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<FactOutcome> {
   const started = performance.now();
   const now = options.now ?? Date.now();
@@ -193,6 +194,11 @@ export async function factLines(
   let stale = true;
   const done = (): FactOutcome => ({ lines, claims, stale, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
+  // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
+  if (!factsEnabled(options.env)) {
+    stale = false;
+    return done();
+  }
   try {
     store = await openFacts(root);
     if (store === null) return done();
