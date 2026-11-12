@@ -2673,7 +2673,7 @@ mod tests {
         ident: &str,
         decl: Option<(&str, u32)>,
         type_text: &str,
-        flags: u8,
+        flags: u16,
     ) -> Row {
         let start = (text.find(needle).unwrap() + needle.find(ident).unwrap()) as u32;
         Row(

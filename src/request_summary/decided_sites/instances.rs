@@ -2419,7 +2419,7 @@ mod tests {
     /// declaration at all, or one in the repository, is not.
     #[test]
     fn a_call_row_with_an_unnamed_declaration_is_a_library_call() {
-        let row = |decl_file: Option<&str>, flags: u8| {
+        let row = |decl_file: Option<&str>, flags: u16| {
             Row(
                 Kind::Call,
                 0,
