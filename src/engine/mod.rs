@@ -3571,8 +3571,9 @@ impl ServiceScan {
         let sidecar_took = sidecar_started.elapsed();
 
         let analysis_started = Instant::now();
-        let (analysis, totals) =
-            crate::phase_timing::record(Box::pin(analyze_current_repo_incremental(
+        let (analysis, totals) = crate::phase_timing::record(
+            (index + 1, total),
+            Box::pin(analyze_current_repo_incremental(
                 &self.repo_path,
                 service,
                 &packages,
@@ -3605,8 +3606,9 @@ impl ServiceScan {
                     .as_deref()
                     .filter(|_| generation == PreviousGeneration::Stored)
                     .and_then(|board| board.place(index)),
-            )))
-            .await;
+            )),
+        )
+        .await;
         let analysis = analysis?;
         // A type checker that died of memory while this service was analysed
         // ends the run here when the run was told to stop on one: this

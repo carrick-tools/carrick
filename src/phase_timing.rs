@@ -18,11 +18,27 @@
 //! `analysis <seconds>s` per service and refuses a run whose total has grown
 //! against the previous scan of the same tree. Keep the field order and the
 //! `name 0.0s` shape stable.
+//!
+//! The same marks are also the scan's local progress, on the log's own channel
+//! (stderr, at info): a line when a service's analysis starts, a line as each
+//! stage ends, and a heartbeat every [`HEARTBEAT`] while a stage runs longer
+//! than that. A scan that went silent after its setup calls for 2 h 50 min
+//! until the cloud killed it, and nothing said which local stage it was in
+//! (carrick#3896). A stage's start is the end of the one before it, which is
+//! why a heartbeat names the stage that last ended: the one running is the one
+//! after it. Every line carries the stage name, the service's position, the
+//! elapsed time and the process's resident memory, and never a path, a name
+//! or code.
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a stage may run before the log says it is still running, and how
+/// often it says so after that.
+pub const HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// The stages of one service's analysis, in the order the line prints them.
 ///
@@ -122,6 +138,69 @@ struct Recorder {
     /// When the stage currently being timed started.
     last: Instant,
     totals: BTreeMap<Phase, f64>,
+    /// When this service's analysis started.
+    started: Instant,
+    /// The service's place in the run: its number and how many there are.
+    position: (usize, usize),
+    /// The stage that last ended; `analysis` before the first has.
+    after: &'static str,
+}
+
+/// This process's resident memory in MB, as the line states it.
+fn rss_text() -> String {
+    crate::services::machine::resident_bytes(std::process::id())
+        .map_or_else(|| "unknown".to_string(), |bytes| (bytes >> 20).to_string())
+}
+
+/// One progress line: what happened, the service's place in the run, the
+/// time, and the memory. Nothing in it names a file, a repo or a service.
+fn progress_line(what: &str, position: (usize, usize), figures: &str, elapsed: Duration) -> String {
+    format!(
+        "Phase progress: {what} (service {}/{}, {figures}elapsed {} ms, rss {} MB)",
+        position.0,
+        position.1,
+        elapsed.as_millis(),
+        rss_text()
+    )
+}
+
+/// Say, every `interval` a stage runs on, that it is still running. A thread
+/// of its own, not a task: a stage that holds a runtime worker for minutes
+/// must not hold the line back, and the line must not wait for the work. It
+/// ends when `stop`'s sender is dropped.
+fn heartbeat(
+    recorder: Arc<Mutex<Recorder>>,
+    interval: Duration,
+    stop: mpsc::Receiver<()>,
+    dispatch: tracing::Dispatch,
+) {
+    tracing::dispatcher::with_default(&dispatch, || {
+        let mut beat = Instant::now();
+        loop {
+            let since = |recorder: &Recorder| recorder.last.max(beat).elapsed();
+            let wait = {
+                let recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+                interval.saturating_sub(since(&recorder))
+            };
+            match stop.recv_timeout(wait) {
+                Err(RecvTimeoutError::Disconnected) | Ok(()) => return,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+            let recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
+            if since(&recorder) >= interval {
+                beat = Instant::now();
+                tracing::info!(
+                    "{}",
+                    progress_line(
+                        &format!("still running after {}", recorder.after),
+                        recorder.position,
+                        &format!("{} ms in this stage, ", recorder.last.elapsed().as_millis()),
+                        recorder.started.elapsed(),
+                    )
+                );
+            }
+        }
+    });
 }
 
 tokio::task_local! {
@@ -133,12 +212,52 @@ tokio::task_local! {
 /// [`mark`] made inside it, on its task, lands here and in no other service's
 /// recording. Returns what `work` returned and the stages it spent, even when
 /// `work` ended in an error.
-pub async fn record<Work: Future>(work: Work) -> (Work::Output, Totals) {
+///
+/// `position` is the service's number and the count of services analysed,
+/// for the progress lines.
+pub async fn record<Work: Future>(position: (usize, usize), work: Work) -> (Work::Output, Totals) {
+    record_with(position, HEARTBEAT, work).await
+}
+
+/// [`record`] with its heartbeat interval named, for the test that cannot
+/// wait a minute.
+async fn record_with<Work: Future>(
+    position: (usize, usize),
+    interval: Duration,
+    work: Work,
+) -> (Work::Output, Totals) {
+    let now = Instant::now();
     let recorder = Arc::new(Mutex::new(Recorder {
-        last: Instant::now(),
+        last: now,
         totals: BTreeMap::new(),
+        started: now,
+        position,
+        after: "analysis",
     }));
+    tracing::info!(
+        "{}",
+        progress_line("analysis started", position, "", Duration::ZERO)
+    );
+    let (stop, stopped) = mpsc::channel();
+    let dispatch = tracing::dispatcher::get_default(tracing::Dispatch::clone);
+    let beating = recorder.clone();
+    // Detached: it ends the moment `stop` is dropped below.
+    std::thread::spawn(move || heartbeat(beating, interval, stopped, dispatch));
     let output = RECORDER.scope(recorder.clone(), work).await;
+    drop(stop);
+    tracing::info!(
+        "{}",
+        progress_line(
+            "analysis ended",
+            position,
+            "",
+            recorder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .started
+                .elapsed()
+        )
+    );
     let recorder = recorder.lock().unwrap_or_else(PoisonError::into_inner);
     (
         output,
@@ -160,6 +279,16 @@ pub fn mark(phase: Phase) {
         let elapsed = now.duration_since(recorder.last).as_secs_f64();
         *recorder.totals.entry(phase).or_insert(0.0) += elapsed;
         recorder.last = now;
+        recorder.after = phase.label();
+        tracing::info!(
+            "{}",
+            progress_line(
+                &format!("{} ended", phase.label()),
+                recorder.position,
+                &format!("took {} ms, ", (elapsed * 1000.0) as u64),
+                now.duration_since(recorder.started),
+            )
+        );
     });
 }
 
@@ -225,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn line_states_every_phase_in_order_and_only_inside_a_recording() {
         mark(Phase::Cache);
-        let ((), totals) = record(async {
+        let ((), totals) = record((1, 1), async {
             mark(Phase::Discover);
         })
         .await;
@@ -251,7 +380,7 @@ mod tests {
     /// stage that follows it, and the line prints it (carrick#3861).
     #[tokio::test]
     async fn implementations_ask_time_is_not_inside_cache() {
-        let ((), totals) = record(async {
+        let ((), totals) = record((1, 1), async {
             implementations_ask(Phase::Cache, || {
                 std::thread::sleep(std::time::Duration::from_millis(60));
             });
@@ -271,11 +400,11 @@ mod tests {
     /// take the stages they marked and none of the other's (carrick#1066).
     #[tokio::test]
     async fn services_side_by_side_each_take_only_their_own_stages() {
-        let model = record(async {
+        let model = record((1, 2), async {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             mark(Phase::Model);
         });
-        let types = record(async {
+        let types = record((2, 2), async {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             mark(Phase::Types);
         });
@@ -300,5 +429,120 @@ mod tests {
             .filter(|phase| phase.is_model())
             .collect();
         assert_eq!(model, vec![Phase::Model, Phase::Intents]);
+    }
+
+    /// What a subscriber wrote, line by line.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    fn lines_of(captured: &Captured) -> Vec<String> {
+        String::from_utf8(captured.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn capture() -> (Captured, tracing::Dispatch) {
+        let captured = Captured::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        (captured, dispatch)
+    }
+
+    /// A service's analysis says when it starts, as each stage ends in the
+    /// order it ends, and when it ends; each line carries the service's
+    /// place, the time and the memory, and no line carries a path.
+    #[test]
+    fn a_service_says_where_it_is_as_each_stage_ends() {
+        let (captured, dispatch) = capture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime.block_on(record((2, 3), async {
+                mark(Phase::Discover);
+                mark(Phase::Model);
+            }))
+        });
+        let lines = lines_of(&captured);
+        let named: Vec<&str> = [
+            "analysis started",
+            "discover ended",
+            "model ended",
+            "analysis ended",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(lines.len(), named.len(), "{lines:#?}");
+        for (line, what) in lines.iter().zip(named) {
+            assert!(
+                line.contains(&format!("Phase progress: {what} (service 2/3,")),
+                "{line}"
+            );
+            assert!(
+                line.contains("elapsed ") && line.contains(" ms") && line.contains("rss "),
+                "{line}"
+            );
+            assert!(
+                !line.contains('/') || line.matches('/').count() == 1,
+                "no path in {line}"
+            );
+        }
+    }
+
+    /// A stage that runs past the interval is named every interval, by the
+    /// stage before it, while it is still running, and the work is not held
+    /// back by the heartbeat: a blocking stage still gets its line.
+    #[test]
+    fn a_long_stage_is_named_while_it_runs() {
+        let (captured, dispatch) = capture();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            runtime.block_on(record_with((1, 1), Duration::from_millis(40), async {
+                mark(Phase::Discover);
+                std::thread::sleep(Duration::from_millis(150));
+                mark(Phase::Cache);
+            }))
+        });
+        let lines = lines_of(&captured);
+        let beats: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("still running"))
+            .collect();
+        assert!(beats.len() >= 2, "{lines:#?}");
+        for beat in beats {
+            assert!(
+                beat.contains("still running after discover (service 1/1,"),
+                "{beat}"
+            );
+            assert!(
+                beat.contains(" ms in this stage,") && beat.contains("rss "),
+                "{beat}"
+            );
+        }
     }
 }
