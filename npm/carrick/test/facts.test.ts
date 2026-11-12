@@ -1179,3 +1179,28 @@ test("a file another session wrote in another worktree prints nothing here", asy
   fs.utimesSync(own, new Date(), new Date());
   assert.equal(context((await shell(own, ws.at("orders-api"))).stdout), "");
 });
+
+test("a regex holding a backtick inside a template substitution is read as a regex, not as the template's end", () => {
+  const src = 'function render(line) {\n  const p = `<p>${line.replace(/`([^`]+)`/g, "<code>$1</code>")}</p>`;\n  return api.get("/x");\n}\n';
+  const spans = spansOf(src);
+  assert.notEqual(spans, null);
+  assert.equal(spans![0], `render: ${src.trimEnd()}`);
+});
+
+test("a template inside a substitution inside a template, with a regex holding } and a backtick, still reads", () => {
+  const src = 'function f(s) {\n  return `a ${`b ${s.replace(/[}`]|\\}`/g, "")} c`} d`;\n}\n';
+  assert.deepEqual(spansOf(src), [`f: ${src.trimEnd()}`]);
+});
+
+test("a division inside a template substitution is still division", () => {
+  const src = "function f(a, b, c) {\n  return `${a / b / c}`;\n}\n";
+  assert.deepEqual(spansOf(src), [`f: ${src.trimEnd()}`]);
+  // `/` after `)` and after `a++` is division too; the backtick after it ends nothing early.
+  const src2 = "function g(a, b) {\n  return `${(a) / b} ${a++ / b}`;\n}\n";
+  assert.deepEqual(spansOf(src2), [`g: ${src2.trimEnd()}`]);
+});
+
+test("a file with an unbalanced brace is still unread when it holds a template substitution", () => {
+  assert.equal(spansOf("function f(a) {\n  return `${a / 2}`;\n"), null);
+  assert.equal(spansOf("function f(a) {\n  return `${a / 2`;\n}\n"), null);
+});
