@@ -714,6 +714,7 @@ const LibraryCheckSchema = z
       'in_process_bus',
       'socket',
       'server_framework',
+      'invoke_client',
       'none',
     ]),
     // Any other receiver answers `unchecked` (`receiver_invalid`) on its own.

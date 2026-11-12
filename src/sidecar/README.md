@@ -635,7 +635,7 @@ A slot is `{ "arg": n }` (argument `n`, 0-based) or `{ "arg": n, "key": "k" }` (
 
 The receiver is `export`, `instance:<member>` (what `export.member(...)` returns), `instance:()` (what calling the export returns), `instance:new` (what `new export(...)` builds) or `instance:new:<member>` (what `new export.member(...)` builds), optionally followed by `>scope:<path.member>` (what that scope member returns on it, its `path` joined by `.`), or `type` (carrick#2977): the export is a type, read as `declare const v: Export;` at its declared type-parameter defaults. Only a claim with `of: "type"` is read on `type`, and no scope step follows it; an export with no type meaning, or one whose type parameter has no default, answers `unchecked` `type_unresolved`.
 
-Rules for the message roles (`broker`, `in_process_bus`, `socket`):
+Rules for the message roles (`broker`, `in_process_bus`, `socket`) and `invoke_client` (a client that calls a deployed function by its name, carrick#3439; it checks only `request` ops, and the function's handler is declared in `carrick.json`, never read from a library):
 
 | Rule | Reason when it does not hold |
 |---|---|
@@ -658,7 +658,7 @@ Rules for the message roles (`broker`, `in_process_bus`, `socket`):
 | A name `{ "bound": ... }` needs a maker with a `name` slot, or a scope | `failed name_unbound` |
 | An export given two roles in one request | `unchecked role_conflict` |
 | A `workspace:`, `file:`, `link:` or `portal:` dependency (until its own source is verified, #1666) | `unchecked module_workspace` |
-| `graphql_client`, `server_framework` and `none`, and an `execute` op on a message role | `unchecked role_unsupported` |
+| `graphql_client`, `server_framework` and `none`, an `execute` op on a message role, and any op but `request` on `invoke_client` | `unchecked role_unsupported` |
 | A part of the grammar that amendment 7 of carrick#2434 adds and no judge reads yet (listed below) | `unchecked part_unbuilt` |
 
 Amendment 7 grammar (carrick#3045): the request schema takes the whole of it, so one element never fails a request; the verifier answers `unchecked part_unbuilt` for an element that uses a part it does not judge yet (`unbuiltPart` in `library-claims.ts`; each slice removes the parts it judges). Part 3 (carrick#3047) and part 4 with the `path`, `export`, `literal`, `document` and `ref` name sources (carrick#3048) are judged, below; the rest is not. All fields are optional:
@@ -667,7 +667,7 @@ Amendment 7 grammar (carrick#3045): the request schema takes the whole of it, so
 - An op's `name`: `{ "parts": [slot, slot(, slot)], "join" }`, `{ "literal" }`, or a bound name with the values `path` (`join`), `export` or `subscribed` (`param`, `at`) beside `maker`, `scope` and `key`.
 - An op: `form` (`call` is the default; `new`, `set`, `override`, `decorate`), `protocol` (`http`, `graphql`, `rpc`, `socket`, `message`), `when: { "arg", "key?", "literal" }` and `returns: { "result?": <result shape> }`. A scope: `form` (`call` or `decorate`).
 - Part 4 and the name sources, judged (carrick#3048):
-  - `protocol`: a value outside the five is `claim_invalid`; one the role may not speak is `unchecked protocol_role` (`server_framework` and `http_client` speak `http`, `rpc` and `graphql`; `socket` only `socket`; `broker` and `in_process_bus` only `message`). The method words follow the protocol: `http` the route methods, `rpc` `QUERY|MUTATE|MUTATION|SUBSCRIBE|SUBSCRIPTION`, `graphql` `QUERY|MUTATION|SUBSCRIPTION`. On `rpc` and `graphql` the method is the member's own name upper-cased (`failed method_not_member_verb`), and a `bound: key` procedure may leave it out; on `http` it still needs a route word.
+  - `protocol`: a value outside the five is `claim_invalid`; one the role may not speak is `unchecked protocol_role` (`server_framework` and `http_client` speak `http`, `rpc` and `graphql`; `socket` only `socket`; `broker` and `in_process_bus` only `message`; `invoke_client` none, since the scanner reads its calls as `invoke`). The method words follow the protocol: `http` the route methods, `rpc` `QUERY|MUTATE|MUTATION|SUBSCRIBE|SUBSCRIPTION`, `graphql` `QUERY|MUTATION|SUBSCRIPTION`. On `rpc` and `graphql` the method is the member's own name upper-cased (`failed method_not_member_verb`), and a `bound: key` procedure may leave it out; on `http` it still needs a route word.
   - An `http_client` package with one op that uses `protocol` or a name other than a plain slot reads every one of its `http_client` exports under the v2 rules, so the maker of an RPC client verifies without a base.
   - `name.bound: "path"` (`join` allowed): the receiver is a mapped type or has an index signature, else `failed path_not_proxy`; `member` is a callable property the home packages declare (`failed member_missing`), and `payload` a parameter of one of its signatures. `name.bound: "export"`: a `receive` op with a `handler`, else `claim_invalid`.
   - A name slot with `document: "graphql"` accepts a string or a type named `DocumentNode`, `TypedDocumentNode`, `RequestDocument` or `TypedDocumentString` (`failed name_not_document`); with `ref` every part has a call or construct signature (`failed ref_not_callable`). On a make or scope they stay `part_unbuilt`. `name: { "literal" }` must be a non-empty string.
