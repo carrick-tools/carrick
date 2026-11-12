@@ -63,8 +63,47 @@ pub fn service_manifest(root: &Path, service: &Config) -> Option<PathBuf> {
 }
 
 /// Run only the runtime version command, never application code or tasks.
-pub fn require_runtime(root: &Path, services: &[Config]) -> Result<(), String> {
-    require_runtime_with(root, services, installed_deno_version)
+///
+/// A Deno app nobody declared that sits in no Deno workspace
+/// ([`optional_app`]) does not stop the run: the scan leaves it out when
+/// Deno is missing (carrick#3969).
+pub fn require_runtime(root: &Path, services: &[Config], declared: bool) -> Result<(), String> {
+    let required: Vec<Config> = services
+        .iter()
+        .filter(|service| !optional_app(root, service, declared))
+        .cloned()
+        .collect();
+    require_runtime_with(root, &required, installed_deno_version)
+}
+
+/// Whether `service` is a Deno app the scan may leave out when Deno is
+/// missing (carrick#3969): nobody declared it in `carrick.json`, it is read
+/// as Deno ([`service_manifest`]), and its config is in no Deno workspace
+/// ([`deno_workspace_manifest_paths`]). The Deno app a Node workspace glob
+/// holds is one; a Deno workspace and its members still need Deno to scan.
+pub fn optional_app(root: &Path, service: &Config, declared: bool) -> bool {
+    if declared {
+        return false;
+    }
+    let Some(manifest) = service_manifest(root, service) else {
+        return false;
+    };
+    let identity = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let manifest = identity(&manifest);
+    !deno_workspace_manifest_paths(root)
+        .unwrap_or_default()
+        .iter()
+        .any(|member| identity(member) == manifest)
+}
+
+/// Whether a `deno` that can scan a Deno service (2.9.4 or newer) answers
+/// on PATH.
+pub fn runtime_supported() -> bool {
+    supported(installed_deno_version())
+}
+
+fn supported(installed: Option<semver::Version>) -> bool {
+    installed.is_some_and(|version| version >= semver::Version::new(2, 9, 4))
 }
 
 /// [`require_runtime`] with the installed version supplied, so a test can say
@@ -76,14 +115,13 @@ pub(crate) fn require_runtime_with(
     services: &[Config],
     installed: impl FnOnce() -> Option<semver::Version>,
 ) -> Result<(), String> {
-    if let Some(config) = services.iter().find_map(|s| service_manifest(root, s)) {
-        let supported = installed().is_some_and(|version| version >= semver::Version::new(2, 9, 4));
-        if !supported {
-            return Err(format!(
-                "Deno is required to scan {}. Install or upgrade to Deno 2.9.4 or newer and make `deno` available on PATH. Carrick reads the existing Deno configuration; no generated tsconfig is required.",
-                config.display()
-            ));
-        }
+    if let Some(config) = services.iter().find_map(|s| service_manifest(root, s))
+        && !supported(installed())
+    {
+        return Err(format!(
+            "Deno is required to scan {}. Install or upgrade to Deno 2.9.4 or newer and make `deno` available on PATH. Carrick reads the existing Deno configuration; no generated tsconfig is required.",
+            config.display()
+        ));
     }
     Ok(())
 }

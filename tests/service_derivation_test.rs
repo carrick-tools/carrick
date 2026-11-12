@@ -867,3 +867,253 @@ fn derived_member_without_a_root_config_names_the_nearest_ancestor_tsconfig() {
         Some("../../tsconfig.json")
     );
 }
+
+/// A pnpm workspace whose `apps/*` glob holds a group folder of Deno apps,
+/// each with its own `deno.json` and no `package.json`, beside a Node member
+/// (carrick#3969). Invented layout.
+fn node_workspace_with_deno_apps(root: &Path) {
+    write(
+        root,
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    );
+    write(root, "apps/api/package.json", r#"{"name":"@sample/api"}"#);
+    write(root, "apps/api/src/server.ts", "export const api = 1;\n");
+    write(
+        root,
+        "packages/kit/package.json",
+        r#"{"name":"@sample/kit"}"#,
+    );
+    write(root, "packages/kit/index.ts", "export const kit = 1;\n");
+    // Two levels below the glob's folder: `apps/*` holds `apps/edge`.
+    write(root, "apps/edge/hello/deno.json", r#"{"tasks":{}}"#);
+    write(
+        root,
+        "apps/edge/hello/src/app.ts",
+        "import { Hono } from 'npm:hono@4';\nexport const app = new Hono();\napp.get('/healthz', (c) => c.json({ ok: true }));\n",
+    );
+    // A config nested inside that app is the app's own, not a second app.
+    write(root, "apps/edge/hello/tools/deno.json", "{}");
+    write(
+        root,
+        "apps/edge/hello/tools/gen.ts",
+        "export const gen = 1;\n",
+    );
+    // One level: the glob's folder is the app itself.
+    write(root, "apps/relay/deno.jsonc", "{ // relay\n}");
+    write(root, "apps/relay/main.ts", "export const relay = 1;\n");
+}
+
+#[test]
+fn a_deno_app_under_a_node_workspace_glob_is_derived() {
+    let dir = tempfile::tempdir().unwrap();
+    node_workspace_with_deno_apps(dir.path());
+    let derived = resolve(dir.path()).unwrap();
+    let directories: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.directory.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        directories,
+        ["apps/api", "apps/edge/hello", "apps/relay", "packages/kit"]
+    );
+    let names: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.service_name.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "@sample/api",
+            "apps/edge/hello",
+            "apps/relay",
+            "@sample/kit"
+        ]
+    );
+    // The Deno apps are scanned as Deno: their own config, no tsconfig.
+    for service in &derived.services[1..3] {
+        assert!(service.tsconfig.is_none());
+        assert!(carrick::deno_support::service_manifest(dir.path(), service).is_some());
+    }
+    assert!(
+        derived.reason.contains("Deno manifests"),
+        "{}",
+        derived.reason
+    );
+    assert!(derived.skipped_patterns.is_empty());
+}
+
+/// Only a Deno app nobody declared and no Deno workspace lists may be left
+/// out for a missing Deno (carrick#3969); a declared service and a Deno
+/// workspace member still need Deno to scan.
+#[test]
+fn only_an_undeclared_deno_app_outside_a_deno_workspace_is_optional() {
+    use carrick::deno_support::optional_app;
+    let dir = tempfile::tempdir().unwrap();
+    node_workspace_with_deno_apps(dir.path());
+    let derived = resolve(dir.path()).unwrap();
+    let optional: Vec<bool> = derived
+        .services
+        .iter()
+        .map(|service| optional_app(dir.path(), service, false))
+        .collect();
+    assert_eq!(optional, [false, true, true, false]);
+    assert!(
+        derived
+            .services
+            .iter()
+            .all(|service| !optional_app(dir.path(), service, true))
+    );
+    // Listed by a root Deno workspace: a member, not optional.
+    write(dir.path(), "deno.json", r#"{"workspace":["./apps/relay"]}"#);
+    let relay = carrick::config::Config {
+        directory: Some("apps/relay".into()),
+        ..Default::default()
+    };
+    assert!(!optional_app(dir.path(), &relay, false));
+}
+
+#[test]
+fn a_folder_under_a_workspace_glob_without_a_deno_config_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n");
+    write(root, "apps/api/package.json", r#"{"name":"@sample/api"}"#);
+    write(root, "apps/api/src/server.ts", "export const api = 1;\n");
+    // Source, no manifest of any kind.
+    write(root, "apps/scripts/run.ts", "export const run = 1;\n");
+    write(
+        root,
+        "apps/scripts/nested/more.ts",
+        "export const more = 1;\n",
+    );
+    // A Deno config under a test folder.
+    write(root, "apps/e2e/test/deno.json", "{}");
+    write(root, "apps/e2e/test/smoke.ts", "export const smoke = 1;\n");
+    // A Deno config inside a Node member is that member's own.
+    write(root, "apps/api/scripts/deno.json", "{}");
+    write(root, "apps/api/scripts/seed.ts", "export const seed = 1;\n");
+    // A Deno config no workspace glob holds.
+    write(root, "tools/deno/deno.json", "{}");
+    write(root, "tools/deno/task.ts", "export const task = 1;\n");
+    let derived = resolve(root).unwrap();
+    let directories: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.directory.as_deref().unwrap())
+        .collect();
+    assert_eq!(directories, ["apps/api"]);
+    assert!(!derived.reason.contains("Deno"), "{}", derived.reason);
+}
+
+/// The Deno app above, scanned: its route is stated (carrick#3969). Before
+/// the fix the app was in no derived service and the route a silent miss.
+#[cfg(unix)]
+fn deno_glob_fixture() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/deno-under-workspace-glob")
+}
+
+/// One scan of the fixture with the `deno` this test chooses: a fake one
+/// answering `--version` with `version`, or none. Every directory of the
+/// test machine's PATH that holds a `deno` is dropped first. Returns the
+/// endpoint rows and stderr (the debug log, `--verbose`).
+#[cfg(unix)]
+fn scan_deno_glob(version: Option<&str>) -> (Vec<serde_json::Value>, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let tools = tempfile::tempdir().unwrap();
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|dir| !dir.join("deno").exists())
+            .collect();
+    if let Some(version) = version {
+        let deno = tools.path().join("deno");
+        std::fs::write(
+            &deno,
+            format!("#!/bin/sh\necho 'deno {version} (stable)'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dirs.insert(0, tools.path().to_path_buf());
+    }
+    let root = deno_glob_fixture();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(&root)
+        .arg("--verbose")
+        .env("PATH", std::env::join_paths(dirs).unwrap())
+        .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", root.join("__llm__").display()),
+        )
+        .env("CARRICK_OUTPUT_JSON", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("CI")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "deno {version:?}: scan failed:\n{stderr}"
+    );
+    let projection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    (projection["endpoints"].as_array().unwrap().clone(), stderr)
+}
+
+#[cfg(unix)]
+fn route_at<'a>(
+    endpoints: &'a [serde_json::Value],
+    file: &str,
+    path: &str,
+) -> Vec<&'a serde_json::Value> {
+    endpoints
+        .iter()
+        .filter(|row| row["file"] == file && row["line"] == 3 && row["path"] == path)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_deno_app_under_a_workspace_glob_states_its_route() {
+    let (endpoints, stderr) = scan_deno_glob(Some("2.9.4"));
+    assert_eq!(
+        route_at(&endpoints, "apps/edge/hello/src/app.ts", "/healthz").len(),
+        1,
+        "the Deno app's route is stated once: {endpoints:#?}\n{stderr}"
+    );
+    assert_eq!(
+        route_at(&endpoints, "apps/api/src/server.ts", "/status").len(),
+        1
+    );
+}
+
+/// Without a supported Deno the derived app is left out unread with its
+/// reason, and the scan reads every other service as before (carrick#3969):
+/// a repository that scanned before the app was derived never starts
+/// failing on a machine without Deno.
+#[cfg(unix)]
+#[test]
+fn a_deno_app_without_deno_is_left_out_and_the_rest_is_read() {
+    let (with_deno, _) = scan_deno_glob(Some("2.9.4"));
+    let node_route = route_at(&with_deno, "apps/api/src/server.ts", "/status");
+    for version in [None, Some("2.6.0")] {
+        let (endpoints, stderr) = scan_deno_glob(version);
+        assert!(
+            route_at(&endpoints, "apps/edge/hello/src/app.ts", "/healthz").is_empty(),
+            "{version:?}: {endpoints:#?}"
+        );
+        assert_eq!(
+            route_at(&endpoints, "apps/api/src/server.ts", "/status"),
+            node_route,
+            "{version:?}: the Node member's rows are unchanged"
+        );
+        assert!(
+            stderr.contains("skipped_no_deno: apps/edge/hello"),
+            "{version:?}: the app is named with its reason:\n{stderr}"
+        );
+    }
+}

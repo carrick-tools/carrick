@@ -407,6 +407,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         .iter()
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
+    let mut glob_deno_members = false;
     if !sources.is_empty() {
         let globs = WorkspaceGlobs::compile(&sources)?;
         let mut seen = vec![false; globs.positive.len()];
@@ -426,8 +427,15 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                     // copy of every member (carrick#1902).
                     && crate::file_finder::git_boundary(entry).is_none()
             });
+        let mut deno_configs: Vec<PathBuf> = Vec::new();
         for entry in walker {
             let entry = entry.map_err(|e| e.to_string())?;
+            if entry.file_type().is_file()
+                && (entry.file_name() == "deno.json" || entry.file_name() == "deno.jsonc")
+            {
+                deno_configs.push(entry.path().to_path_buf());
+                continue;
+            }
             if !entry.file_type().is_file() || entry.file_name() != "package.json" {
                 continue;
             }
@@ -447,6 +455,11 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
                 members.insert(directory.to_path_buf(), entry.path().to_path_buf());
             }
         }
+        for manifest in deno_apps_under_globs(&root, &globs, &members, &deno_configs, &mut seen)? {
+            let directory = manifest.parent().expect("manifest parent").to_path_buf();
+            members.entry(directory).or_insert(manifest);
+            glob_deno_members = true;
+        }
         for ((raw, _), seen) in globs.positive.iter().zip(seen) {
             // A folder emptied or optional in a real monorepo: nothing to
             // propose for it, which is not a reason to refuse the rest.
@@ -463,7 +476,7 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         }
     }
     let deno = deno_workspace_manifest_paths(&root).map_err(|e| e.to_string())?;
-    let has_deno = !deno.is_empty();
+    let has_deno = !deno.is_empty() || glob_deno_members;
     if has_deno {
         reasons.push("Deno manifests".into());
         for manifest in deno {
@@ -586,6 +599,65 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
         without_source,
         skipped_patterns,
     })
+}
+
+/// The Deno apps a Node workspace glob holds without a `package.json`
+/// (carrick#3969): a pnpm or npm glob names a folder (`apps/*` holds
+/// `apps/edge`) whose app is a Deno project, configured by its own
+/// `deno.json`/`deno.jsonc` at that folder or below it, with no root Deno
+/// workspace listing it. The package manager never sees it, so the
+/// `package.json` walk does not either.
+///
+/// The marker is the Deno config file alone, because it is what
+/// [`crate::deno_support::service_manifest`] reads to scan the service as
+/// Deno. Each config counts when it sits inside no `package.json` member,
+/// some folder from it up to the root is held by a glob, it is under no test
+/// folder, and no other such config sits above it: the nearest config is the
+/// app, and one nested inside it is the app's own. A folder with no Deno
+/// config stays out, as before.
+fn deno_apps_under_globs(
+    root: &Path,
+    globs: &WorkspaceGlobs,
+    members: &BTreeMap<PathBuf, PathBuf>,
+    deno_configs: &[PathBuf],
+    seen: &mut [bool],
+) -> Result<Vec<PathBuf>, String> {
+    let mut apps: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for config in deno_configs {
+        let directory = config.parent().expect("config parent");
+        if directory.join("package.json").is_file()
+            || members.keys().any(|member| directory.starts_with(member))
+            || crate::file_finder::is_under_test_dir(config, root)
+        {
+            continue;
+        }
+        let relative = directory.strip_prefix(root).map_err(|e| e.to_string())?;
+        let held: Vec<usize> = relative
+            .ancestors()
+            .filter(|folder| !folder.as_os_str().is_empty() && !globs.excludes(folder))
+            .flat_map(|folder| globs.matching(folder).collect::<Vec<_>>())
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        for index in held {
+            seen[index] = true;
+        }
+        // `deno.json` and `deno.jsonc` in one folder: the one Deno reads.
+        if let Some(manifest) = crate::deno_support::manifest_at(directory) {
+            apps.insert(directory.to_path_buf(), manifest);
+        }
+    }
+    let directories: Vec<PathBuf> = apps.keys().cloned().collect();
+    Ok(apps
+        .into_iter()
+        .filter(|(directory, _)| {
+            !directories
+                .iter()
+                .any(|other| other != directory && directory.starts_with(other))
+        })
+        .map(|(_, manifest)| manifest)
+        .collect())
 }
 
 /// Take out of `members` every workspace member that holds no source file,
