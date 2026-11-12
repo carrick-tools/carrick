@@ -30,9 +30,8 @@ use crate::services::TypeSidecar;
 use crate::services::type_sidecar::{
     AnchorOrigin, CaptureAliasRecord, CaptureAnchor, CaptureBackfillRequest, CaptureV2Result,
     CheckPairEndpoint, CheckPairSpec, CheckStubInput, CheckV2Result, InferKind, InferRequestItem,
-    ManifestEntry, MemoryDeath, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd,
-    RetypeItem, RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket,
-    VerdictSide,
+    ManifestEntry, OperationProgress, ProbeProtocol, ProbeTypeKind, ProcessEnd, RetypeItem,
+    RetypeOutcome, RetypeVerdict, SidecarError, SymbolRequest, VerdictBucket, VerdictSide,
 };
 
 // ===========================================================================
@@ -1129,7 +1128,9 @@ fn capture_in_a_fresh_process(
             heap_line: died.heap_line,
             oom_kills_rose: died.oom_kills_rose,
         };
-        if died_before.is_none() && !retries_after(&death, fail_on_memory) {
+        if died_before.is_none()
+            && !crate::services::type_sidecar::retries_after(&death.process_death(), fail_on_memory)
+        {
             warn!(
                 "The type sidecar died of memory during the capture for {} ({}): it {} {}; \
                  not retried at the same size, as this run stops on a memory death",
@@ -1168,13 +1169,6 @@ fn capture_in_a_fresh_process(
             deaths: vec![first, death],
         });
     }
-}
-
-/// Whether a capture whose process died once is asked again of a fresh
-/// process of the same size: always, unless the run stops on a memory death
-/// (`fail_on_memory`) and this death is one.
-fn retries_after(death: &CaptureDeath, fail_on_memory: bool) -> bool {
-    !(fail_on_memory && death.is_memory_death())
 }
 
 /// The failure of a capture whose process died of memory once and was not
@@ -1226,12 +1220,20 @@ pub(crate) struct CaptureDeath {
 impl CaptureDeath {
     /// Whether the process died of memory: it aborted with V8's
     /// heap-exhaustion line on stderr, or it was killed and the cgroup
-    /// counted an OOM kill ([`MemoryDeath::classify`], carrick#2208).
+    /// counted an OOM kill ([`crate::services::type_sidecar::MemoryDeath::classify`], carrick#2208).
     ///
     /// The one rule the capture retry reads, and the one the run's record
     /// of the death was made by, so the two agree.
     pub(crate) fn is_memory_death(&self) -> bool {
-        MemoryDeath::classify(self.end, self.heap_line, self.oom_kills_rose).is_some()
+        self.process_death().memory_death().is_some()
+    }
+
+    fn process_death(&self) -> crate::services::type_sidecar::ProcessDeath {
+        crate::services::type_sidecar::ProcessDeath {
+            end: self.end,
+            heap_line: self.heap_line,
+            oom_kills_rose: self.oom_kills_rose,
+        }
     }
 
     /// How the process ended, as the verb of a sentence about one process or
@@ -8409,7 +8411,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ..death(program, end)
             };
             assert_eq!(
-                retries_after(&death, fail_on_memory),
+                crate::services::type_sidecar::retries_after(
+                    &death.process_death(),
+                    fail_on_memory
+                ),
                 retried,
                 "end {end:?}, heap line {heap_line}, OOM kills rose {oom_kills_rose}, \
                  fail_on_memory {fail_on_memory}"
