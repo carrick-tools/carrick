@@ -163,6 +163,9 @@ pub struct SiteRow {
     /// the library call through a function (carrick#2795). The mirrored graph
     /// row of such a fact is a `wrapper_call`, never a request of its own.
     pub through: bool,
+    /// For a [`Self::through`] row, the labelled call it reaches, as
+    /// `file`, `line` (carrick#3961). `None` otherwise.
+    pub end_at: Option<(String, u32)>,
     /// A dispatch row's handler (carrick#2474 R4b, [`dispatch`]): the
     /// functions in which a reader endpoint row agreeing on its key is the
     /// same route read again, at another line. Empty for a site's row.
@@ -1113,6 +1116,7 @@ pub fn of(
                 lead: lead(Stop::BelowBand),
                 needs_reader: needs_reader(record),
                 through: is_through(site),
+                end_at: is_through(site).then(|| (site.end.file.clone(), site.end.line)),
                 within: Vec::new(),
                 base,
                 procedure,
@@ -1171,6 +1175,7 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                 },
                 needs_reader: false,
                 through: false,
+                end_at: None,
                 within: Vec::new(),
                 base: crate::call_base::stated_base(
                     &descriptor.target,
@@ -1658,30 +1663,19 @@ pub fn fold_rows(
             }
         }
     }
-    // The reader's row at a decided site no single operation keys (a
-    // callee that reads a destructured options key with a default,
-    // carrick#3961) is the same request the callers' fact rows state, each
-    // with the key it sends: the callers' rows are the request, and the
-    // reader's row at the callee is a second statement of it. It goes where
-    // every call that reaches the site holds a fact row at its own line and
-    // no other call shares that line.
-    let mut sites: BTreeMap<(&str, u32), Vec<&Through>> = BTreeMap::new();
-    for through in &site.through {
-        sites
-            .entry((through.site_file.as_str(), through.site_line))
-            .or_default()
-            .push(through);
-    }
-    for ((file, line), throughs) in sites {
-        let every_caller_states = throughs.iter().all(|through| {
-            !through.other_call
-                && calls.iter().any(|row| {
-                    is_fact(row) && !is_old_path(row) && at(row, &through.file, through.line)
-                })
-        });
-        if !every_caller_states {
-            continue;
-        }
+    // A decided call reaches its request through a function: the function's
+    // own call is where the request is written, and the reader's row there is
+    // the same request read again. Where the callers' fact rows state it,
+    // each with the key it sends (a callee that reads a destructured options
+    // key with a default, carrick#3961), that reader row goes.
+    let ends: std::collections::BTreeSet<(&str, u32)> = site
+        .rows
+        .iter()
+        .filter(|row| row.side == RowSide::Call && row.fact() && row.through)
+        .filter_map(|row| row.end_at.as_ref())
+        .map(|(file, line)| (file.as_str(), *line))
+        .collect();
+    for (file, line) in ends {
         let mut index = 0;
         while index < calls.len() {
             if is_reader(&calls[index]) && at(&calls[index], file, line) {

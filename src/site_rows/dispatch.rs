@@ -172,6 +172,7 @@ fn row(
         lead: lead(place, Stop::BelowBand),
         needs_reader: false,
         through: false,
+        end_at: None,
         within: place.within.clone(),
         // A handler is no request: it states no base.
         base: None,
