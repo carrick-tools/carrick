@@ -243,6 +243,57 @@ test("unnamed socket and pub/sub rows are found by their site in the call around
   assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "  const room = rooms.get(socket.id);"), []);
 });
 
+test("R24.1: several rows of one kind under one name print only by their own reached site", async (t) => {
+  const handlers = [1, 2, 3, 4, 5].map((n) =>
+    row({ side: "producer", protocol: "http", label: `GET /r${n}`, repo: "orders-api", file: "src/register.ts", line: n + 1, name: "registerRoutes", site: `/r${n}`, text: `r${n} line` }),
+  );
+  const ndjson = [
+    header(["orders-api"]),
+    ...handlers,
+    // A consumer call inside the /r1 handler, also named by the encloser.
+    row({ side: "consumer", protocol: "http", label: "POST /audit", repo: "orders-api", file: "src/register.ts", line: 3, name: "registerRoutes", site: "/audit", text: "audit line" }),
+    row({ side: "consumer", protocol: "http", label: "GET /orders/:id", repo: "orders-api", file: "src/api.ts", line: 3, name: "createApi", site: "/orders/1", text: "get line" }),
+    row({ side: "consumer", protocol: "http", label: "POST /orders", repo: "orders-api", file: "src/api.ts", line: 7, name: "createApi", site: "/orders", text: "post line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("orders-api/src/register.ts"),
+    [
+      "export function registerRoutes(app) {",
+      "  app.get('/r1', (req, res) => {",
+      "    http.post('/audit', req.body);",
+      "    res.json(1);",
+      "  });",
+      ...[2, 3, 4, 5].flatMap((n) => [`  app.get('/r${n}', (req, res) => {`, `    res.json(${n});`, "  });"]),
+      "  log('routes');",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "orders-api/src/register.ts", "    res.json(5);"), ["r5 line"]);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/register.ts", "    http.post('/audit', req.body);"), ["r1 line", "audit line"]);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/register.ts", "  log('routes');"), []);
+  fs.writeFileSync(
+    ws.at("orders-api/src/api.ts"),
+    [
+      "export function createApi(http) {",
+      "  return {",
+      "    getOrder() {",
+      "      trace('get');",
+      "      return http.get('/orders/1');",
+      "    },",
+      "    createOrder(body) {",
+      "      return http.post('/orders', body);",
+      "    },",
+      "  };",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "orders-api/src/api.ts", "      trace('get');"), []);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/api.ts", "      return http.post('/orders', body);"), ["post line"]);
+});
+
 test("R24.3: an unnamed listener row needs a function in its call; an unnamed emit row is silent", async (t) => {
   const ndjson = [
     header(["gateway"]),

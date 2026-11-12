@@ -126,7 +126,8 @@ function callFits(call: CallSpan, row: FactRow, method: string | null): boolean 
 }
 
 /**
- * The rows with no name that a reached call writes: the row's `site` is a
+ * The rows with no name (or several under one name, `holdsSeveral`) that a
+ * reached call writes: the row's `site` is a
  * direct string argument of the call around the changed line, an HTTP row's
  * method is the callee's name (`.post(` for `POST ...`), and that (site,
  * method) pair belongs to one row and one call in the file. A row with no
@@ -153,6 +154,25 @@ function unnamedRows(rows: FactRow[], reached: readonly CallSpan[], fileCalls: r
  */
 function namedRows(store: FactStore, repo: string, name: string, rel: string): FactRow[] {
   return store.byName(repo, name).filter((row) => row.file === rel);
+}
+
+/**
+ * Whether one name's rows in a file are several things (R24.1): rows grouped
+ * by (side, protocol), and some group holds two or more (inline handlers
+ * named by their encloser, `registerRoutes` with five `app.get`). Then every
+ * row under the name, in every group, prints only when its own site call is
+ * reached (`unnamedRows`); a row with no site, or none reached, is silent.
+ * When every group holds one row (a resolver that also calls a route: one
+ * thing, two facts) all of them print, as for any named thing.
+ */
+function holdsSeveral(rows: readonly FactRow[]): boolean {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const group = `${row.side} ${row.protocol}`;
+    if (seen.has(group)) return true;
+    seen.add(group);
+  }
+  return false;
 }
 
 function rowKey(row: FactRow): string {
@@ -221,7 +241,14 @@ export async function factLines(
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
       for (const name of reach.names) {
         if (declared.get(name) !== 1) continue;
-        rows.push(...namedRows(store, at.repo, name, at.rel));
+        const own = namedRows(store, at.repo, name, at.rel);
+        if (!holdsSeveral(own)) {
+          rows.push(...own);
+          continue;
+        }
+        // Several inline handlers or calls under one name: each row by its own site.
+        const span = scan.spans.find((one) => one.name === name)!;
+        rows.push(...unnamedRows(own, reach.reachedIn(span), scan.calls));
       }
       if (reach.calls.length > 0) {
         const unnamed = store.unnamed(at.repo, at.rel);
