@@ -76,6 +76,11 @@ export type FactOutcome = {
    * time and in a late answer (carrick#4017; plan section 33, R33.6).
    */
   callersRead: string[];
+  /**
+   * The fact file opened for this root: there, readable, this project's.
+   * With it the edit hook asks no probe and queues the edit (T12-2).
+   */
+  present: boolean;
 };
 
 /**
@@ -216,7 +221,8 @@ export async function factLines(
   const claims: FactOutcome["claims"] = {};
   const callersRead: string[] = [];
   let stale = true;
-  const done = (): FactOutcome => ({ lines, claims, stale, callersRead, ms: Math.round((performance.now() - started) * 10) / 10 });
+  let present = false;
+  const done = (): FactOutcome => ({ lines, claims, stale, callersRead, present, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<(typeof KINDS)[number], Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
@@ -227,6 +233,7 @@ export async function factLines(
   try {
     store = await openFacts(root);
     if (store === null) return done();
+    present = true;
     const facts: FactStore = store;
     const fetched = Date.parse(store.meta["fetched_at"] ?? "");
     stale = !Number.isFinite(fetched) || now - fetched > FACTS_STALE_MS;

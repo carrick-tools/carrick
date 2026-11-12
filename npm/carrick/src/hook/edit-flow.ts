@@ -87,18 +87,11 @@ export async function editFlow(
   // Lead lines (carrick#3249) are remembered the same way, once delivered.
   const led: string[] = [];
   const relatives = edited.map((file) => path.relative(choice.root, file));
-  // The edit just landed, so the index describes the file as it was before
-  // it. The hook asks the binary once, with a probe that never starts a
-  // re-scan: an answer that needs none (the file reads the same, no service
-  // reads it, a known miss) comes back at once and prints below. Every other
-  // file is queued for the background runner (carrick#3198).
-  const answers = edited.length > 0 ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
-  if (input.timing) input.timing.waitedMs = answers.ms;
   // Where each operation the edited code serves or calls sits in other
   // files, and who calls the edited functions, from the fact file
-  // (`facts/lines.ts`): read locally, beside the probe's answer, never
-  // instead of it. Read before the probe's answer is rendered: a file the
-  // fact file covers gets its callers from there, not the uses-count line.
+  // (`facts/lines.ts`), read locally. Read before any probe answer is
+  // rendered: a file the fact file covers gets its callers from there, not
+  // the uses-count line.
   const facts =
     channel.channel === "hook"
       ? await factLines(
@@ -111,6 +104,18 @@ export async function editFlow(
       : null;
   const covered = new Set(facts?.callersRead ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
+  // The edit just landed, so the index describes the file as it was before
+  // it. Without a fact file the hook asks the binary once, with a probe that
+  // never starts a re-scan: an answer that needs none (the file reads the
+  // same, no service reads it, a known miss) comes back at once and prints
+  // below. Every other file is queued for the background runner
+  // (carrick#3198). With a fact file the fact lines print now and every file
+  // is queued in place of the probe: its answer, problem and uses lines and
+  // leads included, arrives on the next carrier (T12-2).
+  const insteadOfProbe = queueable && facts?.present === true;
+  const answers =
+    edited.length > 0 && !insteadOfProbe ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
+  if (input.timing) input.timing.waitedMs = answers.ms;
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
   const leads = new Map<number, LeadLines>();
@@ -119,7 +124,7 @@ export async function editFlow(
     if (!result) {
       // A probe with no answer queues every file; one unreadable file in a
       // patch of four is no reason to say nothing about the other three.
-      log("no answer for", relative, answers.failure ?? "");
+      log(insteadOfProbe ? "queued in place of the probe:" : "no answer for", relative, answers.failure ?? "");
       if (queueable) toQueue.push(index);
       continue;
     }
@@ -149,7 +154,10 @@ export async function editFlow(
   if (toQueue.length > 0 && session) {
     // A file whose callers the fact lines answered keeps its late answer free
     // of the uses-count line too, as this answer would have been.
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered });
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, {
+      factsCallers: covered,
+      insteadOfProbe,
+    });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     // A queued file says nothing now: its answer is delivered with the next

@@ -43,6 +43,9 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 ### check-silent.json :: renderPostToolUse
 (silent)
 
+### check-stale-uses.json :: renderPostToolUse
+Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.
+
 ### check-types.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract problems.
 - user-service/src/routes/users.ts:42:3 route GET /api/users [fact, file_based_route] response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number. Type 'UsersResponse' is not assignable to type 'number'. Consumers: notification-service server.ts:25

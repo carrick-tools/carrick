@@ -95,6 +95,12 @@ export type QueueEntry = {
    * leaves out the uses-count line (`facts/lines.ts` `callersRead`).
    */
   facts_callers?: true;
+  /**
+   * Queued in place of the edit-time probe (a workspace with a fact file,
+   * T12-2): its answer is rendered as the probe's would have been, even one
+   * that does not answer the edit (`late.ts` `lateContext`).
+   */
+  instead_of_probe?: true;
 };
 
 export type Answer = {
@@ -112,6 +118,8 @@ export type Answer = {
   named?: string[];
   /** Carried from the entry: the late answer leaves out the uses-count line. */
   facts_callers?: true;
+  /** Carried from the entry: rendered as the edit-time probe's answer would have been. */
+  instead_of_probe?: true;
   result?: CheckResult;
   /** What a `changed` entry's `check --changed` answered. */
   changed?: ChangedResult;
@@ -138,8 +146,11 @@ export type Pending = QueueEntry & { toldRunning: boolean };
 
 type Options = { home?: string };
 type ChangedOptions = Options & { named?: string[] };
-/** `factsCallers`: the files whose edit-time fact lines answered their callers. */
-type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string> };
+/**
+ * `factsCallers`: the files whose edit-time fact lines answered their callers.
+ * `insteadOfProbe`: the entries stand in for the edit-time probe.
+ */
+type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean };
 
 export function rechecksDir(root: string): string {
   return path.join(root, ".carrick", "rechecks");
@@ -235,6 +246,7 @@ export function enqueue(
       enqueued_at: new Date(now).toISOString(),
       attempts: 0,
       ...(options.factsCallers?.has(file) ? { facts_callers: true as const } : {}),
+      ...(options.insteadOfProbe ? { instead_of_probe: true as const } : {}),
     };
     const pending = sessionPart(session, seq, "pending.json", options.home);
     if (pending === null) continue;
@@ -464,6 +476,7 @@ function writeAnswer(
     ...(isChanged(entry) ? { kind: "changed" as const } : {}),
     ...(entry.named !== undefined ? { named: entry.named } : {}),
     ...(entry.facts_callers ? { facts_callers: true as const } : {}),
+    ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);

@@ -28,7 +28,11 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
   // A re-check that stopped, gave no answer or answered nothing prints
   // nothing: a failure is logged by `deliverLate`, and the Stop hook names a
   // file left unchecked.
-  if (!answer.result || answer.result.error || !answersTheEdit(answer.result)) return null;
+  if (!answer.result || answer.result.error) return null;
+  // An answer queued in place of the edit-time probe (a fact-file workspace)
+  // says what the probe's answer would have said in hand, the uses-count line
+  // on a result that does not answer the edit included (T12-2).
+  if (!answer.instead_of_probe && !answersTheEdit(answer.result)) return null;
   return renderPostToolUse(answer.result, answer.relative, { uses, late: true });
 }
 
