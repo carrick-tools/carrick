@@ -1,0 +1,28 @@
+{
+  "caller_rows": {
+    "src/checkout.ts:2": "POST /v1/orders",
+    "src/checkout.ts:3": "POST /v1/orders/cancel",
+    "src/net/orders.ts:7": "POST /v1/orders/draft",
+    "src/health.ts:2": "POST /v1/ping",
+    "src/invoice.ts:2": "POST /billing/charges",
+    "src/daily.ts:3": "POST /v1/daily",
+    "src/send.ts:2": "POST /v1/send",
+    "src/alerts.ts:2": "POST /v1/fire"
+  },
+  "stated_at_callers": [
+    "src/net/orders.ts:4",
+    "src/net/ping.ts:4",
+    "src/net/billing.ts:4"
+  ],
+  "kept": {
+    "src/net/reports.ts:4": "POST /v1/:endpoint",
+    "src/net/relay.ts:4": "POST /v1/:endpoint",
+    "src/net/forward.ts:4": "POST /v1/:endpoint",
+    "src/net/notify.ts:4": "POST /v1/:endpoint"
+  },
+  "unread_sites": [
+    "src/daily.ts:4 unread_expression",
+    "src/daily.ts:4 interface_member",
+    "src/forwarding.ts:5 name_never_bound"
+  ]
+}

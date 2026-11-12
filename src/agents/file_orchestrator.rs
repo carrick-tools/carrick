@@ -749,6 +749,9 @@ pub struct ProcessingStats {
     /// Model rows kept as rows of their own: the only record of a shape no
     /// deterministic source reads.
     pub model_only_rows: usize,
+    /// Model rows withdrawn at a request line whose callers' rows state the
+    /// request (carrick#3961). Logged only.
+    pub model_rows_stated_at_callers: usize,
     /// Candidates in files the model was never asked about — local mode, where
     /// no model runs — that no deterministic row covers. What the paid scan
     /// would classify, counted so a free pass is distinguishable from an empty
@@ -4576,6 +4579,7 @@ impl FileOrchestrator {
                         &pf.candidate_map,
                         &overrules,
                         summaries.verbs(Path::new(&pf.path_str)),
+                        &summaries.answered_at_callers(Path::new(&pf.path_str)),
                         &pf.path_str,
                         pf.route_module_claimed,
                         &mut stats,
@@ -4800,6 +4804,10 @@ impl FileOrchestrator {
             stats.model_endpoints_dropped_unanchored
         );
         debug!("  - Model-only rows: {}", stats.model_only_rows);
+        debug!(
+            "  - Model rows withdrawn, their callers state the request: {}",
+            stats.model_rows_stated_at_callers
+        );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
         // Cross-file, so it runs once every file's own result is in: the sites
@@ -9104,6 +9112,7 @@ impl FileOrchestrator {
         candidate_map: &HashMap<String, CandidateTarget>,
         overrules: &[Resolved],
         stated_verbs: &[StatedVerb],
+        answered_at_callers: &BTreeSet<u32>,
         file_path: &str,
         route_module_claimed: bool,
         stats: &mut ProcessingStats,
@@ -9637,6 +9646,18 @@ impl FileOrchestrator {
             // No row of its own at this span, but the source may still state
             // part of what the model reported there.
             let span = call.call_expression_span_start;
+            // A request line that leaves its path to its callers, each of
+            // which states the request in a row of its own (carrick#3961):
+            // a row here is the same request stated once more, whatever
+            // path it reads.
+            if span.is_some_and(|start| answered_at_callers.contains(&start)) {
+                debug!(
+                    "Withdrawing the model's call at {}:{}: its callers' rows state the request",
+                    file_path, call.line_number
+                );
+                stats.model_rows_stated_at_callers += 1;
+                continue;
+            }
             if let Some(overrule) = overrules
                 .iter()
                 .find(|entry| entry.span.map(|(start, _)| start) == span)
@@ -14807,6 +14828,7 @@ export * from "./aFetch.js";"#,
             &HashMap::new(),
             &[],
             &[],
+            &BTreeSet::new(),
             "src/client.ts",
             false,
             &mut stats,
@@ -14992,6 +15014,7 @@ export * from "./aFetch.js";"#,
             &candidate_map,
             &[],
             &[],
+            &BTreeSet::new(),
             "src/client.ts",
             false,
             &mut stats,
@@ -19605,6 +19628,7 @@ export { routes };
             candidate_map,
             &overrules,
             &[],
+            &BTreeSet::new(),
             file_path,
             route_module_claimed,
             &mut stats,
