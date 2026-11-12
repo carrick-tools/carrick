@@ -83,8 +83,10 @@ export interface ResolvedAnchor {
    * carrick#3995: why the alias is untyped, decided here: `machinery_envelope`
    * for a demotion off framework machinery, `site_unreadable` for every other
    * demotion, `not_located` for an abstain because the anchor named no
-   * payload. Absent on a typed alias and on an abstain decided from the code
-   * (its reason is stated elsewhere). Recorded as the record's `unread_cause`,
+   * payload, `no_success_payload` for a response table with no success row.
+   * Absent on a typed alias and on an abstain decided from the code whose
+   * reason is stated elsewhere. A located bare `any`/`unknown` with no cause
+   * here is stamped `declared` by the self-check (carrick#4046). Recorded as the record's `unread_cause`,
    * which only the index reads: never a verdict input, never in `surface_hash`.
    */
   unreadCause?: TypeProvenanceReason;
@@ -313,6 +315,8 @@ export function resolveAnchor(
           abstainReason:
             `'${request.symbol_name}' is a response table keyed by status code with no ` +
             'success row that states a body, so this consumer states no response contract',
+          // carrick#4046: no success body is the reason, not a declared `unknown`.
+          unreadCause: 'no_success_payload',
         };
       }
       if (table?.kind === 'body') {

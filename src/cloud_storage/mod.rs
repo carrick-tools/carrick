@@ -213,6 +213,10 @@ pub struct V1Demotion {
     /// the top type, the entry's root finding says `any` rather than
     /// `unknown`, because that is what a reader of the printed shape sees.
     pub holds_any: bool,
+    /// v1 printed a bare top type with no shape (carrick#4046), so there is no
+    /// shape to place a top type in: `state` is `Implicit`, the state an entry
+    /// with no demotion record settles to, and `holds_any` is the bare word.
+    pub bare: bool,
 }
 
 /// A producer response's modes (carrick#2054): see
