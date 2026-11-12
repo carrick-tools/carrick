@@ -113,6 +113,8 @@ const ROLE_PROTOCOLS: Readonly<Record<LibraryRole, ReadonlySet<string>>> = {
   socket: new Set(['socket']),
   broker: new Set(['message']),
   in_process_bus: new Set(['message']),
+  // A direct function call is no claim protocol: the scanner reads it as `invoke`.
+  invoke_client: new Set(),
   none: new Set(),
 };
 
@@ -238,6 +240,12 @@ const HTTP_V2_RULES: RoleRules = { http: false, message: true, ops: new Set(['re
  * the method from the member's own name (`get` registers GET) or from a slot.
  */
 const SERVER_RULES: RoleRules = { http: false, message: true, ops: new Set(['receive']), methods: ROUTE_METHODS };
+/**
+ * A client that calls a deployed function by its name (carrick#3439): the
+ * message checks for its one op, `request`. It never receives: the function's
+ * handler is declared in `carrick.json`, not read from a library.
+ */
+const INVOKE_RULES: RoleRules = { http: false, message: true, ops: new Set(['request']) };
 
 /**
  * A server's rules as `labelledMembers` reads them (carrick#2674): a `send`
@@ -261,6 +269,7 @@ const ROLE_TABLE: Readonly<Record<LibraryRole, RoleRules | undefined>> = {
   socket: MESSAGE_RULES,
   graphql_client: undefined,
   server_framework: SERVER_RULES,
+  invoke_client: INVOKE_RULES,
   none: undefined,
 };
 

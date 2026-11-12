@@ -755,6 +755,7 @@ export type LibraryRole =
   | 'in_process_bus'
   | 'socket'
   | 'server_framework'
+  | 'invoke_client'
   | 'none';
 
 /** What an `op` claim does on the wire. */
