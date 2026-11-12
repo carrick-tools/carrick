@@ -1395,10 +1395,7 @@ pub(crate) fn forward_to_running_scan(signal: crate::shutdown::Shutdown) -> bool
         // A pid that has already exited is an error this does not act on: the
         // build is on its way out either way, and the only thing the answer
         // decides is whether to wait for a child that is already gone.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-            return false;
-        }
-        true
+        unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
     }
     #[cfg(not(unix))]
     {

@@ -1030,7 +1030,7 @@ pub(super) fn in_repo(row: &Row) -> bool {
 enum ProcedureCall {
     /// A procedure call: its end, and the reason when its key cannot be
     /// made.
-    Site(SiteEnd, Option<Stop>),
+    Site(Box<SiteEnd>, Option<Stop>),
     /// A typed client whose keys are all present, calling an op its type
     /// lacks (`client.p.mutate()` on a query): no procedure call, and no
     /// call on an untyped client either (carrick#3847 reads only a router
@@ -1870,15 +1870,15 @@ impl<'a> Walker<'a> {
         );
         match self.procedure_at(file, call, ir, positions, proxy, join.as_deref(), absent) {
             Ok(Some(procedure)) => Some(ProcedureCall::Site(
-                SiteEnd {
+                Box::new(SiteEnd {
                     procedure: Some(procedure),
                     ..end
-                },
+                }),
                 None,
             )),
             Ok(None) if absent => Some(ProcedureCall::TypedWithoutKey),
             Ok(None) => None,
-            Err(reason) => Some(ProcedureCall::Site(end, Some(reason))),
+            Err(reason) => Some(ProcedureCall::Site(Box::new(end), Some(reason))),
         }
     }
 
@@ -2551,7 +2551,7 @@ impl<'a> Walker<'a> {
         // not resolve.
         let typed_without_key = matches!(procedure, Some(ProcedureCall::TypedWithoutKey));
         let procedure = match procedure {
-            Some(ProcedureCall::Site(end, stop)) => Some((end, stop)),
+            Some(ProcedureCall::Site(end, stop)) => Some((*end, stop)),
             Some(ProcedureCall::TypedWithoutKey) | None => None,
         };
         let mut several = procedure.as_ref().and_then(|(_, stop)| *stop);
