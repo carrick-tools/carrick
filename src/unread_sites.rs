@@ -518,11 +518,10 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
             for (_, file) in &order {
                 let (with, without) = &files[file];
                 let group = if labelled { with } else { without };
-                if group.len() <= left {
-                    left -= group.len();
-                    for &i in group {
-                        keep[i] = true;
-                    }
+                let take = group.len().min(left);
+                left -= take;
+                for &i in &group[..take] {
+                    keep[i] = true;
                 }
             }
         }
