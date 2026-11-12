@@ -163,18 +163,24 @@ fn keeps(at: &str) {
 /// Each wrapper whose path its callers fill in is stated by its callers'
 /// rows alone: the model's row at its request line goes, whether it reads
 /// the path open (`orders`), the same as the one caller's (`ping`), or a
-/// base the callers' rows extend (`billing`).
+/// host the code does not write (`billing`).
 #[test]
 fn callers_state_the_request_once() {
     let rows = rows();
-    for at in key()["stated_at_callers"].as_array().unwrap() {
-        let at = at.as_str().unwrap();
-        assert!(
-            !rows.contains_key(at),
-            "{at}: the request line restates its callers' requests: {:?}\n{rows:#?}",
-            rows[at]
-        );
-    }
+    let restated: Vec<String> = key()["stated_at_callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|at| {
+            let at = at.as_str().unwrap();
+            rows.get(at).map(|stated| format!("{at}: {stated:?}"))
+        })
+        .collect();
+    assert!(
+        restated.is_empty(),
+        "a request line restates its callers' requests:\n{}\n{rows:#?}",
+        restated.join("\n")
+    );
 }
 
 /// A caller whose argument is not read leaves an unread site, not a row:
