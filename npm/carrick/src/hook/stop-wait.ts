@@ -22,7 +22,7 @@
 // event that carries late answers (`late.ts`: the next prompt, Read, edit or
 // shell command).
 //
-// Reference: the B3 scope in the Arber workflow plan (pins S4, S5, S6c),
+// Reference: the B3 scope in the after-edit workflow plan (pins S4, S5, S6c),
 // carrick#3466 for the session's check, and hook-wording audit T2.
 
 import type { CheckResult } from "../contract.ts";
