@@ -44,6 +44,43 @@ fn calls() -> Vec<serde_json::Value> {
         .clone()
 }
 
+/// The blob the same scan stores. `CARRICK_OUTPUT_JSON` writes none, and
+/// the projection carries no unread sites, so this is a second scan.
+fn blob() -> serde_json::Value {
+    let repo = env!("CARGO_MANIFEST_DIR");
+    let fixture = format!("{repo}/tests/fixtures/imported-object-member");
+    let mock_dir = format!("{fixture}/__llm__/");
+    let store = tempfile::tempdir().expect("store dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .arg(&fixture)
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", &mock_dir)
+        .env("CARRICK_LOCAL_STORAGE_DIR", store.path())
+        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_SKIP_INTENTS", "1")
+        .env_remove("CARRICK_OUTPUT_JSON")
+        .env_remove("GITHUB_REPOSITORY")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("CI")
+        .output()
+        .expect("failed to spawn carrick binary");
+    assert!(
+        output.status.success(),
+        "scanner exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_dir(store.path())
+        .expect("the store dir is readable")
+        .map(|entry| entry.expect("store entry").path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .map(|path| {
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read the blob"))
+                .expect("the blob is JSON")
+        })
+        .expect("the scan stored a blob")
+}
+
 fn call_at<'a>(calls: &'a [serde_json::Value], file: &str, line: i64) -> &'a serde_json::Value {
     let matches: Vec<&serde_json::Value> = calls
         .iter()
@@ -101,24 +138,66 @@ fn a_site_the_join_cannot_prove_keeps_the_model_s_answer() {
     assert_eq!(via["resolution_source"], "model");
 
     // The client modules' own request rows are untouched.
+    for (file, line, method, path) in [(
+        "src/orders.api.ts",
+        11,
+        "GET",
+        "/v1/orders/:orderId/files/:fileId",
+    )] {
+        let own = call_at(&calls, file, line);
+        assert_eq!(own["method"], method, "{file}:{line}");
+        assert_eq!(own["path"], path, "{file}:{line}");
+    }
+
+    // V1 rule C2 is deleted: the client modules' calls that carry an options
+    // bag were rows only because they were awaited with a string argument.
+    // Discovery stops at the transport's span callback, which no label
+    // covers, so each site is saved as an unread site with its reason.
+    let blob = blob();
+    let unread = blob["unread_sites"]
+        .as_array()
+        .expect("the blob carries its unread sites");
+    for (file, line) in [
+        ("src/orders.api.ts", 21),
+        ("src/orders.api.ts", 32),
+        ("src/admin.api.ts", 5),
+    ] {
+        let site = unread
+            .iter()
+            .find(|site| site["file"] == file && site["line"].as_i64() == Some(line))
+            .unwrap_or_else(|| panic!("{file}:{line} is saved as unread: {unread:#?}"));
+        assert_eq!(site["reason"], "unresolved_name", "{file}:{line}");
+        assert_eq!(site["stop_at"], "src/http.ts:7", "{file}:{line}");
+    }
+
+    // Each of those requests is still stated where it is made: at the
+    // client object's caller.
     for (file, line, method, path) in [
         (
-            "src/orders.api.ts",
-            11,
-            "GET",
-            "/v1/orders/:orderId/files/:fileId",
+            "src/OrderActions.ts",
+            7,
+            "POST",
+            "/v1/orders/:orderId/notes",
         ),
-        ("src/orders.api.ts", 21, "POST", "/v1/orders/:orderId/notes"),
-        ("src/orders.api.ts", 32, "PUT", "/v1/orders/:orderId/status"),
         (
-            "src/admin.api.ts",
-            5,
+            "src/OrderActions.ts",
+            12,
+            "PUT",
+            "/v1/orders/:orderId/status",
+        ),
+        (
+            "src/AdminActions.ts",
+            3,
             "POST",
             "/admin/orders/:orderId/notes",
         ),
     ] {
-        let own = call_at(&calls, file, line);
-        assert_eq!(own["method"], method, "{file}:{line}");
-        assert_eq!(own["path"], path, "{file}:{line}");
+        let caller = call_at(&calls, file, line);
+        assert_eq!(caller["method"], method, "{file}:{line}");
+        assert_eq!(caller["path"], path, "{file}:{line}");
+        assert_eq!(
+            caller["resolution_source"], "imported_member",
+            "{file}:{line}"
+        );
     }
 }
