@@ -3940,6 +3940,7 @@ mod tests {
             &discovery,
             &crate::request_summary::decided_sites::Decided::default(),
             &[],
+            &[],
             &on.repo,
         );
         crate::unread_sites::with_unanswered_implementations(unread, &asked.unanswered, &on.repo)
@@ -4013,6 +4014,7 @@ mod tests {
         let mut unread = crate::unread_sites::from_scan(
             &discovery,
             &crate::request_summary::decided_sites::Decided::default(),
+            &[],
             &[],
             &on.repo,
         );

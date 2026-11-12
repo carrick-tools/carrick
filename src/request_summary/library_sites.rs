@@ -2456,7 +2456,7 @@ impl Reader<'_> {
             path,
             member,
             args: site_args(args, scope),
-            arg_texts: super::resolve::args_text(args, &|lo| lo),
+            arg_texts: super::resolve::args_text(args, &|lo| lo, scope.class()),
             decorated: None,
         })
     }
