@@ -585,7 +585,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          # Pinned so a new stable clippy cannot break the merge queue; bump on purpose.
+          toolchain: 1.100.0
           components: rustfmt, clippy
 
       - name: Cache dependencies
