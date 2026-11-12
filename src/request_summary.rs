@@ -10905,14 +10905,21 @@ pub struct RequestSummaryIndex {
     /// What the requests whose method is a parameter declared as a set of
     /// verbs wait on (carrick#2049).
     methods: Box<DeclaredMethods>,
-    /// The calls each row at a caller was composed through (C11 T1,
-    /// [`Summary::through`]), the row's own call included: keyed by the
+    /// The calls the rows and stops were composed through (C11 T1). Read
+    /// by [`Self::placements`].
+    chains: Box<Chains>,
+}
+
+/// The calls the summaries' rows and stops were composed through (C11 T1,
+/// [`Summary::through`]).
+#[derive(Debug, Default)]
+struct Chains {
+    /// Per row at a caller, the row's own call included: keyed by the
     /// row's request ([`SummaryRow::request_at`]) and the row's file and
-    /// line. Read by [`Self::placements`].
-    through: HashMap<RowAt, BTreeSet<(PathBuf, u32)>>,
+    /// line.
+    rows: HashMap<RowAt, BTreeSet<(PathBuf, u32)>>,
     /// The chains to callers saved as a stop ([`CallerStop`]): the request
-    /// was closed there and does not render (C11 T1). Read by
-    /// [`Self::placements`].
+    /// was closed there and does not render.
     stopped: Vec<StoppedChain>,
 }
 
@@ -11027,11 +11034,11 @@ impl RequestSummaryIndex {
         for (file, sites) in &self.rows {
             for row in sites.values().flatten() {
                 let at = (file.clone(), row.line);
-                let through = self.through.get(&(row.request_at.clone(), at.clone()));
+                let through = self.chains.rows.get(&(row.request_at.clone(), at.clone()));
                 placed.place(row.request_at.clone(), at, through);
             }
         }
-        for chain in &self.stopped {
+        for chain in &self.chains.stopped {
             placed.stop(chain.request_at.clone(), &chain.through);
         }
         placed
@@ -11674,7 +11681,8 @@ fn emit(
                     match row(&instantiated, file, files, call, reaches, at, call_body) {
                         Some(row) => {
                             index
-                                .through
+                                .chains
+                                .rows
                                 .entry((row.request_at.clone(), (file.to_path_buf(), row.line)))
                                 .or_default()
                                 .extend(callee.through_call(effect, file, call.site.line));
@@ -11689,7 +11697,7 @@ fn emit(
                                 // The summaries answered this caller with a
                                 // stop (C11 T1): a site on the same chain
                                 // yields to it (`RequestSummaryIndex::placements`).
-                                index.stopped.push(StoppedChain {
+                                index.chains.stopped.push(StoppedChain {
                                     request_at: (
                                         instantiated.site.file.clone(),
                                         instantiated.site.span_start,
