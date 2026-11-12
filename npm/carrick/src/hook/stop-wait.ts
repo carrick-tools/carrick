@@ -186,13 +186,18 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       gap(`its re-check is still running after ${seconds} s`);
       continue;
     }
-    // An answer queued in place of the probe is not this Stop's to state
-    // while the next carrier still owes it (R46.2), nor ever when the binary
-    // refused the file, as the probe's refusal was not recorded (R46.5).
-    if (answer.instead_of_probe && (answer.result?.error || !wasDelivered(session, entry.seq, home))) {
+    // An answer queued in place of the probe that the binary refused is not
+    // stated, as the probe's refusal was not recorded (R46.5).
+    if (answer.instead_of_probe && answer.result?.error) {
       coverage.files -= 1;
       continue;
     }
+    // One the next carrier still owes is a gap below as any answer is; one
+    // that answered the edit is not this Stop's to state (R46.2).
+    const covered = () => {
+      if (answer.instead_of_probe && !wasDelivered(session, entry.seq, home)) coverage.files -= 1;
+      else coverage.covered.push(answer);
+    };
     const result = answer.result;
     if (answer.state !== "answered" || result === undefined) {
       gap(answer.failure ?? "the re-check gave no answer");
@@ -203,7 +208,7 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       continue;
     }
     if (readsNothing(result)) {
-      coverage.covered.push(answer);
+      covered();
       continue;
     }
     if (!answersTheEdit(result)) {
@@ -215,7 +220,7 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       gap(staleClause(stale, "it"));
       continue;
     }
-    coverage.covered.push(answer);
+    covered();
   }
   return coverage;
 }

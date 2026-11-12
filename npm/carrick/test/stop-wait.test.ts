@@ -425,10 +425,28 @@ test("Stop leaves an answer queued in place of the probe with no finding unclaim
   const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
   recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
   assert.equal(entry.instead_of_probe, true);
-  answer(home, entry, fixture("check-stale-uses.json"));
+  // Answered the edit, no problem, a uses line: nothing Stop prints.
+  answer(home, entry, { ...clean(), uses_lines: fixture("check-stale-uses.json").uses_lines! });
   const run = await stopWith(home);
   assert.equal(run.stdout, "", "nothing for it at Stop: not unchecked, not running");
   assert.equal(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), false, "unclaimed");
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+});
+
+// Ruling on R46.2: a flagged answer that did not answer the edit is a gap at
+// its first Stop, named as with the switch off, once; the next carrier still
+// prints what the probe would have printed in hand (its uses line).
+test("Stop names a flagged answer that did not answer the edit as a gap, once, and the next carrier prints its uses line", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  answer(home, entry, fixture("check-stale-uses.json"));
+  const first = context((await stopWith(home)).stdout);
+  assert.ok(first.startsWith("Carrick did not check the whole change: user-service/src/routes/users.ts: no re-check of it ran."), first);
+  assert.equal((await stopWith(home)).stdout, "", "named once");
   const next = context((await bashHook(home, workspace.root)).stdout);
   assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
 });

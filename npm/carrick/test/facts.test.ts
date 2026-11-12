@@ -1261,17 +1261,34 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
   assert.ok(unsafe.startsWith(`${PROBLEM_HEAD}\n- `), unsafe);
 });
 
-// R46.2 end to end: a lead with nothing for Stop is not lost when Stop comes
-// next. Stop leaves the answer for the next carrier, which prints the lead.
-test("with a fact file, a lead queued in place of the probe survives a Stop and prints on the next carrier", async (t) => {
+// R46.2 end to end (the review's S4): a deferred answer is named at its first
+// Stop as with the switch off, once, and its lead is not lost: Stop leaves the
+// answer for the next carrier, which prints the lead.
+test("with a fact file, a deferred answer is named at Stop as before, once, and its lead prints on the next carrier", async (t) => {
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', { session: "lead", probe: "check-deferred-lead.json" });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
   await waitForAnswer(ws, "lead");
-  assert.equal(await stop(ws, "lead"), "");
+  // What this Stop said with CARRICK_FACT_LINES unset (review run 2, S4).
+  assert.equal(
+    await stop(ws, "lead"),
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "Stop",
+        additionalContext:
+          "Carrick did not check the whole change: orders-api/src/routes/orders.ts: this edit needs a re-scan, which this call was asked not to start. A background `carrick check --changed` is queued; its answer comes with the next Carrick line.",
+      },
+    }),
+  );
+  assert.equal(await stop(ws, "lead"), "", "named once");
+  // The `check --changed` Stop queued has answered (the fake binary: clean).
+  await waitForSessionAnswers(ws.home, "lead", 2);
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
-  assert.equal(context(next.stdout), "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.");
+  assert.equal(
+    context(next.stdout),
+    "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.\n\nCarrick checked orders-api/src/routes/orders.ts and found no contract problem.",
+  );
 });
 
 // R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.
