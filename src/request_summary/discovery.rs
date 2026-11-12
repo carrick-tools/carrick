@@ -7250,6 +7250,22 @@ export function listen(): void {
         );
     }
 
+    /// K1 (carrick#3955): an app and a router made on one line are two
+    /// instances. The app using the router's `routes()` mounts the router,
+    /// not itself, so the routes under it compose, not end `recursion`.
+    #[test]
+    fn two_instances_made_on_one_line_are_two_roots() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "oneline.ts", true),
+            texts(&[
+                "src/oneline.ts:9 <- /v1/s.list via src/oneline.ts:14 use - > src/oneline.ts:13 use /v1",
+            ])
+        );
+    }
+
     /// K1: an app whose `use` takes middleware only, handed a router's
     /// `routes()`, serves the router at the app's own address: one edge
     /// with no prefix, so the router is no longer the top itself.
