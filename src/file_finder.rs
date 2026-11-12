@@ -86,6 +86,31 @@ const TEST_FILE_INFIXES: &[&str] = &[
 /// file set a scan reads does not change.
 const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock", "cypress"];
 
+/// File stems of a test-support helper, compared after lowercasing and
+/// dropping `-` and `_`, so `test-utils`, `test_helpers`, `testUtils` and
+/// `TestHelper` all read as one name. The WHOLE stem must match: `testimonials`
+/// or `contest-utils` is product code. A helper of this name registers
+/// handlers for the suite that imports it, never routes the service serves
+/// (carrick#3967). Kept and tagged like [`MOCK_DIR_NAMES`] trees.
+const MOCK_FILE_STEMS: &[&str] = &["testutils", "testutil", "testhelpers", "testhelper"];
+
+/// Whether `path`'s file stem names a test-support helper ([`MOCK_FILE_STEMS`]).
+fn has_test_helper_name(path: &Path) -> bool {
+    if !has_source_extension(path) {
+        return false;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            let normal: String = stem
+                .chars()
+                .filter(|c| *c != '-' && *c != '_')
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            MOCK_FILE_STEMS.contains(&normal.as_str())
+        })
+}
+
 /// Whether any directory segment of `path`, relative to the scanned
 /// `root_dir`, matches one of `dir_names` (case-insensitive). Only checked
 /// relative to the root so a scan whose root itself sits inside such a
@@ -228,7 +253,10 @@ pub fn endpoint_provenance(path: &Path, root_dir: &Path) -> EndpointProvenance {
     if path.strip_prefix(root_dir).is_err() {
         return EndpointProvenance::Route;
     }
-    if has_dir_named(path, root_dir, MOCK_DIR_NAMES) || is_test_path(path, root_dir) {
+    if has_dir_named(path, root_dir, MOCK_DIR_NAMES)
+        || has_test_helper_name(path)
+        || is_test_path(path, root_dir)
+    {
         EndpointProvenance::Mock
     } else {
         EndpointProvenance::Route
@@ -1919,6 +1947,40 @@ mod tests {
             endpoint_provenance(Path::new("src/api/mocks.ts"), root),
             EndpointProvenance::Route
         );
+    }
+
+    /// carrick#3967: a route registered only in a test-support helper is not
+    /// served; a product file whose name merely starts with "test" is.
+    #[test]
+    fn endpoint_provenance_tags_test_helper_files_not_lookalikes() {
+        use crate::operation::EndpointProvenance;
+
+        let root = Path::new("");
+        for tagged in [
+            "src/orders/test-utils.ts",
+            "src/test-helpers.ts",
+            "src/testUtils.js",
+            "src/test_helper.ts",
+        ] {
+            assert_eq!(
+                endpoint_provenance(Path::new(tagged), root),
+                EndpointProvenance::Mock,
+                "{tagged}"
+            );
+        }
+        for served in [
+            "src/testimonials.ts",
+            "src/contest-utils.ts",
+            "src/test-utils-docs/routes.ts",
+            "src/latest.ts",
+            "src/testing/routes.ts",
+        ] {
+            assert_eq!(
+                endpoint_provenance(Path::new(served), root),
+                EndpointProvenance::Route,
+                "{served}"
+            );
+        }
     }
 
     #[test]
