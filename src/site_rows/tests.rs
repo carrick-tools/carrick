@@ -846,7 +846,6 @@ fn a_fact_replaces_an_old_path_row_at_its_site() {
     for source in [
         ResolutionSource::ImportedMember,
         ResolutionSource::SameFileWrapper,
-        ResolutionSource::NewUrl,
     ] {
         let old = OperationKey::http("POST", "${BASE}/items");
         let mut calls = vec![blob_row(old.clone(), file, LINE, Some(source))];

@@ -181,3 +181,25 @@ fn a_new_url_row_is_keyed_on_the_path_its_source_states_not_the_models_prefix() 
         "https://api.example.test/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete"
     );
 }
+
+/// C11: the `new URL` rule is deleted, so the request summaries state every
+/// site it stated. Each row the tests above assert is a `request_summary` row
+/// with the same key, not the model's and not a retired pass's.
+#[test]
+fn every_new_url_site_is_stated_by_the_request_summaries() {
+    let calls = calls();
+    for (file, line) in [
+        ("src/catalogue.ts", 18),
+        ("src/catalogue.ts", 27),
+        ("src/catalogue.ts", 33),
+        ("src/checkpoints.ts", 15),
+        ("src/checkpoints.ts", 30),
+        ("src/checkpoints.ts", 46),
+    ] {
+        let call = call_at(&calls, file, line);
+        assert_eq!(
+            call["resolution_source"], "request_summary",
+            "{file}:{line} is stated by the request summaries: {call:#?}"
+        );
+    }
+}

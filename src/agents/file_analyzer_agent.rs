@@ -251,8 +251,8 @@ pub enum ResolutionSource {
     /// as a PATH is a route prefix, and what is written after it is not
     /// another service's route.
     LiteralBasePath,
-    /// The path a `new URL(path, base)` states for the call's target
-    /// (carrick#610).
+    /// Retired: the `new URL(path, base)` rule is deleted (C11); the request
+    /// summaries state these rows. Kept until the paired variant retirement.
     NewUrl,
     /// A route declared by file location (Next.js app router, etc.).
     FileBasedRoute,

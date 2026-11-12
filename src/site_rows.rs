@@ -1722,17 +1722,14 @@ fn is_old_path(row: &ApiEndpointDetails) -> bool {
 }
 
 /// Whether `source` is a pass of the old path, frozen until it is deleted
-/// (carrick#1561): an imported request member (`imported_request_member`),
-/// a same-file wrapper (`local_http_wrapper`) or a `new URL` target
-/// (`new_url_target`). The fact layer's site row at the same call is the
-/// reading that replaces each: an imported member's row, for one, leaves a
+/// (carrick#1561): an imported request member (`imported_request_member`)
+/// or a same-file wrapper (`local_http_wrapper`). The fact layer's site row at
+/// the same call is the reading that replaces each: an imported member's row, for one, leaves a
 /// base its module composes from a constant unread.
 fn is_old_path_source(source: ResolutionSource) -> bool {
     matches!(
         source,
-        ResolutionSource::ImportedMember
-            | ResolutionSource::SameFileWrapper
-            | ResolutionSource::NewUrl
+        ResolutionSource::ImportedMember | ResolutionSource::SameFileWrapper
     )
 }
 

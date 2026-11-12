@@ -149,10 +149,22 @@ fn a_block_local_fetch_is_not_the_platform_fetch() {
 #[test]
 fn a_new_url_binding_is_read_in_its_own_scope() {
     assert_no_row("new-url.ts", 6);
-    assert_row("new-url.ts", 12, "new_url", "GET", "/api/new-url-module");
+    assert_row(
+        "new-url.ts",
+        12,
+        "request_summary",
+        "GET",
+        "/api/new-url-module",
+    );
     // The inner block's `link` is declared after the outer one, and before
     // the fix it overwrote it in the function's frame.
-    assert_row("new-url-frame.ts", 7, "new_url", "POST", "/api/frame-outer");
+    assert_row(
+        "new-url-frame.ts",
+        7,
+        "request_summary",
+        "POST",
+        "/api/frame-outer",
+    );
 }
 
 /// A member another module calls is read through the same bindings.
@@ -160,7 +172,13 @@ fn a_new_url_binding_is_read_in_its_own_scope() {
 fn a_member_shadowing_its_modules_url_states_nothing_at_its_callers() {
     assert_no_row("member.ts", 6);
     assert_no_row("member-caller.ts", 4);
-    assert_row("member.ts", 12, "new_url", "GET", "/api/member-module");
+    assert_row(
+        "member.ts",
+        12,
+        "request_summary",
+        "GET",
+        "/api/member-module",
+    );
     assert_row(
         "member-caller.ts",
         5,

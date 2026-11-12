@@ -69,8 +69,8 @@
 //!   at whatever position it sits, or the path a `new URL(<literal>, base)`
 //!   declared in the same function supplies to it (`url.href`, `url.toString()`
 //!   or the binding itself). That second form is read through
-//!   [`crate::new_url_target`], and like everywhere else the base is left
-//!   alone: it is an opaque value, and only the path is asserted. A request
+//!   the `UrlBindings` scope at the foot of this file, and like everywhere
+//!   else the base is left alone: it is an opaque value, and only the path is asserted. A request
 //!   with no URL, or with two, states no single URL and the member is dropped.
 //! - The method must be a literal, EXCEPT that a request-options bag stating no
 //!   method at all is a `GET`. Every fetch-shaped client defaults to `GET` when
@@ -146,9 +146,8 @@ use swc_common::{BytePos, SourceMap, SourceMapper, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use crate::binding_scope::ident_key;
+use crate::binding_scope::{BindingKey, ident_key};
 use crate::forwarded_body::{CallBody, ParamDecl, sent_ident, type_param_names};
-use crate::new_url_target::UrlBindings;
 use crate::type_manifest::{is_http_method, normalize_manifest_method};
 use crate::wrapper_request_shape::{
     literal_string, prop_value, request_options_argument, verb_from_callee_property,
@@ -1101,6 +1100,151 @@ fn pat_name(pat: &Pat) -> Option<String> {
         Pat::Ident(ident) => Some(ident.id.sym.to_string()),
         _ => None,
     }
+}
+
+// The `new URL(path, base)` binding scope this pass reads a member's URL through.
+// It lived with the `new URL` path collector until that rule was deleted (C11);
+// this pass is its only reader now and takes it with it when it goes.
+/// The `new URL(path, base)` bindings a walk can currently see.
+///
+/// Held separately from the visitor that walks them so a second pass reading
+/// the same shape reuses this scope walk rather than repeating it:
+/// [`crate::imported_request_member`] resolves a member's URL through exactly
+/// these bindings, on its own walk of the same module.
+pub(crate) struct UrlBindings<'a> {
+    source_map: &'a Lrc<SourceMap>,
+    /// One frame per enclosing function, outermost (module) first. Each maps a
+    /// binding to the path the `new URL` it was declared from states, or to
+    /// `None` when its declarations state none ([`Self::declare`]).
+    scopes: Vec<HashMap<BindingKey, Option<String>>>,
+}
+
+impl<'a> UrlBindings<'a> {
+    pub(crate) fn new(source_map: &'a Lrc<SourceMap>) -> Self {
+        Self {
+            source_map,
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    /// Enter a function's scope: what it declares is gone once the walk
+    /// leaves it.
+    pub(crate) fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    pub(crate) fn pop(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// Record `const url = new URL(path, base)` in the innermost scope. A
+    /// declarator that states no path holds none, and a binding declared a
+    /// second time (a `var` written again in a block) holds whichever ran
+    /// last, which nothing here says, so it states none either.
+    pub(crate) fn declare(&mut self, node: &VarDeclarator) {
+        let Pat::Ident(binding) = &node.name else {
+            return;
+        };
+        let path = node.init.as_deref().and_then(|init| self.stated_path(init));
+        let frame = self
+            .scopes
+            .last_mut()
+            .expect("the module frame is never popped");
+        frame
+            .entry(ident_key(&binding.id))
+            .and_modify(|held| *held = None)
+            .or_insert(path);
+    }
+
+    /// The path an expression handed to a request states, if any: a `new URL`
+    /// written inline, or a binding holding one, read directly or through the
+    /// accessors a `URL` is normally turned back into a string with.
+    pub(crate) fn stated_path(&self, expr: &Expr) -> Option<String> {
+        match unwrap_transparent(expr) {
+            Expr::New(new_expr) => self.new_url_path(new_expr),
+            Expr::Ident(ident) => self.lookup(ident),
+            // `url.href`.
+            Expr::Member(member) if is_prop(&member.prop, "href") => self.stated_path(&member.obj),
+            Expr::Call(call) => match &call.callee {
+                // `url.toString()`.
+                Callee::Expr(callee) => match &**callee {
+                    Expr::Member(member) if is_prop(&member.prop, "toString") => call
+                        .args
+                        .is_empty()
+                        .then(|| self.stated_path(&member.obj))?,
+                    // `String(url)`.
+                    Expr::Ident(ident) if ident.sym.as_ref() == "String" => {
+                        let arg = call.args.first().filter(|arg| arg.spread.is_none())?;
+                        (call.args.len() == 1).then(|| self.stated_path(&arg.expr))?
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The path the binding `ident` resolves to was declared with.
+    fn lookup(&self, ident: &Ident) -> Option<String> {
+        let key = ident_key(ident);
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&key))
+            .cloned()
+            .flatten()
+    }
+
+    /// The absolute path `new URL(path, base)` states in its first argument.
+    fn new_url_path(&self, new_expr: &NewExpr) -> Option<String> {
+        let Expr::Ident(callee) = &*new_expr.callee else {
+            return None;
+        };
+        if callee.sym.as_ref() != "URL" {
+            return None;
+        }
+        // Exactly two arguments: a path and the base it is resolved against.
+        let args = new_expr.args.as_ref()?;
+        if args.len() != 2 || args.iter().any(|arg| arg.spread.is_some()) {
+            return None;
+        }
+        let path = self.argument_text(&args[0].expr)?;
+        path.starts_with('/').then_some(path)
+    }
+
+    /// A string argument's value, or a template's source with its
+    /// interpolations left intact so an interpolated segment survives as a
+    /// path parameter.
+    fn argument_text(&self, expr: &Expr) -> Option<String> {
+        match unwrap_transparent(expr) {
+            Expr::Lit(Lit::Str(literal)) => Some(literal.value.to_string_lossy().into_owned()),
+            Expr::Tpl(tpl) => {
+                let snippet = self.source_map.span_to_snippet(tpl.span).ok()?;
+                let trimmed = snippet.trim();
+                trimmed
+                    .strip_prefix('`')
+                    .and_then(|rest| rest.strip_suffix('`'))
+                    .map(str::to_string)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Look through the wrappers that change nothing about the value.
+fn unwrap_transparent(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(paren) => unwrap_transparent(&paren.expr),
+        Expr::TsAs(as_expr) => unwrap_transparent(&as_expr.expr),
+        Expr::TsNonNull(non_null) => unwrap_transparent(&non_null.expr),
+        Expr::TsConstAssertion(assertion) => unwrap_transparent(&assertion.expr),
+        other => other,
+    }
+}
+
+fn is_prop(prop: &MemberProp, name: &str) -> bool {
+    matches!(prop, MemberProp::Ident(ident) if ident.sym.as_ref() == name)
 }
 
 #[cfg(test)]
