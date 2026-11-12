@@ -1,7 +1,7 @@
 // Edit-time facts beyond operations: callers of an edited function (`fn`),
 // a same-named function elsewhere (`name`), and a package's specs in other
-// services (`pkg`). Rows are hand-written in the wire's shape until the cloud
-// builder's fixture carries these kinds.
+// services (`pkg`). The pinned fixture's real rows of each kind are tested in
+// `facts.test.ts`; the edge cases here use rows hand-written in the wire's shape.
 
 import test from "node:test";
 import assert from "node:assert/strict";

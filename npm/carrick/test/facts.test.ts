@@ -114,6 +114,34 @@ test("every row of the pinned fixture is ingested", async (t) => {
   db.close();
 });
 
+// The pinned fixture's fn, name and pkg rows (writer 2), on the workspace's own files.
+
+test("the pinned fixture's fn row: an edit in formatPrice names its callers", async (t) => {
+  const ws = await factsWorkspace(t);
+  assert.deepEqual(await linesFor(ws, "web-app/src/lib/format.ts", "const whole = Math.floor(cents / 100);"), [
+    "formatPrice is called from web-app/src/cart/total.ts:4, web-app/src/checkout/summary.ts:14",
+  ]);
+});
+
+test("the pinned fixture's name rows: a new file declaring slugify names the first other declaration", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("gateway/src/slug.ts");
+  fs.writeFileSync(file, "export function slugify(text: string): string {\n  return text;\n}\n");
+  assert.deepEqual((await factLines(ws.root, [{ file, whole: true }], undefined)).lines, [
+    "a function named slugify is declared at orders-api/src/util/slug.ts:1",
+  ]);
+});
+
+test("the pinned fixture's pkg row: a service bumping its own spec is told only the others'", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/package.json");
+  const before = fs.readFileSync(file, "utf8").split("\n");
+  const at = before.findIndex((line) => line.includes("@demo/http-kit")) + 1;
+  fs.writeFileSync(file, before.map((line, i) => (i === at - 1 ? line.replace("^4.18.2", "^4.20.0") : line)).join("\n"));
+  const lines = (await factLines(ws.root, [{ file, lines: [at], removed: [at], removedText: [before[at - 1]!] }], undefined)).lines;
+  assert.deepEqual(lines, ["@demo/http-kit is ^4.19.0 in web-app"]);
+});
+
 // Naming rule 3 first: the dotted path of keys from a const-bound object.
 test("naming rule 3: a resolver in an object map is found by its dotted path", async (t) => {
   const ws = await factsWorkspace(t);
@@ -646,8 +674,9 @@ test("a file this Write created, untracked in git, counts every named thing in i
   const text = fs.readFileSync(ws.at("orders-api/src/routes/orders.ts"), "utf8");
   fs.writeFileSync(file, text);
   const payload = { tool_name: "Write", tool_input: { file_path: file, content: text }, tool_response: { type: "create", filePath: file } };
-  // Its rows are another file's, still on disk: nothing, by the named-row rule.
-  assert.equal(context((await payloadEdit(ws, payload)).stdout), "");
+  // Its op rows are another file's, still on disk: none print, by the named-row
+  // rule. A new function named like one in another file is the name kind's line.
+  assert.equal(context((await payloadEdit(ws, payload)).stdout), "a function named getOrder is declared at orders-api/src/routes/orders.ts:12");
   // A tracked file is never "created by this call".
   fs.rmSync(file);
   const tracked = ws.at("orders-api/src/routes/orders.ts");
