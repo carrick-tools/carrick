@@ -10910,10 +10910,7 @@ pub struct RequestSummaryIndex {
     chains: Box<Chains>,
     /// What says whether a request its own line leaves open is stated by its
     /// callers alone (carrick#3961), gathered while the rows are.
-    ledger: CallerLedger,
-    /// The requests, by file and span start, whose every caller this pass
-    /// read and stated ([`Self::answered_at_callers`], carrick#3961).
-    closed_at_callers: HashSet<(PathBuf, u32)>,
+    ledger: Box<CallerLedger>,
 }
 
 /// What the callers of the requests whose own line leaves the path open
@@ -10933,6 +10930,9 @@ struct CallerLedger {
     /// made where a module is loaded, in a constructor, an optional call, or
     /// one whose callee only the call graph names.
     unseen: HashSet<(PathBuf, String)>,
+    /// The requests, by file and span start, whose every caller this pass
+    /// read and stated ([`RequestSummaryIndex::answered_at_callers`]).
+    closed: HashSet<(PathBuf, u32)>,
 }
 
 /// The calls the summaries' rows and stops were composed through (C11 T1,
@@ -11109,7 +11109,8 @@ impl RequestSummaryIndex {
     /// out of this pass's sight). A row stated at the request's own line by
     /// any other source is the same request stated once more.
     pub fn answered_at_callers(&self, file: &Path) -> BTreeSet<u32> {
-        self.closed_at_callers
+        self.ledger
+            .closed
             .iter()
             .filter(|(at_file, _)| at_file == file)
             .filter(|(at_file, start)| {
@@ -11562,7 +11563,7 @@ pub fn summarize(
             merge_rows(rows);
         }
     }
-    index.closed_at_callers = closed_at_callers(&mut composer, &paths, &mut index.ledger);
+    index.ledger.closed = closed_at_callers(&mut composer, &paths, &mut index.ledger);
     index
 }
 

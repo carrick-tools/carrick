@@ -335,6 +335,7 @@ fn test_processing_stats_tracking() {
         model_endpoints_dropped_unanchored: 0,
         model_endpoints_dropped_unanchored_sites: Vec::new(),
         model_only_rows: 0,
+        model_rows_stated_at_callers: 0,
         candidates_awaiting_model: 0,
         total_mounts: 3,
         total_endpoints: 10,
