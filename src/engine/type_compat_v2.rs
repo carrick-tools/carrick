@@ -8323,7 +8323,7 @@ mod tests {
             two_deaths(&building, &resolving, Some(4096)),
             format!(
                 "{TWICE}; the first was stopped because it ran out of memory, \
-                 full, while building the service's program, before any anchor was resolved, \
+                 while building the service's program, before any anchor was resolved, \
                  the retry was killed by the system while resolving anchors (last report: 3 of 9), \
                  under a memory limit of 4096 MB"
             )
