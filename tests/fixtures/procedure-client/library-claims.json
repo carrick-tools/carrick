@@ -234,6 +234,64 @@
       ]
     },
     {
+      "package": "fixture-sub10",
+      "version": "10.45.3",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-sub10",
+          "export": "createSubClient",
+          "role": "http_client",
+          "side": null,
+          "makes": [{ "form": "call", "member": null }],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "subscribe",
+              "of": "type:fixture-sub10#SubClientOf",
+              "protocol": "rpc",
+              "name": { "bound": "path", "join": "." },
+              "method": "SUBSCRIBE"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [],
+          "receiver_types": { "instance:()": ["type:fixture-sub10#SubClientOf"] }
+        }
+      ]
+    },
+    {
+      "package": "fixture-sub11",
+      "version": "11.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-sub11",
+          "export": "createSubClient",
+          "role": "http_client",
+          "side": null,
+          "makes": [{ "form": "call", "member": null }],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "subscribe",
+              "of": "type:fixture-sub11#SubClientOf",
+              "protocol": "rpc",
+              "name": { "bound": "path", "join": "." },
+              "method": "SUBSCRIBE"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [],
+          "receiver_types": { "instance:()": ["type:fixture-sub11#SubClientOf"] }
+        }
+      ]
+    },
+    {
       "package": "fixture-web",
       "version": "1.0.0",
       "status": "answered",

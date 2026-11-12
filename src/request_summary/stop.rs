@@ -139,6 +139,10 @@ pub enum Stop {
     ProcedureUnmounted,
     /// No adapter reaches the router that holds a procedure.
     ProcedureNoAdapter,
+    /// A procedure subscription on a library version whose HTTP adapter
+    /// does not serve subscriptions (tRPC 10 refuses them: they use a
+    /// websocket link), so the call states no wire method (carrick#4048).
+    ProcedureSubscriptionNotHttp,
     /// A word a later release added: read from a blob, never written by
     /// this build's own passes, and in no [`Stop::ALL`]. A reader says the
     /// raw word, with no phrase.
@@ -178,7 +182,7 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 55] = [
+    pub const ALL: [Stop; 56] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -234,6 +238,7 @@ impl Stop {
         Stop::EnvValue,
         Stop::ProcedureUnmounted,
         Stop::ProcedureNoAdapter,
+        Stop::ProcedureSubscriptionNotHttp,
     ];
 
     /// The word as it is written on the wire.
@@ -294,6 +299,7 @@ impl Stop {
             Stop::EnvValue => "env_value",
             Stop::ProcedureUnmounted => "procedure_unmounted",
             Stop::ProcedureNoAdapter => "procedure_no_adapter",
+            Stop::ProcedureSubscriptionNotHttp => "procedure_subscription_not_http",
             Stop::Unknown(UnknownWord(word)) => word,
         }
     }

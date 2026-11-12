@@ -2716,6 +2716,7 @@ fn procedure_client_rows() -> Vec<String> {
         format!("src/web/hooks.ts:7 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/hooks.ts:16 GET \"\" {router} count request_summary"),
+        format!("src/web/subscribe.ts:13 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/vanilla.ts:11 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/vanilla.ts:15 GET \"\" {router} shelf.inner.get request_summary"),
         format!("src/web/vanilla.ts:16 GET \"\" {router} count request_summary"),
@@ -2747,6 +2748,7 @@ fn a_client_procedure_call_pairs_only_its_own_router() {
             format!("http|GET|/api/rpc/count <- {call}"),
             format!("http|GET|/api/rpc/count <- {call}"),
             format!("http|GET|/api/rpc/shelf.inner.get <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
@@ -2792,6 +2794,30 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
             .get("src/web/remote.ts:7")
             .map(String::as_str),
         Some("procedure_router_outside_repo")
+    );
+}
+
+/// carrick#4048: a subscription call on a library version whose HTTP adapter
+/// refuses subscriptions (tRPC 10) states no wire method: no row, and the
+/// call is saved unread with its reason. The same call at a version that
+/// streams them (11) keeps its GET row (`procedure_client_rows`).
+#[test]
+fn a_v10_subscription_call_is_saved_unread_and_states_no_get_row() {
+    let blobs = scan_fixture("procedure-client");
+    let (flat, graph) = client_rows(&blobs);
+    for rows in [&flat, &graph] {
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.starts_with("src/web/subscribe.ts:9")),
+            "{rows:?}"
+        );
+    }
+    assert_eq!(
+        unread_reasons(&blobs)
+            .get("src/web/subscribe.ts:9")
+            .map(String::as_str),
+        Some("procedure_subscription_not_http")
     );
 }
 
