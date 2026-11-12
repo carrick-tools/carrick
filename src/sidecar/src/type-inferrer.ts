@@ -87,7 +87,13 @@ import {
 } from './node-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
-import { constituentsOf } from './capture/index.js';
+import {
+  canonicalStringQuotes,
+  constituentsOf,
+  matchesMidElision,
+  midTextElision,
+  normalizeLocatorText,
+} from './capture/index.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
@@ -507,76 +513,7 @@ function typeText(type: Type, enclosingNode?: Node): string {
  * `text` is `string`, alone or beside `null` and `undefined` in either order:
  * the only payload a raw-text read publishes (carrick#1842).
  */
-/**
- * Source text with every plain string literal written in double quotes:
- * `'/a'`, `"/a"` and an interpolation-free `` `/a` `` are one value, so text
- * that differs only in its quotes compares equal (carrick#2056).
- *
- * The text is read left to right, pairing quotes the way the scanner does,
- * so a template's closing backtick never pairs with the next template's
- * opening one. A literal holding a quote, a backslash or an interpolation is
- * copied as it is, and so is an unterminated one with everything after it.
- */
-export function canonicalStringQuotes(text: string): string {
-  const isQuote = (ch: string): boolean => ch === "'" || ch === '"' || ch === '`';
-  // The index just past the literal opening at `start`, or -1.
-  const literalEnd = (start: number): number => {
-    const quote = text[start];
-    let j = start + 1;
-    while (j < text.length) {
-      const ch = text[j];
-      if (ch === '\\') {
-        j += 2;
-      } else if (ch === quote) {
-        return j + 1;
-      } else if (quote === '`' && ch === '$' && text[j + 1] === '{') {
-        const close = codeEnd(j + 2);
-        if (close < 0) return -1;
-        j = close + 1;
-      } else {
-        j++;
-      }
-    }
-    return -1;
-  };
-  // The index of the `}` that closes an interpolation whose code starts at `start`, or -1.
-  const codeEnd = (start: number): number => {
-    let depth = 0;
-    let j = start;
-    while (j < text.length) {
-      const ch = text[j];
-      if (isQuote(ch)) {
-        const end = literalEnd(j);
-        if (end < 0) return -1;
-        j = end;
-        continue;
-      }
-      if (ch === '{') depth++;
-      if (ch === '}') {
-        if (depth === 0) return j;
-        depth--;
-      }
-      j++;
-    }
-    return -1;
-  };
-
-  let out = '';
-  let i = 0;
-  while (i < text.length) {
-    if (!isQuote(text[i])) {
-      out += text[i];
-      i++;
-      continue;
-    }
-    const end = literalEnd(i);
-    if (end < 0) return out + text.slice(i);
-    const body = text.slice(i + 1, end - 1);
-    out += /['"`\\]|\$\{/.test(body) ? text.slice(i, end) : `"${body}"`;
-    i = end;
-  }
-  return out;
-}
+export { canonicalStringQuotes };
 
 function isBareStringText(text: string): boolean {
   const members = text.split('|').map((member) => member.trim());
@@ -11792,6 +11729,25 @@ export class TypeInferrer {
       return this.pickBestMatch(opened.map((c) => c.node), lineNumber) as T;
     }
 
+    // A locator that elides the middle of a node (`f(x => { ... }, y)`) stands
+    // for the node whose text opens with what precedes the elision and ends
+    // with what follows it (carrick#3307). Ties go to the stated line, then
+    // the smallest node.
+    const midElision = midTextElision(normalizedTarget);
+    if (midElision !== undefined) {
+      const spanning = candidates.filter((c) => matchesMidElision(c.text, midElision));
+      if (spanning.length === 0) return undefined;
+      if (lineNumber !== undefined) {
+        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
+        const nearest = Math.min(...spanning.map(distance));
+        return this.pickBestMatch(
+          spanning.filter((c) => distance(c) === nearest).map((c) => c.node),
+          lineNumber
+        ) as T;
+      }
+      return this.pickBestMatch(spanning.map((c) => c.node), lineNumber) as T;
+    }
+
     // Fall back to substring match
     // For the reverse direction (target contains node text), require a minimum node text
     // length to avoid matching tiny identifiers like "res" or "body" too broadly.
@@ -11974,35 +11930,9 @@ export class TypeInferrer {
     });
   }
 
-  /**
-   * Normalize whitespace for text comparison:
-   * collapse runs of whitespace into single spaces, trim.
-   *
-   * Also strips trailing commas before `}` `)` `]`: multi-line source
-   * literals carry them but the LLM's single-line locator print does not,
-   * and that one comma used to defeat exact AND containment matching for
-   * the payload and every enclosing node (#335). Applied symmetrically to
-   * node text and target, so both sides compare equal.
-   *
-   * Also strips the space left AFTER `(` `[` `{` by the collapse: a
-   * multi-line call whose arguments start on the next line normalizes to
-   * `f( x)` while the LLM's compact print is `f(x)`, and that one space
-   * defeated exact matching for the call and every enclosing node — the
-   * opening-delimiter mirror of the #335 trailing comma (#336). Symmetric
-   * for the same reason.
-   */
+  /** Locator text normalisation: the module both locators share (carrick#3306). */
   private normalizeWhitespace(text: string): string {
-    const collapsed = text
-      .replace(/\s+/g, ' ')
-      // A member chain broken before its dot (`client\n  .list(…)`) reads the
-      // same as `client.list(…)`; a space around `.` / `?.` means nothing
-      // (carrick#1162).
-      .replace(/\s*(\?\.|\.)\s*/g, '$1')
-      .replace(/\s*,?\s*([}\)\]])/g, '$1')
-      .replace(/([\(\[{])\s+/g, '$1')
-      .trim();
-    // A string literal reads the same in any quotes (carrick#2056).
-    return canonicalStringQuotes(collapsed);
+    return normalizeLocatorText(text);
   }
 
   /**

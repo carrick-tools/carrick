@@ -19,6 +19,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import { matchesMidElision, midTextElision, normalizeLocatorText } from './locator-text.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
@@ -1596,43 +1597,47 @@ function tightestCoveringNode(
   return best;
 }
 
-/**
- * Locator text with insignificant whitespace removed: runs collapse to one
- * space, and a member chain broken before its dot (`client\n  .list(…)`) reads
- * as `client.list(…)` (carrick#1162), the same rule the v1 inferrer applies.
- */
-function normalizeLocatorText(text: string): string {
-  return text
-    .replace(/\s+/g, ' ')
-    .replace(/\s*(\?\.|\.)\s*/g, '$1')
-    .trim();
-}
-
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
   const wanted = normalizeLocatorText(text);
+  // A mid-text elision (`f(x => { ... }, y)`) is read only when no node's
+  // text equals the locator (carrick#3307).
+  const elision = midTextElision(wanted);
   let best: ts.Node | undefined;
+  const elided: ts.Node[] = [];
   const visit = (node: ts.Node) => {
     if (best) return;
     if (isPreferredTarget(node)) {
       const nodeText = normalizeLocatorText(node.getText(sourceFile));
-      if (nodeText === wanted) {
-        // On or after the line, or COVERING it: a chain broken before its dot
-        // starts a line above the line the analyzer reports for the call.
-        const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
-        if (fromLine === undefined || endLine >= fromLine) {
-          best = node;
-          return;
-        }
+      // On or after the line, or COVERING it: a chain broken before its dot
+      // starts a line above the line the analyzer reports for the call.
+      const reachesLine = (): boolean =>
+        fromLine === undefined ||
+        sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1 >= fromLine;
+      if (nodeText === wanted && reachesLine()) {
+        best = node;
+        return;
+      }
+      if (elision && matchesMidElision(nodeText, elision) && reachesLine()) {
+        elided.push(node);
       }
     }
     node.forEachChild(visit);
   };
   visit(sourceFile);
-  return best;
+  if (best || elided.length === 0) return best;
+  // Ties go to the stated line, then the smallest node.
+  const lineOf = (node: ts.Node): number =>
+    sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+  const distance = (node: ts.Node): number =>
+    fromLine === undefined ? 0 : Math.abs(lineOf(node) - fromLine);
+  return elided.reduce((a, b) => {
+    if (distance(b) !== distance(a)) return distance(b) < distance(a) ? b : a;
+    return b.getEnd() - b.getStart(sourceFile) < a.getEnd() - a.getStart(sourceFile) ? b : a;
+  });
 }
 
 function firstExpressionOnLine(
