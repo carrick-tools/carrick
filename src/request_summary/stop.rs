@@ -128,11 +128,15 @@ pub enum Stop {
     ParameterUnread,
     /// A message name the code builds over an environment read: the run decides it.
     EnvValue,
+    /// A procedure's adapter has no prefix and no host call that mounts it.
+    ProcedureUnmounted,
+    /// No adapter reaches the router that holds a procedure.
+    ProcedureNoAdapter,
 }
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 52] = [
+    pub const ALL: [Stop; 54] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -185,6 +189,8 @@ impl Stop {
         Stop::ProcedurePathUnread,
         Stop::ParameterUnread,
         Stop::EnvValue,
+        Stop::ProcedureUnmounted,
+        Stop::ProcedureNoAdapter,
     ];
 
     /// The word as it is written on the wire.
@@ -242,6 +248,8 @@ impl Stop {
             Stop::ProcedurePathUnread => "procedure_path_unread",
             Stop::ParameterUnread => "parameter_unread",
             Stop::EnvValue => "env_value",
+            Stop::ProcedureUnmounted => "procedure_unmounted",
+            Stop::ProcedureNoAdapter => "procedure_no_adapter",
         }
     }
 
