@@ -16,6 +16,9 @@ import { refreshFacts } from "../src/facts/fetch.ts";
 import { readTimings } from "../src/hook/timings.ts";
 
 const WIRE = fixturePath("edit-facts.s1.ndjson");
+/** The pinned fixture's line for `getOrder`, the producer of `GET /orders/:id`. */
+const GET_ORDER_LINE =
+  "GET /orders/:id is called at billing-worker/src/sync/orders.ts:18, gateway/src/resolvers.ts:7, web-app/src/admin/orders.ts:31 (+2 more)";
 const REPOS = ["orders-api", "web-app", "billing-worker", "gateway", "billing-api"];
 
 type FactsWorkspace = { root: string; home: string; at: (rel: string) => string };
@@ -101,20 +104,16 @@ test("the wire fixture is the pinned one", () => {
 // Naming rule 3 first: the dotted path of keys from a const-bound object.
 test("naming rule 3: a resolver in an object map is found by its dotted path", async (t) => {
   const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "orders-api/src/graphql/resolvers.ts", "return db.orders.find(args.id);"), [
-    "QUERY order is called at web-app/src/api/order-query.ts:11",
-  ]);
-  // A method-shorthand member of a nested map, on the consumer side.
-  assert.deepEqual(await linesFor(ws, "gateway/src/resolvers.ts", 'return http.post("/events"'), [
-    "POST /events {type=refund} is served at billing-api/src/routes/events.ts:30",
+  // A method-shorthand resolver that both resolves a query and calls a route: both its rows.
+  assert.deepEqual(await linesFor(ws, "gateway/src/resolvers.ts", "return http.get(`${ORDERS_URL}/orders/${args.id}`);"), [
+    "GET /orders/:id is served at orders-api/src/routes/orders.ts:12",
+    "QUERY order is requested at web-app/src/graphql/order.ts:4",
   ]);
 });
 
 test("naming rule 1: a declared function and a const-bound arrow are found by name", async (t) => {
   const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(204).end();"), [
-    "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17",
-  ]);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(404).json({ error: \"not found\" });"), [GET_ORDER_LINE]);
   assert.deepEqual(await linesFor(ws, "web-app/src/api/orders.ts", "return response.data as Order;"), [
     "GET /orders/:id is served at orders-api/src/routes/orders.ts:12",
   ]);
@@ -122,11 +121,26 @@ test("naming rule 1: a declared function and a const-bound arrow are found by na
 
 test("naming rule 2: a class method and a class field holding an arrow are Class.member", async (t) => {
   const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "web-app/src/api/order-client.ts", "await this.http.post("), [
-    "POST /orders/:id/cancel is served at orders-api/src/routes/orders.ts:40",
+  assert.deepEqual(await linesFor(ws, "web-app/src/billing/client.ts", "await this.http.post("), [
+    "POST /events {type=refund} is served at billing-api/src/routes/events.ts:7",
   ]);
-  assert.deepEqual(await linesFor(ws, "gateway/src/sockets/chat.ts", 'socket.broadcast.emit("chat:message", payload);'), [
-    "CLIENT->SERVER chat:send is called at web-app/src/chat/client.ts:33",
+  assert.deepEqual(await linesFor(ws, "web-app/src/chat/client.ts", 'this.socket.emit("chat:send", { text });'), [
+    "CLIENT->SERVER chat:send is handled at gateway/src/chat.ts:4",
+  ]);
+});
+
+test("the pinned fixture's inline handlers are found by the site written in their call", async (t) => {
+  const ws = await factsWorkspace(t);
+  // An HTTP handler written inline: `router.post("/", ...)` against `POST /orders`, site "/".
+  assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(201).json(created);"), ["POST /orders is called at web-app/src/boot.ts:4"]);
+  // A socket handler inside the connection handler, and the emit inside it.
+  assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", 'io.emit("chat:message", payload);'), [
+    "CLIENT->SERVER chat:send is emitted at web-app/src/chat/client.ts:15",
+    "SERVER->CLIENT chat:message is handled at web-app/src/chat/listen.ts:5",
+  ]);
+  // A pub/sub subscriber written inline.
+  assert.deepEqual(await linesFor(ws, "billing-worker/src/subscribers.ts", "await mirror(message.orderId);"), [
+    "PUBSUB orders.created is published at orders-api/src/events/publish.ts:9",
   ]);
 });
 
@@ -348,7 +362,7 @@ test("text the edit put in that the file holds twice reaches nothing", async (t)
   const ws = await factsWorkspace(t);
   // `return;` is now in both handlers: the text cannot say which one the edit wrote.
   const file = ws.at("orders-api/src/routes/orders.ts");
-  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("res.status(204).end();", "res.status(204).end();\n  return;"));
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("res.status(201).json(created);", "res.status(201).json(created);\n  return;"));
   assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "  return;"), []);
 });
 
@@ -356,7 +370,7 @@ test("an Edit's patch hunks place the change by line, deletions included", async
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");
   const lineOf = (needle: string) => fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes(needle)) + 1;
-  const at = lineOf("res.status(204).end();");
+  const at = lineOf("res.status(201).json(created);");
   const run = await runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
@@ -369,7 +383,7 @@ test("an Edit's patch hunks place the change by line, deletions included", async
     },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
   });
-  assert.equal(context(run.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
+  assert.equal(context(run.stdout), "POST /orders is called at web-app/src/boot.ts:4");
 });
 
 /** Run the post-edit hook for an Edit of `file` whose result carries `hunks`. */
@@ -461,7 +475,7 @@ test("a Write over an existing file, whose changed lines are unknown, prints not
   const run = await payloadEdit(ws, { tool_name: "Write", tool_input: { file_path: file, content: fs.readFileSync(file, "utf8") }, tool_response: { type: "update" } });
   assert.equal(context(run.stdout), "");
   // A Write's result also carries hunks (`structuredPatch`); a Write over a file still says nothing.
-  const at = fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes("res.status(204).end();")) + 1;
+  const at = fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes("res.status(404).json(")) + 1;
   const withHunks = await payloadEdit(
     ws,
     {
@@ -470,7 +484,7 @@ test("a Write over an existing file, whose changed lines are unknown, prints not
       tool_response: {
         type: "update",
         filePath: file,
-        structuredPatch: [{ oldStart: at, oldLines: 1, newStart: at, newLines: 1, lines: ["-  res.status(200).end();", "+  res.status(204).end();"] }],
+        structuredPatch: [{ oldStart: at, oldLines: 1, newStart: at, newLines: 1, lines: ['-    res.status(400).json({ error: "not found" });', '+    res.status(404).json({ error: "not found" });'] }],
       },
     },
     "write-hunks",
@@ -504,14 +518,14 @@ test("Codex apply_patch: its hunks place the change; a hunk that cannot be place
   const ws = await factsWorkspace(t);
   const patch = (body: string[]) => ["*** Begin Patch", "*** Update File: orders-api/src/routes/orders.ts", ...body, "*** End Patch", ""].join("\n");
   const file = ws.at("orders-api/src/routes/orders.ts");
-  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("  res.status(204).end();", "  res.status(205).end();"));
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace('    res.status(404).json({ error: "not found" });', '    res.status(410).json({ error: "not found" });'));
   const placed = await payloadEdit(ws, {
     tool_name: "apply_patch",
-    tool_input: { command: patch(["@@ export async function cancelOrder", '   await db.orders.cancel(req.params["id"]);', "-  res.status(204).end();", "+  res.status(205).end();"]) },
+    tool_input: { command: patch(["@@ export async function getOrder", "   if (!order) {", '-    res.status(404).json({ error: "not found" });', '+    res.status(410).json({ error: "not found" });'] ) },
   });
-  assert.equal(context(placed.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
+  assert.equal(context(placed.stdout), GET_ORDER_LINE);
   // The hunk's new text is nowhere in the file: nothing.
-  const lost = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: patch(["@@", "-  res.status(204).end();", "+  res.status(299).end();"]) } }, "lost");
+  const lost = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: patch(["@@", "-  res.status(201).json(created);", "+  res.status(299).json(created);"]) } }, "lost");
   assert.equal(context(lost.stdout), "");
   // `*** Add File` of a file git does not track: every thing in it counts.
   gitRepo(ws, "orders-api");
@@ -525,7 +539,7 @@ test("Codex apply_patch: its hunks place the change; a hunk that cannot be place
 test("a file over 512 KB is skipped: a 2 MB generated file returns in under 50 ms", async (t) => {
   const ws = await factsWorkspace(t);
   // Warm `node:sqlite` so the timing is the file's.
-  await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(204).end();");
+  await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(201).json(created);");
   const file = ws.at("orders-api/src/routes/generated.ts");
   const parts: string[] = [];
   let size = 0;
@@ -564,7 +578,7 @@ test("a fact file's repo maps to a checkout only by its exact remote, else its e
 
 test("a fact file for another project is not read", async (t) => {
   const ws = await factsWorkspace(t);
-  const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(204).end();"] };
+  const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(201).json(created);"] };
   assert.equal((await factLines(ws.root, [edited], undefined)).lines.length, 1);
   fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "another" }] } }));
   assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
@@ -738,10 +752,7 @@ test("an edit inside a handler prints where it is called, once per session", asy
   assert.equal(first.code, 0);
   // Some Node 24 releases warn when `node:sqlite` loads; a hook's stderr stays clean.
   assert.doesNotMatch(first.stderr, /ExperimentalWarning/);
-  assert.equal(
-    context(first.stdout),
-    "GET /orders/:id is called at web-app/src/api/orders.ts:8, web-app/src/dashboard/setup.ts:21, billing-worker/src/sync.ts:5",
-  );
+  assert.equal(context(first.stdout), GET_ORDER_LINE);
   const second = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);');
   assert.equal(context(second.stdout), "");
   // Another session hears it again.
@@ -751,8 +762,8 @@ test("an edit inside a handler prints where it is called, once per session", asy
 
 test("an edit at a consumer call prints where it is served", async (t) => {
   const ws = await factsWorkspace(t);
-  const run = await edit(ws, ws.at("web-app/src/chat/client.ts"), 'socket.emit("chat:send", { text });');
-  assert.equal(context(run.stdout), "CLIENT->SERVER chat:send is served at gateway/src/sockets/chat.ts:14");
+  const run = await edit(ws, ws.at("web-app/src/chat/client.ts"), 'this.socket.emit("chat:send", { text });');
+  assert.equal(context(run.stdout), "CLIENT->SERVER chat:send is handled at gateway/src/chat.ts:4");
 });
 
 test("the handler moved 30 lines on the branch: the line still prints, found by name", async (t) => {
@@ -760,7 +771,7 @@ test("the handler moved 30 lines on the branch: the line still prints, found by 
   const file = ws.at("orders-api/src/routes/orders.ts");
   fs.writeFileSync(file, `${"// moved\n".repeat(30)}${fs.readFileSync(file, "utf8")}`);
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);');
-  assert.match(context(run.stdout), /^GET \/orders\/:id is called at web-app\/src\/api\/orders\.ts:8/);
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
 });
 
 test("the handler was renamed on the branch: nothing prints", async (t) => {
@@ -832,7 +843,7 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
   assert.equal(await refreshFacts(ws.root, { request, env }), "written");
   assert.equal(calls[1]!.auth, null, "the staged URL is fetched without the credential");
   assert.deepEqual(await linesFor(ws, "orders-api/src/events/publish.ts", 'await bus.publish("orders.created"'), [
-    "PUBSUB orders.created is served at billing-worker/src/subscribers/created.ts:7",
+    "PUBSUB orders.created is handled at billing-worker/src/subscribers.ts:5",
   ]);
   assert.equal(await refreshFacts(ws.root, { request, env }), "unchanged");
   assert.equal(calls.length, 3);
@@ -857,7 +868,7 @@ test("with a fact file, a problem line from the probe still prints, beside the o
   const text = context(run.stdout);
   assert.match(text, /contract problem/);
   assert.match(text, /type_mismatch/);
-  assert.match(text, /\n\nGET \/orders\/:id is called at web-app\/src\/api\/orders\.ts:8/);
+  assert.ok(text.endsWith(`\n\n${GET_ORDER_LINE}`), text);
 });
 
 test("the timing record carries facts_ms", async (t) => {
@@ -934,8 +945,8 @@ function worktree(ws: FactsWorkspace, repo: string, branch: string): string {
 test("an edit in a worktree path maps to its repo's rows", async (t) => {
   const ws = await factsWorkspace(t);
   const top = worktree(ws, "orders-api", "my-branch");
-  const run = await edit(ws, path.join(top, "src", "routes", "orders.ts"), "res.status(204).end();", { cwd: ws.at("orders-api") });
-  assert.equal(context(run.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
+  const run = await edit(ws, path.join(top, "src", "routes", "orders.ts"), "res.status(201).json(created);", { cwd: ws.at("orders-api") });
+  assert.equal(context(run.stdout), "POST /orders is called at web-app/src/boot.ts:4");
 });
 
 test("a file another session wrote in another worktree prints nothing here", async (t) => {

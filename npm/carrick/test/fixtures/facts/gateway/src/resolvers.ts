@@ -1,9 +1,9 @@
 import { http } from "./http";
 
-export const resolvers = {
-  Mutation: {
-    async refund(_parent: unknown, args: { orderId: string }) {
-      return http.post("/events", { type: "refund", orderId: args.orderId });
-    },
+const ORDERS_URL = process.env["ORDERS_URL"];
+
+export const orderResolvers = {
+  async order(_parent: unknown, args: { id: string }) {
+    return http.get(`${ORDERS_URL}/orders/${args.id}`);
   },
 };

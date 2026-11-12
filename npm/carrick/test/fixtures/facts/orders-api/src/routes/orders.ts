@@ -5,7 +5,7 @@ import { db } from "../db";
 export const router = Router();
 
 // Reads one order by id.
-// The handler below is registered on the router at the end of this file.
+// The handler below is registered on the router further down.
 
 /* A block comment with a brace { that is not code. */
 export async function getOrder(req: Request, res: Response): Promise<void> {
@@ -17,10 +17,10 @@ export async function getOrder(req: Request, res: Response): Promise<void> {
   res.json(order);
 }
 
-export async function cancelOrder(req: Request, res: Response): Promise<void> {
-  await db.orders.cancel(req.params["id"]);
-  res.status(204).end();
-}
+router.get("/:id", getOrder);
 
-router.get("/orders/:id", getOrder);
-router.post("/orders/:id/cancel", cancelOrder);
+// Creates an order; this handler is written inline, so it has no name.
+router.post("/", async (req: Request, res: Response) => {
+  const created = await db.orders.create(req.body);
+  res.status(201).json(created);
+});
