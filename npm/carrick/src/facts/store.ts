@@ -339,7 +339,11 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       CREATE TABLE pkgs (id INTEGER PRIMARY KEY, package TEXT, services TEXT, text TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
-    const commits = Object.fromEntries((header.repos ?? []).map((repo) => [repo.repo, repo.commit]));
+    // Each repo's index commit, which the peer proof checks files against
+    // (`peers.ts`). A repo whose services name different commits has none.
+    const named = new Map<string, Set<unknown>>();
+    for (const entry of header.repos ?? []) named.set(entry.repo, (named.get(entry.repo) ?? new Set()).add(entry.commit));
+    const commits = Object.fromEntries([...named].filter(([, seen]) => seen.size === 1).map(([repo, seen]) => [repo, [...seen][0]]));
     for (const [key, value] of Object.entries({
       project: header.project_slug,
       digest: header.digest,

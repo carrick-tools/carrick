@@ -43,11 +43,13 @@ async function factsWorkspace(
     const slug = (JSON.parse(ndjson.slice(0, ndjson.indexOf("\n"))) as { project_slug: string }).project_slug;
     fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
     fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: slug }] } }));
-    // Each fixture repo committed, and the header naming its commit.
+    // Each fixture repo committed, and the header naming its commit. A repo
+    // the fixture has no folder for is not checked out here, so not mapped.
+    const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
     await buildFacts(
-      commitRepos(root, ndjson, REPOS),
+      commitRepos(root, ndjson, local),
       factsPath(root),
-      REPOS.map((repo) => ({ repo, path: path.join(root, repo) })),
+      local.map((repo) => ({ repo, path: path.join(root, repo) })),
       options.fetchedAt ?? new Date().toISOString(),
     );
   }
@@ -1044,8 +1046,10 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
   fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
   fs.writeFileSync(
     path.join(ws.root, ".carrick", "index.json"),
-    JSON.stringify({ repos: REPOS.map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }),
+    JSON.stringify({ repos: REPOS.filter((repo) => fs.existsSync(ws.at(repo))).map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }),
   );
+  // The fixture repos committed; the served file's header names those commits.
+  const wire = commitRepos(ws.root, fs.readFileSync(WIRE, "utf8"), REPOS.filter((repo) => fs.existsSync(ws.at(repo))));
   const { gzipSync } = await import("node:zlib");
   const calls: Array<{ url: string; auth: string | null }> = [];
   const request = (async (url: string, init?: RequestInit) => {
@@ -1056,7 +1060,7 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
       if (body.known_digest) return new Response(JSON.stringify({ unchanged: true }));
       return new Response(JSON.stringify({ staged_url: "https://facts.s3.eu-west-1.amazonaws.com/x?sig=1", digest: "d", schema: 1, writer: 1, bytes: 1 }));
     }
-    return new Response(gzipSync(fs.readFileSync(WIRE)));
+    return new Response(gzipSync(wire));
   }) as typeof fetch;
   const env = { ...process.env, CARRICK_TOKEN: "t" };
   assert.equal(await refreshFacts(ws.root, { request, env }), "written");

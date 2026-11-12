@@ -10,8 +10,8 @@
 // its file still scans cleanly and declares exactly that name.
 
 import path from "node:path";
-import { scanFile } from "../lines.ts";
 import type { Candidate } from "../lines.ts";
+import type { FileMemo } from "../files.ts";
 import { scanSource } from "../match.ts";
 import type { Scan } from "../match.ts";
 import type { FactStore } from "../store.ts";
@@ -84,6 +84,7 @@ export function sameNameLines(
   scan: Scan,
   change: Change,
   jsx: boolean,
+  memo: FileMemo,
 ): Candidate[] {
   const names = addedNames(text, scan, change, jsx);
   if (names === null) return [];
@@ -103,7 +104,7 @@ export function sameNameLines(
     // scanner: gone, rewritten, only importing it, or not scanning cleanly,
     // the function may have moved into this file. Checked only for a line
     // about to print.
-    const holds = (): boolean => scanFile(other)?.spans.some((span) => span.name === name) ?? false;
+    const holds = (): boolean => memo.scanned(other)?.scan.spans.some((span) => span.name === name) ?? false;
     out.push({ key: `name::${name}`, text: first.text, named: [other], holds });
   }
   return out;

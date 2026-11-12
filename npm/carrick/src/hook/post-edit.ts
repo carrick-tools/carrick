@@ -24,7 +24,7 @@ import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import fs from "node:fs";
 import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
-import { MAX_FACT_FILE_BYTES } from "../facts/lines.ts";
+import { MAX_FACT_FILE_BYTES } from "../facts/files.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";

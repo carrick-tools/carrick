@@ -11,7 +11,8 @@
 // pair is not unique in the file, or the row has no site, nothing prints.
 //
 // Each row is said once per session, claimed only once delivered (the caller
-// calls `markFacts` after printing). Never throws.
+// calls `markFacts` after printing). An op or fn line prints only while the
+// peer files it names read as at the index commit (`peers.ts`). Never throws.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -19,30 +20,21 @@ import { performance } from "node:perf_hooks";
 import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
 import { linkedCheckoutTop } from "../hook/worktree.ts";
-import { gapsOfLines, rangesOf, rangesOfLines, scanSource, touched } from "./match.ts";
-import type { CallSpan, Scan } from "./match.ts";
+import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
+import type { CallSpan } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
+import type { FactRow, FactStore, LocalRepo } from "./store.ts";
+import { fileMemo, isJsx, SCANNED } from "./files.ts";
+import { commitsOf, peersUnchanged } from "./peers.ts";
+import type { PeerContext } from "./peers.ts";
 import { sameNameLines } from "./rules/same-name.ts";
 import { isManifest, packageLines } from "./rules/packages.ts";
-
-/** A file's text, or null when it is unreadable or over `MAX_FACT_FILE_BYTES`. */
-function readSmall(file: string): string | null {
-  try {
-    return fs.statSync(file).size > MAX_FACT_FILE_BYTES ? null : fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-}
-import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
 
 /** At most this many fact lines for one action. */
 export const MAX_FACT_LINES = 3;
-
-/** A file larger than this gets no fact lines (and is not read). */
-export const MAX_FACT_FILE_BYTES = 512 * 1024;
 
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
@@ -62,9 +54,6 @@ export type FactEdit = {
   snippets?: string[] | null;
   whole?: boolean;
 };
-
-/** The files the declaration scanner reads. */
-const SCANNED = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 export type FactOutcome = {
   lines: string[];
@@ -92,15 +81,6 @@ export type FactOutcome = {
  */
 export type Candidate = { key: string; text: string; named: string[]; holds?: () => boolean };
 
-/** The declaration scan of `file`, or null when it is not a file the scanner reads, is unreadable, too large, or does not scan cleanly. */
-export function scanFile(file: string): Scan | null {
-  if (!SCANNED.test(file)) return null;
-  const text = readSmall(file);
-  if (text === null) return null;
-  const scan = scanSource(text, isJsx(file));
-  return scan.ok ? scan : null;
-}
-
 /** The row kinds in the order their lines print, before the cap of `MAX_FACT_LINES`. */
 const KINDS = ["op", "fn", "name", "pkg"] as const;
 
@@ -121,10 +101,6 @@ function mainCheckoutOf(worktreeTop: string): string | null {
   } catch {
     return null;
   }
-}
-
-function isJsx(file: string): boolean {
-  return /\.(tsx|jsx)$/.test(file);
 }
 
 function real(dir: string): string {
@@ -258,6 +234,18 @@ export async function factLines(
     stale = !Number.isFinite(fetched) || now - fetched > FACTS_STALE_MS;
     const said = session ? factsSaid(session, options.home) : new Set<string>();
     const where = new Map(store.repos.map((entry) => [entry.repo, entry.path]));
+    // One memo of file reads and scans for the whole call, shared by every rule.
+    const memo = fileMemo();
+    const commits = commitsOf(store.meta);
+    const proofs: PeerContext["proofs"] = new Map();
+    // The peer proof's git failure, shared across the call's edited files.
+    const git = { failed: false };
+    const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
+      const ctx: PeerContext = { at, where, commits, memo, env: options.env, proofs, gitFailed: git.failed };
+      const answer = peersUnchanged(others, ctx);
+      git.failed = ctx.gitFailed;
+      return answer;
+    };
     const pathsOf = (others: ReadonlyArray<{ repo: string; file: string }>): string[] =>
       others.flatMap((other) => {
         const base = where.get(other.repo);
@@ -278,7 +266,7 @@ export async function factLines(
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       if (isManifest(edit.file)) {
-        const manifest = readSmall(edit.file);
+        const manifest = memo.text(edit.file);
         if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit));
         continue;
       }
@@ -287,19 +275,14 @@ export async function factLines(
       // Changed lines not known (a Write over a file, a shell write, a patch
       // hunk that cannot be placed): nothing is said.
       if (!byLine && !edit.snippets && !edit.whole) continue;
-      let text: string;
-      try {
-        // A file this large is generated or bundled: never read in a hook's time.
-        if (fs.statSync(edit.file).size > MAX_FACT_FILE_BYTES) continue;
-        text = fs.readFileSync(edit.file, "utf8");
-      } catch {
+      // A file over `MAX_FACT_FILE_BYTES` is generated or bundled: never read
+      // in a hook's time. One that does not scan cleanly says nothing.
+      const read = memo.scanned(edit.file);
+      if (read === null) {
+        log(`${at.rel} was not read cleanly; no fact lines for it`);
         continue;
       }
-      const scan: Scan = scanSource(text, isJsx(edit.file));
-      if (!scan.ok) {
-        log(`${at.rel} did not read cleanly; no fact lines for it`);
-        continue;
-      }
+      const { text, scan } = read;
       const ranges = byLine
         ? rangesOfLines(text, edit.lines ?? [])
         : edit.snippets
@@ -333,7 +316,7 @@ export async function factLines(
           const unnamed = facts.unnamed(at.repo, at.rel);
           if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
         }
-        return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others) }));
+        return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others), holds: peersHold(at, row.others) }));
       });
       // The functions' callers in other files: only the row in this file.
       // When the fact file holds callers at all and the lookup ran for a
@@ -343,11 +326,11 @@ export async function factLines(
           facts
             .callers(at.repo, name)
             .filter((fn) => fn.file === at.rel)
-            .map((fn) => ({ key: `fn::${fn.repo}::${fn.file}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) })),
+            .map((fn) => ({ key: `fn::${fn.repo}::${fn.file}::${fn.name}`, text: fn.text, named: pathsOf(fn.others), holds: peersHold(at, fn.others) })),
         ),
       );
       if (callersRan && facts.hasCallers && names.length > 0) callersRead.push(edit.file);
-      isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file)));
+      isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file), memo));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
     for (const kind of KINDS) {

@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
@@ -20,7 +21,8 @@ const REPOS = ["api", "web"];
 
 type Ws = { root: string; home: string; at: (rel: string) => string };
 
-const header = () =>
+/** The header; `commits` replaces each repo's commit, and a repo it maps to null is left out. */
+const header = (commits: Record<string, string | null> = {}) =>
   JSON.stringify({
     schema: 1,
     writer: 1,
@@ -28,11 +30,12 @@ const header = () =>
     project_slug: SLUG,
     digest: "d1",
     built_at: "2026-01-01T00:00:00Z",
-    repos: REPOS.map((repo) => ({ repo, service: repo, commit: "1" })),
+    repos: REPOS.filter((repo) => commits[repo] !== null).map((repo) => ({ repo, service: repo, commit: commits[repo] ?? "1" })),
     counts: { rows: 0, producers: 0, consumers: 0 },
   });
 
-const ndjson = (rows: Array<Record<string, unknown>>) => `${[header(), ...rows.map((row) => JSON.stringify(row))].join("\n")}\n`;
+const ndjson = (rows: Array<Record<string, unknown>>, commits: Record<string, string | null> = {}) =>
+  `${[header(commits), ...rows.map((row) => JSON.stringify(row))].join("\n")}\n`;
 
 /** A workspace with `files` written and, unless `rows` is null, a fact file built from them. */
 async function workspace(
@@ -64,7 +67,7 @@ async function workspace(
 type Hunk = { newStart: number; lines: string[] };
 
 /** Run post-edit for an Edit of `file` whose result carries `hunks`. */
-function patchEdit(ws: Ws, file: string, hunks: Hunk[], options: { session?: string; probe?: string; argvLog?: string } = {}) {
+function patchEdit(ws: Ws, file: string, hunks: Hunk[], options: { session?: string; probe?: string; argvLog?: string; env?: Record<string, string> } = {}) {
   return runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
@@ -79,6 +82,7 @@ function patchEdit(ws: Ws, file: string, hunks: Hunk[], options: { session?: str
       CLAUDE_PROJECT_DIR: ws.root,
       CARRICK_FAKE_FIXTURE: fixturePath(options.probe ?? "check-silent.json"),
       ...(options.argvLog ? { CARRICK_FAKE_ARGV_LOG: options.argvLog } : {}),
+      ...options.env,
     }),
   });
 }
@@ -286,7 +290,8 @@ test("an old local fact file without the new tables is rebuilt, not read", async
   }
   db.close();
   assert.notEqual(factsPath(ws.root), old);
-  fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: REPOS.map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }));
+  // Only `api` is checked out here; `web`, where the caller sits, is not.
+  fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: [] }] }));
   const { gzipSync } = await import("node:zlib");
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (url: string, init?: RequestInit) => {
@@ -694,4 +699,77 @@ test("post-edit with a non-string file_path exits 0 without throwing", async (t)
   assert.equal(run.code, 0, run.stderr);
   // Guarded, not caught by main's wrap: an owed late answer is still delivered.
   assert.doesNotMatch(run.stderr, /post-edit failed/);
+});
+
+// ---- Peer files proven unchanged since the index commit (R33.1, R33.2) ----
+
+const PAGE = ["export function render() {", "  const id = '1';", "  return loadOrder(id);", "}", ""].join("\n");
+const PEER = { service: "web", repo: "web", file: "src/page.ts", line: 3 };
+const OP_PEER = { ...OP_LOAD, others: [PEER], text: "GET /orders is called at web/src/page.ts:3" };
+const FN_PEER = { ...fnRow("loadOrder", LOAD_LINE), others: [{ repo: "web", file: "src/page.ts", line: 3, name: "render" }] };
+
+/** The edit inside `loadOrder` as the change post-edit hands on. */
+function inLoadOrder(ws: Ws): { file: string; lines: number[]; removed: number[]; removedText: string[] } {
+  const file = ws.at("api/src/orders.ts");
+  return { file, lines: [lineOf(file, "const key")], removed: [], removedText: [] };
+}
+
+/** Build the fact file again from `rows`, the header naming `commits` (a repo mapped to null left out). */
+async function rebuild(ws: Ws, rows: Array<Record<string, unknown>>, commits: Record<string, string | null>): Promise<void> {
+  const local = REPOS.filter((repo) => fs.existsSync(ws.at(repo)));
+  await buildFacts(ndjson(rows, commits), factsPath(ws.root), local.map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
+}
+
+test("R33.2: op and fn lines print while the peer file reads as at the index commit, and not once it is edited", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
+  // Another agent edited the caller after the index commit: its line there is not proven.
+  fs.writeFileSync(ws.at("web/src/page.ts"), `// moved down\n${PAGE}`);
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R33.2: a peer file gone from disk is silent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+  fs.rmSync(ws.at("web/src/page.ts"));
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R33.2: a commit the clone does not hold, a commit that is not a full id, and no commit are silent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+  for (const commit of ["a".repeat(40), "HEAD", null]) {
+    await rebuild(ws, [OP_PEER, FN_PEER], { web: commit });
+    assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], String(commit));
+  }
+});
+
+test("R33.1: a peer in a repo not checked out here is stated from the index", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER]);
+  assert.equal(fs.existsSync(ws.at("web")), false);
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
+});
+
+test("R33.2: a peer in the edited file's own repo is proven in its checkout", async (t) => {
+  const jobs = { repo: "api", file: "src/jobs.ts", line: 1, name: "run" };
+  const row = { ...fnRow("loadOrder", LOAD_LINE), others: [jobs] };
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "api/src/jobs.ts": "export function run() {\n  return loadOrder('1');\n}\n" }, [row]);
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [LOAD_LINE]);
+  fs.appendFileSync(ws.at("api/src/jobs.ts"), "// edited\n");
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R33.2: git slower than its budget is silent, and the hook exits 0", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
+  // A git that takes 3 s to list a tree, and is the real one otherwise.
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-slow-git-"));
+  t.after(() => fs.rmSync(shim, { recursive: true, force: true }));
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\nfor arg in "$@"; do [ "$arg" = ls-tree ] && sleep 3; done\nexec ${real} "$@"\n`, { mode: 0o755 });
+  const file = ws.at("api/src/orders.ts");
+  const hunk = { newStart: lineOf(file, "const key"), lines: ["+  const key = `order:${id}`;"] };
+  const fast = await patchEdit(ws, file, [hunk], { session: "fast" });
+  assert.equal(context(fast.stdout), LOAD_LINE);
+  const slow = await patchEdit(ws, file, [hunk], { session: "slow", env: { PATH: `${shim}${path.delimiter}${process.env["PATH"] ?? ""}`, CARRICK_FACTS_DIFF_BUDGET_MS: "300" } });
+  assert.equal(slow.code, 0, slow.stderr);
+  assert.equal(context(slow.stdout), "");
+  assert.ok(slow.ms < 2500, `the hook waited ${slow.ms} ms`);
 });
