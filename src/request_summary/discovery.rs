@@ -3772,6 +3772,109 @@ mod tests {
         }
     }
 
+    /// The unread sites of `on`'s walk with no implementations followed, after
+    /// `ask` answered the implementations question as given.
+    fn unread_after_ask(
+        on: &super::super::fixture_walk::Walked,
+        ask: Result<Vec<crate::services::type_sidecar::ImplementationsAnswer>, &'static str>,
+    ) -> Vec<crate::unread_sites::UnreadSite> {
+        let exports = claims();
+        let asked = super::super::implementations::implementations_of(&on.inputs, |_| ask);
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let unread = crate::unread_sites::from_scan(
+            &discovery,
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &on.repo,
+        );
+        crate::unread_sites::with_unanswered_implementations(unread, &asked.unanswered, &on.repo)
+    }
+
+    const ASKED_CALLS: [(&str, &str); 3] = [
+        ("one-impl.ts", "notifier.notify"),
+        ("two-impls.ts", "channels[kind].push"),
+        ("handler-table.ts", "live.send"),
+    ];
+
+    /// An ask that died saves each call through an interface member
+    /// `unanswered` beside `interface_member`: nothing was searched.
+    #[test]
+    fn a_failed_implementations_ask_saves_its_sites_unanswered() {
+        let on = walked("implementations", "services/web", "web", &[], true)
+            .expect("the implementations fixture walks: a skipped test proves nothing");
+        let unread = unread_after_ask(&on, Err("process died"));
+        for (file, callee) in ASKED_CALLS {
+            let rows: Vec<_> = unread
+                .iter()
+                .filter(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee))
+                .collect();
+            assert_eq!(rows.len(), 1, "{file} {callee} is one unread site");
+            assert_eq!(rows[0].reason, Stop::InterfaceMember);
+            assert_eq!(rows[0].also, [Stop::Unanswered], "{file} {callee}");
+        }
+    }
+
+    /// An ask that answered and found nothing is a real `interface_member`
+    /// stop: it adds nothing.
+    #[test]
+    fn an_answered_ask_that_found_none_adds_nothing() {
+        let on = walked("implementations", "services/web", "web", &[], true)
+            .expect("the implementations fixture walks: a skipped test proves nothing");
+        let count = on.inputs.implementation_queries().len();
+        assert!(count >= ASKED_CALLS.len(), "the fixture asks its calls");
+        let none = || crate::services::type_sidecar::ImplementationsAnswer {
+            declaration: None,
+            implementations: Vec::new(),
+            too_many: false,
+            reason: None,
+        };
+        let unread = unread_after_ask(&on, Ok((0..count).map(|_| none()).collect()));
+        for (file, callee) in ASKED_CALLS {
+            let rows: Vec<_> = unread
+                .iter()
+                .filter(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee))
+                .collect();
+            assert_eq!(rows.len(), 1, "{file} {callee} is one unread site");
+            assert_eq!(rows[0].reason, Stop::InterfaceMember);
+            assert!(
+                rows[0].also.is_empty(),
+                "{file} {callee}: {:?}",
+                rows[0].also
+            );
+        }
+    }
+
+    /// A row at an asked span whose primary reason is not `interface_member`
+    /// is left alone.
+    #[test]
+    fn a_row_with_another_reason_at_an_asked_span_is_untouched() {
+        let on = walked("implementations", "services/web", "web", &[], true)
+            .expect("the implementations fixture walks: a skipped test proves nothing");
+        let asked = super::super::implementations::implementations_of(&on.inputs, |_| {
+            Err::<Vec<_>, _>("process died")
+        });
+        let exports = claims();
+        let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
+        let mut unread = crate::unread_sites::from_scan(
+            &discovery,
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &on.repo,
+        );
+        unread.retain(|row| row.reason == Stop::InterfaceMember);
+        unread.truncate(1);
+        assert_eq!(unread.len(), 1, "the walk saved an interface_member site");
+        unread[0].reason = Stop::MissedInside;
+        let kept = crate::unread_sites::with_unanswered_implementations(
+            unread,
+            &asked.unanswered,
+            &on.repo,
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].reason, Stop::MissedInside);
+        assert!(kept[0].also.is_empty());
+    }
+
     /// carrick#2432 slice B: an implementation the walk cannot enter (one
     /// only a `.d.ts` declares, or a property that is no function) is not
     /// silently dropped. A call whose only implementations are like that

@@ -41,6 +41,11 @@ pub struct Implementations {
     by_call: HashMap<(PathBuf, u32, u32), Followed>,
     /// How many calls were asked about, for the run log.
     pub asked: usize,
+    /// The calls (file as walked, SWC span) whose question got no answer:
+    /// the ask failed or came back short. Their `interface_member` stops are
+    /// saved `unanswered` beside it ([`crate::unread_sites::with_unanswered_implementations`]).
+    /// Empty when the sidecar answered, including answers that found nothing.
+    pub unanswered: Vec<(PathBuf, u32, u32)>,
 }
 
 impl Implementations {
@@ -68,6 +73,7 @@ impl Implementations {
         Implementations {
             by_call,
             asked: count,
+            unanswered: Vec::new(),
         }
     }
 
@@ -104,6 +110,7 @@ pub fn implementations_of<E: std::fmt::Display>(
             );
             Implementations {
                 asked: queries.len(),
+                unanswered: calls,
                 ..Default::default()
             }
         }
@@ -111,6 +118,7 @@ pub fn implementations_of<E: std::fmt::Display>(
             tracing::warn!(%error, "implementations: the ask failed; calls through an interface member stay stops");
             Implementations {
                 asked: queries.len(),
+                unanswered: calls,
                 ..Default::default()
             }
         }

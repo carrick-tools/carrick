@@ -145,6 +145,17 @@ impl UnreadSite {
         }
     }
 
+    /// `unanswered` beside the row's own reason, once, when the row has room
+    /// (#3952's merge, shared by every ask that died without an answer).
+    fn also_unanswered(&mut self) {
+        if self.reason != Stop::Unanswered
+            && !self.also.contains(&Stop::Unanswered)
+            && self.also.len() < 4
+        {
+            self.also.push(Stop::Unanswered);
+        }
+    }
+
     /// A discovery record of a call whose walk stopped with `reason`.
     fn of_discovery(site: &DiscoverySite, reason: Stop) -> Self {
         UnreadSite {
@@ -340,12 +351,7 @@ pub fn with_unanswered(
             continue;
         }
         if let Some(held) = stops.iter_mut().find(|row| row.at() == at) {
-            if held.reason != Stop::Unanswered
-                && !held.also.contains(&Stop::Unanswered)
-                && held.also.len() < 4
-            {
-                held.also.push(Stop::Unanswered);
-            }
+            held.also_unanswered();
             continue;
         }
         let path: Vec<&str> = std::iter::once(site.export.as_str())
@@ -398,6 +404,28 @@ pub(crate) fn of_decorator_path(
         ends: Vec::new(),
         listed: false,
     }
+}
+
+/// The calls through an interface member whose implementations the scan
+/// asked for and got no answer to (a failed or short ask,
+/// [`crate::request_summary::implementations::Implementations::unanswered`]).
+/// A site saved at one of those spans with `interface_member` as its reason
+/// gains `unanswered` in `also`; its reason stays. A site there with any
+/// other reason is left alone, and no site is added.
+pub fn with_unanswered_implementations(
+    mut stops: Vec<UnreadSite>,
+    asked: &[(std::path::PathBuf, u32, u32)],
+    root: &Path,
+) -> Vec<UnreadSite> {
+    for (file, lo, hi) in asked {
+        let file = crate::site_rows::relative(root, &file.to_string_lossy());
+        for row in stops.iter_mut().filter(|row| {
+            row.reason == Stop::InterfaceMember && row.at() == (file.as_str(), *lo, *hi)
+        }) {
+            row.also_unanswered();
+        }
+    }
+    stops
 }
 
 /// A saved site that reached a decorator export: where it is, and what the
