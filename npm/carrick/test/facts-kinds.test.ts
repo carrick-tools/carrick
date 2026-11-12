@@ -571,3 +571,15 @@ test("fn: an Edit in one function, then lines prepended to the file, names no fu
   const hunk = { newStart: 6, lines: ["+  return 2;"] };
   assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
 });
+
+// ---- A non-string file_path (ruling 7) ----
+
+test("post-edit with a non-string file_path exits 0 without throwing", async () => {
+  const run = await runHook("post-edit.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "num", cwd: os.tmpdir(), tool_input: { file_path: 123 } },
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_LOG_QUIET: "0" }),
+  });
+  assert.equal(run.code, 0, run.stderr);
+  // Guarded, not caught by main's wrap: an owed late answer is still delivered.
+  assert.doesNotMatch(run.stderr, /post-edit failed/);
+});

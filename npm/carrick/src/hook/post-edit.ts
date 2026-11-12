@@ -80,6 +80,8 @@ type Payload = {
 export function filesFromPayload(payload: Payload): string[] {
   const input = payload.tool_input ?? {};
   const named = input.file_path ?? input.filePath ?? input.edits?.[0]?.file_path ?? null;
+  // A payload naming its file with a non-string (`file_path: 123`) names none of ours.
+  if (named !== null && typeof named !== "string") return [];
   if (named) return [named];
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
 }
