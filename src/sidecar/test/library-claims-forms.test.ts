@@ -283,9 +283,9 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
 
     it('known gap: a name-only receive whose processor accepts a string stays ambiguous', () => {
       // The unassigned processor (`string | URL | null | fn`) competes with the
-      // name and a positional cannot be labelled. Admitting it needs a
-      // name-rule exception in the judge (nameSiblings), parked with its own
-      // ruling (carrick-cloud#3139). Flip this when that change lands.
+      // name and a positional cannot be labelled. The claim states the
+      // processor as `handler: { arg: 1, or_file: true }` instead
+      // (library-claims-or-file.test.ts); the name-only form stays ambiguous.
       assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 } })), 'failed name_ambiguous');
     });
 

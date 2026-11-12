@@ -1594,17 +1594,20 @@ function placementInvalid(claim: LibraryClaim): boolean {
   return of === undefined || (of.maker === undefined && of.scope === undefined && of.type === undefined);
 }
 
+/** The slots a claim's name sits at: one slot, or each of its parts. */
+function nameSlots(claim: LibraryClaim): (ClaimSlot | undefined)[] {
+  const name = (claim as { name?: unknown }).name;
+  if (typeof name !== 'object' || name === null) return [];
+  if ('parts' in name) return [...(name as { parts: ClaimSlot[] }).parts];
+  return 'arg' in name ? [name as ClaimSlot] : [];
+}
+
 /**
  * `handle: true` sits only on a scope's `mounts` (K1a); on any other slot
  * the claim is `claim_invalid`. `handle: false` is no flag.
  */
 function handleMisplaced(claim: LibraryClaim): boolean {
-  const slots: (ClaimSlot | undefined)[] = [];
-  const name = (claim as { name?: unknown }).name;
-  if (typeof name === 'object' && name !== null) {
-    if ('parts' in name) slots.push(...(name as { parts: ClaimSlot[] }).parts);
-    else if ('arg' in name) slots.push(name as ClaimSlot);
-  }
+  const slots = nameSlots(claim);
   if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.handler, claim.runs);
   if (claim.kind === 'scope') slots.push(claim.runs, claim.merges);
   if (claim.kind === 'op') {
@@ -1619,12 +1622,7 @@ function handleMisplaced(claim: LibraryClaim): boolean {
  * `claim_invalid`. `or_file: false` is no flag.
  */
 function orFileMisplaced(claim: LibraryClaim): boolean {
-  const slots: (ClaimSlot | undefined)[] = [];
-  const name = (claim as { name?: unknown }).name;
-  if (typeof name === 'object' && name !== null) {
-    if ('parts' in name) slots.push(...(name as { parts: ClaimSlot[] }).parts);
-    else if ('arg' in name) slots.push(name as ClaimSlot);
-  }
+  const slots = nameSlots(claim);
   if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.runs);
   if (claim.kind === 'scope') slots.push(claim.runs, claim.merges, claim.mounts);
   if (claim.kind === 'op') slots.push(claim.payload, claim.ack, claim.options, claim.method_key, claim.base);
