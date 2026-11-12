@@ -77,6 +77,16 @@ function ownerName(remote: string): string {
   return splitRemote(remote)?.name ?? remote;
 }
 
+/** Whether a staged URL is https on an `amazonaws.com` host (a presigned S3 URL). */
+function stagedUrlAllowed(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.hostname.endsWith(".amazonaws.com");
+  } catch {
+    return false;
+  }
+}
+
 async function knownDigest(root: string): Promise<string | null> {
   const file = factsPath(root);
   if (!fs.existsSync(file)) return null;
@@ -143,6 +153,11 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const url = answer["staged_url"];
     if (typeof url !== "string") {
       log("facts answer carries no staged_url");
+      return "none";
+    }
+    // The staged file is fetched with no credential, so only from where the cloud stages it.
+    if (!stagedUrlAllowed(url)) {
+      log("facts staged_url is not an https amazonaws.com URL; not fetched");
       return "none";
     }
     const staged = await request(url, { redirect: "error", signal: AbortSignal.timeout(60_000) });

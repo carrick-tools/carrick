@@ -541,6 +541,24 @@ test("a fact file for another project is not read", async (t) => {
   assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
 });
 
+test("a staged URL is fetched only over https from an amazonaws.com host", async (t) => {
+  const ws = await factsWorkspace(t, { ndjson: null });
+  fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
+  const env = { ...process.env, CARRICK_TOKEN: "t" };
+  for (const staged of ["https://s3.example/x", "http://facts.s3.amazonaws.com/x", "https://evil.example/.amazonaws.com/x", "https://amazonaws.com.evil.example/x", "not a url"]) {
+    const fetched: string[] = [];
+    const request = (async (url: string) => {
+      fetched.push(url);
+      if (url.endsWith("/mcp/facts")) return new Response(JSON.stringify({ staged_url: staged, digest: "d", schema: 1, writer: 1, bytes: 1 }));
+      return new Response(fs.readFileSync(WIRE));
+    }) as typeof fetch;
+    assert.equal(await refreshFacts(ws.root, { request, env }), "none", staged);
+    assert.equal(fetched.length, 1, `${staged} is not fetched`);
+    assert.equal(fs.existsSync(factsPath(ws.root)), false);
+  }
+});
+
 test("a failed build leaves no temp file behind", async (t) => {
   const ws = await factsWorkspace(t, { ndjson: null });
   const dest = factsPath(ws.root);
@@ -727,7 +745,7 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
     if (url.endsWith("/mcp/facts")) {
       const body = JSON.parse(String(init?.body)) as { known_digest?: string };
       if (body.known_digest) return new Response(JSON.stringify({ unchanged: true }));
-      return new Response(JSON.stringify({ staged_url: "https://s3.example/x", digest: "d", schema: 1, writer: 1, bytes: 1 }));
+      return new Response(JSON.stringify({ staged_url: "https://facts.s3.eu-west-1.amazonaws.com/x?sig=1", digest: "d", schema: 1, writer: 1, bytes: 1 }));
     }
     return new Response(gzipSync(fs.readFileSync(WIRE)));
   }) as typeof fetch;
