@@ -56,6 +56,9 @@ export type FnRow = {
   text: string;
 };
 
+/** One declaration of a function name (`k: "name"`), as the wire states it. */
+export type NameRow = { name: string; repo: string; file: string; line: number; text: string };
+
 /** This package's table layout; bumped with every table a new row kind adds. */
 export const LOCAL_LAYOUT = 2;
 
@@ -97,6 +100,8 @@ export type FactStore = {
   unnamed: (repo: string, file: string) => FactRow[];
   /** The `fn` rows of a function `name` in `repo`, in any file. */
   callers: (repo: string, name: string) => FnRow[];
+  /** Every declaration of a function `name`, in any repo, ordered by (repo, file). */
+  declarations: (name: string) => NameRow[];
   close: () => void;
 };
 
@@ -147,6 +152,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const byName = open.prepare("SELECT * FROM rows WHERE repo = ? AND name = ? ORDER BY id");
     const unnamed = open.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
     const callers = open.prepare("SELECT * FROM fns WHERE repo = ? AND name = ? ORDER BY id");
+    const declarations = open.prepare("SELECT * FROM names WHERE name = ? ORDER BY repo, file, line");
     handed = true;
     return {
       meta,
@@ -161,6 +167,14 @@ export async function openFacts(root: string): Promise<FactStore | null> {
           name: String(raw["name"]),
           others: JSON.parse(String(raw["others"])) as FnRow["others"],
           total: Number(raw["total"]),
+          text: String(raw["text"]),
+        })),
+      declarations: (name) =>
+        declarations.all(name).map((raw) => ({
+          name: String(raw["name"]),
+          repo: String(raw["repo"]),
+          file: String(raw["file"]),
+          line: Number(raw["line"]),
           text: String(raw["text"]),
         })),
       close: () => open.close(),
@@ -241,6 +255,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       CREATE TABLE fns (
         id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, others TEXT, total INTEGER, text TEXT
       );
+      CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, repo TEXT, file TEXT, line INTEGER, text TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     const commits = Object.fromEntries((header.repos ?? []).map((repo) => [repo.repo, repo.commit]));
@@ -261,6 +276,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       "INSERT INTO rows (side, protocol, label, service, repo, file, line, name, site, others, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
     const fn = db.prepare("INSERT INTO fns (repo, file, line, name, others, total, text) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    const declared = db.prepare("INSERT INTO names (name, repo, file, line, text) VALUES (?, ?, ?, ?, ?)");
     db.exec("BEGIN");
     for (const line of lines.slice(1)) {
       const raw = JSON.parse(line) as Record<string, unknown>;
@@ -274,6 +290,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
           Number(raw["total"] ?? 0),
           String(raw["text"]),
         );
+        continue;
+      }
+      if (raw["k"] === "name") {
+        declared.run(String(raw["name"]), String(raw["repo"]), String(raw["file"]), Number(raw["line"]), String(raw["text"]));
         continue;
       }
       // A row kind this package does not know is skipped (the wire adds kinds without a schema bump).
@@ -293,7 +313,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       );
     }
     db.exec("COMMIT");
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name);");
   } finally {
     closeQuietly(db);
   }

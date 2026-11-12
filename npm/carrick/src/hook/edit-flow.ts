@@ -21,6 +21,7 @@ import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 import type { Timing } from "./timings.ts";
 import { factLines } from "../facts/lines.ts";
+import type { FactEdit } from "../facts/lines.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -42,7 +43,7 @@ export async function editFlow(
      * file, a shell write, a patch hunk that cannot be placed) gets no fact
      * lines: which lines changed is not known.
      */
-    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean }>;
+    changes?: ReadonlyMap<string, Omit<FactEdit, "file">>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked

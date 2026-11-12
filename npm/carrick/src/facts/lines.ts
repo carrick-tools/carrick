@@ -23,6 +23,7 @@ import { gapsOfLines, rangesOf, rangesOfLines, scanSource, touched } from "./mat
 import type { CallSpan, Scan } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
+import { sameNameLines } from "./rules/same-name.ts";
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
@@ -39,8 +40,18 @@ export const MAX_FACT_FILE_BYTES = 512 * 1024;
  * just above (`removed`), else the text the edit put in (`snippets`), else
  * `whole` for a file the call created (every named thing in it counts). With
  * none of them the changed lines are not known, and nothing is said.
+ * `removedText` is the text of each `removed` line, in order, when the
+ * patch's other lines were checked against the file: with it the file before
+ * the edit can be rebuilt.
  */
-export type FactEdit = { file: string; lines?: number[] | null; removed?: number[] | null; snippets?: string[] | null; whole?: boolean };
+export type FactEdit = {
+  file: string;
+  lines?: number[] | null;
+  removed?: number[] | null;
+  removedText?: string[] | null;
+  snippets?: string[] | null;
+  whole?: boolean;
+};
 
 /** The files the declaration scanner reads. */
 const SCANNED = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -285,6 +296,7 @@ export async function factLines(
         if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
       }
       for (const row of rows) found.op.push({ key: rowKey(row), text: row.text, named: pathsOf(row.others) });
+      found.name.push(...sameNameLines(store, at, where, text, scan, edit, isJsx(edit.file)));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
     for (const kind of KINDS) {

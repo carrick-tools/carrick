@@ -11,6 +11,7 @@ import path from "node:path";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
+import { factLines } from "../src/facts/lines.ts";
 import { readTimings } from "../src/hook/timings.ts";
 
 const SLUG = "kinds-demo";
@@ -210,4 +211,93 @@ test("an old local fact file without the new tables is rebuilt, not read", async
   const file = ws.at("api/src/orders.ts");
   const at = lineOf(file, "const key");
   assert.equal(context((await patchEdit(ws, file, [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }])).stdout), LOAD_LINE);
+});
+
+// ---- T3: a function the edit added, named like one in another file (`name`) ----
+
+const HOOK = ["import fs from \"node:fs\";", "", "export function main() {", "  return 1;", "}", ""].join("\n");
+const ADDED = ["export function readStdin() {", "  return fs.readFileSync(0, \"utf8\");", "}", ""];
+const nameRow = (name: string, repo: string, file: string) => ({
+  k: "name",
+  name,
+  repo,
+  file,
+  line: 3,
+  text: `a function named ${name} is declared at ${repo}/${file}:3`,
+});
+const STDIN_LINE = "a function named readStdin is declared at web/src/stdin.ts:3";
+
+/** `HOOK` with `ADDED` (or `lines`) inserted at its end, and the hunk that says so. */
+function addFunction(ws: Ws, rel: string, lines = ADDED): { file: string; hunk: Hunk } {
+  const file = ws.at(rel);
+  const before = fs.readFileSync(file, "utf8").split("\n");
+  // The file ends with a newline: insert before the final empty line.
+  const at = before.length;
+  fs.writeFileSync(file, [...before.slice(0, -1), ...lines.slice(0, -1), ""].join("\n"));
+  return { file, hunk: { newStart: at - 1, lines: [` ${before[at - 2]}`, ...lines.slice(0, -1).map((line) => `+${line}`)] } };
+}
+
+const STDIN_FILES = { "api/src/hook.ts": HOOK, "web/src/stdin.ts": "// stdin\n\nexport function readStdin() {\n  return \"\";\n}\n" };
+
+test("name: an Edit that adds a function named like one in another file names that one, once per session", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), STDIN_LINE);
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: a file the call created counts every declaration in it", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/fresh.ts": ADDED.join("\n") }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const outcome = await factLines(ws.root, [{ file: ws.at("api/src/fresh.ts"), whole: true }], undefined);
+  assert.deepEqual(outcome.lines, [STDIN_LINE]);
+});
+
+test("name: more than one other declaration prints the first by (repo, file) only", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/io.ts": "export function readStdin() {}\n" }, [
+    nameRow("readStdin", "web", "src/stdin.ts"),
+    nameRow("readStdin", "api", "src/io.ts"),
+  ]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "a function named readStdin is declared at api/src/io.ts:3");
+});
+
+test("name: silent when the name was declared before the edit", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/hook.ts": [HOOK.trimEnd(), ...ADDED].join("\n") }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const file = ws.at("api/src/hook.ts");
+  const at = lineOf(file, "export function readStdin");
+  // The declaration line itself was replaced.
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("export function readStdin() {", "export function readStdin(fd = 0) {"));
+  const hunk = { newStart: at, lines: ["-export function readStdin() {", "+export function readStdin(fd = 0) {"] };
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: silent when the only declaration is this file's own", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "api", "src/hook.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: silent when main already declares the name in this file, even beside another file's", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "api", "src/hook.ts"), nameRow("readStdin", "web", "src/stdin.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: silent for a name shorter than 4 characters", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "web/src/run.ts": "export function run() {}\n" }, [nameRow("run", "web", "src/run.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts", ["export function run() {", "  return 2;", "}", ""]);
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: silent when the other file is gone from disk (the function may have moved here)", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  fs.rmSync(ws.at("web/src/stdin.ts"));
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("name: silent when the patch does not read the same as the file (the file before is unknown)", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [{ ...hunk, lines: [" not this line", ...hunk.lines.slice(1)] }])).stdout), "");
 });
