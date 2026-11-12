@@ -80,6 +80,14 @@ pub struct GraphqlOp {
     /// paired with `resolver_file`. Anchors the `FunctionReturn` infer request.
     /// `None` whenever `resolver_file` is `None`.
     pub resolver_line: Option<u32>,
+    /// PRODUCER-only: where the schema-keyed field reader placed this root
+    /// field (carrick#1295). It moves where the row is served and nothing
+    /// else: the type anchor stays `resolver_file`/`resolver_line` (the
+    /// model's) or the schema line, because the code at the field's property
+    /// returns its in-process value, not the field's wire type (a `Date`
+    /// that a `DateTime` scalar sends as a string). `None` when the reader
+    /// did not claim the field.
+    pub schema_keyed_place: Option<SchemaKeyedPlace>,
     /// PRODUCER-only fallback (#248): the co-located TS type that declares this
     /// field's response shape when NO resolver function exists (e.g. an SDL
     /// `orders: [Order!]!` field backed by `interface Order`, with no
@@ -174,6 +182,17 @@ pub struct SdlInputDeclaration {
     pub input_object: bool,
     /// The named types an `input` object's fields reference, in field order.
     pub references: Vec<String>,
+}
+
+/// Where the schema-keyed field reader placed a root field (carrick#1295).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaKeyedPlace {
+    /// One place: the file as the scan walked it and the line of the field's
+    /// property.
+    At { file: PathBuf, line: u32 },
+    /// Two or more places: the row stays on its schema line, and the model's
+    /// location does not break the tie.
+    Ambiguous,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2345,6 +2364,8 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     // graphql_operations fill these in the engine merge (Stage B1).
                     resolver_file: None,
                     resolver_line: None,
+                    // Set in the engine merge from the schema-keyed reader.
+                    schema_keyed_place: None,
                     // Populated in the engine merge only when the LLM located a
                     // co-located backing type for a resolver-less field (#248).
                     response_type_symbol: None,
@@ -2405,6 +2426,7 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     // Consumers never carry a resolver location.
                     resolver_file: None,
                     resolver_line: None,
+                    schema_keyed_place: None,
                     // Producer-only fallback; never set on consumers.
                     response_type_symbol: None,
                     response_type_source: None,

@@ -1,0 +1,14 @@
+scalar DateTime
+
+type Mutation {
+  scheduleShipment(id: ID!): Shipment!
+}
+
+type Query {
+  health: String!
+}
+
+type Shipment {
+  id: ID!
+  scheduledDate: DateTime!
+}

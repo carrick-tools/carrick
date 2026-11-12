@@ -6787,6 +6787,47 @@ fn schema_keyed_root_fields(
     claims
 }
 
+/// Records where the schema-keyed reader placed each producer
+/// (carrick#1295): one place, or `Ambiguous` when two claims disagree on
+/// `(file, line)`. This moves where the row is served and nothing else: the
+/// model's resolver location, which anchors the producer's type, is joined
+/// by [`merge_graphql_resolver_locations`] exactly as without the reader.
+fn apply_schema_keyed_claims(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    claims: &[SchemaKeyedClaim],
+) {
+    use crate::graphql::SchemaKeyedPlace;
+    let by_key: HashMap<String, usize> = graphql
+        .producers
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.key.canonical(), idx))
+        .collect();
+    for claim in claims {
+        let Some(&idx) = by_key.get(&claim.key.canonical()) else {
+            continue;
+        };
+        let producer = &mut graphql.producers[idx];
+        let place = SchemaKeyedPlace::At {
+            file: PathBuf::from(&claim.file),
+            line: claim.line,
+        };
+        producer.schema_keyed_place = match &producer.schema_keyed_place {
+            None => Some(place),
+            Some(first) if *first == place => Some(place),
+            Some(first) => {
+                debug!(
+                    op = %claim.key.canonical(),
+                    first = ?first,
+                    second = %format!("{}:{}", claim.file, claim.line),
+                    "conflicting schema-keyed graphql field claims"
+                );
+                Some(SchemaKeyedPlace::Ambiguous)
+            }
+        };
+    }
+}
+
 /// The directories to walk for a service's own GraphQL SDL files
 /// ([`crate::graphql::service_walk_roots`]): its directory, leaving out its
 /// nested services' (carrick#553), plus its `include` roots.
@@ -6827,7 +6868,8 @@ fn scan_protocol_extractions(
         declared.files.contains(&op.file_path) || !exclusion.excludes(&op.file_path, false)
     });
     let structural = schema_keyed_root_fields(repo_path, service, files, &graphql, service_modules);
-    merge_graphql_resolver_locations(&mut graphql, file_results, &structural);
+    apply_schema_keyed_claims(&mut graphql, &structural);
+    merge_graphql_resolver_locations(&mut graphql, file_results);
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
     let sockets = crate::socket_io::scan_files(files, &detection.socket_clients);
@@ -8616,7 +8658,8 @@ fn settle_graphql_documents(
     let label = service.service_name.as_deref().unwrap_or("(root)");
     // A schema the service's walk found is one it serves only with evidence
     // that it serves a schema at all (carrick#1189): it declares one, it serves
-    // HTTP routes, or the model joined a resolver or backing type to a field.
+    // HTTP routes, the model joined a resolver or backing type to a field, or
+    // the schema-keyed reader placed one in its code (carrick#1295).
     // A client app with a vendor schema copied into its tree has none of
     // these. Any HTTP route is broader than a GraphQL server (a backend-for-
     // frontend with a vendor copy has one), but it keeps an SDL-first server's
@@ -8624,10 +8667,13 @@ fn settle_graphql_documents(
     // with a detected GraphQL-server signal.
     let serves_schema = !service.graphql_schemas.is_empty()
         || !mount_graph.endpoints.is_empty()
-        || graphql
-            .producers
-            .iter()
-            .any(|producer| producer.resolver_file.is_some());
+        || graphql.producers.iter().any(|producer| {
+            producer.resolver_file.is_some()
+                || matches!(
+                    producer.schema_keyed_place,
+                    Some(crate::graphql::SchemaKeyedPlace::At { .. })
+                )
+        });
     let unserved = catalogue.settle_walked_schemas(label, graphql, serves_schema);
     if unserved > 0 {
         info!(
@@ -8769,6 +8815,20 @@ fn fold_graphql_transport_calls(
     });
 }
 
+/// Where a GraphQL producer row is served: the schema-keyed reader's place
+/// first (carrick#1295), with two of them keeping the row on its schema line;
+/// otherwise the resolver the model located (carrick#1157); otherwise the
+/// schema line. Only the row reads this: the producer's type stays anchored
+/// at `resolver_file`/`resolver_line` or the schema.
+fn graphql_producer_row_place(op: &crate::graphql::GraphqlOp) -> (&Path, u32) {
+    use crate::graphql::SchemaKeyedPlace;
+    match (&op.schema_keyed_place, &op.resolver_file, op.resolver_line) {
+        (Some(SchemaKeyedPlace::At { file, line }), _, _) => (file, *line),
+        (None, Some(file), Some(line)) => (file, line),
+        _ => (&op.file_path, op.line),
+    }
+}
+
 /// Where a GraphQL, socket or pub/sub producer row's evidence comes from
 /// (#380), classified as an HTTP route's is
 /// ([`crate::file_finder::endpoint_provenance`]): from the row's file relative
@@ -8870,10 +8930,8 @@ fn append_deterministic_protocol_operations(
             .extend(graphql.producers.iter().map(|op| {
                 // The schema states the field, the model only places the
                 // resolver, so the row is the schema's either way (carrick#3091).
-                let row = match (&op.resolver_file, op.resolver_line) {
-                    (Some(file), Some(line)) => to_producer(op.key.clone(), file, line),
-                    _ => to_producer(op.key.clone(), &op.file_path, op.line),
-                };
+                let (file, line) = graphql_producer_row_place(op);
+                let row = to_producer(op.key.clone(), file, line);
                 ApiEndpointDetails {
                     resolution_source: Some(
                         crate::agents::file_analyzer_agent::ResolutionSource::GraphqlSchema,
@@ -9831,7 +9889,6 @@ fn append_pubsub_manifest_entries(
 fn merge_graphql_resolver_locations(
     graphql: &mut crate::graphql::GraphqlExtraction,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    structural: &[SchemaKeyedClaim],
 ) {
     // Canonical producer key -> index, so each LLM op joins in O(1) without an
     // N×M scan (keys are unique across producers).
@@ -9845,35 +9902,6 @@ fn merge_graphql_resolver_locations(
     // producer idx -> (file, resolver function, 1-based line).
     let mut resolver_claims: HashMap<usize, (String, String, u32)> = HashMap::new();
     let mut resolver_conflicts: HashSet<usize> = HashSet::new();
-
-    // The schema-keyed reader's claims enter first (carrick#1295): read from
-    // the structure the service's own schema keys, they decide a field's
-    // location over the model's, which is the fallback for every field they
-    // do not claim. Two in different places fail closed, and the model is not
-    // asked to break the tie. They name no function, so they compare on
-    // `(file, line)`.
-    let mut structurally_decided: HashSet<usize> = HashSet::new();
-    for claim in structural {
-        let Some(&idx) = by_key.get(&claim.key.canonical()) else {
-            continue;
-        };
-        structurally_decided.insert(idx);
-        match resolver_claims.get(&idx) {
-            Some((file, _, line)) if (file, *line) != (&claim.file, claim.line) => {
-                resolver_conflicts.insert(idx);
-                debug!(
-                    op = %claim.key.canonical(),
-                    first = %format!("{file}:{line}"),
-                    second = %format!("{}:{}", claim.file, claim.line),
-                    "conflicting schema-keyed graphql field claims"
-                );
-            }
-            Some(_) => {}
-            None => {
-                resolver_claims.insert(idx, (claim.file.clone(), String::new(), claim.line));
-            }
-        }
-    }
     // producer idx -> (file, backing symbol, backing source).
     #[allow(clippy::type_complexity)]
     let mut backing_claims: HashMap<usize, (String, String, Option<String>)> = HashMap::new();
@@ -9904,15 +9932,6 @@ fn merge_graphql_resolver_locations(
                 );
                 continue;
             };
-            if structurally_decided.contains(&idx) {
-                debug!(
-                    op = %key.canonical(),
-                    file = %path,
-                    line = ?llm_op.resolver_line,
-                    "the schema-keyed reader placed this field; the model's location is not used"
-                );
-                continue;
-            }
             // Trim before the emptiness check: a whitespace-only string (e.g.
             // " ") from the model is not a resolver function name.
             let resolver_name = llm_op
@@ -26890,6 +26909,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: None,
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -26920,6 +26940,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: payload_source.map(String::from),
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -27343,6 +27364,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: None,
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -30773,12 +30795,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
-    /// The schema-keyed reader's claims decide a field's location before the
-    /// model's (carrick#1295): alone, over a model claim at another line, and
-    /// failing closed when two disagree. The model still places a field the
-    /// reader does not claim.
+    /// The schema-keyed reader's claims decide where a field is SERVED before
+    /// the model's location (carrick#1295): alone, over a model claim at
+    /// another line, and failing closed to the schema line when two disagree.
+    /// The model still places a field the reader does not claim. What anchors
+    /// the producer's TYPE is the model's resolver location alone, exactly as
+    /// without the reader: a field only the reader placed has none.
     #[test]
-    fn merge_graphql_resolver_locations_takes_schema_keyed_claims_first() {
+    fn schema_keyed_claims_move_the_row_and_never_the_type_anchor() {
         use crate::operation::GraphqlOperationKind::Query;
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: ["alone", "both", "twice", "model"]
@@ -30802,30 +30826,48 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             schema_keyed("twice", "src/copy.ts", 4),
         ];
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &structural);
+        apply_schema_keyed_claims(&mut graphql, &structural);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
-        let located = |field: &str| {
-            let op = graphql
+        let producer = |field: &str| {
+            graphql
                 .producers
                 .iter()
                 .find(|op| op.key.canonical() == format!("graphql|query|{field}"))
-                .expect("producer");
+                .expect("producer")
+        };
+        let served = |field: &str| {
+            let (file, line) = graphql_producer_row_place(producer(field));
+            format!("{}:{line}", file.display())
+        };
+        let type_anchor = |field: &str| {
+            let op = producer(field);
             op.resolver_file
                 .as_ref()
                 .map(|file| format!("{}:{}", file.display(), op.resolver_line.unwrap_or(0)))
         };
-        assert_eq!(located("alone").as_deref(), Some("src/alone.ts:5"));
+        // Where each row is served.
+        assert_eq!(served("alone"), "src/alone.ts:5");
         assert_eq!(
-            located("both").as_deref(),
-            Some("src/both.ts:20"),
+            served("both"),
+            "src/both.ts:20",
             "the schema-keyed claim beats the model's line"
         );
         assert_eq!(
-            located("twice"),
-            None,
+            served("twice"),
+            "src/schema.graphql:3",
             "two schema-keyed places fail closed, and the model does not break the tie"
         );
-        assert_eq!(located("model").as_deref(), Some("src/model.ts:9"));
+        assert_eq!(served("model"), "src/model.ts:9");
+        // What anchors each producer's type: the model's location, untouched.
+        assert_eq!(type_anchor("alone"), None, "the reader adds no type anchor");
+        assert_eq!(
+            type_anchor("both").as_deref(),
+            Some("src/both.ts:27"),
+            "the reader does not move the model's type anchor"
+        );
+        assert_eq!(type_anchor("twice").as_deref(), Some("src/twice.ts:4"));
+        assert_eq!(type_anchor("model").as_deref(), Some("src/model.ts:9"));
     }
 
     /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
@@ -30890,7 +30932,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         let order = graphql
             .producers
@@ -30979,7 +31021,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         let orders = graphql
             .producers
@@ -31043,7 +31085,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         let orders = graphql
             .producers
@@ -31115,7 +31157,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         for field in ["order", "orders"] {
             let producer = graphql
@@ -31460,7 +31502,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         let ticket = &graphql.producers[0];
         assert_eq!(
@@ -31525,7 +31567,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             result_with(vec![claim("resolveTicketB", 9)]),
         );
 
-        merge_graphql_resolver_locations(&mut graphql, &file_results, &[]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
 
         let ticket = &graphql.producers[0];
         assert_eq!(
@@ -31553,7 +31595,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "src/a.resolver.ts".to_string(),
             result_with(vec![claim("resolveTicket", 4), claim("resolveTicket", 4)]),
         );
-        merge_graphql_resolver_locations(&mut agreeing, &agreeing_results, &[]);
+        merge_graphql_resolver_locations(&mut agreeing, &agreeing_results);
         assert_eq!(
             agreeing.producers[0].resolver_file,
             Some(PathBuf::from("src/a.resolver.ts"))
