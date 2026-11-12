@@ -1432,3 +1432,31 @@ test("R33.2: git slower than its budget is silent, and the hook exits 0", async 
   assert.equal(context(slow.stdout), "");
   assert.ok(slow.ms < 2500, `the hook waited ${slow.ms} ms`);
 });
+
+test("R42.1: a replace ref in a peer clone does not answer for the index commit", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+  // Control: the peer file reads as at the index commit.
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
+  // A second commit moves the call one line down; a replace ref makes the index commit read as it, and the disk is at it.
+  const web = ws.at("web");
+  const indexCommit = gitIn(web, "rev-parse", "HEAD").trim();
+  fs.writeFileSync(path.join(web, "src/page.ts"), `// moved down\n${PAGE}`);
+  gitIn(web, "commit", "-q", "-am", "moved");
+  gitIn(web, "replace", indexCommit, gitIn(web, "rev-parse", "HEAD").trim());
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R42.1: a caller's env cannot unset what keeps the facts git local and exact", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-env-"));
+  t.after(() => fs.rmSync(shim, { recursive: true, force: true }));
+  const log = path.join(shim, "env.log");
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\necho "replace=$GIT_NO_REPLACE_OBJECTS protocol=$GIT_ALLOW_PROTOCOL lazy=$GIT_NO_LAZY_FETCH prompt=$GIT_TERMINAL_PROMPT $*" >> ${log}\nexec ${real} "$@"\n`, { mode: 0o755 });
+  const env = { ...process.env, PATH: `${shim}${path.delimiter}${process.env["PATH"] ?? ""}`, CARRICK_FACT_LINES: "1", GIT_NO_REPLACE_OBJECTS: "0", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "0" };
+  const lines = await factLines(ws.root, [inLoadOrder(ws)], undefined, { env });
+  assert.deepEqual(lines.lines, [LOAD_LINE]);
+  const calls = fs.readFileSync(log, "utf8").trim().split("\n");
+  assert.ok(calls.some((line) => line.includes("ls-tree")), calls.join("\n"));
+  for (const line of calls) assert.match(line, /^replace=1 protocol=none lazy=1 prompt=0 /);
+});

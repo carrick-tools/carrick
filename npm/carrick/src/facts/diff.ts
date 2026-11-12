@@ -43,9 +43,18 @@ export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean
 export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env): string | null {
   const checkout = checkoutOf(dir);
   if (checkout === null || isPartialClone(checkout.top)) return null;
-  // No network from a hook, ever (R36.4): no lazy fetch of a missing object
-  // (git 2.44 and later) and no credential prompt.
-  return git(dir, args, factsGitBudgetMs(env), { ...process.env, ...env, GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" });
+  // Four fixed variables, set after both spreads so neither the process env
+  // nor the caller's can override them (R42.1): no replace ref answering for
+  // another tree, no lazy fetch of a missing object, no transport of any kind,
+  // and no credential prompt. A hook never uses the network.
+  return git(dir, args, factsGitBudgetMs(env), {
+    ...process.env,
+    ...env,
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_ALLOW_PROTOCOL: "none",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  });
 }
 
 /** Whether each checkout is a partial clone, by its top, decided once per process. */
