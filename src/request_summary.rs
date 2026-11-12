@@ -383,16 +383,23 @@ pub enum Link {
 impl Piece {
     /// Whether the piece is a parameter a caller may fill in: the summarised
     /// function's own, whole or by one of its keys, or an enclosing
-    /// function's, or a hole an unread call makes of one ([`Link::Through`]).
+    /// function's.
     fn is_parameter(&self) -> bool {
-        match self {
-            Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) | Piece::Outer(..) => {
-                true
-            }
-            _ => self
+        matches!(
+            self,
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) | Piece::Outer(..)
+        )
+    }
+
+    /// Whether a caller still chooses what the piece holds, for a name or a
+    /// URL: a parameter, or a hole of an unread call open on one
+    /// ([`Link::Through`], carrick#4022). Only the readers of a request's
+    /// name ask this; a receiver handed such a hole is no parameter.
+    fn waits_on_caller(&self) -> bool {
+        self.is_parameter()
+            || self
                 .through()
-                .is_some_and(|inner| inner.iter().any(Piece::is_parameter)),
-        }
+                .is_some_and(|inner| inner.iter().any(Piece::waits_on_caller))
     }
 
     /// The parameters a hole made of an unread call holds ([`Link::Through`]).
@@ -417,7 +424,7 @@ impl Piece {
             return None;
         };
         let inner = fill(inner);
-        let open = inner.iter().any(Piece::is_parameter);
+        let open = inner.iter().any(Piece::waits_on_caller);
         Some(Piece::Opaque {
             text: text.clone(),
             end: end.clone(),
@@ -7222,12 +7229,20 @@ impl Reader<'_> {
     /// arguments read (carrick#4022): a caller still chooses the path, so the
     /// request stays open until one fills them ([`Link::Through`]). A
     /// parameter that is a whole path segment of its argument is a path
-    /// parameter, chosen by no caller, and is not kept. A hole that already
-    /// links elsewhere, and any other value, is `value` as it is.
+    /// parameter, chosen by no caller, and is not kept. Only a call of a
+    /// function by its name: a method's arguments act on its receiver
+    /// (`'/items/:id'.replace(':id', id)` is the receiver's route). A hole
+    /// that already links elsewhere, and any other value, is `value` as it
+    /// is.
     fn through(&self, mut value: Value, call: &CallExpr, scope: &Scope<'_>) -> Value {
+        let by_name = matches!(&call.callee, Callee::Expr(callee)
+            if matches!(crate::graphql_document_sites::unwrap_expression(callee), Expr::Ident(_)));
         let Value::Str(pieces) = &mut value else {
             return value;
         };
+        if !by_name {
+            return value;
+        }
         let [
             Piece::Opaque {
                 end: Root::Hole(_),
@@ -7250,7 +7265,7 @@ impl Reader<'_> {
                         .iter()
                         .enumerate()
                         .filter(|(position, piece)| {
-                            piece.is_parameter() && !is_whole_segment(&pieces, *position)
+                            piece.waits_on_caller() && !is_whole_segment(&pieces, *position)
                         })
                         .map(|(_, piece)| piece.clone())
                         .collect::<Vec<_>>()
@@ -9713,7 +9728,7 @@ impl Effect {
             self.method,
             MethodValue::Param(_) | MethodValue::ParamKey(..)
         ) || self.url.iter().enumerate().any(|(position, piece)| {
-            piece.is_parameter()
+            piece.waits_on_caller()
                 && !is_whole_segment(&self.url, position)
                 // A hole of an unread call (carrick#4022) in a URL that
                 // states a route all the same is no caller's to choose, as

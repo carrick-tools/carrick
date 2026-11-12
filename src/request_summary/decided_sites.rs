@@ -1480,6 +1480,13 @@ fn holds_parameter(pieces: &[Piece]) -> bool {
     pieces.iter().any(Piece::is_parameter)
 }
 
+/// Whether a caller still chooses the name `pieces` holds: a parameter, or
+/// a hole of an unread call open on one ([`Piece::waits_on_caller`],
+/// carrick#4022).
+fn holds_open(pieces: &[Piece]) -> bool {
+    pieces.iter().any(Piece::waits_on_caller)
+}
+
 /// Why the name a caller fills is unread, where `own` (the callee's value)
 /// holds a hole of an unread call open on the callee's parameters
 /// ([`Piece::through`], carrick#4022) and `filled` (the caller's) holds that
@@ -1506,7 +1513,7 @@ fn closed_hole(own: &[Piece], filled: &[Piece]) -> Option<Stop> {
 /// whole path, or a prefix glued to one, leaves it to the callers
 /// (carrick#2433, carrick#2519).
 fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
-    !holds_parameter(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
+    !holds_open(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
 }
 
 /// Whether `pieces` is a message name written as a template whose hole a
@@ -1518,7 +1525,7 @@ fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
 /// ([`decides`]).
 fn is_message_template(pieces: &[Piece], end: &LabelledEnd) -> bool {
     end.role != "http_client"
-        && holds_parameter(pieces)
+        && holds_open(pieces)
         && pieces
             .iter()
             .any(|piece| matches!(piece, Piece::Lit(text) if !text.is_empty()))
