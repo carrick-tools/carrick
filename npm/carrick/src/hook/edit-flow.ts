@@ -134,7 +134,8 @@ export async function editFlow(
     const show = !covered.has(edited[index]!) && (!session || !wasTold(session, key));
     if (show && result.uses_lines?.length) {
       told.push(key);
-      if (input.timing) input.timing.usesFallback = true;
+      // Counted only where the line is delivered (the hook channel).
+      if (input.timing && facts !== null) input.timing.usesFallback = true;
     }
     const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);

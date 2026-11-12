@@ -393,6 +393,33 @@ test("pkg: silent for an unchanged dependency and a package with no row", async 
   assert.equal(none, "");
 });
 
+test("pkg: a Codex patch over a source file and a package.json probes only the source file", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/package.json": before, "web/package.json": "{}\n", "api/src/orders.ts": ORDERS }, [ZOD]);
+  fs.writeFileSync(ws.at("api/package.json"), before.replace('"zod": "^3.22.0"', '"zod": "^3.24.0"'));
+  const argvLog = path.join(os.tmpdir(), `carrick-kinds-mixed-${process.pid}.log`);
+  t.after(() => fs.rmSync(argvLog, { force: true }));
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: api/package.json",
+    "@@",
+    '-    "zod": "^3.22.0"',
+    '+    "zod": "^3.24.0"',
+    "*** Update File: api/src/orders.ts",
+    "@@",
+    "   const key = `order:${id}`;",
+    "*** End Patch",
+  ].join("\n");
+  const run = await runHook("post-edit.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "apply_patch", session_id: "mixed", cwd: ws.root, tool_input: { command: patch } },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_FAKE_ARGV_LOG: argvLog }),
+  });
+  assert.equal(context(run.stdout), ZOD.text);
+  const calls = fs.readFileSync(argvLog, "utf8");
+  assert.match(calls, /api\/src\/orders\.ts/);
+  assert.doesNotMatch(calls, /package\.json/);
+});
+
 // ---- The cap across kinds ----
 
 test("at most 3 fact lines per action, in the order op, fn, name", async (t) => {
