@@ -7278,6 +7278,15 @@ export function listen(): void {
                 "src/both.ts:9 <- /x/one via src/both.ts:13 use /x",
             ])
         );
+        // The same on routers of an export no scope claim names, where the
+        // `use` declaration the call resolves to says which claims apply.
+        assert_eq!(
+            lines_in(&decided, "declared.ts", true),
+            texts(&[
+                "src/declared.ts:11 <- /y/one via src/declared.ts:14 use /y",
+                "src/declared.ts:13 <- /two via src/declared.ts:15 use -",
+            ])
+        );
     }
 
     /// K1: where a `mounts` claim and its handle twin both verify on a
@@ -7373,6 +7382,11 @@ export function listen(): void {
                 "src/items.ts:8 <- /items.list (mount_unverified)",
                 "src/items.ts:9 <- /items.add (mount_unverified)",
             ])
+        );
+        // A router of another package handed there is no more the top.
+        assert_eq!(
+            lines_in(&decided, "cross.ts", false),
+            texts(&["src/cross.ts:11 <- /c (mount_unverified)"])
         );
     }
 

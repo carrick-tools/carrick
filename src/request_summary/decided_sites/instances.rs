@@ -283,6 +283,34 @@ impl ScopeLabel {
         self.member == other.member && self.name == other.name && self.binds.same_as(&other.binds)
     }
 
+    /// Whether `other` is this claim or its handle twin (K1): the same
+    /// export of the same package, binding the same way. One mount edge
+    /// stands for both.
+    pub(super) fn twin_of(&self, other: &ScopeLabel) -> bool {
+        self.package == other.package && self.export == other.export && self.binds_as(other)
+    }
+
+    /// Whether this label and `other` may both apply at one call where
+    /// only the member declaration says which apply (K1): they bind the
+    /// same way, or both mount and read different slots (a path-first and
+    /// a path-less `use`), so the slot that holds an instance decides.
+    fn agrees_with(&self, other: &ScopeLabel) -> bool {
+        if self.binds_as(other) {
+            return true;
+        }
+        match (&self.binds, &other.binds) {
+            (
+                ScopeBinds::Mounts { arg, key, .. },
+                ScopeBinds::Mounts {
+                    arg: other_arg,
+                    key: other_key,
+                    ..
+                },
+            ) => self.member == other.member && (arg, key) != (other_arg, other_key),
+            _ => false,
+        }
+    }
+
     /// Whether the member returns the scoped instance and was verified on
     /// the receiver `receiver` of `package`'s `export`: a call of it on an
     /// instance read through `receiver` returns the object an op claimed on
@@ -1349,24 +1377,33 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         ends: &[InstanceEnd],
     ) -> Vec<Vec<InstanceEnd>> {
         let declared = self.declaration_of(host);
-        let by_declaration: Vec<Option<usize>> = ends
+        // Per end, the labels it applies by declaration: the first of each
+        // binding verified there, where every two bindings agree (K1: a
+        // path-first and a path-less mount read different slots).
+        let by_declaration: Vec<Vec<usize>> = ends
             .iter()
             .map(|end| {
                 if labels.iter().any(|label| label.applies_to(end)) {
-                    return None;
+                    return Vec::new();
                 }
-                let (package, _, _) = identity(end)?;
-                let declared = declared.as_ref()?;
-                let matched: Vec<usize> = (0..labels.len())
-                    .filter(|&at| {
-                        labels[at].package == package
-                            && labels[at].verified_at(declared).next().is_some()
-                    })
-                    .collect();
-                let (&first, rest) = matched.split_first()?;
-                rest.iter()
-                    .all(|&other| labels[other].binds_as(labels[first]))
-                    .then_some(first)
+                let (Some((package, _, _)), Some(declared)) = (identity(end), declared.as_ref())
+                else {
+                    return Vec::new();
+                };
+                let mut kept: Vec<usize> = Vec::new();
+                for at in (0..labels.len()).filter(|&at| {
+                    labels[at].package == package
+                        && labels[at].verified_at(declared).next().is_some()
+                }) {
+                    if !kept.iter().any(|&known| labels[known].binds_as(labels[at])) {
+                        kept.push(at);
+                    }
+                }
+                let agree = kept.iter().all(|&one| {
+                    kept.iter()
+                        .all(|&other| labels[one].agrees_with(labels[other]))
+                });
+                if agree { kept } else { Vec::new() }
             })
             .collect();
         labels
@@ -1375,7 +1412,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             .map(|(index, label)| {
                 ends.iter()
                     .zip(&by_declaration)
-                    .filter(|(end, declared)| label.applies_to(end) || **declared == Some(index))
+                    .filter(|(end, declared)| label.applies_to(end) || declared.contains(&index))
                     .map(|(end, _)| end.clone())
                     .collect()
             })

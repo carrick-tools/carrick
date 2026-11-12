@@ -1092,7 +1092,7 @@ impl Pass<'_, '_> {
             label.member == host.call.callee
                 && matches!(&label.binds, ScopeBinds::Mounts { arg: at, key: None, .. } if *at == arg)
         }) {
-            if !mount_labels.iter().any(|known| known.binds_as(label))
+            if !mount_labels.iter().any(|known| known.twin_of(label))
                 && (label.name.is_some() || walk().name_less_stands(host))
             {
                 mount_labels.push(label);
