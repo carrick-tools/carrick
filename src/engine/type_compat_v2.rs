@@ -850,8 +850,8 @@ impl std::fmt::Display for CaptureFailure {
         match self {
             CaptureFailure::TimedOut => write!(
                 f,
-                "the compiler engine timed out: it returned no response and reported no \
-                 progress before the deadline"
+                "the compiler engine timed out with no response and no progress before \
+                 the deadline"
             ),
             CaptureFailure::SidecarDied { detail, .. } | CaptureFailure::Failed(detail) => {
                 write!(f, "{detail}")
@@ -1069,7 +1069,7 @@ fn capture_in_a_fresh_process(
 ) -> Result<CaptureV2Result, CaptureFailure> {
     let not_started = |e: SidecarError| CaptureFailure::SidecarDied {
         detail: format!(
-            "the compiler engine could not be restarted for the capture: {}",
+            "the compiler engine could not be restarted for the capture because {}",
             e.customer_cause()
         ),
         deaths: Vec::new(),
@@ -1138,7 +1138,7 @@ fn capture_in_a_fresh_process(
                  not retried at the same size, as this run stops on a memory death",
                 service_id,
                 error,
-                death.ended(false),
+                death.how(false),
                 death.stage()
             );
             // The rest of the run still asks the sidecar (the check phase,
@@ -1156,7 +1156,7 @@ fn capture_in_a_fresh_process(
                  once in a fresh process",
                 service_id,
                 error,
-                death.ended(false),
+                death.how(false),
                 death.stage()
             );
             continue;
@@ -1173,18 +1173,11 @@ fn capture_in_a_fresh_process(
     }
 }
 
-/// The heap a process was given, worded as the heap that did not fit and as the
-/// cap it died under, for both phrasings of a memory death.
-fn heap_cap_phrases(heap_cap_mb: Option<u64>) -> (String, String) {
+/// The memory limit a process ran under, as a phrase for a memory death.
+fn memory_limit(heap_cap_mb: Option<u64>) -> String {
     match heap_cap_mb {
-        Some(mb) => (
-            format!("the {mb} MB memory limit it was given"),
-            format!("under a memory limit of {mb} MB"),
-        ),
-        None => (
-            "the default memory limit".to_string(),
-            "under the default memory limit".to_string(),
-        ),
+        Some(mb) => format!("a memory limit of {mb} MB"),
+        None => "the default memory limit".to_string(),
     }
 }
 
@@ -1193,33 +1186,27 @@ fn heap_cap_phrases(heap_cap_mb: Option<u64>) -> (String, String) {
 /// run recorded of it.
 pub(crate) fn resolution_memory_death(death: &crate::scan_health::TypeMemoryDeath) -> String {
     use crate::services::type_sidecar::MemoryDeath;
-    let (_, under) = heap_cap_phrases(death.heap_cap_mb);
     let how = match death.kind {
-        MemoryDeath::HeapLimit => "it ran out of memory",
-        MemoryDeath::OomKilled => "it was stopped because the machine ran out of memory",
+        MemoryDeath::HeapLimit => "ran out of memory",
+        MemoryDeath::OomKilled => "was stopped because the machine ran out of memory",
     };
-    format!("the compiler engine could not read types: {how}, {under}")
+    format!(
+        "the compiler engine {how} while reading types, with {}",
+        memory_limit(death.heap_cap_mb)
+    )
 }
 
 /// The failure of a capture whose process died of memory once and was not
 /// asked again, because the run stops on a memory death (carrick#2209): how
-/// the process ended and at which stage, then what did not fit the heap.
+/// the process ended and at which stage, under which limit.
 fn one_memory_death(death: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
-    let (heap, under) = heap_cap_phrases(heap_cap_mb);
-    let lead = format!(
-        "the compiler engine ended during the capture and was not retried at the \
-         same size, as this run stops on a memory death; it {} {}",
-        death.ended(false),
-        death.stage()
-    );
-    // Only an abort is V8's heap running out; a kill is the machine's memory.
-    match death
-        .held()
-        .filter(|_| death.end.is_some_and(|end| end.is_abort()))
-    {
-        Some(held) => format!("{lead}: {held} did not fit {heap}"),
-        None => format!("{lead}, {under}"),
-    }
+    format!(
+        "the compiler engine {} during the capture {}, with {}, so it was not retried at the \
+         same size",
+        death.how(false),
+        death.stage(),
+        memory_limit(heap_cap_mb)
+    )
 }
 
 /// What is known about a capture process that ended before it answered.
@@ -1247,17 +1234,12 @@ impl CaptureDeath {
         }
     }
 
-    /// How the process ended, as the verb of a sentence about one process or
-    /// about `both`; plain "ended" when the OS did not say.
-    fn ended(&self, both: bool) -> String {
+    /// How the process ended, as the verb phrase of a sentence about one
+    /// process or about `both`; plain "ended" when the OS did not say.
+    fn how(&self, both: bool) -> String {
         let was = if both { "were" } else { "was" };
         match self.end {
-            Some(end) if end.is_abort() => {
-                format!(
-                    "{was} stopped because {} ran out of memory,",
-                    if both { "they" } else { "it" }
-                )
-            }
+            Some(end) if end.is_abort() => "ran out of memory".to_string(),
             Some(ProcessEnd::Signal(9)) => format!("{was} killed by the system"),
             Some(ProcessEnd::Signal(signal)) => format!("{was} ended by signal {signal}"),
             Some(ProcessEnd::Code(code)) => format!("ended with exit code {code}"),
@@ -1272,61 +1254,36 @@ impl CaptureDeath {
         };
         match progress.phase.as_str() {
             "program" => {
-                "while building the service's program, before any anchor was resolved".to_string()
+                "while building the service's program, before any type was resolved".to_string()
             }
-            "anchors" => format!(
-                "while resolving anchors (last report: {})",
-                progress.message
-            ),
-            "emit" => "while emitting declarations, after every anchor was resolved".to_string(),
-            "self-check" => "while type-checking the emitted declarations, after every anchor \
-                             was resolved"
-                .to_string(),
+            "anchors" => format!("while resolving types (last report {})", progress.message),
+            "emit" => "while emitting declarations".to_string(),
+            "self-check" => "while type-checking the emitted declarations".to_string(),
             other => format!("at stage '{other}' ({})", progress.message),
-        }
-    }
-
-    /// What the stage held in the heap, for the stages that say: the thing
-    /// that did not fit when the process aborted there.
-    fn held(&self) -> Option<&'static str> {
-        match self.progress.as_ref()?.phase.as_str() {
-            "program" => Some("the service's program"),
-            "anchors" => Some("the service's program and the types of its anchors"),
-            "emit" => Some("the declarations being emitted"),
-            "self-check" => Some("the emitted declarations and the packages they import"),
-            _ => None,
         }
     }
 }
 
-/// The failure of a capture whose process ended twice: the two deaths as the
-/// client saw them, then how each process ended and at which stage, then,
-/// when both aborted at one stage, what did not fit the heap they were given.
-///
-/// `heap_cap_mb` is the cap every sidecar of this run is started with, or
-/// `None` when it runs under V8's own default.
+/// The failure of a capture whose process ended twice: how each process
+/// ended and at which stage, under which limit.
 fn two_deaths(first: &CaptureDeath, retry: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
-    let lead = "the compiler engine ended during the capture and again when the capture \
-                was retried in a fresh process";
-    let (heap, under) = heap_cap_phrases(heap_cap_mb);
-    let same = first.end == retry.end && first.stage() == retry.stage();
-    if !same {
+    let lead = "the compiler engine ended during the capture and again on the retry in a fresh \
+                process";
+    let limit = memory_limit(heap_cap_mb);
+    if first.end == retry.end && first.stage() == retry.stage() {
         return format!(
-            "{lead}; the first {} {}, the retry {} {}, {under}",
-            first.ended(false),
-            first.stage(),
-            retry.ended(false),
-            retry.stage()
+            "{lead}; both {} {}, with {limit}",
+            first.how(true),
+            first.stage()
         );
     }
-    let both = format!("{lead}; both {} {}", first.ended(true), first.stage());
-    match first
-        .held()
-        .filter(|_| first.end.is_some_and(|end| end.is_abort()))
-    {
-        Some(held) => format!("{both}: {held} did not fit {heap}"),
-        None => format!("{both}, {under}"),
-    }
+    format!(
+        "{lead}; the first {} {}, the retry {} {}, with {limit}",
+        first.how(false),
+        first.stage(),
+        retry.how(false),
+        retry.stage()
+    )
 }
 
 /// A scanner-held type text is usable as a BACKFILL literal anchor when it is
@@ -1656,8 +1613,8 @@ fn select_mode<'a>(
 fn no_surface_pre_verdict(side: &str, entry: &ServiceEntry) -> PreVerdict {
     let reason = match entry.types_degraded {
         Some(lost) => format!(
-            "{side} service '{}' has no type surface: types were lost at {}: {}",
-            entry.service_id, lost.stage, lost.detail
+            "{side} service '{}' has no type surface because its types were lost ({})",
+            entry.service_id, lost.detail
         ),
         None => format!(
             "{side} service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
@@ -8234,47 +8191,41 @@ mod tests {
     }
 
     const ABORTED: Option<ProcessEnd> = Some(ProcessEnd::Signal(ProcessEnd::SIGABRT));
-    const TWICE: &str = "the compiler engine ended during the capture and again when the capture was \
-                         retried in a fresh process";
+    const TWICE: &str =
+        "the compiler engine ended during the capture and again on the retry in a fresh process";
 
-    /// Two processes that aborted before any anchor was resolved are a
-    /// program that does not fit the heap, and the failure says so with the
-    /// cap (carrick#1916).
+    /// Two processes that aborted before any type was resolved are a
+    /// program that does not fit the memory limit, and the failure says so
+    /// with the limit (carrick#1916).
     #[test]
-    fn two_aborts_while_building_the_program_say_the_program_did_not_fit() {
+    fn two_aborts_while_building_the_program_say_the_limit() {
         let building = death(Some(("program", "building the program")), ABORTED);
         assert_eq!(
             two_deaths(&building, &building, Some(2048)),
             format!(
-                "{TWICE}; both were stopped because they ran out of memory, \
-                 while building the service's program, before any anchor was resolved: the \
-                 service's program did not fit the 2048 MB memory limit it was given"
+                "{TWICE}; both ran out of memory while building the service's program, \
+                 before any type was resolved, with a memory limit of 2048 MB"
             )
         );
     }
 
-    /// The stage is the last one the capture reported. A capture that got
-    /// through every anchor and aborted on its last stage ran out of heap on
-    /// what that stage holds, which is not the anchors.
+    /// The stage is the last one the capture reported.
     #[test]
-    fn two_aborts_name_the_stage_they_reached_and_what_it_held() {
+    fn two_aborts_name_the_stage_they_reached() {
         let checking = death(Some(("self-check", "checking the stub")), ABORTED);
         assert_eq!(
             two_deaths(&checking, &checking, Some(8192)),
             format!(
-                "{TWICE}; both were stopped because they ran out of memory, \
-                 while type-checking the emitted declarations, after every anchor was \
-                 resolved: the emitted declarations and the packages they import did not fit \
-                 the 8192 MB memory limit it was given"
+                "{TWICE}; both ran out of memory while type-checking the emitted \
+                 declarations, with a memory limit of 8192 MB"
             )
         );
         let resolving = death(Some(("anchors", "412 of 817")), ABORTED);
         assert_eq!(
             two_deaths(&resolving, &resolving, None),
             format!(
-                "{TWICE}; both were stopped because they ran out of memory, \
-                 while resolving anchors (last report: 412 of 817): the service's program \
-                 and the types of its anchors did not fit the default memory limit"
+                "{TWICE}; both ran out of memory while resolving types (last report 412 of \
+                 817), with the default memory limit"
             )
         );
     }
@@ -8290,8 +8241,8 @@ mod tests {
         assert_eq!(
             two_deaths(&killed, &killed, Some(8192)),
             format!(
-                "{TWICE}; both were killed by the system while emitting declarations, after every \
-                 anchor was resolved, under a memory limit of 8192 MB"
+                "{TWICE}; both were killed by the system while emitting declarations, with a \
+                 memory limit of 8192 MB"
             )
         );
         // A sidecar that writes no frames, and a platform that reports no
@@ -8300,7 +8251,7 @@ mod tests {
         assert_eq!(
             two_deaths(&silent, &silent, Some(8192)),
             format!(
-                "{TWICE}; both ended with exit code 134 before reporting any progress, under \
+                "{TWICE}; both ended with exit code 134 before reporting any progress, with \
                  a memory limit of 8192 MB"
             )
         );
@@ -8308,7 +8259,7 @@ mod tests {
         assert_eq!(
             two_deaths(&unknown, &unknown, None),
             format!(
-                "{TWICE}; both ended before reporting any progress, under the default memory limit"
+                "{TWICE}; both ended before reporting any progress, with the default memory limit"
             )
         );
     }
@@ -8322,10 +8273,9 @@ mod tests {
         assert_eq!(
             two_deaths(&building, &resolving, Some(4096)),
             format!(
-                "{TWICE}; the first was stopped because it ran out of memory, \
-                 while building the service's program, before any anchor was resolved, \
-                 the retry was killed by the system while resolving anchors (last report: 3 of 9), \
-                 under a memory limit of 4096 MB"
+                "{TWICE}; the first ran out of memory while building the service's program, \
+                 before any type was resolved, the retry was killed by the system while \
+                 resolving types (last report 3 of 9), with a memory limit of 4096 MB"
             )
         );
     }
@@ -8381,8 +8331,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         .expect_err("a capture whose process dies twice produces no stub");
 
         let under = match crate::services::type_sidecar::heap_cap_mb() {
-            Some(mb) => format!("under a memory limit of {mb} MB"),
-            None => "under the default memory limit".to_string(),
+            Some(mb) => format!("with a memory limit of {mb} MB"),
+            None => "with the default memory limit".to_string(),
         };
         // Unix says which signal; elsewhere the end is an exit code.
         let CaptureFailure::SidecarDied { detail, deaths } = failure else {
@@ -8391,10 +8341,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         #[cfg(unix)]
         assert_eq!(
             detail,
-            format!(
-                "{TWICE}; both were killed by the system while emitting declarations, after every \
-                 anchor was resolved, {under}"
-            )
+            format!("{TWICE}; both were killed by the system while emitting declarations, {under}")
         );
         assert_eq!(deaths.len(), 2, "both deaths ride the failure");
         assert!(
@@ -8446,32 +8393,34 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
-    /// A memory death returned without its retry says so, with the stage,
-    /// what did not fit and the cap.
+    /// A memory death returned without its retry says so, with the stage
+    /// and the limit.
     #[test]
-    fn one_memory_death_names_the_stage_and_what_did_not_fit() {
+    fn one_memory_death_names_the_stage_and_the_limit() {
         let building = death(Some(("program", "building the program")), ABORTED);
         assert_eq!(
             one_memory_death(&building, Some(8192)),
-            "the compiler engine ended during the capture and was not retried at the \
-             same size, as this run stops on a memory death; it was stopped because it ran \
-             out of memory, while building the service's program, before any anchor was resolved: the \
-             service's program did not fit the 8192 MB memory limit it was given"
+            "the compiler engine ran out of memory during the capture while building the \
+             service's program, before any type was resolved, with a memory limit of 8192 MB, \
+             so it was not retried at the same size"
         );
         let killed = death(
             Some(("program", "building the program")),
             Some(ProcessEnd::Signal(9)),
         );
         assert!(
-            one_memory_death(&killed, Some(8192))
-                .ends_with("before any anchor was resolved, under a memory limit of 8192 MB"),
+            one_memory_death(&killed, Some(8192)).starts_with(
+                "the compiler engine was killed by the system during the capture while building"
+            ),
             "a kill is not the memory limit: {}",
             one_memory_death(&killed, Some(8192))
         );
         let silent = death(None, ABORTED);
         assert!(
-            one_memory_death(&silent, None)
-                .ends_with("before reporting any progress, under the default memory limit"),
+            one_memory_death(&silent, None).ends_with(
+                "before reporting any progress, with the default memory limit, so it was not \
+                 retried at the same size"
+            ),
             "{}",
             one_memory_death(&silent, None)
         );
@@ -8550,8 +8499,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "{deaths:?}"
         );
         assert!(
-            detail.contains("was not retried at the same size")
-                && detail.contains("the service's program did not fit"),
+            detail.contains("so it was not retried at the same size")
+                && detail.contains("while building the service's program"),
             "{detail}"
         );
         assert!(
@@ -10034,8 +9983,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         };
         assert_eq!(
             reason,
-            "producer service 'api' has no type surface: types were lost at resolve: the \
-             process ran out of memory"
+            "producer service 'api' has no type surface because its types were lost (the \
+             process ran out of memory)"
         );
         let pairs = surfaceless_producer_pair(None);
         let Some(PreVerdict::NoSurface { reason }) = pre_verdict_of(&pairs) else {

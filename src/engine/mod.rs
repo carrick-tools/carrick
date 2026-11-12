@@ -10933,10 +10933,8 @@ fn resolve_types_if_available(
         {
             debug!("The compiler engine was unavailable: {}", reason);
         }
-        let detail = "the compiler engine is unavailable: it was not found, failed to start, or \
-                      did not finish starting"
-            .to_string();
-        cloud_data.type_extraction_status = Some(format!("type extraction skipped: {}", detail));
+        let detail = "the compiler engine was not found or could not be started".to_string();
+        cloud_data.type_extraction_status = Some(detail.clone());
         cloud_data.types_degraded = Some(TypeDegradation {
             stage: "spawn".to_string(),
             detail,
@@ -11058,7 +11056,7 @@ fn resolve_types_if_available(
                     ) {
                         Some(death) => type_compat_v2::resolution_memory_death(&death),
                         None => format!(
-                            "the compiler engine could not read types: {}",
+                            "the compiler engine could not read types because {}",
                             e.downcast_ref::<crate::services::type_sidecar::SidecarError>()
                                 .map_or("it reported an error", |e| e.customer_cause())
                         ),
@@ -11076,11 +11074,10 @@ fn resolve_types_if_available(
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
             let detail = format!(
-                "the compiler engine was not ready to read types: {}",
+                "the compiler engine was not ready to read types because {}",
                 e.customer_cause()
             );
-            cloud_data.type_extraction_status =
-                Some(format!("type extraction skipped: {}", detail));
+            cloud_data.type_extraction_status = Some(detail.clone());
             cloud_data.types_degraded = Some(TypeDegradation {
                 stage: "init".to_string(),
                 detail,
@@ -16080,7 +16077,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 && run
                     .status()
                     .contains("compiler engine ended during the capture")
-                && run.status().contains("retried in a fresh process"),
+                && run.status().contains("on the retry in a fresh process"),
             "the status does not say the sidecar died: {}",
             run.status()
         );
@@ -29971,9 +29968,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let degraded = data.types_degraded.as_ref().expect("types_degraded");
         assert_eq!(degraded.stage, "resolve");
         assert!(
-            degraded.detail.starts_with(
-                "the compiler engine could not read types: it ran out of memory, under "
-            ) && degraded.detail.contains("memory limit"),
+            degraded
+                .detail
+                .starts_with("the compiler engine ran out of memory while reading types, with ")
+                && degraded.detail.contains("memory limit"),
             "the detail does not name the memory death: {}",
             degraded.detail
         );
