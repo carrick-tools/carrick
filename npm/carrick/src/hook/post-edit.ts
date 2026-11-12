@@ -139,14 +139,13 @@ async function main(timing: Timing): Promise<void> {
 type Change = Omit<FactEdit, "file">;
 
 /**
- * Whether git, asked in the file's folder, says it does not track `file`;
- * false when git cannot say. Loaded only on this path, which a created file
- * alone takes.
+ * Whether git, asked in the file's folder through the facts git runner, says
+ * it does not track `file`; false when git cannot say. Loaded only on this
+ * path, which a created file alone takes.
  */
 async function untracked(file: string): Promise<boolean> {
-  const { trackedPaths } = await import("../init/repo-copies.ts");
-  const tracked = trackedPaths(path.dirname(file), [path.basename(file)]);
-  return tracked !== null && tracked.size === 0;
+  const { untrackedFile } = await import("../facts/diff.ts");
+  return untrackedFile(file);
 }
 
 /** The file's changed lines against HEAD (`facts/diff.ts`), or null when not known. */

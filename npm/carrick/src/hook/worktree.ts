@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 /** The nearest directory at or above `start` holding a `.git`, and whether it is a linked worktree (`.git` is a file). */
-function checkoutOf(start: string): { top: string; linked: boolean } | null {
+export function checkoutOf(start: string): { top: string; linked: boolean } | null {
   let dir = start;
   for (;;) {
     try {

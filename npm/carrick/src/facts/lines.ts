@@ -237,13 +237,12 @@ export async function factLines(
     const commits = commitsOf(store.meta);
     const proofs: PeerContext["proofs"] = new Map();
     const missing: PeerContext["missing"] = new Set();
-    const partial: PeerContext["partial"] = new Map();
     // A peer-proof git call that ran out of time, shared across the call's edited files.
     const git = { failed: false };
     // Where each repo is checked out here, for every kind (R40.2).
     const checkouts = localCheckouts(where);
     const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
-      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, partial, gitFailed: git.failed };
+      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, gitFailed: git.failed };
       const answer = peersUnchanged(others, ctx);
       git.failed = ctx.gitFailed;
       return answer;

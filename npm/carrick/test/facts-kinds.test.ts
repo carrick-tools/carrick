@@ -1360,6 +1360,30 @@ test("R40.3: a checkout counts as partial from a promisor pack, an included conf
   });
 });
 
+test("R40.4: in a partial clone a shell write and a created file run no git and print nothing", async (t) => {
+  const run = async (partial: boolean) => {
+    const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE)]);
+    if (partial) fs.writeFileSync(path.join(ws.at("api"), ".git", "objects", "pack", "pack-0.promisor"), "");
+    const git = countingGit(t);
+    const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), PATH: git.path });
+    const hook = async (script: string, payload: Record<string, unknown>) =>
+      context((await runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: "partial", cwd: ws.root, ...payload }, env })).stdout);
+    const file = ws.at("api/src/orders.ts");
+    fs.writeFileSync(file, ORDERS.replace("`order:${id}`", "`orders:${id}`"));
+    const shell = await hook("post-bash.ts", { tool_name: "Bash", tool_input: { command: `sed -i 's/order:/orders:/' ${file}` }, tool_response: { stdout: "" } });
+    const created = ws.at("api/src/created.ts");
+    const content = "export function made() {\n  return 1;\n}\n";
+    fs.writeFileSync(created, content);
+    const write = await hook("post-edit.ts", { tool_name: "Write", tool_input: { file_path: created, content }, tool_response: { type: "create", filePath: created } });
+    return { shell, write, diff: git.calls(/ diff /), lsFiles: git.calls(/ ls-files /) };
+  };
+  // Control: a full clone asks git for both, and the shell write prints its fn line.
+  const full = await run(false);
+  assert.equal(full.shell, LOAD_LINE);
+  assert.ok(full.diff > 0 && full.lsFiles > 0, JSON.stringify(full));
+  assert.deepEqual(await run(true), { shell: "", write: "", diff: 0, lsFiles: 0 });
+});
+
 test("R36.4: the facts git runner never lets git fetch or prompt", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
   const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-env-"));

@@ -10,16 +10,15 @@
 // under its budget (`CARRICK_FACTS_DIFF_BUDGET_MS`). The answer is false (the
 // line is silent) when: the fact file has no commit for the repo, the commit
 // is not a full object id, git fails or runs past its budget (an overrun makes
-// every later proof in the same call false too), the commit is not in the clone,
-// a file is missing, over `MAX_FACT_FILE_BYTES`, or differs. Never throws.
+// every later proof in the same call false too), the checkout is a partial
+// clone (`gitFacts` runs nothing there), the commit is not in the clone, a file
+// is missing, over `MAX_FACT_FILE_BYTES`, or differs. Never throws.
 
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { factsGitBudgetMs, gitFacts } from "./diff.ts";
 import type { FileMemo } from "./files.ts";
-import { commonGitDir } from "../hook/worktree.ts";
 
 /** A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). Anything else (a branch, `HEAD`, a short id) proves nothing. */
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -57,8 +56,6 @@ export type PeerContext = {
   proofs: Map<string, boolean>;
   /** Commits a clone answered it lacks in this call, by repo top and commit: not asked again (R36.3). */
   missing: Set<string>;
-  /** Whether each checkout is a partial clone, by repo top, read once per call (R36.4). */
-  partial: Map<string, boolean>;
   /** A git call ran out of time in this call: no further git call, every proof false. */
   gitFailed: boolean;
 };
@@ -79,26 +76,6 @@ export function inRepo(file: string): string | null {
   return parts.join("/");
 }
 
-/**
- * Whether the checkout at `top` is a partial clone (or not known not to be,
- * R40.3): its shared git dir holds a promisor pack (`objects/pack/*.promisor`),
- * or its config includes another file (`[include]`, `[includeIf]`: what that
- * file says is not read) or has any `promisor`, `partialclonefilter` or
- * `partialclone` key, whatever its value. Read as files, no git run. A git
- * dir, pack folder or config that cannot be read counts as partial.
- */
-function isPartialClone(top: string): boolean {
-  const common = commonGitDir(top);
-  if (common === null) return true;
-  try {
-    if (fs.readdirSync(path.join(common, "objects", "pack")).some((name) => name.endsWith(".promisor"))) return true;
-    const config = fs.readFileSync(path.join(common, "config"), "utf8");
-    return /^\s*\[\s*include(?:if)?\b/im.test(config) || /^\s*(?:promisor|partialclonefilter|partialclone)\s*(?:[=;#]|$)/im.test(config);
-  } catch {
-    return true;
-  }
-}
-
 /** Whether every file in `files` under `top` is its blob at `commit`. */
 function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: readonly string[]): boolean {
   const key = `${top}\0${commit}\0${files.join("\0")}`;
@@ -113,14 +90,7 @@ function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: read
     }
     const clone = `${top}\0${commit}`;
     if (ctx.gitFailed || ctx.missing.has(clone)) return false;
-    // A partial clone would fetch a missing object over the network, which a
-    // hook never does, on any git version: no proof there at all (R36.4).
-    let partial = ctx.partial.get(top);
-    if (partial === undefined) {
-      partial = isPartialClone(top);
-      ctx.partial.set(top, partial);
-    }
-    if (partial) return false;
+    // In a partial clone `gitFacts` runs nothing and answers null (R40.4).
     const started = performance.now();
     const out = gitFacts(top, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", ...files], ctx.env);
     if (out === null) {
