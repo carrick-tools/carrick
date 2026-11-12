@@ -14,6 +14,10 @@ import { commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
 import { factLines } from "../src/facts/lines.ts";
+import { fileMemo } from "../src/facts/files.ts";
+import { scanSource } from "../src/facts/match.ts";
+import { sameNameLines, textBefore } from "../src/facts/rules/same-name.ts";
+import type { FactStore } from "../src/facts/store.ts";
 import { readTimings } from "../src/hook/timings.ts";
 
 const SLUG = "kinds-demo";
@@ -724,6 +728,49 @@ test("an fn row with null in others and a pkg service with no manifest do not lo
     undefined,
   );
   assert.deepEqual(outcome.lines, ["op line for loadOrder"]);
+});
+
+// ---- Speed (R33.5) ----
+
+test("R33.5: the name rule rebuilds the text before the edit only when a name could have a row elsewhere", () => {
+  let rebuilt = 0;
+  const change = {
+    lines: [5],
+    removed: [5],
+    get removedText() {
+      rebuilt += 1;
+      return ["  return 0;"];
+    },
+  };
+  const text = HOOK;
+  const scan = scanSource(text, false);
+  const at = { repo: "api", rel: "src/hook.ts", top: "/nowhere/api" };
+  // No declaration of `main` anywhere else: nothing to look up, nothing rebuilt.
+  const none = { declarations: () => [] } as unknown as FactStore;
+  assert.deepEqual(sameNameLines(none, at, new Map(), text, scan, change, false, fileMemo()), []);
+  assert.equal(rebuilt, 0);
+  // A declaration elsewhere: now the text before is rebuilt.
+  const some = { declarations: () => [{ name: "main", repo: "web", file: "src/main.ts", line: 3, text: "t" }] } as unknown as FactStore;
+  sameNameLines(some, at, new Map(), text, scan, change, false, fileMemo());
+  assert.ok(rebuilt > 0);
+});
+
+test("R33.5: the text before the edit is not rebuilt past 512 KB", () => {
+  const big = "x".repeat(300 * 1024);
+  assert.equal(textBefore(`${big}\n`, [], [1], [big]), null);
+  assert.equal(textBefore("a\n", [], [1], ["b"]), "b\na\n");
+});
+
+test("R33.5: the name kind stops after 3 failed checks", async (t) => {
+  // Five added functions, each named like one in web whose file no longer declares it there; the fifth holds.
+  const names = ["alphaOne", "betaTwo", "gammaThree", "deltaFour", "epsilonFive"];
+  const files: Record<string, string> = { "api/src/hook.ts": HOOK };
+  const rows = names.map((name) => ({ ...nameRow(name, "web", `src/${name}.ts`) }));
+  for (const name of names) files[`web/src/${name}.ts`] = name === "epsilonFive" ? `// x\n\nexport function ${name}() {}\n` : `export function other() {}\n`;
+  const ws = await workspace(t, files, rows);
+  const added = names.flatMap((name) => [`export function ${name}() {`, "  return 1;", "}"]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts", [...added, ""]);
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
 });
 
 // ---- Stale hunks (ruling 4) ----

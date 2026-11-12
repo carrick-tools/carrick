@@ -36,6 +36,9 @@ const log = createLogger("carrick-facts");
 /** At most this many fact lines for one action. */
 export const MAX_FACT_LINES = 3;
 
+/** The name kind stops after this many lines whose other file failed its check (R33.5). */
+const MAX_NAME_FAILURES = 3;
+
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
  * file as it is now that it added (`lines`) and the lines it removed lines
@@ -333,11 +336,18 @@ export async function factLines(
       isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file), memo));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
+    // The name kind stops after `MAX_NAME_FAILURES` failed checks (R33.5):
+    // each one may scan a whole other file.
     for (const kind of KINDS) {
+      let failed = 0;
       for (const candidate of found[kind]) {
         if (lines.length >= MAX_FACT_LINES) break;
+        if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
         if (said.has(candidate.key) || candidate.key in claims) continue;
-        if (candidate.holds && !candidate.holds()) continue;
+        if (candidate.holds && !candidate.holds()) {
+          failed += 1;
+          continue;
+        }
         lines.push(candidate.text);
         claims[candidate.key] = { at: now, named: candidate.named };
       }

@@ -11,10 +11,11 @@
 
 import path from "node:path";
 import type { Candidate } from "../lines.ts";
+import { MAX_FACT_FILE_BYTES } from "../files.ts";
 import type { FileMemo } from "../files.ts";
 import { scanSource } from "../match.ts";
 import type { Scan } from "../match.ts";
-import type { FactStore } from "../store.ts";
+import type { FactStore, NameRow } from "../store.ts";
 
 /** A name shorter than this (its last dotted part) is too common to say anything about. */
 export const MIN_NAME_LENGTH = 4;
@@ -25,10 +26,14 @@ type Change = { lines?: number[] | null; removed?: number[] | null; removedText?
 /**
  * The text before the edit: `text` (the file now) with the `added` lines
  * dropped and each removed line put back just above the line `removed`
- * names. Null when the removed lines and their text do not pair up.
+ * names. Null when the removed lines and their text do not pair up, or when
+ * the text before would be larger than `MAX_FACT_FILE_BYTES` (R33.5).
  */
 export function textBefore(text: string, added: readonly number[], removed: readonly number[], removedText: readonly string[]): string | null {
   if (removed.length !== removedText.length) return null;
+  let size = text.length;
+  for (const line of removedText) size += line.length + 1;
+  if (size > MAX_FACT_FILE_BYTES) return null;
   const now = text.split("\n");
   const drop = new Set(added);
   const before: string[] = [];
@@ -37,7 +42,9 @@ export function textBefore(text: string, added: readonly number[], removed: read
     while (next < removed.length && removed[next] === line) before.push(removedText[next++]!);
     if (line <= now.length && !drop.has(line)) before.push(now[line - 1]!);
   }
-  return next === removed.length ? before.join("\n") : null;
+  if (next !== removed.length) return null;
+  const joined = before.join("\n");
+  return Buffer.byteLength(joined, "utf8") > MAX_FACT_FILE_BYTES ? null : joined;
 }
 
 /**
@@ -55,7 +62,7 @@ function holdsWord(text: string, word: string): boolean {
  * `module.exports = { f() {} }` rewritten as `function f` is no new
  * function); null when the text before cannot be known.
  */
-function addedNames(text: string, scan: Scan, change: Change, jsx: boolean): string[] | null {
+function addedNames(names: readonly string[], text: string, change: Change, jsx: boolean): string[] | null {
   let before: Set<string>;
   let old = "";
   if (change.whole) before = new Set();
@@ -68,11 +75,7 @@ function addedNames(text: string, scan: Scan, change: Change, jsx: boolean): str
     before = new Set(oldScan.spans.map((span) => span.name));
     old = rebuilt;
   }
-  const count = new Map<string, number>();
-  for (const span of scan.spans) count.set(span.name, (count.get(span.name) ?? 0) + 1);
-  return [...count]
-    .filter(([name, n]) => n === 1 && !before.has(name) && !holdsWord(old, name.slice(name.lastIndexOf(".") + 1)))
-    .map(([name]) => name);
+  return names.filter((name) => !before.has(name) && !holdsWord(old, name.slice(name.lastIndexOf(".") + 1)));
 }
 
 /** The `name` lines for one edited file: at most one per added name. */
@@ -86,17 +89,25 @@ export function sameNameLines(
   jsx: boolean,
   memo: FileMemo,
 ): Candidate[] {
-  const names = addedNames(text, scan, change, jsx);
+  // First the store (R33.5): the names declared once in the file now that
+  // another file declares. Only when some remain is the text before the edit
+  // rebuilt and scanned.
+  const count = new Map<string, number>();
+  for (const span of scan.spans) count.set(span.name, (count.get(span.name) ?? 0) + 1);
+  const rowsOf = new Map<string, NameRow[]>();
+  for (const [name, n] of count) {
+    if (n !== 1 || name.slice(name.lastIndexOf(".") + 1).length < MIN_NAME_LENGTH) continue;
+    const rows = store.declarations(name);
+    // A row in this file: the name was here on main, so it is not a new one.
+    if (rows.length === 0 || rows.some((row) => row.repo === at.repo && row.file === at.rel)) continue;
+    rowsOf.set(name, rows);
+  }
+  if (rowsOf.size === 0) return [];
+  const names = addedNames([...rowsOf.keys()], text, change, jsx);
   if (names === null) return [];
   const out: Candidate[] = [];
   for (const name of names) {
-    const bare = name.slice(name.lastIndexOf(".") + 1);
-    if (bare.length < MIN_NAME_LENGTH) continue;
-    const rows = store.declarations(name);
-    // A row in this file: the name was here on main, so it is not a new one.
-    if (rows.some((row) => row.repo === at.repo && row.file === at.rel)) continue;
-    const first = rows[0];
-    if (!first) continue;
+    const first = rowsOf.get(name)![0]!;
     const base = first.repo === at.repo ? at.top : where.get(first.repo);
     // A repo not checked out here: stated from the index, which it cannot
     // have changed since (R33.1).
