@@ -45,44 +45,6 @@ pub fn install_table_package(root: &Path) {
     }
 }
 
-/// An installed HTTP client package for trees a test writes itself
-/// (carrick#3711 R2): `createClient()` builds a client whose
-/// `get({ url })` sends a GET to `url`. With its lockfile entry and its store
-/// answer under `__llm__`.
-pub fn install_client_package(root: &Path) {
-    let files = [
-        (
-            "node_modules/fixture-client/package.json",
-            r#"{ "name": "fixture-client", "version": "1.0.0", "types": "index.d.ts" }"#,
-        ),
-        (
-            "node_modules/fixture-client/index.d.ts",
-            "export interface Client {\n  get<T = any>(options: { url: string; params?: unknown }): Promise<T>;\n}\ndeclare function createClient(): Client;\nexport default createClient;\n",
-        ),
-        (
-            "package.json",
-            r#"{ "name": "client-service", "version": "1.0.0", "private": true, "dependencies": { "fixture-client": "^1.0.0" } }"#,
-        ),
-        (
-            "package-lock.json",
-            r#"{ "name": "client-service", "version": "1.0.0", "lockfileVersion": 3, "requires": true, "packages": { "": { "name": "client-service", "version": "1.0.0", "dependencies": { "fixture-client": "^1.0.0" } }, "node_modules/fixture-client": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/fixture-client/-/fixture-client-1.0.0.tgz" } } }"#,
-        ),
-        (
-            "tsconfig.json",
-            r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
-        ),
-        (
-            "__llm__/library-claims/default.json",
-            r#"{ "library_claims": [ { "package": "fixture-client", "version": "1.0.0", "status": "answered", "exports": [ { "specifier": "fixture-client", "export": "default", "role": "http_client", "side": "client", "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }], "scopes": [], "ops": [ { "op": "request", "member": "get", "of": "instance:()", "name": { "arg": 0, "key": "url" }, "method_default": "GET", "picker": "fixture-picker" } ], "reserved": [], "calls": [], "patterns": [] } ] } ] }"#,
-        ),
-    ];
-    for (relative, text) in files {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
-}
-
 const TABLE_TYPES: &str = "export interface Request {\n  path: string;\n}\n\
 export interface Reply {\n  send(body: unknown): void;\n}\n\
 export type Handler = (request: Request, reply: Reply) => unknown;\n\

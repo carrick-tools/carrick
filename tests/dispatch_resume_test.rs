@@ -309,9 +309,7 @@ fn large_file_root(into: &Path) -> (PathBuf, Vec<PathBuf>) {
     for i in 0..600 {
         source.push_str(&format!("GeneratedShapeNumber{i:04}, "));
     }
-    source.push_str(
-        "} from \"./shapes\";\nimport createClient from \"fixture-client\"; const client = createClient();\n\n",
-    );
+    source.push_str("} from \"./shapes\";\ndeclare const client: any;\n\n");
     for i in 0..400 {
         source.push_str(&format!(
             "export function readItem{i}(id: string): Promise<GeneratedShapeNumber{:04}> {{\n  return client.get({{ url: \"/dispatched/items/{i}\", params: {{ id }} }});\n}}\n\n",
@@ -319,7 +317,6 @@ fn large_file_root(into: &Path) -> (PathBuf, Vec<PathBuf>) {
         ));
     }
     let root = into.canonicalize().expect("a canonical temp dir");
-    fact_files::install_client_package(&root);
     let file = root.join("src/large_client.ts");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, source).unwrap();
@@ -330,9 +327,7 @@ async fn analyze_files(
     root: &Path,
     files: &[PathBuf],
 ) -> carrick::agents::file_orchestrator::FileCentricAnalysisResult {
-    let facts = fact_files::walked(root).await;
     FileOrchestrator::new(AgentService::new())
-        .with_fact_files(fact_files::source(&facts))
         .analyze_files(
             files,
             &std::collections::HashMap::new(),
