@@ -84,11 +84,7 @@ const TEST_FILE_INFIXES: &[&str] = &[
 /// in production (carrick#1626). Its `e2e/` and `fixtures/` already fall under
 /// [`TEST_DIR_NAMES`]; the rest is kept and tagged rather than skipped, so the
 /// file set a scan reads does not change.
-///
-/// `testing` is the directory a test-support module lives in (a harness, a
-/// stub server, shared test builders): same class as `mocks/`, kept and tagged
-/// rather than skipped (carrick#3967).
-const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock", "cypress", "testing"];
+const MOCK_DIR_NAMES: &[&str] = &["mocks", "mock", "cypress"];
 
 /// File stems of a test-support helper, compared after lowercasing and
 /// dropping `-` and `_`, so `test-utils`, `test_helpers`, `testUtils` and
@@ -1965,7 +1961,6 @@ mod tests {
             "src/test-helpers.ts",
             "src/testUtils.js",
             "src/test_helper.ts",
-            "src/testing/server.ts",
         ] {
             assert_eq!(
                 endpoint_provenance(Path::new(tagged), root),
@@ -1978,6 +1973,7 @@ mod tests {
             "src/contest-utils.ts",
             "src/test-utils-docs/routes.ts",
             "src/latest.ts",
+            "src/testing/routes.ts",
         ] {
             assert_eq!(
                 endpoint_provenance(Path::new(served), root),
