@@ -1218,16 +1218,9 @@ pub(crate) struct CaptureDeath {
 }
 
 impl CaptureDeath {
-    /// Whether the process died of memory: it aborted with V8's
-    /// heap-exhaustion line on stderr, or it was killed and the cgroup
-    /// counted an OOM kill ([`crate::services::type_sidecar::MemoryDeath::classify`], carrick#2208).
-    ///
-    /// The one rule the capture retry reads, and the one the run's record
-    /// of the death was made by, so the two agree.
-    pub(crate) fn is_memory_death(&self) -> bool {
-        self.process_death().memory_death().is_some()
-    }
-
+    /// The process's end as the sidecar's own type, which holds the one rule
+    /// for a memory death ([`crate::services::type_sidecar::retries_after`],
+    /// carrick#2208).
     fn process_death(&self) -> crate::services::type_sidecar::ProcessDeath {
         crate::services::type_sidecar::ProcessDeath {
             end: self.end,
@@ -8522,7 +8515,10 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         };
         assert_eq!(asked(), 1, "no same-size retry after a memory death");
         assert_eq!(deaths.len(), 1);
-        assert!(deaths[0].is_memory_death(), "{deaths:?}");
+        assert!(
+            deaths[0].process_death().memory_death().is_some(),
+            "{deaths:?}"
+        );
         assert!(
             detail.contains("was not retried at the same size")
                 && detail.contains("the service's program did not fit"),
