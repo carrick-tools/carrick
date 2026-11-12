@@ -23,6 +23,24 @@ use std::process::{Command, Output};
 
 const FIXTURE: &str = "tests/fixtures/recheck-one-repo-two-services/shop";
 const SERVICES: usize = 3;
+/// The first release that reads a reason word it does not know leniently
+/// (carrick#3989 S0). An older release refuses a blob carrying any word added
+/// after it, so the every-reason-word blob is checked only from here; once
+/// FLOOR reaches it, every release this test runs is checked.
+const LENIENT_REASONS_SINCE: &str = "0.3.155";
+
+/// Whether `version` is at or above [`LENIENT_REASONS_SINCE`].
+fn reads_unknown_reason_words(version: &str) -> bool {
+    let parts = |text: &str| -> Vec<u32> {
+        text.split('.')
+            .map(|part| {
+                part.parse()
+                    .unwrap_or_else(|_| panic!("`{text}` is no release"))
+            })
+            .collect()
+    };
+    parts(version) >= parts(LENIENT_REASONS_SINCE)
+}
 
 fn scan(bin: &Path, fixture: &Path, storage: &Path, envs: &[(&str, &Path)]) -> Output {
     let mut command = Command::new(bin);
@@ -118,7 +136,17 @@ fn older_releases_read_every_blob_this_build_writes() {
     // Each older release downloads each blob as its only sibling, and scans
     // to the end.
     for (version, bin) in &releases {
-        for blob in blobs.iter().chain([&every_word]) {
+        let every_word = if reads_unknown_reason_words(version) {
+            Some(&every_word)
+        } else {
+            eprintln!(
+                "release {version} is below {LENIENT_REASONS_SINCE}, which reads an unknown \
+                 reason word leniently: the every-reason-word blob is not checked against it \
+                 (carrick#3989; raise FLOOR to close this)"
+            );
+            None
+        };
+        for blob in blobs.iter().chain(every_word) {
             let peers = tempfile::tempdir().unwrap();
             std::fs::copy(blob, peers.path().join(blob.file_name().unwrap())).unwrap();
             let own = tempfile::tempdir().unwrap();

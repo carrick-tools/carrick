@@ -14,3 +14,10 @@ A field leaves the blob in two steps:
 
 Set at 0.3.153 after carrick#3762 stopped writing `unemitted_literal_candidates`,
 which 0.3.153 requires.
+
+The test also hands each release a blob carrying every reason word this build
+knows (`Stop::ALL` and `npm/carrick/src/unread-reasons.json`), on every field
+that holds one (carrick#3989). Releases from 0.3.155 read an unknown reason
+word leniently; an older one refuses a blob with any word added after it, so
+the test checks the every-word blob only from 0.3.155
+(`LENIENT_REASONS_SINCE`) and says so for the floor until FLOOR is raised.

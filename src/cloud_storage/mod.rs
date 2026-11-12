@@ -1253,6 +1253,12 @@ impl CloudRepoData {
 /// new value, which the cloud's vocabulary check refuses. Mixed versions are
 /// not supported, so the reader stops, and the error names the sibling, the
 /// release that wrote it and, when that release is newer, the upgrade.
+///
+/// The one exception is a reason word ([`crate::request_summary::Stop`]) on
+/// `unread_sites`, `unread_sites_by_reason`, `possible_calls` or
+/// `unfollowed_member_calls` (carrick#3989 S0): never an input, so a word a
+/// later release added reads as `Stop::Unknown` with the raw word, and is
+/// written back as it was read.
 pub(crate) fn read_peer_blob(text: &str) -> Result<CloudRepoData, UnreadablePeerBlob> {
     serde_json::from_str(text).map_err(|error| {
         let writer = serde_json::from_str(text).unwrap_or_default();
