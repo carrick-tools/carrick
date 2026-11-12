@@ -523,6 +523,8 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
                     for &i in group {
                         keep[i] = true;
                     }
+                } else {
+                    break;
                 }
             }
         }
