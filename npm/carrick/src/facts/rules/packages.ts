@@ -112,7 +112,11 @@ export function packageLines(
     if (row === null) continue;
     const others = row.services.filter((service) => !(service.repo === at.repo && service.manifest === at.rel));
     if (others.length === 0 || others.every((service) => service.spec === spec)) continue;
-    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
+    const owners = row.services.filter((service) => service.repo === at.repo && service.manifest === at.rel);
+    // Two services declare the package in this very manifest: the sentence
+    // for one names the other at the spec this edit just changed (R36.1).
+    if (owners.length > 1) continue;
+    const own = owners[0];
     // The edited manifest is not in the row, but the row lists its repo: one
     // of those entries may be this manifest under another path, so the
     // sentence could state its old spec (R33.4, F4). With its own entry

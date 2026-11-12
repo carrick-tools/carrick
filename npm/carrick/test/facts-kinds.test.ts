@@ -596,6 +596,18 @@ test("R33.4: pkg is silent when another service's manifest does not parse, or ho
   assert.deepEqual([broken.text, empty.text], ["", ""]);
 });
 
+test("R36.1: pkg is silent when another service shares the edited manifest", async (t) => {
+  // api and api-worker both declare zod in api/package.json; web in its own.
+  const services = [
+    { repo: "api", service: "api", spec: "^3.22.0", manifest: "package.json", others_text: "zod is ^3.22.0 in api-worker, ^3.23.8 in web" },
+    { repo: "api", service: "api-worker", spec: "^3.22.0", manifest: "package.json", others_text: "zod is ^3.22.0 in api, ^3.23.8 in web" },
+    { repo: "web", service: "web", spec: "^3.23.8", manifest: "package.json", others_text: "zod is ^3.22.0 in api, ^3.22.0 in api-worker" },
+  ];
+  const row = { k: "pkg", package: "zod", services, text: "zod is ^3.22.0 in api, ^3.22.0 in api-worker, ^3.23.8 in web" };
+  const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row]);
+  assert.equal(text, "");
+});
+
 test("R33.4: in a single-repo monorepo the edited manifest's entry prints the other service's spec, while it holds on disk", async (t) => {
   const MONO = pkgRow("zod", [
     ["api", "^3.22.0", "packages/a/package.json"],
