@@ -444,6 +444,30 @@ test("at most 3 fact lines per action, in the order op, fn, name", async (t) => 
   assert.deepEqual(outcome.lines, ["op line 1", "op line 2", LOAD_LINE]);
 });
 
+// ---- Ingest keeps only whole rows (ruling 2) ----
+
+test("ingest skips a row with no text or a mistyped field, of every kind", async (t) => {
+  const { text: _fn, ...fnNoText } = fnRow("loadOrder", LOAD_LINE);
+  const { text: _name, ...nameNoText } = nameRow("readStdin", "web", "src/stdin.ts");
+  const { text: _pkg, ...pkgNoText } = ZOD;
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/orders.ts": ORDERS, "api/package.json": MANIFEST(['    "zod": "^3.22.0"']), "web/package.json": "{}\n" }, [
+    fnNoText,
+    { ...fnRow("listOrders", LIST_LINE), others: [null] },
+    nameNoText,
+    pkgNoText,
+    { ...OP_LOAD, text: "" },
+    { ...OP_LOAD, name: "listOrders", others: [{ repo: "web" }], text: "op line with a bad other" },
+  ]);
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root), { readOnly: true });
+  const counts = ["rows", "fns", "names", "pkgs"].map((table) => Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!["n"]));
+  db.close();
+  assert.deepEqual(counts, [0, 0, 0, 0]);
+  const file = ws.at("api/src/orders.ts");
+  const outcome = await factLines(ws.root, [{ file, whole: true }], undefined);
+  assert.deepEqual(outcome.lines, []);
+});
+
 // ---- One kind's bad row loses only that kind (ruling 8) ----
 
 /** Insert one row straight into the built fact file, past ingest's checks. */

@@ -19,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createLogger } from "../log.ts";
+import { isRecord } from "../fs-util.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 
 const log = createLogger("carrick-facts");
@@ -256,6 +257,65 @@ export async function buildFacts(
   return header;
 }
 
+/** The row kinds this package reads. */
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg"]);
+
+const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
+const isNameOrNull = (value: unknown): boolean => value === null || typeof value === "string";
+const allOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
+  Array.isArray(value) && value.every((entry) => isRecord(entry) && each(entry));
+
+/**
+ * Whether a wire row carries every field its kind requires, each of the
+ * wire's type (carrick-cloud `docs/internal/reference/edit-facts-wire.md`):
+ * a non-empty `text`, and every `others` or `services` entry whole. A row
+ * that does not is skipped at ingest, so no line prints from a half row.
+ */
+function wholeRow(raw: Record<string, unknown>): boolean {
+  if (!isText(raw["text"])) return false;
+  switch (raw["k"]) {
+    case "op":
+      return (
+        (raw["side"] === "producer" || raw["side"] === "consumer") &&
+        isText(raw["protocol"]) &&
+        isText(raw["label"]) &&
+        isText(raw["service"]) &&
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        isLine(raw["line"]) &&
+        isNameOrNull(raw["name"]) &&
+        (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
+        allOf(raw["others"], (other) => isText(other["service"]) && isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]))
+      );
+    case "fn":
+      return (
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        isLine(raw["line"]) &&
+        isText(raw["name"]) &&
+        allOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
+      );
+    case "name":
+      return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && isLine(raw["line"]);
+    case "pkg":
+      return (
+        isText(raw["package"]) &&
+        allOf(
+          raw["services"],
+          (entry) =>
+            isText(entry["repo"]) &&
+            isText(entry["service"]) &&
+            typeof entry["spec"] === "string" &&
+            isText(entry["manifest"]) &&
+            (entry["others_text"] === undefined || isText(entry["others_text"])),
+        )
+      );
+    default:
+      return false;
+  }
+}
+
 /** Write the fact database at `temp` from the header and NDJSON row lines. */
 function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string): void {
   const db = new sqlite.DatabaseSync(temp);
@@ -295,15 +355,24 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const declared = db.prepare("INSERT INTO names (name, repo, file, line, text) VALUES (?, ?, ?, ?, ?)");
     const pkg = db.prepare("INSERT INTO pkgs (package, services, text) VALUES (?, ?, ?)");
     db.exec("BEGIN");
+    let skipped = 0;
     for (const line of lines.slice(1)) {
-      const raw = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as unknown;
+      if (!isRecord(parsed)) continue;
+      const raw = parsed;
+      // A row kind this package does not know is skipped (the wire adds kinds without a schema bump).
+      if (!KNOWN_KINDS.has(String(raw["k"]))) continue;
+      if (!wholeRow(raw)) {
+        skipped += 1;
+        continue;
+      }
       if (raw["k"] === "fn") {
         fn.run(
           String(raw["repo"]),
           String(raw["file"]),
           Number(raw["line"]),
           String(raw["name"]),
-          JSON.stringify(Array.isArray(raw["others"]) ? raw["others"] : []),
+          JSON.stringify(raw["others"]),
           Number(raw["total"] ?? 0),
           String(raw["text"]),
         );
@@ -314,11 +383,9 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         continue;
       }
       if (raw["k"] === "pkg") {
-        pkg.run(String(raw["package"]), JSON.stringify(Array.isArray(raw["services"]) ? raw["services"] : []), String(raw["text"]));
+        pkg.run(String(raw["package"]), JSON.stringify(raw["services"]), String(raw["text"]));
         continue;
       }
-      // A row kind this package does not know is skipped (the wire adds kinds without a schema bump).
-      if (raw["k"] !== "op") continue;
       row.run(
         String(raw["side"]),
         String(raw["protocol"]),
@@ -329,11 +396,12 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         Number(raw["line"]),
         typeof raw["name"] === "string" ? raw["name"] : null,
         typeof raw["site"] === "string" ? raw["site"] : null,
-        JSON.stringify(Array.isArray(raw["others"]) ? raw["others"] : []),
+        JSON.stringify(raw["others"]),
         String(raw["text"]),
       );
     }
     db.exec("COMMIT");
+    if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
     db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package);");
   } finally {
     closeQuietly(db);

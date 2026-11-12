@@ -101,6 +101,19 @@ test("the wire fixture is the pinned one", () => {
   assert.equal(actual, pinned);
 });
 
+test("every row of the pinned fixture is ingested", async (t) => {
+  const ws = await factsWorkspace(t);
+  const wire = fs.readFileSync(WIRE, "utf8").split("\n").filter(Boolean).slice(1).map((line) => (JSON.parse(line) as { k: string }).k);
+  const tables: Record<string, string> = { op: "rows", fn: "fns", name: "names", pkg: "pkgs" };
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root), { readOnly: true });
+  for (const [kind, table] of Object.entries(tables)) {
+    const stored = Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!["n"]);
+    assert.equal(stored, wire.filter((k) => k === kind).length, kind);
+  }
+  db.close();
+});
+
 // Naming rule 3 first: the dotted path of keys from a const-bound object.
 test("naming rule 3: a resolver in an object map is found by its dotted path", async (t) => {
   const ws = await factsWorkspace(t);
