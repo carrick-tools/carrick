@@ -1,5 +1,5 @@
 {
-  "_doc": "Seeded PRs: one known change each, with the check a correct Carrick would post for it. The edits are the one source for both readers: tests/pr_on_main_test.rs (`apply_seed`, payload assertions) and the private PR-accuracy instrument, which replays each seed with a candidate build and the cloud's renderer and scores the posted check against `expect`. `expect` is a closed world: `rows` names every row the correct check carries (an `optional` row may be there or not), so any other row is false and a missing one is a miss. Kinds: `risk_introduced` (a contract risk the PR introduces, at its call site; `label` is the operation as the check names it), `checked_line` (\"Checked N contracts. Nothing to flag.\"), the hidden delta kinds `delta_new`, `delta_removed`, `removed_still_called`, and `dependency` (a sentence of the Dependencies section: a major conflict the PR introduces with another service; `verb` is `adds` or `moves`, `package` the package, `major` the major the PR puts it on). `title` is the title class (`no_contract_changes`, `no_contract_risks`, `risks_introduced`, `not_clean` for any title that is not one of the two clean ones). `open: true` marks a seed whose correct row has no kind yet: a row it posts is new, not false. `change` is the kind of change the seed makes, from a closed list (`shape_break`, `verb_change`, `removed_while_used`, `sender_renamed`, `delta_only`, `added`, `major_bump`, `quiet`). `known_miss` is `{\"stage\", \"issues\"}`: `stage` is the first stage (`found`, `paired`, `judged`, `finding`, `shown`) at which today's check for the seed is wrong, `issues` the open issues it waits on (`carrick#N` or `carrick-cloud#N`). It is a test expectation, never a status: `pr_on_main_test` computes the scanner stages (found to finding) from the payload and fails when the declaration is behind or ahead of them. `retired: {date, reason}` takes a seed out of every run; a seed is never deleted without it. Edit ops: `replace` (each `from` must be in the file), `move` (git mv), `copy`, `write`, `delete`. A seed that moves lines in a file with an `__llm__/analyze-file/` answer moves the answer's lines in the same seed. This file is an answer key: never edit `expect` to make a run pass.",
+  "_doc": "Seeded PRs: one known change each, with the check a correct Carrick would post for it. The edits are the one source for both readers: tests/pr_on_main_test.rs (`apply_seed`, payload assertions) and the private PR-accuracy instrument, which replays each seed with a candidate build and the cloud's renderer and scores the posted check against `expect`. `expect` is a closed world: `rows` names every row the correct check carries (an `optional` row may be there or not), so any other row is false and a missing one is a miss. Kinds: `risk_introduced` (a contract risk the PR introduces, at its call site; `label` is the operation as the check names it), `checked_line` (\"Checked N contracts. Nothing to flag.\"), the hidden delta kinds `delta_new`, `delta_removed`, `removed_still_called`, and `dependency` (a sentence of the Dependencies section: a major conflict the PR introduces with another service; `verb` is `adds` or `moves`, `package` the package, `major` the major the PR puts it on), and `reuse` (a row of the Possible reuse section: `function` and `file` the function the PR adds, `match` and `match_file` the existing function in `service` it repeats). A reuse seed adds exactly one function, so the rendered `compared.added` of 1 proves the comparison ran. `title` is the title class (`no_contract_changes`, `no_contract_risks`, `risks_introduced`, `not_clean` for any title that is not one of the two clean ones). `open: true` marks a seed whose correct row has no kind yet: a row it posts is new, not false. `change` is the kind of change the seed makes, from a closed list (`shape_break`, `verb_change`, `removed_while_used`, `sender_renamed`, `delta_only`, `added`, `major_bump`, `duplicate_added`, `similar_not_duplicate`, `quiet`). `known_miss` is `{\"stage\", \"issues\"}`: `stage` is the first stage (`found`, `paired`, `judged`, `finding`, `shown`) at which today's check for the seed is wrong, `issues` the open issues it waits on (`carrick#N` or `carrick-cloud#N`). It is a test expectation, never a status: `pr_on_main_test` computes the scanner stages (found to finding) from the payload and fails when the declaration is behind or ahead of them. `retired: {date, reason}` takes a seed out of every run; a seed is never deleted without it. Edit ops: `replace` (each `from` must be in the file), `move` (git mv), `copy`, `write`, `delete`. A seed that moves lines in a file with an `__llm__/analyze-file/` answer moves the answer's lines in the same seed. This file is an answer key: never edit `expect` to make a run pass.",
   "stores": {
     "shared": ["orders-api", "storefront"],
     "admin": ["admin-api"],
@@ -846,7 +846,10 @@
         "title": "no_contract_changes",
         "conclusion": "success",
         "quiet": true,
-        "rows": [{"kind": "checked_line", "optional": true}]
+        "rows": [
+          {"kind": "checked_line", "optional": true},
+          {"kind": "reuse", "optional": true, "function": "formatMinor", "file": "src/money.ts", "match": "formatMinor", "match_file": "src/money.ts", "service": "storefront"}
+        ]
       }
     },
     {
@@ -890,6 +893,41 @@
       "repo": "orders-api",
       "edits": [
         {"op": "replace", "file": "package.json", "pairs": [["\"version\": \"1.0.0\"", "\"version\": \"1.0.1\""]]}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true}
+        ]
+      }
+    },
+    {
+      "name": "reuse-duplicate-added",
+      "protocol": "reuse",
+      "change": "duplicate_added",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "write", "file": "src/format.ts", "text": "export function renderAmount(minorUnits: number, code: string): string {\n  const whole = Math.trunc(minorUnits / 100);\n  const cents = String(Math.abs(minorUnits % 100)).padStart(2, \"0\");\n  return `${code} ${whole}.${cents}`;\n}\n"}
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true},
+          {"kind": "reuse", "function": "renderAmount", "file": "src/format.ts", "match": "formatMinor", "match_file": "src/money.ts", "service": "storefront"}
+        ]
+      }
+    },
+    {
+      "name": "reuse-similar-not-duplicate",
+      "protocol": "reuse",
+      "change": "similar_not_duplicate",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "write", "file": "src/money-parse.ts", "text": "export function parseMinor(text: string): number {\n  const [, amount = \"0\"] = text.split(\" \");\n  const [whole, cents = \"0\"] = amount.split(\".\");\n  return Number(whole) * 100 + Number(cents.padEnd(2, \"0\"));\n}\n"}
       ],
       "expect": {
         "title": "no_contract_changes",

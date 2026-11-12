@@ -22,6 +22,9 @@
 //! - delta family (`delta_new`, `delta_removed`): finding;
 //! - dependency family (`dependency`, a major conflict the PR introduces):
 //!   finding;
+//! - reuse family (`reuse`, a Possible reuse row): no scanner stage; the
+//!   payload's `functions.changed` is the comparison's input and the cloud
+//!   renderer owns the row (carrick-cloud#3393);
 //! - the check: finding only; the payload holds a raiser iff the correct
 //!   title is not clean.
 //!
@@ -41,7 +44,7 @@ pub const STAGES: [&str; 5] = ["found", "paired", "judged", "finding", "shown"];
 const SHOWN: usize = 4;
 
 /// The kinds of change a seed makes (the table's second key).
-pub const CHANGES: [&str; 8] = [
+pub const CHANGES: [&str; 10] = [
     "shape_break",
     "verb_change",
     "removed_while_used",
@@ -49,6 +52,8 @@ pub const CHANGES: [&str; 8] = [
     "delta_only",
     "added",
     "major_bump",
+    "duplicate_added",
+    "similar_not_duplicate",
     "quiet",
 ];
 
