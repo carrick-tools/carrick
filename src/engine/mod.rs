@@ -11059,7 +11059,8 @@ fn resolve_types_if_available(
                         Some(death) => type_compat_v2::resolution_memory_death(&death),
                         None => format!(
                             "the compiler engine could not read types: {}",
-                            e.customer_cause()
+                            e.downcast_ref::<crate::services::type_sidecar::SidecarError>()
+                                .map_or("it reported an error", |e| e.customer_cause())
                         ),
                     };
                     cloud_data.type_extraction_status = Some(detail.clone());
