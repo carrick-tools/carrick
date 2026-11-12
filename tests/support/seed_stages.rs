@@ -245,16 +245,21 @@ fn is_removed(label: &str, payload: &Value) -> bool {
             .any(|f| f["kind"] == "method_mismatch" && names(label, &f["method"], &f["path"]))
 }
 
+/// A removal another service still uses. A removed route has a delta row; a
+/// sender removal (an emit or publish another service still listens for) has
+/// none, so its `orphaned_endpoint` break row alone meets the row. A
+/// `missing_endpoint` break row still needs its delta row.
 fn still_called_row(label: &str, payload: &Value) -> Option<(usize, String)> {
     let removed = array(&payload["delta"]["removed_endpoints"])
         .iter()
         .any(|e| names(label, &e["method"], &e["path"]));
-    if !removed {
-        return Some((0, format!("{label}: no removed row")));
-    }
     let break_row = array(&payload["findings"])
         .iter()
         .find(|f| names(label, &f["removed"]["method"], &f["removed"]["path"]));
+    let sender_removal = break_row.is_some_and(|f| f["kind"] == "orphaned_endpoint");
+    if !removed && !sender_removal {
+        return Some((0, format!("{label}: no removed row")));
+    }
     match break_row {
         None => Some((1, format!("{label}: no break row"))),
         Some(f) if !marked(f) => Some((3, format!("{label}: break row is on main"))),

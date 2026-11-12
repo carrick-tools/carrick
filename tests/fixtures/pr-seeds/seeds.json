@@ -716,10 +716,11 @@
       "expect": {
         "title": "not_clean",
         "conclusion": "failure",
-        "open": true,
-        "rows": []
+        "rows": [
+          {"kind": "removed_still_called", "label": "SERVER->CLIENT order:shipped"}
+        ]
       },
-      "known_miss": {"stage": "shown", "issues": ["carrick#3092"]}
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829", "carrick-cloud#3438"]}
     },
     {
       "name": "socket-listener-field-added",
@@ -817,10 +818,11 @@
       "expect": {
         "title": "not_clean",
         "conclusion": "failure",
-        "open": true,
-        "rows": []
+        "rows": [
+          {"kind": "removed_still_called", "label": "PUBSUB orders.shipped"}
+        ]
       },
-      "known_miss": {"stage": "shown", "issues": ["carrick#3092"]}
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829", "carrick-cloud#3438"]}
     },
     {
       "name": "pubsub-subscriber-field-added",
