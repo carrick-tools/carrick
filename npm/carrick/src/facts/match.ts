@@ -378,8 +378,16 @@ export function scanSource(text: string, jsx = false, budget = SCAN_STEP_BUDGET)
   const tokens = tokenize(text, jsx);
   const match = tokens ? matchBrackets(tokens) : null;
   if (!tokens || !match) return { ok: false, spans: [], calls: [], steps: 0 };
+  // A name's line is 1 + the newlines before its token in the text (R40.1),
+  // never the lexer's running count, which a line continuation or a JSX
+  // closing tag can leave behind.
+  let starts: number[] | undefined;
+  const lineAt = (offset: number): number => {
+    starts ??= lineStarts(text);
+    return lastBelow(starts.length, (index) => starts![index]!, offset, true) + 1;
+  };
   try {
-    return scanTokens(tokens, match, budget);
+    return scanTokens(tokens, match, budget, lineAt);
   } catch (error) {
     if (error instanceof OverBudget) return { ok: false, spans: [], calls: [], steps: budget };
     throw error;
@@ -388,7 +396,7 @@ export function scanSource(text: string, jsx = false, budget = SCAN_STEP_BUDGET)
 
 class OverBudget extends Error {}
 
-function scanTokens(tokens: Token[], match: Map<number, number>, budget: number): Scan {
+function scanTokens(tokens: Token[], match: Map<number, number>, budget: number, lineAt: (offset: number) => number): Scan {
   const spans: NamedSpan[] = [];
   const calls: CallSpan[] = [];
   let steps = 0;
@@ -613,7 +621,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
     // The span starts at its modifiers: `export`, `export default`, `async`, `declare`.
     let first = declStart;
     while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
-    spans.push({ name, start: tokens[first]!.start, end: last.end, nameLine: tokens[nameAt]!.line });
+    spans.push({ name, start: tokens[first]!.start, end: last.end, nameLine: lineAt(tokens[nameAt]!.start) });
     if (fn.bodyOpen >= 0) walk(fn.bodyOpen + 1, match.get(fn.bodyOpen)!, { kind: "code" });
     else walk(fn.exprFrom, fn.after, { kind: "code" });
     return fn.after;
@@ -642,7 +650,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
     if (spanFrom >= 0) {
       let first = spanFrom;
       while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
-      spans.push({ name, start: tokens[first]!.start, end: tokens[close]!.end, nameLine: tokens[nameAt]!.line });
+      spans.push({ name, start: tokens[first]!.start, end: tokens[close]!.end, nameLine: lineAt(tokens[nameAt]!.start) });
     }
     walk(k + 1, close, { kind: "class", name });
     return close + 1;

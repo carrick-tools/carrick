@@ -1062,6 +1062,43 @@ test("R36.6 (10): the name line is the declared name's line, past a multi-line e
   assert.equal(span.nameLine, 3);
 });
 
+test("R40.1: the name line counts every newline before the name, past a line continuation and a multi-line JSX closing tag", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["template continuation", "const s = `abc\\\ndef`;\nfunction formatThing() {\n  return 1;\n}\n", false],
+    ["string continuation", "const s = 'abc\\\ndef';\nfunction formatThing() {\n  return 1;\n}\n", false],
+    ["JSX closing tag", "const A = () => (\n  <div>\n    hi\n  </div\n  >\n);\nfunction formatThing() {\n  return 1;\n}\n", true],
+  ];
+  const got = cases.map(([label, text, jsx]) => [label, scanSource(text, jsx).spans.find((span) => span.name === "formatThing")?.nameLine]);
+  assert.deepEqual(got, [
+    ["template continuation", 3],
+    ["string continuation", 3],
+    ["JSX closing tag", 7],
+  ]);
+});
+
+test("R40.1: in every source file of this package, each span's name line holds the span's name", () => {
+  const src = path.join(import.meta.dirname, "..", "src");
+  const files = (fs.readdirSync(src, { recursive: true }) as string[]).filter((rel) => /\.tsx?$/.test(rel) && !rel.endsWith(".d.ts"));
+  const wrong: string[] = [];
+  let spans = 0;
+  for (const rel of files) {
+    const text = fs.readFileSync(path.join(src, rel), "utf8");
+    const lines = text.split("\n");
+    const scan = scanSource(text, rel.endsWith(".tsx"));
+    for (const span of scan.spans) {
+      // A class expression with no name of its own carries no name token.
+      if (span.name === "(class)") continue;
+      spans += 1;
+      const bare = span.name.slice(span.name.lastIndexOf(".") + 1);
+      const word = new RegExp(`(?<![\\w$])${bare.replace(/[$]/g, "\\$")}(?![\\w$])`);
+      if (!word.test(lines[span.nameLine - 1] ?? "")) wrong.push(`${rel}:${span.nameLine} ${span.name}`);
+    }
+  }
+  // Not an empty pass: 83 files and 744 named spans when this was written.
+  assert.ok(files.length >= 80 && spans >= 700, `${files.length} files, ${spans} spans`);
+  assert.deepEqual(wrong, []);
+});
+
 test("R36.6 (12): ingest skips an op or fn row whose others is empty", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [
     { ...OP_LOAD, others: [] },
