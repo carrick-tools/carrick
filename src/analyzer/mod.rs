@@ -334,7 +334,10 @@ pub struct ApiEndpointDetails {
     /// `None` on every other entry and whenever every selected field is
     /// declared, which is nearly every row. Wire path:
     /// `calls[].undeclared_selection`, omitted when `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graphql_selection::states_nothing"
+    )]
     pub undeclared_selection: Option<crate::graphql_selection::UndeclaredSelection>,
     /// Where the handler function sits in `file_path`'s file, 1-based and
     /// inclusive (cloud#948). Carried from the mount-graph row an HTTP endpoint
@@ -677,6 +680,9 @@ struct ConsumerRow<'a> {
 /// - When it may not, the reading is a doubt: a compatible pair becomes
 ///   unverifiable with the doubt as its reason. An incompatible or
 ///   unverifiable pair keeps the check's own answer.
+/// - A selected field the PR retypes in a printed schema it serves
+///   ([`crate::graphql_selection::SelectedTypes::retyped`]) makes the pair
+///   incompatible, stated as a fact.
 ///
 /// A same-service pair is left as the check left it (carrick#2053). An
 /// outcome this changes is never settled from a stored copy
@@ -727,6 +733,16 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
             continue;
         };
         match selection.partial {
+            // A field the PR retypes in the schema it serves is a break, and
+            // stronger than any doubt about an undeclared one.
+            _ if !selection.types.retyped.is_empty() => {
+                outcome.bucket = VerdictBucket::Incompatible;
+                outcome.resolved = true;
+                outcome.unresolved_reason = None;
+                outcome.diagnostic = Some(selection.retyped_sentence());
+            }
+            // A row that holds only the types read from the head schema.
+            _ if selection.fields.is_empty() => continue,
             None => {
                 outcome.bucket = VerdictBucket::Incompatible;
                 outcome.resolved = true;
@@ -9279,6 +9295,7 @@ mod tests {
                 }],
                 schema: "api/schema.graphql".to_string(),
                 partial,
+                types: Default::default(),
             }),
             ..graphql_details(
                 OperationKey::graphql(GraphqlOperationKind::Query, field),
