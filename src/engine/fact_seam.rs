@@ -47,9 +47,12 @@ pub async fn fact_files_of_tree(
     files.sort();
     std::fs::create_dir_all(rows_dir).expect("the rows directory is made");
     let out = rows_dir.join("rows.jsonl.gz");
-    let recipe = crate::services::TypeSidecar::spawn(sidecar_script)
-        .expect("spawn the sidecar")
-        .recipe();
+    // Rooted at the tree, as `main` roots a scan's sidecar before the walk
+    // lane takes its recipe.
+    let sidecar = crate::services::TypeSidecar::spawn(sidecar_script).expect("spawn the sidecar");
+    sidecar.set_scan_root(&repo);
+    let recipe = sidecar.recipe();
+    drop(sidecar);
     crate::position_rows::record_service_rows(
         &recipe,
         &crate::position_rows::ServiceWalk {
