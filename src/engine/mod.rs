@@ -2554,6 +2554,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 shared: crate::pr_baseline::shared_packages(&ours, &declared),
                 changed: baseline.and_then(|input| input.dependencies.changed_packages()),
             },
+            main_pairs: baseline
+                .map(|input| {
+                    crate::pr_baseline::main_pair_verdicts(&[&input.main_self, &input.peers])
+                })
+                .unwrap_or_default(),
             ours,
         }
     });
@@ -3021,6 +3026,12 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     |pair| pair_directions.for_edge(pair).resolved(),
                 ),
                 sdk_pairs: crate::pr_baseline::sdk_pair_counts(&results.sdk_edges, &evidence.ours),
+                pairs_left_uncompared: crate::pr_baseline::pairs_left_uncompared(
+                    &results.cross_repo_matches,
+                    &evidence.ours,
+                    &evidence.main_pairs,
+                    |pair| pair_directions.for_edge(pair).resolved(),
+                ),
                 dependencies: evidence.dependencies,
             }),
         functions: pr_functions,
@@ -14590,6 +14601,10 @@ struct PrEvidence {
     dependencies: crate::findings::DependencyCounts,
     /// This run's services, by the id a match names its sides with.
     ours: std::collections::BTreeSet<String>,
+    /// What main stored for each pair; empty when this repo has no index on
+    /// main.
+    main_pairs:
+        std::collections::BTreeMap<crate::pr_baseline::PairKey, crate::operation::TypeVerdict>,
 }
 
 /// Main's copy of this repo and the peers it is matched against, kept aside

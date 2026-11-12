@@ -1529,6 +1529,12 @@ pub struct Checked {
     /// when the run has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdk_pairs: Option<PairCounts>,
+    /// This run's operation pairs whose verdict main stored as compatible or
+    /// incompatible and that this run reads `unverifiable` or `not_compared`:
+    /// comparisons main made that this run could not. Always written, so an
+    /// absent value is a scanner that predates it. Zero when main stored no
+    /// verdicts to compare with.
+    pub pairs_left_uncompared: usize,
     pub dependencies: DependencyCounts,
 }
 
@@ -2221,6 +2227,7 @@ mod tests {
                 incompatible: 1,
                 not_compared: 2,
             }),
+            pairs_left_uncompared: 1,
             dependencies: DependencyCounts {
                 shared: 41,
                 changed: Some(2),
@@ -2244,6 +2251,7 @@ mod tests {
             json!({
                 "pairs": { "compatible": 22, "unverifiable": 5, "incompatible": 1, "not_compared": 3 },
                 "sdk_pairs": { "compatible": 4, "unverifiable": 0, "incompatible": 1, "not_compared": 2 },
+                "pairs_left_uncompared": 1,
                 "dependencies": { "shared": 41, "changed": 2 },
             })
         );
