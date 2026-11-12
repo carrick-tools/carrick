@@ -437,15 +437,13 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     let remote = tempfile::tempdir().unwrap();
     let upstream = remote.path().join("orders");
     std::fs::create_dir(&upstream).unwrap();
-    let source = "import express from \"express\";\nconst app = express();\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\n";
+    let source = "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\n";
     std::fs::write(upstream.join("app.ts"), source).unwrap();
     std::fs::write(
         upstream.join("package.json"),
-        r#"{"name":"orders","version":"1.0.0","dependencies":{"express":"^4.19.2"}}"#,
+        r#"{"name":"orders","version":"1.0.0"}"#,
     )
     .unwrap();
-    real_packages::install(&upstream, &["express"]);
-    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     std::fs::write(
         upstream.join("carrick.json"),
         r#"{"service_name":"orders","include":["."]}"#,
@@ -488,7 +486,7 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     let start = source.find("app.get(").unwrap() + 1;
     let end = start + "app.get(\"/hosted\", handler)".len();
     hosted["file_results"] = json!({"app.ts":{"mounts":[],"data_calls":[],"endpoints":[{
-        "candidate_id":format!("span:{start}-{end}"),"line_number":4,"owner_node":"app","method":"GET","path":"/hosted",
+        "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET","path":"/hosted",
         "handler_name":"handler","pattern_matched":"fixture","call_expression_span_start":start,"call_expression_span_end":end,
         "resolution_source":"model"
     }]}});
