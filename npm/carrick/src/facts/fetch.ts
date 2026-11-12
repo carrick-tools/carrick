@@ -23,6 +23,7 @@ import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { splitRemote } from "../git-remote.ts";
+import { factsEnabled } from "./enabled.ts";
 import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
@@ -120,6 +121,7 @@ async function knownFile(root: string): Promise<{ digest: string; writer: number
 /** Ask the cloud for the project's fact file and bring the local one up to date. Never throws. */
 export async function refreshFacts(root: string, options: FactsRefreshOptions = {}): Promise<RefreshOutcome> {
   const env = options.env ?? process.env;
+  if (!factsEnabled(env)) return "none";
   const request = options.request ?? fetch;
   const now = new Date(options.now ?? Date.now()).toISOString();
   try {
@@ -200,6 +202,7 @@ export function startFactsRefresh(
   options: { env?: NodeJS.ProcessEnv; now?: number; start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void } = {},
 ): boolean {
   const env = options.env ?? process.env;
+  if (!factsEnabled(env)) return false;
   if (env["CARRICK_NO_FACTS_REFRESH"]) return false;
   // A folder Carrick was never set up in gets nothing, not even a marker directory.
   if (!hasMarker(root)) return false;

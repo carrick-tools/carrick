@@ -12,8 +12,13 @@ import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
 import { scanSource } from "../src/facts/match.ts";
-import { refreshFacts } from "../src/facts/fetch.ts";
+import { FACTS_MARKER, refreshFacts, startFactsRefresh } from "../src/facts/fetch.ts";
 import { readTimings } from "../src/hook/timings.ts";
+
+// The fact lines are off unless CARRICK_FACT_LINES is "1" (`src/facts/enabled.ts`).
+// This file's tests exercise them, so it turns the switch on for itself; every
+// hook child spawned below inherits it through `fakeEnv`. The off tests unset it.
+process.env["CARRICK_FACT_LINES"] = "1";
 
 const WIRE = fixturePath("edit-facts.s1.ndjson");
 /** The pinned fixture's line for `getOrder`, the producer of `GET /orders/:id`. */
@@ -730,7 +735,7 @@ test("the refresh sends the local file's digest and writer", async (t) => {
 });
 
 test("facts_unavailable is silent and does not schedule an early retry", async (t) => {
-  const { runFactsRefresh, startFactsRefresh, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
+  const { runFactsRefresh, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
   const ws = await factsWorkspace(t, { ndjson: null });
   fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
@@ -845,7 +850,7 @@ test("a component file with markup is read: the call in its effect is found by t
 });
 
 test("the refresh starts once per cooldown, sooner after a building answer, and never outside a workspace", async (t) => {
-  const { startFactsRefresh, allowEarlyRetry, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
+  const { allowEarlyRetry, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
   const ws = await factsWorkspace(t, { ndjson: null });
   const env = { ...process.env, CARRICK_NO_FACTS_REFRESH: "" };
   const started: string[][] = [];
@@ -863,6 +868,40 @@ test("the refresh starts once per cooldown, sooner after a building answer, and 
   assert.equal(startFactsRefresh(bare, { env, now, start }), false);
   assert.equal(fs.existsSync(path.join(bare, ".carrick")), false);
   assert.equal(started.length, 2);
+});
+
+test("with CARRICK_FACT_LINES unset, an edit that matches a row prints nothing and starts no refresh", async (t) => {
+  const ws = await factsWorkspace(t);
+  const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") });
+  delete env["CARRICK_FACT_LINES"];
+  const run = await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "facts-off",
+      cwd: ws.root,
+      tool_input: { file_path: ws.at("orders-api/src/routes/orders.ts"), old_string: "x", new_string: 'const order = await db.orders.find(req.params["id"]);' },
+    },
+    env,
+  });
+  assert.equal(run.code, 0);
+  assert.equal(context(run.stdout), "");
+  assert.equal(fs.existsSync(path.join(ws.root, ".carrick", FACTS_MARKER)), false, "no refresh claimed");
+  const started: string[] = [];
+  const noEnv = { ...env, CARRICK_NO_FACTS_REFRESH: "" };
+  assert.equal(startFactsRefresh(ws.root, { env: noEnv, start: () => void started.push("x") }), false);
+  assert.deepEqual(started, []);
+  const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(201).json(created);"] };
+  const off = await factLines(ws.root, [edited], undefined, { env: noEnv });
+  assert.deepEqual(off.lines, []);
+  assert.equal(off.stale, false);
+  assert.equal(await refreshFacts(ws.root, { env: { ...noEnv, CARRICK_TOKEN: "t" }, request: () => Promise.reject(new Error("fetched")) }), "none");
+});
+
+test("with CARRICK_FACT_LINES=1 an edit that matches a row prints it", async (t) => {
+  const ws = await factsWorkspace(t);
+  const run = await edit(ws, ws.at("orders-api/src/routes/orders.ts"), 'const order = await db.orders.find(req.params["id"]);', { session: "facts-on" });
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
 });
 
 test("an edit inside a handler prints where it is called, once per session", async (t) => {
