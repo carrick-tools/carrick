@@ -37,7 +37,12 @@ export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean
  * (`peers.ts`) both run through it.
  */
 export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env): string | null {
-  return git(dir, args, cooldownMs(env, "CARRICK_FACTS_DIFF_BUDGET_MS", DIFF_BUDGET_MS));
+  return git(dir, args, factsGitBudgetMs(env));
+}
+
+/** How long each of the fact path's git calls may take. */
+export function factsGitBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  return cooldownMs(env, "CARRICK_FACTS_DIFF_BUDGET_MS", DIFF_BUDGET_MS);
 }
 
 /**

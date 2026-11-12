@@ -9,13 +9,14 @@
 // `git ls-tree <commit> -- <files>` per repo, run by `diff.ts`'s git runner
 // under its budget (`CARRICK_FACTS_DIFF_BUDGET_MS`). The answer is false (the
 // line is silent) when: the fact file has no commit for the repo, the commit
-// is not a full object id, git fails or runs past its budget (and then every
-// later proof in the same call is false too), the commit is not in the clone,
+// is not a full object id, git fails or runs past its budget (an overrun makes
+// every later proof in the same call false too), the commit is not in the clone,
 // a file is missing, over `MAX_FACT_FILE_BYTES`, or differs. Never throws.
 
 import crypto from "node:crypto";
 import path from "node:path";
-import { gitFacts } from "./diff.ts";
+import { performance } from "node:perf_hooks";
+import { factsGitBudgetMs, gitFacts } from "./diff.ts";
 import type { FileMemo } from "./files.ts";
 
 /** A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). Anything else (a branch, `HEAD`, a short id) proves nothing. */
@@ -33,7 +34,7 @@ export type PeerContext = {
   env?: NodeJS.ProcessEnv;
   /** Answers already given in this call, by repo top, commit and files. */
   proofs: Map<string, boolean>;
-  /** A git call failed or ran out of time in this call: no further git call, every proof false. */
+  /** A git call ran out of time in this call: no further git call, every proof false. */
   gitFailed: boolean;
 };
 
@@ -66,9 +67,12 @@ function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: read
       wanted.set(file, blobId(bytes, commit.length === 64));
     }
     if (ctx.gitFailed) return false;
+    const started = performance.now();
     const out = gitFacts(top, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", ...files], ctx.env);
     if (out === null) {
-      ctx.gitFailed = true;
+      // A git that ran out of time will again: no further call this action.
+      // A quick failure (a commit this clone lacks) is this repo's alone.
+      if (performance.now() - started >= factsGitBudgetMs(ctx.env)) ctx.gitFailed = true;
       return false;
     }
     const found = new Map<string, string>();

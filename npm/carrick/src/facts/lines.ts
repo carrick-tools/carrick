@@ -246,7 +246,7 @@ export async function factLines(
     const memo = fileMemo();
     const commits = commitsOf(store.meta);
     const proofs: PeerContext["proofs"] = new Map();
-    // The peer proof's git failure, shared across the call's edited files.
+    // A peer-proof git call that ran out of time, shared across the call's edited files.
     const git = { failed: false };
     const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
       const ctx: PeerContext = { at, where, commits, memo, env: options.env, proofs, gitFailed: git.failed };
