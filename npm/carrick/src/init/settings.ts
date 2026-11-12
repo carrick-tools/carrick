@@ -97,6 +97,12 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         matcher: "Bash",
         hooks: [{ type: "command", command: `${command} hook post-bash`, timeout: 15 }],
       },
+      // Searches and MCP calls read no file we answer for; they only carry a
+      // background re-check that landed since the last hook spoke (`late.ts`).
+      {
+        matcher: "Grep|Glob|mcp__.*",
+        hooks: [{ type: "command", command: `${command} hook post-search`, timeout: 5 }],
+      },
     ],
     // No matcher: a resumed, cleared or compacted session has lost the map and
     // re-orients for one read of the index.

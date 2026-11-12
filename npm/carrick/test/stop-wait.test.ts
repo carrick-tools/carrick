@@ -205,6 +205,34 @@ test("a finding that lands after Stop is printed once, by the next shell command
   assert.equal((await bashHook(home, workspace.root)).stdout, "", "once: the next tool hook says nothing");
 });
 
+function searchHook(home: string, root: string, toolName: string): Promise<HookRun> {
+  return runHook("post-search.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: toolName, session_id: SESSION, cwd: root, tool_input: {}, tool_response: "x" },
+    env: fakeEnv({ HOME: home }),
+    cwd: root,
+  });
+}
+
+test("a finding that lands after Stop is printed once, by the next Grep, Glob or MCP call", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  const entry = queue(workspace.root, home, workspace.file);
+  await stopWith(home);
+  assert.equal((await searchHook(home, workspace.root, "Grep")).stdout, "", "nothing landed: nothing printed");
+
+  answer(home, entry, problem());
+  const grep = await searchHook(home, workspace.root, "Grep");
+  assert.equal(grep.code, 0);
+  const said = (JSON.parse(grep.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } })
+    .hookSpecificOutput;
+  assert.equal(said.hookEventName, "PostToolUse");
+  assert.match(said.additionalContext, /contract problem/);
+  assert.equal((await searchHook(home, workspace.root, "Glob")).stdout, "", "once: the next search says nothing");
+  assert.equal((await searchHook(home, workspace.root, "mcp__carrick__get_callers")).stdout, "");
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once: the next prompt says nothing");
+});
+
 test("the whole-change check Stop queued, answering later with a problem, is printed once by the next prompt", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);

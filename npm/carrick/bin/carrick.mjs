@@ -39,6 +39,7 @@ const HOOKS = {
   "post-edit": "../dist/hook/post-edit.js",
   "post-bash": "../dist/hook/post-bash.js",
   "post-read": "../dist/hook/post-read.js",
+  "post-search": "../dist/hook/post-search.js",
   "recheck-run": "../dist/hook/recheck-run.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",

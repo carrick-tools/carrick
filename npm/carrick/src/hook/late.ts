@@ -7,6 +7,7 @@
 // any hook speaks. Each answer is claimed with `claimDelivery`, so parallel
 // hooks print it once.
 
+import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
@@ -72,4 +73,15 @@ export function emitPostToolUse(contexts: readonly string[]): void {
       hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: contexts.join("\n\n") },
     }),
   );
+}
+
+/**
+ * Print the late answers alone, for a hook with nothing else to say (a shell
+ * command that names no source file, a search tool): on the hook channel only,
+ * and nothing when none has landed.
+ */
+export function printLateOnly(session: string | undefined): void {
+  if (!session) return;
+  if (resolveChannel({ hooksInstalled: true }).channel !== "hook") return;
+  emitPostToolUse(deliverLate(session));
 }

@@ -173,6 +173,22 @@ test("carrickHooks registers one Bash entry and self-update adds it to an existi
   assert.equal(typeof bringUpToDate, "function");
 });
 
+test("the search entry carries Grep, Glob and MCP calls, and self-update adds it to an existing install", (t) => {
+  const search = carrickHooks("carrick").PostToolUse!.filter((group) => group.matcher === "Grep|Glob|mcp__.*");
+  assert.equal(search.length, 1);
+  assert.equal(search[0]!.hooks[0]!.command, "carrick hook post-search");
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-ps-su-"));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(base, ".claude"), { recursive: true });
+  const without = carrickHooks("carrick");
+  without.PostToolUse = without.PostToolUse!.filter((group) => group.matcher !== "Grep|Glob|mcp__.*");
+  const target = path.join(base, ".claude", "settings.local.json");
+  fs.writeFileSync(target, JSON.stringify({ hooks: without }, null, 2));
+  assert.ok(updateHooks(base, base, "9.9.9").length > 0);
+  assert.ok(fs.readFileSync(target, "utf8").includes("carrick hook post-search"));
+});
+
 // A shell write of a TypeScript file goes through the post-edit flow.
 
 function writeEnv(w: { base: string; home: string }, extra: Record<string, string> = {}) {
