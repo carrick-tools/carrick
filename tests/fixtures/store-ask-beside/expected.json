@@ -432,14 +432,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
@@ -948,14 +948,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
@@ -1464,14 +1464,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
