@@ -157,6 +157,8 @@ export function fakeEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     // The fixtures speak in absolute paths under /workspace; an integration
     // test's workspace is a fresh temp directory, so the fake CLI rebases them.
     CARRICK_FAKE_REBASE: "1",
+    // A test that expects a fact line must not lose it to a slow `git diff` on a busy machine.
+    CARRICK_FACTS_DIFF_BUDGET_MS: "5000",
     ...overrides,
   };
 }

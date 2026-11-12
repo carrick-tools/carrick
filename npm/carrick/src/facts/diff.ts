@@ -20,12 +20,13 @@
 // `DIFF_BUDGET_MS`. Never throws.
 
 import path from "node:path";
+import { cooldownMs } from "../hook/refresh.ts";
 import { git, trackedPaths } from "../init/repo-copies.ts";
 
 /** A diff with more changed lines than this is a rewrite or a generated file: no lines. */
 export const MAX_DIFF_LINES = 2000;
 
-/** Each git call gets this long; a slower one is a silence, not a wait. */
+/** Each git call gets this long; a slower one is a silence, not a wait. `CARRICK_FACTS_DIFF_BUDGET_MS` overrides it (tests on a busy machine). */
 export const DIFF_BUDGET_MS = 150;
 
 export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean };
@@ -35,10 +36,10 @@ export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean
  * is no difference). An untracked file counts whole only when `created`: the
  * session did not see the file before this call.
  */
-export function changesAgainstHead(file: string, created: boolean): DiffChange | null {
+export function changesAgainstHead(file: string, created: boolean, env: NodeJS.ProcessEnv = process.env): DiffChange | null {
   try {
     const dir = path.dirname(file);
-    const out = git(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", "HEAD", "--", path.basename(file)], DIFF_BUDGET_MS);
+    const out = git(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", "HEAD", "--", path.basename(file)], cooldownMs(env, "CARRICK_FACTS_DIFF_BUDGET_MS", DIFF_BUDGET_MS));
     if (out === null) return null;
     if (out === "") {
       // No difference from HEAD: a tracked file that reads the same, or one git does not track.
