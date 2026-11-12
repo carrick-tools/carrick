@@ -985,7 +985,7 @@ pub struct ClaimSlot {
     pub each: bool,
     /// On a `handler` slot only (QW-1): the function that runs, or the path
     /// of a file that exports it. The sidecar refuses it on any other slot.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub or_file: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<ClaimDocument>,
