@@ -4,13 +4,15 @@
     "shared": ["orders-api", "storefront"],
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
-    "shelf": ["rpc-shelf"]
+    "shelf": ["rpc-shelf"],
+    "jobs": ["jobs-sender", "jobs-worker"]
   },
   "main_scans": {
     "shared": ["orders-api", "storefront", "orders-api"],
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
-    "shelf": ["rpc-shelf"]
+    "shelf": ["rpc-shelf"],
+    "jobs": ["jobs-sender", "jobs-worker", "jobs-sender"]
   },
   "seeds": [
     {
@@ -839,6 +841,42 @@
         "quiet": true,
         "rows": [{"kind": "checked_line", "optional": true}]
       }
+    },
+    {
+      "name": "queue-job-renamed",
+      "protocol": "queue",
+      "change": "sender_renamed",
+      "repo": "jobs-sender",
+      "edits": [
+        {"op": "replace", "file": "src/mail.ts", "pairs": [["new Queue(\"welcome-mail\")", "new Queue(\"welcome-email\")"]]},
+        {"op": "replace", "file": "__llm__/analyze-file/mail.json", "pairs": [["\"topic\": \"welcome-mail\"", "\"topic\": \"welcome-email\""]]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "removed_still_called", "label": "PUBSUB welcome-mail"}
+        ]
+      },
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829", "carrick-cloud#3438"]}
+    },
+    {
+      "name": "queue-payload-field-removed",
+      "protocol": "queue",
+      "change": "shape_break",
+      "repo": "jobs-sender",
+      "edits": [
+        {"op": "replace", "file": "src/mail.ts", "pairs": [["{ userId, email, locale }", "{ userId, email }"]]},
+        {"op": "replace", "file": "__llm__/analyze-file/mail.json", "pairs": [["\"payload_expression_text\": \"{ userId, email, locale }\"", "\"payload_expression_text\": \"{ userId, email }\""]]}
+      ],
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "PUBSUB welcome-mail", "site": "src/mail.ts:10"}
+        ]
+      },
+      "known_miss": {"stage": "judged", "issues": ["carrick#3547", "carrick#3782"]}
     },
     {
       "name": "copied-helper",

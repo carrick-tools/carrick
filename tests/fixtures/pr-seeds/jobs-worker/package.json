@@ -1,0 +1,11 @@
+{
+  "name": "jobs-worker",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "bullmq": "5.12.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
