@@ -111,6 +111,8 @@ export type FactStore = {
   callers: (repo: string, name: string) => FnRow[];
   /** Every declaration of a function `name`, in any repo, ordered by (repo, file). */
   declarations: (name: string) => NameRow[];
+  /** Which of `names` are declared in some file but not in `file` of `repo`, in one query. */
+  declaredOnlyElsewhere: (names: readonly string[], repo: string, file: string) => Set<string>;
   /** The `pkg` row of a package, or null. */
   packageRow: (name: string) => PkgRow | null;
   close: () => void;
@@ -164,6 +166,9 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const unnamed = open.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
     const callers = open.prepare("SELECT * FROM fns WHERE repo = ? AND name = ? ORDER BY id");
     const declarations = open.prepare("SELECT * FROM names WHERE name = ? ORDER BY repo, file, line");
+    const declaredOnlyElsewhere = open.prepare(
+      "SELECT name FROM names WHERE name IN (SELECT value FROM json_each(?)) GROUP BY name HAVING SUM(repo = ? AND file = ?) = 0",
+    );
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
     handed = true;
     return {
@@ -181,6 +186,8 @@ export async function openFacts(root: string): Promise<FactStore | null> {
           total: Number(raw["total"]),
           text: String(raw["text"]),
         })),
+      declaredOnlyElsewhere: (names, repo, rel) =>
+        new Set(declaredOnlyElsewhere.all(JSON.stringify(names), repo, rel).map((raw) => String(raw["name"]))),
       declarations: (name) =>
         declarations.all(name).map((raw) => ({
           name: String(raw["name"]),

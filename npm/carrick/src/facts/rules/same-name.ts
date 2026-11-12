@@ -98,13 +98,14 @@ export function sameNameLines(
   // rebuilt and scanned.
   const count = new Map<string, number>();
   for (const span of scan.spans) count.set(span.name, (count.get(span.name) ?? 0) + 1);
+  const once = [...count].filter(([name, n]) => n === 1 && name.slice(name.lastIndexOf(".") + 1).length >= MIN_NAME_LENGTH).map(([name]) => name);
+  if (once.length === 0) return [];
+  // One query for the whole file, then the rows of the few names it found. A
+  // name with a row in this file was here on main, so it is not a new one.
   const rowsOf = new Map<string, NameRow[]>();
-  for (const [name, n] of count) {
-    if (n !== 1 || name.slice(name.lastIndexOf(".") + 1).length < MIN_NAME_LENGTH) continue;
+  for (const name of store.declaredOnlyElsewhere(once, at.repo, at.rel)) {
     const rows = store.declarations(name);
-    // A row in this file: the name was here on main, so it is not a new one.
-    if (rows.length === 0 || rows.some((row) => row.repo === at.repo && row.file === at.rel)) continue;
-    rowsOf.set(name, rows);
+    if (rows.length > 0) rowsOf.set(name, rows);
   }
   if (rowsOf.size === 0) return [];
   const names = addedNames([...rowsOf.keys()], text, change, jsx);

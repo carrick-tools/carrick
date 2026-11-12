@@ -778,11 +778,14 @@ test("R33.5: the name rule rebuilds the text before the edit only when a name co
   const scan = scanSource(text, false);
   const at = { repo: "api", rel: "src/hook.ts", top: "/nowhere/api" };
   // No declaration of `main` anywhere else: nothing to look up, nothing rebuilt.
-  const none = { declarations: () => [] } as unknown as FactStore;
+  const none = { declaredOnlyElsewhere: () => new Set(), declarations: () => [] } as unknown as FactStore;
   assert.deepEqual(sameNameLines(none, at, new Map(), text, scan, change, false, fileMemo()), []);
   assert.equal(rebuilt, 0);
   // A declaration elsewhere: now the text before is rebuilt.
-  const some = { declarations: () => [{ name: "main", repo: "web", file: "src/main.ts", line: 3, text: "t" }] } as unknown as FactStore;
+  const some = {
+    declaredOnlyElsewhere: () => new Set(["main"]),
+    declarations: () => [{ name: "main", repo: "web", file: "src/main.ts", line: 3, text: "t" }],
+  } as unknown as FactStore;
   sameNameLines(some, at, new Map(), text, scan, change, false, fileMemo());
   assert.ok(rebuilt > 0);
 });
