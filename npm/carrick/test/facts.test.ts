@@ -457,19 +457,45 @@ test("an Edit's patch hunks place the change by line, deletions included", async
   const file = ws.at("orders-api/src/routes/orders.ts");
   const lineOf = (needle: string) => fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes(needle)) + 1;
   const at = lineOf("res.status(201).json(created);");
+  const text = fs.readFileSync(file, "utf8").split("\n");
+  // A deletion just above the line: the new text is empty, so only the hunk
+  // places it. Its context lines are the file's lines around the gap.
+  const hunk = { oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [` ${text[at - 2]}`, "-  // gone", ` ${text[at - 1]}`] };
+  const removal = (session: string) =>
+    runHook("post-edit.ts", {
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        session_id: session,
+        cwd: ws.root,
+        tool_input: { file_path: file, old_string: "  // gone\n", new_string: "" },
+        tool_response: { structuredPatch: [hunk] },
+      },
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+    });
+  assert.equal(context((await removal("patch")).stdout), "POST /orders is called at web-app/src/boot.ts:4");
+});
+
+test("a removal-only hunk that went stale is unplaced", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const text = fs.readFileSync(file, "utf8").split("\n");
+  const at = text.findIndex((line) => line.includes("res.status(201).json(created);")) + 1;
+  const hunk = { oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [` ${text[at - 2]}`, "-  // gone", ` ${text[at - 1]}`] };
+  // Ten lines were put on top after the Edit: the hunk's gap now sits inside getOrder.
+  fs.writeFileSync(file, `${"// added\n".repeat(10)}${text.join("\n")}`);
   const run = await runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
       tool_name: "Edit",
-      session_id: "patch",
+      session_id: "stale",
       cwd: ws.root,
-      // A deletion just above the line: the new text is empty, so only the hunk places it.
       tool_input: { file_path: file, old_string: "  // gone\n", new_string: "" },
-      tool_response: { structuredPatch: [{ oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [" ctx", "-  // gone", " ctx"] }] },
+      tool_response: { structuredPatch: [hunk] },
     },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
   });
-  assert.equal(context(run.stdout), "POST /orders is called at web-app/src/boot.ts:4");
+  assert.equal(context(run.stdout), "");
 });
 
 /** Run the post-edit hook for an Edit of `file` whose result carries `hunks`. */

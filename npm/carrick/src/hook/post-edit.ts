@@ -202,8 +202,11 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     // the line that now sits where it was (`facts/match.ts` `gapsOfLines`).
     const removed: number[] = [];
     const removedText: string[] = [];
-    // Each added line's text must be the file's line at that number now; a
-    // formatter that ran after the tool moves them, and then the hunks are unplaced.
+    // Each added and each context line's text must be the file's line at that
+    // number now; a formatter that ran after the tool moves them, and then the
+    // hunks are unplaced (a removal-only hunk is checked by its context alone).
+    // Placed hunks carry the removed text, from which the file before the
+    // edit is rebuilt (`facts/rules/same-name.ts`).
     let now: string[];
     try {
       if (fs.statSync(edited[0]!).size > MAX_FACT_FILE_BYTES) return new Map();
@@ -211,9 +214,6 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     } catch {
       return new Map();
     }
-    // Context lines that also read the same carry the removed text, from which
-    // the file before the edit is rebuilt (`facts/rules/same-name.ts`).
-    let agrees = true;
     for (const hunk of hunks) {
       if (typeof hunk?.newStart !== "number" || !Array.isArray(hunk.lines)) return new Map();
       let at = hunk.newStart;
@@ -224,19 +224,17 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
           removedText.push(text.slice(1));
           continue;
         }
-        const same = now[at - 1]?.replace(/\r$/, "") === text.slice(1).replace(/\r$/, "");
-        if (text.startsWith("+")) {
-          if (!same) {
-            // Unplaced: the file's diff against HEAD, as for a Codex patch.
-            const found = await againstHead(edited[0]!, false);
-            return found ? new Map([[edited[0]!, found]]) : new Map();
-          }
-          lines.push(at);
-        } else if (!same) agrees = false;
+        if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) {
+          // Unplaced: the file's diff against HEAD, as for a Codex patch (no
+          // removed text: that diff rebuilds HEAD, not the file before this call).
+          const found = await againstHead(edited[0]!, false);
+          return found ? new Map([[edited[0]!, found]]) : new Map();
+        }
+        if (text.startsWith("+")) lines.push(at);
         at += 1;
       }
     }
-    return new Map([[edited[0]!, agrees ? { lines, removed, removedText } : { lines, removed }]]);
+    return new Map([[edited[0]!, { lines, removed, removedText }]]);
   }
   const texts = [
     changedMiddle(input.old_string, input.new_string),
