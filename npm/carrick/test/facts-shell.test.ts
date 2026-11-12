@@ -30,7 +30,8 @@ const header = JSON.stringify({
 });
 
 const row = (fields: Record<string, unknown>) =>
-  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
+  // A peer in a repo not checked out here: ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [{ service: "other", repo: "other", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
 
 /** The fixture repos in a fresh workspace, the fact file built from the wire fixture plus `extra` rows. */
 async function workspace(t: { after: (fn: () => void) => void }, extra: string[] = [], files: Record<string, string> = {}): Promise<Ws> {

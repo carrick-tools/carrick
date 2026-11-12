@@ -23,6 +23,7 @@ import type { Timing } from "./timings.ts";
 import { factLines } from "../facts/lines.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
+import { factsEnabled } from "../facts/enabled.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -135,8 +136,9 @@ export async function editFlow(
     const show = !covered.has(edited[index]!) && (!session || !wasTold(session, key));
     if (show && result.uses_lines?.length) {
       told.push(key);
-      // Counted only where the line is delivered (the hook channel).
-      if (input.timing && facts !== null) input.timing.usesFallback = true;
+      // Counted only where the line is delivered (the hook channel) and the
+      // fact lines could have stood in for it (the switch is on).
+      if (input.timing && facts !== null && factsEnabled()) input.timing.usesFallback = true;
     }
     const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);

@@ -22,6 +22,8 @@ import { readTimings } from "../src/hook/timings.ts";
 import { markFacts } from "../src/hook/reuse.ts";
 
 const SLUG = "kinds-demo";
+/** A peer in a repo not checked out here: an op row needs one (ingest skips `others: []`). */
+const ELSEWHERE = { service: "other", repo: "other", file: "src/peer.ts", line: 1 };
 const REPOS = ["api", "web"];
 
 type Ws = { root: string; home: string; at: (rel: string) => string };
@@ -699,7 +701,7 @@ test("at most 3 fact lines per action, in the order op, fn, name", async (t) => 
     "",
   ].join("\n");
   // One row per (side, protocol): one thing with two facts, so both print (R24.1).
-  const op = (side: string, label: string, text: string) => ({ k: "op", side, protocol: "http", label, service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [], total: 0, source: "call", text });
+  const op = (side: string, label: string, text: string) => ({ k: "op", side, protocol: "http", label, service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [ELSEWHERE], total: 0, source: "call", text });
   const ws = await workspace(t, { "api/src/orders.ts": src, "web/src/stdin.ts": "export function readStdin() {}\n" }, [
     op("consumer", "GET /orders", "op line 1"),
     op("producer", "POST /orders", "op line 2"),
@@ -751,7 +753,7 @@ function asChange(hunk: Hunk): { lines: number[]; removed: number[]; removedText
   return { lines: added.map((_, i) => hunk.newStart + i), removed: removedText.map(() => hunk.newStart), removedText };
 }
 
-const OP_LOAD = { k: "op", side: "consumer", protocol: "http", label: "GET /orders", service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [], total: 0, source: "call", text: "op line for loadOrder" };
+const OP_LOAD = { k: "op", side: "consumer", protocol: "http", label: "GET /orders", service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [ELSEWHERE], total: 0, source: "call", text: "op line for loadOrder" };
 
 test("an fn row with null in others and a pkg service with no manifest do not lose the op lines", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
@@ -1012,6 +1014,66 @@ test("R33.2: a repo whose services name different commits has no index commit, s
     await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString(), 0);
     assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], pair[0]!.service);
   }
+});
+
+// ---- R36.6 nits ----
+
+test("R36.6 (6): with the switch off, no uses_fallback is recorded", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE)]);
+  const file = ws.at("api/src/orders.ts");
+  const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+  delete env["CARRICK_FACT_LINES"];
+  const run = await runHook("post-edit.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "off-uses", cwd: ws.root, tool_input: { file_path: file }, tool_response: { structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ["+  const key = `order:${id}`;"] }] } },
+    env,
+  });
+  assert.match(context(run.stdout), USES_LINE);
+  const records = readTimings(ws.root).filter((record) => record.hook === "post-edit");
+  assert.equal(records.length, 1);
+  assert.equal("uses_fallback" in records[0]!, false);
+});
+
+test("R36.6 (8): a name row's file or a pkg manifest that leaves its repo is never read", async (t) => {
+  const outside = await workspace(t, { "api/src/hook.ts": HOOK, "web/src/stdin.ts": STDIN_FILES["web/src/stdin.ts"] }, [{ ...nameRow("readStdin", "api", "../web/src/stdin.ts") }]);
+  const added = addFunction(outside, "api/src/hook.ts");
+  const name = context((await patchEdit(outside, added.file, [added.hunk])).stdout);
+  const row = { ...ZOD, services: ZOD.services.map((entry) => (entry.repo === "web" ? { ...entry, manifest: "../web/package.json" } : entry)) };
+  const pkg = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row], { files: { "web/package.json": '{\n  "dependencies": {\n    "zod": "^3.23.8"\n  }\n}\n' } });
+  assert.deepEqual([name, pkg.text], ["", ""]);
+});
+
+test("R36.6 (9): pkg needs every section of the sibling manifest that names the package to hold the stated spec", async (t) => {
+  // web moved zod in dependencies to ^3.25.0; its peerDependencies still say the stated ^3.23.8.
+  const web = '{\n  "dependencies": {\n    "zod": "^3.25.0"\n  },\n  "peerDependencies": {\n    "zod": "^3.23.8"\n  }\n}\n';
+  const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD], { files: { "web/package.json": web } });
+  assert.equal(text, "");
+});
+
+test("R36.6 (10): the name line is the declared name's line, past a multi-line export or a decorator", async (t) => {
+  // `export` on its own line: the span starts at line 3, the name (the row's line) is on line 4.
+  const split = "// stdin\n\nexport\nfunction readStdin() {\n  return \"\";\n}\n";
+  const row = { ...nameRow("readStdin", "web", "src/stdin.ts"), line: 4, text: "a function named readStdin is declared at web/src/stdin.ts:4" };
+  const ws = await workspace(t, { "api/src/hook.ts": HOOK, "web/src/stdin.ts": split }, [row]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), row.text);
+  // A decorated method: the name's line, not the decorator's.
+  const scan = scanSource("class Svc {\n  @Get(\"/x\")\n  load() {\n    return 1;\n  }\n}\n", false);
+  const span = scan.spans.find((one) => one.name === "Svc.load")!;
+  assert.equal(span.nameLine, 3);
+});
+
+test("R36.6 (12): ingest skips an op or fn row whose others is empty", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [
+    { ...OP_LOAD, others: [] },
+    { ...fnRow("loadOrder", LOAD_LINE), others: [] },
+    OP_LOAD,
+    fnRow("listOrders", LIST_LINE),
+  ]);
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root), { readOnly: true });
+  const counts = ["rows", "fns"].map((table) => Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!["n"]));
+  db.close();
+  assert.deepEqual(counts, [1, 1]);
 });
 
 test("R36.5: with CARRICK_FACT_LINES unset, a package.json Write, a .js Edit and a shell write do no fact work", async (t) => {

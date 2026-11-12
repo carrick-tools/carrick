@@ -20,7 +20,8 @@ type TokenKind = "id" | "str" | "tpl" | "num" | "punc" | "regex";
 type Token = { kind: TokenKind; value: string; start: number; end: number; line: number };
 
 /** A named function-like thing and the text span it covers. */
-export type NamedSpan = { name: string; start: number; end: number };
+/** A named thing: its span (from its modifiers and decorators) and the 1-based line of its name token. */
+export type NamedSpan = { name: string; start: number; end: number; nameLine: number };
 
 /**
  * A call: `from` where its callee starts (`router` in `router.post(`), `start`
@@ -606,13 +607,13 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
     return { bodyOpen: -1, after: end, exprFrom: arrow + 1 };
   };
 
-  /** Records a named function and walks its body. Returns the index after it. */
-  const named = (name: string, declStart: number, fn: { bodyOpen: number; after: number; exprFrom: number }): number => {
+  /** Records a named function whose name token is at `nameAt` and walks its body. Returns the index after it. */
+  const named = (name: string, declStart: number, fn: { bodyOpen: number; after: number; exprFrom: number }, nameAt: number): number => {
     const last = t(fn.after - 1)!;
     // The span starts at its modifiers: `export`, `export default`, `async`, `declare`.
     let first = declStart;
     while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
-    spans.push({ name, start: tokens[first]!.start, end: last.end });
+    spans.push({ name, start: tokens[first]!.start, end: last.end, nameLine: tokens[nameAt]!.line });
     if (fn.bodyOpen >= 0) walk(fn.bodyOpen + 1, match.get(fn.bodyOpen)!, { kind: "code" });
     else walk(fn.exprFrom, fn.after, { kind: "code" });
     return fn.after;
@@ -620,11 +621,12 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
 
   /**
    * Walks the class whose `class` keyword is at `at` as `name`, and records
-   * it as a span from `spanFrom` when that is set (a class expression).
-   * Returns the index after its body; -1 when there is no body before
-   * `limit` or its heritage does not read (then `unplaced` is set).
+   * it as a span from `spanFrom` when that is set (a class expression), its
+   * name token at `nameAt`. Returns the index after its body; -1 when there
+   * is no body before `limit` or its heritage does not read (then `unplaced`
+   * is set).
    */
-  const classAt = (at: number, limit: number, name: string, spanFrom: number): number => {
+  const classAt = (at: number, limit: number, name: string, spanFrom: number, nameAt: number): number => {
     let k = at + 1;
     if (is(k, "id") && !HERITAGE.has(t(k)!.value)) k += 1;
     // The heritage clause up to the body; type arguments may hold `{`.
@@ -640,7 +642,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
     if (spanFrom >= 0) {
       let first = spanFrom;
       while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
-      spans.push({ name, start: tokens[first]!.start, end: tokens[close]!.end });
+      spans.push({ name, start: tokens[first]!.start, end: tokens[close]!.end, nameLine: tokens[nameAt]!.line });
     }
     walk(k + 1, close, { kind: "class", name });
     return close + 1;
@@ -661,7 +663,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
           }
           const fn = functionAt(i, limit);
           if (fn) {
-            i = named(t(k)!.value, i, fn);
+            i = named(t(k)!.value, i, fn, k);
             continue;
           }
           // An overload or `declare` signature: no body to place.
@@ -681,7 +683,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
             continue;
           }
           if (is(value, "id", "class")) {
-            const after = classAt(value, limit, name, i);
+            const after = classAt(value, limit, name, i, i + 1);
             if (unplaced) return;
             if (after > 0) {
               i = after;
@@ -690,7 +692,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
           }
           const fn = functionAt(value, limit);
           if (fn) {
-            i = named(name, i, fn);
+            i = named(name, i, fn, i + 1);
             continue;
           }
           // A function this scanner did not read (a generic it cannot close, an
@@ -707,7 +709,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         // A class with no name of its own (an expression) is its own thing,
         // named by nothing a row can carry: an edit in it is never its encloser's.
         const own = is(i + 1, "id") && !HERITAGE.has(t(i + 1)!.value);
-        const after = classAt(i, limit, own ? t(i + 1)!.value : "(class)", own ? -1 : i);
+        const after = classAt(i, limit, own ? t(i + 1)!.value : "(class)", own ? -1 : i, own ? i + 1 : i);
         if (unplaced) return;
         if (after > 0) {
           i = after;
@@ -721,7 +723,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         let start = i;
         while ((punc(start - 1, ".") || punc(start - 1, "?.")) && is(start - 2, "id")) start -= 2;
         if (is(i + 2, "id", "class")) {
-          const after = classAt(i + 2, limit, token.value, start);
+          const after = classAt(i + 2, limit, token.value, start, i);
           if (unplaced) return;
           if (after > 0) {
             i = after;
@@ -730,7 +732,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         }
         const fn = functionAt(i + 2, limit);
         if (fn) {
-          i = named(token.value, start, fn);
+          i = named(token.value, start, fn, i);
           continue;
         }
       }
@@ -777,6 +779,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
       }
       if (punc(k, "*")) k += 1;
       let key: string | null = null;
+      const keyAt = k;
       if (is(k, "id") || is(k, "str") || is(k, "num")) {
         key = t(k)!.value;
         k += 1;
@@ -797,7 +800,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
       if (punc(k, "(")) {
         const body = bodyAfterParams(match.get(k)!, limit);
         if (body >= 0) {
-          if (key !== null) named(`${path}.${key}`, i, { bodyOpen: body, after: match.get(body)! + 1, exprFrom: -1 });
+          if (key !== null) named(`${path}.${key}`, i, { bodyOpen: body, after: match.get(body)! + 1, exprFrom: -1 }, keyAt);
           else walk(body + 1, match.get(body)!, { kind: "code" });
           i = nextEntry(match.get(body)! + 1, limit, [","]);
           continue;
@@ -812,7 +815,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         }
         const fn = functionAt(value, limit);
         if (fn && key !== null) {
-          const after = named(`${path}.${key}`, i, fn);
+          const after = named(`${path}.${key}`, i, fn, keyAt);
           i = nextEntry(after, limit, [","]);
           continue;
         }
@@ -849,6 +852,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         continue;
       }
       let key: string | null = null;
+      const keyAt = k;
       if (is(k, "id") || is(k, "str") || is(k, "num")) {
         key = t(k)!.value;
         k += 1;
@@ -870,7 +874,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
       if (punc(k, "(")) {
         const body = bodyAfterParams(match.get(k)!, limit);
         if (body >= 0) {
-          if (key !== null) named(`${className}.${key}`, memberStart, { bodyOpen: body, after: match.get(body)! + 1, exprFrom: -1 });
+          if (key !== null) named(`${className}.${key}`, memberStart, { bodyOpen: body, after: match.get(body)! + 1, exprFrom: -1 }, keyAt);
           else walk(body + 1, match.get(body)!, { kind: "code" });
           i = match.get(body)! + 1;
           continue;
@@ -883,7 +887,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
       if (punc(k, "=")) {
         const fn = functionAt(k + 1, limit);
         if (fn && key !== null) {
-          i = named(`${className}.${key}`, memberStart, fn);
+          i = named(`${className}.${key}`, memberStart, fn, keyAt);
           continue;
         }
         const end = exprEnd(k + 1, limit);

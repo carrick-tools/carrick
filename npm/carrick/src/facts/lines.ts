@@ -253,6 +253,16 @@ export async function factLines(
         const base = where.get(other.repo);
         return base ? [path.join(base, other.file)] : [];
       });
+    // A candidate's check, isolated like the lookups (R36.6): one that throws
+    // is a failed check, the line silent.
+    const held = (kind: (typeof KINDS)[number], candidate: Candidate): boolean => {
+      try {
+        return candidate.holds ? candidate.holds() : true;
+      } catch (error) {
+        log(`${kind} fact check failed`, String(error));
+        return false;
+      }
+    };
     // Each kind's lookup on its own: a row of one kind that throws (a field
     // ingest let through) loses only that kind's lines for the file.
     const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): void => {
@@ -349,7 +359,7 @@ export async function factLines(
         if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
         if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
         if (said.has(candidate.key) || candidate.key in claims) continue;
-        if (candidate.holds && !candidate.holds()) {
+        if (!held(kind, candidate)) {
           failed += 1;
           if (proved) proofFailures += 1;
           continue;

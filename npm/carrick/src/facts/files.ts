@@ -28,8 +28,6 @@ export type FileMemo = {
   text: (file: string) => string | null;
   /** The file's text and declaration scan, or null when it is not a file the scanner reads, has no text, or does not scan cleanly. */
   scanned: (file: string) => ScannedFile | null;
-  /** The 1-based line of `offset` in the file's text, or null when the file has no text. */
-  lineOf: (file: string, offset: number) => number | null;
 };
 
 /** A fresh memo, for one `factLines` call. */
@@ -37,7 +35,6 @@ export function fileMemo(): FileMemo {
   const bytes = new Map<string, Buffer | null>();
   const texts = new Map<string, string | null>();
   const scans = new Map<string, ScannedFile | null>();
-  const starts = new Map<string, number[]>();
   const readBytes = (file: string): Buffer | null => {
     if (bytes.has(file)) return bytes.get(file)!;
     let out: Buffer | null = null;
@@ -68,25 +65,6 @@ export function fileMemo(): FileMemo {
       }
       scans.set(file, out);
       return out;
-    },
-    lineOf: (file, offset) => {
-      const text = readText(file);
-      if (text === null) return null;
-      let lineStarts = starts.get(file);
-      if (!lineStarts) {
-        lineStarts = [0];
-        for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", at + 1)) lineStarts.push(at + 1);
-        starts.set(file, lineStarts);
-      }
-      // The last line start at or before `offset`.
-      let low = 0;
-      let high = lineStarts.length - 1;
-      while (low < high) {
-        const mid = (low + high + 1) >> 1;
-        if (lineStarts[mid]! <= offset) low = mid;
-        else high = mid - 1;
-      }
-      return low + 1;
     },
   };
 }

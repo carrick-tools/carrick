@@ -276,6 +276,9 @@ const isLine = (value: unknown): boolean => value === null || (typeof value === 
 const isNameOrNull = (value: unknown): boolean => value === null || typeof value === "string";
 const allOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
   Array.isArray(value) && value.every((entry) => isRecord(entry) && each(entry));
+/** An op or fn row's `others`: whole entries, at least one (an empty list proves nothing; R36.6). */
+const someOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
+  Array.isArray(value) && value.length > 0 && allOf(value, each);
 
 /**
  * Whether a wire row carries every field its kind requires, each of the
@@ -297,7 +300,7 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         isLine(raw["line"]) &&
         isNameOrNull(raw["name"]) &&
         (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
-        allOf(raw["others"], (other) => isText(other["service"]) && isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]))
+        someOf(raw["others"], (other) => isText(other["service"]) && isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]))
       );
     // An fn or name row states a line, so it needs one (R33.7, F15).
     case "fn":
@@ -307,7 +310,7 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         Number.isInteger(raw["line"]) &&
         Number.isInteger(raw["total"]) &&
         isText(raw["name"]) &&
-        allOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
+        someOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
       );
     case "name":
       return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && Number.isInteger(raw["line"]);

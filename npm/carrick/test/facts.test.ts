@@ -98,7 +98,8 @@ const header = (repos: string[]) =>
   });
 
 const row = (fields: Record<string, unknown>) =>
-  JSON.stringify({ k: "op", service: fields["repo"], others: [], total: 0, source: "handler", ...fields });
+  // A peer in a repo not checked out here: ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"], others: [{ service: "other", repo: "other", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", ...fields });
 
 test("the wire fixture is the pinned one", () => {
   const pinned = fs.readFileSync(path.join(testDir, "facts-fixture.sha256"), "utf8").split(/\s+/)[0];

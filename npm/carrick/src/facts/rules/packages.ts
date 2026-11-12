@@ -19,6 +19,7 @@ import { tokenize } from "../match.ts";
 import type { FactStore } from "../store.ts";
 import type { FileMemo } from "../files.ts";
 import type { Candidate } from "../lines.ts";
+import { inRepo } from "../peers.ts";
 import type { LocalCheckouts } from "../peers.ts";
 import { textBefore } from "./same-name.ts";
 
@@ -133,20 +134,27 @@ export function packageLines(
     // one whose repo may be checked out unmapped makes the line silent (R36.2).
     const places = others.map((service) => checkouts.place(service.repo, at));
     if (places.includes(null)) continue;
-    const named = others.flatMap((service, index) => {
+    // A manifest path that leaves its repo is never read (R36.6).
+    const manifests = others.map((service) => inRepo(service.manifest));
+    if (manifests.includes(null)) continue;
+    const named = others.flatMap((_, index) => {
       const place = places[index]!;
-      return place === "index" || place === null ? [] : [path.join(place.top, service.manifest)];
+      return place === "index" || place === null ? [] : [path.join(place.top, manifests[index]!)];
     });
     // Each other service checked out here must still hold the stated spec on
-    // disk (R33.1, R33.4); one proven not checked out is stated from the index.
+    // disk (R33.1, R33.4): the package named in at least one of the four
+    // sections, and every section naming it at exactly that spec (R36.6).
+    // One proven not checked out is stated from the index.
     const holds = (): boolean =>
       others.every((service, index) => {
         const place = places[index]!;
         if (place === "index") return true;
         if (place === null) return false;
-        const manifest = memo.text(path.join(place.top, service.manifest));
+        const manifest = memo.text(path.join(place.top, manifests[index]!));
         const parsed = manifest === null ? null : parse(manifest);
-        return parsed !== null && [...SECTIONS].some((section) => specIn(parsed, section, name) === service.spec);
+        if (parsed === null) return false;
+        const specs = [...SECTIONS].map((section) => specIn(parsed, section, name)).filter((spec) => spec !== undefined);
+        return specs.length > 0 && specs.every((spec) => spec === service.spec);
       });
     out.push({ key: `pkg::${name}`, text, named, holds });
   }

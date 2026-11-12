@@ -17,6 +17,7 @@ import type { FileMemo } from "../files.ts";
 import { scanSource } from "../match.ts";
 import type { Scan } from "../match.ts";
 import type { FactStore, NameRow } from "../store.ts";
+import { inRepo } from "../peers.ts";
 import type { LocalCheckouts } from "../peers.ts";
 
 /** A name shorter than this (its last dotted part) is too common to say anything about. */
@@ -116,6 +117,9 @@ export function sameNameLines(
     // Up to `MAX_NAME_ROWS` rows in (repo, file) order, under one key: the
     // first whose check passes prints, and the rest are skipped (R33.7, F8).
     for (const row of rowsOf.get(name)!.slice(0, MAX_NAME_ROWS)) {
+      // A row path that leaves its repo is never read (R36.6).
+      const file = inRepo(row.file);
+      if (file === null) continue;
       const place = checkouts.place(row.repo, at);
       // Not known whether the repo is checked out here: silent (R36.2).
       if (place === null) continue;
@@ -125,14 +129,14 @@ export function sameNameLines(
         out.push({ key: `name::${name}`, text: row.text, named: [] });
         continue;
       }
-      const other = path.join(place.top, row.file);
+      const other = path.join(place.top, file);
       // The other file must still declare exactly this name, read by the same
-      // scanner, starting on the line the row states (R33.3): gone, rewritten,
+      // scanner, its name token on the line the row states (R33.3, R36.6): gone, rewritten,
       // only importing it, moved within the file, or not scanning cleanly, the
       // line would be wrong or the function may have moved into this file.
       // Checked only for a line about to print.
       const holds = (): boolean =>
-        memo.scanned(other)?.scan.spans.some((span) => span.name === name && memo.lineOf(other, span.start) === row.line) ?? false;
+        memo.scanned(other)?.scan.spans.some((span) => span.name === name && span.nameLine === row.line) ?? false;
       out.push({ key: `name::${name}`, text: row.text, named: [other], holds });
     }
   }
