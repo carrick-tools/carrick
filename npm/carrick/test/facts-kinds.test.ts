@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
-import { commitRepos } from "./facts-repos.ts";
+import { commitRepos, gitIn } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -803,6 +803,73 @@ test("R33.5: the name kind stops after 3 failed checks", async (t) => {
   const added = names.flatMap((name) => [`export function ${name}() {`, "  return 1;", "}"]);
   const { file, hunk } = addFunction(ws, "api/src/hook.ts", [...added, ""]);
   assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+// ---- R33.7: F8, F14, F15 ----
+
+test("R33.7 (F8): the name rule tries the next row when the first one's file fails its check", async (t) => {
+  // api/src/io.ts (first by repo, file) no longer declares readStdin; web/src/stdin.ts does, at line 3.
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/io.ts": "export function other() {}\n" }, [
+    nameRow("readStdin", "web", "src/stdin.ts"),
+    nameRow("readStdin", "api", "src/io.ts"),
+  ]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), STDIN_LINE);
+});
+
+test("R33.7 (F14): name is silent for a name the edited file declares twice", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts", [...ADDED.slice(0, -1), ...ADDED]);
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("R33.7 (F14): name in a linked worktree reads the other file in that worktree", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/io.ts": "// io\n\nexport function readStdin() {}\n" }, [nameRow("readStdin", "api", "src/io.ts")]);
+  const tree = path.join(ws.root, "api-wt");
+  gitIn(ws.at("api"), "worktree", "add", "-q", tree);
+  t.after(() => fs.rmSync(tree, { recursive: true, force: true }));
+  const edit = async (session: string) => {
+    const file = path.join(tree, "src/hook.ts");
+    const before = fs.readFileSync(file, "utf8");
+    const hunk = manifestHunk(file, before, `${before}${ADDED.slice(0, -1).join("\n")}\n`);
+    try {
+      return await patchEdit(ws, file, [hunk], { session });
+    } finally {
+      fs.writeFileSync(file, before);
+    }
+  };
+  assert.equal(context((await edit("wt-1")).stdout), "a function named readStdin is declared at api/src/io.ts:3");
+  // The worktree's own copy moved the declaration down; the main checkout's did not: silent.
+  fs.writeFileSync(path.join(tree, "src/io.ts"), "// io\n\n\nexport function readStdin() {}\n");
+  assert.equal(context((await edit("wt-2")).stdout), "");
+});
+
+test("R33.7 (F14): pkg lines come after fn lines in one action, whatever the edit order", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/package.json": before, "web/src/index.ts": "export {};\n", "api/src/orders.ts": ORDERS }, [ZOD, fnRow("loadOrder", LOAD_LINE)]);
+  const manifest = ws.at("api/package.json");
+  const hunk = manifestHunk(manifest, before, MANIFEST(['    "zod": "^3.24.0"']));
+  const outcome = await factLines(ws.root, [{ file: manifest, ...asChange(hunk) }, inLoadOrder(ws)], undefined);
+  assert.deepEqual(outcome.lines, [LOAD_LINE, ZOD_FOR_API]);
+});
+
+test("R33.7 (F15): ingest skips an fn row whose total is not an integer, and fn or name rows with a null line", async (t) => {
+  const { total: _, ...noTotal } = fnRow("loadOrder", LOAD_LINE);
+  const ws = await workspace(t, STDIN_FILES, [
+    { ...fnRow("loadOrder", LOAD_LINE), total: "1" },
+    { ...fnRow("loadOrder", LOAD_LINE), total: 1.5 },
+    noTotal,
+    { ...fnRow("loadOrder", LOAD_LINE), line: null },
+    { ...nameRow("readStdin", "web", "src/stdin.ts"), line: null },
+    // Whole rows of both kinds are kept.
+    fnRow("listOrders", LIST_LINE),
+    nameRow("readStdin", "web", "src/stdin.ts"),
+  ]);
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root), { readOnly: true });
+  const counts = ["fns", "names"].map((table) => Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!["n"]));
+  db.close();
+  assert.deepEqual(counts, [1, 1]);
 });
 
 // ---- Stale hunks (ruling 4) ----

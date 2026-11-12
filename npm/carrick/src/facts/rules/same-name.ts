@@ -6,8 +6,9 @@
 // the file now and the patch (its added lines dropped, its removed text put
 // back); a file the call created had nothing before. With neither, nothing is
 // said. A name shorter than 4 characters, or with a row in this very file,
-// says nothing; otherwise the first row by (repo, file) prints, and only when
-// its file still scans cleanly and declares exactly that name.
+// says nothing; otherwise the first of up to 3 rows by (repo, file) whose file
+// still scans cleanly and declares exactly that name on the stated line
+// prints. A row in a repo not checked out here is stated from the index.
 
 import path from "node:path";
 import type { Candidate } from "../lines.ts";
@@ -19,6 +20,9 @@ import type { FactStore, NameRow } from "../store.ts";
 
 /** A name shorter than this (its last dotted part) is too common to say anything about. */
 export const MIN_NAME_LENGTH = 4;
+
+/** At most this many other declarations of one name are tried, in (repo, file) order. */
+const MAX_NAME_ROWS = 3;
 
 /** The edit as `facts/lines.ts` holds it, for this rule. */
 type Change = { lines?: number[] | null; removed?: number[] | null; removedText?: string[] | null; whole?: boolean };
@@ -107,23 +111,26 @@ export function sameNameLines(
   if (names === null) return [];
   const out: Candidate[] = [];
   for (const name of names) {
-    const first = rowsOf.get(name)![0]!;
-    const base = first.repo === at.repo ? at.top : where.get(first.repo);
-    // A repo not checked out here: stated from the index, which it cannot
-    // have changed since (R33.1).
-    if (!base) {
-      out.push({ key: `name::${name}`, text: first.text, named: [] });
-      continue;
+    // Up to `MAX_NAME_ROWS` rows in (repo, file) order, under one key: the
+    // first whose check passes prints, and the rest are skipped (R33.7, F8).
+    for (const row of rowsOf.get(name)!.slice(0, MAX_NAME_ROWS)) {
+      const base = row.repo === at.repo ? at.top : where.get(row.repo);
+      // A repo not checked out here: stated from the index, which it cannot
+      // have changed since (R33.1).
+      if (!base) {
+        out.push({ key: `name::${name}`, text: row.text, named: [] });
+        continue;
+      }
+      const other = path.join(base, row.file);
+      // The other file must still declare exactly this name, read by the same
+      // scanner, starting on the line the row states (R33.3): gone, rewritten,
+      // only importing it, moved within the file, or not scanning cleanly, the
+      // line would be wrong or the function may have moved into this file.
+      // Checked only for a line about to print.
+      const holds = (): boolean =>
+        memo.scanned(other)?.scan.spans.some((span) => span.name === name && memo.lineOf(other, span.start) === row.line) ?? false;
+      out.push({ key: `name::${name}`, text: row.text, named: [other], holds });
     }
-    const other = path.join(base, first.file);
-    // The other file must still declare exactly this name, read by the same
-    // scanner, starting on the line the row states (R33.3): gone, rewritten,
-    // only importing it, moved within the file, or not scanning cleanly, the
-    // line would be wrong or the function may have moved into this file.
-    // Checked only for a line about to print.
-    const holds = (): boolean =>
-      memo.scanned(other)?.scan.spans.some((span) => span.name === name && memo.lineOf(other, span.start) === first.line) ?? false;
-    out.push({ key: `name::${name}`, text: first.text, named: [other], holds });
   }
   return out;
 }

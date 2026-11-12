@@ -289,16 +289,18 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
         allOf(raw["others"], (other) => isText(other["service"]) && isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]))
       );
+    // An fn or name row states a line, so it needs one (R33.7, F15).
     case "fn":
       return (
         isText(raw["repo"]) &&
         isText(raw["file"]) &&
-        isLine(raw["line"]) &&
+        Number.isInteger(raw["line"]) &&
+        Number.isInteger(raw["total"]) &&
         isText(raw["name"]) &&
         allOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
       );
     case "name":
-      return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && isLine(raw["line"]);
+      return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && Number.isInteger(raw["line"]);
     case "pkg":
       return (
         isText(raw["package"]) &&
@@ -378,7 +380,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
           Number(raw["line"]),
           String(raw["name"]),
           JSON.stringify(raw["others"]),
-          Number(raw["total"] ?? 0),
+          Number(raw["total"]),
           String(raw["text"]),
         );
         continue;
