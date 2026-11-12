@@ -167,7 +167,9 @@ fn a_site_whose_request_a_summary_places_up_its_chain_still_yields() {
 /// The site stops at a wrapper's call (`page('/api/listing', query)`, where
 /// the path is complete) and the summaries carry the request one caller up,
 /// where the query is filled: the row's chain passes through the site's
-/// line, so the site yields. One request, one row, at the outer caller.
+/// line, so the site yields. One request, one row, at the outer caller, and
+/// no second reading of it at the middle call (a site kept there would be
+/// asked about, and left as a possible call and an unread site).
 #[test]
 fn a_site_at_a_wrapper_call_yields_to_the_row_composed_through_it() {
     let blob = scan();
@@ -177,5 +179,31 @@ fn a_site_at_a_wrapper_call_yields_to_the_row_composed_through_it() {
         vec![(10, "GET".to_string(), "/api/listing".to_string())],
         "{:#?}",
         blob["calls"]
+    );
+    let in_listing = |key: &str, file_key: &str| -> Vec<serde_json::Value> {
+        blob[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item[file_key]
+                            .as_str()
+                            .is_some_and(|file| file.contains("src/listing.ts"))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        in_listing("possible_calls", "file_path").is_empty(),
+        "{:#?}",
+        blob["possible_calls"]
+    );
+    assert!(
+        in_listing("unread_sites", "file").is_empty(),
+        "{:#?}",
+        blob["unread_sites"]
     );
 }

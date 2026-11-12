@@ -14,4 +14,5 @@ Answer key:
 - `src/notices.ts`: one GET row, `/api/notices`, at line 6. The site at the
   `fetch` itself yields to the row at the wrapper's caller.
 - `src/listing.ts`: one GET row, `/api/listing`, at line 10. The site at the
-  middle call (line 6) yields to the row one caller up.
+  middle call (line 6) yields to the row one caller up, whose chain passes
+  through it: no possible call and no unread site in the file.
