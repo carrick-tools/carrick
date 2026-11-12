@@ -199,9 +199,9 @@ fn a_request_inside_a_handed_callback_reads_its_method_from_the_helper_s_caller(
 
 /// V1 rule C2 is deleted: an awaited call with a string argument is no
 /// call-site signal. `src/use-wrapped.ts` awaits a local wrapper with string
-/// arguments and makes no other call, so only the fact layer reads it:
-/// discovery reaches `fetch` through `callApi` and `send`, lists both calls,
-/// and the reader's rows there join.
+/// arguments and makes no other call, so no signal raises it: discovery
+/// reaches `fetch` through `callApi` and `send`, and the fact layer states
+/// both rows itself, whether or not the reader reads the file.
 #[test]
 fn a_call_through_a_local_fetch_wrapper_keeps_its_row_with_no_signal() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
@@ -217,19 +217,14 @@ fn a_call_through_a_local_fetch_wrapper_keeps_its_row_with_no_signal() {
     let rows: Vec<String> = call_rows(&blob)
         .into_iter()
         .filter(|row| row.starts_with("src/use-wrapped.ts:"))
-        .map(|row| {
-            row.rsplit_once(' ')
-                .map(|(key, _)| key.to_string())
-                .unwrap()
-        })
         .collect();
     assert_eq!(
         rows,
         vec![
-            "src/use-wrapped.ts:4 POST /v1/items",
-            "src/use-wrapped.ts:8 GET /v1/items",
+            "src/use-wrapped.ts:4 POST /v1/items request_summary",
+            "src/use-wrapped.ts:8 GET /v1/items request_summary",
         ],
-        "both caller rows"
+        "both caller rows, stated by the fact layer"
     );
     assert!(
         log.contains("fact files: C3 candidates"),

@@ -841,10 +841,10 @@ export async function ping(): Promise<void> {
   await api.post("/checkout");
 }
 
-declare function send(url: string): Promise<{ data: any }>;
+declare const http: { send(url: string): Promise<{ data: any }> };
 
 export async function viaHelper(): Promise<number> {
-  const sent = await send("/checkout");
+  const sent = await http.send("/checkout");
   return sent.data.x;
 }
 "#;
@@ -872,7 +872,7 @@ export async function viaHelper(): Promise<number> {
             "data_calls": [
                 call(6, "api.post(", "api.post(\"/checkout\")"),
                 call(10, "api.post(", "api.post(\"/checkout\")"),
-                call(16, "send(", "send(\"/checkout\")"),
+                call(16, "http.send(", "http.send(\"/checkout\")"),
             ]
         }))
         .expect("cassette json"),

@@ -3265,8 +3265,8 @@ impl CandidateVisitor {
 
     /// Property name of a member-expression callee (`axios.post(...)` ->
     /// "post", `w['post'](...)` -> "post"). `None` for non-member callees and
-    /// non-literal computed properties. Used by the structural signals (URL
-    /// scheme, awaited stringish call) so the candidate hint carries the full
+    /// non-literal computed properties. Used by the structural signals (the
+    /// URL scheme and the imported package) so the candidate hint carries the full
     /// `object.property` callee even when the package is absent from the
     /// LLM-detected `data_fetchers` list — without this, the same call site's
     /// hint flips between `axios.post` and bare `axios` depending on a per-run
@@ -4522,9 +4522,11 @@ async function run() { return sdk.doThing(); }
     }
 
     #[test]
-    fn detects_awaited_stringish_call() {
+    fn an_awaited_call_with_a_string_argument_raises_no_candidate() {
+        // V1 rule C2 is deleted: awaiting a call with a string argument is no
+        // call-site signal.
         let content = r#"async function run() { return await loadData('/data.json'); }"#;
-        assert!(!scan_test_content(content).candidates.is_empty());
+        assert!(scan_test_content(content).candidates.is_empty());
     }
 
     #[test]
@@ -4542,7 +4544,7 @@ function run() {
     #[test]
     fn dedupes_candidate_spans_across_signals() {
         // `await axios.get('https://x.com/y')` matches the import-local,
-        // url-scheme, awaited-stringish, and name heuristics simultaneously,
+        // url-scheme and name heuristics simultaneously,
         // but the single call site must yield exactly one candidate.
         let content = r#"
 import axios from 'axios';
