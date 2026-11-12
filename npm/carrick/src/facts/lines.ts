@@ -67,12 +67,10 @@ export type FactOutcome = {
   /** The fact file is missing, unreadable or older than `FACTS_STALE_MS`: start a background refresh. */
   stale: boolean;
   /**
-   * The edited files (as given) whose callers the fact file answered: it
-   * holds at least one `fn` row, and the fn lookup ran for the file (it
-   * scanned cleanly, its changed lines are known, and they reached a named
-   * thing declared once). Only for these is the probe's uses-count line left
-   * out, at edit time and in a late answer (carrick#4017; plan section 26
-   * ruling 9).
+   * The edited files (as given) whose callers the fact lines answered: an fn
+   * line for the file printed in this action, or was said earlier in this
+   * session. Only for these is the probe's uses-count line left out, at edit
+   * time and in a late answer (carrick#4017; plan section 33, R33.6).
    */
   callersRead: string[];
 };
@@ -82,7 +80,14 @@ export type FactOutcome = {
  * paths it points at. `holds`, when set, is a costlier check run only for a
  * line about to print within the cap; false drops the line.
  */
-export type Candidate = { key: string; text: string; named: string[]; holds?: () => boolean };
+export type Candidate = {
+  key: string;
+  text: string;
+  named: string[];
+  holds?: () => boolean;
+  /** An fn line's edited file (as given), for `callersRead`. */
+  file?: string;
+};
 
 /** The row kinds in the order their lines print, before the cap of `MAX_FACT_LINES`. */
 const KINDS = ["op", "fn", "name", "pkg"] as const;
@@ -256,13 +261,11 @@ export async function factLines(
       });
     // Each kind's lookup on its own: a row of one kind that throws (a field
     // ingest let through) loses only that kind's lines for the file.
-    const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): boolean => {
+    const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): void => {
       try {
         found[kind].push(...lookup());
-        return true;
       } catch (error) {
         log(`${kind} fact lines failed`, String(error));
-        return false;
       }
     };
     for (const edit of edits) {
@@ -322,17 +325,20 @@ export async function factLines(
         return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others), holds: peersHold(at, row.others) }));
       });
       // The functions' callers in other files: only the row in this file.
-      // When the fact file holds callers at all and the lookup ran for a
-      // named thing here, they stand in for the probe's uses-count line.
-      const callersRan = isolated("fn", () =>
+      isolated("fn", () =>
         names.flatMap((name) =>
           facts
             .callers(at.repo, name)
             .filter((fn) => fn.file === at.rel)
-            .map((fn) => ({ key: `fn::${fn.repo}::${fn.file}::${fn.name}`, text: fn.text, named: pathsOf(fn.others), holds: peersHold(at, fn.others) })),
+            .map((fn) => ({
+              key: `fn::${fn.repo}::${fn.file}::${fn.name}`,
+              text: fn.text,
+              named: pathsOf(fn.others),
+              holds: peersHold(at, fn.others),
+              file: edit.file,
+            })),
         ),
       );
-      if (callersRan && facts.hasCallers && names.length > 0) callersRead.push(edit.file);
       isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file), memo));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
@@ -351,6 +357,12 @@ export async function factLines(
         lines.push(candidate.text);
         claims[candidate.key] = { at: now, named: candidate.named };
       }
+    }
+    // A file's callers are answered only where its fn line printed now or
+    // was said earlier in this session (R33.6).
+    for (const candidate of found.fn) {
+      if (candidate.file === undefined || callersRead.includes(candidate.file)) continue;
+      if (said.has(candidate.key) || candidate.key in claims) callersRead.push(candidate.file);
     }
   } catch (error) {
     log("fact lines failed", String(error));

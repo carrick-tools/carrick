@@ -730,6 +730,38 @@ test("an fn row with null in others and a pkg service with no manifest do not lo
   assert.deepEqual(outcome.lines, ["op line for loadOrder"]);
 });
 
+// ---- The uses-count line gives way only to an fn line said (R33.6) ----
+
+/** An Edit at `const key` in loadOrder, the probe answering with uses lines. */
+function usesEdit(ws: Ws, session: string) {
+  const file = ws.at("api/src/orders.ts");
+  return patchEdit(ws, file, [{ newStart: lineOf(file, "const key"), lines: ["+  const key = `order:${id}`;"] }], { session, probe: "check-uses.json" });
+}
+
+test("R33.6: the uses-count line prints when the fn line is held back by its peer proof", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
+  fs.appendFileSync(ws.at("web/src/page.ts"), "// edited after the index\n");
+  const text = context((await usesEdit(ws, "held")).stdout);
+  assert.match(text, USES_LINE);
+  assert.ok(!text.includes(LOAD_LINE), text);
+});
+
+test("R33.6: the uses-count line prints when op lines fill the cap before the fn line", async (t) => {
+  const op = (label: string) => ({ ...OP_LOAD, label, side: label.startsWith("GET") ? "consumer" : "producer", protocol: label.split(" ")[0] === "GET" ? "http" : label.split(" ")[0]!.toLowerCase(), text: `${label} line` });
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [op("GET /a"), op("SOCKET b"), op("PUBSUB c"), fnRow("loadOrder", LOAD_LINE)]);
+  const text = context((await usesEdit(ws, "capped")).stdout);
+  assert.ok(text.includes("GET /a line") && !text.includes(LOAD_LINE), text);
+  assert.match(text, USES_LINE);
+});
+
+test("R33.6: the uses-count line stays out after the fn line was said earlier in the session", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE)]);
+  const first = context((await usesEdit(ws, "twice")).stdout);
+  const second = context((await usesEdit(ws, "twice")).stdout);
+  assert.ok(first.includes(LOAD_LINE) && !USES_LINE.test(first), first);
+  assert.doesNotMatch(second, USES_LINE);
+});
+
 // ---- Speed (R33.5) ----
 
 test("R33.5: the name rule rebuilds the text before the edit only when a name could have a row elsewhere", () => {
