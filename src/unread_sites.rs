@@ -511,7 +511,7 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
             .keys()
             .map(|file| (Sha256::digest(file.as_bytes()).to_vec(), *file))
             .collect();
-        order.sort_by(|a, b| a.1.cmp(b.1));
+        order.sort();
         let mut keep = vec![false; total];
         let mut left = MAX_PER_SERVICE;
         for labelled in [true, false] {
