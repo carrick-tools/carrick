@@ -317,6 +317,26 @@ test("name: silent when the other file does not scan cleanly", async (t) => {
   assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
 });
 
+test("name: silent when a form the scanner does not count as a declaration is rewritten as one", async (t) => {
+  const forms = [
+    "export const readStdin = wrap(() => {});",
+    "exports.readStdin = function () {};",
+    "module.exports = { readStdin() {} };",
+    "export const reader = memo(function readStdin() {});",
+  ];
+  const said: string[] = [];
+  for (const form of forms) {
+    const ws = await workspace(t, { ...STDIN_FILES, "api/src/hook.ts": [HOOK.trimEnd(), form, ""].join("\n") }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+    const file = ws.at("api/src/hook.ts");
+    const at = lineOf(file, form);
+    const added = ADDED.slice(0, -1);
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(form, added.join("\n")));
+    const hunk = { newStart: at, lines: [`-${form}`, ...added.map((line) => `+${line}`)] };
+    said.push(context((await patchEdit(ws, file, [hunk])).stdout));
+  }
+  assert.deepEqual(said, forms.map(() => ""));
+});
+
 test("fn: a row whose file is gone is silent, even for a name declared once here", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE, "src/old-orders.ts")]);
   const file = ws.at("api/src/orders.ts");

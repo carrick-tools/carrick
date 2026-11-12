@@ -40,21 +40,39 @@ export function textBefore(text: string, added: readonly number[], removed: read
   return next === removed.length ? before.join("\n") : null;
 }
 
-/** The names the edit added: declared once now, not at all before; null when that cannot be known. */
+/**
+ * Whether `word` appears in `text` as a whole identifier: not inside a longer
+ * one (Unicode identifier characters, `$`, and the joiners count as part of one).
+ */
+function holdsWord(text: string, word: string): boolean {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\p{ID_Continue}$\\u200c\\u200d])${escaped}(?![\\p{ID_Continue}$\\u200c\\u200d])`, "u").test(text);
+}
+
+/**
+ * The names the edit added: declared once now, and absent before (neither
+ * declared nor written anywhere as a whole word: `const f = wrap(...)`,
+ * `module.exports = { f() {} }` rewritten as `function f` is no new
+ * function); null when the text before cannot be known.
+ */
 function addedNames(text: string, scan: Scan, change: Change, jsx: boolean): string[] | null {
   let before: Set<string>;
+  let old = "";
   if (change.whole) before = new Set();
   else {
     if (!change.lines || !change.removed || !change.removedText) return null;
-    const old = textBefore(text, change.lines, change.removed, change.removedText);
-    if (old === null) return null;
-    const oldScan = scanSource(old, jsx);
+    const rebuilt = textBefore(text, change.lines, change.removed, change.removedText);
+    if (rebuilt === null) return null;
+    const oldScan = scanSource(rebuilt, jsx);
     if (!oldScan.ok) return null;
     before = new Set(oldScan.spans.map((span) => span.name));
+    old = rebuilt;
   }
   const count = new Map<string, number>();
   for (const span of scan.spans) count.set(span.name, (count.get(span.name) ?? 0) + 1);
-  return [...count].filter(([name, n]) => n === 1 && !before.has(name)).map(([name]) => name);
+  return [...count]
+    .filter(([name, n]) => n === 1 && !before.has(name) && !holdsWord(old, name.slice(name.lastIndexOf(".") + 1)))
+    .map(([name]) => name);
 }
 
 /** The `name` lines for one edited file: at most one per added name. */
