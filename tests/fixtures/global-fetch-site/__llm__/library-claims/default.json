@@ -1,0 +1,35 @@
+{
+  "library_claims": [
+    {
+      "package": "node:web-globals/fetch",
+      "version": "20.11.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "node:web-globals/fetch",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": null,
+              "on": "export",
+              "name": { "arg": 0 },
+              "method_key": { "arg": 1, "key": "method" },
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

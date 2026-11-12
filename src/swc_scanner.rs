@@ -2548,18 +2548,6 @@ impl CandidateVisitor {
         api_methods.contains(&name.to_lowercase().as_str())
     }
 
-    /// Check if this is a call to a global network primitive (`fetch(...)`).
-    /// Other primitives (`WebSocket`, `EventSource`, `XMLHttpRequest`) are
-    /// constructed with `new` and handled in `visit_new_expr`.
-    fn is_global_network_call(&self, callee: &Callee) -> bool {
-        if let Callee::Expr(expr) = callee
-            && let Expr::Ident(ident) = &**expr
-        {
-            return matches!(ident.sym.as_ref(), "fetch");
-        }
-        false
-    }
-
     /// Is this a `navigator.sendBeacon(url, ...)` call? This is a web-platform
     /// data-transmitting primitive (a fire-and-forget HTTP POST), the same
     /// family as `fetch`/`XMLHttpRequest`. Matching the syntactic shape
@@ -3577,11 +3565,6 @@ impl Visit for CandidateVisitor {
         // nested inside this call's arguments/callee don't inherit the position.
         let in_pubsub_call_position = self.in_pubsub_call_position;
         self.in_pubsub_call_position = false;
-
-        // Signal 1: global fetch primitive.
-        if self.is_global_network_call(&call.callee) {
-            self.push_candidate(call, "fetch".to_string(), None);
-        }
 
         // Signal 1b: `navigator.sendBeacon(url, ...)` — a web-platform HTTP POST
         // primitive. Its first argument is the URL, so the existing

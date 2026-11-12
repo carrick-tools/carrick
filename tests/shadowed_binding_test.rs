@@ -3,9 +3,10 @@
 //!
 //! Drives the real scanner binary over `tests/fixtures/shadowed-bindings/`
 //! with the model stage off, so every row is one a pass states as a fact. The
+//! fixture's cassette labels the global `fetch` (`lib:lib.dom.d.ts`). The
 //! fixture's README is the answer key: one test per source that reads a
-//! binding, each asserting the shadowed site states nothing and the control
-//! site still states its row.
+//! binding, each asserting the shadowed site never states the outer binding's
+//! value and the control site still states its row.
 
 use std::process::Command;
 use std::sync::OnceLock;
@@ -22,6 +23,9 @@ fn calls() -> &'static [serde_json::Value] {
             .env("CARRICK_NO_MODEL", "1")
             .env("CARRICK_OUTPUT_JSON", "1")
             .env("CARRICK_SKIP_INTENTS", "1")
+            // The store's label for the global `fetch`: a bare `fetch` is read
+            // through it, not through its name.
+            .env("CARRICK_MOCK_FIXTURE_DIR", format!("{fixture}/__llm__/"))
             .env("CARRICK_CACHE_DIR", cache.path())
             // Nothing here reads a type.
             .env("CARRICK_ALLOW_MISSING_TYPES", "1");
@@ -62,14 +66,22 @@ fn rows_at(file: &str, line: i64) -> Vec<&'static serde_json::Value> {
         .collect()
 }
 
-/// No row at `file:line`: the call there sends what an inner binding holds.
-fn assert_no_row(file: &str, line: i64) {
+/// No row at `file:line` is a fact the other binding gives: the call there
+/// sends what an inner binding holds, so a row there (stated through the
+/// store's label for `fetch`) may state the inner value or less, never `outer`.
+fn assert_not_outer(file: &str, line: i64, outer: &str) {
     let rows = rows_at(file, line);
     assert!(
-        rows.is_empty(),
+        rows.iter().all(|row| row["target_url"] != outer),
         "{file}:{line} reads a binding declared again in an inner scope; \
-         no row may state the outer one: {rows:#?}"
+         no row may state the outer one ({outer}): {rows:#?}"
     );
+}
+
+/// No row at `file:line`: the call there is not the platform's.
+fn assert_no_row(file: &str, line: i64) {
+    let rows = rows_at(file, line);
+    assert!(rows.is_empty(), "{file}:{line} states no row: {rows:#?}");
 }
 
 /// The one row at `file:line`, stated by `source`, sending `method` to
@@ -90,7 +102,7 @@ fn assert_row(file: &str, line: i64, source: &str, method: &str, target_url: &st
 /// The issue's reproduction: a block-local `const` shadows a module constant.
 #[test]
 fn a_summary_never_reads_a_module_constant_a_block_declares_again() {
-    assert_no_row("module-const.ts", 6);
+    assert_not_outer("module-const.ts", 6, "/api/users");
     assert_row(
         "module-const.ts",
         12,
@@ -102,7 +114,7 @@ fn a_summary_never_reads_a_module_constant_a_block_declares_again() {
 
 #[test]
 fn a_summary_never_reads_a_functions_local_a_block_declares_again() {
-    assert_no_row("function-local.ts", 5);
+    assert_not_outer("function-local.ts", 5, "/api/items");
     assert_row(
         "function-local.ts",
         7,
@@ -116,14 +128,14 @@ fn a_summary_never_reads_a_functions_local_a_block_declares_again() {
 /// whichever declaration ran last.
 #[test]
 fn a_summary_never_reads_a_var_declared_twice() {
-    assert_no_row("var-redeclared.ts", 6);
+    assert_not_outer("var-redeclared.ts", 6, "/api/var-first");
 }
 
 /// A block-local `const` that shadows a parameter: the caller's argument is
 /// not what the call sends.
 #[test]
 fn a_summary_never_fills_a_parameter_a_block_declares_again() {
-    assert_no_row("parameter-caller.ts", 4);
+    assert_not_outer("parameter-caller.ts", 4, "/api/param-users");
     assert_row(
         "parameter-caller.ts",
         5,
@@ -135,7 +147,7 @@ fn a_summary_never_fills_a_parameter_a_block_declares_again() {
 
 #[test]
 fn a_callback_never_reads_a_captured_local_it_declares_again() {
-    assert_no_row("closure.ts", 7);
+    assert_not_outer("closure.ts", 7, "/api/orders");
     assert_row("closure.ts", 9, "request_summary", "GET", "/api/orders");
 }
 
@@ -148,7 +160,7 @@ fn a_block_local_fetch_is_not_the_platform_fetch() {
 
 #[test]
 fn a_new_url_binding_is_read_in_its_own_scope() {
-    assert_no_row("new-url.ts", 6);
+    assert_not_outer("new-url.ts", 6, "/api/new-url-module");
     assert_row("new-url.ts", 12, "new_url", "GET", "/api/new-url-module");
     // The inner block's `link` is declared after the outer one, and before
     // the fix it overwrote it in the function's frame.
@@ -158,8 +170,8 @@ fn a_new_url_binding_is_read_in_its_own_scope() {
 /// A member another module calls is read through the same bindings.
 #[test]
 fn a_member_shadowing_its_modules_url_states_nothing_at_its_callers() {
-    assert_no_row("member.ts", 6);
-    assert_no_row("member-caller.ts", 4);
+    assert_not_outer("member.ts", 6, "/api/member-module");
+    assert_not_outer("member-caller.ts", 4, "/api/member-module");
     assert_row("member.ts", 12, "new_url", "GET", "/api/member-module");
     assert_row(
         "member-caller.ts",
@@ -176,7 +188,7 @@ fn a_member_shadowing_its_modules_url_states_nothing_at_its_callers() {
 /// `imported_member`.
 #[test]
 fn the_imported_member_join_reads_a_members_url_in_its_own_scope() {
-    assert_no_row("member-namespace.ts", 4);
+    assert_not_outer("member-namespace.ts", 4, "/api/member-module");
     assert_row(
         "member-namespace.ts",
         5,
@@ -188,7 +200,7 @@ fn the_imported_member_join_reads_a_members_url_in_its_own_scope() {
 
 #[test]
 fn an_env_base_is_read_only_through_the_binding_the_alias_table_describes() {
-    assert_no_row("env-base.ts", 6);
+    assert_not_outer("env-base.ts", 6, "${process.env.API_URL}/users");
     assert_row(
         "env-base-control.ts",
         4,
@@ -200,7 +212,7 @@ fn an_env_base_is_read_only_through_the_binding_the_alias_table_describes() {
 
 #[test]
 fn a_whole_url_binding_is_read_only_where_the_alias_table_describes_it() {
-    assert_no_row("whole-url.ts", 6);
+    assert_not_outer("whole-url.ts", 6, "${process.env.HELPDESK_URL}/api/answer");
     assert_row(
         "whole-url-control.ts",
         4,
@@ -212,7 +224,7 @@ fn a_whole_url_binding_is_read_only_where_the_alias_table_describes_it() {
 
 #[test]
 fn a_literal_base_is_read_only_through_the_binding_it_was_declared_on() {
-    assert_no_row("literal-base.ts", 6);
+    assert_not_outer("literal-base.ts", 6, "http://api.example.com/status");
     assert_row(
         "literal-base-control.ts",
         4,
