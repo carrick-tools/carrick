@@ -749,9 +749,20 @@ fn unwritable_route(kind: &str, side: RowSide, method: Option<&str>) -> Option<S
 /// ends at a boundary the cross-service join may still continue
 /// (`entry_point`, `callback_option`: [`crate::engine`]'s
 /// `route_boundaries::settle` runs after this), where a chain ends in no
-/// stop (`handed`), and for a procedure's route.
+/// stop (`handed`).
+///
+/// A procedure's route with no full path says what the procedure walk
+/// found instead: the first adapter's reason, or that no adapter reached it
+/// (carrick#3688, A7).
 fn owner_stop(site: &DecidedSite) -> Stop {
-    if site.procedure.is_some() || site.composed_trimmed || site.composed.is_empty() {
+    if let Some(procedure) = &site.procedure {
+        return match (procedure.full_paths.is_empty(), procedure.stop) {
+            (true, Some(stop)) => stop,
+            (true, None) => Stop::ProcedureNoAdapter,
+            (false, _) => Stop::OwnerUnknown,
+        };
+    }
+    if site.composed_trimmed || site.composed.is_empty() {
         return Stop::OwnerUnknown;
     }
     let ends: Option<Vec<Stop>> = site

@@ -54,6 +54,7 @@ use super::composed::{Mounts, compose};
 use super::instances::{InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex};
 use super::{Calls, Decided, LabelledEnd, SiteLabel, relative};
 use crate::position_rows::Kind;
+use crate::request_summary::stop::Stop;
 
 /// What the store labels for procedure routers, as this pass reads it.
 #[derive(Debug, Clone, Default)]
@@ -261,7 +262,25 @@ pub struct Procedure {
     /// `unread_key`, `walk_stopped`, `unread_mount`, `mount_hole`: one per adapter and key
     /// path that reached the site and named no path.
     pub unread: BTreeMap<String, usize>,
+    /// Why no full path names it, as the saved stop list spells it: the
+    /// reason of the first adapter (in adapter order) that reached it and
+    /// named no path. `None` where no adapter reached it (carrick#3688).
+    pub stop: Option<Stop>,
 }
+
+/// Why an adapter's mount is unread: the key its count is kept under
+/// (`unread_mount`, `mount_hole`) and the word the saved stop list says.
+type Unmounted = (&'static str, Stop);
+
+/// The mount is unread and nothing says more.
+const MOUNT_UNREAD: Unmounted = ("unread_mount", Stop::OwnerUnknown);
+/// The adapter's result goes to a call no verified mount reads, or to a
+/// route whose composed path the walk cannot state.
+const MOUNT_UNVERIFIED: Unmounted = ("unread_mount", Stop::MountUnverified);
+/// The host route's composed path is trimmed or ends below the top.
+const MOUNT_HOLE: Unmounted = ("mount_hole", Stop::MountUnverified);
+/// The adapter has no prefix and no host call to mount it.
+const MOUNT_NONE: Unmounted = ("unread_mount", Stop::ProcedureUnmounted);
 
 /// A procedure at one full path: the key path it is served under and the
 /// router that declares it, as [`super::router_holder`] names it. The repo
@@ -440,8 +459,17 @@ impl Pass<'_, '_> {
                                 });
                             }
                         }
-                        (Err(reason), _) | (Ok(_), Err(reason)) => {
-                            *procedure.unread.entry(reason.to_string()).or_default() += 1
+                        (Err((reason, stop)), _) => {
+                            *procedure.unread.entry(reason.to_string()).or_default() += 1;
+                            procedure.stop.get_or_insert(*stop);
+                        }
+                        (Ok(_), Err(reason)) => {
+                            *procedure.unread.entry(reason.to_string()).or_default() += 1;
+                            procedure.stop.get_or_insert(if *reason == "walk_stopped" {
+                                Stop::Reassigned
+                            } else {
+                                Stop::ProcedurePathUnread
+                            });
                         }
                     }
                 }
@@ -934,7 +962,7 @@ impl Pass<'_, '_> {
         end: &LabelledEnd,
         adapter: &AdapterLabel,
         sites: &[super::DecidedSite],
-    ) -> Vec<Result<String, &'static str>> {
+    ) -> Vec<Result<String, Unmounted>> {
         let walk = || {
             InstanceWalk::new(
                 self.calls,
@@ -946,20 +974,20 @@ impl Pass<'_, '_> {
             )
         };
         let Some(placed) = self.calls.at_span(file, end.span_start, end.span_end) else {
-            return vec![Err("unread_mount")];
+            return vec![Err(MOUNT_UNREAD)];
         };
         if let Some(prefix) = &adapter.prefix {
             match walk().prefix_of(&placed, prefix, None) {
                 Prefix::Stated { values } => return values.into_iter().map(Ok).collect(),
-                Prefix::Unread { .. } => return vec![Err("unread_mount")],
+                Prefix::Unread { .. } => return vec![Err(MOUNT_UNREAD)],
                 Prefix::Unstated => {}
             }
         }
         let Some((host_lo, host_hi, arg)) = self.host_of(file, end.span_start, end.span_end) else {
-            return vec![Err("unread_mount")];
+            return vec![Err(MOUNT_NONE)];
         };
         let Some(host) = self.calls.at_span(file, host_lo, host_hi) else {
-            return vec![Err("unread_mount")];
+            return vec![Err(MOUNT_UNREAD)];
         };
         // A verified mount member, at the slot it mounts.
         let mount_labels: Vec<&ScopeLabel> = self
@@ -972,7 +1000,7 @@ impl Pass<'_, '_> {
             .collect();
         if !mount_labels.is_empty() && walk().library_call(file, host.call) {
             let receivers = walk().of(&[host]);
-            let mut out: Vec<Result<String, &'static str>> = Vec::new();
+            let mut out: Vec<Result<String, Unmounted>> = Vec::new();
             let applying_to = walk().applying(&host, &mount_labels, &receivers);
             for (label, applying) in mount_labels.into_iter().zip(applying_to) {
                 if applying.is_empty() {
@@ -982,7 +1010,7 @@ impl Pass<'_, '_> {
                     Prefix::Stated { values } => values,
                     Prefix::Unstated => vec!["/".to_string()],
                     Prefix::Unread { .. } => {
-                        out.push(Err("unread_mount"));
+                        out.push(Err(MOUNT_UNREAD));
                         continue;
                     }
                 };
@@ -1014,16 +1042,16 @@ impl Pass<'_, '_> {
             })
             .collect();
         if routes.is_empty() {
-            return vec![Err("unread_mount")];
+            return vec![Err(MOUNT_UNVERIFIED)];
         }
         let mut out = Vec::new();
         for route in routes {
             if route.composed_trimmed || route.composed.is_empty() {
-                out.push(Err("mount_hole"));
+                out.push(Err(MOUNT_HOLE));
                 continue;
             }
             for path in served_at(&route.composed) {
-                out.push(path.and_then(|path| below_catch_all(&path).ok_or("unread_mount")));
+                out.push(path.and_then(|path| below_catch_all(&path).ok_or(MOUNT_UNVERIFIED)));
             }
         }
         out
@@ -1031,13 +1059,13 @@ impl Pass<'_, '_> {
 }
 
 /// Each composed path served from the top, or why it is not.
-fn served_at(composed: &[super::Composed]) -> Vec<Result<String, &'static str>> {
+fn served_at(composed: &[super::Composed]) -> Vec<Result<String, Unmounted>> {
     composed
         .iter()
         .map(|composed| match (composed.end.as_str(), &composed.path) {
             ("top", Some(path)) => Ok(path.clone()),
-            ("top", None) => Err("unread_mount"),
-            _ => Err("mount_hole"),
+            ("top", None) => Err(MOUNT_UNREAD),
+            _ => Err(MOUNT_HOLE),
         })
         .collect()
 }

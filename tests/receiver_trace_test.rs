@@ -1549,6 +1549,32 @@ fn procedure_routes_take_their_key_paths() {
     );
 }
 
+/// carrick#3688 (A7): a procedure route no adapter serves is saved with the
+/// walk's own reason, not `owner_unknown`: an adapter handed to a call no
+/// verified mount reads, one with no prefix and no host call, a router no
+/// adapter reaches, a computed key, and a router held in a `let`. Word only:
+/// every site stays the possible call it was.
+#[test]
+fn an_unserved_procedure_is_saved_with_the_walks_reason() {
+    let (on, _) = scan_fixture_reading("procedure-router-unserved");
+    let reasons = unread_reasons(&on);
+    let reasons: Vec<(&str, &str)> = reasons
+        .iter()
+        .map(|(site, reason)| (site.as_str(), reason.as_str()))
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("src/bare.ts:5", "procedure_unmounted"),
+            ("src/computed.ts:10", "procedure_path_unread"),
+            ("src/computed.ts:9", "procedure_path_unread"),
+            ("src/legacy.ts:7", "reassigned"),
+            ("src/mounted.ts:5", "mount_unverified"),
+            ("src/orphan.ts:5", "procedure_no_adapter"),
+        ]
+    );
+}
+
 /// carrick#2775: a router mounted by a helper only tests import is served
 /// at its production mount alone (`/v1`), not unverified; a router whose
 /// only mount is made in an entry only a test imports keeps that mount
