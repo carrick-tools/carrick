@@ -754,7 +754,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
-                unread_cause: None,
+                unread_cause: Some("not_located"),
             });
             continue;
         }
@@ -826,7 +826,7 @@ pub(crate) fn derive_capture_anchors(
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
-            unread_cause: None,
+            unread_cause: Some("not_located"),
         });
     }
 

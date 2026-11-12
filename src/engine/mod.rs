@@ -13171,7 +13171,27 @@ fn stamp_capture_provenance(
                 .chain(&record.unresolved_in_tree)
                 .cloned(),
         );
-        let _ = &entry.v1_before_demotion;
+        if entry.type_state != ManifestTypeState::Unknown || !entry.any_provenance.is_empty() {
+            continue;
+        }
+        let (kind, reason) = match entry.v1_before_demotion {
+            Some(v1) => (
+                if v1.holds_any { "any" } else { "unknown" },
+                "unplaced_top_type",
+            ),
+            None => (
+                "unknown",
+                record.unread_cause.as_deref().unwrap_or("not_recorded"),
+            ),
+        };
+        entry
+            .any_provenance
+            .push(crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+                detail: None,
+            });
     }
 }
 

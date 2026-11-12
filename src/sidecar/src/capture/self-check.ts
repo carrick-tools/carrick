@@ -424,6 +424,7 @@ function literalMarks(
   return {
     ...(request.raw_text_read ? { raw_text_read: true } : {}),
     ...(request.absent_body_tolerated ? { absent_body_tolerated: true } : {}),
+    ...(request.unread_cause ? { unread_cause: request.unread_cause } : {}),
   };
 }
 
