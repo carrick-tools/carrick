@@ -11075,14 +11075,15 @@ fn resolve_types_if_available(
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
+            let detail = format!(
+                "the compiler engine was not ready to read types: {}",
+                e.customer_cause()
+            );
             cloud_data.type_extraction_status =
-                Some(format!("type extraction skipped: sidecar not ready: {}", e));
+                Some(format!("type extraction skipped: {}", detail));
             cloud_data.types_degraded = Some(TypeDegradation {
                 stage: "init".to_string(),
-                detail: format!(
-                    "the compiler engine was not ready to read types: {}",
-                    e.customer_cause()
-                ),
+                detail,
             });
             crate::scan_health::record_types_unavailable(
                 config.service_name.as_deref().unwrap_or("(root)"),
