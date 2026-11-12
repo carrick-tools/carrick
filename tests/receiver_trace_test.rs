@@ -2736,6 +2736,30 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
     );
 }
 
+/// A client whose router type does not resolve (the import names no module)
+/// has no first key the compiler can place: its calls get no row, and each
+/// is saved unread with its reason (carrick#3847).
+#[test]
+fn a_client_whose_router_type_does_not_resolve_is_saved_unread() {
+    let blobs = scan_fixture("procedure-client");
+    let (flat, _) = client_rows(&blobs);
+    assert!(
+        !flat.iter().any(|row| row.starts_with("src/web/ghost.ts")),
+        "{flat:?}"
+    );
+    let reasons = unread_reasons(&blobs);
+    let at = |line: &str| {
+        reasons
+            .get(&format!("src/web/ghost.ts:{line}"))
+            .map(String::as_str)
+    };
+    assert_eq!(
+        (at("7"), at("11")),
+        (Some("untyped_receiver"), Some("untyped_receiver")),
+        "{reasons:?}"
+    );
+}
+
 /// A procedure call's types are not compared yet (carrick#3186): it
 /// writes no consumer type-manifest entry, which would key every query
 /// call of a service alike.
