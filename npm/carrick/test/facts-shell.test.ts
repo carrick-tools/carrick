@@ -30,7 +30,7 @@ const header = JSON.stringify({
 });
 
 const row = (fields: Record<string, unknown>) =>
-  JSON.stringify({ k: "op", service: fields["repo"], others: [], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
+  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
 
 /** The fixture repos in a fresh workspace, the fact file built from the wire fixture plus `extra` rows. */
 async function workspace(t: { after: (fn: () => void) => void }, extra: string[] = [], files: Record<string, string> = {}): Promise<Ws> {
