@@ -334,7 +334,10 @@ pub struct ApiEndpointDetails {
     /// `None` on every other entry and whenever every selected field is
     /// declared, which is nearly every row. Wire path:
     /// `calls[].undeclared_selection`, omitted when `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::graphql_selection::states_nothing"
+    )]
     pub undeclared_selection: Option<crate::graphql_selection::UndeclaredSelection>,
     /// Where the handler function sits in `file_path`'s file, 1-based and
     /// inclusive (cloud#948). Carried from the mount-graph row an HTTP endpoint
@@ -9279,6 +9282,7 @@ mod tests {
                 }],
                 schema: "api/schema.graphql".to_string(),
                 partial,
+                types: Default::default(),
             }),
             ..graphql_details(
                 OperationKey::graphql(GraphqlOperationKind::Query, field),

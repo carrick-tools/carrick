@@ -1341,52 +1341,167 @@ impl SchemaCatalogue {
                 fields: fields.into_iter().collect(),
                 schema: schema_file.to_string_lossy().into_owned(),
                 partial,
+                types: Default::default(),
             });
             marked += 1;
         }
         marked
     }
 
-    /// A printed-copy doubt does not stand for a field the PR itself deletes
-    /// from that file. A several-schemas doubt stays: another schema may still
-    /// serve the field. The doubt is that the file
-    /// may be stale against the code, so it may lack a field the code still
-    /// declares; a field the file declared before the PR and the PR's own diff
-    /// of it no longer declares is not that case. For each reading whose
-    /// doubt is the printed-copy one, `base_copy` gives the schema file as the
-    /// PR's base held it (`None` off a PR run, or where git cannot read it);
-    /// when that copy declared every field the reading names, the reading
-    /// loses its doubt and is a break. A printed file the PR leaves alone, and
-    /// a field the base copy also lacked, keep their doubt (carrick#3201).
-    /// Returns how many readings it lifted.
-    pub fn lift_removals_made_by_pr(
+    /// For each consumer row bound to a served schema, the leaf fields its
+    /// operation selects and the named type the served schema declares for
+    /// each, kept on the row's selection for
+    /// [`Self::lift_changes_made_by_pr`]. Read on a PR run only; nothing
+    /// here reaches the index. Returns how many rows it read.
+    pub fn read_selected_types(&self, extraction: &mut GraphqlExtraction) -> usize {
+        use crate::graphql_selection::UndeclaredSelection;
+        let relative = |path: &Path| {
+            let stripped = path
+                .strip_prefix(&self.canonical_root)
+                .unwrap_or(path)
+                .to_path_buf();
+            repo_relative(&self.repo_root, &stripped)
+        };
+        let own_sources: BTreeSet<PathBuf> = extraction
+            .producers
+            .iter()
+            .map(|op| relative(&op.file_path))
+            .collect();
+        let mut read = 0;
+        for op in &mut extraction.consumers {
+            if op.schema_binding != Some(SchemaBinding::Served) {
+                continue;
+            }
+            let (OperationKey::Graphql { kind, field }, Some(operation)) =
+                (&op.key, op.operation.as_ref())
+            else {
+                continue;
+            };
+            let Some((schema_file, schema)) = self
+                .served_schemas
+                .iter()
+                .find(|(_, schema)| schema.root_field_type(*kind, field).is_some())
+            else {
+                continue;
+            };
+            let leaves: BTreeSet<_> = operation
+                .selections_of(field)
+                .flat_map(|selection| schema.selected_leaves(*kind, field, selection))
+                .collect();
+            if leaves.is_empty() {
+                continue;
+            }
+            let types = crate::graphql_selection::SelectedTypes {
+                leaves: leaves.into_iter().collect(),
+                several_schemas: self.served_schemas.len() > 1
+                    || own_sources.iter().any(|source| source != schema_file),
+                retyped: Vec::new(),
+            };
+            match op.undeclared_selection.as_mut() {
+                Some(selection) => selection.types = types,
+                None => {
+                    op.undeclared_selection = Some(UndeclaredSelection {
+                        fields: Vec::new(),
+                        schema: schema_file.to_string_lossy().into_owned(),
+                        partial: None,
+                        types,
+                    })
+                }
+            }
+            read += 1;
+        }
+        read
+    }
+
+    /// Whether `schema` is a copy printed from a code-first server's schema:
+    /// a service names it in `graphqlSchemas`, or it sits under the walk of a
+    /// service that builds its schema in code.
+    fn is_printed_copy(&self, schema: &str) -> bool {
+        let schema = Path::new(schema);
+        self.declared.contains(schema)
+            || self
+                .code_first_roots
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|root| schema.starts_with(root))
+    }
+
+    /// What a PR's own diff of a printed schema file settles, which the
+    /// file alone cannot (it may be stale against the code that prints it).
+    /// `base_copy` gives the file as the PR's fork point held it (`None` off a
+    /// PR run, or where git cannot read it). One read of that copy serves
+    /// both:
+    ///
+    /// - A reading whose doubt is the printed-copy one, and whose every
+    ///   undeclared field the base copy declared, loses its doubt and is a
+    ///   break. A printed file the PR leaves alone, and a field the base copy
+    ///   also lacked, keep their doubt (carrick#3201). A several-schemas
+    ///   doubt stays: another schema may still serve the field.
+    /// - A leaf field the operation selects whose named type the base copy
+    ///   declared differently is retyped by the PR, and a break. Only a
+    ///   named type that differs between two leaf types counts: adding or
+    ///   removing `!` or a list is left alone, since whether the client's
+    ///   type needs it is not read here. Only a printed copy read as the one
+    ///   schema serving the operation counts, as for removals.
+    ///
+    /// Returns how many readings it lifted and how many it found retyped.
+    pub fn lift_changes_made_by_pr(
+        &self,
         calls: &mut [crate::analyzer::ApiEndpointDetails],
         base_copy: impl Fn(&str) -> Option<String>,
-    ) -> usize {
-        use crate::graphql_selection::{PartialSchema, SchemaFile};
+    ) -> (usize, usize) {
+        use crate::graphql_selection::{PartialSchema, RetypedField, SchemaFile};
         let mut bases: HashMap<String, Option<SchemaFile>> = HashMap::new();
-        let mut lifted = 0;
+        let (mut lifted, mut retyped) = (0, 0);
         for call in calls {
             let Some(selection) = call.undeclared_selection.as_mut() else {
                 continue;
             };
-            if selection.partial != Some(PartialSchema::PrintedFromCode) {
+            let removal = selection.partial == Some(PartialSchema::PrintedFromCode)
+                && !selection.fields.is_empty();
+            let retype = !selection.types.leaves.is_empty()
+                && !selection.types.several_schemas
+                && self.is_printed_copy(&selection.schema);
+            if !removal && !retype {
                 continue;
             }
             let base = bases
                 .entry(selection.schema.clone())
                 .or_insert_with(|| SchemaFile::parse(&base_copy(&selection.schema)?));
-            if base.as_ref().is_some_and(|base| {
-                selection
+            let Some(base) = base.as_ref() else {
+                continue;
+            };
+            if removal
+                && selection
                     .fields
                     .iter()
                     .all(|f| base.declares(&f.on_type, &f.field))
-            }) {
+            {
                 selection.partial = None;
                 lifted += 1;
             }
+            if retype && base.own_doubt().is_none() {
+                selection.types.retyped = selection
+                    .types
+                    .leaves
+                    .iter()
+                    .filter_map(|leaf| {
+                        let was = base.field_type(&leaf.on_type, &leaf.field)?;
+                        (was != leaf.named && base.is_leaf_type(was)).then(|| RetypedField {
+                            on_type: leaf.on_type.clone(),
+                            field: leaf.field.clone(),
+                            was: was.to_string(),
+                            now: leaf.named.clone(),
+                        })
+                    })
+                    .collect();
+                if !selection.types.retyped.is_empty() {
+                    retyped += 1;
+                }
+            }
         }
-        lifted
+        (lifted, retyped)
     }
 
     /// A service builds its GraphQL schema in code: every schema file under
@@ -1421,6 +1536,7 @@ impl SchemaCatalogue {
                 continue;
             };
             if selection.partial.is_none()
+                && !selection.fields.is_empty()
                 && roots
                     .iter()
                     .any(|root| Path::new(&selection.schema).starts_with(root))

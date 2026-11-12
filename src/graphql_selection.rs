@@ -132,9 +132,82 @@ pub struct UndeclaredSelection {
     /// scan holds it whole, which is when the fields are a break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial: Option<PartialSchema>,
+    /// What this operation selects whose declared type a PR may change. Read
+    /// on a PR run only and never written to the index
+    /// ([`Self::states_something`]).
+    #[serde(skip)]
+    pub types: SelectedTypes,
+}
+
+/// A leaf field an operation selects, with the named type the head schema
+/// declares for it (list and non-null markers stripped).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SelectedLeaf {
+    pub on_type: String,
+    pub field: String,
+    pub named: String,
+}
+
+/// A selected field whose named type differs between the schema file as the
+/// PR's fork point held it and the file the PR leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetypedField {
+    pub on_type: String,
+    pub field: String,
+    pub was: String,
+    pub now: String,
+}
+
+/// The type half of a PR run's reading of one operation row
+/// (`SchemaCatalogue::read_selected_types`, then
+/// `SchemaCatalogue::lift_type_changes_made_by_pr`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectedTypes {
+    /// Leaf fields the operation selects, as the head schema types them.
+    pub leaves: Vec<SelectedLeaf>,
+    /// Whether another schema or schema-stating source may also serve the
+    /// operation: then a changed type in this file is not the whole answer.
+    pub several_schemas: bool,
+    /// The selected fields the PR retypes. Empty until the lift finds some.
+    pub retyped: Vec<RetypedField>,
+}
+
+/// An `undeclared_selection` that states no undeclared field and no retyped
+/// field is read-time scratch and is not written to the index.
+pub fn states_nothing(selection: &Option<UndeclaredSelection>) -> bool {
+    selection.as_ref().is_none_or(|s| !s.states_something())
 }
 
 impl UndeclaredSelection {
+    /// Whether this row states a fact or a doubt about the operation: an
+    /// undeclared field, or a retyped one. A row that holds only the types
+    /// read from the head schema states neither.
+    pub fn states_something(&self) -> bool {
+        !self.fields.is_empty() || !self.types.retyped.is_empty()
+    }
+
+    /// The verdict's diagnostic for a pair whose selected fields the PR
+    /// retypes in the schema it serves.
+    pub fn retyped_sentence(&self) -> String {
+        let fields = self
+            .types
+            .retyped
+            .iter()
+            .map(|f| {
+                format!(
+                    "`{}.{}` from `{}` to `{}`",
+                    f.on_type, f.field, f.was, f.now
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "This change retypes {fields} in the schema `{}`; the operation selects the field \
+             and reads the old type.",
+            self.schema
+        )
+    }
+
     /// The verdict's diagnostic for a pair this selection breaks.
     pub fn break_sentence(&self) -> String {
         let fields = self
@@ -482,6 +555,68 @@ impl SchemaFile {
         self.composite.get(root)?.get(field).map(String::as_str)
     }
 
+    /// The named type this file declares for `field` on the object or
+    /// interface type `on_type`, list and non-null markers stripped.
+    pub fn field_type(&self, on_type: &str, field: &str) -> Option<&str> {
+        self.composite.get(on_type)?.get(field).map(String::as_str)
+    }
+
+    /// Whether `name` is a type this file reads as a leaf: not an object or
+    /// interface type it defines. Only meaningful when the file is
+    /// self-contained (`own_doubt` is `None`), since a type defined elsewhere
+    /// also reads as a leaf.
+    pub fn is_leaf_type(&self, name: &str) -> bool {
+        !self.composite.contains_key(name)
+    }
+
+    /// The leaf fields `selection`, selected under root field `field` of a
+    /// `kind` operation, selects on types this file declares them on, each
+    /// with its named type. A file with a doubt of its own reads none.
+    pub fn selected_leaves(
+        &self,
+        kind: GraphqlOperationKind,
+        field: &str,
+        selection: &SelectionSet,
+    ) -> BTreeSet<SelectedLeaf> {
+        let mut out = BTreeSet::new();
+        if self.own_doubt.is_none()
+            && let Some(parent) = self.root_field_type(kind, field)
+        {
+            self.collect_leaves(parent, selection, &mut out);
+        }
+        out
+    }
+
+    fn collect_leaves(
+        &self,
+        parent: &str,
+        selection: &SelectionSet,
+        out: &mut BTreeSet<SelectedLeaf>,
+    ) {
+        if let Some(fields) = self.composite.get(parent) {
+            for field in &selection.fields {
+                if field.name.starts_with("__") {
+                    continue;
+                }
+                let Some(named) = fields.get(&field.name) else {
+                    continue;
+                };
+                if self.is_leaf_type(named) {
+                    out.insert(SelectedLeaf {
+                        on_type: parent.to_string(),
+                        field: field.name.clone(),
+                        named: named.clone(),
+                    });
+                } else {
+                    self.collect_leaves(named, &field.selection, out);
+                }
+            }
+        }
+        for (condition, nested) in &selection.on_types {
+            self.collect_leaves(condition.as_deref().unwrap_or(parent), nested, out);
+        }
+    }
+
     /// Whether this file declares `field` on the object or interface type
     /// `on_type`.
     pub fn declares(&self, on_type: &str, field: &str) -> bool {
@@ -612,6 +747,32 @@ mod tests {
                 ("Parcel".to_string(), "etaDays".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn selected_leaves_name_each_selected_scalar_with_its_named_type() {
+        let file = SchemaFile::parse(SCHEMA).expect("schema");
+        let selection = selection_of(
+            "query P { parcel(id: 1) { id weightGrams depot { code } } }",
+            "parcel",
+        );
+        let leaves: Vec<(String, String, String)> = file
+            .selected_leaves(GraphqlOperationKind::Query, "parcel", &selection)
+            .into_iter()
+            .map(|l| (l.on_type, l.field, l.named))
+            .collect();
+        let leaf = |t: &str, f: &str, n: &str| (t.to_string(), f.to_string(), n.to_string());
+        assert_eq!(
+            leaves,
+            vec![
+                leaf("Depot", "code", "String"),
+                leaf("Parcel", "id", "ID"),
+                leaf("Parcel", "weightGrams", "Int"),
+            ]
+        );
+        assert_eq!(file.field_type("Parcel", "weightGrams"), Some("Int"));
+        assert!(file.is_leaf_type("Int"));
+        assert!(!file.is_leaf_type("Depot"));
     }
 
     #[test]
