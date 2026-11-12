@@ -44,7 +44,7 @@ test("a hook run appends one timing line, with the edited file relative to the w
   assert.equal(rows[0]!.file, path.join("user-service", "src", "routes", "users.ts"));
   assert.ok(rows[0]!.duration_ms >= 0 && rows[0]!.waited_ms >= 0);
   assert.ok(["printed", "silent"].includes(rows[0]!.outcome));
-  assert.deepEqual(Object.keys(rows[0]!).sort(), ["duration_ms", "file", "hook", "outcome", "start", "waited_ms"]);
+  assert.deepEqual(Object.keys(rows[0]!).sort(), ["duration_ms", "facts_ms", "file", "hook", "outcome", "start", "waited_ms"]);
 });
 
 test("the stop hook records its wait", async (t) => {

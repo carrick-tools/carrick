@@ -99,3 +99,79 @@ export function patchedFiles(text: string): string[] {
   }
   return [...new Set(files)];
 }
+
+/**
+ * What a patch did to each file it leaves on disk: `added` for an
+ * `*** Add File`, else its hunks, each the body lines (with their `+`, `-`
+ * or space prefix) under one `@@`. A file the patch names twice, or both adds
+ * and updates, is `null`: which lines are whose is not known.
+ */
+export function patchEdits(text: string): Map<string, { added: true } | { hunks: string[][] } | null> {
+  const out = new Map<string, { added: true } | { hunks: string[][] } | null>();
+  if (!looksLikePatch(text)) return out;
+  let current: { path: string; hunks: string[][] } | null = null;
+  let adding = false;
+  const close = (): void => {
+    if (current !== null) out.set(current.path, out.has(current.path) ? null : { hunks: current.hunks.filter((hunk) => hunk.length > 0) });
+    current = null;
+  };
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    const found = header(line.trimEnd());
+    if (found !== null) {
+      if (found.kind === "move" && current !== null) {
+        current.path = found.path;
+        continue;
+      }
+      close();
+      adding = false;
+      if (found.kind === "add") {
+        out.set(found.path, out.has(found.path) ? null : { added: true });
+        adding = true;
+      } else if (found.kind === "update") current = { path: found.path, hunks: [[]] };
+      continue;
+    }
+    if (line.startsWith("*** End Patch")) {
+      close();
+      adding = false;
+      continue;
+    }
+    if (adding || current === null) continue;
+    if (line.startsWith("@@")) current.hunks.push([]);
+    else if (line.startsWith("*** ")) continue;
+    else if (/^[ +-]/.test(line) || line === "") current.hunks[current.hunks.length - 1]!.push(line === "" ? " " : line);
+  }
+  close();
+  return out;
+}
+
+/**
+ * Where `hunks` (from `patchEdits`) changed `text`, the file as it is now:
+ * the 1-based lines they added, and the lines they removed lines just above.
+ * Each hunk's new text (its context and `+` lines) must be found exactly once
+ * in the file; otherwise null, and nothing is said about the file.
+ */
+export function placeHunks(text: string, hunks: readonly string[][]): { lines: number[]; removed: number[] } | null {
+  const fileLines = text.split("\n");
+  const lines: number[] = [];
+  const removed: number[] = [];
+  for (const hunk of hunks) {
+    const after = hunk.filter((line) => !line.startsWith("-")).map((line) => line.slice(1));
+    if (after.length === 0) return null;
+    let found = -1;
+    for (let at = 0; at + after.length <= fileLines.length; at += 1) {
+      if (after.every((line, k) => fileLines[at + k] === line)) {
+        if (found >= 0) return null;
+        found = at;
+      }
+    }
+    if (found < 0) return null;
+    let at = found + 1;
+    for (const line of hunk) {
+      if (line.startsWith("+")) lines.push(at++);
+      else if (line.startsWith("-")) removed.push(at);
+      else at += 1;
+    }
+  }
+  return { lines, removed };
+}

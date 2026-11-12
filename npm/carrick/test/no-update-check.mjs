@@ -14,3 +14,6 @@
 // Loaded by the `test` script's `--import`. Anything already set wins, so a
 // test that wants the check on can still ask for it.
 process.env["CARRICK_NO_UPDATE_CHECK"] ??= "1";
+// Likewise the background fact refresh (`src/facts/fetch.ts`): it would ask
+// the cloud with whatever credential this machine holds.
+process.env["CARRICK_NO_FACTS_REFRESH"] ??= "1";

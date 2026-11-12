@@ -22,5 +22,7 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts"
-  ]
+  ],
+  // Source text the tests scan, not code this package compiles.
+  "exclude": ["test/fixtures"]
 }

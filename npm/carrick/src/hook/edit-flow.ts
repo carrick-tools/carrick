@@ -12,7 +12,7 @@ import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { leadLines } from "./lead.ts";
 import type { LeadLines } from "./lead.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
@@ -20,6 +20,7 @@ import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 import type { Timing } from "./timings.ts";
+import { factLines } from "../facts/lines.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -29,7 +30,26 @@ const log = createLogger("carrick-hook");
  * command) are printed first, in the same object.
  */
 export async function editFlow(
-  input: { cwd: string | null; session: string | undefined; channel: Channel; timing?: Timing },
+  input: {
+    cwd: string | null;
+    session: string | undefined;
+    channel: Channel;
+    timing?: Timing;
+    /**
+     * Absolute path -> where the edit changed the file: the lines of its
+     * patch, else the text it put in (an Edit's `new_string`), else `whole`
+     * for a file the call created. A file not named here (a Write over a
+     * file, a shell write, a patch hunk that cannot be placed) gets no fact
+     * lines: which lines changed is not known.
+     */
+    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean }>;
+    /**
+     * The files came from a shell command's write shapes, not from an edit
+     * tool, so who wrote them is not proven: a file in another linked
+     * worktree (another session's) gets no fact lines.
+     */
+    shell?: boolean;
+  },
   edited: string[],
   extra: string[] = [],
 ): Promise<void> {
@@ -142,6 +162,20 @@ export async function editFlow(
     log(`the ${channel.channel} channel owns delivery in this install; printing nothing`);
     return;
   }
+  // Where each operation the edited code serves or calls sits in other
+  // files, from the fact file (`facts/lines.ts`): read locally, beside the
+  // probe's answer, never instead of it.
+  const facts = await factLines(
+    choice.root,
+    edited
+      .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
+      .map((file) => ({ file, ...input.changes?.get(file) })),
+    session,
+  );
+  if (input.timing) input.timing.factsMs = facts.ms;
+  contexts.push(...facts.lines);
+  // A missing or stale fact file is refreshed in the background, detached.
+  if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);
   // The `carrick` this hook is running is whatever PATH answered with, which
   // an upgrade elsewhere can leave behind (carrick#1372). Claimed at the last
   // possible moment, so the once-a-day stamp is spent only on a line that is
@@ -151,6 +185,7 @@ export async function editFlow(
   if (mismatch) contexts.push(mismatch);
   if (told.length > 0 && session) markTold(session, told);
   if (led.length > 0 && session) markLed(session, led);
+  if (session) markFacts(session, facts.claims);
   contexts.unshift(...extra);
   emitPostToolUse(contexts);
 }

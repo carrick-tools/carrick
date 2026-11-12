@@ -112,7 +112,7 @@ async function main(): Promise<void> {
 
   if (toEdit.length > 0) {
     const { editFlow } = await import("./edit-flow.ts");
-    await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel }, toEdit, answers);
+    await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel, shell: true }, toEdit, answers);
     return;
   }
   const { deliverLate, emitPostToolUse } = await import("./late.ts");

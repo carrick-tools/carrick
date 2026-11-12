@@ -28,6 +28,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { binary } from "../cli.ts";
 import type { StatusResult } from "../contract.ts";
 
@@ -127,6 +128,16 @@ export type RefreshOptions = {
   /** Injected in tests; the real one detaches a child and forgets it. */
   start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
 };
+
+/**
+ * The command that runs the script `name` beside the module at `moduleUrl`
+ * for a workspace: `.js` in the package, `.ts` when a hook runs from source,
+ * so it does not depend on which script started this process.
+ */
+export function scriptBeside(moduleUrl: string, name: string, root: string): { command: string; args: string[] } {
+  const here = fileURLToPath(moduleUrl);
+  return { command: process.execPath, args: [path.join(path.dirname(here), `${name}${path.extname(here)}`), root] };
+}
 
 export function startDetached(command: string, args: string[], env: NodeJS.ProcessEnv): void {
   const child = spawn(command, args, { detached: true, stdio: "ignore", env });

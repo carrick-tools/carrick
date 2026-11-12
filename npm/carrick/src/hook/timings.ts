@@ -32,6 +32,8 @@ export type TimingRecord = {
   outcome: Outcome;
   /** Post-edit only: the edited file, relative to the workspace. */
   file?: string;
+  /** Post-edit only: time spent opening the fact file and matching (`facts/lines.ts`), inside `duration_ms`. */
+  facts_ms?: number;
 };
 
 /** The file keeps this many of its last lines. */
@@ -54,6 +56,8 @@ export type Timing = {
   /** Post-edit: the edited file, absolute or relative to `root`. */
   file: string | null;
   waitedMs: number;
+  /** Time spent on fact lines, when the hook read the fact file. */
+  factsMs?: number;
 };
 
 /** Append `record` to the file under `root` and trim it to `MAX_LINES`. Never throws. */
@@ -190,6 +194,7 @@ export async function timed(
           waited_ms: Math.round(timing.waitedMs),
           outcome: failed ? "error" : gaveText(output) ? "printed" : "silent",
         };
+        if (timing.factsMs !== undefined) record.facts_ms = timing.factsMs;
         if (timing.file) record.file = path.isAbsolute(timing.file) ? path.relative(root, timing.file) : timing.file;
         appendTiming(root, record);
       }

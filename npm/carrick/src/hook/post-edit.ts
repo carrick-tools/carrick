@@ -22,7 +22,9 @@
 import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
-import { patchedFiles } from "./apply-patch.ts";
+import fs from "node:fs";
+import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
+import { MAX_FACT_FILE_BYTES } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
@@ -37,12 +39,21 @@ const CHECKED = /\.(ts|tsx|mts|cts|graphql|gql)$/;
 type Payload = {
   cwd?: string;
   session_id?: string;
+  tool_name?: string;
   tool_input?: {
     file_path?: string;
     filePath?: string;
-    edits?: Array<{ file_path?: string }>;
+    edits?: Array<{ file_path?: string; old_string?: string; new_string?: string } | null>;
+    /** Claude Code's `Edit`: the text the edit replaced, and the text it put in. */
+    old_string?: string;
+    new_string?: string;
     /** Codex's `apply_patch`: the patch text itself. */
     command?: unknown;
+  };
+  /** Claude Code's `Edit` and `MultiEdit` result: the hunks it applied; a `Write`'s also says whether it created the file. */
+  tool_response?: {
+    structuredPatch?: Array<{ newStart?: unknown; lines?: unknown }>;
+    type?: unknown;
   };
 };
 
@@ -104,8 +115,117 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = edited[0]!;
-  await editFlow({ cwd, session, channel: channel.channel, timing }, edited);
+  await editFlow({ cwd, session, channel: channel.channel, timing, changes: await changesFromPayload(payload, edited, cwd) }, edited);
 }
 
-await timed("post-edit", main);
+type Change = { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean };
+
+/**
+ * Whether git, asked in the file's folder, says it does not track `file`;
+ * false when git cannot say. Loaded only on this path, which a created file
+ * alone takes.
+ */
+async function untracked(file: string): Promise<boolean> {
+  const { trackedPaths } = await import("../init/repo-copies.ts");
+  const tracked = trackedPaths(path.dirname(file), [path.basename(file)]);
+  return tracked !== null && tracked.size === 0;
+}
+
+/**
+ * Where the edit changed each file, keyed by the absolute path: the lines of
+ * the file as it is now that its hunks added and where they removed lines
+ * (an `Edit` or `MultiEdit`'s patch, a Codex `apply_patch` hunk placed in the
+ * file), else the text it put in, else `whole` for a file this call created
+ * that git does not track. A file left out (a `Write` over an existing file,
+ * a hunk that cannot be placed) gets no fact lines (`facts/lines.ts`).
+ */
+async function changesFromPayload(payload: Payload, edited: string[], cwd: string | null): Promise<Map<string, Change>> {
+  const input = payload.tool_input ?? {};
+  const named = input.file_path ?? input.filePath ?? input.edits?.[0]?.file_path ?? null;
+  if (named === null && typeof input.command === "string") {
+    const out = new Map<string, Change>();
+    for (const [relative, change] of patchEdits(input.command)) {
+      const file = path.isAbsolute(relative) ? relative : path.resolve(cwd ?? process.cwd(), relative);
+      if (change === null || !edited.includes(file)) continue;
+      if ("added" in change) {
+        if (await untracked(file)) out.set(file, { whole: true });
+        continue;
+      }
+      try {
+        if (fs.statSync(file).size > MAX_FACT_FILE_BYTES) continue;
+        const placed = placeHunks(fs.readFileSync(file, "utf8"), change.hunks);
+        if (placed) out.set(file, placed);
+      } catch {
+        // Unreadable now: nothing said about it.
+      }
+    }
+    return out;
+  }
+  if (edited.length !== 1) return new Map();
+  // A `Write` (its result has a `type`: `create` or `update`) is placed only
+  // when it created the file; over an existing file it says nothing, even
+  // though its result carries hunks too.
+  const kind = payload.tool_response?.type;
+  if (payload.tool_name === "Write" || kind === "create" || kind === "update") {
+    return kind === "create" && (await untracked(edited[0]!)) ? new Map([[edited[0]!, { whole: true }]]) : new Map();
+  }
+  const hunks = payload.tool_response?.structuredPatch;
+  if (Array.isArray(hunks) && hunks.length > 0) {
+    const lines: number[] = [];
+    // A removed line is not a line of the file now: it is the gap just above
+    // the line that now sits where it was (`facts/match.ts` `gapsOfLines`).
+    const removed: number[] = [];
+    // Each added line's text must be the file's line at that number now; a
+    // formatter that ran after the tool moves them, and then the hunks are unplaced.
+    let now: string[];
+    try {
+      if (fs.statSync(edited[0]!).size > MAX_FACT_FILE_BYTES) return new Map();
+      now = fs.readFileSync(edited[0]!, "utf8").split("\n");
+    } catch {
+      return new Map();
+    }
+    for (const hunk of hunks) {
+      if (typeof hunk?.newStart !== "number" || !Array.isArray(hunk.lines)) return new Map();
+      let at = hunk.newStart;
+      for (const text of hunk.lines) {
+        if (typeof text !== "string" || text.startsWith("\\")) continue;
+        if (text.startsWith("+")) {
+          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) return new Map();
+          lines.push(at++);
+        } else if (text.startsWith("-")) removed.push(at);
+        else at += 1;
+      }
+    }
+    return new Map([[edited[0]!, { lines, removed }]]);
+  }
+  const texts = [
+    changedMiddle(input.old_string, input.new_string),
+    ...(Array.isArray(input.edits) ? input.edits : []).map((edit) => changedMiddle(edit?.old_string, edit?.new_string)),
+  ].filter((text): text is string => typeof text === "string");
+  return texts.length > 0 ? new Map([[edited[0]!, { snippets: texts }]]) : new Map();
+}
+
+/**
+ * The lines of `after` that differ from `before`: the lines both share at
+ * the start and at the end are trimmed, so text the edit only carried along
+ * (a neighbouring function) is not read as changed. Null when nothing differs.
+ */
+function changedMiddle(before: unknown, after: unknown): string | null {
+  if (typeof after !== "string") return null;
+  const old = typeof before === "string" ? before.split("\n") : [];
+  const now = after.split("\n");
+  let head = 0;
+  while (head < old.length && head < now.length && old[head] === now[head]) head += 1;
+  let tail = 0;
+  while (tail < old.length - head && tail < now.length - head && old[old.length - 1 - tail] === now[now.length - 1 - tail]) tail += 1;
+  const middle = now.slice(head, now.length - tail).join("\n");
+  return middle.trim().length > 0 ? middle : null;
+}
+
+try {
+  await timed("post-edit", main);
+} catch (error) {
+  // A payload this hook did not expect: the edit stands, nothing is said.
+  log("post-edit failed", String(error));
+}
 process.exit(0);
