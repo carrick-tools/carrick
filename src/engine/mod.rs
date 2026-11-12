@@ -5226,15 +5226,25 @@ fn normalize_file_results_keys(
         format!("{}/", repo_path)
     };
 
+    let normalize = |key: &str| -> String {
+        key.strip_prefix(&repo_prefix)
+            .or_else(|| key.strip_prefix("./"))
+            .unwrap_or(key)
+            .to_string()
+    };
     file_results
         .iter()
         .map(|(key, value)| {
-            let normalized_key = key
-                .strip_prefix(&repo_prefix)
-                .or_else(|| key.strip_prefix("./"))
-                .unwrap_or(key)
-                .to_string();
-            (normalized_key, value.clone())
+            let mut value = value.clone();
+            // The request line a caller's row carries the anchors of
+            // (carrick#3961) is named by the same key, so it is read in the
+            // same spelling as the file it sits in.
+            for call in &mut value.data_calls {
+                if let Some(anchors) = call.request_line.as_deref_mut() {
+                    anchors.file = normalize(&anchors.file);
+                }
+            }
+            (normalize(key), value)
         })
         .collect()
 }

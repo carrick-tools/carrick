@@ -9,9 +9,8 @@ Two services:
 
 - `api` serves `POST /v1/orders` and `POST /v1/refunds`, with typed request
   bodies and responses.
-- `web` calls them through two wrappers in `web/src/net/`. Each wrapper
-  builds its body and leaves the path to its callers in
-  `web/src/checkout.ts`.
+- `web` calls them through wrappers in `web/src/net/`. Each wrapper builds
+  its body and leaves the path to its callers in `web/src/checkout.ts`.
 
 The model's answer for each wrapper's request line is in
 `model-cassette/analyze-file/<file stem>.json`. Each answer states a response
@@ -19,8 +18,9 @@ type and a payload.
 
 | wrapper | callers | types at each caller | verdicts at each caller |
 |---|---|---|---|
-| `placeOrder` | `checkout.ts:4`, `:5` | the request line's payload and `Order` | request and response compatible |
-| `sendRefund` | `checkout.ts:6` | the request line's payload and `Refund` | request and response compatible |
+| `placeOrder` | `checkout.ts:5`, `:6` | the request line's payload and `Order` | request and response compatible |
+| `sendRefund` | `checkout.ts:7` | the request line's payload and `Refund` | request and response compatible |
+| `openSession` (also sends a token request) | `checkout.ts:8`, two rows there | none moved: the request line keeps the model's row and its types | none |
 
 A caller whose own call types a side keeps its own type for that side. A
 unit test of the type requests covers that case.

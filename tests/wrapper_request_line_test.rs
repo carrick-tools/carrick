@@ -434,7 +434,7 @@ fn a_withdrawn_request_line_leaves_no_row_and_no_type_at_its_line() {
         .flatten()
         .filter(|row| {
             let at = row["file_path"].as_str().unwrap_or_default();
-            at.starts_with("web/src/net/")
+            at.starts_with("web/src/net/orders.ts") || at.starts_with("web/src/net/refunds.ts")
         })
         .collect();
     assert!(at_request_lines.is_empty(), "{at_request_lines:#?}");
@@ -452,15 +452,50 @@ fn each_caller_row_holds_one_type_per_side() {
     }
     let orders = "/v1/orders".to_string();
     let refunds = "/v1/refunds".to_string();
+    let at_callers: Vec<(u64, String, String)> = consumer_entries(CHECKOUT)
+        .into_iter()
+        .filter(|(line, _, _)| (5..=7).contains(line))
+        .collect();
     assert_eq!(
-        consumer_entries(CHECKOUT),
+        at_callers,
         [
-            (4, "request".to_string(), orders.clone()),
-            (4, "response".to_string(), orders.clone()),
             (5, "request".to_string(), orders.clone()),
-            (5, "response".to_string(), orders),
-            (6, "request".to_string(), refunds.clone()),
-            (6, "response".to_string(), refunds),
+            (5, "response".to_string(), orders.clone()),
+            (6, "request".to_string(), orders.clone()),
+            (6, "response".to_string(), orders),
+            (7, "request".to_string(), refunds.clone()),
+            (7, "response".to_string(), refunds),
+        ]
+    );
+}
+
+/// A call that states two requests (`openSession` sends a token request
+/// first) holds two rows, and one row's types cannot sit beside the other
+/// on the same line: the request line keeps the model's row and its types.
+#[test]
+fn a_caller_with_two_requests_keeps_the_request_line() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let kept: Vec<String> = web()["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["file_path"] == "web/src/net/session.ts:5")
+        .map(|row| {
+            row["resolution_source"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kept, ["model"]);
+    assert_eq!(
+        consumer_entries("web/src/net/session.ts"),
+        [
+            (5, "request".to_string(), "/v1/:endpoint".to_string()),
+            (5, "response".to_string(), "/v1/:endpoint".to_string()),
         ]
     );
 }
@@ -486,7 +521,7 @@ fn the_pair_is_judged_at_each_caller() {
             ),
         ]
     };
-    assert_eq!(verdicts_at(CHECKOUT, 4), both("http|POST|/v1/orders"));
     assert_eq!(verdicts_at(CHECKOUT, 5), both("http|POST|/v1/orders"));
-    assert_eq!(verdicts_at(CHECKOUT, 6), both("http|POST|/v1/refunds"));
+    assert_eq!(verdicts_at(CHECKOUT, 6), both("http|POST|/v1/orders"));
+    assert_eq!(verdicts_at(CHECKOUT, 7), both("http|POST|/v1/refunds"));
 }

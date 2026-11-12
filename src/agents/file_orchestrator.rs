@@ -4555,7 +4555,10 @@ impl FileOrchestrator {
 
         // A request line its callers' rows state (carrick#3961) gives up its
         // model row only where every one of those rows stands as a row, to
-        // carry the type anchors the model row held there.
+        // carry the type anchors the model row held there, and is the one
+        // row at its call: a call stating two requests has one place per
+        // side and one manifest entry per line, verb and side, so the
+        // anchors of one request would type the other.
         let summary_sites: HashSet<(PathBuf, u32)> = analyzed
             .iter()
             .flat_map(|(pf, _)| {
@@ -4580,7 +4583,12 @@ impl FileOrchestrator {
                         summaries
                             .stating_callers(&(file.clone(), *start))
                             .iter()
-                            .all(|caller| summary_sites.contains(caller))
+                            .all(|(caller_file, caller_start)| {
+                                summary_sites.contains(&(caller_file.clone(), *caller_start))
+                                    && summaries.rows(caller_file).is_some_and(|sites| {
+                                        sites.get(caller_start).is_some_and(|rows| rows.len() == 1)
+                                    })
+                            })
                     })
                     .collect();
                 (pf.path_str.clone(), starts)
@@ -8874,8 +8882,8 @@ impl FileOrchestrator {
     /// request line's file and span start, as
     /// [`SummaryRow::request_at`](crate::request_summary::SummaryRow) is.
     ///
-    /// A row at a caller whose site states several requests takes the one
-    /// whose verb and target it carries.
+    /// Only a call holding that one row takes them: the withdrawal asks every
+    /// stating call for one row.
     fn carry_request_line_anchors(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         withdrawn: &HashMap<(PathBuf, u32), DataCallResult>,
@@ -8897,23 +8905,13 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
-                let stating: Vec<&crate::request_summary::SummaryRow> = rows
-                    .iter()
-                    .filter(|row| {
-                        row.reaches_request.is_none() && withdrawn.contains_key(&row.request_at)
-                    })
-                    .collect();
-                let row = match stating.as_slice() {
-                    [] => continue,
-                    [only] => *only,
-                    several => match several.iter().find(|row| {
-                        call.method.as_deref() == Some(row.method.as_str())
-                            && call.target == row.target
-                    }) {
-                        Some(row) => *row,
-                        None => continue,
-                    },
+                // The one row at the call (the withdrawal asks for one).
+                let [row] = rows.as_slice() else {
+                    continue;
                 };
+                if row.reaches_request.is_some() || !withdrawn.contains_key(&row.request_at) {
+                    continue;
+                }
                 call.request_line = Some(Box::new(RequestLineAnchors {
                     file: row.request_at.0.to_string_lossy().into_owned(),
                     call: withdrawn[&row.request_at].clone(),
