@@ -7,35 +7,16 @@
       "exports": [
         {
           "specifier": "fixture-route-server",
-          "export": "server",
+          "export": "route",
           "role": "server_framework",
           "side": null,
-          "makes": [
-            {
-              "form": "call",
-              "member": null,
-              "picker": "fixture-picker"
-            }
-          ],
+          "makes": [],
           "scopes": [],
           "ops": [
             {
               "op": "receive",
-              "member": "get",
-              "of": "instance:()",
-              "name": {
-                "arg": 0
-              },
-              "handler": {
-                "arg": 1
-              },
-              "method": "GET",
-              "picker": "fixture-picker"
-            },
-            {
-              "op": "receive",
-              "member": "post",
-              "of": "instance:()",
+              "member": null,
+              "on": "export",
               "name": {
                 "arg": 0
               },

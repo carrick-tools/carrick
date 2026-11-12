@@ -5895,8 +5895,8 @@ export function listen(): void {
         );
         let row = rows
             .iter()
-            .find(|row| row.file == "services/api/src/server.ts" && row.line == 7)
-            .unwrap_or_else(|| panic!("no unread site at server.ts:7: {rows:#?}"));
+            .find(|row| row.file == "services/api/src/server.ts" && row.line == 4)
+            .unwrap_or_else(|| panic!("no unread site at server.ts:4: {rows:#?}"));
         assert_eq!(row.reason, Stop::MissedInside, "{row:?}");
         assert_eq!(row.kind.as_deref(), Some("http"), "{row:?}");
         assert_eq!(row.role.as_deref(), Some("producer"), "{row:?}");
@@ -5907,12 +5907,12 @@ export function listen(): void {
                 end.export.as_str(),
                 end.member.as_deref()
             ),
-            ("fixture-route-server", "server", Some("post")),
+            ("fixture-route-server", "route", None),
         );
         // Every other unread site of the service keeps no kind.
         assert!(
             rows.iter()
-                .filter(|other| other.line != 7)
+                .filter(|other| other.line != 4)
                 .all(|other| other.kind.is_none()),
             "{rows:#?}"
         );
