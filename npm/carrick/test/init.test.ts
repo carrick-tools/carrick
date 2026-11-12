@@ -546,7 +546,7 @@ test("an entry of ours that has moved on is replaced, not duplicated", () => {
   const commands = written.hooks.PostToolUse.flatMap((group: { hooks: Array<{ command: string }> }) =>
     group.hooks.map((entry) => entry.command),
   );
-  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read", "carrick hook post-bash"]);
+  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read", "carrick hook post-bash", "carrick hook post-search"]);
 });
 
 test("a settings file that is not JSON is reported, never overwritten", () => {
@@ -585,7 +585,7 @@ test("an absolute hook command is written, and is still recognised as ours", () 
 
   // The same workspace, now with carrick installed globally: one entry, not two.
   const rewritten = JSON.parse(mergeCarrickHooks(JSON.stringify(written, null, 2)).body);
-  assert.equal(rewritten.hooks.PostToolUse.length, 3);
+  assert.equal(rewritten.hooks.PostToolUse.length, 4);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
   assert.equal(rewritten.hooks.SessionStart.length, 1);
@@ -619,6 +619,7 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
     "carrick hook post-edit",
     "carrick hook post-read",
     "carrick hook post-bash",
+    "carrick hook post-search",
   ]);
 });
 

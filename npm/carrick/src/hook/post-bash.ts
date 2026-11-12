@@ -42,13 +42,10 @@ type Payload = {
   tool_response?: string | { stdout?: string };
 };
 
-/** Print the late answers alone: the path for a command this hook has nothing else to say about. */
+/** The late answers alone, through the shared printer (`late.ts`). */
 async function lateOnly(session: string | undefined): Promise<void> {
-  if (!session) return;
-  const { resolveChannel } = await import("../channel.ts");
-  if (resolveChannel({ hooksInstalled: true }).channel !== "hook") return;
-  const { deliverLate, emitPostToolUse } = await import("./late.ts");
-  emitPostToolUse(deliverLate(session));
+  const { printLateOnly } = await import("./late.ts");
+  printLateOnly(session);
 }
 
 async function main(): Promise<void> {
