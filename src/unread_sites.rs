@@ -14,9 +14,10 @@
 //! - **Never an input.** Nothing here feeds findings, the type check, the
 //!   matcher or the PR result.
 //! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service. The rows that
-//!   reached a labelled library call stay first; past the cap the rest are
-//!   kept as whole files, sampled in sha256-of-path order, so no folder
-//!   sorts out of the list. The listed rows are written by file, line and
+//!   reached a labelled library call, or name an operation through their
+//!   slot, stay first, then the plain calls wrapped around one of those;
+//!   past the cap the rest are kept as whole files, sampled in
+//!   sha256-of-path order, so no folder sorts out of the list. The listed rows are written by file, line and
 //!   span. `unread_sites_total` and `unread_sites_by_reason` count every
 //!   row, past the cap too, and `unread_sites_not_listed` names each file
 //!   the cut left rows of, with its count (total = listed + not listed).
@@ -517,6 +518,14 @@ pub(crate) fn of_own_decorators(
     out
 }
 
+impl UnreadSite {
+    /// The row names an operation: a labelled end, or a slot other than
+    /// `callee` (the rows that carry a `path` or `name`). Used only by [`cap`].
+    fn names_an_operation(&self) -> bool {
+        self.slot != CALLEE || self.labelled_end.is_some()
+    }
+}
+
 /// What [`cap`] keeps, and what it counts.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Capped {
@@ -531,9 +540,11 @@ pub struct Capped {
 /// Drop a repeat of one call (a possible call first, then a row that
 /// reached a labelled call), count what is left, and keep
 /// [`MAX_PER_SERVICE`]. Past the cap, files are walked in sha256-of-path
-/// order twice: first each file's labelled rows, then each file's
-/// unlabelled rows, each kept only whole and only if it fits what is left
-/// (a file that does not fit is skipped and the walk goes on). Every row
+/// order three times: first each file's operation rows (a labelled end, or
+/// a slot other than `callee`), then each file's plain calls whose span
+/// contains an operation row's, then the rest, each kept only whole and
+/// only if it fits what is left (a file that does not fit is skipped and
+/// the walk goes on). Every row
 /// not kept adds one to its file in `not_listed`. The kept rows are sorted
 /// labelled first, then by file, line and span.
 pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
@@ -553,14 +564,30 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
     let total = rows.len();
     let mut not_listed: BTreeMap<String, u32> = BTreeMap::new();
     if total > MAX_PER_SERVICE {
-        let mut files: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+        let mut files: BTreeMap<&str, [Vec<usize>; 3]> = BTreeMap::new();
+        let mut operation_spans: BTreeMap<&str, Vec<(u32, u32)>> = BTreeMap::new();
+        for row in rows.iter().filter(|row| row.names_an_operation()) {
+            operation_spans
+                .entry(row.file.as_str())
+                .or_default()
+                .push((row.span_start, row.span_end));
+        }
         for (i, row) in rows.iter().enumerate() {
-            let entry = files.entry(row.file.as_str()).or_default();
-            if row.labelled_end.is_some() {
-                entry.0.push(i);
+            let around = row.kind.is_none()
+                && !row.names_an_operation()
+                && operation_spans.get(row.file.as_str()).is_some_and(|spans| {
+                    spans
+                        .iter()
+                        .any(|&(start, end)| row.span_start <= start && end <= row.span_end)
+                });
+            let tier = if row.names_an_operation() {
+                0
+            } else if around {
+                1
             } else {
-                entry.1.push(i);
-            }
+                2
+            };
+            files.entry(row.file.as_str()).or_default()[tier].push(i);
         }
         let mut order: Vec<(Vec<u8>, &str)> = files
             .keys()
@@ -569,10 +596,9 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
         order.sort();
         let mut keep = vec![false; total];
         let mut left = MAX_PER_SERVICE;
-        for labelled in [true, false] {
+        for tier in 0..3 {
             for (_, file) in &order {
-                let (with, without) = &files[file];
-                let group = if labelled { with } else { without };
+                let group = &files[file][tier];
                 if group.len() <= left {
                     left -= group.len();
                     for &i in group {
@@ -780,6 +806,86 @@ mod tests {
             rows.extend(file_rows(&format!("z/f{i}.ts"), 7));
         }
         rows
+    }
+
+    fn operation_row(file: &str, slot: &str, reason: Stop, kind: Option<&str>) -> UnreadSite {
+        UnreadSite {
+            slot: slot.to_string(),
+            kind: kind.map(str::to_string),
+            role: kind.map(|_| "consumer".to_string()),
+            line: 3000,
+            span_start: 30000,
+            span_end: 30060,
+            ..stop(file, 3000, reason)
+        }
+    }
+
+    #[test]
+    fn a_row_that_names_an_operation_is_listed_past_the_cap() {
+        let mut rows = Vec::new();
+        for file in ["relay/bus.ts", "gate/send.ts", "gate/routes.ts"] {
+            rows.extend(file_rows(file, 2100));
+        }
+        rows.push(operation_row(
+            "relay/bus.ts",
+            "name",
+            Stop::Unanswered,
+            None,
+        ));
+        rows.push(operation_row(
+            "gate/send.ts",
+            "path",
+            Stop::Unanswered,
+            Some("http"),
+        ));
+        rows.push(operation_row(
+            "gate/routes.ts",
+            "path",
+            Stop::UnreadExpression,
+            None,
+        ));
+        let capped = cap(rows);
+        assert_eq!(capped.total, 6303);
+        assert_eq!(capped.rows.len(), 3);
+        assert!(capped.rows.iter().all(|r| r.line == 3000));
+        assert_eq!(
+            capped.not_listed,
+            BTreeMap::from([
+                ("gate/routes.ts".to_string(), 2100),
+                ("gate/send.ts".to_string(), 2100),
+                ("relay/bus.ts".to_string(), 2100),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_call_around_an_operation_row_is_listed_with_it() {
+        let mut rows = file_rows("relay/bus.ts", 2100);
+        let at = |start: u32, end: u32, reason: Stop| UnreadSite {
+            line: 3000,
+            span_start: start,
+            span_end: end,
+            ..stop("relay/bus.ts", 3000, reason)
+        };
+        rows.push(UnreadSite {
+            span_start: 30000,
+            span_end: 30100,
+            line: 3000,
+            ..labelled_row("relay/bus.ts", 3000)
+        });
+        rows.push(at(29990, 30110, Stop::MissedInside));
+        rows.push(at(30020, 30040, Stop::ValueCallee));
+        rows.push(at(30200, 30210, Stop::ValueCallee));
+        let capped = cap(rows);
+        assert_eq!(capped.rows.len(), 2);
+        assert!(capped.rows.iter().any(|r| r.labelled_end.is_some()));
+        assert!(
+            capped
+                .rows
+                .iter()
+                .any(|r| r.reason == Stop::MissedInside && r.span_start == 29990)
+        );
+        assert_eq!(capped.not_listed["relay/bus.ts"], 2102);
     }
 
     #[test]
