@@ -5119,3 +5119,131 @@ async fn a_field_deleted_from_one_of_two_served_schemas_stays_unverifiable() {
         findings_of(&payload)
     );
 }
+
+// ---- GraphQL: a selected field whose type the PR changes in a printed schema
+
+/// The code and its printed copy both retype `Parcel.etaDays` from an integer
+/// to a string scalar; the record the resolver returns is untouched, so the
+/// type check still reads the pair compatible. The client, which the PR leaves
+/// alone, selects the field and reads a number.
+#[tokio::test]
+async fn a_selected_field_the_pr_retypes_in_a_printed_schema_breaks_the_client() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |_| {},
+        |repo| {
+            edit(
+                repo,
+                "apps/api/src/server.ts",
+                &[(
+                    "    etaDays: { type: GraphQLInt },\n",
+                    "    etaDays: { type: GraphQLString },\n",
+                )],
+            );
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "  etaDays: String\n")],
+            );
+        },
+    )
+    .await;
+    let finding = parcel_page_finding(&payload).unwrap_or_else(|| {
+        panic!(
+            "no type_mismatch at the client: {:#?}",
+            findings_of(&payload)
+        )
+    });
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+}
+
+/// Adding `!` to a selected field never breaks a client.
+#[tokio::test]
+async fn a_selected_field_the_pr_makes_non_null_in_a_printed_schema_is_no_finding() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |_| {},
+        |repo| {
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "  etaDays: Int!\n")],
+            )
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}
+
+/// A PR that edits the printed file without retyping a field the client
+/// selects (it adds an unselected field) is no finding.
+#[tokio::test]
+async fn a_printed_schema_the_pr_edits_without_retyping_a_selected_field_is_no_finding() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |_| {},
+        |repo| {
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "  etaDays: Int\n  note: String\n")],
+            )
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}
+
+/// Two schemas could serve the client: the PR retypes the field in one, and
+/// the other may still serve it as before, so there is no finding.
+#[tokio::test]
+async fn a_field_retyped_in_one_of_two_served_schemas_is_no_finding() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |repo| {
+            std::fs::write(
+                repo.join("apps/api/dist/schema-ops.graphql"),
+                "type Query {\n  ping: String\n}\n",
+            )
+            .unwrap();
+            edit(
+                repo,
+                "carrick.json",
+                &[(
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\"]",
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\", \"apps/api/dist/schema-ops.graphql\"]",
+                )],
+            );
+        },
+        |repo| {
+            edit(
+                repo,
+                "apps/api/src/server.ts",
+                &[(
+                    "    etaDays: { type: GraphQLInt },\n",
+                    "    etaDays: { type: GraphQLString },\n",
+                )],
+            );
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "  etaDays: String\n")],
+            );
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}
