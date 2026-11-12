@@ -183,3 +183,24 @@ test("a `.mjs` file's shell write is seen by the fact path and starts no probe",
   assert.equal(context(edit.stdout), "h line");
   assert.equal(firstCall(argvLog), null);
 });
+
+test("an Edit whose hunks went stale after a formatter ran falls back to the diff against HEAD", async (t) => {
+  const ws = await workspace(t, TWO_ROWS, { "orders-api/src/two.ts": TWO });
+  commit(ws.at("orders-api"));
+  const file = ws.at("orders-api/src/two.ts");
+  // The tool's patch put the change at line 2; a formatter then moved it, so
+  // the file now holds it at line 6 and the patch's line does not match.
+  fs.writeFileSync(file, TWO.replace("return 2;", "return 3;"));
+  const run = await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "stale-hunks",
+      cwd: ws.root,
+      tool_input: { file_path: file, old_string: "return 2;", new_string: "return 3;" },
+      tool_response: { filePath: file, structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ["-  return 1;", "+  return 3;"] }] },
+    },
+    env: env(ws),
+  });
+  assert.equal(context(run.stdout), "g line");
+});

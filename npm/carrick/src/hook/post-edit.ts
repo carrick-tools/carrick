@@ -149,7 +149,9 @@ async function againstHead(file: string, created: boolean): Promise<Change | nul
  * (an `Edit` or `MultiEdit`'s patch, a Codex `apply_patch` hunk placed in the
  * file), else the text it put in, else `whole` for a file this call created
  * that git does not track. A file left out (a `Write` over an existing file,
- * a hunk that cannot be placed) gets no fact lines (`facts/lines.ts`).
+ * a hunk that cannot be placed and has no diff against HEAD) gets no fact
+ * lines (`facts/lines.ts`). An `Edit`'s hunks a formatter has since moved fall
+ * back to the diff against HEAD, as a Codex hunk does.
  */
 async function changesFromPayload(payload: Payload, edited: string[], cwd: string | null): Promise<Map<string, Change>> {
   const input = payload.tool_input ?? {};
@@ -208,7 +210,11 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
       for (const text of hunk.lines) {
         if (typeof text !== "string" || text.startsWith("\\")) continue;
         if (text.startsWith("+")) {
-          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) return new Map();
+          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) {
+            // Unplaced: the file's diff against HEAD, as for a Codex patch.
+            const found = await againstHead(edited[0]!, false);
+            return found ? new Map([[edited[0]!, found]]) : new Map();
+          }
           lines.push(at++);
         } else if (text.startsWith("-")) removed.push(at);
         else at += 1;
