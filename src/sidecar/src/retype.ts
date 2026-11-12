@@ -272,10 +272,33 @@ export class Retyper {
       // value escapes to are invisible and an "agrees" would claim them.
       return escape;
     }
+    const unbound = this.unboundTypeParameterReason(call);
+    if (unbound) return unbound;
 
     const plan = this.plan(call);
     if (typeof plan === 'string') return plan;
     return { sourceFile, call, plan };
+  }
+
+  /**
+   * Why the call does not state the response when the type argument the
+   * retype would state there (its first, written or inferred) holds a type
+   * parameter of a declaration the call sits in (carrick#3897), or
+   * `undefined`. `return send<T>(url)` inside `read<T>(): Promise<T>` is a
+   * pass-through: the call site cannot bind `T`, and the response is read
+   * where `read` is called. Stating the producer's type there only makes the
+   * compiler compare it with the open `T` ("'T' could be instantiated with an
+   * arbitrary type"), which no reader of the response wrote. An enclosing
+   * parameter in any other type argument (a generated client's mode flag)
+   * leaves the response stated, and the call is judged.
+   */
+  private unboundTypeParameterReason(call: CallExpression): string | undefined {
+    const checker = this.project.getTypeChecker().compilerObject;
+    const signature = checker.getResolvedSignature(call.compilerNode);
+    const stated = signature && checker.getTypeArgumentsForResolvedSignature(signature)?.[0];
+    return stated
+      ? unboundReason(checker, "the call's type argument", stated, call.compilerNode)
+      : undefined;
   }
 
   /**
@@ -361,6 +384,10 @@ export class Retyper {
     // touched.
     const reads = bodyReadsOf(call, (read) => this.inferrer.isPlatformBodyRead(read, JSON_READ, 'undeclared_reads'));
     if (typeof reads === 'string') return reads;
+    for (const read of reads) {
+      const unbound = bodyReadUnboundReason(read);
+      if (unbound) return unbound;
+    }
     if (reads.length > 0) {
       const edits = reads.map(bodyReadEdit);
       return (producer, wire) => (useWire) => {
@@ -596,6 +623,118 @@ function abstain(item: RetypeItem, reason: string): RetypeOutcome {
 /** `outcome`, marked as an abstention the run caused (carrick#3104). */
 function runFailed(outcome: RetypeOutcome): RetypeOutcome {
   return { ...outcome, run_failed: true };
+}
+
+/**
+ * The abstention for a response whose type holds a type parameter of a
+ * declaration it sits in (carrick#3897), or `undefined`. The one place the
+ * sentence is built, for a call's result and for a body read alike.
+ */
+function unboundReason(
+  checker: ts.TypeChecker,
+  what: string,
+  type: ts.Type,
+  at: ts.Node
+): string | undefined {
+  const name = enclosingTypeParameterIn(checker, type, at);
+  if (name === undefined) return undefined;
+  return (
+    `${what} ('${checker.typeToString(type)}') uses the enclosing declaration's type ` +
+    `parameter '${name}', so the call does not state the response and its readers ` +
+    `are that declaration's callers`
+  );
+}
+
+/**
+ * {@link unboundReason} for a body read (carrick#3897): the type a cast on
+ * it states, or else the type the place it flows into expects
+ * (`return res.json()` inside `read<T>(): Promise<T>`). The retype states
+ * the producer's type at either, so a type parameter there is the same
+ * pass-through as a call's result.
+ */
+function bodyReadUnboundReason(read: CallExpression): string | undefined {
+  const checker = read.getProject().getTypeChecker().compilerObject;
+  let top: Node = read;
+  for (let parent = top.getParent(); parent; parent = top.getParent()) {
+    if (Node.isAsExpression(parent)) {
+      const cast = parent.getTypeNodeOrThrow();
+      return unboundReason(
+        checker,
+        'the type the body read is cast to',
+        cast.getType().compilerType,
+        read.compilerNode
+      );
+    }
+    if (!Node.isAwaitExpression(parent) && !Node.isParenthesizedExpression(parent)) break;
+    top = parent;
+  }
+  const expected = checker.getContextualType(top.compilerNode as ts.Expression);
+  return expected
+    ? unboundReason(checker, 'the type the body read flows into', expected, read.compilerNode)
+    : undefined;
+}
+
+/** How deep {@link enclosingTypeParameterIn} reads into a type. */
+const TYPE_PARAMETER_DEPTH = 4;
+
+/**
+ * The name of a type parameter in `type` that a declaration enclosing `at`
+ * declares (a function, a method, a class), or `undefined`. Reads union and
+ * intersection members, type arguments, indexed accesses, conditional
+ * branches and the properties of an anonymous object type, to a fixed depth.
+ * A polymorphic `this` is not one: a call can hold it without passing a
+ * response through.
+ */
+function enclosingTypeParameterIn(
+  checker: ts.TypeChecker,
+  type: ts.Type,
+  at: ts.Node
+): string | undefined {
+  const seen = new Set<ts.Type>();
+  const encloses = (declaring: ts.Node): boolean => {
+    for (let node: ts.Node | undefined = at.parent; node; node = node.parent) {
+      if (node === declaring) return true;
+    }
+    return false;
+  };
+  const visit = (current: ts.Type, depth: number): string | undefined => {
+    if (depth > TYPE_PARAMETER_DEPTH || seen.has(current)) return undefined;
+    seen.add(current);
+    if (current.flags & ts.TypeFlags.TypeParameter) {
+      if ((current as ts.TypeParameter & { isThisType?: boolean }).isThisType) return undefined;
+      const declared = current.symbol?.declarations?.some(
+        (decl) => ts.isTypeParameterDeclaration(decl) && encloses(decl.parent)
+      );
+      if (declared) return current.symbol.getName();
+    }
+    const parts: ts.Type[] = [...(current.aliasTypeArguments ?? [])];
+    if (current.isUnionOrIntersection()) parts.push(...current.types);
+    if (current.flags & ts.TypeFlags.IndexedAccess) {
+      const access = current as ts.IndexedAccessType;
+      parts.push(access.objectType, access.indexType);
+    }
+    if (current.flags & ts.TypeFlags.Conditional) {
+      const conditional = current as ts.ConditionalType;
+      parts.push(conditional.checkType, conditional.extendsType);
+    }
+    if (current.flags & ts.TypeFlags.Object) {
+      const flags = (current as ts.ObjectType).objectFlags;
+      if (flags & ts.ObjectFlags.Reference) {
+        parts.push(...checker.getTypeArguments(current as ts.TypeReference));
+      }
+      if (flags & ts.ObjectFlags.Anonymous) {
+        for (const property of current.getProperties()) {
+          parts.push(checker.getTypeOfSymbolAtLocation(property, at));
+        }
+      }
+    }
+    for (const part of parts) {
+      const found = visit(part, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  return visit(type, 0);
 }
 
 function asLocator(item: RetypeLocatorItem): InferRequestItem {
