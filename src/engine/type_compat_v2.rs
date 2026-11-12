@@ -1253,7 +1253,10 @@ impl CaptureDeath {
         let was = if both { "were" } else { "was" };
         match self.end {
             Some(end) if end.is_abort() => {
-                format!("{was} stopped because it ran out of memory,")
+                format!(
+                    "{was} stopped because {} ran out of memory,",
+                    if both { "they" } else { "it" }
+                )
             }
             Some(ProcessEnd::Signal(9)) => format!("{was} killed by the system"),
             Some(ProcessEnd::Signal(signal)) => format!("{was} ended by signal {signal}"),
