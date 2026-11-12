@@ -672,8 +672,9 @@ test("a file this Write created, untracked in git, counts every named thing in i
   fs.writeFileSync(file, text);
   const payload = { tool_name: "Write", tool_input: { file_path: file, content: text }, tool_response: { type: "create", filePath: file } };
   // Its op rows are another file's, still on disk: none print, by the named-row
-  // rule. A new function named like one in another file is the name kind's line.
-  assert.equal(context((await payloadEdit(ws, payload)).stdout), "a function named getOrder is declared at orders-api/src/routes/orders.ts:12");
+  // rule. The name kind's line for getOrder would state orders.ts:12, but this
+  // fixture copy declares getOrder at line 11: unproven on disk, so silent (R33.3).
+  assert.equal(context((await payloadEdit(ws, payload)).stdout), "");
   // A tracked file is never "created by this call".
   fs.rmSync(file);
   const tracked = ws.at("orders-api/src/routes/orders.ts");

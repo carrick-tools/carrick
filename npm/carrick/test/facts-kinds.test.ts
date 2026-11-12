@@ -351,7 +351,8 @@ test("name: a file the call created counts every declaration in it", async (t) =
 });
 
 test("name: more than one other declaration prints the first by (repo, file) only", async (t) => {
-  const ws = await workspace(t, { ...STDIN_FILES, "api/src/io.ts": "export function readStdin() {}\n" }, [
+  // Each declaration on the line its row states (line 3).
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/io.ts": "// io\n\nexport function readStdin() {}\n" }, [
     nameRow("readStdin", "web", "src/stdin.ts"),
     nameRow("readStdin", "api", "src/io.ts"),
   ]);
@@ -407,6 +408,21 @@ test("name: silent when the other file only imports the name, or declares a long
   const longer = await workspace(t, { ...STDIN_FILES, "web/src/stdin.ts": "export function readStdinAll() {\n  return [];\n}\n" }, [nameRow("readStdin", "web", "src/stdin.ts")]);
   const second = addFunction(longer, "api/src/hook.ts");
   assert.equal(context((await patchEdit(longer, second.file, [second.hunk])).stdout), "");
+});
+
+test("R33.3: name is silent when the other file's declaration no longer starts on the stated line", async (t) => {
+  const ws = await workspace(t, STDIN_FILES, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  // Ten lines added at the top of the other file earlier: the declaration is at line 13, the row says 3.
+  fs.writeFileSync(ws.at("web/src/stdin.ts"), `${"// note\n".repeat(10)}${STDIN_FILES["web/src/stdin.ts"]}`);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
+test("R33.1: name in a repo not checked out here is stated from the index", async (t) => {
+  const ws = await workspace(t, { "api/src/hook.ts": HOOK }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  assert.equal(fs.existsSync(ws.at("web")), false);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), STDIN_LINE);
 });
 
 test("name: silent when the other file does not scan cleanly", async (t) => {

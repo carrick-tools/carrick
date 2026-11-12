@@ -98,13 +98,20 @@ export function sameNameLines(
     const first = rows[0];
     if (!first) continue;
     const base = first.repo === at.repo ? at.top : where.get(first.repo);
-    if (!base) continue;
+    // A repo not checked out here: stated from the index, which it cannot
+    // have changed since (R33.1).
+    if (!base) {
+      out.push({ key: `name::${name}`, text: first.text, named: [] });
+      continue;
+    }
     const other = path.join(base, first.file);
     // The other file must still declare exactly this name, read by the same
-    // scanner: gone, rewritten, only importing it, or not scanning cleanly,
-    // the function may have moved into this file. Checked only for a line
-    // about to print.
-    const holds = (): boolean => memo.scanned(other)?.scan.spans.some((span) => span.name === name) ?? false;
+    // scanner, starting on the line the row states (R33.3): gone, rewritten,
+    // only importing it, moved within the file, or not scanning cleanly, the
+    // line would be wrong or the function may have moved into this file.
+    // Checked only for a line about to print.
+    const holds = (): boolean =>
+      memo.scanned(other)?.scan.spans.some((span) => span.name === name && memo.lineOf(other, span.start) === first.line) ?? false;
     out.push({ key: `name::${name}`, text: first.text, named: [other], holds });
   }
   return out;
