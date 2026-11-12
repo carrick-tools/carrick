@@ -2448,7 +2448,7 @@ impl<'a> Walker<'a> {
             && let Some((end, stop)) = self.untyped_procedure_end(file, call)
         {
             several = Some(stop);
-            found = Some((end, ReachedBy::Type));
+            found = Some((end, ReachedBy::Instance));
         }
         if let Some((end, reached)) = found {
             let traced = self.labels.declarations.is_some();

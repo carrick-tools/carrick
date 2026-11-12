@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "/api/rpc/ghosts.reopen",
+      "method": "POST",
+      "pattern_matched": "ghost.ghosts.reopen.mutate(",
+      "call_expression_text": "ghost.ghosts.reopen.mutate({ id })",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

@@ -2654,6 +2654,7 @@ fn matched_producers(name: &str) -> Vec<String> {
 fn procedure_client_rows() -> Vec<String> {
     let router = "workspace:src/router.ts#appRouter";
     let mut rows = vec![
+        "src/web/ghost.ts:11 POST \"/api/rpc/ghosts.reopen\"  model".to_string(),
         format!("src/web/hooks.ts:7 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/hooks.ts:16 GET \"\" {router} count request_summary"),
@@ -2737,27 +2738,33 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
 }
 
 /// A client whose router type does not resolve (the import names no module)
-/// has no first key the compiler can place: its calls get no row, and each
-/// is saved unread with its reason (carrick#3847).
+/// has no first key the compiler can place: its calls get no fact row, and a
+/// call the reader states no row for is saved unread with its reason
+/// (carrick#3847). The reader's mocked answer states the call at line 11,
+/// so that call keeps its row (one request, one row) and is not also listed
+/// unread; the call at line 7 has no row and is listed.
 #[test]
 fn a_client_whose_router_type_does_not_resolve_is_saved_unread() {
     let blobs = scan_fixture("procedure-client");
-    let (flat, _) = client_rows(&blobs);
-    assert!(
-        !flat.iter().any(|row| row.starts_with("src/web/ghost.ts")),
-        "{flat:?}"
-    );
+    let (flat, graph) = client_rows(&blobs);
+    for rows in [&flat, &graph] {
+        let ghost: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.starts_with("src/web/ghost.ts"))
+            .collect();
+        assert_eq!(ghost.len(), 1, "{rows:?}");
+        assert_eq!(
+            ghost[0],
+            "src/web/ghost.ts:11 POST \"/api/rpc/ghosts.reopen\"  model"
+        );
+    }
     let reasons = unread_reasons(&blobs);
-    let at = |line: &str| {
-        reasons
-            .get(&format!("src/web/ghost.ts:{line}"))
-            .map(String::as_str)
-    };
     assert_eq!(
-        (at("7"), at("11")),
-        (Some("untyped_receiver"), Some("untyped_receiver")),
+        reasons.get("src/web/ghost.ts:7").map(String::as_str),
+        Some("untyped_receiver"),
         "{reasons:?}"
     );
+    assert!(!reasons.contains_key("src/web/ghost.ts:11"), "{reasons:?}");
 }
 
 /// A procedure call's types are not compared yet (carrick#3186): it
