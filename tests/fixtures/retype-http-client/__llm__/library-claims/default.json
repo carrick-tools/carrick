@@ -1,0 +1,46 @@
+{
+  "library_claims": [
+    {
+      "package": "http-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "http-server",
+          "export": "createServer",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "http-client",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "http-client",
+          "export": "create",
+          "role": "http_client",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null, "base": { "arg": 0, "key": "baseURL" }, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "payload": { "arg": 1 }, "method": "POST", "result": { "member": ["data"] }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

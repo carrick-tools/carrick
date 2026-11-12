@@ -1,5 +1,9 @@
 {
   "name": "registration-veto",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/router": "^1.0.0"
+  }
 }

@@ -21,13 +21,14 @@
 //!   argument of a send.
 //!
 //! Every arm must reach the same payload. The fixture's two runtimes differ in
-//! what the send RETURNS — the bare platform `Response` in `runtime.ts`, a
-//! wrapper carrying the payload as a type argument in the installed
-//! `@fixture-http/runtime` — and both are in the wild. The second is vendored
-//! as a dependency rather than declared in `src/`, because a type's
-//! declaration ORIGIN is part of what tells transport apart from a payload,
-//! and a framework declared in the scanned repo's own source is not arranged
-//! the way production is.
+//! what the send RETURNS — the bare platform `Response` in the installed
+//! `@fixture-http/router`, a wrapper carrying the payload as a type argument
+//! in the installed `@fixture-http/runtime` — and both are in the wild. Both
+//! are vendored as dependencies rather than declared in `src/`, because a
+//! type's declaration ORIGIN is part of what tells transport apart from a
+//! payload, and because only an installed package's registrations are
+//! labelled by the library store's answer (`library-claims.json`, copied into
+//! the cassettes by every scan).
 //!
 //! Deleting the registration-span fallback in `collect_type_requests` fails
 //! the three no-locator tests here and nothing else. Deleting the
@@ -39,11 +40,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "support/library_claims.rs"]
+mod library_claims;
+
 const FIXTURE: &str = "inline-handler-response";
 
 /// Files of the fixture no arm answers for: an uncovered file falls back to
 /// the generated mock, which invents rows from the prompt.
-const SILENT_FILES: [&str; 2] = ["runtime", "widgets"];
+const SILENT_FILES: [&str; 1] = ["widgets"];
 
 const NOTHING: &str = r#"{"mounts":[],"endpoints":[],"data_calls":[]}"#;
 
@@ -96,6 +100,7 @@ fn scan(routes: &str, typed: &str) -> serde_json::Value {
     for stem in SILENT_FILES {
         std::fs::write(analyze.join(format!("{stem}.json")), NOTHING).expect("write cassette");
     }
+    library_claims::install(&fixture_dir(), dir.path());
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(fixture_dir())
