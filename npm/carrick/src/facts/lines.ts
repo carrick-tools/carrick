@@ -267,7 +267,7 @@ export async function factLines(
       if (at === null) continue;
       if (isManifest(edit.file)) {
         const manifest = memo.text(edit.file);
-        if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit));
+        if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit, memo));
         continue;
       }
       if (!SCANNED.test(edit.file)) continue;

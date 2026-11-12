@@ -7,12 +7,17 @@
 // `peerDependencies` or `optionalDependencies`, the parsed file agrees on
 // that spec, and the file before the edit did not already hold it (a comma
 // added to the line above a new last dependency changes nothing). The row
-// prints unless every other service in it already has exactly the new spec.
+// prints unless every other service in it already has exactly the new spec,
+// and only when each other service checked out here still holds its stated
+// spec on disk (R33.4); a row listing another manifest of the edited repo, or
+// whose entry for the edited manifest has no `others_text`, says nothing.
 // `deno.json(c)` and import maps are a named gap.
 
 import path from "node:path";
 import { tokenize } from "../match.ts";
 import type { FactStore } from "../store.ts";
+import type { FileMemo } from "../files.ts";
+import type { Candidate } from "../lines.ts";
 import { textBefore } from "./same-name.ts";
 
 const SECTIONS = new Set(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]);
@@ -74,7 +79,8 @@ export function packageLines(
   where: ReadonlyMap<string, string>,
   text: string,
   change: { lines?: number[] | null; removed?: number[] | null; removedText?: string[] | null },
-): Array<{ key: string; text: string; named: string[] }> {
+  memo: FileMemo,
+): Candidate[] {
   if (!change.lines || change.lines.length === 0 || !change.removed || !change.removedText) return [];
   const now = parse(text);
   const old = textBefore(text, change.lines, change.removed, change.removedText);
@@ -83,7 +89,7 @@ export function packageLines(
   const keys = keysByLine(text);
   if (keys === null) return [];
   const fileLines = text.split("\n");
-  const out: Array<{ key: string; text: string; named: string[] }> = [];
+  const out: Candidate[] = [];
   for (const line of new Set(change.lines)) {
     const pair = PAIR.exec(fileLines[line - 1] ?? "");
     const written = keys.get(line);
@@ -105,15 +111,31 @@ export function packageLines(
     if (row === null) continue;
     const others = row.services.filter((service) => !(service.repo === at.repo && service.manifest === at.rel));
     if (others.length === 0 || others.every((service) => service.spec === spec)) continue;
+    // Another manifest of this very repo in the row: the edited one is not in
+    // it, and the sentence's spec for this repo cannot be told apart (R33.4, F4).
+    if (others.some((service) => service.repo === at.repo)) continue;
+    // The edited manifest's own entry carries the sentence without it, which
+    // would otherwise state its old spec; an entry with none says nothing
+    // (R33.4, F5). A manifest the row does not hold, in a repo it does not
+    // list, prints the row's sentence.
+    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
+    const text = own ? own.others_text : row.text;
+    if (!text) continue;
     const named = others.flatMap((service) => {
       const base = where.get(service.repo);
       return base ? [path.join(base, service.manifest)] : [];
     });
-    // The edited manifest's own entry carries the sentence without it, which
-    // would otherwise state its old spec; an entry with none (an older file)
-    // and a manifest the row does not hold print the row's sentence.
-    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
-    out.push({ key: `pkg::${name}`, text: own?.others_text ?? row.text, named });
+    // Each other service checked out here must still hold the stated spec on
+    // disk (R33.1, R33.4); one in a repo not checked out is stated from the index.
+    const holds = (): boolean =>
+      others.every((service) => {
+        const base = where.get(service.repo);
+        if (base === undefined) return true;
+        const manifest = memo.text(path.join(base, service.manifest));
+        const parsed = manifest === null ? null : parse(manifest);
+        return parsed !== null && [...SECTIONS].some((section) => specIn(parsed, section, name) === service.spec);
+      });
+    out.push({ key: `pkg::${name}`, text, named, holds });
   }
   return out;
 }

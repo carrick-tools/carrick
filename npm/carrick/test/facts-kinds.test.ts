@@ -465,13 +465,19 @@ const MANIFEST = (deps: string[], extra = "") =>
 const pkgRow = (name: string, specs: Array<[string, string, string]>) => ({
   k: "pkg",
   package: name,
-  services: specs.map(([repo, spec, manifest]) => ({ repo, service: repo, spec, manifest })),
+  // Each entry's `others_text` is the sentence without it, as the cloud's writer 2 writes it.
+  services: specs.map(([repo, spec, manifest], at) => {
+    const others = specs.filter((_, other) => other !== at);
+    return { repo, service: repo, spec, manifest, ...(others.length > 0 ? { others_text: `${name} is ${others.map(([r, s]) => `${s} in ${r}`).join(", ")}` } : {}) };
+  }),
   text: `${name} is ${specs.map(([repo, spec]) => `${spec} in ${repo}`).join(", ")}`,
 });
 const ZOD = pkgRow("zod", [
   ["api", "^3.22.0", "package.json"],
   ["web", "^3.23.8", "package.json"],
 ]);
+/** What api is told after it changes zod: web's spec only. */
+const ZOD_FOR_API = "zod is ^3.23.8 in web";
 
 /** Write `next` over the manifest and return the hunk from `before` to it (whole file, one hunk). */
 function manifestHunk(file: string, before: string, next: string): Hunk {
@@ -489,8 +495,15 @@ function manifestHunk(file: string, before: string, next: string): Hunk {
   return { newStart: head + 1, lines };
 }
 
-async function bump(t: { after: (fn: () => void) => void }, before: string, next: string, rows = [ZOD], options: { argvLog?: string; session?: string } = {}) {
-  const ws = await workspace(t, { "api/package.json": before, "web/package.json": "{}\n", "api/src/orders.ts": ORDERS }, rows);
+async function bump(
+  t: { after: (fn: () => void) => void },
+  before: string,
+  next: string,
+  rows: Array<Record<string, unknown>> = [ZOD],
+  options: { argvLog?: string; session?: string; files?: Record<string, string> } = {},
+) {
+  // `web` is checked out; its manifest holds the rows' specs (written by `commitRepos`).
+  const ws = await workspace(t, { "api/package.json": before, "web/src/index.ts": "export {};\n", "api/src/orders.ts": ORDERS, ...options.files }, rows);
   const file = ws.at("api/package.json");
   const run = await patchEdit(ws, file, [manifestHunk(file, before, next)], options);
   return { ws, text: context(run.stdout) };
@@ -500,7 +513,7 @@ test("pkg: a bumped dependency names the other services' specs, with no probe, q
   const argvLog = path.join(os.tmpdir(), `carrick-kinds-argv-${process.pid}.log`);
   t.after(() => fs.rmSync(argvLog, { force: true }));
   const { ws, text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD], { argvLog });
-  assert.equal(text, ZOD.text);
+  assert.equal(text, ZOD_FOR_API);
   assert.equal(fs.existsSync(argvLog), false, "the binary was not called");
   assert.equal(fs.existsSync(path.join(ws.root, ".carrick", "rechecks")), false, "nothing was queued");
   const sessions = path.join(ws.home, ".carrick", "sessions");
@@ -541,15 +554,39 @@ test("pkg: a service that bumps its own spec is not told its old spec", async (t
     services: ZOD.services.map((entry) => ({ ...entry, others_text: entry.repo === "api" ? "zod is ^3.23.8 in web" : "zod is ^3.22.0 in api" })),
   };
   const own = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row]);
-  // An older fact file: no others_text on the entry, so the row's sentence.
-  const older = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD]);
-  assert.deepEqual([own.text, older.text], ["zod is ^3.23.8 in web", ZOD.text]);
+  // An older fact file: no others_text on the edited manifest's entry. The
+  // row's sentence would state this service's old spec, so nothing (R33.4).
+  const older = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [
+    { ...ZOD, services: ZOD.services.map(({ others_text: _, ...entry }) => entry) },
+  ]);
+  assert.deepEqual([own.text, older.text], ["zod is ^3.23.8 in web", ""]);
 });
 
-test("pkg: a manifest the row does not hold prints the row's sentence", async (t) => {
+test("pkg: silent for a manifest the row does not hold, in a repo the row lists under another manifest (R33.4)", async (t) => {
   const row = { ...ZOD, services: ZOD.services.map((entry) => ({ ...entry, manifest: "packages/core/package.json", others_text: "not this" })) };
   const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [row]);
-  assert.equal(text, ZOD.text);
+  assert.equal(text, "");
+});
+
+test("R33.4: pkg is silent when another service's manifest on disk no longer holds the stated spec", async (t) => {
+  // Another agent already bumped web to ^3.24.0 on disk; the row still says ^3.23.8.
+  const web = '{\n  "dependencies": {\n    "zod": "^3.24.0"\n  }\n}\n';
+  const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.25.0"']), [ZOD], { files: { "web/package.json": web } });
+  assert.equal(text, "");
+});
+
+test("R33.4: pkg is silent when another service's manifest does not parse, or holds no spec for the package", async (t) => {
+  const broken = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD], { files: { "web/package.json": "{ not json\n" } });
+  const empty = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']), [ZOD], { files: { "web/package.json": "{}\n" } });
+  assert.deepEqual([broken.text, empty.text], ["", ""]);
+});
+
+test("R33.4: pkg states a service in a repo not checked out here from the index", async (t) => {
+  const ws = await workspace(t, { "api/package.json": MANIFEST(['    "zod": "^3.22.0"']), "api/src/orders.ts": ORDERS }, [ZOD]);
+  assert.equal(fs.existsSync(ws.at("web")), false);
+  const file = ws.at("api/package.json");
+  const run = await patchEdit(ws, file, [manifestHunk(file, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.24.0"']))]);
+  assert.equal(context(run.stdout), ZOD_FOR_API);
 });
 
 test("pkg: silent for a package moved to another section with the same spec, and for a manifest under node_modules", async (t) => {
@@ -576,7 +613,8 @@ test("pkg: silent for an unchanged dependency and a package with no row", async 
 
 test("pkg: a Codex patch over a source file and a package.json probes only the source file", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
-  const ws = await workspace(t, { "api/package.json": before, "web/package.json": "{}\n", "api/src/orders.ts": ORDERS }, [ZOD]);
+  // `web` is checked out; its manifest holds the rows' specs (written by `commitRepos`).
+  const ws = await workspace(t, { "api/package.json": before, "web/src/index.ts": "export {};\n", "api/src/orders.ts": ORDERS }, [ZOD]);
   fs.writeFileSync(ws.at("api/package.json"), before.replace('"zod": "^3.22.0"', '"zod": "^3.24.0"'));
   const argvLog = path.join(os.tmpdir(), `carrick-kinds-mixed-${process.pid}.log`);
   t.after(() => fs.rmSync(argvLog, { force: true }));
@@ -595,7 +633,7 @@ test("pkg: a Codex patch over a source file and a package.json probes only the s
     payload: { hook_event_name: "PostToolUse", tool_name: "apply_patch", session_id: "mixed", cwd: ws.root, tool_input: { command: patch } },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_FAKE_ARGV_LOG: argvLog }),
   });
-  assert.equal(context(run.stdout), ZOD.text);
+  assert.equal(context(run.stdout), ZOD_FOR_API);
   const calls = fs.readFileSync(argvLog, "utf8");
   assert.match(calls, /api\/src\/orders\.ts/);
   assert.doesNotMatch(calls, /package\.json/);
