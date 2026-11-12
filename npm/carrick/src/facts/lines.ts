@@ -39,6 +39,9 @@ export const MAX_FACT_LINES = 3;
 /** The name kind stops after this many lines whose other file failed its check (R33.5). */
 const MAX_NAME_FAILURES = 3;
 
+/** Op and fn lines stop after this many failed peer proofs in one action (R36.3). */
+const MAX_PROOF_FAILURES = 3;
+
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
  * file as it is now that it added (`lines`) and the lines it removed lines
@@ -246,12 +249,13 @@ export async function factLines(
     const memo = fileMemo();
     const commits = commitsOf(store.meta);
     const proofs: PeerContext["proofs"] = new Map();
+    const missing: PeerContext["missing"] = new Set();
     // A peer-proof git call that ran out of time, shared across the call's edited files.
     const git = { failed: false };
     // Where each repo is checked out here, for every kind (R36.2).
     const checkouts = localCheckouts(root, store.meta, where);
     const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
-      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, gitFailed: git.failed };
+      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, gitFailed: git.failed };
       const answer = peersUnchanged(others, ctx);
       git.failed = ctx.gitFailed;
       return answer;
@@ -345,15 +349,21 @@ export async function factLines(
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
     // The name kind stops after `MAX_NAME_FAILURES` failed checks (R33.5):
-    // each one may scan a whole other file.
+    // each one may scan a whole other file. Op and fn share a bound of
+    // `MAX_PROOF_FAILURES` failed peer proofs (R36.3): each may run git.
+    // Only a failed check counts, never a line skipped as said or capped.
+    let proofFailures = 0;
     for (const kind of KINDS) {
       let failed = 0;
+      const proved = kind === "op" || kind === "fn";
       for (const candidate of found[kind]) {
         if (lines.length >= MAX_FACT_LINES) break;
         if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
+        if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
         if (said.has(candidate.key) || candidate.key in claims) continue;
         if (candidate.holds && !candidate.holds()) {
           failed += 1;
+          if (proved) proofFailures += 1;
           continue;
         }
         lines.push(candidate.text);

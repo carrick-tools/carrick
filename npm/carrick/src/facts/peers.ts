@@ -77,6 +77,8 @@ export type PeerContext = {
   env?: NodeJS.ProcessEnv;
   /** Answers already given in this call, by repo top, commit and files. */
   proofs: Map<string, boolean>;
+  /** Commits a clone answered it lacks in this call, by repo top and commit: not asked again (R36.3). */
+  missing: Set<string>;
   /** A git call ran out of time in this call: no further git call, every proof false. */
   gitFailed: boolean;
 };
@@ -109,13 +111,16 @@ function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: read
       if (bytes === null) return false;
       wanted.set(file, blobId(bytes, commit.length === 64));
     }
-    if (ctx.gitFailed) return false;
+    const clone = `${top}\0${commit}`;
+    if (ctx.gitFailed || ctx.missing.has(clone)) return false;
     const started = performance.now();
     const out = gitFacts(top, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", ...files], ctx.env);
     if (out === null) {
       // A git that ran out of time will again: no further call this action.
-      // A quick failure (a commit this clone lacks) is this repo's alone.
+      // A quick failure (a commit this clone lacks) is this clone's alone,
+      // and is not asked again in this action.
       if (performance.now() - started >= factsGitBudgetMs(ctx.env)) ctx.gitFailed = true;
+      else ctx.missing.add(clone);
       return false;
     }
     const found = new Map<string, string>();

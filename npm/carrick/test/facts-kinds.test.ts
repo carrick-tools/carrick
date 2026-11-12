@@ -19,6 +19,7 @@ import { scanSource } from "../src/facts/match.ts";
 import { sameNameLines, textBefore } from "../src/facts/rules/same-name.ts";
 import type { FactStore } from "../src/facts/store.ts";
 import { readTimings } from "../src/hook/timings.ts";
+import { markFacts } from "../src/hook/reuse.ts";
 
 const SLUG = "kinds-demo";
 const REPOS = ["api", "web"];
@@ -1107,6 +1108,77 @@ test("R33.2: a peer in the edited file's own repo is proven in its checkout", as
   assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [LOAD_LINE]);
   fs.appendFileSync(ws.at("api/src/jobs.ts"), "// edited\n");
   assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+/** A git on PATH that logs every call to `log`, then runs the real one. */
+function countingGit(t: { after: (fn: () => void) => void }): { path: string; calls: (pattern: RegExp) => number } {
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-log-"));
+  t.after(() => fs.rmSync(shim, { recursive: true, force: true }));
+  const log = path.join(shim, "calls.log");
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\necho "$*" >> ${log}\nexec ${real} "$@"\n`, { mode: 0o755 });
+  return {
+    path: `${shim}${path.delimiter}${process.env["PATH"] ?? ""}`,
+    calls: (pattern) => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter((line) => pattern.test(line)).length : 0),
+  };
+}
+
+/** A file of `count` functions, each with an fn row whose caller sits in its own web file. */
+function manyCallers(count: number): { files: Record<string, string>; rows: Array<Record<string, unknown>> } {
+  const files: Record<string, string> = {};
+  const rows: Array<Record<string, unknown>> = [];
+  const body: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    body.push(`export function handler${i}() {`, `  return ${i};`, "}", "");
+    files[`web/src/caller${i}.ts`] = `export function call${i}() {\n  return handler${i}();\n}\n`;
+    rows.push({ k: "fn", repo: "api", file: "src/many.ts", line: i * 4 + 1, name: `handler${i}`, others: [{ repo: "web", file: `src/caller${i}.ts`, line: 2, name: `call${i}` }], total: 1, text: `handler${i} is called from web/src/caller${i}.ts:2` });
+  }
+  files["api/src/many.ts"] = body.join("\n");
+  return { files, rows };
+}
+
+test("R36.3: op and fn stop after 3 failed proofs in one action", async (t) => {
+  const { files, rows } = manyCallers(6);
+  const ws = await workspace(t, files, rows);
+  // Every caller edited after the index commit: every proof fails.
+  for (let i = 0; i < 6; i += 1) fs.appendFileSync(ws.at(`web/src/caller${i}.ts`), "// edited\n");
+  const git = countingGit(t);
+  const lines = await withPath(git.path, () => factLines(ws.root, [{ file: ws.at("api/src/many.ts"), whole: true }], undefined));
+  assert.deepEqual(lines.lines, []);
+  assert.equal(git.calls(/ls-tree/), 3);
+});
+
+/** Run `fn` with PATH set to `value` in this process (the fact path's git is spawned with it). */
+async function withPath<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const before = process.env["PATH"];
+  process.env["PATH"] = value;
+  try {
+    return await fn();
+  } finally {
+    process.env["PATH"] = before;
+  }
+}
+
+test("R36.3: a commit this clone lacks is asked of git once per action", async (t) => {
+  const { files, rows } = manyCallers(2);
+  const ws = await workspace(t, files, rows);
+  const api = spawnSync("git", ["-C", ws.at("api"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  await rebuild(ws, rows, { api, web: "e".repeat(40) });
+  const git = countingGit(t);
+  const lines = await withPath(git.path, () => factLines(ws.root, [{ file: ws.at("api/src/many.ts"), whole: true }], undefined));
+  assert.deepEqual(lines.lines, []);
+  assert.equal(git.calls(/ls-tree/), 1);
+});
+
+test("R36.3: lines said earlier in the session are not failed proofs", async (t) => {
+  const { files, rows } = manyCallers(6);
+  const ws = await workspace(t, files, rows);
+  const edit = { file: ws.at("api/src/many.ts"), whole: true };
+  const first = await factLines(ws.root, [edit], "said", { home: ws.home });
+  markFacts("said", first.claims, ws.home);
+  const second = await factLines(ws.root, [edit], "said", { home: ws.home });
+  assert.deepEqual(first.lines, rows.slice(0, 3).map((row) => row["text"]));
+  assert.deepEqual(second.lines, rows.slice(3, 6).map((row) => row["text"]));
 });
 
 test("R33.2: git slower than its budget is silent, and the hook exits 0", async (t) => {
