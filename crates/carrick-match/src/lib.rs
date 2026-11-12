@@ -164,15 +164,60 @@ pub fn paths_match(endpoint_path: &str, call_path: &str) -> bool {
 /// outranks a concrete route (`/api/v1/chat/new`, agreement 4).
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn match_agreement(endpoint_path: &str, call_path: &str) -> Option<u32> {
+    let endpoint_segments = segments(endpoint_path);
+    let call_segments = segments(call_path);
+    agreement(
+        &SplitPath::new(endpoint_path, &endpoint_segments),
+        &SplitPath::new(call_path, &call_segments),
+    )
+}
+
+/// A path and its `/`-separated segments, split once. Every matcher below
+/// reads the segments from here, so a surface that compares one path with
+/// many (the [`PairingPool`]) splits each path once rather than once per
+/// comparison (the pool holds `Box<str>` segments; a one-shot comparison
+/// borrows `&str` ones).
+#[derive(Debug)]
+pub(crate) struct SplitPath<'a, S> {
+    text: &'a str,
+    segments: &'a [S],
+}
+
+impl<'a, S: AsRef<str>> SplitPath<'a, S> {
+    /// `segments` must be `text.split('/')`, in order.
+    pub(crate) fn new(text: &'a str, segments: &'a [S]) -> Self {
+        SplitPath { text, segments }
+    }
+
+    pub(crate) fn segments(&self) -> &'a [S] {
+        self.segments
+    }
+}
+
+/// `path.split('/')`, borrowed: a one-shot comparison's segments.
+pub(crate) fn segments(path: &str) -> Vec<&str> {
+    path.split('/').collect()
+}
+
+/// `path.split('/')`, owned: the segments a [`PairingPool`] holds per route.
+pub(crate) fn owned_segments(path: &str) -> Box<[Box<str>]> {
+    path.split('/').map(Box::from).collect()
+}
+
+/// [`match_agreement`] over paths already split.
+pub(crate) fn agreement<E: AsRef<str>, C: AsRef<str>>(
+    endpoint: &SplitPath<'_, E>,
+    call: &SplitPath<'_, C>,
+) -> Option<u32> {
     // Exact match: every literal segment is shared by construction.
-    if endpoint_path == call_path {
-        return Some(path_literal_specificity(endpoint_path));
+    if endpoint.text == call.text {
+        return Some(literal_specificity(endpoint.segments));
     }
 
     // Parameter matching (e.g., /users/:id matches /users/123), then
     // wildcards — same dispatch order the boolean matcher always had.
-    agreement_with_params(endpoint_path, call_path)
-        .or_else(|| agreement_with_wildcards(endpoint_path, call_path))
+    agreement_with_params(endpoint.segments, call.segments)
+        .or_else(|| agreement_with_wildcards(endpoint, call))
 }
 
 /// Number of LITERAL segments in a path: segments that are real text rather
@@ -183,7 +228,16 @@ pub fn match_agreement(endpoint_path: &str, call_path: &str) -> Option<u32> {
 /// concrete contract.
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn path_literal_specificity(path: &str) -> u32 {
-    path.split('/')
+    literal_count(path.split('/'))
+}
+
+/// [`path_literal_specificity`] over a path already split.
+pub(crate) fn literal_specificity<S: AsRef<str>>(segments: &[S]) -> u32 {
+    literal_count(segments.iter().map(AsRef::as_ref))
+}
+
+fn literal_count<'s>(segments: impl Iterator<Item = &'s str>) -> u32 {
+    segments
         .filter(|seg| is_literal_segment(seg.trim_end_matches('?')))
         .count() as u32
 }
@@ -378,7 +432,21 @@ pub fn match_verdict_with_dispatch(
     producer_dispatch: Option<String>,
     call_dispatch: Option<String>,
 ) -> MatchVerdict {
-    match match_verdict(endpoint_path, call_path) {
+    fold_dispatch(
+        match_verdict(endpoint_path, call_path),
+        producer_dispatch,
+        call_dispatch,
+    )
+}
+
+/// The path verdict `path`, narrowed by the dispatch case: the second half of
+/// [`match_verdict_with_dispatch`].
+pub(crate) fn fold_dispatch(
+    path: MatchVerdict,
+    producer_dispatch: Option<String>,
+    call_dispatch: Option<String>,
+) -> MatchVerdict {
+    match path {
         MatchVerdict::Matched => match dispatch_verdict(producer_dispatch, call_dispatch) {
             DispatchVerdict::NotDispatching | DispatchVerdict::Matched => MatchVerdict::Matched,
             DispatchVerdict::ValueUnknown => MatchVerdict::DispatchValueUnknown,
@@ -461,13 +529,29 @@ pub fn reportable_agreement_with_dispatch(
 /// the route.
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn match_verdict(endpoint_path: &str, call_path: &str) -> MatchVerdict {
-    if is_unknown_call_path(call_path) {
+    let endpoint_segments = segments(endpoint_path);
+    let call_segments = segments(call_path);
+    let endpoint = SplitPath::new(endpoint_path, &endpoint_segments);
+    let call = SplitPath::new(call_path, &call_segments);
+    path_verdict(&endpoint, &call, || agreement(&endpoint, &call))
+}
+
+/// [`match_verdict`] over paths already split, with the pair's
+/// [`match_agreement`] supplied by the caller (asked only once both
+/// rejections that precede it have passed), so a caller that has already
+/// scored the pair does not score it again.
+pub(crate) fn path_verdict<E: AsRef<str>, C: AsRef<str>>(
+    endpoint: &SplitPath<'_, E>,
+    call: &SplitPath<'_, C>,
+    agreement: impl FnOnce() -> Option<u32>,
+) -> MatchVerdict {
+    if literal_specificity(call.segments) == 0 {
         return MatchVerdict::UnknownCallPath;
     }
-    if is_catch_all_path(endpoint_path) && path_literal_specificity(endpoint_path) == 0 {
+    if is_catch_all_path(endpoint.text) && literal_specificity(endpoint.segments) == 0 {
         return MatchVerdict::CatchAllRoute;
     }
-    match match_agreement(endpoint_path, call_path) {
+    match agreement() {
         None => MatchVerdict::NoRouteMatch,
         Some(0) => MatchVerdict::NoLiteralAgreement,
         Some(_) => MatchVerdict::Matched,
@@ -504,14 +588,14 @@ fn is_wildcard_segment(seg: &str) -> bool {
 /// Segment-by-segment matching with route parameters (on either side) and
 /// trailing `?` optional segments on the endpoint side. Returns the literal
 /// agreement count, or `None` if the paths don't match.
-fn agreement_with_params(endpoint_path: &str, call_path: &str) -> Option<u32> {
-    let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
-    let call_segments: Vec<&str> = call_path.split('/').collect();
-
+fn agreement_with_params<E: AsRef<str>, C: AsRef<str>>(
+    endpoint_segments: &[E],
+    call_segments: &[C],
+) -> Option<u32> {
     // Handle optional segments (e.g., /users/:id?)
     let endpoint_required_count = endpoint_segments
         .iter()
-        .filter(|s| !s.ends_with('?'))
+        .filter(|s| !s.as_ref().ends_with('?'))
         .count();
 
     // Call must have at least required segments and at most all segments
@@ -522,7 +606,7 @@ fn agreement_with_params(endpoint_path: &str, call_path: &str) -> Option<u32> {
     }
 
     let mut agreement = 0u32;
-    for (i, endpoint_seg) in endpoint_segments.iter().enumerate() {
+    for (i, endpoint_seg) in endpoint_segments.iter().map(AsRef::as_ref).enumerate() {
         // Check if this is an optional segment
         let is_optional = endpoint_seg.ends_with('?');
         let seg = endpoint_seg.trim_end_matches('?');
@@ -535,7 +619,7 @@ fn agreement_with_params(endpoint_path: &str, call_path: &str) -> Option<u32> {
             continue;
         }
 
-        let call_seg = call_segments[i];
+        let call_seg = call_segments[i].as_ref();
 
         // A path parameter on EITHER side matches the other side. This must be
         // symmetric: a caller URL with a variable normalizes to a `:param` segment
@@ -643,7 +727,11 @@ pub fn route_identity(path: &str) -> String {
 /// - Anywhere else, a `*` segment matches exactly one call segment, and both
 ///   paths must have the same number of segments. Agreement counts the
 ///   literal positions.
-fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32> {
+fn agreement_with_wildcards<E: AsRef<str>, C: AsRef<str>>(
+    endpoint: &SplitPath<'_, E>,
+    call: &SplitPath<'_, C>,
+) -> Option<u32> {
+    let (endpoint_path, call_path) = (endpoint.text, call.text);
     // A catch-all prefix only matches on a segment boundary: the call path is
     // the prefix itself, or continues with '/'. A raw byte-prefix check would
     // let `/api/**` claim `/api2/...`.
@@ -669,16 +757,14 @@ fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32>
     }
 
     // Check for single-segment wildcards in the middle
-    let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
-    let call_segments: Vec<&str> = call_path.split('/').collect();
-
-    if endpoint_segments.len() != call_segments.len() {
+    if endpoint.segments.len() != call.segments.len() {
         return None;
     }
 
     let mut agreement = 0u32;
-    for (endpoint_seg, call_seg) in endpoint_segments.iter().zip(call_segments.iter()) {
-        if *endpoint_seg == "*" {
+    let pairs = endpoint.segments.iter().zip(call.segments.iter());
+    for (endpoint_seg, call_seg) in pairs.map(|(e, c)| (e.as_ref(), c.as_ref())) {
+        if endpoint_seg == "*" {
             continue; // Single-segment wildcard matches anything
         }
         if endpoint_seg != call_seg {
@@ -772,6 +858,20 @@ pub fn internal_origin_path(call_path: &str, internal_domains: Vec<String>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The params arm over two unsplit paths.
+    fn agreement_with_params(endpoint_path: &str, call_path: &str) -> Option<u32> {
+        super::agreement_with_params(&segments(endpoint_path), &segments(call_path))
+    }
+
+    /// The wildcard arm over two unsplit paths.
+    fn agreement_with_wildcards(endpoint_path: &str, call_path: &str) -> Option<u32> {
+        let (endpoint_segments, call_segments) = (segments(endpoint_path), segments(call_path));
+        super::agreement_with_wildcards(
+            &SplitPath::new(endpoint_path, &endpoint_segments),
+            &SplitPath::new(call_path, &call_segments),
+        )
+    }
 
     // --- internal origin (carrick#3441) -------------------------------------
 
