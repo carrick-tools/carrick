@@ -255,6 +255,18 @@ function verdictText(item: CheckItem): string {
   return detail ? ` ${head}: ${detail}` : ` ${head}`;
 }
 
+/**
+ * The case a row states, spelled as the MCP listings spell it
+ * (`dispatchSuffix` in carrick-cloud `mcp-server/src/utils/dispatch.ts`):
+ * ` {action=start-scan}`. The scanner's key is `<location>:<field>=<value>`;
+ * the location is dropped, as the listings drop it. Empty for a plain row.
+ */
+export function dispatchSuffix(key: string | undefined): string {
+  if (!key) return "";
+  const at = key.indexOf(":");
+  return ` {${at >= 0 ? key.slice(at + 1) : key}}`;
+}
+
 /** One line for one route or call: where it is, what it is, what is known about it. */
 export function itemLine(
   item: CheckItem,
@@ -262,7 +274,7 @@ export function itemLine(
   options: { locatorsOnly?: boolean } = {},
 ): string {
   const where = `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
-  const operation = [item.method, item.path].filter(Boolean).join(" ");
+  const operation = [item.method, item.path].filter(Boolean).join(" ") + dispatchSuffix(item.dispatch);
   const counterparts = item.counterparts ?? [];
   // Locators only (carrick#2069): where the row is, what it is, and who is on
   // the other side. The Read hook has no edit to judge, so no verdict words.
@@ -631,10 +643,10 @@ export function renderPostRead(result: CheckResult, displayFile?: string): strin
     `Carrick: other code depends on ${where} (indexed at ${shortHash(result.index_commit)}). Open these before you change what they use:`,
   ];
   lines.push(...uses.slice(0, MAX_USE_LINES));
-  for (const item of items.slice(0, MAX_ITEM_LINES)) {
-    lines.push(itemLine(item, where, { locatorsOnly: true }));
-  }
-  if (uses.length > MAX_USE_LINES || items.length > MAX_ITEM_LINES) {
+  // A line printed twice tells the agent nothing the first did not (carrick#3956).
+  const itemLines = [...new Set(items.map((item) => itemLine(item, where, { locatorsOnly: true })))];
+  lines.push(...itemLines.slice(0, MAX_ITEM_LINES));
+  if (uses.length > MAX_USE_LINES || itemLines.length > MAX_ITEM_LINES) {
     lines.push(`- more are listed by \`carrick check ${where}\`.`);
   }
   return lines.join("\n");

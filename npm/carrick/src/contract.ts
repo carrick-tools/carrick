@@ -83,6 +83,11 @@ export type CheckItem = {
   kind: "route" | "call" | string;
   method?: string;
   path?: string;
+  /**
+   * The dispatch case a row is, as the scanner keys it: `body:action=start-scan`.
+   * Absent on a plain route or call (carrick#3956).
+   */
+  dispatch?: string;
   line?: number;
   col?: number;
   /** R1: a row whose only source is the model is a candidate, never a fact. */
