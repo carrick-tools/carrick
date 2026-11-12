@@ -68,9 +68,8 @@ fn repo_with_one_oversized_file(root: &Path) -> std::path::PathBuf {
         &repo,
         "src/huge.ts",
         &format!(
-            "declare const client: any;\n\
-             export function sendEverything() {{\n  \
-               return client.post({{ url: \"/everything/items\", body: \"{filler}\" }});\n\
+            "export function sendEverything() {{\n  \
+               return fetch(\"/everything/items\", {{ method: \"POST\", body: \"{filler}\" }});\n\
              }}\n"
         ),
     );
@@ -93,10 +92,10 @@ fn scan(repo: &Path, scratch: &Path) -> Run {
     let cache = scratch.join("cache");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
-    // The store's answer for the installed package; every other answer is the
-    // generated mock.
+    // The store's answer for the installed package and for the global `fetch`;
+    // every other answer is the generated mock.
     let cassettes = scratch.join("cassettes");
-    real_packages::write_claims(&cassettes, &["express"]);
+    real_packages::write_claims(&cassettes, &["express", "lib-dom-fetch"]);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
         .current_dir(repo)
