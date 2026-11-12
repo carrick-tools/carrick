@@ -94,12 +94,17 @@ export function locate(file: string, repos: readonly LocalRepo[]): { repo: strin
     return found ? { repo: found.repo, rel: path.relative(top, real(file)), top } : null;
   }
   let best: LocalRepo | null = null;
+  // Two repos on one checkout (a fact file built before `matchRepos` refused them): neither.
+  let tied = false;
   const abs = real(file);
   for (const entry of repos) {
     const base = real(entry.path);
-    if ((abs === base || abs.startsWith(`${base}${path.sep}`)) && (best === null || base.length > real(best.path).length)) best = entry;
+    if (!(abs === base || abs.startsWith(`${base}${path.sep}`))) continue;
+    const length = best === null ? -1 : real(best.path).length;
+    if (base.length > length) [best, tied] = [entry, false];
+    else if (base.length === length) tied = true;
   }
-  return best ? { repo: best.repo, rel: path.relative(real(best.path), abs), top: real(best.path) } : null;
+  return best && !tied ? { repo: best.repo, rel: path.relative(real(best.path), abs), top: real(best.path) } : null;
 }
 
 /** An HTTP row's method, lower case (`POST /orders` -> `post`); null for other protocols. */

@@ -63,7 +63,8 @@ export function localRepos(root: string): Array<{ name: string; path: string; re
  * is a remote (`owner/name`, as the index stores a GitHub repo) maps only to
  * the one checkout whose origin names exactly that; a bare name maps only to
  * the one checkout of exactly that name. No match, or more than one, leaves
- * the repo unmapped: its rows are never read.
+ * the repo unmapped: its rows are never read. Two header repos that map to
+ * one checkout (`api` and `owner/api`) are both left unmapped.
  */
 export function matchRepos(repos: readonly string[], local: ReturnType<typeof localRepos>): LocalRepo[] {
   const out: LocalRepo[] = [];
@@ -73,7 +74,7 @@ export function matchRepos(repos: readonly string[], local: ReturnType<typeof lo
       : local.filter((entry) => entry.name === repo);
     if (found.length === 1) out.push({ repo, path: found[0]!.path });
   }
-  return out;
+  return out.filter((entry) => out.filter((other) => other.path === entry.path).length === 1);
 }
 
 /** The `owner/name` an origin names, in either spelling git accepts, or the text itself. */

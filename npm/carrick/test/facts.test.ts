@@ -583,6 +583,18 @@ test("a fact file's repo maps to a checkout only by its exact remote, else its e
   assert.deepEqual(matchRepos(["jobs"], local), []);
 });
 
+test("R24.7: two header repos that map to one checkout are neither mapped", async () => {
+  const { matchRepos } = await import("../src/facts/fetch.ts");
+  const { locate } = await import("../src/facts/lines.ts");
+  const local = [{ name: "api", path: "/w/api", remote: "https://github.com/zeta/api" }];
+  assert.deepEqual(matchRepos(["api", "zeta/api"], local), []);
+  assert.deepEqual(matchRepos(["zeta/api"], local), [{ repo: "zeta/api", path: "/w/api" }]);
+  // A fact file built before this rule may still hold both: the edit is placed in neither.
+  const both = [{ repo: "api", path: "/w/api" }, { repo: "zeta/api", path: "/w/api" }];
+  assert.equal(locate("/w/api/src/a.ts", both), null);
+  assert.deepEqual(locate("/w/api/src/a.ts", [both[1]!]), { repo: "zeta/api", rel: "src/a.ts", top: "/w/api" });
+});
+
 test("a fact file for another project is not read", async (t) => {
   const ws = await factsWorkspace(t);
   const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(201).json(created);"] };
