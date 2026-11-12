@@ -168,6 +168,11 @@ pub struct DeclaredOperation {
     /// location so a reader lands on the handler rather than on `carrick.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
+    /// The line of this entry's `value` key in the `carrick.json` it was read
+    /// from; `None` when not read from a tracked file. Never serialized, so
+    /// `config_json` keeps what the repo declared.
+    #[serde(skip)]
+    pub line: Option<u32>,
 }
 
 impl DeclaredOperations {
@@ -245,6 +250,88 @@ struct RootConfig {
     flat: Config,
 }
 
+/// Fill `line` on every declared operation from the file text it was parsed
+/// from. A parse or shape miss leaves `None`; serde has already accepted the
+/// file, so this never fails the load.
+fn fill_operation_lines(blocks: &mut [DeclaredOperations], content: &str) {
+    let lines = operation_value_lines(content);
+    for (block, block_lines) in blocks.iter_mut().zip(lines) {
+        for (operation, line) in block.operations.iter_mut().zip(block_lines) {
+            operation.line = line;
+        }
+    }
+}
+
+/// The line of each `operations[k].operations[j]` entry's `"value"` key, read
+/// with the crate's swc parser on `(` + text + `)`: the wrapper sits on line
+/// one, so lines are the file's own.
+fn operation_value_lines(content: &str) -> Vec<Vec<Option<u32>>> {
+    use swc_common::{FileName, SourceMap, Spanned, sync::Lrc};
+    use swc_ecma_ast::{Expr, KeyValueProp, Prop, PropName, PropOrSpread};
+    use swc_ecma_parser::{Parser, StringInput, Syntax};
+
+    let map: Lrc<SourceMap> = Default::default();
+    let file = map.new_source_file(FileName::Anon.into(), format!("({content})"));
+    let Ok(expr) = Parser::new(Syntax::default(), StringInput::from(&*file), None).parse_expr()
+    else {
+        return Vec::new();
+    };
+
+    fn key_value<'a>(object: &'a Expr, name: &str) -> Option<&'a KeyValueProp> {
+        let Expr::Object(object) = object else {
+            return None;
+        };
+        object.props.iter().rev().find_map(|prop| {
+            let PropOrSpread::Prop(prop) = prop else {
+                return None;
+            };
+            let Prop::KeyValue(pair) = &**prop else {
+                return None;
+            };
+            let key = match &pair.key {
+                PropName::Str(text) => text.value.to_string_lossy().into_owned(),
+                PropName::Ident(ident) => ident.sym.to_string(),
+                _ => return None,
+            };
+            (key == name).then_some(pair)
+        })
+    }
+    fn elements(array: &Expr) -> Vec<Option<&Expr>> {
+        match array {
+            Expr::Array(array) => array
+                .elems
+                .iter()
+                .map(|element| element.as_ref().map(|e| &*e.expr))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    let mut expr: &Expr = &expr;
+    while let Expr::Paren(paren) = expr {
+        expr = &paren.expr;
+    }
+    let Some(blocks) = key_value(expr, "operations") else {
+        return Vec::new();
+    };
+    elements(&blocks.value)
+        .into_iter()
+        .map(|block| {
+            let entries = block
+                .and_then(|block| key_value(block, "operations"))
+                .map(|pair| elements(&pair.value))
+                .unwrap_or_default();
+            entries
+                .into_iter()
+                .map(|entry| {
+                    let pair = key_value(entry?, "value")?;
+                    Some(map.lookup_char_pos(pair.key.span().lo).line as u32)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Compare include paths by what they name, not by how they were typed:
 /// `lambdas/_shared`, `./lambdas/_shared`, and `lambdas/_shared/` are one root.
 /// Used only for matching an `includes` key against a service's `include`; the
@@ -309,8 +396,9 @@ impl Config {
         let mut services = Vec::new();
         for path in file_paths.iter() {
             let content = std::fs::read_to_string(path)?;
-            let root: RootConfig = serde_json::from_str(&content)
+            let mut root: RootConfig = serde_json::from_str(&content)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            fill_operation_lines(&mut root.operations, &content);
 
             let includes: BTreeMap<String, IncludeDeclarations> = root
                 .includes
@@ -1180,5 +1268,55 @@ mod tests {
         std::fs::write(&path, r#"{ "name": "single" }"#).unwrap();
         let services = Config::load_services(vec![path]).unwrap();
         assert!(services[0].nested_directories.is_empty());
+    }
+
+    /// carrick-cloud#3422 S1: each declared operation records the line of its
+    /// `value` key, and the line never reaches `config_json`.
+    #[test]
+    fn declared_operations_record_the_line_of_their_value_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carrick.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "services": [
+    { "name": "rpc", "directory": "." }
+  ],
+  "operations": [
+    {
+      "service": "rpc",
+      "route": "POST /rpc",
+      "dispatch": { "location": "body", "field": "kind" },
+      "operations": [
+        { "value": "a" },
+        {
+          "handler": "src/a.ts:b",
+          "value": "b"
+        }
+      ]
+    },
+    {
+      "service": "rpc",
+      "route": "POST /other",
+      "dispatch": { "location": "body", "field": "kind" },
+      "operations": [{ "value": "c" }]
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+        let services = Config::load_services(vec![path]).unwrap();
+        let blocks = &services[0].declared_operations;
+        let lines: Vec<Vec<Option<u32>>> = blocks
+            .iter()
+            .map(|block| block.operations.iter().map(|op| op.line).collect())
+            .collect();
+        assert_eq!(lines, vec![vec![Some(11), Some(14)], vec![Some(22)]]);
+        let json = serde_json::to_string(&services[0]).unwrap();
+        assert!(
+            !json.contains("\"line\""),
+            "config_json keeps no line: {json}"
+        );
     }
 }

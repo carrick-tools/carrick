@@ -1459,6 +1459,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         schema_binding: None,
         undeclared_selection: None,
         handler_span: endpoint.handler_span,
+        declared_at: endpoint.declared_at.clone(),
         name_scope: None,
         library_semantics: Vec::new(),
         inference: None,
@@ -1469,6 +1470,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
 /// pre-computed `canonical_path` ([`mount_graph_to_api_details`]).
 pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointDetails {
     ApiEndpointDetails {
+        declared_at: None,
         owner: None,
         key: OperationKey::http(&call.method, call.canonical_path.clone()),
         params: vec![],
@@ -2298,6 +2300,7 @@ mod tests {
                 )
             };
             data.endpoints = vec![ApiEndpointDetails {
+                declared_at: None,
                 procedure: None,
                 owner: None,
                 key: OperationKey::http("POST", "/orders".to_string()),
@@ -2546,6 +2549,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -2584,6 +2588,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
@@ -2604,6 +2609,7 @@ mod tests {
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "GET".to_string(),
             path: "/admin".to_string(),
@@ -2681,6 +2687,7 @@ mod tests {
         };
         let mut graph = MountGraph::new();
         let route = |dispatch: Option<Dispatch>| ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
@@ -2810,6 +2817,7 @@ mod tests {
 
         let mut graph = MountGraph::new();
         let row = |path: &str, file: &str, view_module: bool| ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "GET".to_string(),
             path: path.to_string(),
@@ -3449,6 +3457,7 @@ mod tests {
         use crate::graphql::SchemaBinding;
         use crate::operation::{GraphqlOperationKind, OperationKey};
         let row = |key: OperationKey, binding: Option<SchemaBinding>| ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             owner: None,
             key,
@@ -4504,5 +4513,37 @@ mod tests {
             older.response.as_ref().unwrap().verdict,
             crate::operation::TypeVerdict::Compatible
         );
+    }
+
+    /// carrick-cloud#3422 S4: the index row keeps the declaring line.
+    #[test]
+    fn mount_graph_projection_carries_declared_at() {
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let mut graph = MountGraph::new();
+        graph.endpoints.push(ResolvedEndpoint {
+            declared_at: Some("carrick.json:12".to_string()),
+            procedure: None,
+            view_module: false,
+            method: "POST".to_string(),
+            path: "/rpc".to_string(),
+            full_path: "/rpc".to_string(),
+            handler: None,
+            owner: "rpc".to_string(),
+            file_location: "src/a.ts:3".to_string(),
+            middleware_chain: vec![],
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            evidence: carrick_match::MatchEvidence::RouteDefinition,
+            resolution_source: None,
+            dispatch: None,
+            handler_span: None,
+            address: None,
+        });
+        let (endpoints, _calls) = mount_graph_to_api_details(&graph);
+        assert_eq!(endpoints[0].declared_at.as_deref(), Some("carrick.json:12"));
+        let json = serde_json::to_value(&endpoints[0]).unwrap();
+        assert_eq!(json["declared_at"], "carrick.json:12");
     }
 }

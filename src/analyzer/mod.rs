@@ -342,6 +342,11 @@ pub struct ApiEndpointDetails {
     /// the scan could not place, and on rows written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_span: Option<crate::mount_graph::HandlerSpan>,
+    /// Where `carrick.json` declares this operation, `carrick.json:<line>`;
+    /// set only on a row a written (not generated) `operations` block produced
+    /// from a tracked `carrick.json`. Retention only: matching never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_at: Option<String>,
     /// On a pub/sub or socket row stated through verified library claims
     /// (`resolution_source: library_claim`, carrick#1662): where its name
     /// means something. `global` pairs across services, any other scope
@@ -4996,6 +5001,7 @@ mod tests {
 
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -5927,6 +5933,7 @@ mod tests {
             "https://undeclared.test/v1/orders",
         ] {
             analyzer.calls.push(ApiEndpointDetails {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 owner: None,
@@ -5974,6 +5981,7 @@ mod tests {
     /// A call-site fixture for the host tests below.
     fn host_test_call(method: &str, url: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -6001,6 +6009,7 @@ mod tests {
 
     fn host_test_route(method: &str, path: &str) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: method.to_string(),
@@ -6093,6 +6102,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -6119,6 +6129,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -6192,6 +6203,7 @@ mod tests {
         for (consumer_source, producer_source, expected) in cases {
             let mut analyzer = Analyzer::new(Config::default());
             analyzer.calls.push(ApiEndpointDetails {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 owner: None,
@@ -6218,6 +6230,7 @@ mod tests {
 
             let mut mount_graph = MountGraph::new();
             mount_graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
@@ -6359,6 +6372,7 @@ mod tests {
         resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     ) -> ApiEndpointDetails {
         ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -6587,6 +6601,7 @@ mod tests {
         // The HTTP request on the same line is a fact, and so is its route.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -6674,6 +6689,7 @@ mod tests {
         ));
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7034,6 +7050,7 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -7070,6 +7087,7 @@ mod tests {
             ),
         ] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
@@ -7134,6 +7152,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for (path, is_view_module) in [("/dashboard", true), ("/api/orders", false)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: is_view_module,
                 method: "GET".to_string(),
@@ -7199,6 +7218,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
         let mut call = |value: Option<&str>, line: u32| {
             analyzer.calls.push(ApiEndpointDetails {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 owner: None,
@@ -7230,6 +7250,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for value in CASES {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
@@ -7291,6 +7312,7 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -7318,6 +7340,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for (value, line) in [("search-by-intent", 400), ("list-external-calls", 412)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
@@ -7426,6 +7449,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -7452,6 +7476,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7494,6 +7519,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -7522,6 +7548,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7566,6 +7593,7 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -7593,6 +7621,7 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         // The matched producer: an MSW-style handler under a mock tree.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -7613,6 +7642,7 @@ mod tests {
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7733,6 +7763,7 @@ mod tests {
         // reclassified to call-site evidence at scan time.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7824,6 +7855,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7897,6 +7929,7 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -7961,6 +7994,7 @@ mod tests {
     /// Producer endpoint in the mount graph, repo-tagged `"api"`.
     fn resolved(method: &str, full_path: &str) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: method.to_string(),

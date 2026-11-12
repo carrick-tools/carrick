@@ -407,6 +407,7 @@ mod tests {
 
     fn row(method: &str, path: &str, handler: &str, location: &str) -> ResolvedEndpoint {
         ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: method.to_string(),
             path: path.to_string(),

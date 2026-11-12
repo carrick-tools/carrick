@@ -4420,6 +4420,7 @@ mod tests {
         dispatch: Option<crate::dispatch::Dispatch>,
     ) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: method.to_string(),
@@ -9545,6 +9546,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         value: Option<&str>,
     ) -> crate::analyzer::ApiEndpointDetails {
         crate::analyzer::ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -9780,6 +9782,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         scope: Option<&str>,
     ) -> crate::analyzer::ApiEndpointDetails {
         crate::analyzer::ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
