@@ -268,12 +268,19 @@ test("naming rule 6: one name in two files is told apart by the edited file", as
   // A row file that exists but no longer declares the name is not proof the thing moved here.
   fs.writeFileSync(ws.at("orders-api/src/c.ts"), "export {};\n");
   assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), []);
-  // Once its file is gone, the one declaration of the name here is that thing, moved.
+  // Nor is its file being gone: a named row prints only in its own file.
   fs.rmSync(ws.at("orders-api/src/c.ts"));
-  assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), ["GET /c line"]);
-  // Not when the name is declared twice here.
-  fs.writeFileSync(ws.at("orders-api/src/d.ts"), "export function only() { return 5; }\nclass K { m() { function only() { return 6; } } }\n");
   assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), []);
+});
+
+test("R24.6: a new function whose only row sits in a file gone from the checkout prints nothing", async (t) => {
+  const ndjson = [
+    header(["web-app"]),
+    row({ side: "consumer", protocol: "http", label: "GET /orders/:id", repo: "web-app", file: "src/old/orders.ts", line: 3, name: "fetchOrder", text: "fetchOrder line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(ws.at("web-app/src/fresh.ts"), "export async function fetchOrder(id: string) {\n  return cache.read(id);\n}\n");
+  assert.deepEqual(await linesFor(ws, "web-app/src/fresh.ts", "return cache.read(id);"), []);
 });
 
 test("a row in another file whose name the edited file also declares is another thing", async (t) => {

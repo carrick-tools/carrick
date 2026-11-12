@@ -3,8 +3,8 @@
 // `text` (the cloud writes the sentence; this package adds none).
 //
 // A row is found by (repo, name): the named things the changed lines sit in
-// (`match.ts`), declared once in the edited file. A row prints for its own
-// file, or for a file that is gone (the thing moved here); never on a guess. A
+// (`match.ts`), declared once in the edited file. A row prints only for its
+// own file, never for a file it might have moved from. A
 // row with no name (an inline handler or a call at module top level) is found
 // only by its `site`, written as a string argument of the call around the
 // changed line, with an HTTP row's method as the callee's name; when that
@@ -134,21 +134,12 @@ function unnamedRows(rows: FactRow[], reached: readonly CallSpan[], fileCalls: r
 
 /**
  * The rows under `name` that are this file's thing. The caller has made sure
- * the edited file declares `name` exactly once. A row in the edited file is
- * its own; a row in another file counts only when every row under the name
- * sits in that one file and the file is gone from both the edit's checkout
- * and the repo's checkout (the thing moved here). A row file that is still
- * on disk, whatever it now declares, is another thing.
+ * the edited file declares `name` exactly once. Only a row in the edited file
+ * is its own: a row in another file, even one gone from disk, is never
+ * guessed to have moved here.
  */
-function namedRows(store: FactStore, repo: string, name: string, rel: string, checkouts: readonly string[]): FactRow[] {
-  const rows = store.byName(repo, name);
-  if (rows.length === 0) return [];
-  const files = new Set(rows.map((row) => row.file));
-  if (files.has(rel)) return rows.filter((row) => row.file === rel);
-  if (files.size > 1) return [];
-  const other = rows[0]!.file;
-  if (checkouts.some((top) => fs.existsSync(path.join(top, other)))) return [];
-  return rows;
+function namedRows(store: FactStore, repo: string, name: string, rel: string): FactRow[] {
+  return store.byName(repo, name).filter((row) => row.file === rel);
 }
 
 function rowKey(row: FactRow): string {
@@ -215,10 +206,9 @@ export async function factLines(
       // components) cannot say which one the edit reached.
       const declared = new Map<string, number>();
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
-      const checkouts = [at.top, where.get(at.repo)].filter((top): top is string => typeof top === "string");
       for (const name of reach.names) {
         if (declared.get(name) !== 1) continue;
-        rows.push(...namedRows(store, at.repo, name, at.rel, checkouts));
+        rows.push(...namedRows(store, at.repo, name, at.rel));
       }
       if (reach.calls.length > 0) {
         const unnamed = store.unnamed(at.repo, at.rel);
