@@ -6202,6 +6202,7 @@ export function listen(): void {
             &discovery,
             &crate::request_summary::decided_sites::Decided::default(),
             &[],
+            &[],
             &on.repo,
         );
         let row = rows
