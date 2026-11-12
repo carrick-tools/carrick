@@ -90,8 +90,8 @@ export function locate(file: string, repos: readonly LocalRepo[]): { repo: strin
   const top = linkedCheckoutTop(file);
   if (top !== null) {
     const main = mainCheckoutOf(top);
-    const found = main === null ? undefined : repos.find((entry) => real(entry.path) === real(main));
-    return found ? { repo: found.repo, rel: path.relative(top, real(file)), top } : null;
+    const found = main === null ? [] : repos.filter((entry) => real(entry.path) === real(main));
+    return found.length === 1 ? { repo: found[0]!.repo, rel: path.relative(top, real(file)), top } : null;
   }
   let best: LocalRepo | null = null;
   // Two repos on one checkout (a fact file built before `matchRepos` refused them): neither.

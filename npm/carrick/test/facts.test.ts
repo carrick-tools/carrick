@@ -1143,6 +1143,16 @@ test("an edit in a worktree path maps to its repo's rows", async (t) => {
   assert.equal(context(run.stdout), "POST /orders is called at web-app/src/boot.ts:4");
 });
 
+test("R24.7: a worktree of a checkout two fact-file repos map to is placed in neither", async (t) => {
+  const { locate } = await import("../src/facts/lines.ts");
+  const ws = await factsWorkspace(t);
+  const top = worktree(ws, "orders-api", "dup-branch");
+  const file = path.join(top, "src", "routes", "orders.ts");
+  const one = [{ repo: "orders-api", path: ws.at("orders-api") }];
+  assert.equal(locate(file, one)?.repo, "orders-api");
+  assert.equal(locate(file, [...one, { repo: "acme/orders-api", path: ws.at("orders-api") }]), null);
+});
+
 test("a file another session wrote in another worktree prints nothing here", async (t) => {
   const ws = await factsWorkspace(t);
   fs.mkdirSync(ws.at("web-app/.git"), { recursive: true });
