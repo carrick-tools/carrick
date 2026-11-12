@@ -59,9 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 
-use super::{
-    MethodValue, Piece, Reader, Scope, Value, concat, ident_key, render_target, to_string_object,
-};
+use super::{MethodValue, Piece, Reader, Scope, Value, concat, ident_key, render_target};
 use crate::type_manifest::is_http_method;
 
 /// How many readings a value may have before it is left as the opaque text it
@@ -277,8 +275,6 @@ impl Reader<'_> {
             Expr::TsSatisfies(e) => self.alternatives(&e.expr, scope),
             Expr::TsTypeAssertion(e) => self.alternatives(&e.expr, scope),
             Expr::Await(e) => self.alternatives(&e.arg, scope),
-            // `url.toString()` reads as the url, as `eval` reads it.
-            Expr::Call(call) => self.alternatives(to_string_object(call)?, scope),
             Expr::Cond(cond) => self.conditional(cond, scope),
             Expr::Tpl(tpl) => {
                 let mut readings = Alternatives::single(Vec::new());
