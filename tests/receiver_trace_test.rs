@@ -2890,7 +2890,7 @@ fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
     assert_eq!(vanilla(&graph).len(), 4, "{graph:?}");
     // One edge per call: `count` is called at `vanilla.ts:16` and
     // `hooks.ts:16`, `shelf.list` at `vanilla.ts:7`, `vanilla.ts:16` and
-    // `hooks.ts:7`.
+    // `hooks.ts:7`, and `subscribe.ts:13` (a `GET` subscription label).
     let edges = matched_producers("procedure-client");
     let calls_of = |producer: &str| {
         edges
@@ -2904,7 +2904,7 @@ fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
             calls_of("shelf.inner.get"),
             calls_of("shelf.list")
         ],
-        [2, 1, 3],
+        [2, 1, 4],
         "{edges:?}"
     );
 }
