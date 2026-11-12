@@ -1,4 +1,5 @@
 import { useCached } from "cache-kit";
+import { buildOptions } from "./shared";
 import { link } from "event-kit";
 import { LoadClient } from "cache-kit";
 
@@ -6,12 +7,35 @@ export function readX() {
   return useCached({ key: ["x"], load: () => fetch("/api/x") });
 }
 
-export function readGiven(options) {
+const options = { key: ["g"], load: () => fetch("/api/g") };
+const bare = { key: ["z"] };
+
+function loadOptions(id) {
+  return { key: [id], load: () => fetch(`/api/h/${id}`) };
+}
+
+export function readGiven() {
   return useCached(options);
 }
 
-export function readSpread(options) {
-  return useCached({ ...options });
+export function readFactory(id) {
+  return useCached(loadOptions(id));
+}
+
+export function readBuilt() {
+  return useCached(buildOptions("x"));
+}
+
+export function readBare() {
+  return useCached(bare);
+}
+
+export function readParam(given) {
+  return useCached(given);
+}
+
+export function readSpread(extra) {
+  return useCached({ ...extra });
 }
 
 const conn = link("ws://x");
