@@ -11,6 +11,8 @@ import os from "node:os";
 import path from "node:path";
 import { renderPostRead } from "../src/render.ts";
 import { readSession } from "../src/hook/reuse.ts";
+import { FACTS_MARKER } from "../src/facts/fetch.ts";
+import { factsPath, FACTS_STALE_MS, loadSqlite, touchFetched } from "../src/facts/store.ts";
 import { fakeEnv, fixture, fixturePath, runHook } from "./helpers.ts";
 import { context, lineOf, nameRow, nextCarrier, patchEdit, workspace } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
@@ -135,8 +137,13 @@ test("a fact said at the Read is not repeated at the edit, and the uses-count li
 });
 
 test("a Read never prints a same-name line", async (t) => {
-  const names = FN_NAMES.map((name) => nameRow(name, "web", `src/${name}.ts`));
-  const ws = await workspace(t, FILES, [...ROWS, ...names]);
+  // Peers really declare each name on the row's line (3), and the read file's own
+  // op and fn rows are left out so the cap is not full; one fn row elsewhere keeps
+  // `hasCallers` true. With `whole` in place of `read` these lines would print.
+  const names = FN_NAMES.map((name) => nameRow(name, "web", `src/dup/${name}.ts`));
+  const dups = Object.fromEntries(FN_NAMES.map((name) => [`web/src/dup/${name}.ts`, `// a\n// b\nexport function ${name}() {\n  return 1;\n}\n`]));
+  const elsewhere = { ...fnRows[0], repo: "web", file: "src/client.ts", name: "c", text: "c is called from x" };
+  const ws = await workspace(t, { ...FILES, ...dups }, [...names, elsewhere]);
   const log = logPath(t);
   const run = await read(ws, "api/src/orders.ts", "read-name", log);
   assert.ok(!context(run.stdout).includes("a function named"), context(run.stdout));
@@ -144,6 +151,32 @@ test("a Read never prints a same-name line", async (t) => {
     Object.keys(readSession("read-name", ws.home).facts).filter((key) => key.startsWith("name::")),
     [],
   );
+});
+
+test("a throwing fn lookup sends the Read to the binary's check, once (P7)", async (t) => {
+  const ws = await workspace(t, FILES, ROWS);
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root));
+  db.prepare("UPDATE fns SET others = 'not json' WHERE name = 'listOrders'").run();
+  db.close();
+  const log = logPath(t);
+  const run = await read(ws, "api/src/orders.ts", "read-throws", log);
+  assert.equal(argvCalls(log), 1);
+  const answer = renderPostRead(fixture("check-uses.json"), "api/src/orders.ts");
+  assert.ok(answer, "the fixture has an answer");
+  assert.ok(context(run.stdout).includes(answer), context(run.stdout));
+});
+
+test("a stale fact file starts the refresh at a Read, a fresh one does not", async (t) => {
+  const refresh = { CARRICK_NO_FACTS_REFRESH: "" };
+  const marker = (ws: Ws) => path.join(ws.root, ".carrick", FACTS_MARKER);
+  const fresh = await workspace(t, FILES, ROWS);
+  await read(fresh, "api/src/orders.ts", "read-fresh", logPath(t), refresh);
+  assert.equal(fs.existsSync(marker(fresh)), false, "a fresh file starts no refresh");
+  const old = await workspace(t, FILES, ROWS);
+  await touchFetched(old.root, new Date(Date.now() - 2 * FACTS_STALE_MS).toISOString());
+  await read(old, "api/src/orders.ts", "read-stale", logPath(t), refresh);
+  assert.equal(fs.existsSync(marker(old)), true, "a stale file starts the refresh");
 });
 
 test("a types-only file keeps today's answer", async (t) => {

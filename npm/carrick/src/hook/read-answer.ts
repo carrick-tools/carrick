@@ -99,6 +99,8 @@ export async function answerReads(
           );
     if (outcome !== null) {
       factsMs = (factsMs ?? 0) + outcome.ms;
+      // A missing or stale fact file is refreshed in the background, detached, as at an edit.
+      if (outcome.stale) (await import("../facts/fetch.ts")).startFactsRefresh(root);
       contexts.push(...outcome.lines);
       used.push(...outcome.used);
       Object.assign(claims, outcome.claims);
