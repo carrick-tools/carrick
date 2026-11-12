@@ -287,3 +287,71 @@ test("a file answered in hand counts as covered", () => {
     s.cleanup();
   }
 });
+
+function sessionFile(home: string, session: string, seq: string, kind: string): string {
+  return path.join(home, ".carrick", "sessions", `${session}.recheck.${seq}.${kind}`);
+}
+
+
+/** An entry with a pending file, an answer and a delivered marker, written by hand. */
+function plantDelivered(s: ReturnType<typeof scratch>, session: string, seq: string, file: string): void {
+  const entry = { seq, session, file, relative: path.basename(file), root: s.root, enqueued_at: new Date(0).toISOString(), attempts: 0 };
+  fs.mkdirSync(path.join(s.home, ".carrick", "sessions"), { recursive: true });
+  fs.writeFileSync(sessionFile(s.home, session, seq, "pending.json"), JSON.stringify(entry));
+  fs.writeFileSync(sessionFile(s.home, session, seq, "answer.json"), JSON.stringify({ ...entry, state: "answered", result: undefined }));
+  fs.writeFileSync(sessionFile(s.home, session, seq, "delivered"), "{}");
+}
+
+test("finishedFor marks answers no carrier will deliver", async () => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    for (let i = 0; i < 100; i++) plantDelivered(s, "s1", `000000000${String(i).padStart(4, "0")}-1-0001`, s.file(`other${i}.ts`));
+    const [one] = enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    const [two] = enqueue(s.root, "s1", [s.file("a.ts")], now + 1, { home: s.home });
+    const [three] = enqueue(s.root, "s1", [s.file("a.ts")], now + 2, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    assert.deepEqual(finishedFor("s1", s.home).map((a) => a.seq), [three!.seq]);
+    for (const e of [one!, two!]) {
+      assert.ok(fs.existsSync(sessionFile(s.home, "s1", e.seq, "delivered")), `${e.seq} claimed`);
+    }
+    assert.equal(fs.existsSync(sessionFile(s.home, "s1", three!.seq, "delivered")), false, "the newest is still owed");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a session with nothing owed reads no file", async (t) => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    for (let i = 0; i < 100; i++) plantDelivered(s, "s1", `000000000${String(i).padStart(4, "0")}-1-0001`, s.file(`other${i}.ts`));
+    const [one] = enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    assert.equal(claimDelivery("s1", one!.seq, s.home), true);
+    const read = t.mock.method(fs, "readFileSync");
+    assert.deepEqual(finishedFor("s1", s.home), []);
+    const sessionReads = read.mock.calls.filter((c) => /\.(pending|answer)\.json$/.test(String(c.arguments[0])));
+    assert.equal(sessionReads.length, 0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("one new owed answer among 100 delivered entries reads only pending entries from its seq", async (t) => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    for (let i = 0; i < 100; i++) plantDelivered(s, "s1", `000000000${String(i).padStart(4, "0")}-1-0001`, s.file(`other${i}.ts`));
+    const [one] = enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
+    await runQueue(s.root, { env: env(s), home: s.home });
+    const read = t.mock.method(fs, "readFileSync");
+    assert.deepEqual(finishedFor("s1", s.home).map((a) => a.seq), [one!.seq]);
+    const pendingReads = read.mock.calls.map((c) => String(c.arguments[0])).filter((f) => f.endsWith(".pending.json"));
+    assert.equal(pendingReads.length, 1, "only the owed entry's own pending file");
+    assert.ok(pendingReads[0]!.includes(one!.seq));
+  } finally {
+    s.cleanup();
+  }
+});
