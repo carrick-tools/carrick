@@ -163,9 +163,59 @@ test("naming rule 6: one name in two files is told apart by the edited file", as
   assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 4;"), []);
   // `only` is still declared in its own file, so this `only` is another thing.
   assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), []);
-  // Once its file no longer declares it, the thing moved here.
+  // A row file that exists but no longer declares the name is not proof the thing moved here.
   fs.writeFileSync(ws.at("orders-api/src/c.ts"), "export {};\n");
+  assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), []);
+  // Once its file is gone, the one declaration of the name here is that thing, moved.
+  fs.rmSync(ws.at("orders-api/src/c.ts"));
   assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), ["GET /c line"]);
+  // Not when the name is declared twice here.
+  fs.writeFileSync(ws.at("orders-api/src/d.ts"), "export function only() { return 5; }\nclass K { m() { function only() { return 6; } } }\n");
+  assert.deepEqual(await linesFor(ws, "orders-api/src/d.ts", "return 5;"), []);
+});
+
+test("a row in another file whose name the edited file also declares is another thing", async (t) => {
+  const ndjson = [
+    header(["orders-api", "web-app"]),
+    row({ side: "consumer", protocol: "http", label: "GET /orders", repo: "orders-api", file: "src/client.ts", line: 2, name: "fetchAll", text: "fetchAll line" }),
+    row({ side: "consumer", protocol: "http", label: "GET /orders", repo: "web-app", file: "src/Page.tsx", line: 3, name: "load", text: "load line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(ws.at("orders-api/src/client.ts"), 'export async function fetchAll<T>(url: string): Promise<T> {\n  return http.get("/orders");\n}\n');
+  fs.writeFileSync(ws.at("orders-api/src/jobs.ts"), "export function fetchAll() {\n  return queue.drain();\n}\n");
+  assert.deepEqual(await linesFor(ws, "orders-api/src/jobs.ts", "return queue.drain();"), []);
+  // The row's file does not read cleanly: never "not declared there".
+  fs.writeFileSync(ws.at("web-app/src/Page.tsx"), 'const pick = <T,>(a: T) => a;\nexport function load() {\n  return api.get("/orders"\n}\n');
+  fs.writeFileSync(ws.at("web-app/src/cron.ts"), "export function load() {\n  return cache.warm();\n}\n");
+  assert.deepEqual(await linesFor(ws, "web-app/src/cron.ts", "return cache.warm();"), []);
+});
+
+test("a name declared twice in the edited file prints nothing for that name", async (t) => {
+  const ndjson = [
+    header(["web-app"]),
+    row({ side: "consumer", protocol: "socket", label: "CLIENT->SERVER chat:send", repo: "web-app", file: "src/chat.tsx", line: 3, name: "onMessage", site: "chat:send", text: "onMessage line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("web-app/src/chat.tsx"),
+    [
+      "export function Inbox() {",
+      "  const onMessage = (text: string) => {",
+      '    socket.emit("chat:send", text);',
+      "  };",
+      "  return <List onMessage={onMessage} />;",
+      "}",
+      "export function Thread() {",
+      "  const onMessage = (text: string) => {",
+      "    log(text);",
+      "  };",
+      "  return <List onMessage={onMessage} />;",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "web-app/src/chat.tsx", "    log(text);"), []);
+  assert.deepEqual(await linesFor(ws, "web-app/src/chat.tsx", '    socket.emit("chat:send", text);'), []);
 });
 
 test("an inline handler is found by the operation string written at its site, and only when it is unique", async (t) => {

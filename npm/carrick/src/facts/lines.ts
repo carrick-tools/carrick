@@ -134,21 +134,22 @@ function unnamedRows(rows: FactRow[], reached: CallSpan[], fileCalls: CallSpan[]
   return out;
 }
 
-/** The rows under `name` that are this file's thing, by the file filter. */
-function namedRows(store: FactStore, repo: string, name: string, rel: string, top: string): FactRow[] {
+/**
+ * The rows under `name` that are this file's thing. The caller has made sure
+ * the edited file declares `name` exactly once. A row in the edited file is
+ * its own; a row in another file counts only when every row under the name
+ * sits in that one file and the file is gone from both the edit's checkout
+ * and the repo's checkout (the thing moved here). A row file that is still
+ * on disk, whatever it now declares, is another thing.
+ */
+function namedRows(store: FactStore, repo: string, name: string, rel: string, checkouts: readonly string[]): FactRow[] {
   const rows = store.byName(repo, name);
   if (rows.length === 0) return [];
   const files = new Set(rows.map((row) => row.file));
   if (files.has(rel)) return rows.filter((row) => row.file === rel);
   if (files.size > 1) return [];
-  // One other file holds every row: the edit is the same thing moved, unless
-  // that file still declares the name, in which case it is another thing.
-  const other = path.join(top, rows[0]!.file);
-  try {
-    if (scanSource(fs.readFileSync(other, "utf8"), isJsx(other)).spans.some((span) => span.name === name)) return [];
-  } catch {
-    // The file is gone: the thing moved here.
-  }
+  const other = rows[0]!.file;
+  if (checkouts.some((top) => fs.existsSync(path.join(top, other)))) return [];
   return rows;
 }
 
@@ -201,7 +202,15 @@ export async function factLines(
       if (ranges.length === 0) continue;
       const reach = touched(text, scan, ranges);
       const rows: FactRow[] = [];
-      for (const name of reach.names) rows.push(...namedRows(store, at.repo, name, at.rel, at.top));
+      // A name declared twice in this file (a handler of one name in two
+      // components) cannot say which one the edit reached.
+      const declared = new Map<string, number>();
+      for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
+      const checkouts = [at.top, where.get(at.repo)].filter((top): top is string => typeof top === "string");
+      for (const name of reach.names) {
+        if (declared.get(name) !== 1) continue;
+        rows.push(...namedRows(store, at.repo, name, at.rel, checkouts));
+      }
       if (reach.calls.length > 0) {
         const unnamed = store.unnamed(at.repo, at.rel);
         if (unnamed.length > 0) {
