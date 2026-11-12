@@ -26,7 +26,7 @@ own.
 
 ## The answer key
 
-No row at the shadowed sites:
+No row at the shadowed sites states the outer value (`own-fetch.ts:6` states no row at all):
 
 | site | what the call sends | wrong fact stated before |
 |---|---|---|
@@ -44,8 +44,8 @@ No row at the shadowed sites:
 | `whole-url.ts:6` | `POST /api/local-answer` | `POST ${process.env.HELPDESK_URL}/api/answer` |
 | `literal-base.ts:6` | `DELETE http://other.example.com/status` | `DELETE http://api.example.com/status` |
 
-The shadowed sites state nothing rather than the inner value: a block's own
-declarations are not read, so the site is left to the model's row.
+A shadowed site may state the inner value, or less where the base is not read,
+through the store's label for `fetch`; it never states the outer one.
 
 These rows are stated:
 
