@@ -33,6 +33,7 @@ const STATED: &[&str] = &[
     "unread_sites",
     "unread_sites_total",
     "unread_sites_by_reason",
+    "unread_sites_not_listed",
     "compat_verdicts",
     "pair_outcomes",
     "call_through",

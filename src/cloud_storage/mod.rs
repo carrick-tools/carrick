@@ -910,7 +910,7 @@ pub struct CloudRepoData {
     /// [`crate::unread_sites`]): the possible calls, and the calls whose walk
     /// stopped with no labelled library call. At most
     /// [`crate::unread_sites::MAX_PER_SERVICE`] per service, labelled rows
-    /// first. Never a row, never an input to matching, findings or the PR
+    /// first, then whole files in a fixed sample order. Never a row, never an input to matching, findings or the PR
     /// result. Written wherever the site pass reads the service. Additive
     /// and optional: `None` is "this scanner did not state it", never "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -923,6 +923,15 @@ pub struct CloudRepoData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread_sites_by_reason:
         Option<std::collections::BTreeMap<crate::request_summary::Stop, u32>>,
+    /// Per file, how many unread sites the cap left out of `unread_sites`
+    /// (carrick#3688 U7). Keys are spelled exactly as `UnreadSite.file`.
+    /// Present only when the cap cut rows, never empty, never a zero entry;
+    /// then `unread_sites_total` is the listed rows plus the sum of these.
+    /// Absent with `unread_sites_total` above the listed rows is a blob
+    /// from before this key: which files were cut is unknown. Top level,
+    /// never inside `boundary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_not_listed: Option<std::collections::BTreeMap<String, u32>>,
     /// What the call-through pass reads of this service from another one
     /// (carrick#2378): its model rows at calls through its own code, its
     /// definitions that hand back a request's parsed body, and its calls
@@ -1217,6 +1226,7 @@ impl CloudRepoData {
             possible_calls_omitted: None,
             unread_sites: None,
             unread_sites_total: None,
+            unread_sites_not_listed: None,
             unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
@@ -2917,6 +2927,7 @@ mod tests {
             possible_calls_omitted: None,
             unread_sites: None,
             unread_sites_total: None,
+            unread_sites_not_listed: None,
             unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,

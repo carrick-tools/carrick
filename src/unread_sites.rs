@@ -13,10 +13,13 @@
 //!   before this field, until its readers move to this one (U5).
 //! - **Never an input.** Nothing here feeds findings, the type check, the
 //!   matcher or the PR result.
-//! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service, the rows that
-//!   reached a labelled library call first, then by file, line and span.
-//!   `unread_sites_total` and `unread_sites_by_reason` count every row,
-//!   past the cap too.
+//! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service. The rows that
+//!   reached a labelled library call stay first; past the cap the rest are
+//!   kept as whole files, sampled in sha256-of-path order, so no folder
+//!   sorts out of the list. The listed rows are written by file, line and
+//!   span. `unread_sites_total` and `unread_sites_by_reason` count every
+//!   row, past the cap too, and `unread_sites_not_listed` names each file
+//!   the cut left rows of, with its count (total = listed + not listed).
 //! - **Words.** `reason` and `also` are [`Stop`] words; the phrase a reader
 //!   shows for each is `npm/carrick/src/unread-reasons.json`. Files are
 //!   repo-relative.
@@ -28,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::possible_calls::{
@@ -465,12 +469,18 @@ pub struct Capped {
     /// Every row once, past the cap too.
     pub total: usize,
     pub by_reason: BTreeMap<Stop, u32>,
+    /// Per file, the rows the cap left out. Empty when it cut nothing.
+    pub not_listed: BTreeMap<String, u32>,
 }
 
 /// Drop a repeat of one call (a possible call first, then a row that
 /// reached a labelled call), count what is left, and keep
-/// [`MAX_PER_SERVICE`]: the rows with a labelled end first, then by file,
-/// line and span.
+/// [`MAX_PER_SERVICE`]. Past the cap, files are walked in sha256-of-path
+/// order twice: first each file's labelled rows, then each file's
+/// unlabelled rows, each kept only whole and only if it fits what is left
+/// (a file that does not fit is skipped and the walk goes on). Every row
+/// not kept adds one to its file in `not_listed`. The kept rows are sorted
+/// labelled first, then by file, line and span.
 pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
     rows.sort_by(|a, b| {
         (a.at(), !a.listed, a.labelled_end.is_none()).cmp(&(
@@ -484,6 +494,46 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
     let mut by_reason: BTreeMap<Stop, u32> = BTreeMap::new();
     for row in &rows {
         *by_reason.entry(row.reason).or_default() += 1;
+    }
+    let total = rows.len();
+    let mut not_listed: BTreeMap<String, u32> = BTreeMap::new();
+    if total > MAX_PER_SERVICE {
+        let mut files: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let entry = files.entry(row.file.as_str()).or_default();
+            if row.labelled_end.is_some() {
+                entry.0.push(i);
+            } else {
+                entry.1.push(i);
+            }
+        }
+        let mut order: Vec<(Vec<u8>, &str)> = files
+            .keys()
+            .map(|file| (Sha256::digest(file.as_bytes()).to_vec(), *file))
+            .collect();
+        order.sort();
+        let mut keep = vec![false; total];
+        let mut left = MAX_PER_SERVICE;
+        for labelled in [true, false] {
+            for (_, file) in &order {
+                let (with, without) = &files[file];
+                let group = if labelled { with } else { without };
+                if group.len() <= left {
+                    left -= group.len();
+                    for &i in group {
+                        keep[i] = true;
+                    }
+                }
+            }
+        }
+        let mut kept = keep.iter();
+        rows.retain(|row| {
+            let keeps = *kept.next().unwrap_or(&false);
+            if !keeps {
+                *not_listed.entry(row.file.clone()).or_default() += 1;
+            }
+            keeps
+        });
     }
     rows.sort_by(|a, b| {
         (
@@ -501,12 +551,11 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
                 b.span_end,
             ))
     });
-    let total = rows.len();
-    rows.truncate(MAX_PER_SERVICE);
     Capped {
         rows,
         total,
         by_reason,
+        not_listed,
     }
 }
 
@@ -530,6 +579,7 @@ pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[Possib
         mut rows,
         total,
         by_reason,
+        not_listed,
     } = cap(rows);
     // The ends the possible call at the same span reaches (carrick#3818).
     let ends: BTreeMap<(&str, u32, u32), &Vec<PossibleEnd>> = data
@@ -552,6 +602,7 @@ pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[Possib
     data.unread_sites = Some(rows);
     data.unread_sites_total = (total > 0).then_some(total as u32);
     data.unread_sites_by_reason = (!by_reason.is_empty()).then_some(by_reason);
+    data.unread_sites_not_listed = (!not_listed.is_empty()).then_some(not_listed);
 }
 
 #[cfg(test)]
@@ -630,7 +681,13 @@ mod tests {
         };
         rows.push(labelled.clone());
         let capped = cap(rows);
-        assert_eq!(capped.rows.len(), MAX_PER_SERVICE);
+        // `a.ts` (2,009 rows) is cut whole: the rows listed are `zz.ts`
+        // and `z.ts`, the cost of keeping whole files (carrick#3688 U7).
+        assert_eq!(capped.rows.len(), 2);
+        assert_eq!(
+            capped.not_listed,
+            BTreeMap::from([("a.ts".to_string(), 2009)])
+        );
         assert_eq!(capped.total, MAX_PER_SERVICE + 11);
         assert_eq!(capped.rows[0], labelled, "the labelled row leads");
         assert_eq!(
@@ -641,6 +698,123 @@ mod tests {
                 (Stop::Recursion, 1),
             ])
         );
+    }
+
+    fn file_rows(file: &str, n: u32) -> Vec<UnreadSite> {
+        (1..=n).map(|l| stop(file, l, Stop::ValueCallee)).collect()
+    }
+
+    fn labelled_row(file: &str, line: u32) -> UnreadSite {
+        UnreadSite {
+            labelled_end: Some(LabelledEndRef {
+                package: "a-http-lib".to_string(),
+                export: "Client".to_string(),
+                member: None,
+            }),
+            ..stop(file, line, Stop::Unplaced)
+        }
+    }
+
+    /// 358 files of 7 rows under `a/` and 71 under `z/`.
+    fn two_folders() -> Vec<UnreadSite> {
+        let mut rows = Vec::new();
+        for i in 0..358 {
+            rows.extend(file_rows(&format!("a/f{i}.ts"), 7));
+        }
+        for i in 0..71 {
+            rows.extend(file_rows(&format!("z/f{i}.ts"), 7));
+        }
+        rows
+    }
+
+    #[test]
+    fn a_folder_that_sorts_last_keeps_rows_past_the_cap() {
+        let capped = cap(two_folders());
+        assert!(capped.rows.iter().any(|r| r.file.starts_with("z/")));
+    }
+
+    #[test]
+    fn past_the_cap_every_file_is_whole_or_counted() {
+        let capped = cap(two_folders());
+        let mut listed: BTreeMap<&str, u32> = BTreeMap::new();
+        for row in &capped.rows {
+            *listed.entry(row.file.as_str()).or_default() += 1;
+        }
+        assert!(capped.rows.len() <= MAX_PER_SERVICE);
+        assert_eq!(capped.total, 3003);
+        for (file, n) in &listed {
+            assert_eq!(*n, 7, "{file} is split");
+            assert!(!capped.not_listed.contains_key(*file), "{file} both");
+        }
+        for (file, n) in &capped.not_listed {
+            assert_eq!(*n, 7, "{file}");
+            assert!(*n >= 1);
+        }
+        let cut: u32 = capped.not_listed.values().sum();
+        assert_eq!(capped.total, capped.rows.len() + cut as usize);
+    }
+
+    /// The big file's name hashes first in sha256 order (computed by running
+    /// the hash over candidate names): `big0.ts` is the first of the 11 files.
+    #[test]
+    fn a_file_larger_than_the_cap_is_counted_not_split() {
+        let mut names: Vec<String> = (0..10).map(|i| format!("s{i}.ts")).collect();
+        let big = (0..)
+            .map(|i| format!("big{i}.ts"))
+            .find(|b| {
+                let h = |f: &str| Sha256::digest(f.as_bytes()).to_vec();
+                names.iter().all(|n| h(b) < h(n))
+            })
+            .unwrap();
+        let mut rows = file_rows(&big, 2100);
+        for n in names.drain(..) {
+            rows.extend(file_rows(&n, 3));
+        }
+        let capped = cap(rows);
+        assert_eq!(capped.rows.len(), 30);
+        assert_eq!(capped.not_listed, BTreeMap::from([(big, 2100)]));
+    }
+
+    #[test]
+    fn every_labelled_row_stays_listed_under_the_labelled_cap() {
+        let mut rows = Vec::new();
+        for i in 0..300 {
+            for l in 1..=5 {
+                rows.push(labelled_row(&format!("f{i}.ts"), l));
+            }
+        }
+        for i in 0..250 {
+            for l in 100..108 {
+                rows.push(stop(&format!("f{i}.ts"), l, Stop::ValueCallee));
+            }
+        }
+        let capped = cap(rows);
+        let labelled = capped.rows.iter().filter(|r| r.labelled_end.is_some());
+        assert_eq!(labelled.count(), 1500);
+        assert_eq!(capped.rows.len(), MAX_PER_SERVICE);
+        assert_eq!(capped.total, 3500);
+    }
+
+    #[test]
+    fn under_the_cap_nothing_moves() {
+        let mut rows = vec![
+            stop("b.ts", 2, Stop::ValueCallee),
+            stop("a.ts", 9, Stop::ValueCallee),
+            labelled_row("z.ts", 1),
+        ];
+        for l in 1..=27 {
+            rows.push(stop("c.ts", l, Stop::Recursion));
+        }
+        let capped = cap(rows);
+        assert_eq!(capped.rows.len(), 30);
+        assert!(capped.not_listed.is_empty());
+        assert_eq!(capped.rows[0].file, "z.ts");
+        assert_eq!(capped.rows[1].file, "a.ts");
+        assert_eq!(capped.rows[2].file, "b.ts");
+        assert_eq!(capped.rows[3].file, "c.ts");
+        let mut data = blob();
+        attach(&mut data, capped.rows, &[]);
+        assert!(data.unread_sites_not_listed.is_none());
     }
 
     /// One call found twice is one row: the possible call's.
@@ -701,11 +875,13 @@ mod tests {
         assert!(data.unread_sites.is_none());
         assert!(data.unread_sites_total.is_none());
         assert!(data.unread_sites_by_reason.is_none());
+        assert!(data.unread_sites_not_listed.is_none());
         let wire = serde_json::to_value(&data).unwrap();
         for key in [
             "unread_sites",
             "unread_sites_total",
             "unread_sites_by_reason",
+            "unread_sites_not_listed",
         ] {
             assert!(wire.get(key).is_none(), "{key} written on an old blob");
         }
@@ -754,6 +930,13 @@ mod tests {
             ])
         );
         assert_eq!(wire["unread_sites_total"], 2);
+        assert!(wire.get("unread_sites_not_listed").is_none());
+        data.unread_sites_not_listed = Some(BTreeMap::from([("src/c.ts".to_string(), 3)]));
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["unread_sites_not_listed"],
+            serde_json::json!({"src/c.ts": 3})
+        );
+        data.unread_sites_not_listed = None;
         assert_eq!(
             wire["unread_sites_by_reason"],
             serde_json::json!({"value_callee": 1, "several_values": 1})

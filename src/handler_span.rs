@@ -471,6 +471,7 @@ mod tests {
             possible_calls_omitted: None,
             unread_sites: None,
             unread_sites_total: None,
+            unread_sites_not_listed: None,
             unread_sites_by_reason: None,
             call_through: None,
             route_boundaries: None,
