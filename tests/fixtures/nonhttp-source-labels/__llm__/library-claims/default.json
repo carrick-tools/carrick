@@ -27,6 +27,7 @@
        "of": "instance:()",
        "op": "receive",
        "name": { "arg": 0 },
+       "name_scope": { "scope": "global", "namespace": null },
        "picker": "fixture-picker"
       }
      ],
