@@ -148,8 +148,8 @@ test("bashTargets reads the shapes the agents use and skips writes", (t) => {
   assert.deepEqual(at("grep -n backfill.ts src").reads, [], "the pattern is not a file");
   assert.deepEqual(at("awk '{print}' src/capture/backfill.ts").reads, [f]);
   assert.deepEqual(at("git show HEAD:src/capture/backfill.ts", path.join(w.worktree, "src")).reads, [f]);
-  assert.deepEqual(at("sed -i s/a/b/ src/capture/backfill.ts"), { reads: [], writes: [f] });
-  assert.deepEqual(at("cat src/capture/backfill.ts > src/capture/backfill.ts"), { reads: [], writes: [f] });
+  assert.deepEqual(at("sed -i s/a/b/ src/capture/backfill.ts"), { reads: [], writes: [f], factWrites: [] });
+  assert.deepEqual(at("cat src/capture/backfill.ts > src/capture/backfill.ts"), { reads: [], writes: [f], factWrites: [] });
   assert.deepEqual(at("rg -g '*.ts' foo").reads, []);
   assert.deepEqual(at("cat src/missing.ts").reads, []);
 });

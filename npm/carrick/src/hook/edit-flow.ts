@@ -49,6 +49,11 @@ export async function editFlow(
      * worktree (another session's) gets no fact lines.
      */
     shell?: boolean;
+    /**
+     * Files the fact path reads that the probe does not (JavaScript, `FACT_FILE`):
+     * they get fact lines and nothing else, so `edited` may be empty.
+     */
+    factOnly?: string[];
   },
   edited: string[],
   extra: string[] = [],
@@ -61,7 +66,7 @@ export async function editFlow(
   const choice = resolveRoot({
     clientRoot: cwd,
     projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null,
-    filePath: edited[0]!,
+    filePath: (edited[0] ?? input.factOnly?.[0])!,
   });
   const note = rootNote(choice);
   if (note) log(note);
@@ -69,7 +74,7 @@ export async function editFlow(
   // earlier did not read this edit (`checked.ts`). The files themselves are
   // recorded once the probe has answered (below).
   const editedAt = Date.now();
-  if (session) recordEdit(session, choice.root, editedAt);
+  if (session && edited.length > 0) recordEdit(session, choice.root, editedAt);
 
   const contexts: string[] = [];
   // Files whose uses lines this message carries, remembered only once it is
@@ -83,7 +88,7 @@ export async function editFlow(
   // re-scan: an answer that needs none (the file reads the same, no service
   // reads it, a known miss) comes back at once and prints below. Every other
   // file is queued for the background runner (carrick#3198).
-  const answers = await probeEdits(relatives, choice.root);
+  const answers = edited.length > 0 ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
   if (input.timing) input.timing.waitedMs = answers.ms;
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
@@ -167,7 +172,7 @@ export async function editFlow(
   // probe's answer, never instead of it.
   const facts = await factLines(
     choice.root,
-    edited
+    [...edited, ...(input.factOnly ?? [])]
       .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
       .map((file) => ({ file, ...input.changes?.get(file) })),
     session,

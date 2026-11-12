@@ -113,9 +113,9 @@ export function withExcludeBlock(existing: string | null, relatives: string[]): 
   return `${EXCLUDE_BEGIN}\n${relatives.map(asPattern).join("\n")}\n${EXCLUDE_END}\n${body}`;
 }
 
-/** What `git` prints for these arguments in this folder, or null when it says nothing. */
-function git(repo: string, args: string[]): string | null {
-  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", timeout: 5000 });
+/** What `git` prints for these arguments in this folder, or null when it says nothing (or runs past `timeoutMs`). */
+export function git(repo: string, args: string[], timeoutMs = 5000): string | null {
+  const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8", timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
   if (result.status !== 0 || typeof result.stdout !== "string") return null;
   return result.stdout;
 }
