@@ -271,6 +271,9 @@ pub fn apply_declared_operations(
                     declared_location(operation, carried.as_ref(), handlers);
                 graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
                     procedure: None,
+                    declared_at: (!block.is_generated())
+                        .then(|| operation.line.map(|line| format!("carrick.json:{line}")))
+                        .flatten(),
                     method: method.clone(),
                     path: path.clone(),
                     full_path: path.clone(),
@@ -1042,6 +1045,7 @@ mod tests {
                 .map(|value| crate::config::DeclaredOperation {
                     value: value.to_string(),
                     handler: Some(format!("lambdas/check-or-upload/index.ts:handle-{value}")),
+                    line: None,
                 })
                 .collect(),
             source: None,
@@ -1338,6 +1342,7 @@ mod tests {
     fn a_declaration_replaces_the_inferred_rows_for_its_route() {
         let mut graph = crate::mount_graph::MountGraph::new();
         graph.endpoints.push(crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
@@ -1385,6 +1390,7 @@ mod tests {
 
         let mut graph = crate::mount_graph::MountGraph::new();
         let inferred = |value: &str| crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
@@ -1486,6 +1492,7 @@ mod tests {
         );
         let mut consumer = blob("mcp-server", None);
         consumer.calls.push(crate::analyzer::ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             owner: None,
             key: crate::operation::OperationKey::http("POST", "/types/check-or-upload"),
@@ -1580,6 +1587,7 @@ mod tests {
         dispatch: Option<Dispatch>,
     ) -> crate::analyzer::ApiEndpointDetails {
         crate::analyzer::ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             owner: None,
             key: crate::operation::OperationKey::http("POST", "/notices"),
@@ -1900,6 +1908,7 @@ mod tests {
                     operations: vec![crate::config::DeclaredOperation {
                         value: "upload-logs".to_string(),
                         handler: None,
+                        line: None,
                     }],
                     source: None,
                 }],
@@ -1972,5 +1981,37 @@ mod tests {
         let kept = dupes.normalized().expect("a table with values is kept");
         assert_eq!(kept.field, "action");
         assert_eq!(kept.values, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// carrick-cloud#3422 S3: a written block's rows name the `carrick.json`
+    /// line of their `value` key; a generated block's rows name nothing. The
+    /// row's `file_location` is untouched.
+    #[test]
+    fn declared_rows_name_the_line_that_declares_them() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dispatch-generated/carrick.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line_of = |value: &str| {
+            text.lines()
+                .position(|l| l.contains("\"value\"") && l.contains(&format!("\"{value}\"")))
+                .unwrap()
+                + 1
+        };
+
+        let mut config = generated_fixture_config();
+        let generated = fixture_rows(&config);
+        assert!(generated.iter().all(|row| row.declared_at.is_none()));
+
+        config.declared_operations[0].source = None;
+        let rows = fixture_rows(&config);
+        for row in &rows {
+            let value = &row.dispatch.as_ref().unwrap().value;
+            assert_eq!(
+                row.declared_at,
+                Some(format!("carrick.json:{}", line_of(value))),
+                "row {value}"
+            );
+            assert_eq!(row.file_location, generated[0].file_location);
+        }
     }
 }

@@ -11722,6 +11722,7 @@ impl FileOrchestrator {
                 };
 
                 graph.endpoints.push(ResolvedEndpoint {
+                    declared_at: None,
                     procedure: None,
                     method,
                     path: endpoint.path.clone(),
@@ -18990,6 +18991,7 @@ export { routes };
         source: ResolutionSource,
     ) -> ResolvedEndpoint {
         ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             method: method.to_string(),
             path: path.to_string(),

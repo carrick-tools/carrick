@@ -125,6 +125,11 @@ pub struct ResolvedEndpoint {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure: Option<carrick_match::ProcedureKey>,
+    /// Where `carrick.json` declares this operation, `carrick.json:<line>`;
+    /// set only on a row a written (not generated) `operations` block produced
+    /// from a tracked `carrick.json`. Retention only: matching never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_at: Option<String>,
 }
 
 /// A 1-based, inclusive line range in an endpoint row's own file: the span of
@@ -786,6 +791,7 @@ mod tests {
             ("/orders/list", "c"),
         ] {
             graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "POST".to_string(),
@@ -822,6 +828,7 @@ mod tests {
     #[test]
     fn a_row_written_before_addresses_reads_as_not_recorded() {
         let row = ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -1099,6 +1106,7 @@ mod tests {
 
         // Add an endpoint
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -1382,6 +1390,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -1434,6 +1443,7 @@ mod tests {
         // method a client sends.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "ALL".to_string(),
@@ -1471,6 +1481,7 @@ mod tests {
         // endpoint; keeping `${this.apiUrl}` on the key made the join impossible.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -1510,6 +1521,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -1551,6 +1563,7 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -1587,6 +1600,7 @@ mod tests {
         let mut graph = MountGraph::new();
         for full_path in ["/api/**", "/api/v1/chat/new"] {
             graph.endpoints.push(ResolvedEndpoint {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 method: "GET".to_string(),
@@ -1673,6 +1687,7 @@ mod tests {
     ) -> crate::cloud_storage::CloudRepoData {
         let mut mg = MountGraph::new();
         mg.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),

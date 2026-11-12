@@ -362,13 +362,27 @@ pub fn resolve(root: &Path) -> Result<ServiceDerivation, String> {
     // mistaken for permission to infer and replace an explicit declaration.
     match std::fs::symlink_metadata(&config_path) {
         Ok(_) => {
-            let services = Config::load_services(vec![config_path.clone()]).map_err(|e| {
+            let mut services = Config::load_services(vec![config_path.clone()]).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::InvalidInput {
                     e.to_string()
                 } else {
                     format!("Failed to parse {}: {e}", config_path.display())
                 }
             })?;
+            // A line in an untracked file points at nothing the repo states
+            // (a generated config), so only a tracked `carrick.json` keeps its
+            // lines. No git, or a git error, drops them too.
+            let tracked = crate::git_state::tracked_paths(root, &["carrick.json"])
+                .is_ok_and(|paths| paths.iter().any(|path| path == "carrick.json"));
+            if !tracked {
+                for service in services.iter_mut() {
+                    for block in service.declared_operations.iter_mut() {
+                        for operation in block.operations.iter_mut() {
+                            operation.line = None;
+                        }
+                    }
+                }
+            }
             validate(root, &services)?;
             let members = member_facts(root, &services);
             return Ok(ServiceDerivation {
@@ -1109,5 +1123,61 @@ mod tests {
             .services;
         assert_eq!(names(&services), ["a", "root"]);
         assert_eq!(services[1].nested_directories, ["packages/a"]);
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn operation_lines(derivation: &ServiceDerivation) -> Vec<Option<u32>> {
+        derivation
+            .services
+            .iter()
+            .flat_map(|service| &service.declared_operations)
+            .flat_map(|block| &block.operations)
+            .map(|operation| operation.line)
+            .collect()
+    }
+
+    /// carrick-cloud#3422 S2: only a tracked `carrick.json` keeps the lines of
+    /// its declared operations; an untracked (generated) one points at nothing
+    /// the repo states.
+    #[test]
+    fn declared_operation_lines_need_a_tracked_carrick_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git_in(repo, &["init", "-q"]);
+        std::fs::write(
+            repo.join("carrick.json"),
+            r#"{
+  "services": [{ "name": "rpc", "directory": "." }],
+  "operations": [
+    {
+      "service": "rpc",
+      "route": "POST /rpc",
+      "dispatch": { "location": "body", "field": "kind" },
+      "operations": [{ "value": "a" }]
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        let untracked = resolve(repo).unwrap();
+        assert_eq!(operation_lines(&untracked), vec![None]);
+
+        git_in(repo, &["add", "carrick.json"]);
+        let tracked = resolve(repo).unwrap();
+        assert_eq!(operation_lines(&tracked), vec![Some(8)]);
     }
 }

@@ -1302,6 +1302,7 @@ mod tests {
 
         let repo_path = "/work/acme";
         let endpoint = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -1386,6 +1387,7 @@ mod tests {
         use crate::operation::OperationKey;
 
         let call = |method: &str, path: &str, site: &str| ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -1480,6 +1482,7 @@ mod tests {
         use crate::operation::OperationKey;
 
         let call = |path: &str, site: &str, procedure| ApiEndpointDetails {
+            declared_at: None,
             procedure,
             view_module: false,
             owner: None,

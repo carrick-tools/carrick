@@ -406,3 +406,42 @@ fn each_call_is_judged_against_its_own_case() {
     assert!(verdicts_at(64).contains(&compatible("response")));
     assert!(verdicts_at(71).contains(&compatible("response")));
 }
+
+/// carrick-cloud#3422 S5: every declared row, in the mount graph and in the
+/// top-level `endpoints`, names the `carrick.json` line of its `value` key,
+/// and still points at its handler.
+#[test]
+fn declared_rows_name_the_carrick_json_line_that_declares_them() {
+    let config = std::fs::read_to_string(fixture_dir().join("carrick.json")).unwrap();
+    let line_of = |value: &str| {
+        config
+            .lines()
+            .position(|l| l.contains("\"value\"") && l.contains(&format!("\"{value}\"")))
+            .unwrap_or_else(|| panic!("no value line for {value}"))
+            + 1
+    };
+    let mut seen = 0;
+    for service in ["ledger-fn", "notes-fn"] {
+        let blob = &blobs()[service];
+        for rows in [&blob["mount_graph"]["endpoints"], &blob["endpoints"]] {
+            for row in rows.as_array().expect("rows") {
+                if row["resolution_source"] != "declared_operation" {
+                    continue;
+                }
+                let value = text(&row["dispatch"]["value"]);
+                assert_eq!(
+                    text(&row["declared_at"]),
+                    format!("carrick.json:{}", line_of(&value)),
+                    "{service} {value}"
+                );
+                assert!(
+                    !text(&row["file_location"]).starts_with("carrick.json"),
+                    "{service} {value} still points at its handler"
+                );
+                seen += 1;
+            }
+        }
+    }
+    // Eight declared operations, listed in both places.
+    assert_eq!(seen, 16);
+}

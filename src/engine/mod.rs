@@ -8323,6 +8323,7 @@ fn write_traced_routes(
                         continue;
                     }
                     (None, Some(owner)) => crate::mount_graph::ResolvedEndpoint {
+                        declared_at: None,
                         method: route.method.clone(),
                         path: route.path.clone(),
                         full_path: full_path.clone(),
@@ -8599,6 +8600,7 @@ fn append_deterministic_protocol_operations(
     // Same "{file}:{line}" convention the mount-graph conversions use. A
     // call's row; a producer's is `to_producer` below.
     let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+        declared_at: None,
         procedure: None,
         owner: None,
         key,
@@ -17526,6 +17528,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             |pkg: &str| format!("{home}/.cache/runtime/npm/registry.npmjs.org/{pkg}/dist/types");
 
         let op = |file: &str| ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -17573,6 +17576,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
         graph.endpoints.push(ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -17978,6 +17982,7 @@ unfollowed_member_calls_total: 0,
     fn test_ast_stripping_removes_nodes() {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
@@ -18155,6 +18160,7 @@ unfollowed_member_calls_total: 0,
 
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
@@ -18644,6 +18650,7 @@ unfollowed_member_calls_total: 0,
     fn test_duplicate_producer_keys_each_get_their_own_manifest_entry() {
         let config = Config::default();
         let mk_endpoint = |file: &str| crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "GET".to_string(),
@@ -18724,6 +18731,7 @@ unfollowed_member_calls_total: 0,
         let config = Config::default();
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints = vec![crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -28551,6 +28559,7 @@ unfollowed_member_calls_total: 0,
             },
         );
         let route = |line: u32, path: &str, source| crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: "POST".to_string(),
@@ -28652,6 +28661,7 @@ unfollowed_member_calls_total: 0,
         source: crate::agents::file_analyzer_agent::ResolutionSource,
     ) -> crate::mount_graph::ResolvedEndpoint {
         crate::mount_graph::ResolvedEndpoint {
+            declared_at: None,
             procedure: None,
             view_module: false,
             method: method.to_string(),
@@ -32215,6 +32225,7 @@ io.on("bare:in", (event) => {});
         // in calls (consumer), keyed identically so they match cross-repo.
         let mut cloud_data = repo_with_bundle("metrics-monorepo", None, "");
         let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
+            declared_at: None,
             procedure: None,
             view_module: false,
             owner: None,
@@ -33001,6 +33012,7 @@ io.on("bare:in", (event) => {});
         repo.endpoints = paths
             .iter()
             .map(|path| ApiEndpointDetails {
+                declared_at: None,
                 procedure: None,
                 view_module: false,
                 owner: None,
@@ -33931,6 +33943,7 @@ mod declared_alias_tests {
                     .map(|value| DeclaredOperation {
                         value: value.to_string(),
                         handler: Some(format!("notes/src/index.ts:{value}Note")),
+                        line: None,
                     })
                     .collect(),
                 source: None,
