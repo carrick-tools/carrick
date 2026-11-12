@@ -1218,10 +1218,10 @@ test("a fact-file edit whose runner answer does not answer the edit still delive
 });
 
 /** Run the Stop hook for `session` in the workspace, as a settings entry does. */
-function stop(ws: FactsWorkspace, session: string): Promise<string> {
+function stop(ws: FactsWorkspace, session: string, env: Record<string, string> = {}): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(pluginDir, "src", "hook", "stop.ts")], {
-      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root }),
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, ...env }),
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -1267,12 +1267,21 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
 test("with a fact file, a deferred answer is named at Stop as before, once, and its lead prints on the next carrier", async (t) => {
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");
-  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', { session: "lead", probe: "check-deferred-lead.json" });
+  // The `check --changed` the first Stop queues answers late, whichever runner
+  // takes it (the edit's or Stop's): a second Stop that finds its clean answer
+  // claims it in silence (as on main), and the next carrier then has nothing
+  // to say about it. Held back, the second Stop always runs first.
+  const slowCheck = { CARRICK_FAKE_FULL_DELAY_MS: "2000" };
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
+    session: "lead",
+    probe: "check-deferred-lead.json",
+    env: slowCheck,
+  });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
   await waitForAnswer(ws, "lead");
   // What this Stop said with CARRICK_FACT_LINES unset (review run 2, S4).
   assert.equal(
-    await stop(ws, "lead"),
+    await stop(ws, "lead", slowCheck),
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "Stop",
