@@ -9,6 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
+import { commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -52,7 +53,10 @@ async function workspace(
   fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: SLUG }] } }));
   if (rows !== null) {
-    await buildFacts(ndjson(rows), factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
+    // Only a repo folder the test wrote is a checkout here, as `matchRepos`
+    // maps only what it finds; each is committed and the header names it.
+    const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
+    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
   }
   return { root, home, at: (rel) => path.join(root, rel) };
 }

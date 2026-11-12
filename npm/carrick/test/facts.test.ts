@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
+import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
 import { scanSource } from "../src/facts/match.ts";
@@ -42,8 +43,9 @@ async function factsWorkspace(
     const slug = (JSON.parse(ndjson.slice(0, ndjson.indexOf("\n"))) as { project_slug: string }).project_slug;
     fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
     fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: slug }] } }));
+    // Each fixture repo committed, and the header naming its commit.
     await buildFacts(
-      ndjson,
+      commitRepos(root, ndjson, REPOS),
       factsPath(root),
       REPOS.map((repo) => ({ repo, path: path.join(root, repo) })),
       options.fetchedAt ?? new Date().toISOString(),
@@ -634,14 +636,7 @@ function payloadEdit(ws: FactsWorkspace, payload: Record<string, unknown>, sessi
 
 /** Make `repo` in the workspace a git repository with its files committed. */
 function gitRepo(ws: FactsWorkspace, repo: string): void {
-  const dir = ws.at(repo);
-  const git = (...args: string[]) => {
-    const run = spawnSync("git", ["-C", dir, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { encoding: "utf8" });
-    assert.equal(run.status, 0, run.stderr);
-  };
-  git("init", "-q");
-  git("add", ".");
-  git("commit", "-q", "-m", "init");
+  commitAll(ws.at(repo));
 }
 
 test("a Write over an existing file, whose changed lines are unknown, prints nothing", async (t) => {
@@ -700,7 +695,9 @@ test("Codex apply_patch: its hunks place the change; a hunk that cannot be place
     tool_input: { command: patch(["@@ export async function getOrder", "   if (!order) {", '-    res.status(404).json({ error: "not found" });', '+    res.status(410).json({ error: "not found" });'] ) },
   });
   assert.equal(context(placed.stdout), GET_ORDER_LINE);
-  // The hunk's new text is nowhere in the file: nothing.
+  // The hunk's new text is nowhere in the file, and the file reads as HEAD
+  // (the diff fallback has nothing either): nothing.
+  gitRepo(ws, "orders-api");
   const lost = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: patch(["@@", "-  res.status(201).json(created);", "+  res.status(299).json(created);"]) } }, "lost");
   assert.equal(context(lost.stdout), "");
   // `*** Add File` of a file git does not track: every thing in it counts.
