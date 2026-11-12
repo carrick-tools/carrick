@@ -1723,10 +1723,12 @@ fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> u
     };
     let bytes = text.as_bytes();
     let mut at = start + offset;
-    let closer = if text[at..].starts_with("\"\"\"") {
-        "\"\"\""
-    } else if text[at..].starts_with('"') {
-        "\""
+    // Bytes only from here: a description may hold multi-byte characters, and
+    // `at` must never be sliced as a str.
+    let closer: &[u8] = if bytes[at..].starts_with(b"\"\"\"") {
+        b"\"\"\""
+    } else if bytes[at..].starts_with(b"\"") {
+        b"\""
     } else {
         return line;
     };
@@ -1734,7 +1736,7 @@ fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> u
     while at < bytes.len() {
         if bytes[at] == b'\\' {
             at += 2;
-        } else if text[at..].starts_with(closer) {
+        } else if bytes[at..].starts_with(closer) {
             at += closer.len();
             break;
         } else {
@@ -1753,7 +1755,10 @@ fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> u
             _ => break,
         }
     }
-    line + text[start..at.min(bytes.len())].matches('\n').count()
+    line + bytes[start..at.min(bytes.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
 }
 
 /// [`extract_from_document_text`], with `None` when the text parses as neither
@@ -2494,6 +2499,18 @@ mod tests {
 "#;
         assert_eq!(producer_lines(sdl, 1), vec![3, 8, 10, 11, 14]);
         assert_eq!(producer_lines(sdl, 10), vec![12, 17, 19, 20, 23]);
+    }
+
+    /// Multi-byte characters in a description must not panic the scan, and an
+    /// unterminated description must not either.
+    #[test]
+    fn a_description_with_multibyte_text_is_skipped_safely() {
+        let sdl = "type Query {\n  \"\"\"Café \u{1F600}\n  日本語\"\"\"\n  one: Int\n  \"say \\\"é\\\" \u{1F600}\"\n  two: Int\n  \"\"\"é\\\"\u{1F600}\"\"\"\n  three: Int\n}\n";
+        assert_eq!(producer_lines(sdl, 1), vec![4, 6, 8]);
+        // Unterminated at end of file: the parser rejects it, no panic.
+        let open = "type Query {\n  \"\"\"é\u{1F600} never closed\n  one: Int\n}\n";
+        let _ = producer_lines(open, 1);
+        assert_eq!(field_name_line(open, 2, 3, true), 5);
     }
 
     /// A repo with a `.graphql` file inside and a link to one outside it.
