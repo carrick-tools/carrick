@@ -439,6 +439,23 @@ test("a replaced header line of a nested function is that function's, not its en
   assert.equal(context(run.stdout), "");
 });
 
+test("R24.5: hunks whose added lines are not the file's lines at those numbers are unplaced", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /a", repo: "orders-api", file: "src/ab.ts", line: 5, name: "a", text: "a line" }),
+    row({ side: "consumer", protocol: "http", label: "POST /b", repo: "orders-api", file: "src/ab.ts", line: 8, name: "b", text: "b line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  const file = ws.at("orders-api/src/ab.ts");
+  // The tool added `trace("b")` at line 5, inside b; three header lines were added above it afterwards.
+  fs.writeFileSync(file, '// one\n// two\n// three\nfunction a() {\n  return api.post("/a");\n}\nfunction b() {\n  trace("b");\n  return api.post("/b");\n}\n');
+  const stale = await patchEdit(ws, file, [{ newStart: 4, lines: [" function b() {", '+  trace("b");', '   return api.post("/b");'] }]);
+  assert.equal(context(stale.stdout), "");
+  // The same hunk at its true numbers places the line in b.
+  const placed = await patchEdit(ws, file, [{ newStart: 7, lines: [" function b() {", '+  trace("b");', '   return api.post("/b");'] }], "placed");
+  assert.equal(context(placed.stdout), "b line");
+});
+
 test("a thing's span starts at export, default, async and decorators: its header line is its own", async (t) => {
   assert.deepEqual(spansOf("export async function g() { return 1 }\nexport default function h() {}\nexport const k = () => 1;\n"), [
     "g: export async function g() { return 1 }",

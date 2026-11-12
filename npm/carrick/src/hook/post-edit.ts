@@ -174,13 +174,24 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     // A removed line is not a line of the file now: it is the gap just above
     // the line that now sits where it was (`facts/match.ts` `gapsOfLines`).
     const removed: number[] = [];
+    // Each added line's text must be the file's line at that number now; a
+    // formatter that ran after the tool moves them, and then the hunks are unplaced.
+    let now: string[];
+    try {
+      if (fs.statSync(edited[0]!).size > MAX_FACT_FILE_BYTES) return new Map();
+      now = fs.readFileSync(edited[0]!, "utf8").split("\n");
+    } catch {
+      return new Map();
+    }
     for (const hunk of hunks) {
       if (typeof hunk?.newStart !== "number" || !Array.isArray(hunk.lines)) return new Map();
       let at = hunk.newStart;
       for (const text of hunk.lines) {
         if (typeof text !== "string" || text.startsWith("\\")) continue;
-        if (text.startsWith("+")) lines.push(at++);
-        else if (text.startsWith("-")) removed.push(at);
+        if (text.startsWith("+")) {
+          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) return new Map();
+          lines.push(at++);
+        } else if (text.startsWith("-")) removed.push(at);
         else at += 1;
       }
     }
