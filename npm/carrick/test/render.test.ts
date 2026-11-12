@@ -6,6 +6,7 @@ import {
   boundaryFor,
   boundaryLines,
   itemLine,
+  renderPostRead,
   renderPostToolUse,
   renderSessionStart,
   sessionCheckedLines,
@@ -957,4 +958,40 @@ test("the port and the cli say the same boundary lines", () => {
   ) as { service: string; boundary: Boundary; lines: string[] };
   assert.deepEqual(boundaryLines(expected.boundary, expected.service), expected.lines);
   assert.ok(expected.lines.some((line) => line.includes("call site(s) Carrick could not read")));
+});
+
+// carrick#3956: a route with several dispatch cases states one row per case at
+// one path. The Read hook printed each without its case, so the same sentence
+// came out once per case.
+function dispatchRows(cases: string[]): CheckResult {
+  return {
+    ...fixture("check-mismatch.json"),
+    items: cases.map((value) => ({
+      kind: "route",
+      method: "POST",
+      path: "/types/check-or-upload",
+      dispatch_label: ` {action=${value}}`,
+      line: 1,
+      col: 1,
+      source: "fact",
+      counterparts: [{ role: "consumer", service: "cli", file: "src/auth/read.ts", line: 29 }],
+      verdict: null,
+    })),
+  } as CheckResult;
+}
+
+test("the Read hook prints each dispatch case once, with its case", () => {
+  const out = renderPostRead(dispatchRows(["start-scan", "list-projects", "get-type-reach"]), "index.ts");
+  const lines = (out ?? "").split("\n").filter((line) => line.startsWith("- index.ts"));
+  assert.equal(lines.length, 3, out ?? "");
+  assert.equal(new Set(lines).size, 3);
+  assert.match(lines[2] ?? "",/route POST \/types\/check-or-upload \{action=get-type-reach\}\./);
+});
+
+test("the Read hook never prints an identical line twice, and keeps its cap", () => {
+  const out = renderPostRead(dispatchRows(Array(5).fill("start-scan")), "index.ts") ?? "";
+  assert.equal(out.split("\n").filter((line) => line.startsWith("- index.ts")).length, 1, out);
+  const many = renderPostRead(dispatchRows(Array.from({ length: 20 }, (_, n) => `case-${n}`)), "index.ts") ?? "";
+  assert.equal(many.split("\n").filter((line) => line.startsWith("- index.ts")).length, 12, many);
+  assert.match(many, /more are listed by/);
 });

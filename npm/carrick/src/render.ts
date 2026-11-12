@@ -262,7 +262,7 @@ export function itemLine(
   options: { locatorsOnly?: boolean } = {},
 ): string {
   const where = `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
-  const operation = [item.method, item.path].filter(Boolean).join(" ");
+  const operation = [item.method, item.path].filter(Boolean).join(" ") + (item.dispatch_label ?? "");
   const counterparts = item.counterparts ?? [];
   // Locators only (carrick#2069): where the row is, what it is, and who is on
   // the other side. The Read hook has no edit to judge, so no verdict words.
@@ -631,10 +631,10 @@ export function renderPostRead(result: CheckResult, displayFile?: string): strin
     `Carrick: other code depends on ${where} (indexed at ${shortHash(result.index_commit)}). Open these before you change what they use:`,
   ];
   lines.push(...uses.slice(0, MAX_USE_LINES));
-  for (const item of items.slice(0, MAX_ITEM_LINES)) {
-    lines.push(itemLine(item, where, { locatorsOnly: true }));
-  }
-  if (uses.length > MAX_USE_LINES || items.length > MAX_ITEM_LINES) {
+  // A line printed twice tells the agent nothing the first did not (carrick#3956).
+  const itemLines = [...new Set(items.map((item) => itemLine(item, where, { locatorsOnly: true })))];
+  lines.push(...itemLines.slice(0, MAX_ITEM_LINES));
+  if (uses.length > MAX_USE_LINES || itemLines.length > MAX_ITEM_LINES) {
     lines.push(`- more are listed by \`carrick check ${where}\`.`);
   }
   return lines.join("\n");

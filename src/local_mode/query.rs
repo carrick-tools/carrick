@@ -676,6 +676,7 @@ fn project(
         kind: item.kind.as_str().to_string(),
         method: item.method.clone(),
         path: item.path.clone(),
+        dispatch_label: item.dispatch.as_deref().map(carrick_match::dispatch_label),
         line: item.line,
         col: item.col,
         source: item.source.as_str().to_string(),

@@ -315,6 +315,16 @@ pub fn dispatch_key(location: &str, field: &str, value: &str) -> String {
     format!("{location}:{field}={value}")
 }
 
+/// The case a [`dispatch_key`] states, in the few characters a listing can
+/// carry: `" {action=upload-logs}"` from `"body:action=upload-logs"`. The
+/// location is dropped and the leading space is part of the label, so it
+/// appends straight to an operation. A key with no location is taken whole.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn dispatch_label(key: &str) -> String {
+    let case = key.split_once(':').map_or(key, |(_, case)| case);
+    format!(" {{{case}}}")
+}
+
 /// Whether a call satisfies the dispatch case a producer answers.
 ///
 /// Both sides are passed as [`dispatch_key`] strings, or `None` where the row
@@ -846,6 +856,15 @@ mod tests {
     }
 
     // --- body dispatch (carrick#831) ---------------------------------------
+
+    #[test]
+    fn dispatch_label_is_the_case_without_its_location() {
+        assert_eq!(
+            dispatch_label(&dispatch_key("body", "action", "get-type-reach")),
+            " {action=get-type-reach}"
+        );
+        assert_eq!(dispatch_label("meta.kind=x"), " {meta.kind=x}");
+    }
 
     #[test]
     fn dispatch_key_is_the_case_written_verbatim() {
