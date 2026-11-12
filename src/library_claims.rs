@@ -2334,6 +2334,42 @@ mod tests {
         );
     }
 
+    /// QW-1: `or_file` on a handler is read from the store, written back as
+    /// stored, and moves no claim id.
+    #[test]
+    fn or_file_on_a_handler_keeps_the_claim_id() {
+        let jobs = export(json!({
+            "package": "fixture-jobs", "version": "5.1.0", "specifier": "fixture-jobs",
+            "export": "Worker", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "receive", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0 }, "handler": { "arg": 1, "or_file": true } },
+                { "kind": "op", "op": "receive", "member": null, "on": "export", "form": "new",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+            ]
+        }));
+        let LibraryClaim::Op { handler, .. } = &jobs.claims[0] else {
+            panic!("an op")
+        };
+        assert!(handler.as_ref().unwrap().or_file);
+        let ids: Vec<String> = jobs
+            .claims
+            .iter()
+            .map(|claim| claim_id("fixture-jobs@5:Worker", claim).unwrap())
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+        assert!(
+            serde_json::to_string(&jobs.claims[0])
+                .unwrap()
+                .contains(r#""handler":{"arg":1,"or_file":true}"#)
+        );
+        assert!(
+            serde_json::to_string(&jobs.claims[1])
+                .unwrap()
+                .contains(r#""handler":{"arg":1}"#)
+        );
+    }
+
     /// The readers of call sites do not meet a claim written as a set, an
     /// override or a scope decorator (amendment 7); an op written as a
     /// construction or a method decorator is met where it is written.

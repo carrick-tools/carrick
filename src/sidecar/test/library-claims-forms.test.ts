@@ -303,11 +303,13 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
       assert.strictEqual(verdict(define), 'failed handler_not_function');
     });
 
-    it('lists the processor as no function and with no keys (the lister is unchanged)', () => {
+    it('lists the processor as no function, a function or file, and with no keys', () => {
       const listed = verifier.listSurface(root, ['fixture-jobs'], 1_000_000);
       const worker = listed.surfaces[0].exports.find(e => e.export === 'Worker')!;
       const construct = worker.receivers.find(r => r.receiver === 'export')!.construct![0];
       assert.strictEqual(construct.params[1].function, false);
+      // QW-1: a claim here carries `or_file` (library-claims-or-file.test.ts).
+      assert.strictEqual(construct.params[1].function_or_file, true);
       assert.strictEqual(construct.params[1].keys, undefined);
     });
   });

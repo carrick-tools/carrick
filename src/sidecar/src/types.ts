@@ -618,6 +618,13 @@ export interface ClaimSlot extends SlotPosition {
    * `false` is no flag.
    */
   handle?: boolean;
+  /**
+   * On a `handler` slot only (QW-1): the slot takes the function that runs,
+   * or the path of a file that exports it (a string or the platform `URL`).
+   * The file parts are dropped and the rest is judged by the handler rule.
+   * `false` is no flag.
+   */
+  or_file?: boolean;
 }
 
 /** A slot that holds a name: also read as a GraphQL document, or as the name of a function or class (amendment 7). */
@@ -1385,6 +1392,12 @@ export interface SurfaceParam {
   accepts_string: boolean;
   /** A function type with a declared signature. */
   function: boolean;
+  /**
+   * Not a function, but one once its file parts (a string, the platform
+   * `URL`) are dropped (QW-1): a `handler` claim here carries `or_file`.
+   * Present only when true.
+   */
+  function_or_file?: true;
   /** Declared keys, when it is an object type. */
   keys?: SurfaceKey[];
   /** String literals the slot spells (an overload's literal, a `keyof` map's keys). */
