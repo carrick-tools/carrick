@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 /// In-memory storage with no synthetic seed repos and direct access to what
 /// was uploaded, so a test can read scan #1's payload back and mutate it
 /// before scan #2 picks it up as `previous_data`.
@@ -151,10 +154,17 @@ fn committed_copy_of(name: &str, tmp: &Path, extra: &[(&str, &str)]) -> (PathBuf
         std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
         std::fs::write(&path, contents).unwrap();
     }
+    let cassette = repo_path.join("__llm__");
+    if name == "llm-mocked-api" {
+        // The fixture imports `express`, which a scan labels only from the
+        // store's answer for an installed copy. The committed fixture is also
+        // pinned by a golden, so the copy gets the install, not the fixture.
+        real_packages::install(&repo_path, &["express"]);
+        real_packages::write_claims(&cassette, &["express"]);
+    }
     run_git(&repo_path, &["init", "-q"]);
     run_git(&repo_path, &["add", "-A"]);
     run_git(&repo_path, &["commit", "-q", "-m", "init"]);
-    let cassette = repo_path.join("__llm__");
     (repo_path, cassette)
 }
 
