@@ -1490,9 +1490,14 @@ fn holds_open(pieces: &[Piece]) -> bool {
 /// Why the name a caller fills is unread, where `own` (the callee's value)
 /// holds a hole of an unread call open on the callee's parameters
 /// ([`Piece::through`], carrick#4022) and `filled` (the caller's) holds that
-/// hole closed: the reason the hole ends at. `None` for any other value.
-fn closed_hole(own: &[Piece], filled: &[Piece]) -> Option<Stop> {
-    if !own.iter().any(|piece| piece.through().is_some()) {
+/// hole closed: the reason the hole ends at. `None` for any other value, and
+/// where `filled` states a route all the same (`${base(siteUrl)}/notes`, an
+/// unread base glued to a written path, [`decides`]): that call is the site,
+/// and what it sends keeps its anchor there.
+fn closed_hole(own: &[Piece], filled: &[Piece], end: &LabelledEnd) -> Option<Stop> {
+    if !own.iter().any(|piece| piece.through().is_some())
+        || (end.role == "http_client" && render_target(filled).is_some())
+    {
         return None;
     }
     filled.iter().find_map(|piece| match piece {
@@ -2637,7 +2642,7 @@ impl<'a> Walk<'a, '_> {
         value: Vec<Piece>,
         args: BTreeSet<usize>,
     ) {
-        match closed_hole(below, &value) {
+        match closed_hole(below, &value, end) {
             Some(why) => {
                 let entered = u32::try_from(down.len() - 1).unwrap_or(u32::MAX);
                 self.lead_at(&down[0], entered, end, why);

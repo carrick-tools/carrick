@@ -20,6 +20,10 @@
               "name": {
                 "arg": 0
               },
+              "payload": {
+                "arg": 1,
+                "key": "body"
+              },
               "method_key": {
                 "arg": 1,
                 "key": "method"
