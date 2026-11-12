@@ -21,3 +21,9 @@ Answer key:
   `GET /api/v1/badge`, `GET /badges`, `GET /api/v1/badges/:id`). An unread
   helper call that is the base of a written path, or a whole path segment,
   still states the route.
+- `src/net/site-client.ts` lines 38 and 47 (`sendJson`, whose URL is an
+  unread helper call on its base parameter glued to its path parameter,
+  called with a base that is itself such a call and a written path): each
+  caller states the route, so it stays the site, and its request body keeps
+  the type the compiler engine inferred (`{ title: string; slug: string; }`
+  and `{ title: string; }`).

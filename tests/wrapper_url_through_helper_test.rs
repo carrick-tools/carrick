@@ -223,3 +223,52 @@ fn the_controls_keep_their_rows() {
     nothing_at(&blob, "src/net/plain.ts", 24);
     nothing_at(&blob, "src/net/plain.ts", 29);
 }
+
+/// The request-body type the compiler engine infers at `file:line`, as the
+/// type manifest states it: `(type_state, expanded_definition)`.
+fn request_body_at(blob: &serde_json::Value, file: &str, line: u64) -> Vec<(String, String)> {
+    blob["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["file_path"] == file
+                && entry["line_number"] == line
+                && entry["evidence"]["infer_kind"] == "request_body"
+        })
+        .map(|entry| {
+            (
+                entry["evidence"]["type_state"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                entry["expanded_definition"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A wrapper whose URL is an unread helper call on its base parameter glued
+/// to its path parameter (`${normalizeBase(siteUrl)}${path}`), called with a
+/// base that is itself such a call and a written path: the caller states the
+/// route, so it stays the site, and the body it sends keeps the type the
+/// compiler engine inferred. The hole of the unread base closing at the
+/// caller leaves the route stated.
+#[test]
+fn a_caller_that_writes_the_path_keeps_its_request_body_type() {
+    let blob = scan();
+    for (line, body) in [
+        (38, "{ title: string; slug: string; }"),
+        (47, "{ title: string; }"),
+    ] {
+        let types = request_body_at(&blob, "src/net/site-client.ts", line);
+        assert_eq!(
+            types,
+            vec![("implicit".to_string(), body.to_string())],
+            "site-client.ts:{line} request body"
+        );
+    }
+}
