@@ -185,7 +185,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "commit": "e2dbd6a1bf9044289e12abdfd03980bf3cccbf46",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -212,23 +212,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -277,6 +260,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -412,7 +416,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "commit": "e2dbd6a1bf9044289e12abdfd03980bf3cccbf46",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -697,7 +701,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "commit": "d60c61e4740756fe89c61ed00f837e8022e189d9",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -724,23 +728,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -789,6 +776,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -924,7 +932,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "commit": "d60c61e4740756fe89c61ed00f837e8022e189d9",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -1209,7 +1217,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "commit": "3ccb9ca5017a245320f890737dff1c61cbce6b17",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -1236,23 +1244,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -1301,6 +1292,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -1436,7 +1448,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "commit": "3ccb9ca5017a245320f890737dff1c61cbce6b17",
         "outcomes": [
           {
             "bucket": "unverifiable",
