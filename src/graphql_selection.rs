@@ -202,7 +202,7 @@ impl UndeclaredSelection {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "This change retypes {fields} in the schema `{}`; the operation selects the field \
+            "This PR changes {fields} in the schema `{}`. The operation selects the field(s) \
              and reads the old type.",
             self.schema
         )
