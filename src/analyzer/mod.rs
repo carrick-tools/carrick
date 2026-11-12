@@ -680,6 +680,9 @@ struct ConsumerRow<'a> {
 /// - When it may not, the reading is a doubt: a compatible pair becomes
 ///   unverifiable with the doubt as its reason. An incompatible or
 ///   unverifiable pair keeps the check's own answer.
+/// - A selected field the PR retypes in a printed schema it serves
+///   ([`crate::graphql_selection::SelectedTypes::retyped`]) makes the pair
+///   incompatible, stated as a fact.
 ///
 /// A same-service pair is left as the check left it (carrick#2053). An
 /// outcome this changes is never settled from a stored copy
@@ -730,6 +733,16 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
             continue;
         };
         match selection.partial {
+            // A field the PR retypes in the schema it serves is a break, and
+            // stronger than any doubt about an undeclared one.
+            _ if !selection.types.retyped.is_empty() => {
+                outcome.bucket = VerdictBucket::Incompatible;
+                outcome.resolved = true;
+                outcome.unresolved_reason = None;
+                outcome.diagnostic = Some(selection.retyped_sentence());
+            }
+            // A row that holds only the types read from the head schema.
+            _ if selection.fields.is_empty() => continue,
             None => {
                 outcome.bucket = VerdictBucket::Incompatible;
                 outcome.resolved = true;
