@@ -541,6 +541,48 @@ test("a fact file for another project is not read", async (t) => {
   assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
 });
 
+test("the refresh sends the local file's digest and writer", async (t) => {
+  const ws = await factsWorkspace(t);
+  const bodies: Array<Record<string, unknown>> = [];
+  const request = (async (_url: string, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(JSON.stringify({ unchanged: true }));
+  }) as typeof fetch;
+  const env = { ...process.env, CARRICK_TOKEN: "t" };
+  assert.equal(await refreshFacts(ws.root, { request, env }), "unchanged");
+  const wire = JSON.parse(fs.readFileSync(WIRE, "utf8").split("\n")[0]!) as { digest: string; writer: number };
+  assert.equal(bodies[0]!["known_digest"], wire.digest);
+  assert.equal(bodies[0]!["known_writer"], wire.writer);
+  // With no local file, neither is sent.
+  fs.rmSync(factsPath(ws.root));
+  const building = (async (_url: string, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(JSON.stringify({ success: false, error: { code: "facts_building" } }));
+  }) as typeof fetch;
+  await refreshFacts(ws.root, { request: building, env });
+  assert.equal("known_digest" in bodies[1]!, false);
+  assert.equal("known_writer" in bodies[1]!, false);
+});
+
+test("facts_unavailable is silent and does not schedule an early retry", async (t) => {
+  const { runFactsRefresh, startFactsRefresh, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
+  const ws = await factsWorkspace(t, { ndjson: null });
+  fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
+  const env = { ...process.env, CARRICK_TOKEN: "t", CARRICK_NO_FACTS_REFRESH: "" };
+  const now = Date.parse("2026-01-01T12:00:00Z");
+  const start = () => undefined;
+  assert.equal(startFactsRefresh(ws.root, { env, now, start }), true);
+  const answer = (code: string) =>
+    (async () => new Response(JSON.stringify({ success: false, error: { code, message: "", retriable: code === "facts_building" } }))) as typeof fetch;
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable"), env, now }), "none");
+  assert.equal(fs.existsSync(factsPath(ws.root)), false);
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), false, "no early retry");
+  // A building answer does move the next ask a minute on.
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_building"), env, now }), "building");
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), true);
+});
+
 test("a staged URL is fetched only over https from an amazonaws.com host", async (t) => {
   const ws = await factsWorkspace(t, { ndjson: null });
   fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });

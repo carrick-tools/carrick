@@ -3,11 +3,13 @@
 // last refresh left.
 //
 // One request to `POST /mcp/facts` with the stored CLI credential, sending the
-// digest it already holds, so an unchanged project costs one read. A new
-// digest answers with a presigned URL to gzipped NDJSON, which is fetched
-// (no credential), built into SQLite under a temporary name and renamed
-// (`store.ts`). `facts_building`, a 404 (route not deployed) and every other
-// error mean no new facts: one log line, and the next trigger asks again.
+// digest and writer it already holds, so an unchanged project costs one read.
+// A new digest or writer answers with a presigned URL to gzipped NDJSON, which
+// is fetched (no credential, https amazonaws.com only), built into SQLite
+// under a temporary name and renamed (`store.ts`). `facts_building`,
+// `facts_unavailable`, a 404 (route not deployed) and every other error mean
+// no new facts: one log line. Only `facts_building` moves the next ask a
+// minute on (`runFactsRefresh`); the rest wait out the cooldown.
 // Wire contract: carrick-cloud `docs/internal/reference/edit-facts-wire.md`.
 
 import fs from "node:fs";
@@ -87,7 +89,12 @@ function stagedUrlAllowed(url: string): boolean {
   }
 }
 
-async function knownDigest(root: string): Promise<string | null> {
+/**
+ * The digest and writer of the local fact file, or null when there is no
+ * readable file holding both. The cloud answers `unchanged` only when both
+ * match, so a wording fix (a new writer) reaches this file without a new scan.
+ */
+async function knownFile(root: string): Promise<{ digest: string; writer: number } | null> {
   const file = factsPath(root);
   if (!fs.existsSync(file)) return null;
   const sqlite = await loadSqlite();
@@ -96,8 +103,10 @@ async function knownDigest(root: string): Promise<string | null> {
   try {
     const open = new sqlite.DatabaseSync(file, { readOnly: true });
     db = open;
-    const row = open.prepare("SELECT value FROM meta WHERE key = 'digest'").get();
-    return row ? String(row["value"]) : null;
+    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
+    const digest = meta.get("digest");
+    const writer = Number(meta.get("writer"));
+    return digest && Number.isInteger(writer) ? { digest, writer } : null;
   } catch {
     return null;
   } finally {
@@ -121,13 +130,13 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
       log("no single project for this workspace; no fact file");
       return "none";
     }
-    const known = await knownDigest(root);
+    const known = await knownFile(root);
     const response = await request(`${API_BASE}/mcp/facts`, {
       method: "POST",
       redirect: "error",
       signal: AbortSignal.timeout(30_000),
       headers: { Authorization: `Bearer ${credential.token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ project, schema: SCHEMA, ...(known ? { known_digest: known } : {}) }),
+      body: JSON.stringify({ project, schema: SCHEMA, ...(known ? { known_digest: known.digest, known_writer: known.writer } : {}) }),
     });
     if (response.status === 404) {
       log("facts route not found; no fact file");
@@ -202,6 +211,18 @@ export function startFactsRefresh(
     log("fact refresh not started", String(error));
     return false;
   }
+}
+
+/**
+ * One detached refresh (`refresh-run.ts`): bring the file up to date and,
+ * after `facts_building` only, let the next trigger ask again a minute on.
+ * Every other outcome (`facts_unavailable` included) waits out the cooldown.
+ */
+export async function runFactsRefresh(root: string, options: FactsRefreshOptions = {}): Promise<RefreshOutcome> {
+  const outcome = await refreshFacts(root, options);
+  log(`fact refresh: ${outcome}`);
+  if (outcome === "building") allowEarlyRetry(root, options.env ?? process.env, options.now ?? Date.now());
+  return outcome;
 }
 
 /**
