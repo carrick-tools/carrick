@@ -188,4 +188,3 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/graphql-walked-vendor-schema/apps/api/node_modules/
 !tests/fixtures/graphql-walked-vendor-schema/apps/gateway/node_modules/
 !tests/fixtures/deno-under-workspace-glob/apps/api/node_modules/
-!tests/fixtures/deno-under-workspace-glob/apps/edge/hello/node_modules/
