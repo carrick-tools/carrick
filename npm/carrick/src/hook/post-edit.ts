@@ -186,11 +186,16 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     }
     return new Map([[edited[0]!, { lines, removed }]]);
   }
-  const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(
+  const texts = [input.new_string, ...(Array.isArray(input.edits) ? input.edits : []).map((edit) => edit?.new_string)].filter(
     (text): text is string => typeof text === "string",
   );
   return texts.length > 0 ? new Map([[edited[0]!, { snippets: texts }]]) : new Map();
 }
 
-await timed("post-edit", main);
+try {
+  await timed("post-edit", main);
+} catch (error) {
+  // A payload this hook did not expect: the edit stands, nothing is said.
+  log("post-edit failed", String(error));
+}
 process.exit(0);

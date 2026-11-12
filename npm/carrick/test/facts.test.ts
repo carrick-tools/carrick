@@ -928,6 +928,16 @@ test("an edit inside a generic arrow nested in a function is the arrow's, not th
   assert.deepEqual(await linesFor(ws, "orders-api/src/a.ts", 'api.post("/audit");'), ["outer line"]);
 });
 
+test("R24.9: a malformed edits list exits 0 with no output", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  for (const edits of [[null], {}]) {
+    const run = await payloadEdit(ws, { tool_name: "MultiEdit", tool_input: { file_path: file, edits } }, `bad-${JSON.stringify(edits)}`);
+    assert.equal(run.code, 0, run.stderr);
+    assert.equal(run.stdout, "");
+  }
+});
+
 /** A linked worktree of `repo` at `<repo>/.claude/worktrees/<branch>`, holding a copy of the repo's files. */
 function worktree(ws: FactsWorkspace, repo: string, branch: string): string {
   const main = ws.at(repo);
