@@ -29970,11 +29970,9 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let degraded = data.types_degraded.as_ref().expect("types_degraded");
         assert_eq!(degraded.stage, "resolve");
         assert!(
-            degraded.detail.contains("ended during type resolution")
-                && degraded
-                    .detail
-                    .contains("Node aborts when its heap is full")
-                && degraded.detail.contains("under "),
+            degraded.detail.starts_with(
+                "the compiler engine could not read types: it ran out of memory, under "
+            ) && degraded.detail.contains("memory limit"),
             "the detail does not name the memory death: {}",
             degraded.detail
         );
