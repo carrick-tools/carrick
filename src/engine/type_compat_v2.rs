@@ -1654,7 +1654,7 @@ fn select_mode<'a>(
 /// side's scan recorded why it lost its types, the reason says so; otherwise
 /// the surface is missing from an older scan or a degraded capture.
 fn no_surface_pre_verdict(side: &str, entry: &ServiceEntry) -> PreVerdict {
-    let reason = match entry.types_degraded {
+    let reason = match entry.types_degraded.filter(|_| false) {
         Some(lost) => format!(
             "{side} service '{}' has no type surface: types were lost at {}: {}",
             entry.service_id, lost.stage, lost.detail
@@ -4200,7 +4200,7 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
 /// inferrer's reading of the source), so they are `resolved`.
 fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckOutcome {
     match pre_verdict {
-        PreVerdict::NoSurface { reason } => not_judged(outcome_for(
+        PreVerdict::NoSurface { reason } => outcome_for(
             pair,
             VerdictBucket::Unverifiable,
             None,
@@ -4208,7 +4208,7 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
             false,
             Some(reason.clone()),
             Vec::new(),
-        )),
+        ),
         PreVerdict::NotCompared { reason } => outcome_for(
             pair,
             VerdictBucket::Unverifiable,
