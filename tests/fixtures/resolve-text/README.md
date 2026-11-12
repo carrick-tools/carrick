@@ -183,3 +183,28 @@ compiler's literal type does not answer before the table does.
 No reader reads an entry of these classes yet: every probe above still reads
 as before (`outside_service`). The steps that open each reader replace that
 answer.
+
+## Fields a constructor sets from its parameters (`fields.ts`, carrick#3678 S6-2)
+
+Each `p_field_*` probe is a call whose argument is `this.<field>`, read in a
+method of a class whose constructor sets the field. Read through callers
+(`texts_through_callers`), the field is what each construction passes,
+read at the construction and on through its own callers:
+
+| Probe | Texts, with the calls read through (innermost first) |
+|---|---|
+| `p_field_lit` (a module-level construction with a literal) | `orders.lit`: `LitHub("orders.lit")` |
+| `p_field_param` (a construction filled by `subscribe`'s parameter) | `orders.a3.*`: `ParamHub(_)`, `subscribe("orders.a3.*")` |
+| `p_field_hub` (filled by a method's parameter, called on a module instance) | `orders.hub`: `InnerSub(_)`, `subscribe("orders.hub")` |
+| `p_field_assign` (`this.topic = topic` in the constructor body) | `orders.assign`: `AssignHub("orders.assign")` |
+| `p_field_twice` (two constructions) | `orders.one`: `TwiceHub("orders.one")`; `orders.two`: `TwiceHub("orders.two")` |
+| `p_field_typed` (the field is typed as one literal) | `orders.typed`, read from the type, no calls |
+| `p_field_spread` (constructed with a spread: the class is refused) | a hole, `unread_expression`, no calls |
+| `p_field_fallback` (`topic ?? "orders.fallback"`) | a hole, `unread_expression`, no calls |
+
+Read as parts (`pieces_through_callers`), `p_field_param` is one part,
+`orders.a3.*`, passed through the field read at the probe (the first hop,
+at `ParamHub(_)`) and `subscribe`'s parameter.
+
+With no callers read (`text_values`), every probe reads as before S6-2: a
+hole, `unread_expression`, except `p_field_typed`, `orders.typed`.

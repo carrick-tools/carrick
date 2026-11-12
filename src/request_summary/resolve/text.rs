@@ -26,7 +26,7 @@ const BUILT_INS: [&str; 4] = ["join", "concat", "replace", "replaceAll"];
 /// What `expr` states as text, each span mapped through `shift` (the
 /// numbering the term is read in).
 pub(in crate::request_summary) fn text_of(expr: &Expr, shift: &dyn Fn(u32) -> u32) -> ValueAt {
-    lower(expr, shift, 0)
+    lower(expr, shift, None, 0)
 }
 
 /// What each argument of a call states as text, by position, the way
@@ -34,9 +34,16 @@ pub(in crate::request_summary) fn text_of(expr: &Expr, shift: &dyn Fn(u32) -> u3
 /// parameter, kept for the text reader to read a parameter through its
 /// callers. A spread is `None` and ends the list: it moves every position
 /// from it on, as [`super::Resolver::arg_values`] ends its own.
+///
+/// `class` is where the class the call is written in starts, where it is
+/// written in a member of one: there `this.<field>` is a
+/// [`ValueAt::Field`], which the text reader reads through the class's
+/// constructions (carrick#3678 S6-2), as the callee lowering does
+/// (carrick#2452).
 pub(in crate::request_summary) fn args_text(
     args: &[ExprOrSpread],
     shift: &dyn Fn(u32) -> u32,
+    class: Option<u32>,
 ) -> Vec<Option<ValueAt>> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
@@ -44,17 +51,17 @@ pub(in crate::request_summary) fn args_text(
             out.push(None);
             break;
         }
-        out.push(Some(text_of(&arg.expr, shift)));
+        out.push(Some(lower(&arg.expr, shift, class, 0)));
     }
     out
 }
 
-fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
+fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, class: Option<u32>, depth: usize) -> ValueAt {
     if depth > MAX_TEXT_DEPTH {
         return ValueAt::Unread;
     }
     let at = |span: Span| (shift(span.lo.0), shift(span.hi.0));
-    let next = |expr: &Expr| lower(expr, shift, depth + 1);
+    let next = |expr: &Expr| lower(expr, shift, class, depth + 1);
     match crate::request_summary::unwrap_value(expr) {
         Expr::Lit(Lit::Str(lit)) => lit
             .value
@@ -93,6 +100,27 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, depth: usize) -> ValueAt {
                 hi,
                 member: false,
                 holds: super::Holds::Nothing,
+            }
+        }
+        // `this.<field>` in a member of a class: the field, by the class's
+        // span start, as the callee lowering reads it. A private name stays
+        // unread.
+        Expr::Member(MemberExpr {
+            span,
+            obj,
+            prop: MemberProp::Ident(field),
+        }) if class.is_some()
+            && matches!(
+                crate::graphql_document_sites::unwrap_expression(obj),
+                Expr::This(_)
+            ) =>
+        {
+            let (lo, hi) = at(*span);
+            ValueAt::Field {
+                lo,
+                hi,
+                class: class.unwrap_or_default(),
+                field: field.sym.to_string(),
             }
         }
         Expr::Member(member) => {
