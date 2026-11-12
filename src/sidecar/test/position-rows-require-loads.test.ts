@@ -28,7 +28,7 @@ describe('position_rows: a package only required from TypeScript (carrick#3971)'
   let root: string;
   let files: Record<string, Row[]>;
   const sources: Record<string, string> = {};
-  const names = ['moduleRequire.ts', 'localRequire.ts', 'declaredRequire.ts', 'relative.ts'];
+  const names = ['moduleRequire.ts', 'localRequire.ts', 'declaredRequire.ts', 'relative.ts', 'untyped.ts'];
 
   before(async () => {
     root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-require-loads-')));
@@ -101,5 +101,9 @@ describe('position_rows: a package only required from TypeScript (carrick#3971)'
 
   it('loads packages only: a relative require outside the program stays at its binding', () => {
     assert.strictEqual(placeOf('src/relative.ts', 'call', 'helper()'), 'helper src/relative.ts:1 svc');
+  });
+
+  it('loads no JavaScript: a package with no types stays at its binding, as an import leaves it untyped', () => {
+    assert.strictEqual(placeOf('src/untyped.ts', 'call', 'make()'), 'make src/untyped.ts:1 svc');
   });
 });

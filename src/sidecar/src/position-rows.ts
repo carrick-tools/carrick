@@ -1230,7 +1230,8 @@ function resolveRequired(
  * is required and never imported is not in the program, and the carrick#2454
  * rule finds no module to name (carrick#3971). An `import` of the package
  * would load the same file. Relative specifiers are left as they are: a
- * required repo file the program does not list stays out of it.
+ * required repo file the program does not list stays out of it. So is a
+ * package's JavaScript: an import of a package with no types loads none.
  */
 function loadRequiredPackages(project: Project, fileNames: readonly string[]): void {
   const options = project.getCompilerOptions();
@@ -1251,7 +1252,7 @@ function loadRequiredPackages(project: Project, fileNames: readonly string[]): v
     for (const specifier of specifiers) {
       host ??= ts.createCompilerHost(options);
       const resolved = resolveRequired(specifier, sourceFile.fileName, options, host);
-      if (!resolved || project.getSourceFile(resolved)) continue;
+      if (!resolved || /\.[cm]?jsx?$/.test(resolved) || project.getSourceFile(resolved)) continue;
       try {
         project.addSourceFileAtPath(resolved);
       } catch {
