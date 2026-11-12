@@ -1,5 +1,3 @@
-import type { App } from 'fixture-plugin-server';
-
 // A handler: it registers nothing on its first parameter, which carries the
 // name the router below gives its own.
 export function onError(app: any, reply: any) {
@@ -7,6 +5,6 @@ export function onError(app: any, reply: any) {
 }
 
 // A router this module also holds, mounted from `status-index.ts`.
-export async function statusRoutes(app: App) {
+export async function statusRoutes(app: any) {
   app.get('/status', async () => ({ ok: true }));
 }
