@@ -466,6 +466,27 @@ mod tests {
         }
     }
 
+    /// carrick#3989 S0: a word a later release added reads, keeps its
+    /// spelling, is no stop this build names and has no phrase.
+    #[test]
+    fn a_word_from_a_later_release_reads_as_its_raw_word() {
+        let word = "a_word_from_a_later_release";
+        let stop = serde_json::from_value::<Stop>(word.into()).unwrap();
+        assert!(matches!(stop, Stop::Unknown(_)));
+        assert_eq!(stop.as_str(), word);
+        assert_eq!(stop.phrase(), word);
+        assert_eq!(serde_json::to_value(stop).unwrap(), word);
+        assert_eq!(Stop::parse(word), None);
+        assert!(!Stop::ALL.contains(&stop));
+        let long = "w".repeat(UnknownWord::MAX_CHARS + 1);
+        assert_eq!(
+            serde_json::from_value::<Stop>(long.into())
+                .unwrap()
+                .as_str(),
+            UnknownWord::OVER_CAP
+        );
+    }
+
     /// An older blob spelled a recursion `cycle`.
     #[test]
     fn an_older_cycle_reads_as_recursion() {
