@@ -10910,6 +10910,11 @@ pub struct RequestSummaryIndex {
     /// row's request ([`SummaryRow::request_at`]) and the row's file and
     /// line. Read by [`Self::placements`].
     through: HashMap<RowAt, BTreeSet<(PathBuf, u32)>>,
+    /// The callers where a request was closed and stated no row (it does
+    /// not render), with the calls it was composed through to there:
+    /// keyed by the request's file and span start (C11 T1). Read by
+    /// [`Self::placements`].
+    closed_unstated: Vec<((PathBuf, u32), BTreeSet<(PathBuf, u32)>)>,
 }
 
 /// A summary row by its request ([`SummaryRow::request_at`]) and its own
@@ -11007,7 +11012,8 @@ impl RequestSummaryIndex {
     /// Where the rows of each request stand (carrick#2524): the request's
     /// file and span start ([`SummaryRow::request_at`]) to the file and line
     /// of every row stated for it, with the calls each row at a caller was
-    /// composed through (C11 T1).
+    /// composed through, and the chains to callers where the request was
+    /// closed with no row (C11 T1).
     pub fn placements(&self) -> decided_sites::SummaryPlacements {
         let mut placed = decided_sites::SummaryPlacements::default();
         for (file, sites) in &self.rows {
@@ -11016,6 +11022,9 @@ impl RequestSummaryIndex {
                 let through = self.through.get(&(row.request_at.clone(), at.clone()));
                 placed.place(row.request_at.clone(), at, through);
             }
+        }
+        for (request, through) in &self.closed_unstated {
+            placed.close_unstated(request.clone(), through);
         }
         placed
     }
@@ -11665,6 +11674,13 @@ fn emit(
                         }
                         None => {
                             index.undetermined += 1;
+                            // The summaries answered this caller: no row
+                            // (C11 T1). A site on the same chain yields to
+                            // that answer (`RequestSummaryIndex::placements`).
+                            index.closed_unstated.push((
+                                (instantiated.site.file.clone(), instantiated.site.span_start),
+                                callee.through_call(effect, file, call.site.line),
+                            ));
                             // The request is closed at this caller and does
                             // not render: the caller is a site the send side
                             // could not compose (carrick#3688 F).
