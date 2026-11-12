@@ -38,6 +38,10 @@ miss moves the declaration in the same PR. A seed is removed only by
   mounted under `/api/v1`; `src/web/orders-view.ts` calls one procedure through
   a typed client. Its library answers are `procedure-router`'s. It has a store
   of its own for the same reason as `admin-api`.
+- `jobs-sender` and `jobs-worker` are BullMQ-shaped queue services in one
+  store of their own: the sender calls `new Queue("welcome-mail").add(...)`,
+  the worker `new Worker("welcome-mail", processor)` over a `bullmq` stub. The
+  queue seeds edit `jobs-sender` only.
 - `rpc-shelf` (carrick#3778) is two services in one repo, with a store of its
   own: `api` serves a `shelf` procedure router (`shelf.list`, `shelf.get`,
   `shelf.add`) under a fetch adapter at `/api/rpc`, and `web` calls it through
@@ -113,6 +117,8 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `socket-listener-field-added` | the listener's `OrderUpdate` gains optional `note` | as above, empty delta | passes (carrick#3172) |
 | `socket-event-added` | a new `order:note` listener that relays to every client | as above for the old events; the relay's emit is one gap (`missing_endpoint`), as in `socket-emit-rename`; delta new listener | passes (carrick#3172) |
 | `pubsub-subscriber-field-added` | the subscriber's `PaymentSettled` gains optional `currency` (the answer's lines move) | as above | passes (carrick#3172) |
+| `queue-job-renamed` (`jobs-sender`) | `new Queue("welcome-mail")` to `"welcome-email"` (`src/mail.ts:3`); the worker still listens on the old name | `removed_still_called` `PUBSUB welcome-mail`; the payload carries the `missing_endpoint` at `src/mail.ts:10` | scanner stages right; shown waits on carrick-cloud#2829, #3438 |
+| `queue-payload-field-removed` (`jobs-sender`) | `.add` drops `locale` from its payload (`src/mail.ts:10`), which the worker reads | `type_mismatch` `PUBSUB welcome-mail` at `src/mail.ts:10` | stops at judged: the send has no resolved expected type; carrick#3547, #3782 |
 
 ## Type-reach seeds (carrick#3102)
 

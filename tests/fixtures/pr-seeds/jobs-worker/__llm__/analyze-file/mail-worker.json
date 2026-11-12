@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [],
+  "graphql_operations": [],
+  "pubsub_operations": [
+    {
+      "topic": "welcome-mail",
+      "role": "subscriber",
+      "line_number": 9,
+      "primary_type_symbol": "WelcomeJob",
+      "type_import_source": null,
+      "broker": "bullmq",
+      "payload_expression_text": null,
+      "payload_expression_line": null
+    }
+  ],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}

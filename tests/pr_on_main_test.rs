@@ -2467,6 +2467,8 @@ struct MainSnapshot {
     rpc_reach: ReachObjects,
     shelf_rows: Vec<CloudRepoData>,
     shelf_reach: ReachObjects,
+    jobs_rows: Vec<CloudRepoData>,
+    jobs_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2503,6 +2505,8 @@ impl MainSnapshot {
             "rpc_reach": reach(&self.rpc_reach),
             "shelf_rows": self.shelf_rows,
             "shelf_reach": reach(&self.shelf_reach),
+            "jobs_rows": self.jobs_rows,
+            "jobs_reach": reach(&self.jobs_reach),
         })
     }
 }
@@ -2532,6 +2536,12 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
     let shelf = seed_repo(trees, "rpc-shelf");
     let shelf_store = Store::default();
     scan_seed_repo(&shelf_store, &shelf).await;
+    let jobs_sender = seed_repo(trees, "jobs-sender");
+    let jobs_worker = seed_repo(trees, "jobs-worker");
+    let jobs_store = Store::default();
+    scan_seed_repo(&jobs_store, &jobs_sender).await;
+    scan_seed_repo(&jobs_store, &jobs_worker).await;
+    scan_seed_repo(&jobs_store, &jobs_sender).await;
     MainSnapshot {
         trees: unlinked(trees),
         shared_rows: shared.repos.lock().unwrap().clone(),
@@ -2542,6 +2552,8 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
         rpc_reach: rpc_store.type_reach.lock().unwrap().clone(),
         shelf_rows: shelf_store.repos.lock().unwrap().clone(),
         shelf_reach: shelf_store.type_reach.lock().unwrap().clone(),
+        jobs_rows: jobs_store.repos.lock().unwrap().clone(),
+        jobs_reach: jobs_store.type_reach.lock().unwrap().clone(),
     }
 }
 
@@ -2587,6 +2599,8 @@ fn read_snapshot(dir: &Path) -> MainSnapshot {
         rpc_reach: reach("rpc_reach"),
         shelf_rows: rows("shelf_rows"),
         shelf_reach: reach("shelf_reach"),
+        jobs_rows: rows("jobs_rows"),
+        jobs_reach: reach("jobs_reach"),
     }
 }
 
@@ -2696,6 +2710,7 @@ async fn snapshot_from_cache_equals_fresh_scan() {
         .chain(&cached.admin_rows)
         .chain(&cached.rpc_rows)
         .chain(&cached.shelf_rows)
+        .chain(&cached.jobs_rows)
     {
         assert_eq!(
             head(&cached.trees.join(&row.repo_name)),
@@ -2714,10 +2729,11 @@ async fn snapshot_from_cache_equals_fresh_scan() {
 /// (manifest protocol, seed name). Every other seed runs its own assertions
 /// on the one (on) pass; the nightly workflow sets `CARRICK_PR_SEED_REACH_ALL=1`
 /// and pairs every seed (.github/workflows/nightly-seed-reach.yml).
-const REACH_SAMPLE: [(&str, &str); 5] = [
+const REACH_SAMPLE: [(&str, &str); 6] = [
     ("http", "http-field-rename"),
     ("graphql", "graphql-field-rename"),
     ("pubsub", "pubsub-field-rename"),
+    ("queue", "queue-payload-field-removed"),
     ("socket", "socket-field-rename"),
     ("trpc", "trpc-procedure-renamed"),
 ];
@@ -2824,6 +2840,7 @@ async fn seed_payload_from(
         "admin-api" => (&main.admin_rows, &main.admin_reach),
         "rpc-api" => (&main.rpc_rows, &main.rpc_reach),
         "rpc-shelf" => (&main.shelf_rows, &main.shelf_reach),
+        "jobs-sender" | "jobs-worker" => (&main.jobs_rows, &main.jobs_reach),
         _ => (&main.shared_rows, &main.shared_reach),
     };
     let store = Store {
@@ -3916,6 +3933,25 @@ async fn seed_copied_helper() {
         "{payload:#}"
     );
     assert!(findings_of(&payload).is_empty(), "{payload:#}");
+}
+
+// ---- Queues (jobs-sender, jobs-worker) ----------------------------------
+//
+// BullMQ-shaped: `new Queue(name).add(job, data)` and `new Worker(name, fn)`.
+// Both seeds are `open`: they record today's miss (the stage the payload
+// reaches) and hold it in both directions, so closing the miss moves the
+// declaration in the same PR.
+
+#[tokio::test]
+async fn seed_queue_job_renamed() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("queue-job-renamed").await;
+}
+
+#[tokio::test]
+async fn seed_queue_payload_field_removed() {
+    let _serial = SERIAL.lock().await;
+    manifest_seed_payload("queue-payload-field-removed").await;
 }
 
 /// A reworded copy of another service's helper: the payload carries exactly
