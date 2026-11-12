@@ -19,7 +19,7 @@ import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { splitRemote } from "../init/repos.ts";
-import { buildFacts, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
+import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
@@ -82,13 +82,16 @@ async function knownDigest(root: string): Promise<string | null> {
   if (!fs.existsSync(file)) return null;
   const sqlite = await loadSqlite();
   if (!sqlite) return null;
+  let db: { close: () => void } | null = null;
   try {
-    const db = new sqlite.DatabaseSync(file, { readOnly: true });
-    const row = db.prepare("SELECT value FROM meta WHERE key = 'digest'").get();
-    db.close();
+    const open = new sqlite.DatabaseSync(file, { readOnly: true });
+    db = open;
+    const row = open.prepare("SELECT value FROM meta WHERE key = 'digest'").get();
     return row ? String(row["value"]) : null;
   } catch {
     return null;
+  } finally {
+    closeQuietly(db);
   }
 }
 

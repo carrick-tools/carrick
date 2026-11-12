@@ -541,6 +541,50 @@ test("a fact file for another project is not read", async (t) => {
   assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
 });
 
+test("a failed build leaves no temp file behind", async (t) => {
+  const ws = await factsWorkspace(t, { ndjson: null });
+  const dest = factsPath(ws.root);
+  const bad = `${header(["orders-api"])}\n{"k":"op", not json\n`;
+  await assert.rejects(buildFacts(bad, dest, [], new Date().toISOString()));
+  assert.deepEqual(fs.readdirSync(path.dirname(dest)), []);
+});
+
+test("every database handle is closed, whichever way the read ends", async (t) => {
+  const sqlite = (await loadSqlite())!;
+  const proto = sqlite.DatabaseSync.prototype as { close: () => void };
+  const close = proto.close;
+  let closed = 0;
+  proto.close = function (this: unknown) {
+    closed += 1;
+    return close.call(this);
+  };
+  t.after(() => {
+    proto.close = close;
+  });
+  const { openFacts, touchFetched } = await import("../src/facts/store.ts");
+  const ws = await factsWorkspace(t, { ndjson: null });
+  fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo" }] } }));
+  fs.mkdirSync(path.dirname(factsPath(ws.root)), { recursive: true });
+  // A file with a meta table this package reads but no other table.
+  const db = new sqlite.DatabaseSync(factsPath(ws.root));
+  db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('schema', '1'), ('project', 'demo');");
+  db.close();
+  closed = 0;
+  assert.equal(await openFacts(ws.root), null);
+  assert.equal(closed, 1, "openFacts closes the file it could not read");
+  // A file with no meta table at all.
+  fs.rmSync(factsPath(ws.root));
+  new sqlite.DatabaseSync(factsPath(ws.root)).close();
+  closed = 0;
+  await touchFetched(ws.root, new Date().toISOString());
+  assert.equal(closed, 1, "touchFetched closes the file it could not stamp");
+  closed = 0;
+  const request = (async () => new Response(JSON.stringify({ success: false, error: { code: "facts_building" } }))) as typeof fetch;
+  await refreshFacts(ws.root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } });
+  assert.equal(closed, 1, "the digest read closes the file it could not read");
+});
+
 test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
   const ndjson = [
     header(["web-app"]),

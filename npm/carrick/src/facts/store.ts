@@ -106,35 +106,49 @@ export async function openFacts(root: string): Promise<FactStore | null> {
   if (!fs.existsSync(file)) return null;
   const sqlite = await loadSqlite();
   if (!sqlite) return null;
+  let db: InstanceType<Sqlite["DatabaseSync"]> | null = null;
+  // Handed to the caller once the store is built; closed here on every other path.
+  let handed = false;
   try {
-    const db = new sqlite.DatabaseSync(file, { readOnly: true });
+    const open = new sqlite.DatabaseSync(file, { readOnly: true });
+    db = open;
     const meta: Record<string, string> = {};
-    for (const raw of db.prepare("SELECT key, value FROM meta").all()) meta[String(raw["key"])] = String(raw["value"]);
+    for (const raw of open.prepare("SELECT key, value FROM meta").all()) meta[String(raw["key"])] = String(raw["value"]);
     if (meta["schema"] !== String(SCHEMA)) {
       log(`fact file has schema ${meta["schema"] ?? "none"}, this package reads ${SCHEMA}; not read`);
-      db.close();
       return null;
     }
     // A file for another project (a workspace re-pointed since it was built) is not this one's.
     const project = snapshotProjectSlug(root);
     if (!project || meta["project"] !== project) {
       log(`fact file is for project ${meta["project"] ?? "none"}, this workspace is ${project || "unknown"}; not read`);
-      db.close();
       return null;
     }
-    const repos = db.prepare("SELECT repo, path FROM repos").all().map((raw) => ({ repo: String(raw["repo"]), path: String(raw["path"]) }));
-    const byName = db.prepare("SELECT * FROM rows WHERE repo = ? AND name = ? ORDER BY id");
-    const unnamed = db.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
+    const repos = open.prepare("SELECT repo, path FROM repos").all().map((raw) => ({ repo: String(raw["repo"]), path: String(raw["path"]) }));
+    const byName = open.prepare("SELECT * FROM rows WHERE repo = ? AND name = ? ORDER BY id");
+    const unnamed = open.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
+    handed = true;
     return {
       meta,
       repos,
       byName: (repo, name) => byName.all(repo, name).map((raw) => toRow(raw as Record<string, unknown>)),
       unnamed: (repo, rel) => unnamed.all(repo, rel).map((raw) => toRow(raw as Record<string, unknown>)),
-      close: () => db.close(),
+      close: () => open.close(),
     };
   } catch (error) {
     log("fact file not readable", String(error));
     return null;
+  } finally {
+    if (!handed) closeQuietly(db);
+  }
+}
+
+/** Close a database handle, if open, without throwing. */
+export function closeQuietly(db: { close: () => void } | null): void {
+  try {
+    db?.close();
+  } catch {
+    // Already closed.
   }
 }
 
@@ -172,6 +186,19 @@ export async function buildFacts(
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const temp = `${dest}.${process.pid}.tmp`;
   fs.rmSync(temp, { force: true });
+  try {
+    writeFactsDatabase(sqlite, temp, header, lines, local, fetchedAt);
+    fs.renameSync(temp, dest);
+  } catch (error) {
+    // No half-built file is left behind, whatever failed.
+    fs.rmSync(temp, { force: true });
+    throw error;
+  }
+  return header;
+}
+
+/** Write the fact database at `temp` from the header and NDJSON row lines. */
+function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string): void {
   const db = new sqlite.DatabaseSync(temp);
   try {
     db.exec(`
@@ -222,21 +249,22 @@ export async function buildFacts(
     db.exec("COMMIT");
     db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file);");
   } finally {
-    db.close();
+    closeQuietly(db);
   }
-  fs.renameSync(temp, dest);
-  return header;
 }
 
 /** Stamp `fetched_at` on an existing file (an unchanged answer). Never throws. */
 export async function touchFetched(root: string, at: string): Promise<void> {
   const sqlite = await loadSqlite();
   if (!sqlite) return;
+  let db: { close: () => void } | null = null;
   try {
-    const db = new sqlite.DatabaseSync(factsPath(root));
-    db.prepare("UPDATE meta SET value = ? WHERE key = 'fetched_at'").run(at);
-    db.close();
+    const open = new sqlite.DatabaseSync(factsPath(root));
+    db = open;
+    open.prepare("UPDATE meta SET value = ? WHERE key = 'fetched_at'").run(at);
   } catch (error) {
     log("could not stamp the fact file", String(error));
+  } finally {
+    closeQuietly(db);
   }
 }
