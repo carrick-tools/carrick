@@ -63,8 +63,30 @@ test("used names every key printed, so a second call can pass them as exclude", 
   const first = await factLines(ws.root, [whole(ws, "api/src/orders.ts")], undefined, { limit: 2 });
   assert.deepEqual(first.lines, [fnText("alpha"), fnText("beta")]);
   assert.deepEqual(first.used, [fnKey("alpha"), fnKey("beta")]);
-  const second = await factLines(ws.root, [whole(ws, "api/src/orders.ts")], undefined, { limit: 3, exclude: new Set(first.used) });
-  assert.deepEqual(second.lines, [fnText("gamma"), fnText("delta"), fnText("echo")]);
+  const second = await factLines(ws.root, [whole(ws, "api/src/orders.ts")], undefined, { limit: 3 - first.used.length, exclude: new Set(first.used) });
+  assert.deepEqual(second.lines, [fnText("gamma")]);
+  assert.equal(first.lines.length + second.lines.length, 3);
+});
+
+test("limit never exceeds the cap of three, and a non-finite limit means three", async (t) => {
+  const ws = await workspace(t, FILES, fnRows);
+  const files = [whole(ws, "api/src/orders.ts")];
+  const five = await factLines(ws.root, files, undefined, { limit: 5 });
+  assert.equal(five.lines.length, 3);
+  assert.equal(five.used.length, 3);
+  const nan = await factLines(ws.root, files, undefined, { limit: Number.NaN });
+  assert.equal(nan.lines.length, 3);
+  for (const limit of [0, -1]) {
+    const none = await factLines(ws.root, files, undefined, { limit });
+    assert.deepEqual(none.lines, []);
+  }
+});
+
+test("an excluded key is not a failed proof: a fourth fn line still prints", async (t) => {
+  const ws = await workspace(t, FILES, fnRows);
+  const exclude = new Set(["alpha", "beta", "gamma"].map(fnKey));
+  const outcome = await factLines(ws.root, [whole(ws, "api/src/orders.ts")], undefined, { exclude });
+  assert.deepEqual(outcome.lines, [fnText("delta"), fnText("echo")]);
 });
 
 test("a line said earlier in the session and a line in exclude both stay out of one action", async (t) => {

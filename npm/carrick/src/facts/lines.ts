@@ -230,6 +230,8 @@ function held(kind: (typeof KINDS)[number], candidate: Candidate): boolean {
  * file. Op and fn share a bound of `MAX_PROOF_FAILURES` failed peer proofs
  * (R36.3): each may run git. Only a failed check counts, never a line
  * skipped as said, excluded or capped. Each printed line is added to `claims`.
+ * `options.limit` is never above `MAX_FACT_LINES`; an absent or non-finite
+ * limit (NaN, Infinity) means `MAX_FACT_LINES`, and 0 or less prints nothing.
  */
 export function pickLines(
   found: Record<(typeof KINDS)[number], readonly Candidate[]>,
@@ -238,7 +240,7 @@ export function pickLines(
   now: number,
   options: { limit?: number; exclude?: ReadonlySet<string> } = {},
 ): { lines: string[]; used: string[] } {
-  const limit = options.limit ?? MAX_FACT_LINES;
+  const limit = Number.isFinite(options.limit) ? Math.min(options.limit!, MAX_FACT_LINES) : MAX_FACT_LINES;
   const lines: string[] = [];
   const used: string[] = [];
   let proofFailures = 0;
