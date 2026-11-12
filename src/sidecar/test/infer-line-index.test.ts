@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Node, Project, SyntaxKind, type SourceFile } from 'ts-morph';
 import { endLineOf, startLineOf } from '../src/line-index.js';
+import { locatorNames, normalizeLocatorText } from '../src/capture/site-node.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
 import type { InferRequestItem } from '../src/types.js';
 
@@ -89,7 +90,7 @@ function referenceMatch(
   const nodes = sourceFile
     .getDescendants()
     .filter((n) => !Node.isSourceFile(n) && n.getKind() !== SyntaxKind.SyntaxList);
-  const target = inferrer.normalizeWhitespace(expressionText);
+  const target = normalizeLocatorText(expressionText);
   if (!target) return undefined;
   const inWindow = lineNumber
     ? nodes.filter((n) => {
@@ -97,7 +98,7 @@ function referenceMatch(
         return l >= lineNumber - searchRadius && l <= lineNumber + searchRadius;
       })
     : nodes;
-  const candidates = inWindow.map((node) => ({ node, text: inferrer.normalizeWhitespace(node.getText()) }));
+  const candidates = inWindow.map((node) => ({ node, text: normalizeLocatorText(node.getText()) }));
   if (candidates.length === 0) return undefined;
   const pick = (ns: Node[]): Node =>
     ns.reduce((best, current) => {
@@ -132,7 +133,7 @@ function referenceMatch(
   if (reverse.length === 0) return undefined;
   // The fragment rule (carrick#2056) reads the locator's own parse; it is
   // the inferrer's, and only the line each node starts on is this copy's.
-  const named = inferrer.locatorNames(target);
+  const named = locatorNames(target);
   if (!named) return pick(reverse.map((c) => c.node));
   const textOf = new Map<Node, string>(candidates.map((c) => [c.node, c.text]));
   const bound = new Set<Node>();

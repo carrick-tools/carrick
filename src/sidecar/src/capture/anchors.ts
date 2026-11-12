@@ -19,6 +19,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
+import { firstExactLocatorMatch } from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
@@ -579,7 +580,7 @@ function finishInferAnchor(
   // type. No source locator points at a distinct clean payload here (the payload
   // lives inside the wrapper's response builder), so degrade to `unknown` —
   // abstain, never a concrete verdict off the machinery.
-  if (typeIsOrContainsMachinery(program, type, located, repoRoot)) {
+  if (typeIsOrContainsMachinery(program, type, repoRoot)) {
     return demote(
       'resolved type is or contains framework machinery (Response/Request-shaped); ' +
         'degraded to unknown rather than emit a wrapper envelope as a response contract'
@@ -1597,42 +1598,16 @@ function tightestCoveringNode(
 }
 
 /**
- * Locator text with insignificant whitespace removed: runs collapse to one
- * space, and a member chain broken before its dot (`client\n  .list(…)`) reads
- * as `client.list(…)` (carrick#1162), the same rule the v1 inferrer applies.
+ * The node a locator's text names: the first exact match on or after the line
+ * among the nodes a value type can be read at (`firstExactLocatorMatch`,
+ * carrick#3500).
  */
-function normalizeLocatorText(text: string): string {
-  return text
-    .replace(/\s+/g, ' ')
-    .replace(/\s*(\?\.|\.)\s*/g, '$1')
-    .trim();
-}
-
 function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number
 ): ts.Node | undefined {
-  const wanted = normalizeLocatorText(text);
-  let best: ts.Node | undefined;
-  const visit = (node: ts.Node) => {
-    if (best) return;
-    if (isPreferredTarget(node)) {
-      const nodeText = normalizeLocatorText(node.getText(sourceFile));
-      if (nodeText === wanted) {
-        // On or after the line, or COVERING it: a chain broken before its dot
-        // starts a line above the line the analyzer reports for the call.
-        const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
-        if (fromLine === undefined || endLine >= fromLine) {
-          best = node;
-          return;
-        }
-      }
-    }
-    node.forEachChild(visit);
-  };
-  visit(sourceFile);
-  return best;
+  return firstExactLocatorMatch(sourceFile, text, fromLine, isPreferredTarget);
 }
 
 function firstExpressionOnLine(

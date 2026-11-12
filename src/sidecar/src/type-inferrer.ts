@@ -83,11 +83,19 @@ import {
   descendantsOnLine,
   descendantsOnLines,
   wrap,
+  wrapCompilerNode,
   type IndexedNode,
 } from './node-index.js';
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
-import { constituentsOf } from './capture/index.js';
+import {
+  constituentsOf,
+  isFrameworkMachinery,
+  nodeByLocatorText,
+  normalizeLocatorText,
+  symbolDeclaredOutside,
+  typeIsOrContainsMachinery,
+} from './capture/index.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
@@ -174,54 +182,6 @@ const BUILTIN_ANCHOR_SYMBOLS = new Set<string>([
   'RegExp',
   'Error',
 ]);
-
-/**
- * Strongly-discriminating member names of HTTP transport machinery — the
- * fetch/DOM `Response` & `Request`, a Node `http.ServerResponse`, a framework
- * reply object. A type declared in a lib or installed-dependency origin that carries
- * a subset of these is framework machinery, never a user contract: the
- * PRODUCER-side structural mirror of the consumer `machineryIndicators`
- * (ExtractionConfig), used to reject a wrapper envelope whose response field is
- * a raw `Response` (carrick#371) instead of emitting it as a comparable type.
- *
- * Framework-agnostic by construction: no framework NAME appears here, only the
- * shared HTTP-message surface. The names are deliberately the ones no
- * JSON payload ever carries (`ok`, `redirected`, `bodyUsed`, `arrayBuffer`,
- * `writeHead`, ...), so the origin gate + `MACHINERY_INDICATOR_THRESHOLD` never
- * fire on real data. Kept in lockstep with the capture-seam mirror
- * `capture/machinery.ts` (the seam forbids sharing a module across it, same as
- * `BUILTIN_ANCHOR_SYMBOLS` mirrors `socket_io.rs`). Exported so a drift-guard
- * test (`machinery-indicator-mirror.test.ts`) asserts the two sets stay equal.
- */
-export const MACHINERY_MEMBER_INDICATORS = new Set<string>([
-  // fetch / DOM Response & Request body-consumer surface
-  'ok',
-  'redirected',
-  'bodyUsed',
-  'arrayBuffer',
-  'blob',
-  'formData',
-  'clone',
-  'json',
-  'statusText',
-  // FROZEN (old path, 2026-10-21): the reply-object half below only (the
-  // fetch half above and the threshold stay). Deletions and safety fixes
-  // only. Fixes for wrong or missing types go in labelled reply objects
-  // (carrick#2472 C4) and the language library rows (carrick#2445). Delete
-  // when a delete-and-replay on the four repos moves no row wrongly, after
-  // carrick-cloud#2379 and carrick#2445 (carrick#2472, C6).
-  // Node http ServerResponse / reply-object surface
-  'statusCode',
-  'statusMessage',
-  'setHeader',
-  'getHeader',
-  'removeHeader',
-  'writeHead',
-  'flushHeaders',
-]);
-
-/** Machinery needs at least this many indicator members to be recognized. */
-const MACHINERY_INDICATOR_THRESHOLD = 3;
 
 /**
  * True when a binary expression COMPARES rather than assigns or computes: its
@@ -507,77 +467,6 @@ function typeText(type: Type, enclosingNode?: Node): string {
  * `text` is `string`, alone or beside `null` and `undefined` in either order:
  * the only payload a raw-text read publishes (carrick#1842).
  */
-/**
- * Source text with every plain string literal written in double quotes:
- * `'/a'`, `"/a"` and an interpolation-free `` `/a` `` are one value, so text
- * that differs only in its quotes compares equal (carrick#2056).
- *
- * The text is read left to right, pairing quotes the way the scanner does,
- * so a template's closing backtick never pairs with the next template's
- * opening one. A literal holding a quote, a backslash or an interpolation is
- * copied as it is, and so is an unterminated one with everything after it.
- */
-export function canonicalStringQuotes(text: string): string {
-  const isQuote = (ch: string): boolean => ch === "'" || ch === '"' || ch === '`';
-  // The index just past the literal opening at `start`, or -1.
-  const literalEnd = (start: number): number => {
-    const quote = text[start];
-    let j = start + 1;
-    while (j < text.length) {
-      const ch = text[j];
-      if (ch === '\\') {
-        j += 2;
-      } else if (ch === quote) {
-        return j + 1;
-      } else if (quote === '`' && ch === '$' && text[j + 1] === '{') {
-        const close = codeEnd(j + 2);
-        if (close < 0) return -1;
-        j = close + 1;
-      } else {
-        j++;
-      }
-    }
-    return -1;
-  };
-  // The index of the `}` that closes an interpolation whose code starts at `start`, or -1.
-  const codeEnd = (start: number): number => {
-    let depth = 0;
-    let j = start;
-    while (j < text.length) {
-      const ch = text[j];
-      if (isQuote(ch)) {
-        const end = literalEnd(j);
-        if (end < 0) return -1;
-        j = end;
-        continue;
-      }
-      if (ch === '{') depth++;
-      if (ch === '}') {
-        if (depth === 0) return j;
-        depth--;
-      }
-      j++;
-    }
-    return -1;
-  };
-
-  let out = '';
-  let i = 0;
-  while (i < text.length) {
-    if (!isQuote(text[i])) {
-      out += text[i];
-      i++;
-      continue;
-    }
-    const end = literalEnd(i);
-    if (end < 0) return out + text.slice(i);
-    const body = text.slice(i + 1, end - 1);
-    out += /['"`\\]|\$\{/.test(body) ? text.slice(i, end) : `"${body}"`;
-    i = end;
-  }
-  return out;
-}
-
 function isBareStringText(text: string): boolean {
   const members = text.split('|').map((member) => member.trim());
   return (
@@ -2043,12 +1932,12 @@ export class TypeInferrer {
     }
 
     // 2. Whole binding pattern, whitespace-normalized.
-    const normalizedTarget = this.normalizeWhitespace(paramName);
+    const normalizedTarget = normalizeLocatorText(paramName);
     for (const param of params) {
       const nameNode = param.getNameNode();
       if (
         (Node.isObjectBindingPattern(nameNode) || Node.isArrayBindingPattern(nameNode)) &&
-        this.normalizeWhitespace(nameNode.getText()) === normalizedTarget
+        normalizeLocatorText(nameNode.getText()) === normalizedTarget
       ) {
         return { param, node: param };
       }
@@ -6687,85 +6576,22 @@ export class TypeInferrer {
    * envelope `{ response: Response; error?: undefined } | { ...; error: Error }`
    * was captured as the response contract. Machinery is never a comparable
    * contract, so a response path that resolves here abstains (honest `unknown`)
-   * rather than emit a concrete-but-false type.
-   *
-   * DETECTS, exactly (see `typeIsOrContainsMachinery`):
-   *   1. the type itself is machinery (`typeIsFrameworkMachinery`);
-   *   2. a union/intersection member is machinery (the envelope union);
-   *   3. a DIRECT property's type is machinery, ONE level of descent only
-   *      (`{ response: Response; error }`).
-   *
-   * DELIBERATELY NOT DETECTED — listed so this comment never overstates the
-   * guarantee (an overstated safety comment is what bit sibling PR #442). Each is
-   * a non-regression: it leaves the pre-existing verdict unchanged and never
-   * manufactures a new wrong one, tracked as a follow-up:
-   *   - machinery nested deeper than one property level (a property whose type
-   *     is itself a nested object wrapping the machinery);
-   *   - a property typed `Promise<Response>` (the property type is NOT awaited /
-   *     Promise-unwrapped before the machinery check);
-   *   - an array element type: `Response[]` is not descended to its element;
-   *   - `interface X extends Response` declared in USER source — the origin gate
-   *     is lib/installed-dependency only, so a user-declared subtype reads as a real
-   *     contract, not machinery;
-   *   - a function / call-signature return type: the response paths that call
-   *     this resolve a handler's RETURN (an envelope/object), never a function
-   *     value, so no call-signature descent happens here. The capture-seam
-   *     mirror `capture/machinery.ts` DOES descend call signatures — that is
-   *     where the wrapper-FUNCTION type the Infer fallback resolves is caught.
-   *
-   * The origin gate in `typeIsFrameworkMachinery` keeps a user object whose
-   * fields merely share a member name from tripping.
+   * rather than emit a concrete-but-false type. The capture asks the same
+   * question of the same function (`capture/site-node.ts`, carrick#3500), which
+   * states what it detects and what it does not.
    */
   private typeIsOrContainsResponseMachinery(type: Type): boolean {
-    return this.typeIsOrContainsMachinery(type, 0);
+    return typeIsOrContainsMachinery(this.checker(), type.compilerType, this.declaredOutside);
   }
 
-  private typeIsOrContainsMachinery(type: Type, depth: number): boolean {
-    if (this.typeIsFrameworkMachinery(type)) {
-      return true;
-    }
-    // Union/intersection: any envelope member wrapping machinery taints it.
-    if (type.isUnion()) {
-      return type
-        .getUnionTypes()
-        .some((part) => this.typeIsOrContainsMachinery(part, depth));
-    }
-    if (type.isIntersection()) {
-      return type
-        .getIntersectionTypes()
-        .some((part) => this.typeIsOrContainsMachinery(part, depth));
-    }
-    // One level of property descent: `{ response: Response; error?: undefined }`.
-    if (depth < 1) {
-      for (const prop of type.getProperties()) {
-        const decl = prop.getDeclarations()[0];
-        if (!decl) continue;
-        const propType = prop.getTypeAtLocation(decl);
-        if (this.typeIsOrContainsMachinery(propType, depth + 1)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  /**
-   * True when `type` itself is an HTTP-machinery type: it structurally carries
-   * at least `MACHINERY_INDICATOR_THRESHOLD` of the strongly-discriminating
-   * `MACHINERY_MEMBER_INDICATORS`, AND its symbol is declared in a lib
-   * (`lib.dom.d.ts`, ...) or installed-dependency origin. Both gates are required —
-   * the indicator subset alone essentially never matches a JSON payload, and
-   * the origin gate makes certain a user's own local type sharing those member
-   * names is never mistaken for framework machinery (the advisor's guard).
-   */
   /**
    * Blueprint row N8: true when `type` is framework machinery by where it is
    * declared, never by its name. Either it passes the structural test
-   * (`typeIsFrameworkMachinery`: the transport's members, declared by a
-   * library or an installed package), or an installed package the store
-   * labels a server framework declares it (`frameworkPackages`), which also
-   * covers app and router instances that carry no reply members. A
-   * service's own `Context` or `Router` is neither.
+   * (`isFrameworkMachinery` in `capture/site-node.ts`: the transport's
+   * members, declared by a library or an installed package), or an installed
+   * package the store labels a server framework declares it
+   * (`frameworkPackages`), which also covers app and router instances that
+   * carry no reply members. A service's own `Context` or `Router` is neither.
    */
   private isFrameworkMachinery(type: Type): boolean {
     if (this.typeIsFrameworkMachinery(type)) {
@@ -6779,64 +6605,37 @@ export class TypeInferrer {
   }
 
   private typeIsFrameworkMachinery(type: Type): boolean {
-    if (!this.hasMachineryIndicatorThreshold(type)) {
-      return false;
-    }
-    const symbol = type.getSymbol() ?? type.getAliasSymbol();
-    return this.symbolIsLibOrExternalOrigin(symbol);
+    return isFrameworkMachinery(this.checker(), type.compilerType, this.declaredOutside);
+  }
+
+  private checker(): ts.TypeChecker {
+    return this.project.getTypeChecker().compilerObject;
   }
 
   /**
-   * True once the type carries at least `MACHINERY_INDICATOR_THRESHOLD` DISTINCT
-   * `MACHINERY_MEMBER_INDICATORS` (own + apparent). Deduplicates by name (own and
-   * apparent property lists overlap) and early-returns the moment the threshold
-   * is reached — the callers only need the boolean, never the full count.
-   */
-  private hasMachineryIndicatorThreshold(type: Type): boolean {
-    const matched = new Set<string>();
-    const consider = (name: string): boolean => {
-      if (MACHINERY_MEMBER_INDICATORS.has(name)) {
-        matched.add(name);
-      }
-      return matched.size >= MACHINERY_INDICATOR_THRESHOLD;
-    };
-    for (const prop of type.getProperties()) {
-      if (consider(prop.getName())) return true;
-    }
-    for (const prop of type.getApparentProperties()) {
-      if (consider(prop.getName())) return true;
-    }
-    return false;
-  }
-
-  /**
-   * True when the symbol is declared in a runtime/library origin
+   * Whether a declaration's file is a runtime/library origin
    * (`isExternalOrigin`): a TypeScript lib, an installed dependency however
    * the program resolved it, or the runtime declarations Carrick materialises
    * under `.carrick/deno/` — framework/runtime machinery, not user source.
+   * The program is read per call: the project adds source files lazily and
+   * rebuilds it.
+   */
+  private readonly declaredOutside = (sourceFile: ts.SourceFile): boolean =>
+    isExternalOrigin(
+      this.project.getProgram().compilerObject,
+      sourceFile,
+      this.repoRoot,
+      externalImportsOf(this.project)
+    );
+
+  /**
+   * True when the symbol is declared in a runtime/library origin
+   * (`declaredOutside`), itself or through the import alias it stands for.
    * Works on a bare checkout: the DOM `Response`/`Request` resolve from the
-   * bundled `lib.dom.d.ts` even with no installed dependencies. The program is
-   * read per call: the project adds source files lazily and rebuilds it.
+   * bundled `lib.dom.d.ts` even with no installed dependencies.
    */
   private symbolIsLibOrExternalOrigin(symbol: TsSymbol | undefined): boolean {
-    if (!symbol) {
-      return false;
-    }
-    const program = this.project.getProgram().compilerObject;
-    for (const decl of symbol.getDeclarations()) {
-      if (isExternalOrigin(program, decl.getSourceFile().compilerNode, this.repoRoot, externalImportsOf(this.project))) {
-        return true;
-      }
-    }
-    try {
-      const aliased = symbol.getAliasedSymbol?.();
-      if (aliased && aliased !== symbol) {
-        return this.symbolIsLibOrExternalOrigin(aliased);
-      }
-    } catch {
-      // Ignore errors when resolving the aliased symbol.
-    }
-    return false;
+    return symbolDeclaredOutside(this.checker(), symbol?.compilerSymbol, this.declaredOutside);
   }
 
   /**
@@ -11683,14 +11482,9 @@ export class TypeInferrer {
   }
 
   /**
-   * Find a node by matching expression text near a target line.
-   *
-   * Strategy:
-   * 1. Get all descendant nodes within [lineNumber - searchRadius, lineNumber + searchRadius]
-   * 2. Normalize whitespace for comparison
-   * 3. Try exact match first (after normalization), prefer closest to target line
-   * 4. Fall back to substring match (LLM text in node text, or vice versa)
-   * 5. Return smallest matching node closest to target line
+   * Find a node by matching expression text near a target line: the shared
+   * locator (`nodeByLocatorText`, carrick#3500) over every node that starts
+   * within `searchRadius` lines of it, the one the capture runs too.
    */
   private findNodeByText(
     sourceFile: SourceFile,
@@ -11698,14 +11492,17 @@ export class TypeInferrer {
     lineNumber?: number,
     searchRadius: number = 5
   ): Node | undefined {
-    // Only the window's nodes are wrapped: `matchByText` keeps no other.
     const inWindow = lineNumber
       ? descendantsOnLines(sourceFile, lineNumber - searchRadius, lineNumber + searchRadius)
       : descendantsOf(sourceFile);
-    const nodes = inWindow
-      .filter((entry) => entry.kind !== SyntaxKind.SyntaxList)
-      .map((entry) => wrap(sourceFile, entry));
-    return this.matchByText(nodes, expressionText, lineNumber, searchRadius);
+    const found = nodeByLocatorText(
+      sourceFile.compilerNode,
+      inWindow.filter((entry) => entry.kind !== SyntaxKind.SyntaxList).map((entry) => entry.node),
+      expressionText,
+      lineNumber,
+      searchRadius
+    );
+    return found === undefined ? undefined : wrapCompilerNode(sourceFile, found);
   }
 
   /**
@@ -11723,286 +11520,14 @@ export class TypeInferrer {
             entry.line >= lineNumber - searchRadius && entry.line <= lineNumber + searchRadius
         )
       : callsOf(sourceFile);
-    const callExpressions = inWindow.map((entry) => wrap<CallExpression>(sourceFile, entry));
-    return this.matchByText(callExpressions, expressionText, lineNumber, searchRadius) as
-      | CallExpression
-      | undefined;
-  }
-
-  /**
-   * Shared text-matching logic for node resolution.
-   * Normalizes whitespace once per candidate, then tries exact match,
-   * then substring match (preferring containing matches).
-   */
-  private matchByText<T extends Node>(
-    nodes: T[],
-    expressionText: string,
-    lineNumber?: number,
-    searchRadius: number = 5
-  ): T | undefined {
-    const normalizedTarget = this.normalizeWhitespace(expressionText);
-    if (!normalizedTarget) return undefined;
-
-    // Filter to nodes within the search window and pre-compute normalized text
-    const candidates = (
-      lineNumber
-        ? nodes.filter((node) => {
-            const nodeLine = startLineOf(node);
-            return nodeLine >= lineNumber - searchRadius && nodeLine <= lineNumber + searchRadius;
-          })
-        : nodes
-    ).map((node) => ({ node, text: this.normalizeWhitespace(node.getText()) }));
-
-    if (candidates.length === 0) return undefined;
-
-    // Try exact match (normalized whitespace)
-    const exactMatches = candidates.filter((c) => c.text === normalizedTarget);
-    if (exactMatches.length > 0) {
-      return this.pickBestMatch(exactMatches.map((c) => c.node), lineNumber) as T;
-    }
-
-    // A bare identifier target must match a node exactly: substring matching
-    // would bind `users` to `usersCsv` (or to any enclosing node that merely
-    // contains the identifier somewhere) and report a confidently wrong type.
-    // Failing here is correct — the caller records an error and the alias
-    // pads to `unknown` downstream.
-    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(normalizedTarget)) {
-      return undefined;
-    }
-
-    // A locator that elides members (`body: { a: x, ... }`) stands for the
-    // whole node it opens: the text before the elision is where the source
-    // opens. Never a node the text merely contains, which is one member of the
-    // payload it names.
-    // An opening shorter than this (`{`) names no node in particular.
-    const MIN_ELIDED_OPENING_LEN = 8;
-    const elidedOpening = this.elidedLocatorOpening(normalizedTarget);
-    if (elidedOpening !== undefined) {
-      if (elidedOpening.length < MIN_ELIDED_OPENING_LEN) return undefined;
-      const opened = candidates.filter((c) => c.text.startsWith(elidedOpening));
-      if (opened.length === 0) return undefined;
-      if (lineNumber !== undefined) {
-        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
-        const nearest = Math.min(...opened.map(distance));
-        return this.pickBestMatch(
-          opened.filter((c) => distance(c) === nearest).map((c) => c.node),
-          lineNumber
-        ) as T;
-      }
-      return this.pickBestMatch(opened.map((c) => c.node), lineNumber) as T;
-    }
-
-    // Fall back to substring match
-    // For the reverse direction (target contains node text), require a minimum node text
-    // length to avoid matching tiny identifiers like "res" or "body" too broadly.
-    // Also require the node to cover at least half of the target: the reverse
-    // branch exists for a locator with minor syntactic drift around the true
-    // node, not for binding to a fragment. Without the floor, a 100+ char
-    // locator whose exact match failed would bind to the smallest embedded
-    // sub-expression (pickBestMatch prefers small nodes), e.g. the 8-char
-    // literal "active" inside a res.json object payload (#335).
-    //
-    // A node the text itself places strictly inside what it names is a
-    // fragment, however much of the text it covers (carrick#2056): the
-    // `new URLSearchParams(…)` inside a call's URL argument, or the object a
-    // callback nested in the named object returns. Only the node the text
-    // names, or a wrapper the text adds around it, may be bound this way. A
-    // fragment still points at what the text names where the source agrees
-    // with the text up to it: the enclosing node of the named kind whose text
-    // opens with the text's own opening up to the fragment (`new Response(`
-    // before a payload, when the text dropped the call's second argument).
-    const MIN_REVERSE_MATCH_LEN = 8;
-    const MIN_REVERSE_MATCH_COVERAGE = 0.5;
-    const containingMatches = candidates.filter((c) => c.text.includes(normalizedTarget));
-    if (containingMatches.length > 0) {
-      // A text that is only a wrapped call's first line (`load({`) is held by
-      // every sibling that opens alike, and the smallest of them is not the
-      // one the locator names (carrick#2114). The nodes whose own text OPENS
-      // with the text are the ones a first line names: among those the stated
-      // line decides, then size. A fragment from the middle of a node opens
-      // nothing, and stays on the smallest node holding it.
-      const opening =
-        lineNumber === undefined
-          ? []
-          : containingMatches.filter((c) => c.text.startsWith(normalizedTarget));
-      if (lineNumber !== undefined && opening.length > 0) {
-        const distance = (c: { node: T }) => Math.abs(startLineOf(c.node) - lineNumber);
-        const nearest = Math.min(...opening.map(distance));
-        return this.pickBestMatch(
-          opening.filter((c) => distance(c) === nearest).map((c) => c.node),
-          lineNumber
-        ) as T;
-      }
-      return this.pickBestMatch(containingMatches.map((c) => c.node), lineNumber) as T;
-    }
-    const reverseMatches = candidates.filter(
-      (c) =>
-        c.text.length >= MIN_REVERSE_MATCH_LEN &&
-        c.text.length >= normalizedTarget.length * MIN_REVERSE_MATCH_COVERAGE &&
-        normalizedTarget.includes(c.text)
+    const found = nodeByLocatorText(
+      sourceFile.compilerNode,
+      inWindow.map((entry) => entry.node),
+      expressionText,
+      lineNumber,
+      searchRadius
     );
-    if (reverseMatches.length === 0) return undefined;
-
-    const named = this.locatorNames(normalizedTarget);
-    if (!named) {
-      return this.pickBestMatch(reverseMatches.map((c) => c.node), lineNumber) as T;
-    }
-    const textOf = new Map<Node, string>(candidates.map((c) => [c.node, c.text]));
-    const bound = new Set<Node>();
-    for (const c of reverseMatches) {
-      if (named.texts.has(c.text)) {
-        bound.add(c.node);
-        continue;
-      }
-      const at = normalizedTarget.indexOf(c.text, named.rootStart + 1);
-      if (at < 0) continue;
-      const opening = normalizedTarget.slice(named.rootStart, at);
-      const enclosing = c.node.getFirstAncestor(
-        (ancestor) =>
-          ancestor.getKind() === named.rootKind &&
-          textOf.get(ancestor)?.startsWith(opening) === true
-      );
-      if (enclosing) bound.add(enclosing);
-    }
-    return bound.size > 0 ? (this.pickBestMatch([...bound], lineNumber) as T) : undefined;
-  }
-
-  /**
-   * The text a locator opens with before an elision, or `undefined` when the
-   * locator has none. An elision is `...` followed only by closing brackets
-   * (`{ a: x, ... }`); `...rest` is a spread and source text. An opening too
-   * short to tell nodes apart is judged by the caller.
-   */
-  private elidedLocatorOpening(normalizedTarget: string): string | undefined {
-    const match = /^(.*?)[\s,]*\.\.\.[\s,)}\]]*$/s.exec(normalizedTarget);
-    if (!match) return undefined;
-    return match[1];
-  }
-
-  /**
-   * What a locator's text names, read off its own parse (carrick#2056):
-   *
-   *  - `texts`: the normalized text of the expression it names and of each
-   *    wrapper it carries around it (`return`, a `const x =` binding, a label,
-   *    `await`, parentheses, a cast, `satisfies`, `!`). A node strictly inside
-   *    that expression is not among them;
-   *  - `rootKind` and `rootStart`: the innermost of those, its kind, and where
-   *    its text starts in the locator.
-   *
-   * `null` when the text does not parse as one expression or one statement:
-   * there is no structure to read, and the caller keeps its text rule.
-   */
-  private locatorNames(
-    normalizedTarget: string
-  ): { texts: Set<string>; rootKind: SyntaxKind; rootStart: number } | null {
-    const parsed = (source: string): ts.SourceFile | null => {
-      const file = ts.createSourceFile('locator.ts', source, ts.ScriptTarget.Latest, true);
-      const diagnostics = (file as unknown as { parseDiagnostics?: readonly unknown[] })
-        .parseDiagnostics;
-      return diagnostics && diagnostics.length === 0 && file.statements.length === 1 ? file : null;
-    };
-
-    // An object literal is a block as a statement, so try the text as an
-    // expression first.
-    const EXPRESSION_OPENING = '(\n';
-    const asExpression = parsed(`${EXPRESSION_OPENING}${normalizedTarget}\n);`);
-    let node: ts.Node | undefined;
-    let file: ts.SourceFile | null = asExpression;
-    let offset = 0;
-    if (asExpression) {
-      const statement = asExpression.statements[0];
-      if (ts.isExpressionStatement(statement) && ts.isParenthesizedExpression(statement.expression)) {
-        node = statement.expression.expression;
-        offset = EXPRESSION_OPENING.length;
-      }
-    } else {
-      file = parsed(normalizedTarget);
-      node = file?.statements[0];
-    }
-    if (!file || !node) return null;
-
-    const texts = new Set<string>();
-    let root: ts.Node | undefined;
-    while (node) {
-      if (ts.isLabeledStatement(node)) {
-        node = node.statement;
-      } else if (ts.isExpressionStatement(node) || ts.isReturnStatement(node)) {
-        node = node.expression;
-      } else if (ts.isVariableStatement(node)) {
-        const declarations = node.declarationList.declarations;
-        node = declarations.length === 1 ? declarations[0].initializer : undefined;
-      } else {
-        texts.add(this.normalizeWhitespace(node.getText(file)));
-        root = node;
-        node =
-          ts.isParenthesizedExpression(node) ||
-          ts.isAwaitExpression(node) ||
-          ts.isAsExpression(node) ||
-          ts.isSatisfiesExpression(node) ||
-          ts.isNonNullExpression(node) ||
-          ts.isTypeAssertionExpression(node)
-            ? node.expression
-            : undefined;
-      }
-    }
-    if (!root) return null;
-    return { texts, rootKind: root.kind, rootStart: root.getStart(file) - offset };
-  }
-
-  /**
-   * Pick the best match from a set of candidate nodes:
-   * smallest range, then closest to target line.
-   */
-  private pickBestMatch(nodes: Node[], targetLine?: number): Node {
-    return nodes.reduce((best, current) => {
-      const bestRange = best.getEnd() - best.getStart();
-      const currentRange = current.getEnd() - current.getStart();
-
-      // Prefer smaller nodes
-      if (currentRange !== bestRange) {
-        return currentRange < bestRange ? current : best;
-      }
-
-      // Tie-break by proximity to target line
-      if (targetLine !== undefined) {
-        const bestDist = Math.abs(startLineOf(best) - targetLine);
-        const currentDist = Math.abs(startLineOf(current) - targetLine);
-        return currentDist < bestDist ? current : best;
-      }
-
-      return best;
-    });
-  }
-
-  /**
-   * Normalize whitespace for text comparison:
-   * collapse runs of whitespace into single spaces, trim.
-   *
-   * Also strips trailing commas before `}` `)` `]`: multi-line source
-   * literals carry them but the LLM's single-line locator print does not,
-   * and that one comma used to defeat exact AND containment matching for
-   * the payload and every enclosing node (#335). Applied symmetrically to
-   * node text and target, so both sides compare equal.
-   *
-   * Also strips the space left AFTER `(` `[` `{` by the collapse: a
-   * multi-line call whose arguments start on the next line normalizes to
-   * `f( x)` while the LLM's compact print is `f(x)`, and that one space
-   * defeated exact matching for the call and every enclosing node — the
-   * opening-delimiter mirror of the #335 trailing comma (#336). Symmetric
-   * for the same reason.
-   */
-  private normalizeWhitespace(text: string): string {
-    const collapsed = text
-      .replace(/\s+/g, ' ')
-      // A member chain broken before its dot (`client\n  .list(…)`) reads the
-      // same as `client.list(…)`; a space around `.` / `?.` means nothing
-      // (carrick#1162).
-      .replace(/\s*(\?\.|\.)\s*/g, '$1')
-      .replace(/\s*,?\s*([}\)\]])/g, '$1')
-      .replace(/([\(\[{])\s+/g, '$1')
-      .trim();
-    // A string literal reads the same in any quotes (carrick#2056).
-    return canonicalStringQuotes(collapsed);
+    return found === undefined ? undefined : wrapCompilerNode<CallExpression>(sourceFile, found);
   }
 
   /**

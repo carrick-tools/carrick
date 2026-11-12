@@ -27,6 +27,7 @@ import { Node, Project, SyntaxKind, type CallExpression, type SourceFile } from 
 import { startLineOf } from '../src/line-index.js';
 import { callsOf, descendantsOf, nodeIndexBuilds } from '../src/node-index.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
+import { nodeByLocatorText } from '../src/capture/site-node.js';
 import type { InferRequestItem } from '../src/types.js';
 
 const CLIENT_FUNCTIONS = 420;
@@ -157,6 +158,25 @@ function referenceRegistrationAtLine(inferrer: any, nodes: Node[], line: number)
   return undefined;
 }
 
+/** The shared text matcher (carrick#3500), over ts-morph nodes. */
+function matchByText<T extends Node>(
+  nodes: T[],
+  expressionText: string,
+  lineNumber?: number,
+  searchRadius = 5
+): T | undefined {
+  if (nodes.length === 0) return undefined;
+  const byCompiler = new Map(nodes.map((node) => [node.compilerNode, node]));
+  const found = nodeByLocatorText(
+    nodes[0].getSourceFile().compilerNode,
+    nodes.map((node) => node.compilerNode),
+    expressionText,
+    lineNumber,
+    searchRadius
+  );
+  return found === undefined ? undefined : byCompiler.get(found);
+}
+
 function referenceFindNodeByText(
   inferrer: any,
   nodes: Node[],
@@ -169,7 +189,7 @@ function referenceFindNodeByText(
     if (node.getKind() === SyntaxKind.SyntaxList) return false;
     return true;
   });
-  return inferrer.matchByText(allNodes, expressionText, lineNumber, searchRadius);
+  return matchByText(allNodes, expressionText, lineNumber, searchRadius);
 }
 
 function referenceFindCallExpressionByText(
@@ -179,7 +199,7 @@ function referenceFindCallExpressionByText(
   lineNumber?: number,
   searchRadius = 5
 ): CallExpression | undefined {
-  return inferrer.matchByText(calls, expressionText, lineNumber, searchRadius);
+  return matchByText(calls, expressionText, lineNumber, searchRadius);
 }
 
 function referenceFindNodeAtSpan(nodes: Node[], spanStart: number, spanEnd: number): Node | undefined {
