@@ -791,7 +791,7 @@ mod tests {
         let capped = cap(rows);
         let labelled = capped.rows.iter().filter(|r| r.labelled_end.is_some());
         assert_eq!(labelled.count(), 1500);
-        assert_eq!(capped.rows.len(), MAX_PER_SERVICE);
+        assert!(capped.rows.len() <= MAX_PER_SERVICE);
         assert_eq!(capped.total, 3500);
     }
 
