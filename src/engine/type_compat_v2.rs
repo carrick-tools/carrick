@@ -850,8 +850,8 @@ impl std::fmt::Display for CaptureFailure {
         match self {
             CaptureFailure::TimedOut => write!(
                 f,
-                "the type sidecar gave no answer and reported no progress inside the \
-                 operation deadline"
+                "the compiler engine timed out: it returned no response and reported no \
+                 progress before the deadline"
             ),
             CaptureFailure::SidecarDied { detail, .. } | CaptureFailure::Failed(detail) => {
                 write!(f, "{detail}")
@@ -1068,7 +1068,10 @@ fn capture_in_a_fresh_process(
     fail_on_memory: bool,
 ) -> Result<CaptureV2Result, CaptureFailure> {
     let not_started = |e: SidecarError| CaptureFailure::SidecarDied {
-        detail: e.to_string(),
+        detail: format!(
+            "the compiler engine could not be restarted for the capture: {}",
+            e.customer_cause()
+        ),
         deaths: Vec::new(),
     };
     let mut died_before: Option<CaptureDeath> = None;
@@ -1122,7 +1125,6 @@ fn capture_in_a_fresh_process(
         // starts the progress empty, and the restart replaces the process.
         let died = sidecar.how_the_process_died();
         let death = CaptureDeath {
-            error: error.to_string(),
             progress: sidecar.last_progress(),
             end: died.end,
             heap_line: died.heap_line,
@@ -1171,24 +1173,42 @@ fn capture_in_a_fresh_process(
     }
 }
 
+/// The heap a process was given, worded as the heap that did not fit and as the
+/// cap it died under, for both phrasings of a memory death.
+fn heap_cap_phrases(heap_cap_mb: Option<u64>) -> (String, String) {
+    match heap_cap_mb {
+        Some(mb) => (
+            format!("the {mb} MB memory limit it was given"),
+            format!("under a memory limit of {mb} MB"),
+        ),
+        None => (
+            "the default memory limit".to_string(),
+            "under the default memory limit".to_string(),
+        ),
+    }
+}
+
+/// The `types_degraded` detail of a type resolution whose process died of
+/// memory, worded as the capture words its own (LED-2): `death` is what the
+/// run recorded of it.
+pub(crate) fn resolution_memory_death(death: &crate::scan_health::TypeMemoryDeath) -> String {
+    use crate::services::type_sidecar::MemoryDeath;
+    let (_, under) = heap_cap_phrases(death.heap_cap_mb);
+    let how = match death.kind {
+        MemoryDeath::HeapLimit => "it ran out of memory",
+        MemoryDeath::OomKilled => "it was stopped because the machine ran out of memory",
+    };
+    format!("the compiler engine could not read types: {how}, {under}")
+}
+
 /// The failure of a capture whose process died of memory once and was not
 /// asked again, because the run stops on a memory death (carrick#2209): how
 /// the process ended and at which stage, then what did not fit the heap.
 fn one_memory_death(death: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
-    let (heap, under) = match heap_cap_mb {
-        Some(mb) => (
-            format!("the {mb} MB heap it was given"),
-            format!("under a heap cap of {mb} MB"),
-        ),
-        None => (
-            "V8's default heap".to_string(),
-            "under V8's default heap cap".to_string(),
-        ),
-    };
+    let (heap, under) = heap_cap_phrases(heap_cap_mb);
     let lead = format!(
-        "the type sidecar process ended during the capture ({}) and was not retried at the \
+        "the compiler engine ended during the capture and was not retried at the \
          same size, as this run stops on a memory death; it {} {}",
-        death.error,
         death.ended(false),
         death.stage()
     );
@@ -1205,8 +1225,6 @@ fn one_memory_death(death: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
 /// What is known about a capture process that ended before it answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureDeath {
-    /// The client's own error for it.
-    error: String,
     /// The last stage the capture reported, when it reported any.
     progress: Option<OperationProgress>,
     /// How the process ended, when the OS said.
@@ -1235,9 +1253,9 @@ impl CaptureDeath {
         let was = if both { "were" } else { "was" };
         match self.end {
             Some(end) if end.is_abort() => {
-                format!("{was} aborted (SIGABRT), as Node aborts when its heap is full,")
+                format!("{was} stopped because it ran out of memory,")
             }
-            Some(ProcessEnd::Signal(9)) => format!("{was} killed (SIGKILL)"),
+            Some(ProcessEnd::Signal(9)) => format!("{was} killed by the system"),
             Some(ProcessEnd::Signal(signal)) => format!("{was} ended by signal {signal}"),
             Some(ProcessEnd::Code(code)) => format!("ended with exit code {code}"),
             None => "ended".to_string(),
@@ -1286,20 +1304,10 @@ impl CaptureDeath {
 /// `None` when it runs under V8's own default.
 fn two_deaths(first: &CaptureDeath, retry: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
     let lead = format!(
-        "the type sidecar process ended during the capture ({}) and again when the capture \
-         was retried in a fresh process ({})",
-        first.error, retry.error
+        "the compiler engine ended during the capture and again when the capture \
+         was retried in a fresh process"
     );
-    let (heap, under) = match heap_cap_mb {
-        Some(mb) => (
-            format!("the {mb} MB heap it was given"),
-            format!("under a heap cap of {mb} MB"),
-        ),
-        None => (
-            "V8's default heap".to_string(),
-            "under V8's default heap cap".to_string(),
-        ),
-    };
+    let (heap, under) = heap_cap_phrases(heap_cap_mb);
     let same = first.end == retry.end && first.stage() == retry.stage();
     if !same {
         return format!(
@@ -1474,6 +1482,10 @@ fn join_identity(key: &OperationKey) -> Option<(String, String)> {
 pub(crate) enum PreVerdict {
     /// Nothing was compared, and `reason` says why: stored unverifiable.
     NotCompared { reason: String },
+    /// A side has no v2 type surface, so nothing was compared. Stored
+    /// unverifiable and not judged: the run lost or never had the surface, and
+    /// the next run may answer differently on the same code (LED-2).
+    NoSurface { reason: String },
     /// An HTTP request pair whose two sides both carry the decided root reason
     /// `no_request_body`: the call writes no body and the route's handler
     /// reads none. Compatible and resolved, with a note.
@@ -1637,9 +1649,28 @@ fn select_mode<'a>(
     }
 }
 
+/// The pre-verdict of a pair whose `side` has no v2 type surface. When the
+/// side's scan recorded why it lost its types, the reason says so; otherwise
+/// the surface is missing from an older scan or a degraded capture.
+fn no_surface_pre_verdict(side: &str, entry: &ServiceEntry) -> PreVerdict {
+    let reason = match entry.types_degraded {
+        Some(lost) => format!(
+            "{side} service '{}' has no type surface: types were lost at {}: {}",
+            entry.service_id, lost.stage, lost.detail
+        ),
+        None => format!(
+            "{side} service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
+            entry.service_id
+        ),
+    };
+    PreVerdict::NoSurface { reason }
+}
+
 struct ServiceEntry<'a> {
     service_id: &'a str,
     has_surface: bool,
+    /// Why the service lost its operation types, when its scan recorded it.
+    types_degraded: Option<&'a crate::cloud_storage::TypeDegradation>,
     entry: &'a TypeManifestEntry,
     /// Where the entry's name means something, read off the repo's operation
     /// row at the entry's site (carrick#3520). `None`: the site states none.
@@ -1772,6 +1803,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             let side = ServiceEntry {
                 service_id,
                 has_surface,
+                types_degraded: repo.types_degraded.as_ref(),
                 entry,
                 name_scope: scopes
                     .get(&(
@@ -2028,19 +2060,9 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         None
     };
     let pre_verdict = if !producer.has_surface {
-        Some(PreVerdict::NotCompared {
-            reason: format!(
-                "producer service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
-                producer.service_id
-            ),
-        })
+        Some(no_surface_pre_verdict("producer", producer))
     } else if !consumer.has_surface {
-        Some(PreVerdict::NotCompared {
-            reason: format!(
-                "consumer service '{}' has no v2 type surface (older scan or capture degraded) — re-scan it",
-                consumer.service_id
-            ),
-        })
+        Some(no_surface_pre_verdict("consumer", consumer))
     } else {
         no_request_body_pre_verdict(protocol, producer, consumer)
     };
@@ -4177,6 +4199,15 @@ fn unresolved_pair_line(outcome: &PairCheckOutcome) -> Option<String> {
 /// inferrer's reading of the source), so they are `resolved`.
 fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckOutcome {
     match pre_verdict {
+        PreVerdict::NoSurface { reason } => not_judged(outcome_for(
+            pair,
+            VerdictBucket::Unverifiable,
+            None,
+            Some(reason.clone()),
+            false,
+            Some(reason.clone()),
+            Vec::new(),
+        )),
         PreVerdict::NotCompared { reason } => outcome_for(
             pair,
             VerdictBucket::Unverifiable,
@@ -4551,7 +4582,7 @@ mod tests {
 
         let pairs = build_check_pairs(&[producer, consumer]);
         assert_eq!(pairs.len(), 1);
-        let Some(PreVerdict::NotCompared { reason }) = pairs[0].pre_verdict.as_ref() else {
+        let Some(PreVerdict::NoSurface { reason }) = pairs[0].pre_verdict.as_ref() else {
             panic!(
                 "expected a not-compared pre-verdict: {:?}",
                 pairs[0].pre_verdict
@@ -8189,7 +8220,6 @@ mod tests {
 
     fn death(phase: Option<(&str, &str)>, end: Option<ProcessEnd>) -> CaptureDeath {
         CaptureDeath {
-            error: "Sidecar process died unexpectedly".to_string(),
             progress: phase.map(|(phase, message)| OperationProgress {
                 phase: phase.to_string(),
                 message: message.to_string(),
@@ -8203,9 +8233,8 @@ mod tests {
     }
 
     const ABORTED: Option<ProcessEnd> = Some(ProcessEnd::Signal(ProcessEnd::SIGABRT));
-    const TWICE: &str = "the type sidecar process ended during the capture (Sidecar process \
-                         died unexpectedly) and again when the capture was retried in a fresh \
-                         process (Sidecar process died unexpectedly)";
+    const TWICE: &str = "the compiler engine ended during the capture and again when the capture was \
+                         retried in a fresh process";
 
     /// Two processes that aborted before any anchor was resolved are a
     /// program that does not fit the heap, and the failure says so with the
@@ -8216,9 +8245,9 @@ mod tests {
         assert_eq!(
             two_deaths(&building, &building, Some(2048)),
             format!(
-                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                "{TWICE}; both were stopped because they ran out of memory, \
                  while building the service's program, before any anchor was resolved: the \
-                 service's program did not fit the 2048 MB heap it was given"
+                 service's program did not fit the 2048 MB memory limit it was given"
             )
         );
     }
@@ -8232,19 +8261,19 @@ mod tests {
         assert_eq!(
             two_deaths(&checking, &checking, Some(8192)),
             format!(
-                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                "{TWICE}; both were stopped because they ran out of memory, \
                  while type-checking the emitted declarations, after every anchor was \
                  resolved: the emitted declarations and the packages they import did not fit \
-                 the 8192 MB heap it was given"
+                 the 8192 MB memory limit it was given"
             )
         );
         let resolving = death(Some(("anchors", "412 of 817")), ABORTED);
         assert_eq!(
             two_deaths(&resolving, &resolving, None),
             format!(
-                "{TWICE}; both were aborted (SIGABRT), as Node aborts when its heap is full, \
+                "{TWICE}; both were stopped because they ran out of memory, \
                  while resolving anchors (last report: 412 of 817): the service's program \
-                 and the types of its anchors did not fit V8's default heap"
+                 and the types of its anchors did not fit the default memory limit"
             )
         );
     }
@@ -8260,8 +8289,8 @@ mod tests {
         assert_eq!(
             two_deaths(&killed, &killed, Some(8192)),
             format!(
-                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
-                 anchor was resolved, under a heap cap of 8192 MB"
+                "{TWICE}; both were killed by the system while emitting declarations, after every \
+                 anchor was resolved, under a memory limit of 8192 MB"
             )
         );
         // A sidecar that writes no frames, and a platform that reports no
@@ -8271,14 +8300,14 @@ mod tests {
             two_deaths(&silent, &silent, Some(8192)),
             format!(
                 "{TWICE}; both ended with exit code 134 before reporting any progress, under \
-                 a heap cap of 8192 MB"
+                 a memory limit of 8192 MB"
             )
         );
         let unknown = death(None, None);
         assert_eq!(
             two_deaths(&unknown, &unknown, None),
             format!(
-                "{TWICE}; both ended before reporting any progress, under V8's default heap cap"
+                "{TWICE}; both ended before reporting any progress, under the default memory limit"
             )
         );
     }
@@ -8292,10 +8321,10 @@ mod tests {
         assert_eq!(
             two_deaths(&building, &resolving, Some(4096)),
             format!(
-                "{TWICE}; the first was aborted (SIGABRT), as Node aborts when its heap is \
+                "{TWICE}; the first was stopped because it ran out of memory, \
                  full, while building the service's program, before any anchor was resolved, \
-                 the retry was killed (SIGKILL) while resolving anchors (last report: 3 of 9), \
-                 under a heap cap of 4096 MB"
+                 the retry was killed by the system while resolving anchors (last report: 3 of 9), \
+                 under a memory limit of 4096 MB"
             )
         );
     }
@@ -8351,8 +8380,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         .expect_err("a capture whose process dies twice produces no stub");
 
         let under = match crate::services::type_sidecar::heap_cap_mb() {
-            Some(mb) => format!("under a heap cap of {mb} MB"),
-            None => "under V8's default heap cap".to_string(),
+            Some(mb) => format!("under a memory limit of {mb} MB"),
+            None => "under the default memory limit".to_string(),
         };
         // Unix says which signal; elsewhere the end is an exit code.
         let CaptureFailure::SidecarDied { detail, deaths } = failure else {
@@ -8362,7 +8391,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             detail,
             format!(
-                "{TWICE}; both were killed (SIGKILL) while emitting declarations, after every \
+                "{TWICE}; both were killed by the system while emitting declarations, after every \
                  anchor was resolved, {under}"
             )
         );
@@ -8423,11 +8452,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let building = death(Some(("program", "building the program")), ABORTED);
         assert_eq!(
             one_memory_death(&building, Some(8192)),
-            "the type sidecar process ended during the capture (Sidecar process died \
-             unexpectedly) and was not retried at the same size, as this run stops on a \
-             memory death; it was aborted (SIGABRT), as Node aborts when its heap is full, \
-             while building the service's program, before any anchor was resolved: the \
-             service's program did not fit the 8192 MB heap it was given"
+            "the compiler engine ended during the capture and was not retried at the \
+             same size, as this run stops on a memory death; it was stopped because it ran \
+             out of memory, while building the service's program, before any anchor was resolved: the \
+             service's program did not fit the 8192 MB memory limit it was given"
         );
         let killed = death(
             Some(("program", "building the program")),
@@ -8435,14 +8463,14 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         assert!(
             one_memory_death(&killed, Some(8192))
-                .ends_with("before any anchor was resolved, under a heap cap of 8192 MB"),
-            "a kill is not V8's heap: {}",
+                .ends_with("before any anchor was resolved, under a memory limit of 8192 MB"),
+            "a kill is not the memory limit: {}",
             one_memory_death(&killed, Some(8192))
         );
         let silent = death(None, ABORTED);
         assert!(
             one_memory_death(&silent, None)
-                .ends_with("before reporting any progress, under V8's default heap cap"),
+                .ends_with("before reporting any progress, under the default memory limit"),
             "{}",
             one_memory_death(&silent, None)
         );
@@ -9917,7 +9945,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let pairs = build_check_pairs(&[no_surface_producer, consumer_ok.clone()]);
         assert_eq!(pairs.len(), 1);
-        let Some(PreVerdict::NotCompared { reason }) = pairs[0].pre_verdict.as_ref() else {
+        let Some(PreVerdict::NoSurface { reason }) = pairs[0].pre_verdict.as_ref() else {
             panic!(
                 "expected a not-compared pre-verdict: {:?}",
                 pairs[0].pre_verdict
@@ -9949,6 +9977,96 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             "an Unknown-state side WITH a surface must probe, not pre-verdict: {:?}",
             pairs[0].pre_verdict
         );
+    }
+
+    /// The two sides of one `GET /orders` pair, the producer without a surface
+    /// and with `degraded` as what its scan recorded of the loss.
+    fn surfaceless_producer_pair(
+        degraded: Option<crate::cloud_storage::TypeDegradation>,
+    ) -> Vec<BuiltPair> {
+        let key = OperationKey::http("GET", "/orders");
+        let mut api = repo(
+            "api",
+            None,
+            vec![entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/routes.ts",
+                3,
+                ManifestTypeState::Unknown,
+            )],
+            None,
+        );
+        api.types_degraded = degraded;
+        let web = repo(
+            "web",
+            None,
+            vec![entry(
+                key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Explicit,
+            )],
+            Some(fake_artifact()),
+        );
+        build_check_pairs(&[api, web])
+    }
+
+    /// LED-2: a side whose scan lost its types says at which stage and why,
+    /// and not that the scan is old; a side with no record says what it did.
+    #[test]
+    fn a_pair_whose_producer_lost_its_types_names_the_stage() {
+        let pairs = surfaceless_producer_pair(Some(crate::cloud_storage::TypeDegradation {
+            stage: "resolve".to_string(),
+            detail: "the process ran out of memory".to_string(),
+        }));
+        let Some(PreVerdict::NoSurface { reason }) = pre_verdict_of(&pairs) else {
+            panic!(
+                "expected a no-surface pre-verdict: {:?}",
+                pairs[0].pre_verdict
+            );
+        };
+        assert_eq!(
+            reason,
+            "producer service 'api' has no type surface: types were lost at resolve: the \
+             process ran out of memory"
+        );
+        let pairs = surfaceless_producer_pair(None);
+        let Some(PreVerdict::NoSurface { reason }) = pre_verdict_of(&pairs) else {
+            panic!(
+                "expected a no-surface pre-verdict: {:?}",
+                pairs[0].pre_verdict
+            );
+        };
+        assert_eq!(
+            reason,
+            "producer service 'api' has no v2 type surface (older scan or capture degraded) \
+             — re-scan it"
+        );
+    }
+
+    /// LED-2: a pair that was never compared for want of a surface is how the
+    /// run went, not what the types are: stored not judged. A pair left
+    /// uncompared for a reason of its own types (an unstated case) stays judged.
+    #[test]
+    fn a_no_surface_pair_is_not_judged() {
+        let pairs = surfaceless_producer_pair(None);
+        let pre = pairs[0].pre_verdict.as_ref().unwrap();
+        let outcome = pre_verdict_outcome(&pairs[0], pre);
+        assert!(!outcome.judged);
+        assert_eq!(outcome.bucket, VerdictBucket::Unverifiable);
+        let case_unknown = pre_verdict_outcome(
+            &pairs[0],
+            &PreVerdict::NotCompared {
+                reason: "the case is unknown".to_string(),
+            },
+        );
+        assert!(case_unknown.judged);
     }
 
     // ---- the request-body pre-verdicts (carrick#2674) ----------------------
@@ -10156,7 +10274,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let pairs = build_check_pairs(&[api, web]);
         assert!(matches!(
             pre_verdict_of(&pairs),
-            Some(PreVerdict::NotCompared { .. })
+            Some(PreVerdict::NoSurface { .. })
         ));
     }
 

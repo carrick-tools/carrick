@@ -5520,6 +5520,20 @@ pub enum SidecarError {
 }
 
 impl SidecarError {
+    /// Why the compiler engine failed, in words a customer reads (it ends up
+    /// in a service's `types_degraded` detail). The raw error is for the log.
+    pub fn customer_cause(&self) -> &'static str {
+        match self {
+            SidecarError::SpawnFailed(_)
+            | SidecarError::InitFailed(_)
+            | SidecarError::NotReady(_) => "it could not be started",
+            SidecarError::Timeout => "it ran out of time",
+            SidecarError::ProcessDied | SidecarError::IoError(_) => "it stopped unexpectedly",
+            SidecarError::Interrupted(_) => "it was interrupted",
+            _ => "it reported an error",
+        }
+    }
+
     /// Whether this failure is environmental — the machine or this run having
     /// a bad day — rather than a repeatable property of the checkout.
     ///
