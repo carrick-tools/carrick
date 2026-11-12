@@ -541,3 +541,18 @@ test("an fn row with null in others and a pkg service with no manifest do not lo
   );
   assert.deepEqual(outcome.lines, ["op line for loadOrder"]);
 });
+
+// ---- Stale hunks (ruling 4) ----
+
+test("fn: an Edit in one function, then lines prepended to the file, names no function", async (t) => {
+  const src = ["export function fOne() {", "  return 1;", "}", "", "export function gTwo() {", "  return 2;", "}", ""].join("\n");
+  const ws = await workspace(t, { "api/src/two.ts": src }, [
+    fnRow("fOne", "fOne is called from web/src/page.ts:4", "src/two.ts"),
+    fnRow("gTwo", "gTwo is called from web/src/page.ts:9", "src/two.ts"),
+  ]);
+  const file = ws.at("api/src/two.ts");
+  // The Edit added `  return 2;` in gTwo (line 6); a formatter then put three lines on top.
+  fs.writeFileSync(file, `// one\n// two\n// three\n${src}`);
+  const hunk = { newStart: 6, lines: ["+  return 2;"] };
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
