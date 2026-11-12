@@ -983,6 +983,59 @@ test("R33.2: a commit one clone lacks silences only the lines naming that repo",
   assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [LOAD_LINE]);
 });
 
+test("R33.2: a repo whose services name different commits has no index commit, so its peers are silent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+  const web = spawnSync("git", ["-C", ws.at("web"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const head = JSON.parse(header()) as { repos: Array<{ repo: string; service: string; commit: string }> };
+  // web's two services: one at the real commit, one at another, in either order.
+  const real = { repo: "web", service: "site", commit: web };
+  const other = { repo: "web", service: "admin", commit: "c".repeat(40) };
+  for (const pair of [[real, other], [other, real]]) {
+    head.repos = [...head.repos.filter((entry) => entry.repo !== "web"), ...pair];
+    const body = `${[JSON.stringify(head), JSON.stringify(OP_PEER), JSON.stringify(FN_PEER)].join("\n")}\n`;
+    await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
+    assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], pair[0]!.service);
+  }
+});
+
+test("with CARRICK_FACT_LINES unset, edits that would print fn, name and pkg lines print nothing and run no git", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { ...STDIN_FILES, "api/src/orders.ts": ORDERS, "api/package.json": before, "web/src/page.ts": PAGE }, [
+    FN_PEER,
+    nameRow("readStdin", "web", "src/stdin.ts"),
+    ZOD,
+  ]);
+  // Every git call any hook makes is logged, then the real git runs.
+  const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-count-"));
+  t.after(() => fs.rmSync(shim, { recursive: true, force: true }));
+  const log = path.join(shim, "calls.log");
+  const real = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
+  fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\necho "$*" >> ${log}\nexec ${real} "$@"\n`, { mode: 0o755 });
+  const run = async (on: boolean, session: string) => {
+    const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), PATH: `${shim}${path.delimiter}${process.env["PATH"] ?? ""}` });
+    if (!on) delete env["CARRICK_FACT_LINES"];
+    const call = (file: string, hunk: Hunk) =>
+      runHook("post-edit.ts", {
+        payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: session, cwd: ws.root, tool_input: { file_path: file, old_string: "x", new_string: "" }, tool_response: { structuredPatch: [{ oldStart: hunk.newStart, oldLines: 0, newLines: 0, ...hunk }] } },
+        env,
+      });
+    const orders = ws.at("api/src/orders.ts");
+    const said = [context((await call(orders, { newStart: lineOf(orders, "const key"), lines: ["+  const key = `order:${id}`;"] })).stdout)];
+    const added = addFunction(ws, "api/src/hook.ts");
+    said.push(context((await call(added.file, added.hunk)).stdout));
+    fs.writeFileSync(added.file, HOOK);
+    const manifest = ws.at("api/package.json");
+    said.push(context((await call(manifest, manifestHunk(manifest, before, MANIFEST(['    "zod": "^3.24.0"'])))).stdout));
+    fs.writeFileSync(manifest, before);
+    return said;
+  };
+  assert.deepEqual(await run(false, "off"), ["", "", ""]);
+  assert.equal(fs.existsSync(log), false, fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "");
+  // Control: switched on, the same edits print each kind's line, and the peer proof runs git.
+  assert.deepEqual(await run(true, "on"), [LOAD_LINE, STDIN_LINE, ZOD_FOR_API]);
+  assert.match(fs.readFileSync(log, "utf8"), /ls-tree/);
+});
+
 test("R33.1: a peer in a repo not checked out here is stated from the index", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER]);
   assert.equal(fs.existsSync(ws.at("web")), false);

@@ -345,7 +345,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     // Each repo's index commit, which the peer proof checks files against
-    // (`peers.ts`). A repo whose services name different commits has none.
+    // (`peers.ts`). A repo whose services name different commits has none,
+    // so its peers are never proven: which commit a peer's file was read at
+    // is not known. Kept that strict because both live fact files measured
+    // (2026-11-12) hold one commit per repo across all its services.
     const named = new Map<string, Set<unknown>>();
     for (const entry of header.repos ?? []) named.set(entry.repo, (named.get(entry.repo) ?? new Set()).add(entry.commit));
     const commits = Object.fromEntries([...named].filter(([, seen]) => seen.size === 1).map(([repo, seen]) => [repo, [...seen][0]]));
