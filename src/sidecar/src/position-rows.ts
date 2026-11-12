@@ -59,6 +59,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { ts, type Project } from 'ts-morph';
 import { WriteGuard, installedPackageDirectory, isDeclarationFileName, moduleExport, toPosix } from './capture/index.js';
+import { isRelative } from './capture/specifiers.js';
 import { attributedDeclaration, installedPackageOf, typeDeclaration } from './declaration-attribution.js';
 import { typeToStringAsDeclared } from './print-type.js';
 import type { ProjectLoader } from './project-loader.js';
@@ -234,6 +235,7 @@ export function writePositionRows(options: PositionRowsOptions): PositionRowsCou
       }
       read.set(index, sourceFile?.getFilePath());
     }
+    loadRequiredPackages(project, [...read.values()].filter((f): f is string => f !== undefined));
     // Built once, after every file the group adds. The language service's
     // program is the one walked, as it was when go-to-implementation answered
     // over it (carrick#2430, dropped in #2561): its rows are pinned.
@@ -1162,30 +1164,21 @@ export class PositionWalker {
 
   /** `"m"` of a call `require("m")` to the global `require`, else `undefined`. */
   private requireSpecifier(expression: ts.Expression): string | undefined {
-    if (!ts.isCallExpression(expression) || expression.arguments.length !== 1) return undefined;
-    const callee = expression.expression;
-    const argument = expression.arguments[0];
-    if (!ts.isIdentifier(callee) || callee.text !== 'require' || !ts.isStringLiteral(argument)) return undefined;
-    // The global `require` is declared in a declaration file (or nowhere); a
-    // `require` the service writes is a declaration in its own source.
-    const own = (this.checker.getSymbolAtLocation(callee)?.declarations ?? []).some(
-      (d) => !d.getSourceFile().isDeclarationFile
+    const specifier = requireCallSpecifier(expression);
+    if (specifier === undefined || !ts.isCallExpression(expression)) return undefined;
+    // The global `require` is declared in a declaration file, by a `declare`
+    // in the source (carrick#3971), or nowhere; a `require` the service
+    // writes is a declaration in its own source with a body.
+    const own = (this.checker.getSymbolAtLocation(expression.expression)?.declarations ?? []).some(
+      (d) => !d.getSourceFile().isDeclarationFile && !isAmbient(d)
     );
-    return own ? undefined : argument.text;
+    return own ? undefined : specifier;
   }
 
   private exportOfRequired(binding: RequireBinding): ts.Symbol | undefined {
     const sourceOf = (specifier: string): ts.SourceFile | undefined => {
-      const resolved = ts.resolveModuleName(
-        specifier,
-        binding.from.fileName,
-        this.program.getCompilerOptions(),
-        this.resolutionHost(),
-        undefined,
-        undefined,
-        ts.ModuleKind.CommonJS
-      ).resolvedModule;
-      return resolved ? this.program.getSourceFile(resolved.resolvedFileName) : undefined;
+      const resolved = resolveRequired(specifier, binding.from.fileName, this.program.getCompilerOptions(), this.resolutionHost());
+      return resolved ? this.program.getSourceFile(resolved) : undefined;
     };
     // The require that runs wins; the cast is read only when it names no file.
     const target =
@@ -1200,6 +1193,72 @@ export class PositionWalker {
   private resolutionHost(): ts.ModuleResolutionHost {
     this.host ??= ts.createCompilerHost(this.program.getCompilerOptions());
     return this.host;
+  }
+}
+
+/** Whether a node is under a `declare`: it declares a value and gives it no body. */
+function isAmbient(node: ts.Node): boolean {
+  for (let current: ts.Node | undefined = node; current; current = current.parent) {
+    if (ts.canHaveModifiers(current) && ts.getModifiers(current)?.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) return true;
+  }
+  return false;
+}
+
+/** `"m"` of a call `require("m")` with one string literal, read from the syntax alone. */
+function requireCallSpecifier(expression: ts.Expression): string | undefined {
+  if (!ts.isCallExpression(expression) || expression.arguments.length !== 1) return undefined;
+  const callee = expression.expression;
+  const argument = expression.arguments[0];
+  if (!ts.isIdentifier(callee) || callee.text !== 'require' || !ts.isStringLiteral(argument)) return undefined;
+  return argument.text;
+}
+
+/** The file `require(specifier)` in the file `from` resolves to, as CommonJS. */
+function resolveRequired(
+  specifier: string,
+  from: string,
+  options: ts.CompilerOptions,
+  host: ts.ModuleResolutionHost
+): string | undefined {
+  return ts.resolveModuleName(specifier, from, options, host, undefined, undefined, ts.ModuleKind.CommonJS).resolvedModule
+    ?.resolvedFileName;
+}
+
+/**
+ * Add to `project` the module of each package that a TypeScript file of
+ * `fileNames` names in a `require("m")` call, before its program is built.
+ * TypeScript follows such a call only in a JavaScript file, so a package that
+ * is required and never imported is not in the program, and the carrick#2454
+ * rule finds no module to name (carrick#3971). An `import` of the package
+ * would load the same file. Relative specifiers are left as they are: a
+ * required repo file the program does not list stays out of it.
+ */
+function loadRequiredPackages(project: Project, fileNames: readonly string[]): void {
+  const options = project.getCompilerOptions();
+  let host: ts.ModuleResolutionHost | undefined;
+  for (const fileName of fileNames) {
+    if (!/\.[cm]?tsx?$/.test(fileName) || isDeclarationFileName(fileName)) continue;
+    const sourceFile = project.getSourceFile(fileName)?.compilerNode;
+    if (!sourceFile || !sourceFile.text.includes('require')) continue;
+    const specifiers = new Set<string>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const specifier = requireCallSpecifier(node);
+        if (specifier !== undefined && !isRelative(specifier)) specifiers.add(specifier);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    for (const specifier of specifiers) {
+      host ??= ts.createCompilerHost(options);
+      const resolved = resolveRequired(specifier, sourceFile.fileName, options, host);
+      if (!resolved || project.getSourceFile(resolved)) continue;
+      try {
+        project.addSourceFileAtPath(resolved);
+      } catch {
+        // A module that cannot be read is left out, as before.
+      }
+    }
   }
 }
 
