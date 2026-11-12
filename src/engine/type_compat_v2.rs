@@ -1303,10 +1303,8 @@ impl CaptureDeath {
 /// `heap_cap_mb` is the cap every sidecar of this run is started with, or
 /// `None` when it runs under V8's own default.
 fn two_deaths(first: &CaptureDeath, retry: &CaptureDeath, heap_cap_mb: Option<u64>) -> String {
-    let lead = format!(
-        "the compiler engine ended during the capture and again when the capture \
-         was retried in a fresh process"
-    );
+    let lead = "the compiler engine ended during the capture and again when the capture \
+                was retried in a fresh process";
     let (heap, under) = heap_cap_phrases(heap_cap_mb);
     let same = first.end == retry.end && first.stage() == retry.stage();
     if !same {
