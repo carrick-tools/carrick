@@ -1631,6 +1631,10 @@ pub(super) enum ValueAt {
         lo: u32,
         hi: u32,
         branches: Vec<ValueAt>,
+        /// Written `a ?? b`: `b` is held only where `a` may be nullish, so a
+        /// left the compiler types as one non-nullable text is the whole
+        /// value (carrick#3835).
+        nullish: bool,
     },
     /// An object literal's entries in source order; a key may be computed.
     Entries(Vec<(ValueAt, ValueAt)>),
@@ -2631,6 +2635,7 @@ impl Reader<'_> {
                     lo: binding.span.lo.0,
                     hi: default.span().hi.0,
                     branches: vec![ValueAt::Unread, text_of(default, &identity)],
+                    nullish: false,
                 }),
                 reassigned: false,
                 plain: false,
@@ -5197,7 +5202,12 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             return;
         };
         let parts = interpolated(piece_probe(&on, "p_env"));
-        let [ValueAt::Alt { lo, hi, branches }] = parts.as_slice() else {
+        let [
+            ValueAt::Alt {
+                lo, hi, branches, ..
+            },
+        ] = parts.as_slice()
+        else {
             panic!("{parts:?}");
         };
         assert_eq!(

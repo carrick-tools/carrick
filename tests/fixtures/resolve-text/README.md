@@ -64,6 +64,8 @@ function whose argument is the local.
 | `p_nullish` | `/a`, `/b` | an unconditional `??=` adds a way and keeps the one that reaches it |
 | `p_hidden` | `/a`, `/b` | a write in an `if` test: the flow refuses the local, and the set stands |
 
+`??` after a name the compiler types as one non-nullable text (carrick#3835): `p_nullish_typed` is `/api` alone, the right side is never taken; `p_or_typed` (`||`) stays `/api` and `/falsy`, an empty text falls through; `p_coalesce` (the left is `string | undefined`) keeps both sides.
+
 `selfread.ts`: `p_self` reads itself; the second read is a recursion hole, and
 reading it again gives the same answer (the mark is released).
 
