@@ -319,6 +319,26 @@ fn the_receiver_trace_moves_only_what_it_finds() {
     );
 }
 
+/// PROOF-BRANCH ONLY (carrick#3711 C2): what the blobs hold at
+/// `src/helpers.ts`, printed by failing.
+#[test]
+fn c2_measure_helpers_rows() {
+    let on = scan();
+    let (graph, flat) = endpoint_rows(&on);
+    let at = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| row.contains("helpers.ts"))
+            .cloned()
+            .collect()
+    };
+    panic!(
+        "C2 graph: {:#?}\nC2 flat: {:#?}\nC2 possible: {:#?}",
+        at(&graph),
+        at(&flat),
+        possible_calls(&on)
+    );
+}
+
 /// Every HTTP endpoint row of the blobs' mount graphs, as `file:line METHOD
 /// full_path source owner`, and the same of the payload's flat `endpoints`.
 fn endpoint_rows(blobs: &Blobs) -> (Vec<String>, Vec<String>) {
