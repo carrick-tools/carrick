@@ -246,12 +246,6 @@ pub struct ScanResult {
     /// without re-parsing, whether a zero-candidate file imports a recognized
     /// messaging-client package and should be force-analyzed (pub/sub Part B).
     pub import_sources: Vec<String>,
-    /// Pub/sub operations whose identity is fully derivable from the AST
-    /// (carrick#387). Merged into the file's LLM extraction after the analyzer
-    /// pass so an extraction-recall flake cannot lose the operation — the same
-    /// authoritative-structural-facts contract as file-based route endpoints.
-    /// Empty whenever Signal 7's messaging-client gates are off.
-    pub pubsub_anchor_ops: Vec<PubsubAnchorOp>,
     /// Outbound calls that reach their endpoint through a request wrapper
     /// declared in THIS file, with the path passed in as an argument
     /// (carrick#588). The site raises no candidate of its own and the wrapper's
@@ -291,41 +285,6 @@ impl RegisterSignal {
             Self::C4 => "C4",
         }
     }
-}
-
-/// A pub/sub operation asserted deterministically from the AST (carrick#387):
-/// a statement/initializer-position member call literally named `publish` or
-/// `subscribe` whose ONLY argument resolves to a literal topic string (inline
-/// literal, top-level const-string reference, or a template literal whose every
-/// interpolation is such a reference). Payload-less by construction — a call
-/// with a payload argument stays on the LLM path so the type-capture judgment
-/// (locators, envelope unwrapping) is never preempted. The measured gap this
-/// closes: the file-analyzer sometimes omits no-payload template-literal-topic
-/// ops entirely (4/20 passes on the messenger-template-topic-nopayload
-/// fixture), and with no payload there is no judgment left for the LLM to add —
-/// the topic, role, and line are structural facts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PubsubAnchorOp {
-    /// The fully resolved literal topic string (e.g. "PollController:pollingStarted").
-    pub topic: String,
-    /// publish -> Publisher, subscribe -> Subscriber (the protocol vocabulary
-    /// is the only method-name shape the anchor accepts).
-    pub role: PubsubRole,
-    /// 1-based line number of the call site.
-    pub line_number: usize,
-    /// First parameter of an inline handler function passed alongside the
-    /// topic (`subscribe("topic", (msg) => …)`, carrick#402 shape c) — the one
-    /// shape where the handler param IS the decoded payload binding, so the
-    /// backfill records it as a FunctionParam payload locator. Recorded only
-    /// when the param is a simple identifier. `None` for every other anchor
-    /// shape: the single-arg call has no handler, and the options-object
-    /// shape (kafkajs `eachMessage`) passes an ENVELOPE to the
-    /// handler, where a deterministic param locator would replace an honest
-    /// Unknown with a wrong type.
-    pub handler_param: Option<String>,
-    /// 1-based line of that parameter (the handler may start on a later line
-    /// than the call the op is keyed on).
-    pub handler_param_line: Option<usize>,
 }
 
 /// A value exported from a module. Used by file-based routing to recover the
@@ -602,12 +561,7 @@ impl SwcScanner {
     /// Returns a ScanResult with candidates and whether the file should be analyzed.
     /// If no candidates are found, the file can be skipped.
     #[allow(dead_code)]
-    pub fn scan_file(
-        &self,
-        file_path: &Path,
-        data_fetchers: &[String],
-        messaging_clients: &[String],
-    ) -> ScanResult {
+    pub fn scan_file(&self, file_path: &Path, data_fetchers: &[String]) -> ScanResult {
         let handler = Handler::with_tty_emitter(
             ColorConfig::Never,
             true,
@@ -622,7 +576,6 @@ impl SwcScanner {
                     candidates: Vec::new(),
                     parse_failed: true,
                     import_sources: Vec::new(),
-                    pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
                     register_signals: BTreeMap::new(),
                     kept_spans: BTreeSet::new(),
@@ -631,25 +584,12 @@ impl SwcScanner {
         };
 
         let import_sources = collect_import_sources(&module);
-        let imports_messaging_client =
-            file_imports_messaging_client(&import_sources, messaging_clients);
-        let repo_has_messaging_clients = !messaging_clients.is_empty();
-        // Const-string topic bindings are only needed for the gated Signal 7, so
-        // skip the pre-pass entirely when both gate tiers are off.
-        let const_string_values = if imports_messaging_client || repo_has_messaging_clients {
-            collect_const_string_values(&module)
-        } else {
-            HashMap::new()
-        };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &self.source_map);
         let new_url_paths = collect_new_url_paths(&module, &self.source_map);
         let mut visitor = CandidateVisitor::new(
             self.source_map.clone(),
             package_import_locals(&module, data_fetchers),
-            imports_messaging_client,
-            const_string_values,
             new_url_paths,
-            repo_has_messaging_clients,
             Declarations::of(&module),
         );
         module.visit_with(&mut visitor);
@@ -658,7 +598,6 @@ impl SwcScanner {
             candidates: visitor.candidates,
             parse_failed: false,
             import_sources,
-            pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
             register_signals: visitor.register_hits,
             kept_spans: visitor.kept_hits,
@@ -675,26 +614,17 @@ impl SwcScanner {
         file_path: &Path,
         content: &str,
         data_fetchers: &[String],
-        messaging_clients: &[String],
     ) -> ScanResult {
-        self.scan_content_with(
-            file_path,
-            content,
-            data_fetchers,
-            messaging_clients,
-            None,
-            false,
-        )
+        self.scan_content_with(file_path, content, data_fetchers, None, false)
     }
 
     /// Every candidate [`SwcScanner::scan_content`] raises, plus one at each
     /// other call expression, with no detection list. The edited-file carry
     /// (`model_carry`) places a model row by the call it stands on, and a row
-    /// can stand on a call no signal raises without the detection lists
-    /// (an import-gated messaging subscribe), so it enumerates calls instead
+    /// can stand on a call no signal raises, so it enumerates calls instead
     /// of re-running the gated scanner.
     pub fn scan_every_call(&self, file_path: &Path, content: &str) -> ScanResult {
-        self.scan_content_with(file_path, content, &[], &[], None, true)
+        self.scan_content_with(file_path, content, &[], None, true)
     }
 
     /// The HTTP candidates at the calls the fact layer found in a file
@@ -710,7 +640,7 @@ impl SwcScanner {
         spans: &BTreeSet<(u32, u32)>,
     ) -> ScanResult {
         let mut result =
-            self.scan_content_with(file_path, content, &[], &[], Some(spans.clone()), false);
+            self.scan_content_with(file_path, content, &[], Some(spans.clone()), false);
         result
             .candidates
             .retain(|candidate| spans.contains(&(candidate.span_start, candidate.span_end)));
@@ -725,7 +655,6 @@ impl SwcScanner {
         file_path: &Path,
         content: &str,
         data_fetchers: &[String],
-        messaging_clients: &[String],
         wanted: Option<BTreeSet<(u32, u32)>>,
         every_call: bool,
     ) -> ScanResult {
@@ -761,7 +690,6 @@ impl SwcScanner {
                     candidates: Vec::new(),
                     parse_failed: true,
                     import_sources: Vec::new(),
-                    pubsub_anchor_ops: Vec::new(),
                     local_wrapper_calls: Vec::new(),
                     register_signals: BTreeMap::new(),
                     kept_spans: BTreeSet::new(),
@@ -778,25 +706,12 @@ impl SwcScanner {
         });
 
         let import_sources = collect_import_sources(&module);
-        let imports_messaging_client =
-            file_imports_messaging_client(&import_sources, messaging_clients);
-        let repo_has_messaging_clients = !messaging_clients.is_empty();
-        // Const-string topic bindings are only needed for the gated Signal 7, so
-        // skip the pre-pass entirely when both gate tiers are off.
-        let const_string_values = if imports_messaging_client || repo_has_messaging_clients {
-            collect_const_string_values(&module)
-        } else {
-            HashMap::new()
-        };
         let local_wrapper_calls = collect_local_wrapper_calls(&module, &file_source_map);
         let new_url_paths = collect_new_url_paths(&module, &file_source_map);
         let mut visitor = CandidateVisitor::new(
             file_source_map,
             package_import_locals(&module, data_fetchers),
-            imports_messaging_client,
-            const_string_values,
             new_url_paths,
-            repo_has_messaging_clients,
             Declarations::of(&module),
         );
         visitor.wanted = wanted;
@@ -807,7 +722,6 @@ impl SwcScanner {
             candidates: visitor.candidates,
             parse_failed: false,
             import_sources,
-            pubsub_anchor_ops: visitor.pubsub_anchor_ops,
             local_wrapper_calls,
             register_signals: visitor.register_hits,
             kept_spans: visitor.kept_hits,
@@ -2360,46 +2274,7 @@ struct CandidateVisitor {
     /// argument is a strong network-call signal even when the callee name is
     /// unknown.
     await_depth: usize,
-    /// True when this file imports a package the cloud /framework-detect step
-    /// flagged as a messaging client (NATS, Redis, Kafka, …). This is the gate
-    /// for Signal 7 (pub/sub call-site surfacing): the publish/subscribe shape
-    /// (`obj.method("topic", payload)`) is indistinguishable from
-    /// `socket.emit('x')` / `logger.info('x')`, so surfacing it unconditionally
-    /// broke the socket-skip invariant and risked corpus-1. Socket libraries are
-    /// listed in `socket_clients`, NOT here — that list gates the deterministic
-    /// socket pass (`crate::socket_io`) and the two are disjoint by contract, so
-    /// socket files never gate in and this signal stays inert there
-    /// (carrick#1281). Empty `messaging_clients` → always false → Signal 7 never
-    /// fires.
-    file_imports_messaging_client: bool,
-    /// Top-level `const <id> = "<literal>"` bindings (name -> literal value),
-    /// so a pub/sub call whose topic is referenced by name (`const SUBJECT =
-    /// "user.registered"; … nc.publish(SUBJECT, …)`) still counts as having a
-    /// string-literal topic for the Signal 7 first-arg check, and so the
-    /// anchor-op path (carrick#387) can resolve const-ref and template-literal
-    /// topics to their literal strings. Only string-literal initializers are
-    /// recorded; this is a recall booster, not a full constant-folder.
-    const_string_values: HashMap<String, String>,
     new_url_paths: NewUrlPathMap,
-    /// True while visiting a call expression that sits directly in a
-    /// statement-expression (`nc.publish(SUBJECT, payload);`) or a variable
-    /// initializer (`const sub = nc.subscribe("topic");`). Signal 7 only fires
-    /// in these two positions — the fire-and-forget publish/subscribe shapes —
-    /// so call sites nested inside other expressions are not surfaced.
-    in_pubsub_call_position: bool,
-    /// True when the REPO's framework detection found any messaging client,
-    /// regardless of this file's imports. Second tier of the Signal 7 gate:
-    /// a file that receives its messaging client by constructor injection or
-    /// inheritance (`this.messenger` from a base class) has no gating import,
-    /// so the call SHAPE gates instead — but only for member calls literally
-    /// named `publish`/`subscribe`, the protocol vocabulary itself, so
-    /// `logger.info('msg')` / `socket.emit('evt')` stay inert (carrick#317).
-    repo_has_messaging_clients: bool,
-    /// Deterministically asserted pub/sub operations (carrick#387): the
-    /// payload-less publish/subscribe sites whose topic resolves to a literal
-    /// string. Collected alongside the Signal 7 candidates (same gates, same
-    /// position rule) and merged into the file's extraction after the LLM pass.
-    pubsub_anchor_ops: Vec<PubsubAnchorOp>,
     /// Every declaration in the file, for [`CandidateTarget::url_binding`].
     declarations: Declarations,
     /// The signal whose block is running ([`RegisterSignal`]), set at the
@@ -2424,10 +2299,7 @@ impl CandidateVisitor {
     fn new(
         source_map: Lrc<SourceMap>,
         network_import_locals: HashSet<String>,
-        file_imports_messaging_client: bool,
-        const_string_values: HashMap<String, String>,
         new_url_paths: NewUrlPathMap,
-        repo_has_messaging_clients: bool,
         declarations: Declarations,
     ) -> Self {
         Self {
@@ -2437,12 +2309,7 @@ impl CandidateVisitor {
             network_import_locals,
             seen_spans: HashSet::new(),
             await_depth: 0,
-            file_imports_messaging_client,
-            const_string_values,
             new_url_paths,
-            in_pubsub_call_position: false,
-            repo_has_messaging_clients,
-            pubsub_anchor_ops: Vec::new(),
             declarations,
             register_signal: None,
             register_hits: BTreeMap::new(),
@@ -2633,156 +2500,6 @@ impl CandidateVisitor {
             call.args.first().map(|a| &*a.expr),
             Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_))
         )
-    }
-
-    /// Signal-7 topic check: is the first argument a string/template literal, or
-    /// a bare identifier bound to a top-level `const <id> = "<literal>"`? The
-    /// const-ref case (`const SUBJECT = "user.registered"; nc.publish(SUBJECT,
-    /// …)`) is the publisher idiom that an inline-literal-only check would miss.
-    fn first_arg_is_stringish_or_const_string(&self, call: &CallExpr) -> bool {
-        match call.args.first().map(|a| &*a.expr) {
-            Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_)) => true,
-            Some(Expr::Ident(ident)) => self.const_string_values.contains_key(ident.sym.as_ref()),
-            _ => false,
-        }
-    }
-
-    /// Resolve a topic expression to its literal string, or `None` when it is
-    /// not deterministically resolvable (carrick#387 anchor-op path). Handles
-    /// exactly the shapes the const-string pre-pass supports: an inline string
-    /// literal, a reference to a top-level `const <id> = "<literal>"`, and a
-    /// template literal whose every interpolation is such a reference
-    /// (`` `${name}:pollingStarted` `` with `export const name = '...'`).
-    /// Anything else — call results, member expressions, parameters — returns
-    /// `None` and the site stays on the LLM path.
-    fn resolve_topic_string(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-            Expr::Ident(ident) => self.const_string_values.get(ident.sym.as_ref()).cloned(),
-            Expr::Tpl(tpl) => {
-                let mut resolved = String::new();
-                for (i, quasi) in tpl.quasis.iter().enumerate() {
-                    // A quasi with no cooked value contains an invalid
-                    // escape — not a resolvable literal.
-                    let cooked = quasi.cooked.as_ref()?;
-                    resolved.push_str(&cooked.to_string_lossy());
-                    if let Some(interp) = tpl.exprs.get(i) {
-                        let Expr::Ident(ident) = &**interp else {
-                            return None;
-                        };
-                        let value = self.const_string_values.get(ident.sym.as_ref())?;
-                        resolved.push_str(value);
-                    }
-                }
-                Some(resolved)
-            }
-            _ => None,
-        }
-    }
-
-    /// Does this expression occupy a Signal-7 position when it forms a whole
-    /// statement expression or variable initializer? Directly a call
-    /// (`nc.publish(SUBJECT, payload);`), or under a single `await` (`await
-    /// consumer.subscribe({ topic });`) — the idiom every promise-returning
-    /// subscribe API forces, which the bare-call check missed (carrick#402).
-    fn is_pubsub_positioned_expr(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call(_) => true,
-            Expr::Await(awaited) => matches!(&*awaited.arg, Expr::Call(_)),
-            _ => false,
-        }
-    }
-
-    /// The first argument as an object literal (`subscribe({ topic: 'x',
-    /// fromBeginning: false })`), or `None` when absent, spread, or any other
-    /// shape.
-    fn first_arg_object_literal(call: &CallExpr) -> Option<&ObjectLit> {
-        let arg = call.args.first()?;
-        if arg.spread.is_some() {
-            return None;
-        }
-        match &*arg.expr {
-            Expr::Object(obj) => Some(obj),
-            _ => None,
-        }
-    }
-
-    /// Topic values carried by a publish/subscribe options object (carrick#402
-    /// shape a): a `topic: <t>` property or a `topics: [<t>, …]` array, where
-    /// each `<t>` resolves via [`Self::resolve_topic_string`]. Returns `Some`
-    /// when the object carries a protocol-vocabulary topic key at all — the
-    /// shape that qualifies the site as a candidate — with the vec holding
-    /// only the deterministically resolvable values (used for anchor ops; may
-    /// be empty when e.g. the topic is a parameter). Sibling properties
-    /// (`fromBeginning`, `groupId`, …) are deliberately tolerated: the key
-    /// vocabulary is the signal, not the whole object shape.
-    fn object_literal_topic_values(&self, obj: &ObjectLit) -> Option<Vec<String>> {
-        let mut has_topic_key = false;
-        let mut topics = Vec::new();
-        for prop in &obj.props {
-            let PropOrSpread::Prop(prop) = prop else {
-                continue;
-            };
-            match &**prop {
-                Prop::KeyValue(kv) => {
-                    let name = match &kv.key {
-                        PropName::Ident(id) => id.sym.to_string(),
-                        PropName::Str(s) => s.value.to_string_lossy().into_owned(),
-                        _ => continue,
-                    };
-                    match name.as_str() {
-                        "topic" => {
-                            has_topic_key = true;
-                            if let Some(topic) = self.resolve_topic_string(&kv.value) {
-                                topics.push(topic);
-                            }
-                        }
-                        "topics" => {
-                            has_topic_key = true;
-                            if let Expr::Array(arr) = &*kv.value {
-                                for elem in arr.elems.iter().flatten() {
-                                    if elem.spread.is_none()
-                                        && let Some(topic) = self.resolve_topic_string(&elem.expr)
-                                    {
-                                        topics.push(topic);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Shorthand `{ topic }` references a local binding; resolvable
-                // exactly when it is a recorded top-level const string.
-                Prop::Shorthand(id) => {
-                    if matches!(id.sym.as_ref(), "topic" | "topics") {
-                        has_topic_key = true;
-                        if let Some(value) = self.const_string_values.get(id.sym.as_ref()) {
-                            topics.push(value.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        has_topic_key.then_some(topics)
-    }
-
-    /// First parameter of an inline handler function expression, when it is a
-    /// simple identifier (`(msg) => …`, `function (msg) { … }`, incl. a typed
-    /// `(msg: T)`). `None` for non-function expressions, param-less handlers,
-    /// and destructured params — a deterministic locator is only recorded for
-    /// the binding shape the sidecar matches by name.
-    fn handler_first_ident_param(expr: &Expr) -> Option<(String, swc_common::Span)> {
-        let pat = match expr {
-            Expr::Arrow(arrow) => arrow.params.first(),
-            Expr::Fn(fn_expr) => fn_expr.function.params.first().map(|p| &p.pat),
-            _ => None,
-        }?;
-        match pat {
-            Pat::Ident(binding) => Some((binding.id.sym.to_string(), binding.id.span)),
-            _ => None,
-        }
     }
 
     /// The base-plus-path target this call's first argument states
@@ -3454,38 +3171,7 @@ impl Visit for CandidateVisitor {
         self.await_depth -= 1;
     }
 
-    fn visit_expr_stmt(&mut self, node: &ExprStmt) {
-        // A statement-expression that *is* a call (`nc.publish(SUBJECT, payload);`)
-        // is one of the two Signal-7 positions. Mark it so the call expr it wraps
-        // is eligible; `visit_call_expr` clears the flag before descending so
-        // nested calls don't inherit the position.
-        if Self::is_pubsub_positioned_expr(&node.expr) {
-            self.in_pubsub_call_position = true;
-        }
-        node.visit_children_with(self);
-        self.in_pubsub_call_position = false;
-    }
-
-    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        // A variable initializer that *is* a call (`const sub = nc.subscribe("topic");`)
-        // is the other Signal-7 position. Same flag-clearing discipline as
-        // `visit_expr_stmt`.
-        if node
-            .init
-            .as_deref()
-            .is_some_and(Self::is_pubsub_positioned_expr)
-        {
-            self.in_pubsub_call_position = true;
-        }
-        node.visit_children_with(self);
-        self.in_pubsub_call_position = false;
-    }
-
     fn visit_new_expr(&mut self, node: &NewExpr) {
-        // Clear the Signal-7 position flag as `visit_call_expr` does, so a call
-        // nested in the arguments does not inherit the position.
-        self.in_pubsub_call_position = false;
-
         // Network primitives constructed with `new`: `new WebSocket(url)`,
         // `new EventSource(url)`, `new XMLHttpRequest()`. Emitting these as
         // candidates keeps files using them from being skipped by the gate.
@@ -3572,12 +3258,6 @@ impl Visit for CandidateVisitor {
             call.visit_children_with(self);
             return;
         }
-        // Snapshot the Signal-7 position flag set by the enclosing
-        // `visit_expr_stmt` / `visit_var_declarator`, then clear it so calls
-        // nested inside this call's arguments/callee don't inherit the position.
-        let in_pubsub_call_position = self.in_pubsub_call_position;
-        self.in_pubsub_call_position = false;
-
         // Signal 1: global fetch primitive.
         if self.is_global_network_call(&call.callee) {
             self.push_candidate(call, "fetch".to_string(), None);
@@ -3758,151 +3438,6 @@ impl Visit for CandidateVisitor {
             }
         }
 
-        // Signal 7 (GATED): fire-and-forget pub/sub call sites. The
-        // publish/subscribe shape (`nc.publish(SUBJECT, payload);`,
-        // `const sub = nc.subscribe("topic")`) is a member call with a
-        // string/const-string topic as its first argument, but unlike an HTTP
-        // call it is not awaited and the method name is library-specific
-        // (publish/subscribe/emit/produce/…), so the other signals miss it
-        // inconsistently. Surfacing is TWO-TIER (carrick#317): tier 1 — the
-        // file imports a messaging-client package
-        // (`file_imports_messaging_client`), any member-call shape qualifies;
-        // tier 2 — no gating import but the repo detected messaging clients
-        // (`repo_has_messaging_clients`, the injected/inherited-client case),
-        // then only calls literally named publish/subscribe qualify. The shape
-        // is identical to `socket.emit('x')` and `logger.info('x')`; the
-        // gating is what keeps this from firing on socket.io / logging files
-        // (socket.io is not a messaging client, and tier 2's method-name
-        // constraint excludes emit/info), so it has zero socket-skip /
-        // corpus-1 collateral. With empty `messaging_clients` both tiers are
-        // off and this branch is inert.
-        if (self.file_imports_messaging_client || self.repo_has_messaging_clients)
-            && in_pubsub_call_position
-            && let Callee::Expr(callee_expr) = &call.callee
-            && let Expr::Member(member) = &**callee_expr
-            // Receiver must not be a string/number literal — that would be a
-            // `"str".method()` / `(123).method()` chain, not a pub/sub client.
-            && !matches!(&*member.obj, Expr::Lit(Lit::Str(_)) | Expr::Lit(Lit::Num(_)))
-        {
-            let method = match &member.prop {
-                MemberProp::Ident(id) => Some(id.sym.to_string()),
-                MemberProp::Computed(c) => match &*c.expr {
-                    Expr::Lit(Lit::Str(s)) => Some(s.value.to_string_lossy().into_owned()),
-                    _ => None,
-                },
-                MemberProp::PrivateName(_) => None,
-            };
-            let role = match method.as_deref() {
-                Some("publish") => Some(PubsubRole::Publisher),
-                Some("subscribe") => Some(PubsubRole::Subscriber),
-                _ => None,
-            };
-            // First-argument shapes that qualify the site: the direct
-            // stringish/const-string topic (unchanged), or — on calls literally
-            // named publish/subscribe only — an options object carrying a
-            // protocol-vocabulary `topic`/`topics` key, the kafkajs
-            // `subscribe({ topic, fromBeginning })` idiom (carrick#402 shape a).
-            // Restricting the object shape to the vocabulary-named methods
-            // keeps `client.run({ eachMessage })` / arbitrary `configure({...})`
-            // config calls inert.
-            let stringish_topic = self.first_arg_is_stringish_or_const_string(call);
-            let object_topics = if role.is_some() {
-                Self::first_arg_object_literal(call)
-                    .and_then(|obj| self.object_literal_topic_values(obj))
-            } else {
-                None
-            };
-            // Two-tier gate (carrick#317). Tier 1: the file imports a detected
-            // messaging client — any member-call shape qualifies (unchanged).
-            // Tier 2: the file has NO gating import (injected/inherited client,
-            // e.g. `this.messenger` provided by a base class) but the repo has
-            // detected messaging clients — then the method NAME must be the
-            // pub/sub protocol vocabulary itself (`publish`/`subscribe`), which
-            // keeps `logger.info('msg')` / `socket.emit('evt')` / RxJS
-            // `.subscribe(fn)` (function arg, already excluded by the
-            // first-argument shape checks) inert.
-            let gates_in = self.file_imports_messaging_client || role.is_some();
-            if (stringish_topic || object_topics.is_some()) && gates_in {
-                let obj_name = Self::extract_callee_object(&member.obj)
-                    .unwrap_or_else(|| "<pubsub>".to_string());
-
-                // Anchor-op path (carrick#387 + #402), a strict subset of the
-                // sites gated in above: only calls literally named
-                // publish/subscribe (the protocol vocabulary — stricter than
-                // tier 1's any-method candidate) whose topic resolves to a
-                // literal are structural facts. Assert them deterministically
-                // so an LLM extraction omission cannot lose them;
-                // payload-carrying calls stay LLM-owned (locator judgment,
-                // envelope unwrapping).
-                if let Some(role) = role {
-                    // The method name's line: a call written across lines
-                    // starts on its receiver's, which names nothing
-                    // (carrick#1626).
-                    let line_number = self.get_line_number(member.prop.span());
-                    if let Some(topics) = &object_topics {
-                        // Options-object shape (#402 a): every resolvable
-                        // topic anchors, payload-less — the message handler is
-                        // registered elsewhere (`run({ eachMessage })`) and
-                        // receives an envelope, so there is no deterministic
-                        // payload locator to record. SUBSCRIBER role only
-                        // (Copilot review on #409): a `publish({ topic, ... })`
-                        // options object may carry the payload as a sibling
-                        // property, so a payload-less publisher assertion could
-                        // put a typeless op on the wire where the LLM's locator
-                        // judgment should own the site. Publisher object shapes
-                        // keep the candidate below but stay LLM-owned.
-                        if role == PubsubRole::Subscriber && call.args.len() == 1 {
-                            for topic in topics {
-                                self.pubsub_anchor_ops.push(PubsubAnchorOp {
-                                    topic: topic.clone(),
-                                    role,
-                                    line_number,
-                                    handler_param: None,
-                                    handler_param_line: None,
-                                });
-                            }
-                        }
-                    } else if call.args.len() == 1
-                        && call.args[0].spread.is_none()
-                        && let Some(topic) = self.resolve_topic_string(&call.args[0].expr)
-                    {
-                        // Payload-less single-arg call (#387, unchanged).
-                        self.pubsub_anchor_ops.push(PubsubAnchorOp {
-                            topic,
-                            role,
-                            line_number,
-                            handler_param: None,
-                            handler_param_line: None,
-                        });
-                    } else if role == PubsubRole::Subscriber
-                        && call.args.len() == 2
-                        && call.args.iter().all(|a| a.spread.is_none())
-                        && matches!(&*call.args[1].expr, Expr::Arrow(_) | Expr::Fn(_))
-                        && let Some(topic) = self.resolve_topic_string(&call.args[0].expr)
-                    {
-                        // Two-arg `subscribe("topic", handler)` (#402 c): the
-                        // inline function second argument is a handler, not a
-                        // payload, so the op is still structurally certain.
-                        // Its first param — when a simple identifier — is the
-                        // decoded-payload binding, recorded as a FunctionParam
-                        // locator for the sidecar. A function REFERENCE second
-                        // arg stays LLM-owned: an identifier could be an
-                        // options object.
-                        let handler = Self::handler_first_ident_param(&call.args[1].expr);
-                        self.pubsub_anchor_ops.push(PubsubAnchorOp {
-                            topic,
-                            role,
-                            line_number,
-                            handler_param: handler.as_ref().map(|(name, _)| name.clone()),
-                            handler_param_line: handler.map(|(_, span)| self.get_line_number(span)),
-                        });
-                    }
-                }
-
-                self.push_candidate(call, obj_name, method);
-            }
-        }
-
         if self.every_call {
             self.register_signal = None;
             let (obj, prop) = match &call.callee {
@@ -3937,35 +3472,11 @@ pub(crate) fn collect_import_sources(module: &Module) -> Vec<String> {
         .collect()
 }
 
-/// Does any of this module's import specifiers match a `messaging_clients`
-/// entry? Gate for the pub/sub call-site Signal 7.
-///
-/// An import source matches when it is exactly the entry (`"nats"` matches
-/// `"nats"`) or a subpath under it (`"nats"` matches `"nats/foo"`). Matching is
-/// strictly exact-or-`"<entry>/"`-prefix, so `"nats"` does NOT match
-/// `"@nats-io/nats-core"` — a scoped client gates only when that scoped name
-/// (e.g. `"@nats-io/nats-core"`, or `"@nats-io"` as a `"@nats-io/"` prefix) is
-/// itself a `messaging_clients` entry.
-/// This is the same matching convention as
-/// `FileOrchestrator::imports_messaging_client` and the data-fetcher
-/// import-recall check, kept in sync deliberately so a package gates the same
-/// way everywhere without a hardcoded list. Empty `messaging_clients` → false.
-fn file_imports_messaging_client(import_sources: &[String], messaging_clients: &[String]) -> bool {
-    if messaging_clients.is_empty() {
-        return false;
-    }
-    import_sources.iter().any(|src| {
-        messaging_clients
-            .iter()
-            .any(|pkg| src == pkg || src.starts_with(&format!("{}/", pkg)))
-    })
-}
-
 /// Collect top-level `const <id> = "<string-literal>"` bindings (name ->
 /// literal value) so a pub/sub call whose topic is a const reference (`const
-/// SUBJECT = "user.registered"; nc.publish(SUBJECT, …)`) still counts as having
-/// a string-literal topic for Signal 7, and so the anchor-op path (carrick#387)
-/// can resolve const-ref and template-literal topics to their literal strings.
+/// SUBJECT = "user.registered"; nc.publish(SUBJECT, …)`) resolves to its
+/// literal string in the in-process pub/sub pass, as do const-ref and
+/// template-literal topics.
 /// Only module-body `const` declarators with an identifier pattern and a bare
 /// string-literal initializer are recorded — this is a targeted recall booster,
 /// not a general constant-folder, so template literals, member exprs, and
@@ -4075,7 +3586,7 @@ mod tests {
     fn scan_test_content_with_fetchers(content: &str, data_fetchers: &[String]) -> ScanResult {
         let scanner = SwcScanner::new();
         let path = PathBuf::from("test.ts");
-        scanner.scan_content(&path, content, data_fetchers, &[])
+        scanner.scan_content(&path, content, data_fetchers)
     }
 
     fn handler_names(content: &str) -> Vec<String> {
@@ -5831,8 +5342,8 @@ createRouter()
         let file_a_content = "fetch('/api/a');";
         let file_b_content = "fetch('/api/b');";
 
-        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[], &[]);
-        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[], &[]);
+        let result_a = scanner.scan_content(&PathBuf::from("a.ts"), file_a_content, &[]);
+        let result_b = scanner.scan_content(&PathBuf::from("b.ts"), file_b_content, &[]);
 
         assert!(
             !result_a.candidates.is_empty(),
@@ -6400,413 +5911,57 @@ apiHandler.route('/data', handleData);
         );
     }
 
-    /// Gating proof for the pub/sub call-site Signal 7. The critical property is
-    /// that the publish/subscribe shape is surfaced ONLY in files that import a
-    /// messaging-client package, and that the shape-identical `socket.emit(...)`
-    /// is never surfaced (socket.io is not a messaging client), so the gate has
-    /// zero socket-skip / corpus-1 collateral.
+    /// Old-path row N1 deleted: a call named `publish` or `subscribe` is no
+    /// candidate and no anchor op because the detection step listed a
+    /// messaging package, whether this file imports it (tier 1) or only the
+    /// repo lists it (tier 2, an injected client). A labelled send or receive
+    /// is a site through discovery (proved by
+    /// `request_summary::discovery::tests::a_queue_opened_in_a_constructor_chain_is_a_site`).
     #[test]
-    fn pubsub_candidate_surfacing_is_gated_by_messaging_client_import() {
-        use std::fs;
-
+    fn a_publish_named_call_raises_no_candidate_from_the_messaging_list() {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-
-        // --- Real NATS publisher fixture: `nc.publish(SUBJECT, ...)` with a
-        //     const-string topic (`const SUBJECT = "user.registered"`). ---
-        let publisher_path = fixtures.join("xrepo-corpus-2/analytics-worker/src/nats/publisher.ts");
-        let publisher_src = fs::read_to_string(&publisher_path)
-            .unwrap_or_else(|e| panic!("read {}: {}", publisher_path.display(), e));
-        let publisher_scanner = SwcScanner::new();
-
-        // Gated in (messaging_clients=["nats"]): the publish call is surfaced,
-        // proving const-string topic resolution works (`SUBJECT` -> literal).
-        let gated_in = publisher_scanner.scan_content(
-            &publisher_path,
-            &publisher_src,
-            &[],
-            &["nats".to_string()],
-        );
-        assert!(
-            gated_in
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("publish")),
-            "gated in (messaging_clients=[nats]): nc.publish(SUBJECT,…) must be surfaced, got {:?}",
-            gated_in.candidates
-        );
-
-        // Gated out (messaging_clients=[]): the file is inert — zero candidates.
-        let gated_out = publisher_scanner.scan_content(&publisher_path, &publisher_src, &[], &[]);
-        assert!(
-            gated_out.candidates.is_empty(),
-            "gated out (messaging_clients=[]): publisher file must surface 0 candidates, got {:?}",
-            gated_out.candidates
-        );
-
-        // --- Real NATS subscriber fixture: `const sub = nc.subscribe("user.registered")`
-        //     (variable initializer position, inline string literal). ---
-        let subscriber_path =
-            fixtures.join("xrepo-corpus-2/notifications-svc/src/nats/subscriber.ts");
-        let subscriber_src = fs::read_to_string(&subscriber_path)
-            .unwrap_or_else(|e| panic!("read {}: {}", subscriber_path.display(), e));
-        let subscriber_scanner = SwcScanner::new();
-
-        let sub_gated_in = subscriber_scanner.scan_content(
-            &subscriber_path,
-            &subscriber_src,
-            &[],
-            &["nats".to_string()],
-        );
-        assert!(
-            sub_gated_in
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("subscribe")),
-            "gated in: const sub = nc.subscribe(\"…\") must be surfaced, got {:?}",
-            sub_gated_in.candidates
-        );
-
-        let sub_gated_out =
-            subscriber_scanner.scan_content(&subscriber_path, &subscriber_src, &[], &[]);
-        assert!(
-            sub_gated_out.candidates.is_empty(),
-            "gated out: subscriber file must surface 0 candidates, got {:?}",
-            sub_gated_out.candidates
-        );
-
-        // --- Socket gate exclusion: socket.io is NOT a messaging client, so even
-        //     with messaging_clients=["nats"] set, `socket.emit('x', d)` (the
-        //     shape-identical publish look-alike) must NOT be surfaced by
-        //     Signal 7. This is the socket-skip invariant the ungated version
-        //     broke. ---
-        let socket_src = r#"
-import { Server } from 'socket.io';
-const io = new Server();
-io.on('connection', (socket) => {
-  socket.emit('payment:settled', { id: 1 });
-});
-"#;
-        let socket_path = PathBuf::from("realtime.ts");
-        let socket_scanner = SwcScanner::new();
-        let socket_scan =
-            socket_scanner.scan_content(&socket_path, socket_src, &[], &["nats".to_string()]);
-        assert!(
-            !socket_scan
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("emit")),
-            "socket.emit must NOT be surfaced — socket.io is not a messaging client, so the gate \
-             excludes socket files even when messaging_clients=[nats], got {:?}",
-            socket_scan.candidates
-        );
-    }
-
-    /// carrick#317: a file that receives its messaging client by constructor
-    /// injection or inheritance (`this.messenger` from a base class) has no
-    /// gating import. Tier 2 of the Signal 7 gate surfaces its call sites by
-    /// SHAPE — member calls literally named publish/subscribe with a stringish
-    /// topic — while logger/socket/emit shapes stay inert.
-    #[test]
-    fn pubsub_shape_gate_surfaces_injected_messenger_without_import() {
-        let src = r#"
+        let publisher = fixtures.join("xrepo-corpus-2/analytics-worker/src/nats/publisher.ts");
+        let subscriber = fixtures.join("xrepo-corpus-2/notifications-svc/src/nats/subscriber.ts");
+        let injected = r#"
 import type { Messenger } from './types';
-
-declare const logger: { info: (m: string) => void };
-declare const socket: { emit: (e: string, p: unknown) => void };
-
-export class NetworkMonitor {
+export class Monitor {
   constructor(private readonly messenger: Messenger) {}
-
-  notifyDegraded(url: string): void {
-    this.messenger.publish('NetworkController:rpcEndpointDegraded', { url });
-  }
-
-  watch(handler: (payload: unknown) => void): void {
-    this.messenger.subscribe('NetworkController:networkDidChange', handler);
-  }
-
-  log(): void {
-    logger.info('a plain log line');
-    socket.emit('user:connected', { id: 1 });
+  notify(url: string): void {
+    this.messenger.publish('Network:degraded', { url });
+    this.messenger.subscribe('Network:changed');
   }
 }
 "#;
         let scanner = SwcScanner::new();
-
-        // Repo-level clients detected; this file imports none of them.
-        let result = scanner.scan_content(
-            &PathBuf::from("network-monitor.ts"),
-            src,
-            &[],
-            &["@metamask/messenger".to_string()],
-        );
-        let props: Vec<&str> = result
-            .candidates
-            .iter()
-            .filter_map(|c| c.callee_property.as_deref())
-            .collect();
-        assert!(
-            props.contains(&"publish"),
-            "shape gate must surface the injected messenger publish, got {props:?}"
-        );
-        assert!(
-            props.contains(&"subscribe"),
-            "shape gate must surface the injected messenger subscribe, got {props:?}"
-        );
-        assert!(
-            !props.contains(&"info") && !props.contains(&"emit"),
-            "logger.info / socket.emit must stay inert under the shape gate, got {props:?}"
-        );
-
-        // Empty messaging_clients: both tiers off, file fully inert.
-        let inert = scanner.scan_content(&PathBuf::from("network-monitor.ts"), src, &[], &[]);
-        assert!(
-            inert.candidates.is_empty(),
-            "with no detected messaging clients the file must surface 0 candidates, got {:?}",
-            inert.candidates
-        );
-    }
-
-    /// carrick#387: a payload-less publish/subscribe with a deterministically
-    /// resolvable topic is a structural fact — emit it as an anchor op so an
-    /// LLM extraction omission cannot lose the operation. The template-literal
-    /// case (`` this.messenger.publish(`${name}:started`) `` with
-    /// `export const name = '...'`) is the measured 4/20 recall gap.
-    #[test]
-    fn pubsub_anchor_ops_resolve_template_and_literal_topics() {
-        use crate::operation::PubsubRole;
-
-        let src = r#"
-export const name = 'PollController';
-const CHANNEL = 'jobs.retry';
-export class PollController {
-  start() {
-    this.messenger.publish(`${name}:pollingStarted`);
-  }
-  stop() {
-    this.messenger.publish('PollController:stopped');
-  }
-  listen() {
-    const sub = this.messenger.subscribe(CHANNEL);
-  }
-}
-"#;
-        let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("poll.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
-        let ops = &result.pubsub_anchor_ops;
-        assert_eq!(ops.len(), 3, "expected 3 anchor ops, got {ops:?}");
-        assert!(
-            ops.iter()
-                .any(|op| op.topic == "PollController:pollingStarted"
-                    && op.role == PubsubRole::Publisher
-                    && op.line_number == 6),
-            "template topic with exported same-file const must resolve, got {ops:?}"
-        );
-        assert!(
-            ops.iter().any(|op| op.topic == "PollController:stopped"
-                && op.role == PubsubRole::Publisher
-                && op.line_number == 9),
-            "inline string-literal topic must resolve, got {ops:?}"
-        );
-        assert!(
-            ops.iter().any(|op| op.topic == "jobs.retry"
-                && op.role == PubsubRole::Subscriber
-                && op.line_number == 12),
-            "const-ref topic in initializer position must resolve, got {ops:?}"
-        );
-    }
-
-    /// carrick#1626: a pub/sub call written across lines sits on the line of
-    /// its method name, not the line its receiver chain
-    /// starts on, so a row and anything joined to it by line name the call.
-    #[test]
-    fn pubsub_anchor_ops_sit_on_the_method_line() {
-        use crate::operation::PubsubRole;
-
-        let src = r#"
-import { connect } from "fakebus";
-const client = connect();
-export async function start() {
-  await client
-    .subscribe("feed.updated");
-  client
-    .publish(
-      "feed.refreshed",
-    );
-}
-"#;
-        let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("feed.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
-        let mut ops: Vec<(String, PubsubRole, usize)> = result
-            .pubsub_anchor_ops
-            .iter()
-            .map(|op| (op.topic.clone(), op.role, op.line_number))
-            .collect();
-        ops.sort_by_key(|op| op.2);
-        assert_eq!(
-            ops,
-            vec![
-                ("feed.updated".to_string(), PubsubRole::Subscriber, 6),
-                ("feed.refreshed".to_string(), PubsubRole::Publisher, 8),
-            ]
-        );
-    }
-
-    /// The anchor path only asserts what is structurally certain: gated off with
-    /// no detected messaging clients; never for payload-carrying calls (those
-    /// stay LLM-owned so the type-capture path is undisturbed); never for
-    /// unresolvable or non-publish/subscribe-named calls; never in nested
-    /// (non-statement/initializer) positions.
-    #[test]
-    fn pubsub_anchor_ops_stay_inert_outside_the_guarded_shape() {
-        let src = r#"
-export const name = 'PollController';
-import { bus } from 'fakebus';
-function localTopic(): string { return 'x'; }
-export function run(payload: object, dynamic: string) {
-  bus.publish('with.payload', payload);
-  bus.publish(`${dynamic}:started`);
-  bus.emit('not.protocol.vocab');
-  wrap(bus.publish('nested.position'));
-  bus.publish(localTopic());
-}
-"#;
-        let scanner = SwcScanner::new();
-        let gated_in = scanner.scan_content(
-            &PathBuf::from("guarded.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
-        assert!(
-            gated_in.pubsub_anchor_ops.is_empty(),
-            "payload-carrying / unresolvable / nested / non-vocab calls must not anchor, got {:?}",
-            gated_in.pubsub_anchor_ops
-        );
-
-        // Gate off entirely: no messaging clients detected.
-        let no_payload_src = r#"
-import { bus } from 'fakebus';
-bus.publish('plain.topic');
-"#;
-        let gated_out =
-            scanner.scan_content(&PathBuf::from("guarded.ts"), no_payload_src, &[], &[]);
-        assert!(
-            gated_out.pubsub_anchor_ops.is_empty(),
-            "empty messaging_clients must keep the anchor path inert, got {:?}",
-            gated_out.pubsub_anchor_ops
-        );
-    }
-
-    /// carrick#402 shape a, on the exact corpus-2 file that flaked (kafkajs
-    /// `await consumer.subscribe({ topic: TOPIC, fromBeginning: false })` with
-    /// a const-ref topic): the site must surface as a candidate AND emit a
-    /// payload-less subscriber anchor op, so an LLM extraction miss is
-    /// backfilled deterministically. With no detected messaging clients the
-    /// file stays fully inert.
-    #[test]
-    fn kafkajs_object_literal_subscribe_is_candidate_and_anchor() {
-        use crate::operation::PubsubRole;
-        use std::fs;
-
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/xrepo-corpus-2/notifications-svc/src/kafka/consumer.ts");
-        let src =
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        let scanner = SwcScanner::new();
-
-        let gated_in = scanner.scan_content(&path, &src, &[], &["kafkajs".to_string()]);
-        assert!(
-            gated_in
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("subscribe")),
-            "awaited consumer.subscribe({{ topic }}) must surface as a candidate, got {:?}",
-            gated_in.candidates
-        );
-        let ops = &gated_in.pubsub_anchor_ops;
-        assert_eq!(
-            ops.len(),
-            1,
-            "expected exactly the subscribe anchor, got {ops:?}"
-        );
-        let op = &ops[0];
-        assert_eq!(op.topic, "order.placed");
-        assert_eq!(op.role, PubsubRole::Subscriber);
-        assert_eq!(
-            (op.handler_param.as_deref(), op.handler_param_line),
-            (None, None),
-            "options-object subscribe registers its handler elsewhere; the anchor must be payload-less"
-        );
-
-        let gated_out = scanner.scan_content(&path, &src, &[], &[]);
-        assert!(
-            gated_out.pubsub_anchor_ops.is_empty(),
-            "empty messaging_clients must keep the kafkajs file anchor-inert, got {:?}",
-            gated_out.pubsub_anchor_ops
-        );
-    }
-
-    /// carrick#402 shape a: `subscribe({ topics: ['a','b'] })` anchors every
-    /// resolvable topic; a vocabulary key on a NON-vocabulary method
-    /// (`configure({ topic })`), the handler-registration object
-    /// (`run({ eachMessage })`), and a `publish({ topic, ... })` options
-    /// object (whose sibling property may be the payload — Copilot review on
-    /// #409) stay anchor-inert. The publish object shape still surfaces as a
-    /// candidate so the LLM owns the site.
-    #[test]
-    fn object_literal_topics_array_anchors_each_topic() {
-        use crate::operation::PubsubRole;
-
-        let src = r#"
-import { Kafka } from 'fakekafka';
-const consumer = new Kafka({ brokers: [] }).consumer({ groupId: 'g' });
-declare const bus: { publish: (opts: object) => void };
-export async function start(): Promise<void> {
-  await consumer.subscribe({ topics: ['order.created', 'order.cancelled'], fromBeginning: true });
-  await consumer.configure({ topic: 'not.a.subscription' });
-  await consumer.run({ eachMessage: async () => {} });
-  bus.publish({ topic: 'order.audited', payload: { id: 1 } });
-}
-"#;
-        let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("consumer.ts"),
-            src,
-            &[],
-            &["fakekafka".to_string()],
-        );
-        let ops = &result.pubsub_anchor_ops;
-        assert_eq!(
-            ops.len(),
-            2,
-            "expected one anchor per topics[] entry and nothing else, got {ops:?}"
-        );
-        for topic in ["order.created", "order.cancelled"] {
+        let scans = [
+            (
+                "tier 1 publisher",
+                scanner.scan_content(
+                    &publisher,
+                    &std::fs::read_to_string(&publisher).unwrap(),
+                    &[],
+                ),
+            ),
+            (
+                "tier 1 subscriber",
+                scanner.scan_content(
+                    &subscriber,
+                    &std::fs::read_to_string(&subscriber).unwrap(),
+                    &[],
+                ),
+            ),
+            (
+                "tier 2 injected client",
+                scanner.scan_content(&PathBuf::from("monitor.ts"), injected, &[]),
+            ),
+        ];
+        for (label, scan) in &scans {
             assert!(
-                ops.iter()
-                    .any(|op| op.topic == topic && op.role == PubsubRole::Subscriber),
-                "topics[] entry {topic} must anchor, got {ops:?}"
+                scan.candidates.is_empty(),
+                "{label}: a publish-named call is no candidate: {:?}",
+                scan.candidates
             );
         }
-        assert!(
-            result
-                .candidates
-                .iter()
-                .any(|c| c.callee_property.as_deref() == Some("publish")),
-            "publish({{ topic }}) must still surface as a candidate, got {:?}",
-            result.candidates
-        );
     }
 
     /// Old-path row N20 deleted: `new X("queue", fn)` is no subscriber
@@ -6821,7 +5976,7 @@ export async function start(): Promise<void> {
             .join("tests/fixtures/xrepo-corpus-3/fulfillment-worker/src/worker.ts");
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        let result = SwcScanner::new().scan_content(&path, &src, &[], &["bullmq".to_string()]);
+        let result = SwcScanner::new().scan_content(&path, &src, &[]);
         assert!(
             !result
                 .candidates
@@ -6829,65 +5984,6 @@ export async function start(): Promise<void> {
                 .any(|c| c.callee_object == "Worker"),
             "a construction from a listed package is no candidate: {:?}",
             result.candidates
-        );
-        assert!(
-            result.pubsub_anchor_ops.is_empty(),
-            "a construction anchors no op: {:?}",
-            result.pubsub_anchor_ops
-        );
-    }
-
-    /// carrick#402 shape c: two-arg `subscribe("topic", handler)` with an
-    /// INLINE function anchors and records the handler's first param (simple
-    /// identifier only) as the FunctionParam payload locator; a destructured
-    /// param anchors payload-less; a function REFERENCE second arg (could be
-    /// an options object) does not anchor at all.
-    #[test]
-    fn two_arg_subscribe_records_inline_handler_param() {
-        use crate::operation::PubsubRole;
-
-        let src = r#"
-import { bus } from 'fakebus';
-declare function handlerRef(msg: unknown): void;
-bus.subscribe('user.created', (msg) => { console.log(msg); });
-bus.subscribe('user.updated', function (payload: { id: string }) { void payload; });
-bus.subscribe('user.enriched', ({ data }) => { void data; });
-bus.subscribe('user.deleted', handlerRef);
-"#;
-        let scanner = SwcScanner::new();
-        let result = scanner.scan_content(
-            &PathBuf::from("subscriber.ts"),
-            src,
-            &[],
-            &["fakebus".to_string()],
-        );
-        let ops = &result.pubsub_anchor_ops;
-        assert_eq!(
-            ops.len(),
-            3,
-            "expected the three inline-handler anchors, got {ops:?}"
-        );
-        assert!(
-            ops.iter().any(|op| op.topic == "user.created"
-                && op.role == PubsubRole::Subscriber
-                && op.handler_param.as_deref() == Some("msg")
-                && op.handler_param_line == Some(4)),
-            "arrow handler's ident param must be recorded, got {ops:?}"
-        );
-        assert!(
-            ops.iter()
-                .any(|op| op.topic == "user.updated"
-                    && op.handler_param.as_deref() == Some("payload")),
-            "function-expression handler's typed ident param must be recorded, got {ops:?}"
-        );
-        assert!(
-            ops.iter()
-                .any(|op| op.topic == "user.enriched" && op.handler_param.is_none()),
-            "destructured handler param must anchor payload-less, got {ops:?}"
-        );
-        assert!(
-            !ops.iter().any(|op| op.topic == "user.deleted"),
-            "a function-reference second arg must not anchor, got {ops:?}"
         );
     }
 

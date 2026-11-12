@@ -9264,9 +9264,7 @@ fn protocol_relative(root: &Path, file: &Path) -> PathBuf {
 /// cross-service event, so it is counted and not indexed.
 ///
 /// A row the model stated carries `resolution_source: model`, so it reads as a
-/// candidate everywhere a source is read (carrick#1626). An op the scanner's
-/// pass backfilled into the same list (`PubsubOperation::backfilled`) states
-/// no source.
+/// candidate everywhere a source is read (carrick#1626).
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
@@ -9320,12 +9318,11 @@ fn append_pubsub_operations(
             }
             let file_path = PathBuf::from(path);
             let key = OperationKey::pubsub(op.topic.clone());
-            // The model's row says so (carrick#1626). A row the scanner's own
-            // pass backfilled into the model's list is not the model's, and no
-            // pass here is a labelled source yet, so it states none.
+            // The model's row says so (carrick#1626).
             let stated = |row: ApiEndpointDetails| ApiEndpointDetails {
-                resolution_source: (!op.backfilled)
-                    .then_some(crate::agents::file_analyzer_agent::ResolutionSource::Model),
+                resolution_source: Some(
+                    crate::agents::file_analyzer_agent::ResolutionSource::Model,
+                ),
                 ..row
             };
             match op.role {
@@ -29851,19 +29848,15 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             broker: Some("redis".to_string()),
             payload_expression_text: None,
             payload_expression_line: None,
-            backfilled: false,
         }
     }
 
     /// carrick#1626, on the wire: a pub/sub row the model stated is uploaded
-    /// with `resolution_source: "model"`, and one the scanner backfilled into
-    /// the model's list states no source, so the key is absent.
+    /// with `resolution_source: "model"`.
     #[test]
-    fn model_pubsub_rows_are_stamped_model_and_backfilled_rows_state_nothing() {
+    fn model_pubsub_rows_are_stamped_model() {
         use crate::operation::PubsubRole;
 
-        let mut backfilled = pubsub_op("orders.cancelled", PubsubRole::Subscriber, None, None);
-        backfilled.backfilled = true;
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
             "svc/src/orders.ts".to_string(),
@@ -29871,7 +29864,6 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 pubsub_operations: vec![
                     pubsub_op("orders.created", PubsubRole::Publisher, None, None),
                     pubsub_op("orders.shipped", PubsubRole::Subscriber, None, None),
-                    backfilled,
                 ],
                 ..Default::default()
             },
@@ -29900,11 +29892,6 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert_eq!(
             row("endpoints", "orders.shipped")["resolution_source"],
             "model"
-        );
-        let scanner_row = row("endpoints", "orders.cancelled");
-        assert!(
-            scanner_row.get("resolution_source").is_none(),
-            "a backfilled row is not the model's: {scanner_row}"
         );
     }
 
@@ -31759,7 +31746,6 @@ io.on("bare:in", (event) => {});
                 broker: None,
                 payload_expression_text: Some(text.to_string()),
                 payload_expression_line: Some(line),
-                backfilled: false,
             }
         };
 
@@ -31795,7 +31781,6 @@ io.on("bare:in", (event) => {});
                         broker: None,
                         payload_expression_text: Some("order".to_string()),
                         payload_expression_line: Some(30),
-                        backfilled: false,
                     },
                     // Envelope-copy guard: the locator text contains the op's
                     // own topic literal (the model copied the whole enqueue
@@ -31908,7 +31893,6 @@ io.on("bare:in", (event) => {});
                     broker: None,
                     payload_expression_text: Some("event".to_string()),
                     payload_expression_line: None,
-                    backfilled: false,
                 }],
                 ..Default::default()
             },
@@ -32473,7 +32457,6 @@ io.on("bare:in", (event) => {});
                         broker: None,
                         payload_expression_text: None,
                         payload_expression_line: None,
-                        backfilled: false,
                     },
                 ],
                 ..Default::default()

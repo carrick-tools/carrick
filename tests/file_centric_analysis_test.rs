@@ -338,7 +338,6 @@ fn test_processing_stats_tracking() {
         candidates_awaiting_model: 0,
         total_mounts: 3,
         total_endpoints: 10,
-        pubsub_anchor_backfills: 0,
         mount_prefixes_unread: 0,
         uri_version_unread: 0,
         uri_version_prefix_unread: 0,
