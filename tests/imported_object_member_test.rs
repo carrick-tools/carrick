@@ -138,16 +138,12 @@ fn a_site_the_join_cannot_prove_keeps_the_model_s_answer() {
     assert_eq!(via["resolution_source"], "model");
 
     // The client modules' own request rows are untouched.
-    for (file, line, method, path) in [(
-        "src/orders.api.ts",
-        11,
-        "GET",
-        "/v1/orders/:orderId/files/:fileId",
-    )] {
-        let own = call_at(&calls, file, line);
-        assert_eq!(own["method"], method, "{file}:{line}");
-        assert_eq!(own["path"], path, "{file}:{line}");
-    }
+    let own = call_at(&calls, "src/orders.api.ts", 11);
+    assert_eq!(own["method"], "GET", "src/orders.api.ts:11");
+    assert_eq!(
+        own["path"], "/v1/orders/:orderId/files/:fileId",
+        "src/orders.api.ts:11"
+    );
 
     // V1 rule C2 is deleted: the client modules' calls that carry an options
     // bag were rows only because they were awaited with a string argument.
