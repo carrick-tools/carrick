@@ -459,7 +459,7 @@ pub fn root_field_claims(
     schema: &SdlTypeFields,
     reader: &mut PackageValueReader,
 ) -> Vec<RootFieldClaim> {
-    if schema.roots.is_empty() || std::env::var_os("CARRICK_RED_STUB").is_none() {
+    if schema.roots.is_empty() {
         return Vec::new();
     }
     let Some((source_map, module)) =
