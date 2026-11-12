@@ -598,7 +598,9 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
         let mut left = MAX_PER_SERVICE;
         for tier in 0..3 {
             for (_, file) in &order {
-                let group = &files[file][tier];
+                let Some(group) = files[file].get(tier) else {
+                    continue;
+                };
                 if group.len() <= left {
                     left -= group.len();
                     for &i in group {
