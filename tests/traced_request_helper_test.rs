@@ -57,6 +57,12 @@ fn run_git(dir: &Path, args: &[&str]) {
 
 /// The fixture scanned as the Action scans it; its stored blob.
 fn scan() -> serde_json::Value {
+    scan_with_log().0
+}
+
+/// The fixture scanned as the Action scans it; its stored blob and its run
+/// log.
+fn scan_with_log() -> (serde_json::Value, String) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("traced-request-helper");
     copy_dir(
@@ -68,9 +74,11 @@ fn scan() -> serde_json::Value {
     run_git(&repo, &["commit", "-q", "-m", "init"]);
     let store = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
         .current_dir(&repo)
+        .env("HOME", home.path())
         .env("CARRICK_LOCAL_STORAGE_DIR", store.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
@@ -104,12 +112,18 @@ fn scan() -> serde_json::Value {
         "scan exited non-zero:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fs::read_dir(store.path())
+    let blob = fs::read_dir(store.path())
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "json"))
         .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
-        .expect("the scan stored a blob")
+        .expect("the scan stored a blob");
+    let log = fs::read_dir(home.path().join(".carrick/logs/runs"))
+        .expect("the scan keeps a run log")
+        .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (blob, log)
 }
 
 /// Each call row of the blob as `file:line METHOD path source`.
@@ -181,4 +195,49 @@ fn a_request_inside_a_handed_callback_reads_its_method_from_the_helper_s_caller(
         }
     }
     assert!(missing.is_empty(), "{missing:#?}\nrows: {rows:#?}");
+}
+
+/// V1 rule C2 is deleted: an awaited call with a string argument is no
+/// call-site signal. `src/use-wrapped.ts` awaits a local wrapper with string
+/// arguments and makes no other call, so only the fact layer reads it:
+/// discovery reaches `fetch` through `callApi` and `send`, lists both calls,
+/// and the reader's rows there join.
+#[test]
+fn a_call_through_a_local_fetch_wrapper_keeps_its_row_with_no_signal() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
+    if !script.exists() {
+        assert!(
+            std::env::var("CI").is_err(),
+            "the built sidecar is missing in CI"
+        );
+        eprintln!("Skipping: the built sidecar is missing");
+        return;
+    }
+    let (blob, log) = scan_with_log();
+    let rows: Vec<String> = call_rows(&blob)
+        .into_iter()
+        .filter(|row| row.starts_with("src/use-wrapped.ts:"))
+        .map(|row| {
+            row.rsplit_once(' ')
+                .map(|(key, _)| key.to_string())
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            "src/use-wrapped.ts:4 POST /v1/items",
+            "src/use-wrapped.ts:8 GET /v1/items",
+        ],
+        "both caller rows"
+    );
+    assert!(
+        log.contains("fact files: C3 candidates"),
+        "the run log counts the register signals that remain:\n{log}"
+    );
+    let c2: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("fact files: C2 candidates"))
+        .collect();
+    assert!(c2.is_empty(), "the await signal is deleted: {c2:#?}");
 }

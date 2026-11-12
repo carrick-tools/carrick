@@ -273,8 +273,6 @@ pub struct ScanResult {
 /// once the fact layer selects its files without it (carrick#2613).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegisterSignal {
-    /// Signal 4: an awaited call with a string argument.
-    C2,
     /// Signal 5: the method-name and object-name lists.
     C3,
     /// Signal 2: a call rooted at an import from a detected package.
@@ -282,11 +280,10 @@ pub enum RegisterSignal {
 }
 
 impl RegisterSignal {
-    pub const ALL: [Self; 3] = [Self::C2, Self::C3, Self::C4];
+    pub const ALL: [Self; 2] = [Self::C3, Self::C4];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::C2 => "C2",
             Self::C3 => "C3",
             Self::C4 => "C4",
         }
@@ -2356,10 +2353,6 @@ struct CandidateVisitor {
     /// Span ranges already emitted, so the broadened signals below don't push
     /// the same call site twice (candidate ids are span-based).
     seen_spans: HashSet<(u32, u32)>,
-    /// Depth of enclosing `await` expressions. An awaited call with a string
-    /// argument is a strong network-call signal even when the callee name is
-    /// unknown.
-    await_depth: usize,
     /// True when this file imports a package the cloud /framework-detect step
     /// flagged as a messaging client (NATS, Redis, Kafka, …). This is the gate
     /// for Signal 7 (pub/sub call-site surfacing): the publish/subscribe shape
@@ -2436,7 +2429,6 @@ impl CandidateVisitor {
             function_stack: Vec::new(),
             network_import_locals,
             seen_spans: HashSet::new(),
-            await_depth: 0,
             file_imports_messaging_client,
             const_string_values,
             new_url_paths,
@@ -2619,20 +2611,6 @@ impl CandidateVisitor {
                 .unwrap_or(false),
             _ => false,
         }
-    }
-
-    // FROZEN (old path, 2026-10-21): Signal 4, the await gate. Deletions and
-    // safety fixes only. Fixes for wrong or missing rows go in discovery (a
-    // call that reaches a labelled library export). Delete when discovery is
-    // on by default and the four-repo replay shows no site only this signal
-    // raised (carrick#2440, target 2).
-    /// Is the first argument a string or template literal? Combined with an
-    /// enclosing `await`, this flags awaited calls like `await load('/data')`.
-    fn first_arg_is_stringish(call: &CallExpr) -> bool {
-        matches!(
-            call.args.first().map(|a| &*a.expr),
-            Some(Expr::Lit(Lit::Str(_))) | Some(Expr::Tpl(_))
-        )
     }
 
     /// Signal-7 topic check: is the first argument a string/template literal, or
@@ -3442,18 +3420,6 @@ impl Visit for CandidateVisitor {
         node.visit_children_with(self);
     }
 
-    // FROZEN (old path, 2026-10-21): Signal 4, the await gate (this visitor
-    // only keeps `await_depth`). Deletions and safety fixes only. Fixes for
-    // wrong or missing rows go in discovery (a call that reaches a labelled
-    // library export). Delete when discovery is on by default and the
-    // four-repo replay shows no site only this signal raised (carrick#2440,
-    // target 2).
-    fn visit_await_expr(&mut self, node: &AwaitExpr) {
-        self.await_depth += 1;
-        node.visit_children_with(self);
-        self.await_depth -= 1;
-    }
-
     fn visit_expr_stmt(&mut self, node: &ExprStmt) {
         // A statement-expression that *is* a call (`nc.publish(SUBJECT, payload);`)
         // is one of the two Signal-7 positions. Mark it so the call expr it wraps
@@ -3611,7 +3577,7 @@ impl Visit for CandidateVisitor {
             && let Some(root) = Self::callee_root_ident(callee_expr)
             && self.network_import_locals.contains(&root)
         {
-            // Same member-property extraction as Signals 3/4 (incl. computed
+            // Same member-property extraction as Signals 3/5 (incl. computed
             // string properties like `client["post"](url)`), so every signal
             // that can emit this span first labels it identically.
             let property = Self::callee_member_prop(callee_expr);
@@ -3628,25 +3594,6 @@ impl Visit for CandidateVisitor {
                     Self::callee_member_prop(e),
                 ),
                 _ => ("<url-call>".to_string(), None),
-            };
-            self.push_candidate(call, obj, prop);
-        }
-
-        self.register_signal = Some(RegisterSignal::C2);
-        // FROZEN (old path, 2026-10-21): Signal 4, the await gate, this block,
-        // `await_depth`, `visit_await_expr` and `first_arg_is_stringish`.
-        // Deletions and safety fixes only. Fixes for wrong or missing rows go
-        // in discovery (a call that reaches a labelled library export). Delete
-        // when discovery is on by default and the four-repo replay shows no
-        // site only this signal raised (carrick#2440, target 2).
-        // Signal 4: awaited call with a string/template argument.
-        if self.await_depth > 0 && Self::first_arg_is_stringish(call) {
-            let (obj, prop) = match &call.callee {
-                Callee::Expr(e) => (
-                    Self::extract_callee_object(e).unwrap_or_else(|| "<awaited-call>".to_string()),
-                    Self::callee_member_prop(e),
-                ),
-                _ => ("<awaited-call>".to_string(), None),
             };
             self.push_candidate(call, obj, prop);
         }
@@ -4119,8 +4066,8 @@ mod tests {
             .expect("the register signals raised the axios call");
         assert_eq!(
             axios.iter().copied().collect::<Vec<_>>(),
-            vec![RegisterSignal::C2, RegisterSignal::C3, RegisterSignal::C4],
-            "the await gate, the name lists and the detected import all raised it"
+            vec![RegisterSignal::C3, RegisterSignal::C4],
+            "the name lists and the detected import both raised it"
         );
         assert!(
             !result.register_signals.contains_key(&span_of("fetch(")),
@@ -4215,7 +4162,7 @@ export async function record(event: unknown): Promise<void> {
     #[test]
     fn imported_fetcher_computed_property_call_carries_property() {
         // Signal 2 (import-gated) must extract computed string properties the
-        // same way Signals 3/4 do, so whichever signal emits a span first
+        // same way Signals 3/5 do, so whichever signal emits a span first
         // labels it identically.
         let content = r#"
 import client from "client-lib";
