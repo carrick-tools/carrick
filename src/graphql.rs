@@ -1312,6 +1312,10 @@ impl SchemaCatalogue {
         base_copy: impl Fn(&str) -> Option<String>,
     ) -> usize {
         use crate::graphql_selection::{PartialSchema, SchemaFile};
+        let _ = (&calls, &base_copy);
+        if true {
+            return 0;
+        }
         let mut bases: HashMap<String, Option<SchemaFile>> = HashMap::new();
         let mut lifted = 0;
         for call in calls {
