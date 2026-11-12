@@ -1658,6 +1658,43 @@ pub fn fold_rows(
             }
         }
     }
+    // The reader's row at a decided site no single operation keys (a
+    // callee that reads a destructured options key with a default,
+    // carrick#3961) is the same request the callers' fact rows state, each
+    // with the key it sends: the callers' rows are the request, and the
+    // reader's row at the callee is a second statement of it. It goes where
+    // every call that reaches the site holds a fact row at its own line and
+    // no other call shares that line.
+    let mut sites: BTreeMap<(&str, u32), Vec<&Through>> = BTreeMap::new();
+    for through in &site.through {
+        sites
+            .entry((through.site_file.as_str(), through.site_line))
+            .or_default()
+            .push(through);
+    }
+    for ((file, line), throughs) in sites {
+        let every_caller_states = throughs.iter().all(|through| {
+            !through.other_call
+                && calls.iter().any(|row| {
+                    is_fact(row) && !is_old_path(row) && at(row, &through.file, through.line)
+                })
+        });
+        if !every_caller_states {
+            continue;
+        }
+        let mut index = 0;
+        while index < calls.len() {
+            if is_reader(&calls[index]) && at(&calls[index], file, line) {
+                let gone = calls.remove(index);
+                out.through_folded
+                    .push((file.to_string(), line, gone.key.clone()));
+                out.withdrawn
+                    .push((file.to_string(), line, gone.key, RowSide::Call));
+            } else {
+                index += 1;
+            }
+        }
+    }
     // An unread site at a line a row stands at once the fold is done, of
     // either side, is that row's call (a class-only GraphQL call is its
     // document's row).
