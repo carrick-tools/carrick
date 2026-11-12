@@ -1,0 +1,46 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/router",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/router",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "define", "on": "export", "name": { "arg": 0 }, "handler": { "arg": 2 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/http",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/http",
+          "export": "request",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": null, "on": "export", "name": { "arg": 0 }, "method_key": { "arg": 1, "key": "method" }, "method_default": "GET", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
