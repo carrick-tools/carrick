@@ -63,6 +63,7 @@ function answer(home: string, entry: QueueEntry, result: CheckResult): void {
     enqueued_at: entry.enqueued_at,
     started_at: entry.enqueued_at,
     finished_at: new Date().toISOString(),
+    ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
     result,
   };
   writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
@@ -412,6 +413,20 @@ test("stop says a re-check is still running, once, without waiting, and delivers
   assert.match(context(third.stdout), /contract problem/);
   const fourth = await stopWith(home);
   assert.equal(fourth.stdout, "", "delivered once");
+});
+
+// Pins a gap T12-2 leaves (Stop is unchanged): an answer queued in place of
+// the probe is claimed by Stop when Stop is its next carrier, and Stop renders
+// no uses-count line, so a uses-only answer says nothing of its uses there.
+test("Stop claims an answer queued in place of the probe and prints no uses line for it", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], Date.now(), { home, insteadOfProbe: true })[0]!;
+  assert.equal(entry.instead_of_probe, true);
+  answer(home, entry, fixture("check-stale-uses.json"));
+  const run = await stopWith(home);
+  assert.doesNotMatch(run.stdout, /Other files use what this file declares/);
+  assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), "claimed at Stop");
 });
 
 test("a clean late answer alone prints nothing and is marked delivered; beside a problem both print", async (t) => {

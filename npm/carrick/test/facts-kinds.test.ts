@@ -278,11 +278,7 @@ async function lateAnswer(t: { after: (fn: () => void) => void }, rows: Array<Re
   const at = lineOf(file, "const key");
   const payload = (target: string, extra: Record<string, unknown>) => ({ hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "late", cwd: ws.root, tool_input: { file_path: target }, ...extra });
   await runHook("post-edit.ts", { payload: payload(file, { tool_response: { structuredPatch: [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }] } }), env });
-  const sessions = path.join(ws.home, ".carrick", "sessions");
-  const until = Date.now() + 20_000;
-  while (Date.now() < until && !(fs.existsSync(sessions) && fs.readdirSync(sessions).some((name) => name.endsWith(".answer.json")))) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForSessionAnswers(ws.home, "late");
   return context((await runHook("post-edit.ts", { payload: payload(ws.at("README.md"), {}), env })).stdout);
 }
 

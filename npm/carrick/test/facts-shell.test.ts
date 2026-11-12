@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fakeEnv, firstCall, fixturePath, runHook, testDir } from "./helpers.ts";
+import { drainRunner, fakeEnv, firstCall, fixturePath, runHook, testDir } from "./helpers.ts";
 import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
 import { changesAgainstHead, MAX_DIFF_LINES } from "../src/facts/diff.ts";
@@ -38,7 +38,9 @@ const row = (fields: Record<string, unknown>) =>
 async function workspace(t: { after: (fn: () => void) => void }, extra: string[] = [], files: Record<string, string> = {}): Promise<Ws> {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-shell-")));
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-shell-home-")));
-  t.after(() => {
+  t.after(async () => {
+    // A shell write with a fact file queues its check: no runner outlives the test.
+    await drainRunner(root);
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   });
