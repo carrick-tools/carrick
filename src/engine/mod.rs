@@ -29906,7 +29906,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         .expect("write");
         let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
         let site = sites.sites.first().expect("one site").clone();
-        let held = crate::unread_sites::with_unanswered(Vec::new(), &[], &[site.clone()], &root);
+        let held = crate::unread_sites::with_unanswered(
+            Vec::new(),
+            &[],
+            std::slice::from_ref(&site),
+            &root,
+        );
         let mut earlier = held[0].clone();
         earlier.reason = crate::request_summary::Stop::MissedInside;
         earlier.also.clear();
