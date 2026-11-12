@@ -311,6 +311,11 @@ pub fn mismatch_break_status(
     on_main: Option<bool>,
     on_main_unknown: Option<OnMainUnknown>,
 ) -> BreakStatus {
+    // Main already has it, whatever its proof: not this change's break
+    // (carrick#3895). Read before either candidate check.
+    if on_main == Some(true) {
+        return BreakStatus::OnMain;
+    }
     if edge_source == Some(EdgeSource::Candidate) {
         return BreakStatus::Candidate {
             reason: "rests_on_a_model_stated_row",
@@ -857,6 +862,7 @@ impl Finding {
             Finding::MissingEndpoint { removal, .. }
             | Finding::OrphanedEndpoint { removal, .. } => match removal {
                 None => BreakStatus::NotABreak,
+                Some(removal) if removal.on_main == Some(true) => BreakStatus::OnMain,
                 Some(removal) => {
                     let marked = removal.on_main.is_some() || removal.on_main_unknown.is_some();
                     if removal.edge_source != Some(EdgeSource::Fact)
@@ -2564,6 +2570,65 @@ mod tests {
                 reason: "removal_unplaced"
             }
         );
+    }
+
+    /// carrick#3895: main already has the mismatch, so it reads `on_main`
+    /// whatever its proof; only a PR-introduced one stays a candidate.
+    #[test]
+    fn break_status_on_main_wins_over_candidate_checks() {
+        let on_main_candidate = mismatch(Some(EdgeSource::Candidate), None, Some(true));
+        assert_eq!(on_main_candidate.break_status(), BreakStatus::OnMain);
+        let on_main_unresolved = mismatch(
+            Some(EdgeSource::Fact),
+            Some(VerdictState::Unresolved),
+            Some(true),
+        );
+        assert_eq!(on_main_unresolved.break_status(), BreakStatus::OnMain);
+        let introduced_candidate = mismatch(Some(EdgeSource::Candidate), None, Some(false));
+        assert!(matches!(
+            introduced_candidate.break_status(),
+            BreakStatus::Candidate {
+                reason: "rests_on_a_model_stated_row"
+            }
+        ));
+        let introduced_unresolved = mismatch(
+            Some(EdgeSource::Fact),
+            Some(VerdictState::Unresolved),
+            Some(false),
+        );
+        assert_eq!(
+            introduced_unresolved.break_status(),
+            BreakStatus::Candidate {
+                reason: "type_side_unresolved"
+            }
+        );
+    }
+
+    #[test]
+    fn break_status_removal_on_main_wins_over_candidate_checks() {
+        let f = Finding::missing_endpoint("GET", "/x", None, vec![]).with_removal(
+            removal(
+                Some(EdgeSource::Candidate),
+                Some(VerdictState::Unresolved),
+                Some(true),
+                None,
+            ),
+            vec![],
+        );
+        assert_eq!(f.break_status(), BreakStatus::OnMain);
+        let introduced = Finding::missing_endpoint("GET", "/x", None, vec![]).with_removal(
+            removal(
+                Some(EdgeSource::Candidate),
+                Some(VerdictState::Unresolved),
+                Some(false),
+                None,
+            ),
+            vec![],
+        );
+        assert!(matches!(
+            introduced.break_status(),
+            BreakStatus::Candidate { .. }
+        ));
     }
 
     #[test]
