@@ -2275,6 +2275,64 @@ fn procedure_rows_state_their_router_and_key_path() {
     assert!(flat.iter().all(|row| !row.ends_with("=> -")), "{flat:?}");
 }
 
+/// A server label that states its method as the kind word (`QUERY`,
+/// `MUTATION`, on `protocol: "rpc"`) writes the same rows the HTTP words do:
+/// the server's procedure sites state their wire method through
+/// `procedure_wire_label`, as the client's do (cloud#2743 item 5, S1).
+/// Subscriptions are left out (carrick#4048): `stream` keeps no method.
+#[test]
+fn a_server_procedure_label_stating_the_kind_word_writes_its_wire_method() {
+    let name = "procedure-router";
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
+    // The same claims, the two key-named ops stating the kind word.
+    let claims = tmp.path().join("cassettes/library-claims/default.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claims).unwrap()).unwrap();
+    let mut rewritten = 0;
+    for package in doc["library_claims"].as_array_mut().unwrap() {
+        for export in package["exports"].as_array_mut().unwrap() {
+            for op in export["ops"].as_array_mut().unwrap() {
+                let word = match op["member"].as_str() {
+                    Some("query") => "QUERY",
+                    Some("mutation") => "MUTATION",
+                    _ => continue,
+                };
+                if op["name"]["bound"] == "key" {
+                    op["method"] = word.into();
+                    op["protocol"] = "rpc".into();
+                    rewritten += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(rewritten, 2, "the fixture's key-named query and mutation");
+    std::fs::write(&claims, serde_json::to_string(&doc).unwrap()).unwrap();
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env_remove("CARRICK_PROGRESS");
+    let (on, _) = run_scan(&mut cmd, &storage);
+    let (graph, flat) = procedure_rows(&on);
+    let (stated, _) = {
+        let (base, _) = scan_fixture_reading(name);
+        procedure_rows(&base)
+    };
+    // Byte-identical to the rows the HTTP words write.
+    assert_eq!(graph, stated);
+    assert!(
+        graph.iter().any(|row| row.contains(" POST ")),
+        "the mutation writes POST: {graph:?}"
+    );
+    assert!(flat.iter().all(|row| !row.ends_with("=> -")), "{flat:?}");
+}
+
 /// The router a procedure row names is the innermost declaration holding the
 /// property of the first key: the binding the router call is assigned to, a
 /// table another binding hands it, and two routers in one file that share a
