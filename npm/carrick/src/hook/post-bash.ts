@@ -24,7 +24,7 @@ import { readStdin } from "./stdin.ts";
 import { sessionKey } from "./session-key.ts";
 import path from "node:path";
 import fs from "node:fs";
-import { bashTargets, MENTIONS_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
+import { bashTargets, MENTIONS_FACT_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
 
 /** At most this many files are asked about for one command. */
 const MAX_FILES = 2;
@@ -58,10 +58,10 @@ async function main(): Promise<void> {
     return;
   }
   const command = payload.tool_input?.command;
-  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(sessionKey(payload));
+  if (!command || !(MENTIONS_FACT_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(sessionKey(payload));
   const cwd = payload.cwd ?? process.cwd();
-  const { reads, writes } = bashTargets(command, path.resolve(cwd));
-  const candidates = writes.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? writes : [];
+  const { reads, writes, factWrites } = bashTargets(command, path.resolve(cwd));
+  const candidates = writes.length + factWrites.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? [...writes, ...factWrites] : [];
   // A search for a function's name: the index sites its output did not print.
   const searched = SEARCH_WORD.test(command) ? searchedNames(command, path.resolve(cwd)) : { names: [], operands: [] };
   if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return lateOnly(sessionKey(payload));
@@ -74,6 +74,8 @@ async function main(): Promise<void> {
 
   // Written: the mtime moved since the session last saw the file.
   const written: string[] = [];
+  // Written files the session had no record of: a new file, for the fact path.
+  const unseen = new Set<string>();
   if (candidates.length > 0 && channel.channel !== "off") {
     const mtimes: Record<string, number> = {};
     for (const file of candidates) {
@@ -85,15 +87,18 @@ async function main(): Promise<void> {
       }
       mtimes[file] = mtime;
       const seen = session ? reuse.writtenMtime(session, file) : undefined;
+      if (seen === undefined) unseen.add(file);
       if (seen === undefined ? Date.now() - mtime < FRESH_MS : mtime !== seen) written.push(file);
     }
     if (session && Object.keys(mtimes).length > 0) reuse.markWritten(session, mtimes);
   }
-  const toEdit = written.slice(0, MAX_WRITES);
+  const capped = written.slice(0, MAX_WRITES);
+  const toEdit = capped.filter((file) => !factWrites.includes(file));
+  const factOnly = capped.filter((file) => factWrites.includes(file));
 
   // The answer is the Read hook's (or the edit hook's), so the cloud's log tells it the same way.
-  markInvoker(toEdit.length > 0 ? "post-edit" : "post-read");
-  if (toEdit.length === 0 && channel.channel !== "hook") return;
+  markInvoker(capped.length > 0 ? "post-edit" : "post-read");
+  if (capped.length === 0 && channel.channel !== "hook") return;
   const { wasRead } = reuse;
   const fresh =
     channel.channel === "hook" ? reads.filter((file) => !(session && wasRead(session, file))).slice(0, MAX_FILES) : [];
@@ -112,9 +117,19 @@ async function main(): Promise<void> {
     if (line !== null) answers.push(line);
   }
 
-  if (toEdit.length > 0) {
+  if (capped.length > 0) {
     const { editFlow } = await import("./edit-flow.ts");
-    await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel, shell: true }, toEdit, answers);
+    // A shell write names no changed lines: the file's diff against HEAD does
+    // (`facts/diff.ts`); a file the session never saw, untracked, counts whole.
+    const changes = new Map<string, { lines?: number[]; removed?: number[]; whole?: boolean }>();
+    if (channel.channel === "hook") {
+      const { changesAgainstHead } = await import("../facts/diff.ts");
+      for (const file of capped) {
+        const found = changesAgainstHead(file, unseen.has(file));
+        if (found) changes.set(file, found);
+      }
+    }
+    await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel, shell: true, changes, factOnly }, toEdit, answers);
     return;
   }
   const { deliverLate, emitPostToolUse } = await import("./late.ts");

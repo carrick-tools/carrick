@@ -36,6 +36,8 @@ const log = createLogger("carrick-hook");
 
 /** The files the index has rows for. */
 const CHECKED = /\.(ts|tsx|mts|cts|graphql|gql)$/;
+/** JavaScript: fact lines only (`FACT_FILE`); the probe and re-check flow never see it. */
+const FACT_ONLY = /\.(js|jsx|mjs|cjs)$/;
 
 type Payload = {
   cwd?: string;
@@ -102,11 +104,12 @@ async function main(timing: Timing): Promise<void> {
   // A patch can name a file this index has no rows for beside one it does, so
   // the filter is per file rather than a reason to drop the call.
   const cwd = payload.cwd ?? null;
-  const edited = filesFromPayload(payload)
-    .filter((file) => CHECKED.test(file))
-    .map((file) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file)));
+  const absolute = (file: string) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file));
+  const named = filesFromPayload(payload);
+  const edited = named.filter((file) => CHECKED.test(file)).map(absolute);
+  const factOnly = named.filter((file) => FACT_ONLY.test(file)).map(absolute);
   const session = sessionKey(payload);
-  if (edited.length === 0) {
+  if (edited.length === 0 && factOnly.length === 0) {
     // Nothing of ours to check in this edit, but a finished background answer
     // is still owed to the model (B3: every carrier delivers).
     if (channel.channel === "hook") {
@@ -116,8 +119,9 @@ async function main(timing: Timing): Promise<void> {
     return;
   }
 
-  timing.file = edited[0]!;
-  await editFlow({ cwd, session, channel: channel.channel, timing, changes: await changesFromPayload(payload, edited, cwd) }, edited);
+  timing.file = (edited[0] ?? factOnly[0])!;
+  const changes = await changesFromPayload(payload, [...edited, ...factOnly], cwd);
+  await editFlow({ cwd, session, channel: channel.channel, timing, changes, factOnly }, edited);
 }
 
 type Change = { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean };
@@ -133,13 +137,21 @@ async function untracked(file: string): Promise<boolean> {
   return tracked !== null && tracked.size === 0;
 }
 
+/** The file's changed lines against HEAD (`facts/diff.ts`), or null when not known. */
+async function againstHead(file: string, created: boolean): Promise<Change | null> {
+  const { changesAgainstHead } = await import("../facts/diff.ts");
+  return changesAgainstHead(file, created);
+}
+
 /**
  * Where the edit changed each file, keyed by the absolute path: the lines of
  * the file as it is now that its hunks added and where they removed lines
  * (an `Edit` or `MultiEdit`'s patch, a Codex `apply_patch` hunk placed in the
  * file), else the text it put in, else `whole` for a file this call created
  * that git does not track. A file left out (a `Write` over an existing file,
- * a hunk that cannot be placed) gets no fact lines (`facts/lines.ts`).
+ * a hunk that cannot be placed and has no diff against HEAD) gets no fact
+ * lines (`facts/lines.ts`). An `Edit`'s hunks a formatter has since moved fall
+ * back to the diff against HEAD, as a Codex hunk does.
  */
 async function changesFromPayload(payload: Payload, edited: string[], cwd: string | null): Promise<Map<string, Change>> {
   const input = payload.tool_input ?? {};
@@ -156,7 +168,9 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
       try {
         if (fs.statSync(file).size > MAX_FACT_FILE_BYTES) continue;
         const placed = placeHunks(fs.readFileSync(file, "utf8"), change.hunks);
-        if (placed) out.set(file, placed);
+        // A hunk that cannot be placed: the file's diff against HEAD.
+        const found = placed ?? (await againstHead(file, false));
+        if (found) out.set(file, found);
       } catch {
         // Unreadable now: nothing said about it.
       }
@@ -169,7 +183,11 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
   // though its result carries hunks too.
   const kind = payload.tool_response?.type;
   if (payload.tool_name === "Write" || kind === "create" || kind === "update") {
-    return kind === "create" && (await untracked(edited[0]!)) ? new Map([[edited[0]!, { whole: true }]]) : new Map();
+    if (kind === "create" && (await untracked(edited[0]!))) return new Map([[edited[0]!, { whole: true }]]);
+    // Over an existing file the call's own hunks are not read (a `Write` says
+    // little of what it changed): the file's diff against HEAD is.
+    const found = await againstHead(edited[0]!, false);
+    return found ? new Map([[edited[0]!, found]]) : new Map();
   }
   const hunks = payload.tool_response?.structuredPatch;
   if (Array.isArray(hunks) && hunks.length > 0) {
@@ -192,7 +210,11 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
       for (const text of hunk.lines) {
         if (typeof text !== "string" || text.startsWith("\\")) continue;
         if (text.startsWith("+")) {
-          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) return new Map();
+          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) {
+            // Unplaced: the file's diff against HEAD, as for a Codex patch.
+            const found = await againstHead(edited[0]!, false);
+            return found ? new Map([[edited[0]!, found]]) : new Map();
+          }
           lines.push(at++);
         } else if (text.startsWith("-")) removed.push(at);
         else at += 1;

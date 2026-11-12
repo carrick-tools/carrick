@@ -15,6 +15,13 @@ import { patchedFiles } from "./apply-patch.ts";
 export const SOURCE_FILE = /\.(ts|tsx|mts|cts)$/;
 /** A command that cannot name a source file is not parsed at all. */
 export const MENTIONS_SOURCE = /\.(ts|tsx|mts|cts)\b/;
+/**
+ * The files the fact path (`facts/lines.ts`) reads: the above and JavaScript.
+ * A JavaScript write gets fact lines only; the probe and the re-check flow
+ * still run on `SOURCE_FILE` alone.
+ */
+export const FACT_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+export const MENTIONS_FACT_SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)\b/;
 
 /** One command of a line. `body` is the text of the heredoc it reads, when it has one. */
 type Step = { words: string[]; writes: string[]; cwd: string; body: string; piped: boolean };
@@ -190,7 +197,7 @@ function isFile(file: string): boolean {
 /** A script run by one of these names the files it writes in its own text. */
 const SCRIPTERS = /^(python[\d.]*|node|nodejs|deno|bun|tsx|ruby|perl|php)$/;
 /** A source path written into a script's text. */
-const PATH_IN_TEXT = /[\w@~./-]*[\w-]\.(?:ts|tsx|mts|cts)\b/g;
+const PATH_IN_TEXT = /[\w@~./-]*[\w-]\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)\b/g;
 /** Commands that move the tree in bulk: what they touch is not a write of the agent's. */
 const BULK_GIT = new Set(["checkout", "switch", "rebase", "merge", "reset", "stash", "pull", "worktree", "restore", "cherry-pick", "revert"]);
 const BULK_PACKAGE = new Set(["ci", "install", "i", "add", "update", "upgrade"]);
@@ -214,9 +221,9 @@ export function movesTreeInBulk(command: string, cwd: string): boolean {
   return false;
 }
 
-function sourceWords(words: string[], cwd: string): string[] {
+function sourceWords(words: string[], cwd: string, kind: RegExp = SOURCE_FILE): string[] {
   return words
-    .filter((word) => SOURCE_FILE.test(word) && !/[*?[{]/.test(word))
+    .filter((word) => kind.test(word) && !/[*?[{]/.test(word))
     .map((word) => path.resolve(cwd, word));
 }
 
@@ -225,14 +232,14 @@ function sourceWords(words: string[], cwd: string): string[] {
  * that exist. A file the same command writes (`>`, `>>`, `sed -i`, `tee`) is
  * not in `reads`; the write is the other branch of the hook.
  */
-export function bashTargets(command: string, cwd: string): { reads: string[]; writes: string[] } {
+export function bashTargets(command: string, cwd: string): { reads: string[]; writes: string[]; factWrites: string[] } {
   const reads: string[] = [];
   const writes: string[] = [];
   for (const step of steps(command, cwd)) {
-    writes.push(...sourceWords(step.writes, step.cwd));
+    writes.push(...sourceWords(step.writes, step.cwd, FACT_FILE));
     // `apply_patch <<EOF` through the shell: the patch names its files.
     if (step.body.includes("*** Begin Patch")) {
-      writes.push(...sourceWords(patchedFiles(step.body), step.cwd));
+      writes.push(...sourceWords(patchedFiles(step.body), step.cwd, FACT_FILE));
     }
     let at = 0;
     while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(step.words[at] ?? "")) at += 1;
@@ -242,19 +249,20 @@ export function bashTargets(command: string, cwd: string): { reads: string[]; wr
       // A script's text is the only place its target is named; whether it
       // wrote that file is decided by the file's mtime, not here.
       const text = `${step.body}\n${args.join("\n")}`;
-      writes.push(...sourceWords(text.match(PATH_IN_TEXT) ?? [], step.cwd));
+      writes.push(...sourceWords(text.match(PATH_IN_TEXT) ?? [], step.cwd, FACT_FILE));
     } else if (name === "cp" || name === "mv" || name === "install") {
       const rest = positionals(args, new Set(["-t", "--target-directory"])).rest;
       // The destination is the last word; `-t dir` and a directory target name no file.
-      writes.push(...sourceWords(rest.slice(-1), step.cwd));
+      writes.push(...sourceWords(rest.slice(-1), step.cwd, FACT_FILE));
     } else if (name === "tee") {
-      writes.push(...sourceWords(positionals(args).rest, step.cwd));
+      writes.push(...sourceWords(positionals(args).rest, step.cwd, FACT_FILE));
     } else if (name === "sed") {
       const { rest, flags } = positionals(args, new Set(["-e", "-f", "--expression", "--file"]));
       const inPlace = [...flags].some((flag) => /^-[a-zA-Z]*i/.test(flag) || flag.startsWith("--in-place"));
       const scripted = ["-e", "-f", "--expression", "--file"].some((flag) => flags.has(flag));
-      const files = sourceWords(scripted ? rest : rest.slice(1), step.cwd);
-      (inPlace ? writes : reads).push(...files);
+      const operands = scripted ? rest : rest.slice(1);
+      if (inPlace) writes.push(...sourceWords(operands, step.cwd, FACT_FILE));
+      else reads.push(...sourceWords(operands, step.cwd));
     } else if (name === "awk") {
       reads.push(...sourceWords(positionals(args, new Set(["-f"])).rest.slice(1), step.cwd));
     } else if (READERS.has(name)) {
@@ -285,7 +293,9 @@ export function bashTargets(command: string, cwd: string): { reads: string[]; wr
   const written = new Set(writes);
   return {
     reads: [...new Set(reads)].filter((file) => !written.has(file) && isFile(file)),
-    writes: [...written].filter(isFile),
+    writes: [...written].filter((file) => SOURCE_FILE.test(file) && isFile(file)),
+    // JavaScript writes: fact lines only, never the probe (`FACT_FILE`).
+    factWrites: [...written].filter((file) => !SOURCE_FILE.test(file) && isFile(file)),
   };
 }
 
