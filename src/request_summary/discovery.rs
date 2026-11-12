@@ -1058,6 +1058,30 @@ fn path_op<'e>(
         })
 }
 
+/// Whether `claim` is a call-form op on `member` that names its operation by
+/// the key path walked on the receiver ([`path_op`]'s claim, any type).
+fn is_path_named_call(claim: &LibraryClaim, member: &str) -> bool {
+    use crate::services::type_sidecar::{BoundName, OpName};
+    match claim {
+        LibraryClaim::Op {
+            member: Some(claimed),
+            name,
+            ..
+        } => {
+            claim.is_call_form()
+                && claimed == member
+                && matches!(
+                    name.as_deref(),
+                    Some(OpName::Bound {
+                        bound: BoundName::Path,
+                        ..
+                    })
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Whether `claims` state `member` as a call-form op of the export.
 fn claims_member(claims: &ExportClaims, member: &str) -> bool {
     claims.claims.iter().any(|claim| {
@@ -1784,6 +1808,49 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// A client procedure call whose router type does not resolve
+    /// (carrick#3847): the compiler types the call, and every key read on
+    /// the client, as `any`, so [`Self::procedure_end`] finds no proxy and no
+    /// key to name. The call's own site still says it is one: the receiver is
+    /// an instance a maker builds, the members read on it are keys, and the
+    /// member called is a path-named op of the maker's export. The end is
+    /// kept with the reason, so the call is a lead that says why.
+    fn untyped_procedure_end(&self, file: &Path, call: &CallIr) -> Option<(SiteEnd, Stop)> {
+        let site = self
+            .instances
+            .get(&(file, call.site.span_start, call.site.span_end))?;
+        let member = site.member.as_deref()?;
+        if site.path.is_empty() {
+            return None;
+        }
+        let exports = if site.export == "default" {
+            vec!["default", "export ="]
+        } else {
+            vec![site.export.as_str()]
+        };
+        let invoke = Invoke {
+            file,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        specifier_keys(&site.specifier).iter().find_map(|key| {
+            exports.iter().find_map(|export| {
+                let claims = self.labels.get(key, export)?;
+                claims
+                    .claims
+                    .iter()
+                    .any(|claim| is_path_named_call(claim, member))
+                    .then(|| {
+                        (
+                            self.end_at(invoke, key, export, Some(member), claims),
+                            Stop::UntypedReceiver,
+                        )
+                    })
+            })
+        })
+    }
+
     /// The procedure `call` names through the proxy at `proxy` on its chain
     /// ([`Self::procedure_end`]): the keys read on the proxy, outermost
     /// first, joined by `join`, and the router its first key's declaration
@@ -2372,11 +2439,18 @@ impl<'a> Walker<'a> {
         let procedure = (!construction)
             .then(|| self.procedure_end(file, call))
             .flatten();
-        let several = procedure.as_ref().and_then(|(_, stop)| *stop);
-        if let Some((end, reached)) = procedure
+        let mut several = procedure.as_ref().and_then(|(_, stop)| *stop);
+        let mut found = procedure
             .map(|(end, _)| (end, ReachedBy::Type))
-            .or_else(|| self.library_end(file, call, construction))
+            .or_else(|| self.library_end(file, call, construction));
+        if found.is_none()
+            && !construction
+            && let Some((end, stop)) = self.untyped_procedure_end(file, call)
         {
+            several = Some(stop);
+            found = Some((end, ReachedBy::Instance));
+        }
+        if let Some((end, reached)) = found {
             let traced = self.labels.declarations.is_some();
             return Outcome {
                 ends: vec![Found {

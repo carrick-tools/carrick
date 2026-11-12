@@ -2654,6 +2654,7 @@ fn matched_producers(name: &str) -> Vec<String> {
 fn procedure_client_rows() -> Vec<String> {
     let router = "workspace:src/router.ts#appRouter";
     let mut rows = vec![
+        "src/web/ghost.ts:11 POST \"/api/rpc/ghosts.reopen\"  model".to_string(),
         format!("src/web/hooks.ts:7 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/hooks.ts:16 GET \"\" {router} count request_summary"),
@@ -2736,6 +2737,36 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
     );
 }
 
+/// A client whose router type does not resolve (the import names no module)
+/// has no first key the compiler can place: its calls get no fact row, and a
+/// call the reader states no row for is saved unread with its reason
+/// (carrick#3847). The reader's mocked answer states the call at line 11,
+/// so that call keeps its row (one request, one row) and is not also listed
+/// unread; the call at line 7 has no row and is listed.
+#[test]
+fn a_client_whose_router_type_does_not_resolve_is_saved_unread() {
+    let blobs = scan_fixture("procedure-client");
+    let (flat, graph) = client_rows(&blobs);
+    for rows in [&flat, &graph] {
+        let ghost: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.starts_with("src/web/ghost.ts"))
+            .collect();
+        assert_eq!(ghost.len(), 1, "{rows:?}");
+        assert_eq!(
+            ghost[0],
+            "src/web/ghost.ts:11 POST \"/api/rpc/ghosts.reopen\"  model"
+        );
+    }
+    let reasons = unread_reasons(&blobs);
+    assert_eq!(
+        reasons.get("src/web/ghost.ts:7").map(String::as_str),
+        Some("untyped_receiver"),
+        "{reasons:?}"
+    );
+    assert!(!reasons.contains_key("src/web/ghost.ts:11"), "{reasons:?}");
+}
+
 /// A procedure call's types are not compared yet (carrick#3186): it
 /// writes no consumer type-manifest entry, which would key every query
 /// call of a service alike.
@@ -2753,6 +2784,8 @@ fn a_procedure_call_writes_no_consumer_manifest_entry() {
         })
         .filter(|entry| entry["role"] == "consumer")
         .map(|entry| entry["file_path"].as_str().unwrap_or_default().to_string())
+        // `ghost.ts` holds a plain model row, not a procedure call.
+        .filter(|file| !file.ends_with("src/web/ghost.ts"))
         .collect();
     assert_eq!(consumers, Vec::<String>::new());
 }
