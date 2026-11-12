@@ -924,7 +924,7 @@ test("operations whose types were not checked are named with the reason", () => 
 
 // A call the scan did not read (carrick#3688 U4). The CLI marks the lines the
 // working tree wrote as `edited`; the hook prints the CLI's own sentence for
-// those and nothing for the rest of the file's unread calls.
+// those; the hooks print none of them (carrick#3932), the CLI's check text does.
 function withUnread(): CheckResult {
   const result: CheckResult = { ...fixture("check-clean.json"), recheck: { ran: "extraction", elapsed_ms: 900 } };
   result.unread = [
@@ -934,11 +934,24 @@ function withUnread(): CheckResult {
   return result;
 }
 
-test("an edit on an unread call names it", () => {
-  assert.equal(
-    renderPostToolUse(withUnread(), "util/format.ts"),
-    "Carrick could not read the call at util/format.ts:12: the function called is a value in this code, and Carrick found no function behind it.",
-  );
+test("an edit on an unread call prints nothing (carrick#3932)", () => {
+  assert.equal(renderPostToolUse(withUnread(), "util/format.ts"), null);
+});
+
+test("unread items never add a line beside a contract problem (carrick#3932)", () => {
+  const result = rechecked();
+  const plain = renderPostToolUse(result, "api/users.ts");
+  assert.ok(plain !== null && plain.includes("api/users.ts"));
+  result.unread = [12, 20, 31].map((line) => ({
+    file: "api/users.ts",
+    line,
+    reason: "value_callee",
+    phrase: "Carrick can't tell what kind of object this is",
+    edited: true,
+  }));
+  const text = renderPostToolUse(result, "api/users.ts");
+  assert.equal(text, plain);
+  assert.ok(!String(text).includes("could not read the call"));
 });
 
 test("an edit elsewhere says nothing", () => {

@@ -592,6 +592,22 @@ test("a Stop whose only gap is an edit that changed nothing the scan reads print
   assert.equal(changedQueued(workspace.root).length, 0);
 });
 
+test("a Stop whose answer holds only unread calls prints no line for them (carrick#3932)", async (t) => {
+  const { workspace, home } = setup(t);
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  const unread = reread(clean());
+  unread.unread = [3, 9].map((line) => ({
+    file: workspace.file,
+    line,
+    reason: "value_callee",
+    phrase: "Carrick can't tell what kind of object this is",
+    edited: true,
+  }));
+  answer(home, queue(workspace.root, home, workspace.file), unread);
+  const text = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n");
+  assert.ok(!text.includes("could not read the call"));
+});
+
 test("a Stop with 1 problem prints the header and its line", async (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
