@@ -1253,6 +1253,12 @@ impl CloudRepoData {
 /// new value, which the cloud's vocabulary check refuses. Mixed versions are
 /// not supported, so the reader stops, and the error names the sibling, the
 /// release that wrote it and, when that release is newer, the upgrade.
+///
+/// The one exception is a reason word ([`crate::request_summary::Stop`]) on
+/// `unread_sites`, `unread_sites_by_reason`, `possible_calls` or
+/// `unfollowed_member_calls` (carrick#3989 S0): never an input, so a word a
+/// later release added reads as `Stop::Unknown` with the raw word, and is
+/// written back as it was read.
 pub(crate) fn read_peer_blob(text: &str) -> Result<CloudRepoData, UnreadablePeerBlob> {
     serde_json::from_str(text).map_err(|error| {
         let writer = serde_json::from_str(text).unwrap_or_default();
@@ -4083,6 +4089,57 @@ mod tests {
         }
         // The text entry point keeps where in the blob the value sits.
         assert!(from_text.to_string().contains(" at line 1 column "));
+    }
+
+    /// carrick#3989 S0: a reason word a later release added does not stop
+    /// the read. Every place a reason word sits on the blob keeps the raw
+    /// word, and writes it back as it read it; a known word reads as today.
+    #[test]
+    fn a_sibling_blob_with_a_reason_word_from_a_later_release_reads_and_keeps_the_word() {
+        const LATER: &str = "a_word_from_a_later_release";
+        let mut blob = serde_json::to_value(empty_repo("org/ledger", Some("ledger"))).unwrap();
+        let known = serde_json::json!({
+            "file": "src/known.ts", "line": 3, "span_start": 10, "span_end": 20,
+            "reason": "value_callee", "slot": "callee", "depth": 0,
+        });
+        let later = serde_json::json!({
+            "file": "src/later.ts", "line": 7, "span_start": 30, "span_end": 40,
+            "reason": LATER, "also": ["recursion", "another_word_from_a_later_release"],
+            "slot": "path", "depth": 1,
+        });
+        blob["unread_sites"] = serde_json::json!([known, later]);
+        blob["unread_sites_total"] = serde_json::json!(2);
+        blob["unread_sites_by_reason"] = serde_json::json!({ "value_callee": 1, LATER: 1 });
+        blob["possible_calls"] = serde_json::json!([{
+            "file_path": "src/later.ts", "line_number": 7, "span_start": 30, "span_end": 40,
+            "kind": null, "role": null, "labelled_end": null,
+            "unread": { "slot": "path", "reason": LATER }, "trace_depth": 1,
+        }]);
+        blob["unfollowed_member_calls"] = serde_json::json!([{
+            "file": "src/later.ts", "line": 9, "caller": "src/later.ts::send",
+            "member": "send", "receiver": "bus", "reason": LATER,
+        }]);
+
+        let from_text = read_peer_blob(&blob.to_string()).expect("an unknown reason word reads");
+        let from_value = read_peer_blob_value(blob.clone()).expect("an unknown reason word reads");
+        for back in [from_text, from_value] {
+            let written = serde_json::to_value(&back).unwrap();
+            for key in [
+                "unread_sites",
+                "unread_sites_total",
+                "unread_sites_by_reason",
+                "possible_calls",
+                "unfollowed_member_calls",
+            ] {
+                assert_eq!(written[key], blob[key], "`{key}` is written back as read");
+            }
+            assert_eq!(back.unread_sites.as_ref().unwrap().len(), 2);
+            assert_eq!(
+                back.unread_sites.unwrap()[0].reason,
+                crate::request_summary::Stop::ValueCallee,
+                "a known word reads as today"
+            );
+        }
     }
 
     /// carrick#1740: a blob from this release or an earlier one that does not

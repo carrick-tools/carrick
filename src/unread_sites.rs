@@ -716,6 +716,25 @@ mod tests {
         .unwrap()
     }
 
+    /// carrick#3989 S0: a word a later release added reads, and a reader
+    /// says the raw word with no phrase; the boundary line says the same.
+    #[test]
+    fn a_reason_word_from_a_later_release_is_said_as_the_raw_word() {
+        let site: UnreadSite = serde_json::from_value(serde_json::json!({
+            "file": "src/later.ts", "line": 7, "span_start": 30, "span_end": 40,
+            "reason": "a_word_from_a_later_release", "slot": "path", "depth": 0,
+        }))
+        .expect("an unknown reason word reads");
+        assert_eq!(phrase_of(&site), "a_word_from_a_later_release");
+        let known: UnreadSite = serde_json::from_value(serde_json::json!({
+            "file": "src/known.ts", "line": 3, "span_start": 1, "span_end": 2,
+            "reason": "value_callee", "slot": "callee", "depth": 0,
+        }))
+        .unwrap();
+        assert_eq!(phrase_of(&known), Stop::ValueCallee.phrase());
+        assert_ne!(phrase_of(&known), "value_callee");
+    }
+
     fn stop(file: &str, line: u32, reason: Stop) -> UnreadSite {
         UnreadSite {
             file: file.to_string(),

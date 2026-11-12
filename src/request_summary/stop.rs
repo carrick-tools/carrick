@@ -18,8 +18,13 @@ use super::decided_sites::InstanceHole;
 use super::guards::HoleReason;
 
 /// Why a site was not read. One word per variant, spelled in `snake_case`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Read leniently (carrick#3989 S0): a word this build does not know, which a
+/// later release wrote on a sibling's blob, reads as [`Stop::Unknown`] holding
+/// the raw word, and is written back as it was read. A reason word is never
+/// an input to matching, findings or the PR result, so a word this build
+/// cannot name is no reason to refuse the whole blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Stop {
     /// The callee is an in-repo value that is no definition, and the resolver read none of its values.
     ValueCallee,
@@ -101,7 +106,6 @@ pub enum Stop {
     FanOutCap,
     /// The chain reaches a function it already passed.
     /// Older blobs spelled the route side of this `cycle`.
-    #[serde(alias = "cycle")]
     Recursion,
     /// No compiler row answers the position.
     RowsMissing,
@@ -135,6 +139,41 @@ pub enum Stop {
     ProcedureUnmounted,
     /// No adapter reaches the router that holds a procedure.
     ProcedureNoAdapter,
+    /// A word a later release added: read from a blob, never written by
+    /// this build's own passes, and in no [`Stop::ALL`]. A reader says the
+    /// raw word, with no phrase.
+    Unknown(UnknownWord),
+}
+
+/// The raw word of a [`Stop::Unknown`]. Only the deserialiser makes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnknownWord(&'static str);
+
+impl UnknownWord {
+    /// The most distinct unknown words one process keeps, and the longest.
+    const MAX_WORDS: usize = 256;
+    const MAX_CHARS: usize = 64;
+    /// What a word past either cap reads as.
+    const OVER_CAP: &'static str = "unknown_reason";
+
+    /// The word, kept once per process so [`Stop`] stays `Copy`. A blob is
+    /// a sibling's, so the words it can add are bounded by the caps.
+    fn intern(word: &str) -> UnknownWord {
+        static WORDS: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+            std::sync::Mutex::new(std::collections::BTreeSet::new());
+        let mut words = WORDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(kept) = words.get(word) {
+            return UnknownWord(kept);
+        }
+        if word.chars().count() > Self::MAX_CHARS || words.len() >= Self::MAX_WORDS {
+            return UnknownWord(Self::OVER_CAP);
+        }
+        let kept: &'static str = Box::leak(word.to_string().into_boxed_str());
+        words.insert(kept);
+        UnknownWord(kept)
+    }
 }
 
 impl Stop {
@@ -255,10 +294,13 @@ impl Stop {
             Stop::EnvValue => "env_value",
             Stop::ProcedureUnmounted => "procedure_unmounted",
             Stop::ProcedureNoAdapter => "procedure_no_adapter",
+            Stop::Unknown(UnknownWord(word)) => word,
         }
     }
 
-    /// The stop a wire word names; `None` for a word that is no stop.
+    /// The stop a wire word names; `None` for a word that is no stop. Never
+    /// [`Stop::Unknown`]: only a blob's read keeps a word this build does
+    /// not know.
     pub fn parse(word: &str) -> Option<Stop> {
         Stop::ALL.into_iter().find(|stop| stop.as_str() == word)
     }
@@ -320,6 +362,25 @@ impl From<InstanceHole> for Stop {
             InstanceHole::CallbackOption => Stop::CallbackOption,
             InstanceHole::Unread => Stop::Unread,
         }
+    }
+}
+
+impl Serialize for Stop {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Stop {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stop, D::Error> {
+        let word = std::borrow::Cow::<'de, str>::deserialize(deserializer)?;
+        Ok(match word.as_ref() {
+            // Older blobs spelled the route side of a recursion `cycle`.
+            "cycle" => Stop::Recursion,
+            known => {
+                Stop::parse(known).unwrap_or_else(|| Stop::Unknown(UnknownWord::intern(known)))
+            }
+        })
     }
 }
 
@@ -408,6 +469,27 @@ mod tests {
             assert_eq!(serde_json::to_value(reason).unwrap(), word);
             assert_eq!(Stop::from(reason).as_str(), word);
         }
+    }
+
+    /// carrick#3989 S0: a word a later release added reads, keeps its
+    /// spelling, is no stop this build names and has no phrase.
+    #[test]
+    fn a_word_from_a_later_release_reads_as_its_raw_word() {
+        let word = "a_word_from_a_later_release";
+        let stop = serde_json::from_value::<Stop>(word.into()).unwrap();
+        assert!(matches!(stop, Stop::Unknown(_)));
+        assert_eq!(stop.as_str(), word);
+        assert_eq!(stop.phrase(), word);
+        assert_eq!(serde_json::to_value(stop).unwrap(), word);
+        assert_eq!(Stop::parse(word), None);
+        assert!(!Stop::ALL.contains(&stop));
+        let long = "w".repeat(UnknownWord::MAX_CHARS + 1);
+        assert_eq!(
+            serde_json::from_value::<Stop>(long.into())
+                .unwrap()
+                .as_str(),
+            UnknownWord::OVER_CAP
+        );
     }
 
     /// An older blob spelled a recursion `cycle`.
