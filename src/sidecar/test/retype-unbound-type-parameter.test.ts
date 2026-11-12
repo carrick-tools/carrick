@@ -171,7 +171,7 @@ const sendAt = (route: string) => {
 
 const WIDGET = '{ id: string; name: string; activeCount: number; }';
 const MISSING = '{ id: string; name: string; active: number; }';
-const UNBOUND = /holds the type parameter 'T' of the declaration it is in/;
+const UNBOUND = /uses the enclosing declaration's type parameter 'T'/;
 
 describe('carrick#3897: a call whose result holds an enclosing type parameter', () => {
   let client: SidecarClient;

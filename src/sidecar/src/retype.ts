@@ -639,9 +639,9 @@ function unboundReason(
   const name = enclosingTypeParameterIn(checker, type, at);
   if (name === undefined) return undefined;
   return (
-    `${what} ('${checker.typeToString(type)}') holds the type parameter '${name}' ` +
-    `of the declaration it is in, so the call does not state the response and its ` +
-    `readers are where that declaration is called`
+    `${what} ('${checker.typeToString(type)}') uses the enclosing declaration's type ` +
+    `parameter '${name}', so the call does not state the response and its readers ` +
+    `are that declaration's callers`
   );
 }
 
