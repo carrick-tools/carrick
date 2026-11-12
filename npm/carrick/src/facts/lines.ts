@@ -82,8 +82,21 @@ export type FactOutcome = {
   covered: string[];
 };
 
-/** A line one rule found, before the cap: its once-per-session key and the paths it points at. */
-type Candidate = { key: string; text: string; named: string[] };
+/**
+ * A line one rule found, before the cap: its once-per-session key and the
+ * paths it points at. `holds`, when set, is a costlier check run only for a
+ * line about to print within the cap; false drops the line.
+ */
+export type Candidate = { key: string; text: string; named: string[]; holds?: () => boolean };
+
+/** The declaration scan of `file`, or null when it is not a file the scanner reads, is unreadable, too large, or does not scan cleanly. */
+export function scanFile(file: string): Scan | null {
+  if (!SCANNED.test(file)) return null;
+  const text = readSmall(file);
+  if (text === null) return null;
+  const scan = scanSource(text, isJsx(file));
+  return scan.ok ? scan : null;
+}
 
 /** The row kinds in the order their lines print, before the cap of `MAX_FACT_LINES`. */
 const KINDS = ["op", "fn", "name", "pkg"] as const;
@@ -334,6 +347,7 @@ export async function factLines(
       for (const candidate of found[kind]) {
         if (lines.length >= MAX_FACT_LINES) break;
         if (said.has(candidate.key) || candidate.key in claims) continue;
+        if (candidate.holds && !candidate.holds()) continue;
         lines.push(candidate.text);
         claims[candidate.key] = { at: now, named: candidate.named };
       }

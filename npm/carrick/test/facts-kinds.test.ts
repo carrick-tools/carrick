@@ -302,6 +302,21 @@ test("name: silent when the patch does not read the same as the file (the file b
   assert.equal(context((await patchEdit(ws, file, [{ ...hunk, lines: [" not this line", ...hunk.lines.slice(1)] }])).stdout), "");
 });
 
+test("name: silent when the other file only imports the name, or declares a longer one", async (t) => {
+  const moved = await workspace(t, { ...STDIN_FILES, "web/src/stdin.ts": 'import { readStdin } from "./moved";\n\nexport { readStdin };\n' }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const first = addFunction(moved, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(moved, first.file, [first.hunk])).stdout), "");
+  const longer = await workspace(t, { ...STDIN_FILES, "web/src/stdin.ts": "export function readStdinAll() {\n  return [];\n}\n" }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const second = addFunction(longer, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(longer, second.file, [second.hunk])).stdout), "");
+});
+
+test("name: silent when the other file does not scan cleanly", async (t) => {
+  const ws = await workspace(t, { ...STDIN_FILES, "web/src/stdin.ts": "export function readStdin(\n" }, [nameRow("readStdin", "web", "src/stdin.ts")]);
+  const { file, hunk } = addFunction(ws, "api/src/hook.ts");
+  assert.equal(context((await patchEdit(ws, file, [hunk])).stdout), "");
+});
+
 test("fn: a row whose file is gone is silent, even for a name declared once here", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE, "src/old-orders.ts")]);
   const file = ws.at("api/src/orders.ts");

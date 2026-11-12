@@ -7,11 +7,11 @@
 // back); a file the call created had nothing before. With neither, nothing is
 // said. A name shorter than 4 characters, or with a row in this very file,
 // says nothing; otherwise the first row by (repo, file) prints, and only when
-// its file is still on disk and still holds the name.
+// its file still scans cleanly and declares exactly that name.
 
-import fs from "node:fs";
 import path from "node:path";
-import { MAX_FACT_FILE_BYTES } from "../lines.ts";
+import { scanFile } from "../lines.ts";
+import type { Candidate } from "../lines.ts";
 import { scanSource } from "../match.ts";
 import type { Scan } from "../match.ts";
 import type { FactStore } from "../store.ts";
@@ -66,10 +66,10 @@ export function sameNameLines(
   scan: Scan,
   change: Change,
   jsx: boolean,
-): Array<{ key: string; text: string; named: string[] }> {
+): Candidate[] {
   const names = addedNames(text, scan, change, jsx);
   if (names === null) return [];
-  const out: Array<{ key: string; text: string; named: string[] }> = [];
+  const out: Candidate[] = [];
   for (const name of names) {
     const bare = name.slice(name.lastIndexOf(".") + 1);
     if (bare.length < MIN_NAME_LENGTH) continue;
@@ -81,13 +81,12 @@ export function sameNameLines(
     const base = first.repo === at.repo ? at.top : where.get(first.repo);
     if (!base) continue;
     const other = path.join(base, first.file);
-    try {
-      // Gone or rewritten here: the function may have moved into this file.
-      if (fs.statSync(other).size > MAX_FACT_FILE_BYTES ||!fs.readFileSync(other, "utf8").includes(bare)) continue;
-    } catch {
-      continue;
-    }
-    out.push({ key: `name::${name}`, text: first.text, named: [other] });
+    // The other file must still declare exactly this name, read by the same
+    // scanner: gone, rewritten, only importing it, or not scanning cleanly,
+    // the function may have moved into this file. Checked only for a line
+    // about to print.
+    const holds = (): boolean => scanFile(other)?.spans.some((span) => span.name === name) ?? false;
+    out.push({ key: `name::${name}`, text: first.text, named: [other], holds });
   }
   return out;
 }
