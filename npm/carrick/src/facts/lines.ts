@@ -26,7 +26,7 @@ import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 import { fileMemo, isJsx, SCANNED } from "./files.ts";
-import { commitsOf, peersUnchanged } from "./peers.ts";
+import { commitsOf, localCheckouts, peersUnchanged } from "./peers.ts";
 import type { PeerContext } from "./peers.ts";
 import { sameNameLines } from "./rules/same-name.ts";
 import { isManifest, packageLines } from "./rules/packages.ts";
@@ -248,8 +248,10 @@ export async function factLines(
     const proofs: PeerContext["proofs"] = new Map();
     // A peer-proof git call that ran out of time, shared across the call's edited files.
     const git = { failed: false };
+    // Where each repo is checked out here, for every kind (R36.2).
+    const checkouts = localCheckouts(root, store.meta, where);
     const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
-      const ctx: PeerContext = { at, where, commits, memo, env: options.env, proofs, gitFailed: git.failed };
+      const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, gitFailed: git.failed };
       const answer = peersUnchanged(others, ctx);
       git.failed = ctx.gitFailed;
       return answer;
@@ -273,7 +275,7 @@ export async function factLines(
       if (at === null) continue;
       if (isManifest(edit.file)) {
         const manifest = memo.text(edit.file);
-        if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit, memo));
+        if (manifest !== null) isolated("pkg", () => packageLines(facts, at, checkouts, manifest, edit, memo));
         continue;
       }
       if (!SCANNED.test(edit.file)) continue;
@@ -339,7 +341,7 @@ export async function factLines(
             })),
         ),
       );
-      isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file), memo));
+      isolated("name", () => sameNameLines(facts, at, checkouts, text, scan, edit, isJsx(edit.file), memo));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
     // The name kind stops after `MAX_NAME_FAILURES` failed checks (R33.5):

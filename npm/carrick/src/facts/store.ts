@@ -233,14 +233,17 @@ export type FactHeader = {
 /**
  * Build the fact file at `dest` from NDJSON `text` (header line, then rows),
  * written under a temporary name and renamed. `local` maps each repo to its
- * main checkout here. Returns the header, or null when the text is not a
- * schema this package reads (nothing is written then).
+ * main checkout here; `unmappedLocal` counts the local index's repos that
+ * mapped to no header repo (`meta.local_unmapped`, read by `peers.ts`
+ * `peerCheckout`). Returns the header, or null when the text is not a schema
+ * this package reads (nothing is written then).
  */
 export async function buildFacts(
   text: string,
   dest: string,
   local: LocalRepo[],
   fetchedAt: string,
+  unmappedLocal: number,
 ): Promise<FactHeader | null> {
   const lines = text.split("\n").filter((line) => line.length > 0);
   if (lines.length === 0) return null;
@@ -255,7 +258,7 @@ export async function buildFacts(
   const temp = `${dest}.${process.pid}.tmp`;
   fs.rmSync(temp, { force: true });
   try {
-    writeFactsDatabase(sqlite, temp, header, lines, local, fetchedAt);
+    writeFactsDatabase(sqlite, temp, header, lines, local, fetchedAt, unmappedLocal);
     fs.renameSync(temp, dest);
   } catch (error) {
     // No half-built file is left behind, whatever failed.
@@ -327,7 +330,15 @@ function wholeRow(raw: Record<string, unknown>): boolean {
 }
 
 /** Write the fact database at `temp` from the header and NDJSON row lines. */
-function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string): void {
+function writeFactsDatabase(
+  sqlite: Sqlite,
+  temp: string,
+  header: FactHeader,
+  lines: string[],
+  local: LocalRepo[],
+  fetchedAt: string,
+  unmappedLocal: number,
+): void {
   const db = new sqlite.DatabaseSync(temp);
   try {
     db.exec(`
@@ -360,6 +371,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       built_at: header.built_at,
       fetched_at: fetchedAt,
       commits: JSON.stringify(commits),
+      // When the repo mapping was made and how many local repos it left
+      // unmapped; an unchanged refresh stamps only `fetched_at`.
+      mapped_at: fetchedAt,
+      local_unmapped: String(unmappedLocal),
     })) {
       meta.run(key, value);
     }

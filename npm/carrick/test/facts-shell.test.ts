@@ -48,7 +48,7 @@ async function workspace(t: { after: (fn: () => void) => void }, extra: string[]
   const body = [header, ...wire.split("\n").slice(1).filter((line) => line.trim() !== ""), ...extra].join("\n");
   // The peer repos are committed checkouts at the index commit; the edited
   // repo, `orders-api`, is left for each test to make a repository or not.
-  await buildFacts(`${commitRepos(root, body, REPOS.filter((repo) => repo !== "orders-api"))}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
+  await buildFacts(`${commitRepos(root, body, REPOS.filter((repo) => repo !== "orders-api"))}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString(), 0);
   return { root, home, at: (rel) => path.join(root, rel) };
 }
 

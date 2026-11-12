@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
-import { commitRepos, gitIn } from "./facts-repos.ts";
+import { commitAll, commitRepos, gitIn } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -63,7 +63,7 @@ async function workspace(
     // Only a repo folder the test wrote is a checkout here, as `matchRepos`
     // maps only what it finds; each is committed and the header names it.
     const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
-    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
+    await buildFacts(commitRepos(root, ndjson(rows), local), factsPath(root), local.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString(), 0);
   }
   return { root, home, at: (rel) => path.join(root, rel) };
 }
@@ -296,6 +296,8 @@ test("an old local fact file without the new tables is rebuilt, not read", async
   assert.notEqual(factsPath(ws.root), old);
   // Only `api` is checked out here; `web`, where the caller sits, is not.
   fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: [] }] }));
+  // Written before the refresh, as `carrick refresh` does (not within the same millisecond).
+  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
   const { gzipSync } = await import("node:zlib");
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (url: string, init?: RequestInit) => {
@@ -819,14 +821,15 @@ test("R33.5: the name rule rebuilds the text before the edit only when a name co
   const at = { repo: "api", rel: "src/hook.ts", top: "/nowhere/api" };
   // No declaration of `main` anywhere else: nothing to look up, nothing rebuilt.
   const none = { declaredOnlyElsewhere: () => new Set(), declarations: () => [] } as unknown as FactStore;
-  assert.deepEqual(sameNameLines(none, at, new Map(), text, scan, change, false, fileMemo()), []);
+  const nowhere = { place: () => null };
+  assert.deepEqual(sameNameLines(none, at, nowhere, text, scan, change, false, fileMemo()), []);
   assert.equal(rebuilt, 0);
   // A declaration elsewhere: now the text before is rebuilt.
   const some = {
     declaredOnlyElsewhere: () => new Set(["main"]),
     declarations: () => [{ name: "main", repo: "web", file: "src/main.ts", line: 3, text: "t" }],
   } as unknown as FactStore;
-  sameNameLines(some, at, new Map(), text, scan, change, false, fileMemo());
+  sameNameLines(some, at, nowhere, text, scan, change, false, fileMemo());
   assert.ok(rebuilt > 0);
 });
 
@@ -960,7 +963,7 @@ function inLoadOrder(ws: Ws): { file: string; lines: number[]; removed: number[]
 /** Build the fact file again from `rows`, the header naming `commits` (a repo mapped to null left out). */
 async function rebuild(ws: Ws, rows: Array<Record<string, unknown>>, commits: Record<string, string | null>): Promise<void> {
   const local = REPOS.filter((repo) => fs.existsSync(ws.at(repo)));
-  await buildFacts(ndjson(rows, commits), factsPath(ws.root), local.map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
+  await buildFacts(ndjson(rows, commits), factsPath(ws.root), local.map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString(), 0);
 }
 
 test("R33.2: op and fn lines print while the peer file reads as at the index commit, and not once it is edited", async (t) => {
@@ -1005,7 +1008,7 @@ test("R33.2: a repo whose services name different commits has no index commit, s
   for (const pair of [[real, other], [other, real]]) {
     head.repos = [...head.repos.filter((entry) => entry.repo !== "web"), ...pair];
     const body = `${[JSON.stringify(head), JSON.stringify(OP_PEER), JSON.stringify(FN_PEER)].join("\n")}\n`;
-    await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString());
+    await buildFacts(body, factsPath(ws.root), ["api", "web"].map((repo) => ({ repo, path: ws.at(repo) })), new Date().toISOString(), 0);
     assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], pair[0]!.service);
   }
 });
@@ -1046,6 +1049,49 @@ test("with CARRICK_FACT_LINES unset, edits that would print fn, name and pkg lin
   // Control: switched on, the same edits print each kind's line, and the peer proof runs git.
   assert.deepEqual(await run(true, "on"), [LOAD_LINE, STDIN_LINE, ZOD_FOR_API]);
   assert.match(fs.readFileSync(log, "utf8"), /ls-tree/);
+});
+
+test("R36.2: a local repo whose origin is a fork is not mapped, and its peers are silent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, null);
+  const api = commitAll(ws.at("api"));
+  commitAll(ws.at("web"));
+  // web is checked out here from a fork: its origin names another owner.
+  const remote = (name: string) => [{ enrichment: { remote: `https://github.com/${name}.git` } }];
+  fs.writeFileSync(
+    path.join(ws.root, ".carrick", "index.json"),
+    JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: remote("acme/api") }, { name: "web", path: ws.at("web"), services: remote("fork/web") }] }),
+  );
+  const op = { ...OP_LOAD, repo: "acme/api", service: "api", others: [{ service: "web", repo: "acme/web", file: "src/page.ts", line: 3 }], text: "GET /orders is called at acme/web/src/page.ts:3" };
+  const head = JSON.parse(header()) as Record<string, unknown>;
+  head["repos"] = [{ repo: "acme/api", service: "api", commit: api }, { repo: "acme/web", service: "web", commit: "d".repeat(40) }];
+  const body = `${[JSON.stringify(head), JSON.stringify(op)].join("\n")}\n`;
+  const { gzipSync } = await import("node:zlib");
+  const request = (async (url: string) =>
+    url.endsWith("/mcp/facts")
+      ? new Response(JSON.stringify({ staged_url: "https://facts.s3.eu-west-1.amazonaws.com/x?sig=1", digest: "d9", schema: 1, writer: 1, bytes: 1 }))
+      : new Response(gzipSync(body))) as typeof fetch;
+  assert.equal(await refreshFacts(ws.root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } }), "written");
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R36.2: a repo added to the local index after the store was built is not proven absent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER]);
+  // Proven absent while the local index lists only api.
+  fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: [{ name: "api", path: ws.at("api"), services: [] }] }));
+  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [OP_PEER.text, LOAD_LINE]);
+  // web cloned and added afterwards: the store still maps only api.
+  fs.mkdirSync(ws.at("web/src"), { recursive: true });
+  fs.writeFileSync(ws.at("web/src/page.ts"), `// moved\n${PAGE}`);
+  fs.writeFileSync(path.join(ws.root, ".carrick", "index.json"), JSON.stringify({ repos: ["api", "web"].map((name) => ({ name, path: ws.at(name), services: [] })) }));
+  fs.utimesSync(path.join(ws.root, ".carrick", "index.json"), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
+});
+
+test("R36.2: a store built before the unmapped count was kept proves no repo absent", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [OP_PEER, FN_PEER, nameRow("readStdin", "web", "src/stdin.ts")]);
+  await plant(ws, "DELETE FROM meta WHERE key = 'local_unmapped'");
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
 });
 
 test("R33.1: a peer in a repo not checked out here is stated from the index", async (t) => {

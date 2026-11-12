@@ -19,6 +19,7 @@ import { tokenize } from "../match.ts";
 import type { FactStore } from "../store.ts";
 import type { FileMemo } from "../files.ts";
 import type { Candidate } from "../lines.ts";
+import type { LocalCheckouts } from "../peers.ts";
 import { textBefore } from "./same-name.ts";
 
 const SECTIONS = new Set(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]);
@@ -77,7 +78,7 @@ function specIn(manifest: Record<string, unknown> | null, section: string, name:
 export function packageLines(
   store: FactStore,
   at: { repo: string; rel: string; top: string },
-  where: ReadonlyMap<string, string>,
+  checkouts: LocalCheckouts,
   text: string,
   change: { lines?: number[] | null; removed?: number[] | null; removedText?: string[] | null },
   memo: FileMemo,
@@ -128,19 +129,22 @@ export function packageLines(
     // list, prints the row's sentence.
     const text = own ? own.others_text : row.text;
     if (!text) continue;
-    // A service of the edited repo is read in the edited manifest's checkout.
-    const baseOf = (repo: string): string | undefined => (repo === at.repo ? at.top : where.get(repo));
-    const named = others.flatMap((service) => {
-      const base = baseOf(service.repo);
-      return base ? [path.join(base, service.manifest)] : [];
+    // A service of the edited repo is read in the edited manifest's checkout;
+    // one whose repo may be checked out unmapped makes the line silent (R36.2).
+    const places = others.map((service) => checkouts.place(service.repo, at));
+    if (places.includes(null)) continue;
+    const named = others.flatMap((service, index) => {
+      const place = places[index]!;
+      return place === "index" || place === null ? [] : [path.join(place.top, service.manifest)];
     });
     // Each other service checked out here must still hold the stated spec on
-    // disk (R33.1, R33.4); one in a repo not checked out is stated from the index.
+    // disk (R33.1, R33.4); one proven not checked out is stated from the index.
     const holds = (): boolean =>
-      others.every((service) => {
-        const base = baseOf(service.repo);
-        if (base === undefined) return true;
-        const manifest = memo.text(path.join(base, service.manifest));
+      others.every((service, index) => {
+        const place = places[index]!;
+        if (place === "index") return true;
+        if (place === null) return false;
+        const manifest = memo.text(path.join(place.top, service.manifest));
         const parsed = manifest === null ? null : parse(manifest);
         return parsed !== null && [...SECTIONS].some((section) => specIn(parsed, section, name) === service.spec);
       });

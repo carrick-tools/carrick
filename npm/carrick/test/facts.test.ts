@@ -51,6 +51,7 @@ async function factsWorkspace(
       factsPath(root),
       local.map((repo) => ({ repo, path: path.join(root, repo) })),
       options.fetchedAt ?? new Date().toISOString(),
+      0,
     );
   }
   return { root, home, at: (rel) => path.join(root, rel) };
@@ -844,7 +845,7 @@ test("a failed build leaves no temp file behind", async (t) => {
   const ws = await factsWorkspace(t, { ndjson: null });
   const dest = factsPath(ws.root);
   const bad = `${header(["orders-api"])}\n{"k":"op", not json\n`;
-  await assert.rejects(buildFacts(bad, dest, [], new Date().toISOString()));
+  await assert.rejects(buildFacts(bad, dest, [], new Date().toISOString(), 0));
   assert.deepEqual(fs.readdirSync(path.dirname(dest)), []);
 });
 

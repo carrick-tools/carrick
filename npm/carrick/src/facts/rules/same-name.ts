@@ -17,6 +17,7 @@ import type { FileMemo } from "../files.ts";
 import { scanSource } from "../match.ts";
 import type { Scan } from "../match.ts";
 import type { FactStore, NameRow } from "../store.ts";
+import type { LocalCheckouts } from "../peers.ts";
 
 /** A name shorter than this (its last dotted part) is too common to say anything about. */
 export const MIN_NAME_LENGTH = 4;
@@ -86,7 +87,7 @@ function addedNames(names: readonly string[], text: string, change: Change, jsx:
 export function sameNameLines(
   store: FactStore,
   at: { repo: string; rel: string; top: string },
-  where: ReadonlyMap<string, string>,
+  checkouts: LocalCheckouts,
   text: string,
   scan: Scan,
   change: Change,
@@ -115,14 +116,16 @@ export function sameNameLines(
     // Up to `MAX_NAME_ROWS` rows in (repo, file) order, under one key: the
     // first whose check passes prints, and the rest are skipped (R33.7, F8).
     for (const row of rowsOf.get(name)!.slice(0, MAX_NAME_ROWS)) {
-      const base = row.repo === at.repo ? at.top : where.get(row.repo);
-      // A repo not checked out here: stated from the index, which it cannot
+      const place = checkouts.place(row.repo, at);
+      // Not known whether the repo is checked out here: silent (R36.2).
+      if (place === null) continue;
+      // Proven not checked out here: stated from the index, which it cannot
       // have changed since (R33.1).
-      if (!base) {
+      if (place === "index") {
         out.push({ key: `name::${name}`, text: row.text, named: [] });
         continue;
       }
-      const other = path.join(base, row.file);
+      const other = path.join(place.top, row.file);
       // The other file must still declare exactly this name, read by the same
       // scanner, starting on the line the row states (R33.3): gone, rewritten,
       // only importing it, moved within the file, or not scanning cleanly, the

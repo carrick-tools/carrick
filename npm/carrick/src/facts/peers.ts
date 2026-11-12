@@ -14,6 +14,7 @@
 // a file is missing, over `MAX_FACT_FILE_BYTES`, or differs. Never throws.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { factsGitBudgetMs, gitFacts } from "./diff.ts";
@@ -22,12 +23,54 @@ import type { FileMemo } from "./files.ts";
 /** A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). Anything else (a branch, `HEAD`, a short id) proves nothing. */
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
+/**
+ * Where a row's repo is, for every kind of line (R33.1, R36.2): its checkout
+ * here (`top`; the edited file's own repo is read in the edited file's
+ * checkout), `"index"` when it is proven not checked out here (stated from
+ * the index), or null when that is not known (the line is silent).
+ */
+export type Place = { top: string } | "index" | null;
+
+export type LocalCheckouts = { place: (repo: string, at: { repo: string; top: string }) => Place };
+
+/**
+ * The one answer to "is this repo checked out here" for a fact file under
+ * `root`. A repo the store did not map is proven absent only when, at build,
+ * every repo of the local index mapped to a header repo (`meta.local_unmapped`
+ * is 0) and `.carrick/index.json` has not changed since (`meta.mapped_at`): a
+ * fork's origin, a renamed repo or a repo added later is otherwise unmapped
+ * yet checked out. A store without those values proves nothing absent.
+ */
+export function localCheckouts(root: string, meta: Readonly<Record<string, string>>, where: ReadonlyMap<string, string>): LocalCheckouts {
+  let proven: boolean | undefined;
+  const absentProven = (): boolean => {
+    if (proven !== undefined) return proven;
+    proven = false;
+    const mappedAt = Date.parse(meta["mapped_at"] ?? "");
+    if (meta["local_unmapped"] !== "0" || !Number.isFinite(mappedAt)) return proven;
+    try {
+      proven = fs.statSync(path.join(root, ".carrick", "index.json")).mtimeMs <= mappedAt;
+    } catch (error) {
+      // No local index at all: no repo of it can be checked out unmapped.
+      proven = (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+    return proven;
+  };
+  return {
+    place: (repo, at) => {
+      if (repo === at.repo) return { top: at.top };
+      const top = where.get(repo);
+      if (top !== undefined) return { top };
+      return absentProven() ? "index" : null;
+    },
+  };
+}
+
 /** What one `factLines` call proves against. */
 export type PeerContext = {
-  /** The edited file's repo and the checkout it sits in: a peer in the same repo is read there. */
+  /** The edited file's repo and the checkout it sits in. */
   at: { repo: string; top: string };
-  /** Each mapped repo's main checkout here. */
-  where: ReadonlyMap<string, string>;
+  checkouts: LocalCheckouts;
   /** Each repo's index commit, from the fact file's `meta`; null when the file holds none. */
   commits: Readonly<Record<string, string>> | null;
   memo: FileMemo;
@@ -47,7 +90,7 @@ function blobId(bytes: Buffer, sha256: boolean): string {
 }
 
 /** A repo-relative path that stays inside the repo, in git's spelling; null otherwise. */
-function inRepo(file: string): string | null {
+export function inRepo(file: string): string | null {
   if (file === "" || path.isAbsolute(file) || file.includes("\0")) return null;
   const parts = file.split(/[\\/]/);
   if (parts.some((part) => part === ".." || part === "")) return null;
@@ -101,12 +144,13 @@ export function peersUnchanged(others: ReadonlyArray<{ repo: string; file: strin
       files.add(file);
     }
     for (const [repo, files] of byRepo) {
-      const top = repo === ctx.at.repo ? ctx.at.top : ctx.where.get(repo);
-      // Not checked out here: stated from the index.
-      if (top === undefined) continue;
+      const place = ctx.checkouts.place(repo, ctx.at);
+      if (place === null) return false;
+      // Proven not checked out here: stated from the index.
+      if (place === "index") continue;
       const commit = ctx.commits?.[repo];
       if (typeof commit !== "string" || !OBJECT_ID.test(commit)) return false;
-      if (!sameAsCommit(ctx, top, commit, [...files].sort())) return false;
+      if (!sameAsCommit(ctx, place.top, commit, [...files].sort())) return false;
     }
     return true;
   } catch {
