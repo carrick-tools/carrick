@@ -2784,6 +2784,8 @@ fn a_procedure_call_writes_no_consumer_manifest_entry() {
         })
         .filter(|entry| entry["role"] == "consumer")
         .map(|entry| entry["file_path"].as_str().unwrap_or_default().to_string())
+        // `ghost.ts` holds a plain model row, not a procedure call.
+        .filter(|file| !file.ends_with("src/web/ghost.ts"))
         .collect();
     assert_eq!(consumers, Vec::<String>::new());
 }
