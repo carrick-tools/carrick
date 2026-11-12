@@ -237,6 +237,7 @@ export async function factLines(
   try {
     store = await openFacts(root);
     if (store === null) return done();
+    const facts: FactStore = store;
     const fetched = Date.parse(store.meta["fetched_at"] ?? "");
     stale = !Number.isFinite(fetched) || now - fetched > FACTS_STALE_MS;
     const said = session ? factsSaid(session, options.home) : new Set<string>();
@@ -246,13 +247,22 @@ export async function factLines(
         const base = where.get(other.repo);
         return base ? [path.join(base, other.file)] : [];
       });
+    // Each kind's lookup on its own: a row of one kind that throws (a field
+    // ingest let through) loses only that kind's lines for the file.
+    const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): void => {
+      try {
+        found[kind].push(...lookup());
+      } catch (error) {
+        log(`${kind} fact lines failed`, String(error));
+      }
+    };
     for (const edit of edits) {
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       covered.push(edit.file);
       if (isManifest(edit.file)) {
         const manifest = readSmall(edit.file);
-        if (manifest !== null) found.pkg.push(...packageLines(store, at, where, manifest, edit));
+        if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit));
         continue;
       }
       if (!SCANNED.test(edit.file)) continue;
@@ -285,33 +295,39 @@ export async function factLines(
       const gaps = byLine ? gapsOfLines(text, removed) : [];
       if (ranges.length === 0 && gaps.length === 0) continue;
       const reach = touched(text, scan, ranges, gaps);
-      const rows: FactRow[] = [];
       // A name declared twice in this file (a handler of one name in two
       // components) cannot say which one the edit reached.
       const declared = new Map<string, number>();
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
-      for (const name of reach.names) {
-        if (declared.get(name) !== 1) continue;
-        // The function's callers in other files: only the row in this file.
-        for (const fn of store.callers(at.repo, name)) {
-          if (fn.file !== at.rel) continue;
-          found.fn.push({ key: `fn::${fn.repo}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) });
+      const names = reach.names.filter((name) => declared.get(name) === 1);
+      isolated("op", () => {
+        const rows: FactRow[] = [];
+        for (const name of names) {
+          const own = namedRows(facts, at.repo, name, at.rel);
+          if (!holdsSeveral(own)) {
+            rows.push(...own);
+            continue;
+          }
+          // Several inline handlers or calls under one name: each row by its own site.
+          const span = scan.spans.find((one) => one.name === name)!;
+          rows.push(...unnamedRows(own, reach.reachedIn(span), scan.calls));
         }
-        const own = namedRows(store, at.repo, name, at.rel);
-        if (!holdsSeveral(own)) {
-          rows.push(...own);
-          continue;
+        if (reach.calls.length > 0) {
+          const unnamed = facts.unnamed(at.repo, at.rel);
+          if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
         }
-        // Several inline handlers or calls under one name: each row by its own site.
-        const span = scan.spans.find((one) => one.name === name)!;
-        rows.push(...unnamedRows(own, reach.reachedIn(span), scan.calls));
-      }
-      if (reach.calls.length > 0) {
-        const unnamed = store.unnamed(at.repo, at.rel);
-        if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
-      }
-      for (const row of rows) found.op.push({ key: rowKey(row), text: row.text, named: pathsOf(row.others) });
-      found.name.push(...sameNameLines(store, at, where, text, scan, edit, isJsx(edit.file)));
+        return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others) }));
+      });
+      // The functions' callers in other files: only the row in this file.
+      isolated("fn", () =>
+        names.flatMap((name) =>
+          facts
+            .callers(at.repo, name)
+            .filter((fn) => fn.file === at.rel)
+            .map((fn) => ({ key: `fn::${fn.repo}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) })),
+        ),
+      );
+      isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file)));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
     for (const kind of KINDS) {

@@ -443,3 +443,42 @@ test("at most 3 fact lines per action, in the order op, fn, name", async (t) => 
   const outcome = await factLines(ws.root, [{ file: ws.at("api/src/orders.ts"), whole: true }], undefined);
   assert.deepEqual(outcome.lines, ["op line 1", "op line 2", LOAD_LINE]);
 });
+
+// ---- One kind's bad row loses only that kind (ruling 8) ----
+
+/** Insert one row straight into the built fact file, past ingest's checks. */
+async function plant(ws: Ws, sql: string, ...values: Array<string | number>): Promise<void> {
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root));
+  db.prepare(sql).run(...values);
+  db.close();
+}
+
+/** A `manifestHunk` hunk (its removed lines first, then its added ones) as the change post-edit hands on. */
+function asChange(hunk: Hunk): { lines: number[]; removed: number[]; removedText: string[] } {
+  const removedText = hunk.lines.filter((line) => line.startsWith("-")).map((line) => line.slice(1));
+  const added = hunk.lines.filter((line) => line.startsWith("+"));
+  return { lines: added.map((_, i) => hunk.newStart + i), removed: removedText.map(() => hunk.newStart), removedText };
+}
+
+const OP_LOAD = { k: "op", side: "consumer", protocol: "http", label: "GET /orders", service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [], total: 0, source: "call", text: "op line for loadOrder" };
+
+test("an fn row with null in others and a pkg service with no manifest do not lose the op lines", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "api/package.json": before, "web/package.json": "{}\n" }, [OP_LOAD]);
+  await plant(ws, "INSERT INTO fns (repo, file, line, name, others, total, text) VALUES (?, ?, ?, ?, ?, ?, ?)", "api", "src/orders.ts", 1, "loadOrder", "[null]", 1, LOAD_LINE);
+  await plant(ws, "INSERT INTO pkgs (package, services, text) VALUES (?, ?, ?)", "zod", JSON.stringify([{ repo: "api", service: "api", spec: "^3.22.0" }, { repo: "web", service: "web", spec: "^3.23.8" }]), "zod is ^3.22.0 in api, ^3.23.8 in web");
+  const manifest = ws.at("api/package.json");
+  const hunk = manifestHunk(manifest, before, MANIFEST(['    "zod": "^3.24.0"']));
+  const file = ws.at("api/src/orders.ts");
+  const at = lineOf(file, "const key");
+  const outcome = await factLines(
+    ws.root,
+    [
+      { file, lines: [at], removed: [], removedText: [] },
+      { file: manifest, ...asChange(hunk) },
+    ],
+    undefined,
+  );
+  assert.deepEqual(outcome.lines, ["op line for loadOrder"]);
+});
