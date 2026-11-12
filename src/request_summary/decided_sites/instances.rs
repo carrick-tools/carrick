@@ -115,10 +115,39 @@ pub enum ScopeBinds {
         key: Option<String>,
         param: usize,
     },
-    /// The instance at `arg` (`key`) is served under the prefix.
-    Mounts { arg: usize, key: Option<String> },
+    /// The instance at `arg` (`key`) is served under the prefix. With
+    /// `handle`, the slot takes a handler (K1): what is handed there serves
+    /// only where it is itself an instance a label reads (a pass-through's
+    /// receiver, a maker's root); anything else is plain middleware.
+    Mounts {
+        arg: usize,
+        key: Option<String>,
+        handle: bool,
+    },
     /// It returns the scoped instance.
     Returns,
+    /// Its value is its receiver itself, served at the receiver's own
+    /// address (K1: `router.routes()`).
+    Passes,
+}
+
+impl ScopeBinds {
+    /// Whether `other` binds the same slot the same way, a handle twin
+    /// counting as its instance-rule claim: both read one argument, and one
+    /// edge stands for both (K1).
+    fn same_as(&self, other: &ScopeBinds) -> bool {
+        match (self, other) {
+            (
+                ScopeBinds::Mounts { arg, key, .. },
+                ScopeBinds::Mounts {
+                    arg: other_arg,
+                    key: other_key,
+                    ..
+                },
+            ) => arg == other_arg && key == other_key,
+            _ => self == other,
+        }
+    }
 }
 
 /// A scope member the store labels (carrick#2474 R2b): the package (as the
@@ -134,7 +163,10 @@ pub struct ScopeLabel {
     /// declarations (`decl_file`, `decl_line`) its verdict names
     /// (carrick#2636).
     verified_on: Vec<(String, Vec<(String, u32)>)>,
-    pub name: (usize, Option<String>),
+    /// The slot the prefix sits in; `None` for a scope that binds no prefix
+    /// (K1: a name-less mount or `runs`, served at its parent's address,
+    /// and a pass-through).
+    pub name: Option<(usize, Option<String>)>,
     pub binds: ScopeBinds,
 }
 
@@ -152,15 +184,16 @@ impl ScopeLabel {
         let mut labels = Vec::new();
         for export in exports {
             for (claim_id, claim) in export.claims_with_scopes_by_id() {
-                // A procedure router's member has no name (#2474 R6a): it binds
-                // no prefix, and R6c reads its collection.
                 let LibraryClaim::Scope {
                     member,
-                    name: Some(name),
+                    name,
                     path,
                     runs,
                     yields,
                     mounts,
+                    collects,
+                    merges,
+                    passes,
                     ..
                 } = claim
                 else {
@@ -169,19 +202,31 @@ impl ScopeLabel {
                 if !path.is_empty() {
                     continue;
                 }
-                let binds = match (runs, yields, mounts) {
-                    (Some(runs), Some(yields), None) => ScopeBinds::Runs {
+                let binds = match (runs, yields, mounts, *passes) {
+                    (Some(runs), Some(yields), None, false) => ScopeBinds::Runs {
                         arg: runs.arg as usize,
                         key: runs.key.clone(),
                         param: yields.param as usize,
                     },
-                    (None, None, Some(mounts)) => ScopeBinds::Mounts {
+                    (None, None, Some(mounts), false) => ScopeBinds::Mounts {
                         arg: mounts.arg as usize,
                         key: mounts.key.clone(),
+                        handle: mounts.handle,
                     },
-                    (None, None, None) => ScopeBinds::Returns,
+                    (None, None, None, false) => ScopeBinds::Returns,
+                    (None, None, None, true) if name.is_none() => ScopeBinds::Passes,
                     _ => continue,
                 };
+                // A procedure router's member has no name (#2474 R6a): it
+                // binds no prefix, and R6c reads its collection. A name-less
+                // scope is a label only where it binds or passes (K1): a
+                // name-less `returns` would open a scope on what a procedure
+                // router's member returns.
+                if name.is_none()
+                    && (collects.is_some() || merges.is_some() || binds == ScopeBinds::Returns)
+                {
+                    continue;
+                }
                 let mut verified_on: Vec<(String, Vec<(String, u32)>)> = verified
                     .iter()
                     .filter(|(asked, _)| {
@@ -200,7 +245,9 @@ impl ScopeLabel {
                     export: export.export.clone(),
                     member: member.clone(),
                     verified_on,
-                    name: (name.arg as usize, name.key.clone()),
+                    name: name
+                        .as_ref()
+                        .map(|name| (name.arg as usize, name.key.clone())),
                     binds,
                 };
                 if !labels.contains(&label) {
@@ -230,9 +277,10 @@ impl ScopeLabel {
     }
 
     /// Whether `other` opens the same scope at a call: the same member, the
-    /// prefix in the same slot, and the same binding (carrick#3185).
-    fn binds_as(&self, other: &ScopeLabel) -> bool {
-        self.member == other.member && self.name == other.name && self.binds == other.binds
+    /// prefix in the same slot, and the same binding (carrick#3185), a
+    /// handle twin counting as its instance-rule claim (K1).
+    pub(super) fn binds_as(&self, other: &ScopeLabel) -> bool {
+        self.member == other.member && self.name == other.name && self.binds.same_as(&other.binds)
     }
 
     /// Whether the member returns the scoped instance and was verified on
@@ -758,6 +806,26 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         self.of_value(&[placed], value, held.unwrap_or_default())
     }
 
+    /// Whether a name-less mount label stands at `placed`'s call (K1
+    /// ruling): it applies only where the call's first argument cannot be
+    /// a path. A string, a template, or any value the walk does not read as
+    /// an instance (a library instance or a scope) could be one, and a
+    /// router served past an unread path would be served at its parent's
+    /// address. There only a named scope, whose name slot reads the path,
+    /// applies; with none, what is handed there is a mount the trace cannot
+    /// place (`mount_unverified`), never the parent's address. An object or
+    /// a function written in place is no path.
+    pub(super) fn name_less_stands(self, placed: Placed<'a>) -> bool {
+        match placed.call.args.first() {
+            Some(Value::Obj(_) | Value::Callback(_)) => return true,
+            None if placed.call.instance.args.is_empty() => return true,
+            Some(Value::Str(_)) | None => {}
+        }
+        self.of_arg(placed, 0, None)
+            .iter()
+            .any(|end| matches!(end.end, InstanceAt::Root { .. } | InstanceAt::Scope { .. }))
+    }
+
     fn of_value(
         mut self,
         down: &[Placed<'a>],
@@ -1032,9 +1100,13 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         self.returned_at(host, at);
     }
 
-    /// The value of `host`'s call: the scope a member a `returns` label
+    /// The value of `host`'s call: its receiver, where a pass-through
+    /// label names the member (K1), the scope a member a `returns` label
     /// names opens there, or a hole.
     fn returned_at(&mut self, host: Placed<'a>, at: String) {
+        if self.library_call(host.file, host.call) && self.passes(&host) {
+            return;
+        }
         let labels: Vec<&'w ScopeLabel> = self
             .scopes
             .iter()
@@ -1046,6 +1118,63 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                 InstanceHole::Unread,
                 Some(host.call.callee_text.clone()),
             );
+        }
+    }
+
+    /// The value of a pass-through member's call at `host` (K1): each of
+    /// its receiver's ends a pass-through label of the member applies to,
+    /// as the receiver's own walk reads it, so `parent.use("/v1",
+    /// sub.routes())` serves `sub` under `/v1`. Where every end above is a
+    /// hole (a router handed in), those holes, when the member declaration
+    /// the call resolves to is one a pass-through label was verified at.
+    /// False where no label applies.
+    fn passes(&mut self, host: &Placed<'a>) -> bool {
+        let labels: Vec<&'w ScopeLabel> = self
+            .scopes
+            .iter()
+            .filter(|label| label.member == host.call.callee && label.binds == ScopeBinds::Passes)
+            .collect();
+        if labels.is_empty() {
+            return false;
+        }
+        let here = (
+            host.file.to_path_buf(),
+            host.call.site.span_start,
+            host.call.site.span_end,
+        );
+        if self.hosts.contains(&here) {
+            return false;
+        }
+        let parents = self.parents(host, here);
+        if !parents.is_empty() && parents.iter().all(|end| end.hole().is_some()) {
+            let Some(declared) = self.declaration_of(host) else {
+                return false;
+            };
+            if !labels
+                .iter()
+                .any(|label| label.verified_at(&declared).next().is_some())
+            {
+                return false;
+            }
+            self.pass(parents);
+            return true;
+        }
+        let applying: Vec<InstanceEnd> = self
+            .applying(host, &labels, &parents)
+            .into_iter()
+            .flatten()
+            .collect();
+        let passed = !applying.is_empty();
+        self.pass(applying);
+        passed
+    }
+
+    /// The receiver's own `ends`, as its walk read them, as this value's.
+    fn pass(&mut self, ends: Vec<InstanceEnd>) {
+        for end in ends {
+            if !self.ends.contains(&end) {
+                self.ends.push(end);
+            }
         }
     }
 
@@ -1965,9 +2094,13 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     pub(super) fn prefix_of(
         &self,
         placed: &Placed<'a>,
-        name: &(usize, Option<String>),
+        name: &Option<(usize, Option<String>)>,
         origin: Option<&str>,
     ) -> Prefix {
+        // A scope with no name binds no prefix (K1).
+        let Some(name) = name else {
+            return Prefix::Unstated;
+        };
         let pieces = match slot_pieces(placed, name) {
             Ok(pieces) => pieces,
             Err(prefix) => return prefix,
@@ -2001,9 +2134,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     pub(super) fn value_of(
         &self,
         placed: &Placed<'a>,
-        name: &(usize, Option<String>),
+        name: &Option<(usize, Option<String>)>,
         prefix: &Prefix,
     ) -> address::Value {
+        let Some(name) = name else {
+            return address::Value::Unstated;
+        };
         match prefix {
             Prefix::Unstated => address::Value::Unstated,
             Prefix::Stated { values } => address::Value::Text {
@@ -2410,8 +2546,15 @@ mod tests {
         )]);
         let labels = ScopeLabel::from_exports(&exports, &verified);
         assert_eq!(labels.len(), 1, "{labels:#?}");
-        assert_eq!(labels[0].name, (0, None));
-        assert_eq!(labels[0].binds, ScopeBinds::Mounts { arg: 1, key: None });
+        assert_eq!(labels[0].name, Some((0, None)));
+        assert_eq!(
+            labels[0].binds,
+            ScopeBinds::Mounts {
+                arg: 1,
+                key: None,
+                handle: false
+            }
+        );
     }
 
     /// carrick#2474 R2b: a call row whose declaration the rows could not

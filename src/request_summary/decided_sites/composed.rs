@@ -304,23 +304,39 @@ fn verified_edges<'a>(
             continue;
         }
         let receivers = walk().of(&[placed]);
-        let here: Vec<&ScopeLabel> = mounts
+        // A handle claim first: where it and its instance-rule twin both
+        // verified, its reading stands (K1).
+        let mut here: Vec<&ScopeLabel> = mounts
             .iter()
             .copied()
             .filter(|label| label.member == placed.call.callee)
             .collect();
+        here.sort_by_key(|label| !matches!(label.binds, ScopeBinds::Mounts { handle: true, .. }));
         let applying = walk().applying(&placed, &here, &receivers);
+        // One edge per (call, slot, instance): twins read one slot (K1).
+        let mut read: Vec<(usize, Option<String>, (String, u32))> = Vec::new();
         for (label, parents) in here.into_iter().zip(applying) {
-            let ScopeBinds::Mounts { arg, key } = &label.binds else {
+            let ScopeBinds::Mounts { arg, key, .. } = &label.binds else {
                 continue;
             };
             if parents.is_empty() {
+                continue;
+            }
+            // A name-less mount past a value that could be a path never
+            // serves at the parent's address (K1 ruling): what it is handed
+            // stays a mount the trace cannot place.
+            if label.name.is_none() && !walk().name_less_stands(placed) {
                 continue;
             }
             for child in walk().of_arg(placed, *arg, key.as_deref()) {
                 let InstanceAt::Root { file, line, .. } = &child.end else {
                     continue;
                 };
+                let slot_read = (*arg, key.clone(), (file.clone(), *line));
+                if read.contains(&slot_read) {
+                    continue;
+                }
+                read.push(slot_read);
                 let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
                 let prefix = walk().prefix_of(&placed, &label.name, None);
                 edges.push(MountEdge {

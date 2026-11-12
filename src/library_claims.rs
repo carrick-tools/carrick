@@ -242,8 +242,10 @@ impl ExportClaims {
     /// (`<prefix>:scope:<path.member>:name@<slot>:<binds>[:on/of…]`, where
     /// `<binds>` is `runs@<slot>><param>`, `mounts@<slot>` or `returns` and
     /// a slot is `<arg>` or `<arg>.<key>`; a procedure router's member spells
-    /// `collects@<slot>/<join>` in the name's place, #2474 R6a, and a merging
-    /// member `merges@<arg>`, amendment 9): what the
+    /// `collects@<slot>/<join>` in the name's place, #2474 R6a, a merging
+    /// member `merges@<arg>`, amendment 9, a pass-through `passes`, and a
+    /// name-less binding scope its `<binds>` alone, where a handler slot
+    /// spells `handle@<slot>`, K1): what the
     /// receiver trace sends in
     /// its own request (carrick#2474 R2b, carrick#1678), never the library
     /// check's.
@@ -562,8 +564,19 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
             mounts,
             collects,
             merges,
+            passes,
             ..
         } => {
+            // A slot that takes a handler spells `handle@` where one that
+            // takes an instance spells `mounts@` (K1), so a claim and its
+            // handle twin are two ids, not one stated twice.
+            let mounted = |mounts: &ClaimSlot| {
+                format!(
+                    "{}@{}",
+                    if mounts.handle { "handle" } else { "mounts" },
+                    slot(mounts)
+                )
+            };
             // What it binds (carrick#2474 R0's fields): two scope claims of
             // one member on one receiver that read different slots are two
             // claims (carrick#2474 R2b).
@@ -571,7 +584,7 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                 (Some(runs), Some(yields), None) => {
                     format!("runs@{}>{}", slot(runs), yields.param)
                 }
-                (None, None, Some(mounts)) => format!("mounts@{}", slot(mounts)),
+                (None, None, Some(mounts)) => mounted(mounts),
                 (None, None, None) => "returns".to_string(),
                 (runs, yields, mounts) => format!(
                     "runs@{}>{}:mounts@{}",
@@ -580,7 +593,7 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                         .as_ref()
                         .map(|yields| yields.param.to_string())
                         .unwrap_or_default(),
-                    mounts.as_ref().map(slot).unwrap_or_default()
+                    mounts.as_ref().map(mounted).unwrap_or_default()
                 ),
             };
             // A procedure router's member has no name (#2474 R6a, contract
@@ -611,7 +624,19 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
                     collected(collects),
                     slot(merges)
                 ),
+                // A name-less scope (K1): a pass-through spells `passes`;
+                // one that binds spells its binding alone. One that does
+                // neither names nothing.
+                (None, None, None) if *passes => "passes".to_string(),
+                (None, None, None) if binds != "returns" => binds,
                 (None, None, None) => return None,
+            };
+            // A pass-through beside another field is refused by the
+            // verifier; its id still holds the flag.
+            let named = if *passes && named != "passes" {
+                format!("{named}:passes")
+            } else {
+                named
             };
             Some(format!(
                 "{prefix}:scope:{}:{named}{}{}",
@@ -2924,6 +2949,46 @@ mod tests {
                 "fixture-procs@3:init:scope:both:name@0:returns:collects@1/.:of:instance:create",
                 "fixture-procs@3:init:scope:mergeRouters:merges@0:of:instance:create",
                 "fixture-procs@3:init:op:receive:procedure.query:of:instance:create",
+            ]
+        );
+    }
+
+    /// K1 (carrick#2434): a name-less binding scope spells its binding
+    /// alone, a handle slot `handle@<slot>` where an instance mount spells
+    /// `mounts@<slot>`, and a pass-through `passes`, so a claim and its
+    /// handle twin are two ids. A named mount's id stays byte for byte, and
+    /// a scope that binds nothing and carries nothing has none.
+    #[test]
+    fn a_name_less_scope_s_id_spells_its_binding_and_a_handle_its_flag() {
+        let kit = export(json!({
+            "package": "fixture-mw", "version": "1.0.0", "specifier": "fixture-mw",
+            "export": "default", "role": "server_framework",
+            "claims": [
+                { "kind": "scope", "member": "use", "of": "instance:()",
+                  "name": { "arg": 0 }, "mounts": { "arg": 1 } },
+                { "kind": "scope", "member": "use", "of": "instance:()",
+                  "name": { "arg": 0 }, "mounts": { "arg": 1, "handle": true } },
+                { "kind": "scope", "member": "use", "of": "instance:()",
+                  "mounts": { "arg": 0 } },
+                { "kind": "scope", "member": "use", "of": "instance:()",
+                  "mounts": { "arg": 0, "handle": true } },
+                { "kind": "scope", "member": "routes", "of": "instance:()", "passes": true },
+                { "kind": "scope", "member": "nothing", "of": "instance:()" }
+            ]
+        }));
+        let ids: Vec<String> = kit
+            .claims_with_scopes_by_id()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fixture-mw@1:default:scope:use:name@0:mounts@1:of:instance:()",
+                "fixture-mw@1:default:scope:use:name@0:handle@1:of:instance:()",
+                "fixture-mw@1:default:scope:use:mounts@0:of:instance:()",
+                "fixture-mw@1:default:scope:use:handle@0:of:instance:()",
+                "fixture-mw@1:default:scope:routes:passes:of:instance:()",
             ]
         );
     }

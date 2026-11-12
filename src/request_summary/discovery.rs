@@ -7193,6 +7193,221 @@ export function listen(): void {
         );
     }
 
+    /// K1 (carrick#2434): `receiver-mount-pathless`'s sites, decided under
+    /// the scope labels the live verifier verified there, with those labels.
+    fn pathless_decided() -> Option<(
+        super::super::decided_sites::Decided,
+        Vec<super::super::decided_sites::ScopeLabel>,
+    )> {
+        use super::super::decided_sites::ScopeLabel;
+        let (on, exports, declarations) = traced_fixture_named("receiver-mount-pathless")?;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        Some((decided, scopes))
+    }
+
+    /// The composed lines of `decided` written in `file`.
+    fn lines_in(
+        decided: &super::super::decided_sites::Decided,
+        file: &str,
+        edges: bool,
+    ) -> Vec<String> {
+        composed_lines(decided, edges)
+            .into_iter()
+            .filter(|line| line.starts_with(&format!("src/{file}:")))
+            .collect()
+    }
+
+    /// K1: `items.routes()`, a member a verified pass-through label names,
+    /// is `items` itself for the walk, so `api.use("/v1", items.routes())`
+    /// serves `items` under `/v1`. Without the label the call's value is a
+    /// hole and `items` is served at the top, its prefix lost.
+    #[test]
+    fn a_pass_through_member_mounted_under_a_path_serves_its_receiver_there() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "items.ts", false),
+            texts(&[
+                "src/items.ts:10 <- /v1/items.remove",
+                "src/items.ts:8 <- /v1/items.list",
+                "src/items.ts:9 <- /v1/items.add",
+            ])
+        );
+    }
+
+    /// K1: a router handed to `use` with no path, under a verified
+    /// name-less `mounts`, is served at its parent's own address.
+    #[test]
+    fn a_router_mounted_with_no_path_is_served_at_its_parent_address() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "plain.ts", false),
+            texts(&["src/plain.ts:13 <- /plain/a"])
+        );
+    }
+
+    /// K1: an app whose `use` takes middleware only, handed a router's
+    /// `routes()`, serves the router at the app's own address: one edge
+    /// with no prefix, so the router is no longer the top itself.
+    #[test]
+    fn an_app_using_a_routers_middleware_serves_the_router_at_its_own_address() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "api.ts", true),
+            texts(&["src/api.ts:10 <- /ping via src/api.ts:16 use -"])
+        );
+    }
+
+    /// K1: a path-first and a path-less `use` on one member are two labels;
+    /// each reads its own call, and neither takes the other's.
+    #[test]
+    fn a_path_first_and_a_path_less_use_on_one_member_each_read_their_own_call() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "both.ts", true),
+            texts(&[
+                "src/both.ts:11 <- /two via src/both.ts:14 use -",
+                "src/both.ts:9 <- /x/one via src/both.ts:13 use /x",
+            ])
+        );
+    }
+
+    /// K1: where a `mounts` claim and its handle twin both verify on a
+    /// call, the call makes one edge per slot, not one per claim: each
+    /// route under it composes once.
+    #[test]
+    fn a_slot_both_twins_verify_on_makes_one_edge() {
+        let Some((decided, scopes)) = pathless_decided() else {
+            return;
+        };
+        use super::super::decided_sites::ScopeBinds;
+        let twins: Vec<bool> = scopes
+            .iter()
+            .filter(|label| label.package == "fixture-hrouter" && label.name == Some((0, None)))
+            .filter_map(|label| match label.binds {
+                ScopeBinds::Mounts { arg: 1, handle, .. } => Some(handle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(twins, vec![false, true], "both twins verified: {scopes:#?}");
+        // Seven twin-verified mounts deep: one edge each would compose one
+        // chain; one per claim would compose 2^7 and spend the chain budget.
+        for (file, line) in [
+            ("src/plain.ts", 13),
+            ("src/both.ts", 9),
+            ("src/nest.ts", 24),
+        ] {
+            let site = decided
+                .sites
+                .iter()
+                .find(|site| site.file == file && site.line == line)
+                .expect("the route is decided");
+            let chains: Vec<Vec<String>> = site
+                .composed
+                .iter()
+                .map(|composed| composed.edges())
+                .collect();
+            assert_eq!(chains.len(), 1, "{file}:{line}: {chains:#?}");
+            assert!(!site.composed_trimmed, "{file}:{line}: trimmed");
+        }
+        assert_eq!(
+            lines_in(&decided, "nest.ts", false),
+            texts(&["src/nest.ts:24 <- /a/b/c/d/e/f/g/z"])
+        );
+    }
+
+    /// K1 ruling: a name-less mount label whose slot sits past a value that
+    /// could be a path (`router.use("/v1", sub.routes())`, where the only
+    /// verified `use` label is a name-less handle mount at argument 1)
+    /// never serves `sub` at the parent's address: with no named scope to
+    /// read `/v1`, `sub` is a mount the trace cannot place.
+    #[test]
+    fn a_name_less_mount_past_a_path_never_serves_at_the_parent_address() {
+        use super::super::decided_sites::{ScopeBinds, ScopeLabel};
+        use crate::services::type_sidecar::LibraryClaim;
+        let Some((on, exports, declarations)) =
+            traced_fixture_edited("receiver-mount-pathless", ".", "web", |exports| {
+                for export in exports
+                    .iter_mut()
+                    .filter(|export| export.package == "fixture-mw-router")
+                {
+                    for claim in &mut export.claims {
+                        if let LibraryClaim::Scope { member, name, .. } = claim
+                            && member == "use"
+                        {
+                            *name = None;
+                        }
+                    }
+                }
+            })
+        else {
+            return;
+        };
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        assert!(
+            scopes.iter().any(|label| {
+                label.package == "fixture-mw-router"
+                    && label.name.is_none()
+                    && label.binds
+                        == ScopeBinds::Mounts {
+                            arg: 1,
+                            key: None,
+                            handle: true,
+                        }
+            }),
+            "the name-less handle mount past the path verified: {scopes:#?}"
+        );
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        assert_eq!(
+            lines_in(&decided, "items.ts", false),
+            texts(&[
+                "src/items.ts:10 <- /items.remove (mount_unverified)",
+                "src/items.ts:8 <- /items.list (mount_unverified)",
+                "src/items.ts:9 <- /items.add (mount_unverified)",
+            ])
+        );
+    }
+
+    /// K1: plain middleware handed to a handle mount is no instance: no
+    /// edge, no lead or stop at the call, and the app's own routes stay at
+    /// the top, not `mount_unverified`.
+    #[test]
+    fn an_unlabelled_argument_under_a_handle_mount_saves_no_site() {
+        let Some((decided, _)) = pathless_decided() else {
+            return;
+        };
+        assert_eq!(
+            lines_in(&decided, "middleware.ts", true),
+            texts(&["src/middleware.ts:15 <- /m/ok via "])
+        );
+        let at_use =
+            |file: &str, line: u32| file == "src/middleware.ts" && (line == 13 || line == 14);
+        assert!(
+            !decided
+                .leads
+                .iter()
+                .any(|lead| at_use(&lead.file, lead.line)),
+            "{:#?}",
+            decided.leads
+        );
+        assert!(
+            !decided
+                .stops
+                .iter()
+                .any(|stop| at_use(&stop.file, stop.line)),
+            "{:#?}",
+            decided.stops
+        );
+    }
+
     /// carrick#2386: a route's own path written through a conditional or a
     /// default (`base ? \`${base}api\` : "/api"`, `base ?? "/"`) is served at
     /// each way the code writes whole, read the way a mount's prefix is. A

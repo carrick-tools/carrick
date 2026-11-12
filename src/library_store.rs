@@ -1671,9 +1671,10 @@ fn parse_export(
             });
             let parsed = tagged
                 .and_then(|()| serde_json::from_value::<LibraryClaim>(element).ok())
-                // A scope names a prefix, collects procedures (#2474 R6a) or
-                // merges collections (amendment 9); one that does none is
-                // out of shape.
+                // A scope names a prefix, collects procedures (#2474 R6a),
+                // merges collections (amendment 9), passes its receiver
+                // through, or binds with no prefix (`mounts`, or `runs` with
+                // `yields`: K1); one that does none is out of shape.
                 .filter(|claim| {
                     !matches!(
                         claim,
@@ -1681,8 +1682,12 @@ fn parse_export(
                             name: None,
                             collects: None,
                             merges: None,
+                            passes: false,
+                            runs,
+                            yields,
+                            mounts: None,
                             ..
-                        }
+                        } if runs.is_none() || yields.is_none()
                     )
                 });
             match parsed {
@@ -3577,6 +3582,61 @@ mod tests {
         let (capped, dropped) = Asked::merged(Some(full), [Asked::naming(&["extra"])]);
         assert_eq!(capped.unwrap().request.packages.len(), MAX_PACKAGES);
         assert_eq!(dropped, 1);
+    }
+
+    /// K1 (carrick#2434): a name-less scope that binds (`mounts`, or `runs`
+    /// with `yields`) and a pass-through are kept, with the slot's `handle`
+    /// flag; a scope that binds nothing and carries no name, collection,
+    /// merge or pass-through is dropped, counted.
+    #[test]
+    fn a_name_less_mounts_scope_is_kept_and_a_scope_that_binds_nothing_is_dropped() {
+        use crate::services::type_sidecar::LibraryClaim;
+        let answer = parse_answer(
+            &serde_json::json!({ "library_claims": [{
+                "package": "fixture-mw", "version": "1.0.0", "status": "answered",
+                "exports": [{
+                    "specifier": "fixture-mw", "export": "default",
+                    "role": "server_framework", "side": null,
+                    "makes": [{ "form": "call", "member": null }],
+                    "scopes": [
+                        { "member": "use", "of": "instance:()", "mounts": { "arg": 0, "handle": true } },
+                        { "member": "register", "of": "instance:()", "runs": { "arg": 0 },
+                          "yields": { "param": 0, "export": "App", "side": "server" } },
+                        { "member": "routes", "of": "instance:()", "passes": true },
+                        { "member": "nothing", "of": "instance:()" },
+                        { "member": "half", "of": "instance:()", "runs": { "arg": 0 } }
+                    ],
+                    "ops": [], "reserved": [], "calls": [], "patterns": []
+                }]
+            }]})
+            .to_string(),
+        );
+        assert_eq!(answer.dropped, 2);
+        let kept: Vec<(&str, bool, bool)> = answer.exports[0]
+            .claims
+            .iter()
+            .filter_map(|claim| match claim {
+                LibraryClaim::Scope {
+                    member,
+                    mounts,
+                    passes,
+                    ..
+                } => Some((
+                    member.as_str(),
+                    mounts.as_ref().is_some_and(|slot| slot.handle),
+                    *passes,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("use", true, false),
+                ("register", false, false),
+                ("routes", false, true)
+            ]
+        );
     }
 
     #[test]

@@ -1,0 +1,92 @@
+[
+  {
+    "claim_id": "fixture-hrouter@1:default:scope:use:name@0:mounts@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-hrouter/index.d.ts",
+        "decl_line": 14
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-hrouter@1:default:scope:use:name@0:handle@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-hrouter/index.d.ts",
+        "decl_line": 14
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-hrouter@1:default:scope:use:mounts@0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-hrouter/index.d.ts",
+        "decl_line": 14
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-hrouter@1:default:scope:use:handle@0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-hrouter/index.d.ts",
+        "decl_line": 14
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-mw-app@1:default:scope:use:handle@0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-mw-app/index.d.ts",
+        "decl_line": 7
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-mw-router@1:default:scope:use:name@0:handle@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-mw-router/index.d.ts",
+        "decl_line": 7
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-mw-router@1:default:scope:use:handle@0:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-mw-router/index.d.ts",
+        "decl_line": 7
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-mw-router@1:default:scope:use:handle@1:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-mw-router/index.d.ts",
+        "decl_line": 7
+      }
+    ]
+  },
+  {
+    "claim_id": "fixture-mw-router@1:default:scope:routes:passes:of:instance:()",
+    "receiver": "instance:()",
+    "declarations": [
+      {
+        "decl_file": "node_modules/fixture-mw-router/index.d.ts",
+        "decl_line": 11
+      }
+    ]
+  }
+]

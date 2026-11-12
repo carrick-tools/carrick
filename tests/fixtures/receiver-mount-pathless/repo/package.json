@@ -1,0 +1,10 @@
+{
+  "name": "receiver-mount-pathless-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-hrouter": "^1.0.0",
+    "fixture-mw-app": "^1.0.0",
+    "fixture-mw-router": "^1.0.0"
+  }
+}

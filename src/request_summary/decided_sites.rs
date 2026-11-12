@@ -2611,13 +2611,8 @@ impl<'a> Walk<'a, '_> {
         let label = self.scopes.iter().find(|label| {
             label.member == scope.step && label.returns_on(&end.package, &end.export, &scope.base)
         })?;
-        Some((
-            call,
-            ArgSlot {
-                arg: label.name.0,
-                key: label.name.1.clone(),
-            },
-        ))
+        let (arg, key) = label.name.clone()?;
+        Some((call, ArgSlot { arg, key }))
     }
 
     /// The site of the labelled call `last`, an op whose name the scope call
