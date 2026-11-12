@@ -289,10 +289,13 @@ fn observe(
         json_exit: json.status.code(),
         stored: without_root(&stored_verdicts(root), root),
         // "Prescreened ...'s consumer calls" runs before the retype and is not
-        // the retype.
+        // the retype. "Retyping ..." is logged only when the calls split over
+        // more than one request; "Retyped ..." is logged whenever the retype
+        // ran (a call the retype abstains at before any rewrite, as at a
+        // generic wrapper, leaves a single request).
         retype_ran: log
             .lines()
-            .any(|line| line.contains(" Retyping ") && line.contains("'s consumer calls: ")),
+            .any(|line| line.contains(" Retyped ") && line.contains("'s consumer calls: ")),
         retype_decided: log
             .lines()
             .filter(|line| line.contains("Pair verdict:") && line.contains("gate=retype:"))
@@ -556,16 +559,41 @@ fn refresh_indexes_the_retype_and_check_changed_counts_what_it_moved() {
     args.push("--json");
     let index = command(root, &args, &[]).output().expect("check files");
     let index: Value = serde_json::from_slice(&index.stdout).expect("JSON");
-    // Every pair the refresh child judged is a checked row; none reads "not
-    // judged", as each did before the join read the stored outcomes.
+    // The retype abstains at `client.ts:8`: its call sits in a generic
+    // wrapper whose stated type is the enclosing type parameter (carrick#3897),
+    // so nothing is claimed about it. That pair is the one unresolved row,
+    // carrying the reason; every other pair the refresh child judged is a
+    // checked row, as each was before the join read the stored outcomes.
+    let wrapped = "apps/web/src/client.ts:8";
+    assert!(
+        before.contains_key(wrapped) && before[wrapped] != "incompatible",
+        "the refresh child does not call the wrapper's pair a break: {before:#?}"
+    );
     assert_eq!(
         index["type_checked"],
-        serde_json::json!(before.len()),
+        serde_json::json!(before.len() - 1),
+        "{index:#}"
+    );
+    let unchecked = index["not_type_checked"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(unchecked.len(), 1, "{index:#}");
+    assert_eq!(
+        format!(
+            "{}:{}",
+            unchecked[0]["file"]
+                .as_str()
+                .unwrap_or_default()
+                .trim_start_matches("mono/"),
+            unchecked[0]["line"]
+        ),
+        wrapped,
         "{index:#}"
     );
     assert_eq!(
-        index["not_type_checked"],
-        serde_json::json!([]),
+        unchecked[0]["reason"],
+        "the pair was compared and a side of it did not resolve to a usable type, so nothing is claimed about it",
         "{index:#}"
     );
     let listed: Vec<String> = index["problems"]
