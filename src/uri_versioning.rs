@@ -386,7 +386,9 @@ mod tests {
     }
 
     fn routes(content: &str) -> Vec<DecoratorRoute> {
-        let mut routes = SwcScanner::new().decorator_routes(&PathBuf::from("c.ts"), content);
+        let mut routes = SwcScanner::new()
+            .decorator_routes(&PathBuf::from("c.ts"), content)
+            .routes;
         routes.sort_by_key(|route| route.span_start);
         routes
     }

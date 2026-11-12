@@ -571,6 +571,10 @@ pub struct FileCentricAnalysisResult {
     /// (`stats.mount_prefixes_corroborated`), so a record here is an input to
     /// the graph, not a verdict that the prefix stayed unread.
     pub unread_mount_prefixes: Vec<crate::registration_scope::UnreadPrefix>,
+    /// Elements of a decorator's array of paths that are no literal, one
+    /// unread site each ([`crate::unread_sites::of_decorator_path`]). The
+    /// engine adds them to the site pass's unread sites.
+    pub unread_decorator_paths: Vec<crate::unread_sites::UnreadSite>,
     /// Bundled type definitions (if sidecar was used)
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
@@ -2878,6 +2882,9 @@ impl FileOrchestrator {
         // file than the controllers it versions.
         let mut uri_statements: Vec<crate::uri_versioning::AppVersioning> = Vec::new();
         let mut versioned_routes: Vec<(String, Vec<DecoratorRoute>)> = Vec::new();
+        // Array elements of a verb decorator's path that are no literal: no
+        // route, saved as unread sites for the engine to attach.
+        let mut unread_decorator_paths: Vec<crate::unread_sites::UnreadSite> = Vec::new();
         // carrick#656, filled per file and read once every file is in.
         // `member_deficits` counts, per member name, the sites that named it
         // and did not resolve to it; `resolved_member_rows` says which spans in
@@ -3113,7 +3120,14 @@ impl FileOrchestrator {
             // scanner raises for the same class are deliberately KEPT: the
             // model reading them is what supplies the owner and the type
             // anchors, and its rows fold onto these as twins.
-            let decorator_routes = self.swc_scanner.decorator_routes(file_path, &content);
+            let decorator_reading = self.swc_scanner.decorator_routes(file_path, &content);
+            unread_decorator_paths.extend(decorator_reading.unread.iter().map(|at| {
+                crate::unread_sites::of_decorator_path(
+                    &crate::site_rows::relative(repo_root, &file_path.to_string_lossy()),
+                    at,
+                )
+            }));
+            let decorator_routes = decorator_reading.routes;
             uri_statements.extend(crate::uri_versioning::app_versioning(file_path, &content));
             let decorator_endpoints = Self::decorator_route_endpoints(decorator_routes.clone());
             if !decorator_routes.is_empty() {
@@ -4226,6 +4240,7 @@ impl FileOrchestrator {
                 builds_graphql_schema_in_code: false,
                 stats,
                 unread_mount_prefixes: Vec::new(),
+                unread_decorator_paths: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -4294,6 +4309,7 @@ impl FileOrchestrator {
                 builds_graphql_schema_in_code: false,
                 stats,
                 unread_mount_prefixes: Vec::new(),
+                unread_decorator_paths: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -4915,6 +4931,7 @@ impl FileOrchestrator {
             builds_graphql_schema_in_code,
             stats,
             unread_mount_prefixes: unread_prefixes,
+            unread_decorator_paths,
             bundled_types: None,
             type_resolution: None,
         })
@@ -7816,7 +7833,16 @@ impl FileOrchestrator {
                 view_module: false,
                 handler_declaration_line: u32::try_from(route.declaration_line).ok(),
                 registration_literal: None,
-                candidate_id: format!("decorator-route:{}:{}", route.method, route.span_start),
+                // Routes of one method decorator's array of paths share its
+                // span: the array position tells them apart. A single path
+                // keeps the id it always had.
+                candidate_id: match route.array_index {
+                    Some(index) => format!(
+                        "decorator-route:{}:{}:{}",
+                        route.method, route.span_start, index
+                    ),
+                    None => format!("decorator-route:{}:{}", route.method, route.span_start),
+                },
                 line_number: i32::try_from(route.line_number).unwrap_or(0),
                 owner_node: route.class_name,
                 method: route.method,

@@ -1035,3 +1035,35 @@ fn object_form_controllers_are_decorator_routes_with_a_silent_model() {
     }
     assert_eq!(endpoints.len(), 4, "no decoy is a route: {endpoints:#?}");
 }
+
+/// A verb decorator's array of literal paths is one route per path with the
+/// same method and handler; an element that is no literal states no route; a
+/// single string reads as before.
+#[test]
+fn a_decorator_array_of_paths_states_one_route_per_literal() {
+    let endpoints = rows(&empty_scan("decorator-route-array"), "endpoints");
+    let mut found: Vec<(String, String, String)> = endpoints
+        .iter()
+        .map(|row| {
+            (
+                row["method"].as_str().unwrap_or_default().to_string(),
+                row["path"].as_str().unwrap_or_default().to_string(),
+                row["handler"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    found.sort();
+    let want: Vec<(String, String, String)> = [
+        ("GET", "/api/status", "status"),
+        ("POST", "/api/hooks/orders", "receive"),
+        ("POST", "/api/hooks/refunds", "refund"),
+        ("POST", "/api/internal/orders-hook", "receive"),
+    ]
+    .iter()
+    .map(|(m, p, h)| (m.to_string(), p.to_string(), h.to_string()))
+    .collect();
+    assert_eq!(found, want, "rows: {endpoints:#?}");
+    for row in &endpoints {
+        assert_eq!(row["resolution_source"], "decorator_route", "{row:#?}");
+    }
+}

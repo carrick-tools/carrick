@@ -517,6 +517,32 @@ pub struct DecoratorRoute {
     /// The version the handler or the controller states for this route
     /// (carrick#3422). See [`crate::uri_versioning`].
     pub version: crate::uri_versioning::RouteVersion,
+    /// The position of this route's path in the verb decorator's array of
+    /// paths (`@Post(['/a', '/b'])`), `None` for a single string or no
+    /// argument. Two routes of one method share its span, so this is what
+    /// tells their ids apart.
+    pub array_index: Option<usize>,
+}
+
+/// One element of a verb decorator's array of paths that is not a string
+/// literal (a name, a call, a spread): it states no route, and the engine
+/// saves it as an unread site rather than guessing its value. See
+/// [`SwcScanner::decorator_routes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadDecoratorPath {
+    /// The verb decorator's name as written, for the site's callee.
+    pub decorator: String,
+    /// 1-based line of the element.
+    pub line_number: usize,
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+/// What [`SwcScanner::decorator_routes`] reads from one file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecoratorRouteReading {
+    pub routes: Vec<DecoratorRoute>,
+    pub unread: Vec<UnreadDecoratorPath>,
 }
 
 /// A route bound to an imported handler in a route table
@@ -1071,21 +1097,30 @@ impl SwcScanner {
     /// does one whose decorator carries no string argument: `@Controller()`
     /// with the prefix left implicit is a real shape, but reading it would
     /// mean treating every no-argument class decorator as a routing claim.
-    pub fn decorator_routes(&self, file_path: &Path, content: &str) -> Vec<DecoratorRoute> {
+    ///
+    /// The verb decorator's path may be an array of paths
+    /// (`@Post(['/a', '/b'])`): each string-literal element is one route of
+    /// the same method and handler. An element that is not a literal states
+    /// no route and is returned in `unread`, never guessed.
+    pub fn decorator_routes(&self, file_path: &Path, content: &str) -> DecoratorRouteReading {
         if !may_declare_decorators(content) {
-            return Vec::new();
+            return DecoratorRouteReading::default();
         }
         let Some((sm, module)) = parse_standalone_module(file_path, content) else {
-            return Vec::new();
+            return DecoratorRouteReading::default();
         };
 
         let mut visitor = DecoratorRouteVisitor {
             source_map: sm,
             imports: collect_import_locals(&module),
             routes: Vec::new(),
+            unread: Vec::new(),
         };
         module.visit_with(&mut visitor);
-        visitor.routes
+        DecoratorRouteReading {
+            routes: visitor.routes,
+            unread: visitor.unread,
+        }
     }
 
     /// Collect every `router('/path', …, controller)` binding in `content`
@@ -1714,6 +1749,50 @@ fn decorator_string_argument(args: &[ExprOrSpread]) -> Option<String> {
     }
 }
 
+/// What a verb decorator's arguments state as the method's path: the
+/// literal paths, one route each, and the array elements that are no
+/// literal.
+struct MethodPaths<'a> {
+    /// Each literal path, with its position when it came from an array.
+    literals: Vec<(Option<usize>, String)>,
+    unread: Vec<&'a Expr>,
+}
+
+/// The paths a verb decorator states: what [`decorator_string_argument`]
+/// reads, or an array of them. `None` for any other argument.
+fn decorator_path_arguments(args: &[ExprOrSpread]) -> Option<MethodPaths<'_>> {
+    if let Some(path) = decorator_string_argument(args) {
+        return Some(MethodPaths {
+            literals: vec![(None, path)],
+            unread: Vec::new(),
+        });
+    }
+    let [arg] = args else {
+        return None;
+    };
+    if arg.spread.is_some() {
+        return None;
+    }
+    let Expr::Array(array) = unwrap_expr(&arg.expr) else {
+        return None;
+    };
+    let mut paths = MethodPaths {
+        literals: Vec::new(),
+        unread: Vec::new(),
+    };
+    for (index, element) in array.elems.iter().enumerate() {
+        match element {
+            Some(element) if element.spread.is_none() => match literal_string(&element.expr) {
+                Some(text) => paths.literals.push((Some(index), text)),
+                None => paths.unread.push(&element.expr),
+            },
+            Some(element) => paths.unread.push(&element.expr),
+            None => {}
+        }
+    }
+    Some(paths)
+}
+
 /// The text of a string literal or of a template literal with no
 /// substitution, `None` for any other expression.
 pub(crate) fn literal_string(expr: &Expr) -> Option<String> {
@@ -1796,13 +1875,17 @@ struct DecoratorRouteVisitor {
     /// come from the same place.
     imports: HashMap<String, String>,
     routes: Vec<DecoratorRoute>,
+    unread: Vec<UnreadDecoratorPath>,
 }
 
 /// One verb-decorated method of a class: what its decorator states, and where
 /// the method itself is.
 struct VerbDecoratedMethod {
     http_method: String,
-    path: String,
+    /// Each literal path the decorator states, one route each.
+    paths: Vec<(Option<usize>, String)>,
+    /// The array elements of the decorator's path that are no literal.
+    unread: Vec<UnreadDecoratorPath>,
     /// Where the verb decorator came from: the module it was imported from,
     /// or this module when it is declared here.
     decorator_origin: String,
@@ -1846,9 +1929,19 @@ impl DecoratorRouteVisitor {
                 let Some(http_method) = decorator_http_method(&decorator_name) else {
                     continue;
                 };
-                let Some(path) = decorator_string_argument(args) else {
+                let Some(stated) = decorator_path_arguments(args) else {
                     continue;
                 };
+                let unread = stated
+                    .unread
+                    .iter()
+                    .map(|expr| UnreadDecoratorPath {
+                        decorator: decorator_name.clone(),
+                        line_number: self.source_map.lookup_char_pos(expr.span().lo).line,
+                        span_start: expr.span().lo.0,
+                        span_end: expr.span().hi.0,
+                    })
+                    .collect();
                 let decorator_origin = self.origin(&decorator_name);
                 let version = handler_version(
                     &method.function.decorators,
@@ -1858,7 +1951,8 @@ impl DecoratorRouteVisitor {
                 );
                 methods.push(VerbDecoratedMethod {
                     http_method,
-                    path,
+                    paths: stated.literals,
+                    unread,
                     decorator_origin,
                     name: name.clone(),
                     // The method's NAME, not its span: the span opens at the
@@ -2001,19 +2095,23 @@ impl Visit for DecoratorRouteVisitor {
                 RouteVersion::Inherit => class_version.for_origin(&method.decorator_origin),
                 stated => stated,
             };
-            self.routes.push(DecoratorRoute {
-                path: join_decorator_path(&prefix, &method.path),
-                method: method.http_method,
-                class_name: class_name.clone(),
-                handler: method.name,
-                line_number: method.line_number,
-                declaration_line: method.declaration_line,
-                returns_no_payload: method.returns_no_payload,
-                span_start: method.span_start,
-                span_end: method.span_end,
-                origin: method.decorator_origin,
-                version,
-            });
+            self.unread.extend(method.unread);
+            for (array_index, path) in method.paths {
+                self.routes.push(DecoratorRoute {
+                    path: join_decorator_path(&prefix, &path),
+                    method: method.http_method.clone(),
+                    class_name: class_name.clone(),
+                    handler: method.name.clone(),
+                    line_number: method.line_number,
+                    declaration_line: method.declaration_line,
+                    returns_no_payload: method.returns_no_payload,
+                    span_start: method.span_start,
+                    span_end: method.span_end,
+                    origin: method.decorator_origin.clone(),
+                    version: version.clone(),
+                    array_index,
+                });
+            }
         }
     }
 }
@@ -5874,6 +5972,7 @@ createRouter()
         let scanner = SwcScanner::new();
         let mut routes: Vec<(String, String, String, usize)> = scanner
             .decorator_routes(&PathBuf::from("controller.ts"), content)
+            .routes
             .into_iter()
             .map(|route| (route.method, route.path, route.handler, route.line_number))
             .collect();
@@ -5934,6 +6033,76 @@ export class UsersController {
                 ),
             ]
         );
+    }
+
+    fn decorator_reading(content: &str) -> DecoratorRouteReading {
+        SwcScanner::new().decorator_routes(&PathBuf::from("controller.ts"), content)
+    }
+
+    #[test]
+    fn an_array_of_literal_paths_is_one_route_per_path() {
+        let content = r#"
+import { Controller, Post } from "./framework";
+@Controller("api")
+class C {
+  @Post(["/a", "/b"])
+  hook() {}
+}
+"#;
+        let reading = decorator_reading(content);
+        let routes: Vec<(&str, &str, &str)> = reading
+            .routes
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str(), r.handler.as_str()))
+            .collect();
+        assert_eq!(
+            routes,
+            vec![("POST", "/api/a", "hook"), ("POST", "/api/b", "hook")]
+        );
+        assert_eq!(reading.routes[0].span_start, reading.routes[1].span_start);
+        assert_eq!(
+            [reading.routes[0].array_index, reading.routes[1].array_index],
+            [Some(0), Some(1)]
+        );
+        assert!(reading.unread.is_empty());
+    }
+
+    #[test]
+    fn a_non_literal_array_element_is_unread_never_guessed() {
+        let content = r#"
+import { Controller, Post } from "./framework";
+const NAME = "/x";
+@Controller("api")
+class C {
+  @Post(["/a", NAME, ...more])
+  hook() {}
+}
+"#;
+        let reading = decorator_reading(content);
+        let paths: Vec<&str> = reading.routes.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["/api/a"]);
+        let lines: Vec<usize> = reading.unread.iter().map(|u| u.line_number).collect();
+        assert_eq!(lines, vec![6, 6]);
+        assert_eq!(reading.unread[0].decorator, "Post");
+        let text = &content
+            [reading.unread[0].span_start as usize - 1..reading.unread[0].span_end as usize - 1];
+        assert_eq!(text, "NAME");
+    }
+
+    #[test]
+    fn a_single_string_path_has_no_array_position() {
+        let content = r#"
+import { Controller, Post } from "./framework";
+@Controller("api")
+class C {
+  @Post("/a")
+  hook() {}
+}
+"#;
+        let reading = decorator_reading(content);
+        assert_eq!(reading.routes.len(), 1);
+        assert_eq!(reading.routes[0].array_index, None);
+        assert!(reading.unread.is_empty());
     }
 
     /// carrick#3422: a class decorator whose one argument is an object states
@@ -6053,7 +6222,9 @@ export class UsersController {
   find() { return null; }
 }
 "#;
-        let routes = SwcScanner::new().decorator_routes(&PathBuf::from("controller.ts"), content);
+        let routes = SwcScanner::new()
+            .decorator_routes(&PathBuf::from("controller.ts"), content)
+            .routes;
         let stated: Vec<(&str, usize, usize, bool)> = routes
             .iter()
             .map(|route| {
