@@ -968,6 +968,29 @@ test("a declaration the scanner cannot place makes the file unread, never its ou
   assert.equal(spansOf("class A { find<T(a) { return 1 } }"), null);
 });
 
+test("R24.2: a type-predicate return type is read as a type, and one that does not read makes the file unread", async (t) => {
+  assert.deepEqual(spansOf("function outer() {\n  function isX(v): v is { id: string } { return check(v); }\n}\n"), [
+    "outer: function outer() {\n  function isX(v): v is { id: string } { return check(v); }\n}",
+    "isX: function isX(v): v is { id: string } { return check(v); }",
+  ]);
+  assert.deepEqual(spansOf("function outer() {\n  function must(v): asserts v is { id: string } { check(v); }\n}\n"), [
+    "outer: function outer() {\n  function must(v): asserts v is { id: string } { check(v); }\n}",
+    "must: function must(v): asserts v is { id: string } { check(v); }",
+  ]);
+  assert.deepEqual(spansOf("function pick<T>(v: T): T extends string ? { s: T } : { n: T } { return wrap(v); }\n"), [
+    "pick: function pick<T>(v: T): T extends string ? { s: T } : { n: T } { return wrap(v); }",
+  ]);
+  // A return type the scanner cannot skip: the file is not read.
+  assert.equal(spansOf("function outer() {\n  function f(v): Box = { id: string } { return v; }\n}\n"), null);
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /audit", repo: "orders-api", file: "src/p.ts", line: 2, name: "outer", text: "outer line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(ws.at("orders-api/src/p.ts"), 'export function outer() {\n  api.post("/audit");\n  function isX(v): v is { id: string } {\n    return check(v);\n  }\n}\n');
+  assert.deepEqual(await linesFor(ws, "orders-api/src/p.ts", "return check(v);"), []);
+});
+
 test("an edit inside a generic arrow nested in a function is the arrow's, not the outer function's", async (t) => {
   const ndjson = [
     header(["orders-api"]),

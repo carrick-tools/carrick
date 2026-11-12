@@ -49,6 +49,8 @@ const REGEX_AFTER_WORD = new Set([
 const PUNCS = ["...", "===", "!==", "**=", "??=", "&&=", "||=", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "+=", "-=", "*=", "/=", "%=", "++", "--"];
 /** Words before a declaration that belong to its span. */
 const DECLARATION_PREFIXES = new Set(["export", "default", "async", "declare"]);
+/** Words in a type after which a `{` opens an object type, not a body. */
+const TYPE_OPERATORS = new Set(["is", "asserts", "keyof", "typeof", "extends", "infer", "readonly", "unique"]);
 const CLASS_MODIFIERS = new Set([
   "static", "async", "get", "set", "public", "private", "protected", "readonly", "override", "abstract", "declare", "accessor",
 ]);
@@ -469,8 +471,20 @@ export function scanSource(text: string, jsx = false): Scan {
       while (k < limit) {
         const token = t(k)!;
         if (token.kind === "punc" && token.value === "{") {
+          // After a word or bracket that ends a type the `{` is the body; after
+          // one that opens a type (`v is {`, `T extends U ? {`) it is an object
+          // type. After anything else the return type did not read: the file is not read.
           const before = t(k - 1)!;
-          const typeOpener = before.kind === "punc" && [":", "|", "&", "<", ",", "(", "=>"].includes(before.value);
+          const typeOpener =
+            (before.kind === "punc" && [":", "|", "&", "<", ",", "(", "=>", "?"].includes(before.value)) ||
+            (before.kind === "id" && TYPE_OPERATORS.has(before.value));
+          const typeEnds =
+            before.kind === "id" || before.kind === "str" || before.kind === "num" || before.kind === "tpl" ||
+            (before.kind === "punc" && [")", "]", "}", ">"].includes(before.value));
+          if (!typeOpener && !typeEnds) {
+            unplaced = true;
+            return -1;
+          }
           if (!typeOpener) return k;
           k = match.get(k)! + 1;
           continue;
