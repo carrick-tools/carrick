@@ -5794,6 +5794,12 @@ async fn analyze_current_repo_incremental(
             )
             .await;
             protocol_extractions.site = site_rows;
+            add_unread_decorator_paths(
+                &mut protocol_extractions.site,
+                &analysis.unread_decorator_paths,
+                repo_path,
+                service,
+            );
             yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
             let withdrawn = withdraw_model_routes_at_definitions(
                 &mut mount_graph,
@@ -7154,6 +7160,30 @@ fn server_claims_of(
         type_packages: crate::library_claims::server_type_packages(claims),
         checks,
     })
+}
+
+/// The elements of a decorator's array of paths that state no route join the
+/// site pass's unread sites, but none in a mock or test tree, as every unread
+/// site is filtered (carrick#3688 U3). Nothing happens for a service the site
+/// pass did not read.
+fn add_unread_decorator_paths(
+    site: &mut crate::site_rows::SiteRows,
+    unread: &[crate::unread_sites::UnreadSite],
+    repo_path: &str,
+    service: &Config,
+) {
+    if !site.enabled {
+        return;
+    }
+    let root = Path::new(repo_path);
+    site.unread.extend(
+        unread
+            .iter()
+            .filter(|row| {
+                !protocol_producer_provenance(&root.join(&row.file), repo_path, service).is_mock()
+            })
+            .cloned(),
+    );
 }
 
 /// The service's site rows (carrick#2439): every call discovery finds that
@@ -14135,6 +14165,12 @@ async fn analyze_current_repo(
     )
     .await;
     protocol_extractions.site = site_rows;
+    add_unread_decorator_paths(
+        &mut protocol_extractions.site,
+        &analysis_result.unread_decorator_paths,
+        repo_path,
+        service,
+    );
     yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
     let withdrawn = withdraw_model_routes_at_definitions(
         &mut analysis_result.mount_graph,

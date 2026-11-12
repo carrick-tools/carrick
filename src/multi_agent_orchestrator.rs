@@ -42,6 +42,8 @@ pub struct MultiAgentAnalysisResult {
     pub raw_model_results: HashMap<String, FileAnalysisResult>,
     /// See [`FileCentricAnalysisResult::builds_graphql_schema_in_code`].
     pub builds_graphql_schema_in_code: bool,
+    /// See [`FileCentricAnalysisResult::unread_decorator_paths`].
+    pub unread_decorator_paths: Vec<crate::unread_sites::UnreadSite>,
     /// Processing statistics
     #[allow(dead_code)]
     pub stats: ProcessingStats,
@@ -179,6 +181,7 @@ impl MultiAgentOrchestrator {
             file_results: file_centric_result.file_results,
             raw_model_results: file_centric_result.raw_model_results,
             builds_graphql_schema_in_code: file_centric_result.builds_graphql_schema_in_code,
+            unread_decorator_paths: file_centric_result.unread_decorator_paths,
             stats: file_centric_result.stats,
         })
     }

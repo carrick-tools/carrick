@@ -1,0 +1,6 @@
+{
+  "name": "decorator-route-array",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixture: a verb decorator stating an array of paths"
+}

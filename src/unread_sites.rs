@@ -373,6 +373,33 @@ pub fn with_unanswered(
     stops
 }
 
+/// An element of a verb decorator's array of paths that is no literal
+/// (`@Post(['/a', NAME])`): it states no route, so it is saved at its own
+/// line, slot `path`, reason [`Stop::UnreadExpression`] (the same word a
+/// value written in a form Carrick does not read has everywhere else).
+pub(crate) fn of_decorator_path(
+    file: &str,
+    at: &crate::swc_scanner::UnreadDecoratorPath,
+) -> UnreadSite {
+    UnreadSite {
+        file: file.to_string(),
+        line: u32::try_from(at.line_number).unwrap_or(u32::MAX),
+        span_start: at.span_start,
+        span_end: at.span_end,
+        reason: Stop::UnreadExpression,
+        also: Vec::new(),
+        slot: "path".to_string(),
+        callee: callee(&at.decorator),
+        stop_at: None,
+        depth: 0,
+        labelled_end: None,
+        kind: None,
+        role: None,
+        ends: Vec::new(),
+        listed: false,
+    }
+}
+
 /// A saved site that reached a decorator export: where it is, and what the
 /// label says of it.
 struct DecoratorEnd {
