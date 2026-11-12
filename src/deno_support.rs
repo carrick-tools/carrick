@@ -115,13 +115,13 @@ pub(crate) fn require_runtime_with(
     services: &[Config],
     installed: impl FnOnce() -> Option<semver::Version>,
 ) -> Result<(), String> {
-    if let Some(config) = services.iter().find_map(|s| service_manifest(root, s)) {
-        if !supported(installed()) {
-            return Err(format!(
-                "Deno is required to scan {}. Install or upgrade to Deno 2.9.4 or newer and make `deno` available on PATH. Carrick reads the existing Deno configuration; no generated tsconfig is required.",
-                config.display()
-            ));
-        }
+    if let Some(config) = services.iter().find_map(|s| service_manifest(root, s))
+        && !supported(installed())
+    {
+        return Err(format!(
+            "Deno is required to scan {}. Install or upgrade to Deno 2.9.4 or newer and make `deno` available on PATH. Carrick reads the existing Deno configuration; no generated tsconfig is required.",
+            config.display()
+        ));
     }
     Ok(())
 }
