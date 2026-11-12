@@ -47,6 +47,8 @@ const REGEX_AFTER_WORD = new Set([
   "return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await", "instanceof",
 ]);
 const PUNCS = ["...", "===", "!==", "**=", "??=", "&&=", "||=", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "+=", "-=", "*=", "/=", "%=", "++", "--"];
+/** Words before a declaration that belong to its span. */
+const DECLARATION_PREFIXES = new Set(["export", "default", "async", "declare"]);
 const CLASS_MODIFIERS = new Set([
   "static", "async", "get", "set", "public", "private", "protected", "readonly", "override", "abstract", "declare", "accessor",
 ]);
@@ -554,7 +556,10 @@ export function scanSource(text: string, jsx = false): Scan {
   /** Records a named function and walks its body. Returns the index after it. */
   const named = (name: string, declStart: number, fn: { bodyOpen: number; after: number; exprFrom: number }): number => {
     const last = t(fn.after - 1)!;
-    spans.push({ name, start: tokens[declStart]!.start, end: last.end });
+    // The span starts at its modifiers: `export`, `export default`, `async`, `declare`.
+    let first = declStart;
+    while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
+    spans.push({ name, start: tokens[first]!.start, end: last.end });
     if (fn.bodyOpen >= 0) walk(fn.bodyOpen + 1, match.get(fn.bodyOpen)!, { kind: "code" });
     else walk(fn.exprFrom, fn.after, { kind: "code" });
     return fn.after;
@@ -816,10 +821,25 @@ export function rangesOf(text: string, snippets: readonly string[]): Range[] {
   return ranges;
 }
 
-/** The ranges of the 1-based `lines` of `text`. */
-export function rangesOfLines(text: string, lines: readonly number[]): Range[] {
+function lineStarts(text: string): number[] {
   const starts = [0];
   for (let at = text.indexOf("\n"); at >= 0; at = text.indexOf("\n", at + 1)) starts.push(at + 1);
+  return starts;
+}
+
+/**
+ * Where lines were removed, as offsets: a removal before the 1-based line N
+ * of the file as it is now sits at the start of line N (the end of the text
+ * when N is past the last line).
+ */
+export function gapsOfLines(text: string, removedBefore: readonly number[]): number[] {
+  const starts = lineStarts(text);
+  return [...new Set(removedBefore)].map((line) => starts[line - 1] ?? text.length);
+}
+
+/** The ranges of the 1-based `lines` of `text`. */
+export function rangesOfLines(text: string, lines: readonly number[]): Range[] {
+  const starts = lineStarts(text);
   const ranges: Range[] = [];
   for (const line of new Set(lines)) {
     const start = starts[line - 1];
@@ -846,12 +866,23 @@ export type Touched = { names: string[]; calls: CallSpan[] };
  * The names an edit over `ranges` touched (the innermost named encloser of
  * each changed line, and every named thing inside a changed range), and the
  * calls outside every named thing whose text (from the callee to the
- * closing `)`) covers part of a changed line.
+ * closing `)`) covers part of a changed line. A removal at offset `gap`
+ * (`gapsOfLines`) touches only the innermost thing, or top-level call, it
+ * sits strictly inside: never one whose first line it is just above, and
+ * never one it follows.
  */
-export function touched(text: string, scan: Scan, ranges: readonly Range[]): Touched {
+export function touched(text: string, scan: Scan, ranges: readonly Range[], gaps: readonly number[] = []): Touched {
   const names = new Set<string>();
   const calls = new Set<CallSpan>();
   const topCalls = scan.calls.filter((call) => innermost(scan.spans, call.start) === null);
+  for (const gap of gaps) {
+    let best: NamedSpan | null = null;
+    for (const span of scan.spans) {
+      if (span.start < gap && gap < span.end && (best === null || span.end - span.start < best.end - best.start)) best = span;
+    }
+    if (best) names.add(best.name);
+    else for (const call of topCalls) if (call.from < gap && gap < call.end) calls.add(call);
+  }
   for (const range of ranges) {
     // Each changed line, by its first non-blank character.
     let at = range.start;

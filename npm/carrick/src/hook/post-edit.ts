@@ -119,22 +119,25 @@ async function main(timing: Timing): Promise<void> {
  * they removed lines; else the text it put in. A `Write` or a patch names
  * neither: the file was written whole.
  */
-function changesFromPayload(payload: Payload, edited: string[]): Map<string, { lines?: number[]; snippets?: string[] }> {
+function changesFromPayload(payload: Payload, edited: string[]): Map<string, { lines?: number[]; removed?: number[]; snippets?: string[] }> {
   if (edited.length !== 1) return new Map();
   const hunks = payload.tool_response?.structuredPatch;
   if (Array.isArray(hunks) && hunks.length > 0) {
     const lines: number[] = [];
+    // A removed line is not a line of the file now: it is the gap just above
+    // the line that now sits where it was (`facts/match.ts` `gapsOfLines`).
+    const removed: number[] = [];
     for (const hunk of hunks) {
       if (typeof hunk?.newStart !== "number" || !Array.isArray(hunk.lines)) return new Map();
       let at = hunk.newStart;
       for (const text of hunk.lines) {
         if (typeof text !== "string" || text.startsWith("\\")) continue;
         if (text.startsWith("+")) lines.push(at++);
-        else if (text.startsWith("-")) lines.push(at);
+        else if (text.startsWith("-")) removed.push(at);
         else at += 1;
       }
     }
-    return new Map([[edited[0]!, { lines }]]);
+    return new Map([[edited[0]!, { lines, removed }]]);
   }
   const input = payload.tool_input ?? {};
   const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(

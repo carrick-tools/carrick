@@ -41,7 +41,7 @@ export async function editFlow(
      * named here was written whole (a Write, a patch, a shell write), and
      * every named thing in it counts as touched.
      */
-    changes?: ReadonlyMap<string, { lines?: number[]; snippets?: string[] }>;
+    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[] }>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked

@@ -367,6 +367,57 @@ test("an Edit's patch hunks place the change by line, deletions included", async
   assert.equal(context(run.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
 });
 
+/** Run the post-edit hook for an Edit of `file` whose result carries `hunks`. */
+function patchEdit(ws: FactsWorkspace, file: string, hunks: Array<{ newStart: number; lines: string[] }>, session = "patch") {
+  return runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: session,
+      cwd: ws.root,
+      tool_input: { file_path: file, old_string: "x", new_string: "" },
+      tool_response: { structuredPatch: hunks.map((hunk) => ({ oldStart: hunk.newStart, oldLines: 0, newLines: 0, ...hunk })) },
+    },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+  });
+}
+
+test("a removed line touches a thing only when it was removed strictly inside it", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /g", repo: "orders-api", file: "src/g.ts", line: 3, name: "g", text: "g line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  const file = ws.at("orders-api/src/g.ts");
+  // `function f() {...}` was deleted from above g: g now starts at line 1.
+  fs.writeFileSync(file, 'function g() {\n  log("g");\n  return api.post("/g");\n}\n\nconst after = 1;\n');
+  const above = await patchEdit(ws, file, [{ newStart: 1, lines: ["-function f() {", '-  api.get("/f");', "-}", " function g() {"] }]);
+  assert.equal(context(above.stdout), "");
+  // Removed just below g's closing brace: not inside g.
+  const below = await patchEdit(ws, file, [{ newStart: 4, lines: [" }", "-// note", " "] }]);
+  assert.equal(context(below.stdout), "");
+  // Removed between two lines of g's body: g.
+  const inside = await patchEdit(ws, file, [{ newStart: 2, lines: ['   log("g");', "-  trace();", '   return api.post("/g");'] }]);
+  assert.equal(context(inside.stdout), "g line");
+});
+
+test("a thing's span starts at export, default, async and decorators: its header line is its own", async (t) => {
+  assert.deepEqual(spansOf("export async function g() { return 1 }\nexport default function h() {}\nexport const k = () => 1;\n"), [
+    "g: export async function g() { return 1 }",
+    "h: export default function h() {}",
+    "k: export const k = () => 1",
+  ]);
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /g", repo: "orders-api", file: "src/g.ts", line: 2, name: "g", text: "g line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  const file = ws.at("orders-api/src/g.ts");
+  fs.writeFileSync(file, 'export async function g(id: string) {\n  return api.post("/g");\n}\n');
+  const run = await patchEdit(ws, file, [{ newStart: 1, lines: ["-export async function g() {", "+export async function g(id: string) {", '   return api.post("/g");'] }]);
+  assert.equal(context(run.stdout), "g line");
+});
+
 test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
   const ndjson = [
     header(["web-app"]),

@@ -19,7 +19,7 @@ import { performance } from "node:perf_hooks";
 import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
 import { linkedCheckoutTop } from "../hook/worktree.ts";
-import { rangesOf, rangesOfLines, scanSource, touched } from "./match.ts";
+import { gapsOfLines, rangesOf, rangesOfLines, scanSource, touched } from "./match.ts";
 import type { CallSpan, Scan } from "./match.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
@@ -31,10 +31,11 @@ export const MAX_FACT_LINES = 3;
 
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
- * file as it is now, else the text the edit put in; both null means the file
- * was written whole.
+ * file as it is now that it added (`lines`) and the lines it removed lines
+ * just above (`removed`), else the text the edit put in (`snippets`); none of
+ * them means the file was written whole.
  */
-export type FactEdit = { file: string; lines?: number[] | null; snippets?: string[] | null };
+export type FactEdit = { file: string; lines?: number[] | null; removed?: number[] | null; snippets?: string[] | null };
 
 /** The files the declaration scanner reads. */
 const SCANNED = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -187,13 +188,15 @@ export async function factLines(
         log(`${at.rel} did not read cleanly; no fact lines for it`);
         continue;
       }
-      const ranges = edit.lines
-        ? rangesOfLines(text, edit.lines)
+      const byLine = edit.lines || edit.removed;
+      const ranges = byLine
+        ? rangesOfLines(text, edit.lines ?? [])
         : edit.snippets
           ? rangesOf(text, edit.snippets)
           : [{ start: 0, end: text.length }];
-      if (ranges.length === 0) continue;
-      const reach = touched(text, scan, ranges);
+      const gaps = byLine ? gapsOfLines(text, edit.removed ?? []) : [];
+      if (ranges.length === 0 && gaps.length === 0) continue;
+      const reach = touched(text, scan, ranges, gaps);
       const rows: FactRow[] = [];
       // A name declared twice in this file (a handler of one name in two
       // components) cannot say which one the edit reached.
