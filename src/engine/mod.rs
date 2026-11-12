@@ -5837,6 +5837,7 @@ async fn analyze_current_repo_incremental(
                 &semantics_root,
             );
             protocol_extractions.library = library;
+            protocol_extractions.implementations_unanswered = implementations.unanswered.clone();
             let server_claims = server_claims_of(&claims, &semantics_root);
             let declarations =
                 member_declarations(&request_inputs, &claims, sidecar, &semantics_root);
@@ -6646,6 +6647,9 @@ struct ProtocolExtractions {
     /// claims (carrick#1662, [`library_rows`]). Read once the request inputs
     /// and the sidecar are at hand, after the scan above.
     library: crate::library_claims::LibraryRows,
+    /// The calls through an interface member whose implementations ask got no
+    /// answer ([`crate::request_summary::implementations::Implementations::unanswered`]).
+    implementations_unanswered: Vec<(PathBuf, u32, u32)>,
     /// The rows and possible calls the decided sites come to (carrick#2439,
     /// [`site_rows_of`]). Empty, and off, until the site pass reads them.
     site: crate::site_rows::SiteRows,
@@ -6723,6 +6727,7 @@ fn scan_protocol_extractions(
         sockets,
         event_bus,
         library: crate::library_claims::LibraryRows::default(),
+        implementations_unanswered: Vec::new(),
         site: crate::site_rows::SiteRows::default(),
         socket_sites: socket_sites::SocketSites::default(),
     }
@@ -8846,6 +8851,11 @@ fn append_deterministic_protocol_operations(
             site.unread.clone(),
             &site.leads,
             &extractions.library.unanswered,
+            Path::new(repo_path),
+        );
+        let unread = crate::unread_sites::with_unanswered_implementations(
+            unread,
+            &extractions.implementations_unanswered,
             Path::new(repo_path),
         );
         crate::unread_sites::attach(cloud_data, unread, &site.leads);
@@ -14248,6 +14258,7 @@ async fn analyze_current_repo(
         &service_root,
     );
     protocol_extractions.library = library;
+    protocol_extractions.implementations_unanswered = implementations.unanswered.clone();
     let server_claims = server_claims_of(&claims, &service_root);
     let declarations = member_declarations(&request_inputs, &claims, sidecar, &service_root);
     let results = result_index_of(
@@ -30333,6 +30344,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         file_results.insert(
@@ -30911,6 +30923,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
         let mut entries = Vec::new();
         append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
@@ -31388,6 +31401,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         let mut entries = Vec::new();
@@ -31464,6 +31478,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         let mut entries = Vec::new();
@@ -31532,6 +31547,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         let mut entries = Vec::new();
@@ -31780,6 +31796,7 @@ io.on("bare:in", (event) => {});
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
         let mut entries = Vec::new();
         append_protocol_manifest_entries(&mut entries, &extractions, &library);
@@ -32474,6 +32491,7 @@ io.on("bare:in", (event) => {});
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -32900,6 +32918,7 @@ io.on("bare:in", (event) => {});
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         let mut entries = Vec::new();
@@ -33040,6 +33059,7 @@ io.on("bare:in", (event) => {});
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
 
         // The producer manifest entry's alias (Producer, Response).
@@ -33107,6 +33127,7 @@ io.on("bare:in", (event) => {});
             library: Default::default(),
             site: crate::site_rows::SiteRows::default(),
             socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
         };
         assert!(
             orchestrator

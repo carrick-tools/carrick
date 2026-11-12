@@ -41,6 +41,12 @@ pub struct Implementations {
     by_call: HashMap<(PathBuf, u32, u32), Followed>,
     /// How many calls were asked about, for the run log.
     pub asked: usize,
+    /// The calls (file as walked, `span_start..span_end` as unread sites
+    /// number them) whose question got no answer:
+    /// the ask failed or came back short. Their `interface_member` stops are
+    /// saved `unanswered` beside it ([`crate::unread_sites::with_unanswered_implementations`]).
+    /// Empty when the sidecar answered, including answers that found nothing.
+    pub unanswered: Vec<(PathBuf, u32, u32)>,
 }
 
 impl Implementations {
@@ -68,6 +74,7 @@ impl Implementations {
         Implementations {
             by_call,
             asked: count,
+            unanswered: Vec::new(),
         }
     }
 
@@ -104,6 +111,7 @@ pub fn implementations_of<E: std::fmt::Display>(
             );
             Implementations {
                 asked: queries.len(),
+                unanswered: inputs.unread_spans_of(&calls),
                 ..Default::default()
             }
         }
@@ -111,6 +119,7 @@ pub fn implementations_of<E: std::fmt::Display>(
             tracing::warn!(%error, "implementations: the ask failed; calls through an interface member stay stops");
             Implementations {
                 asked: queries.len(),
+                unanswered: inputs.unread_spans_of(&calls),
                 ..Default::default()
             }
         }
@@ -118,6 +127,21 @@ pub fn implementations_of<E: std::fmt::Display>(
 }
 
 impl RequestSummaryInputs {
+    /// `calls` (file as walked, `lo..hi`, the numbering [`Implementations`]
+    /// answers by) as the file and `span_start..span_end` an unread site at
+    /// the call carries.
+    fn unread_spans_of(&self, calls: &[(PathBuf, u32, u32)]) -> Vec<(PathBuf, u32, u32)> {
+        every_call(&self.files)
+            .into_iter()
+            .filter(|(file, call, _)| {
+                calls.iter().any(|(at, lo, hi)| {
+                    at.as_path() == *file && *lo == call.site.lo && *hi == call.site.hi
+                })
+            })
+            .map(|(file, call, _)| (file.to_path_buf(), call.site.span_start, call.site.span_end))
+            .collect()
+    }
+
     /// One question for each call whose declaration is an interface member
     /// the service writes ([`Self::unfollowed_at`]): the call's file as
     /// walked and SWC span, and the span of its `call` row in the rows'
