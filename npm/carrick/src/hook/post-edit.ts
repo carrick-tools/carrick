@@ -31,6 +31,7 @@ import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
 import { sessionKey } from "./session-key.ts";
 import { isManifest } from "../facts/rules/packages.ts";
+import { factsEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
 import { timed, type Timing } from "./timings.ts";
 
@@ -113,7 +114,12 @@ async function main(timing: Timing): Promise<void> {
   const edited = named.filter((file) => CHECKED.test(file)).map(absolute);
   // JavaScript (`FACT_FILE`) and a `package.json` (`facts/rules/packages.ts`)
   // reach the fact lines only: the probe and re-check never run on them.
-  const factOnly = named.filter((file) => FACT_ONLY.test(file) || isManifest(file)).map(absolute);
+  // With the fact lines off, no fact work at all: no manifest, no changed
+  // lines computed, no git (R36.5). JavaScript still takes the edit flow it
+  // took before fact lines (owed late answers, the version notice), so the
+  // output is the same as without this package's fact kinds.
+  const factsOn = factsEnabled();
+  const factOnly = named.filter((file) => FACT_ONLY.test(file) || (factsOn && isManifest(file))).map(absolute);
   const session = sessionKey(payload);
   if (edited.length === 0 && factOnly.length === 0) {
     // Nothing of ours to check in this edit, but a finished background answer
@@ -126,7 +132,7 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = (edited[0] ?? factOnly[0])!;
-  const changes = await changesFromPayload(payload, [...edited, ...factOnly], cwd);
+  const changes = factsOn ? await changesFromPayload(payload, [...edited, ...factOnly], cwd) : undefined;
   await editFlow({ cwd, session, channel: channel.channel, timing, changes, factOnly }, edited);
 }
 

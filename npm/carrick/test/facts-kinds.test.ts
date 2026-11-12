@@ -1014,6 +1014,45 @@ test("R33.2: a repo whose services name different commits has no index commit, s
   }
 });
 
+test("R36.5: with CARRICK_FACT_LINES unset, a package.json Write, a .js Edit and a shell write do no fact work", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const js = "export function h() {\n  return 1;\n}\n";
+  const ws = await workspace(t, { "api/package.json": before, "api/src/util.js": js, "web/src/index.ts": "export {};\n" }, [ZOD]);
+  const git = countingGit(t);
+  const reads = path.join(ws.home, "reads.log");
+  const run = async (on: boolean, session: string) => {
+    const env = fakeEnv({
+      HOME: ws.home,
+      CLAUDE_PROJECT_DIR: ws.root,
+      CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"),
+      PATH: git.path,
+      CARRICK_TEST_READS_MATCH: `${ws.at("api")}${path.sep}`,
+      CARRICK_TEST_READS_LOG: reads,
+    });
+    if (!on) delete env["CARRICK_FACT_LINES"];
+    const hook = (script: string, payload: Record<string, unknown>) =>
+      runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: session, cwd: ws.root, ...payload }, env, nodeArgs: ["--import", path.join(testDir, "count-reads.mjs")] });
+    const manifest = ws.at("api/package.json");
+    fs.writeFileSync(manifest, MANIFEST(['    "zod": "^3.24.0"']));
+    const said = [context((await hook("post-edit.ts", { tool_name: "Write", tool_input: { file_path: manifest }, tool_response: { type: "update" } })).stdout)];
+    const file = ws.at("api/src/util.js");
+    fs.writeFileSync(file, js.replace("return 1;", "return 2;"));
+    said.push(context((await hook("post-edit.ts", { tool_name: "Edit", tool_input: { file_path: file, old_string: "return 1;", new_string: "return 2;" }, tool_response: { structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ["-  return 1;", "+  return 2;"] }] } })).stdout));
+    fs.writeFileSync(file, js.replace("return 1;", "return 3;"));
+    said.push(context((await hook("post-bash.ts", { tool_name: "Bash", tool_input: { command: `sed -i 's/1/3/' ${file}` }, tool_response: { stdout: "" } })).stdout));
+    fs.writeFileSync(manifest, before);
+    fs.writeFileSync(file, js);
+    return said;
+  };
+  assert.deepEqual(await run(false, "off"), ["", "", ""]);
+  assert.equal(git.calls(/./), 0, "no git");
+  assert.equal(fs.existsSync(reads) ? fs.readFileSync(reads, "utf8") : "", "", "no read of the written files");
+  // Control: switched on, the same calls read the files and ask git.
+  await run(true, "on");
+  assert.ok(git.calls(/./) > 0);
+  assert.ok(fs.readFileSync(reads, "utf8").length > 0);
+});
+
 test("with CARRICK_FACT_LINES unset, edits that would print fn, name and pkg lines print nothing and run no git", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
   const ws = await workspace(t, { ...STDIN_FILES, "api/src/orders.ts": ORDERS, "api/package.json": before, "web/src/page.ts": PAGE }, [
