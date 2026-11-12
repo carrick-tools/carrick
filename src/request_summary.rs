@@ -7012,12 +7012,8 @@ impl Reader<'_> {
                     return value;
                 }
                 // `url.toString()` is the URL.
-                if let Callee::Expr(callee) = &call.callee
-                    && let Expr::Member(member) = &**callee
-                    && member_prop(member).as_deref() == Some("toString")
-                    && call.args.is_empty()
-                {
-                    let inner = self.eval(&member.obj, scope);
+                if let Some(object) = to_string_object(call) {
+                    let inner = self.eval(object, scope);
                     if matches!(inner, Value::Str(_)) {
                         return inner;
                     }
@@ -9234,6 +9230,20 @@ fn prop_name(key: &PropName) -> Option<String> {
         PropName::Str(s) => Some(s.value.to_string_lossy().into_owned()),
         _ => None,
     }
+}
+
+/// The object of a `x.toString()` call: a member call named `toString` with
+/// no arguments. The one rule for reading `url.toString()` as the URL; `eval`
+/// and `Reader::alternatives` both read through it.
+pub(super) fn to_string_object(call: &CallExpr) -> Option<&Expr> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = &**callee else {
+        return None;
+    };
+    (member_prop(member).as_deref() == Some("toString") && call.args.is_empty())
+        .then_some(&*member.obj)
 }
 
 fn member_prop(member: &MemberExpr) -> Option<String> {
