@@ -1,0 +1,388 @@
+/**
+ * Probe generation for the v2 check phase ("tsc as the judge").
+ *
+ * One probe file per matched pair. The probe is a value-level assignment in
+ * the data-flow direction, guarded by six top/bottom-type gates on BOTH sides
+ * (IsAny/IsUnknown/IsNever). Value-level (not `[X] extends [Y]`) because the
+ * conditional-type relation diverges around `any`, and because the compiler's
+ * elaborated assignment error is the user-facing mismatch report.
+ *
+ * An `http` pair carries a SECOND assignment of the same value in the form JSON
+ * puts on the wire, and that one decides the bucket (see `wireAssignmentLine`):
+ * a payload is serialised before it travels, so the declared types are not what
+ * meet each other. Both questions go to the same judge; nothing here decides a
+ * verdict.
+ *
+ * GraphQL pairs additionally unwrap the producer's resolver-return ENVELOPE
+ * before the assignment (see the `graphql` branch in `buildProbe`): a GraphQL
+ * producer's captured type is the resolver function's return type with
+ * transport layers (Promise / async-iterator) already peeled at inference
+ * time, which for wrapper-returning resolvers is a single-payload envelope
+ * (`{ data: Order; errors: string[] }`) — not the SDL field payload the
+ * consumer's selection set reads. The v1 checker unwrapped this structurally
+ * at compare time (ts_check type-checker `unwrapGraphqlPayload`, deleted in
+ * WP8); the type-level port here is its v2-native equivalent.
+ *
+ * GraphQL pairs also read the consumer's `__typename` as optional, at any depth
+ * (carrick#1759): the server adds that meta-field to every object a selection
+ * asks for, so a resolver's return type never states it, while a consumer type
+ * generated from a document that selects it declares it required.
+ *
+ * Seam: node builtins + `typescript` + this bundle only. No imports needed here.
+ */
+/**
+ * The direction table, keyed on (protocol, type_kind) — one place. Structurally
+ * fixes the confirmed HTTP request-body inversion (data flows consumer ->
+ * producer for request bodies, so the check is consumer <= producer).
+ *
+ *  | protocol       | type_kind | sent     | expected |
+ *  | http, graphql  | response  | producer | consumer |
+ *  | http           | request   | consumer | producer |
+ *  | socket, pubsub | both      | consumer | producer |
+ */
+export function directionFor(protocol, typeKind) {
+    if (protocol === 'socket' || protocol === 'pubsub') {
+        return { sent: 'consumer', expected: 'producer' };
+    }
+    if (protocol === 'http' && typeKind === 'request') {
+        return { sent: 'consumer', expected: 'producer' };
+    }
+    // http/graphql response, and any other (http, graphql) shape.
+    return { sent: 'producer', expected: 'consumer' };
+}
+/** Deterministic FNV-1a (32-bit) over the pair's stable key. Never a path. */
+export function fnv1a(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        // hash *= 16777619, kept in 32-bit unsigned range.
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+/** The pair ID is derived from the pair's semantic identity, not the workspace
+ * path, so it is byte-stable across runs. */
+export function pairId(spec) {
+    const key = [
+        spec.protocol,
+        spec.type_kind,
+        spec.producer.service_name,
+        spec.producer.alias,
+        spec.consumer.service_name,
+        spec.consumer.alias,
+        spec.pair_key,
+    ].join('|');
+    return fnv1a(key);
+}
+/**
+ * The surface export that carries a response alias's unwidened reading
+ * (carrick#1516). The scanner names it when it asks the capture for one
+ * (`unwidened_alias` in `src/engine/type_compat_v2.rs`); this is the same
+ * name, read back.
+ */
+export function unwidenedAliasOf(alias) {
+    return `${alias}_Unwidened`;
+}
+/** The local name the probe imports the unwidened alias under. */
+export const UNWIDENED_LOCAL_NAME = 'SentUnwidened';
+/** The assignment line whose diagnostic decides the bucket. */
+/**
+ * The JSON wire transform as TypeScript declarations: `JsonWire<T>` is the
+ * form `JSON.stringify` puts `T` on the wire in (a value with `toJSON()`
+ * travels as what it returns), and `JsonWireSame<A, B>` says two forms are
+ * mutually assignable. `prefix` namespaces the three names so the same
+ * transform can be appended to a file that is not ours (the retype check,
+ * carrick#1491) without colliding with anything the file declares. The probe
+ * uses no prefix.
+ *
+ * `null` and `undefined` pass through before any other test. Without
+ * `strictNullChecks` (the retype runs under the consumer's own options) both
+ * are assignable to every type, so the `toJSON` test held for them and
+ * `infer R` came back `unknown` (carrick#1514).
+ *
+ * The depth counts `toJSON()` hops only, never nesting (carrick#2058). A body
+ * is mapped at every depth it has, a list's element at the list's own depth,
+ * so a `Date` three lists down travels as a string like one at the top. The
+ * mapped type is deferred, so a recursive type is expanded only as far as the
+ * compiler's own comparison walks it. What the count bounds is a `toJSON()`
+ * that returns a value with another `toJSON()`, which a type can do forever
+ * (one that returns its own type), and which no depth of nesting reaches.
+ */
+export function jsonWireDeclarations(prefix) {
+    const depth = `${prefix}JsonWireDepth`;
+    const wire = `${prefix}JsonWire`;
+    const same = `${prefix}JsonWireSame`;
+    return [
+        `type ${depth} = [never, 0, 1, 2, 3, 4, 5, 6];`,
+        `type ${wire}<T, D extends number = 6> = [D] extends [never] ? T : T extends null | undefined ? T : T extends { toJSON: (...args: any[]) => infer R } ? ${wire}<R, ${depth}[D]> : T extends (...args: any[]) => any ? T : T extends object ? { [K in keyof T]: ${wire}<T[K], D> } : T;`,
+        `type ${same}<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;`,
+    ];
+}
+export function decisiveAssignmentLine(plan) {
+    return plan.wireAssignmentLine ?? plan.assignmentLine;
+}
+/**
+ * Build one probe, recording the exact line of every gate and the assignment so
+ * the classifier never depends on hard-coded offsets. `packageOf` maps a
+ * service name to its workspace package specifier (e.g. `@carrick/orders`).
+ *
+ * `unwidenedAliasFor` answers, for the sending side, the surface export that
+ * carries its unwidened reading, when its stub ships one: a producer's
+ * response (carrick#1538) or a consumer's request body (carrick#2011). The
+ * probe of an `http` pair then ends with a second assignment of that reading,
+ * in the wire form. Without an answer the probe is what it always was, byte
+ * for byte.
+ *
+ * `expectedToleratesAbsence` answers, for the receiving side, whether its
+ * capture record marks a handler that works when no body is sent
+ * (carrick#2814).
+ */
+export function buildProbe(spec, packageOf, unwidenedAliasFor, expectedToleratesAbsence) {
+    const id = pairId(spec);
+    const direction = directionFor(spec.protocol, spec.type_kind);
+    const sentEndpoint = direction.sent === 'producer' ? spec.producer : spec.consumer;
+    const expectedEndpoint = direction.expected === 'producer' ? spec.producer : spec.consumer;
+    const sentPkg = packageOf(sentEndpoint.service_name);
+    const expectedPkg = packageOf(expectedEndpoint.service_name);
+    const lines = [];
+    const importLines = [];
+    const gateLines = new Map();
+    const push = (text) => {
+        lines.push(text);
+        return lines.length; // 1-based line number just written
+    };
+    importLines.push(push(`import type { ${sentEndpoint.alias} as Sent } from '${sentPkg}';`));
+    importLines.push(push(`import type { ${expectedEndpoint.alias} as Expected } from '${expectedPkg}';`));
+    push(`type IsAny<T> = 0 extends 1 & T ? true : false;`);
+    push(`type IsUnknown<T> = unknown extends T ? (0 extends 1 & T ? false : true) : false;`);
+    push(`type IsNever<T> = [T] extends [never] ? true : false;`);
+    push(`type Not<T extends boolean> = T extends true ? false : true;`);
+    push(`type Assert<T extends true> = T;`);
+    gateLines.set(push(`type _G_sent_any = Assert<Not<IsAny<Sent>>>;`), 'sent:any');
+    gateLines.set(push(`type _G_sent_unknown = Assert<Not<IsUnknown<Sent>>>;`), 'sent:unknown');
+    gateLines.set(push(`type _G_sent_never = Assert<Not<IsNever<Sent>>>;`), 'sent:never');
+    gateLines.set(push(`type _G_expected_any = Assert<Not<IsAny<Expected>>>;`), 'expected:any');
+    gateLines.set(push(`type _G_expected_unknown = Assert<Not<IsUnknown<Expected>>>;`), 'expected:unknown');
+    gateLines.set(push(`type _G_expected_never = Assert<Not<IsNever<Expected>>>;`), 'expected:never');
+    // carrick#1162: `void`/`undefined` is what a call site that reads no body
+    // types its response as (a wrapper returning `Promise<void>`). It states no
+    // contract, so no counterparty shape can be judged against it.
+    // `any` is excluded first: `[any] extends [void]` holds, and an `any` side
+    // must keep its own top-type reason, never read as "reads no body".
+    push(`type IsVoid<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [void] ? true : false;`);
+    gateLines.set(push(`type _G_sent_void = Assert<Not<IsVoid<Sent>>>;`), 'sent:void');
+    gateLines.set(push(`type _G_expected_void = Assert<Not<IsVoid<Expected>>>;`), 'expected:void');
+    // carrick#1162: a form-encoded request body (the platform `FormData` or
+    // `URLSearchParams`) carries its fields as runtime appends, which no type
+    // records, so a field-by-field comparison against a declared shape reads
+    // every such body as missing all of its fields.
+    if (spec.protocol === 'http' && spec.type_kind === 'request') {
+        push(`type IsFormBody<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [FormData | URLSearchParams] ? true : false;`);
+        gateLines.set(push(`type _G_sent_form = Assert<Not<IsFormBody<Sent>>>;`), 'sent:form');
+    }
+    // carrick#1793: a body of bytes (a blob, a buffer, a typed array, a stream)
+    // has no JSON shape. The wire carries the bytes whatever either side holds
+    // them in, so a route sending a `Uint8Array` read with `.blob()` is not a
+    // mismatch, and neither is the same route read as text. Either side, either
+    // half: a file upload states no fields a declared body could be compared
+    // with. Bytes that assign to bytes are not a contract either: the check
+    // cannot read a file's content (carrick#1812). `null`/`undefined` are
+    // dropped first, so `Blob | null` still gates, while a bare `null`,
+    // `undefined` or `never` leaves nothing to test.
+    if (spec.protocol === 'http') {
+        push(`type IsByteBody<T> = 0 extends 1 & T ? false : [NonNullable<T>] extends [never] ? false : [NonNullable<T>] extends [Blob | ArrayBuffer | SharedArrayBuffer | ArrayBufferView | ReadableStream<any>] ? true : false;`);
+        gateLines.set(push(`type _G_sent_bytes = Assert<Not<IsByteBody<Sent>>>;`), 'sent:bytes');
+        gateLines.set(push(`type _G_expected_bytes = Assert<Not<IsByteBody<Expected>>>;`), 'expected:bytes');
+    }
+    // carrick#1979: a pub/sub subscriber is typed as the whole message (a routing
+    // key naming the topic, a tag, the payload, the fields the wrapper stamps)
+    // where a publisher is typed as the payload it passes in, or as a batch of
+    // messages. A side "states the topic" when it is no array, no top or bottom
+    // type, and every union member has a required member typed exactly as this
+    // topic's literal. When exactly one side states it the two are different
+    // levels of one message, and the shapes are not compared.
+    //   - the array test comes first: a mapped type over an array maps its
+    //     elements, so a batch would read as stating the topic;
+    //   - `PsJudged` keeps both gates silent when either side is any, unknown,
+    //     never or void, so a pair the decay gates decide gains no stray code.
+    if (spec.protocol === 'pubsub' && spec.topic !== undefined) {
+        push(`type PsTopic = ${JSON.stringify(spec.topic)};`);
+        push(`type PsTopicKeys<T> = { [K in keyof T]-?: [T[K]] extends [PsTopic] ? ([PsTopic] extends [T[K]] ? K : never) : never }[keyof T];`);
+        push(`type PsStatesTopic<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T extends readonly unknown[] ? false : T extends object ? ([PsTopicKeys<T>] extends [never] ? false : true) : false] extends [true] ? true : false;`);
+        push(`type PsJudged<T> = 0 extends 1 & T ? false : unknown extends T ? false : [T] extends [never] ? false : [T] extends [void] ? false : true;`);
+        push(`type PsOnly<A, B> = [PsJudged<A>, PsJudged<B>, PsStatesTopic<A>, PsStatesTopic<B>] extends [true, true, true, false] ? true : false;`);
+        gateLines.set(push(`type _G_sent_envelope = Assert<Not<PsOnly<Sent, Expected>>>;`), 'sent:envelope');
+        gateLines.set(push(`type _G_expected_envelope = Assert<Not<PsOnly<Expected, Sent>>>;`), 'expected:envelope');
+    }
+    // carrick#2814: a body the sender may omit (`T | undefined`, `T | void`) is
+    // compatible with a receiver that requires none. A receiver requires none
+    // when its type has no required member (`{} extends Expected`) AND either
+    // its type admits absence (`Expected` holds `undefined` or `void`), or its
+    // handler works with nothing sent: the capture record says so
+    // (`absent_body_tolerated`), from a handler that defaults the body or reads
+    // it only through `?.` / `?? {}`. A handler that destructures or
+    // dereferences the body throws on `undefined`, whatever its type says, so
+    // without the mark the absent body keeps today's incompatible reading. When
+    // it holds, the absent members are dropped from the sent side and what
+    // remains is compared as before. The request direction of HTTP, and socket
+    // and pub/sub payloads (the subscriber is `expected`); a GraphQL request is
+    // not read this way.
+    const absentBodyAllowed = (spec.protocol === 'http' && spec.type_kind === 'request') ||
+        spec.protocol === 'socket' ||
+        spec.protocol === 'pubsub';
+    const toleratesAbsence = expectedToleratesAbsence?.(expectedEndpoint) === true;
+    const sentBodyType = (sent) => {
+        const dropped = `Exclude<${sent}, undefined | void>`;
+        const byHandler = toleratesAbsence ? dropped : sent;
+        return `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? ([Extract<Expected, undefined | void>] extends [never] ? ${byHandler} : ${dropped}) : ${sent}`;
+    };
+    if (absentBodyAllowed)
+        push(`type SentBody = ${sentBodyType('Sent')};`);
+    const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
+    push(`declare const sent: ${sentBody};`);
+    let assignmentLine;
+    if (spec.protocol === 'graphql') {
+        // GraphQL selection-set semantics (v1 `unwrapGraphqlPayload` parity): the
+        // producer side (always `sent` for graphql — see the direction table) is
+        // the resolver's return type. When that return is a single-payload
+        // ENVELOPE — exactly one property whose type is payload-shaped (an
+        // object, an array of objects, or a union of objects), every sibling a
+        // scalar or scalar array (`errors: string[]`) — the consumer's selection
+        // reads the payload, not the envelope, so the payload is the comparand.
+        //
+        // Fail-closed by construction:
+        //   - `Sent` already assignable to `Expected` short-circuits to `Sent`
+        //     (plain structural subset selection stays exactly as before);
+        //   - zero payload-shaped properties (already-bare payloads of scalars)
+        //     or several (ambiguous envelope, or a bare payload whose own fields
+        //     include more than one object-shaped property) keep the whole type —
+        //     the unwrap never fires on anything but an unambiguous envelope;
+        //   - a consumer that names a field only the outer object has (not the
+        //     payload under its one object-shaped property) reads that object, so
+        //     it keeps the whole type (carrick#1764): a bare payload with one
+        //     object-shaped property is not an envelope around it. A field both
+        //     declare says nothing either way, and neither does `__typename`, which
+        //     the server puts on every object (see below);
+        //   - `GqlObjLike` can never select `any`/`unknown`/`never` (top/bottom
+        //     types fail both its array and its object arm), and the comparand is
+        //     re-gated below anyway — the v2 port of v1's comparand re-guard, so
+        //     a payload decayed to a top type can never read compatible.
+        push(`type GqlObjLike<V> = [V] extends [readonly unknown[]] ? ([V] extends [readonly (infer E)[]] ? ([E] extends [readonly unknown[]] ? false : ([E] extends [object] ? true : false)) : false) : ([V] extends [object] ? true : false);`);
+        push(`type GqlIsUnion<T, U = T> = [T extends unknown ? ([U] extends [T] ? false : true) : never] extends [false] ? false : true;`);
+        push(`type GqlPayloadKeys<T> = { [K in keyof T]-?: [GqlObjLike<T[K]>] extends [true] ? K : never }[keyof T];`);
+        push(`type GqlSingleKey<K> = [K] extends [never] ? never : ([GqlIsUnion<K>] extends [false] ? K : never);`);
+        push(`type GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([GqlSingleKey<GqlPayloadKeys<S>>] extends [never] ? never : S[GqlSingleKey<GqlPayloadKeys<S>> & keyof S]) : never;`);
+        // The field names a reading declares: the keys of every object member, so
+        // a nullable or union consumer names what each member names.
+        push(`type GqlNames<T> = T extends object ? keyof T : never;`);
+        push(`type GqlReadsOuter<S, E> = [Extract<Exclude<GqlNames<S>, GqlNames<GqlPayloadOf<S>>>, Exclude<GqlNames<E>, '__typename'>>] extends [never] ? false : true;`);
+        // carrick#1759: the server supplies `__typename` on every object a
+        // selection asks for, so the consumer's `__typename` is read as OPTIONAL,
+        // at any depth. It keeps its declared type: a producer that states a
+        // different one is still a mismatch, and tsc stays the judge of that.
+        //
+        //   - only an object that declares `__typename` is rebuilt, through one
+        //     anonymous mapped type, so modifiers survive, the field walk sees an
+        //     object root, and a headline prints its members, not a helper name;
+        //   - arrays and tuples map homomorphically, so they stay arrays, and a
+        //     function member is kept whole (a mapped function loses its call
+        //     signature and would accept anything);
+        //   - the depth bound ends the expansion; below it the consumer type is
+        //     compared as declared, which can only keep a mismatch;
+        //   - `GqlExpected` keeps the declared type whenever relaxing changes
+        //     nothing observable, so a consumer with no `__typename` to relax is
+        //     judged, and named in the headline, exactly as before.
+        //
+        // The envelope short-circuit below tests the RELAXED consumer: a consumer
+        // that names only fields the payload shares would otherwise fail it on
+        // `__typename` alone and unwrap onto that payload.
+        push(`type GqlDepth = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];`);
+        push(`type GqlTypenameParts<T, D extends number> = { [K in keyof T as K extends '__typename' ? never : K]: GqlTypenameOptional<T[K], GqlDepth[D]> } & { [K in keyof T as K extends '__typename' ? K : never]?: T[K] };`);
+        push(`type GqlTypenameOptional<T, D extends number = 16> = [D] extends [never] ? T : T extends (...args: any[]) => any ? T : T extends object ? ('__typename' extends keyof T ? { [K in keyof GqlTypenameParts<T, D>]: GqlTypenameParts<T, D>[K] } : { [K in keyof T]: GqlTypenameOptional<T[K], GqlDepth[D]> }) : T;`);
+        push(`type GqlExpected = [GqlTypenameOptional<Expected>] extends [Expected] ? Expected : GqlTypenameOptional<Expected>;`);
+        push(`type GqlComparand = [Sent] extends [GqlExpected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : [GqlReadsOuter<Sent, Expected>] extends [true] ? Sent : GqlPayloadOf<Sent>);`);
+        gateLines.set(push(`type _G_comparand_any = Assert<Not<IsAny<GqlComparand>>>;`), 'sent:any');
+        gateLines.set(push(`type _G_comparand_unknown = Assert<Not<IsUnknown<GqlComparand>>>;`), 'sent:unknown');
+        gateLines.set(push(`type _G_comparand_never = Assert<Not<IsNever<GqlComparand>>>;`), 'sent:never');
+        push(`declare const sentComparand: GqlComparand;`);
+        assignmentLine = push(`const expected: GqlExpected = sentComparand;`);
+    }
+    else {
+        assignmentLine = push(`const expected: Expected = sent;`);
+    }
+    // The JSON wire line (carrick-tools/carrick-cloud#1119). An `http` payload is
+    // serialised before it travels, and `JSON.stringify` writes a value's
+    // `toJSON()` RESULT: a producer's `Date` arrives at the consumer as the
+    // string it serialises to, so comparing the DECLARED `Date` against a
+    // correctly-declared `string` reports a drift that cannot happen. The
+    // transform is applied to the SENT side in BOTH directions, which is where
+    // serialisation happens: a consumer that sends a `Date` in a request body
+    // likewise delivers a string, so a producer declaring `Date` there is a real
+    // mismatch and stays one.
+    //
+    // `WireSent` short-circuits to the declared type when that already assigns,
+    // so a pair that agrees as declared never instantiates the mapped type (no
+    // cost, and no way for the transform to turn an agreeing pair into a
+    // disagreeing one). tsc stays the judge of both forms.
+    let wireAssignmentLine;
+    if (spec.protocol === 'http') {
+        // Keep the DECLARED type whenever serialising changes nothing observable,
+        // so the compiler's headline still names the real surface alias (the probe
+        // prints `Sent`, which the scrub rewrites) instead of expanding a mapped
+        // type structurally. Only a pair whose payload really is transformed loses
+        // that name — and there the declared name no longer describes what travels.
+        for (const line of jsonWireDeclarations(''))
+            push(line);
+        push(`type WireSent = [${sentBody}] extends [Expected] ? ${sentBody} : (JsonWireSame<JsonWire<${sentBody}>, ${sentBody}> extends true ? ${sentBody} : JsonWire<${sentBody}>);`);
+        push(`declare const sentWire: WireSent;`);
+        wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
+    }
+    // The unwidened reading (carrick#1538). A handler that returns
+    // `cond ? 'a' : 'b'` publishes `string`, because a literal widens where it
+    // is inferred, and a consumer that declares `'a' | 'b'` then mismatches a
+    // response it reads correctly. The capture keeps the reading with no literal
+    // widened beside the published alias, and it is assigned here a second time.
+    //
+    // Everything sits after the lines above, the import included, and none of it
+    // is recorded as an import, gate or assignment line: a missing export, a top
+    // type or a mismatch here says only that the second reading did not clear
+    // the pair, and the verdict on the published type stands.
+    //
+    // Only an `http` pair gets one: a response the producer sends, or a request
+    // body the consumer sends (carrick#2011), each judged on a decisive
+    // assignment the second reading mirrors, here in the wire form. A GraphQL
+    // pair compares an unwrapped comparand (above), which a plain assignment of
+    // the reading would not mirror. Socket and pub/sub payloads are not read
+    // again.
+    let unwidenedFromLine;
+    const sentUnwidenedAlias = spec.protocol === 'http' ? unwidenedAliasFor?.(sentEndpoint) : undefined;
+    if (sentUnwidenedAlias !== undefined) {
+        const local = UNWIDENED_LOCAL_NAME;
+        unwidenedFromLine = push(`import type { ${sentUnwidenedAlias} as ${local} } from '${sentPkg}';`);
+        push(`type _G_unwidened_any = Assert<Not<IsAny<${local}>>>;`);
+        push(`type _G_unwidened_unknown = Assert<Not<IsUnknown<${local}>>>;`);
+        push(`type _G_unwidened_never = Assert<Not<IsNever<${local}>>>;`);
+        let unwidenedBody = local;
+        if (absentBodyAllowed) {
+            push(`type SentUnwidenedBody = ${sentBodyType(local)};`);
+            unwidenedBody = 'SentUnwidenedBody';
+        }
+        push(`type WireSentUnwidened = [${unwidenedBody}] extends [Expected] ? ${unwidenedBody} : (JsonWireSame<JsonWire<${unwidenedBody}>, ${unwidenedBody}> extends true ? ${unwidenedBody} : JsonWire<${unwidenedBody}>);`);
+        push(`declare const sentWireUnwidened: WireSentUnwidened;`);
+        push(`const expectedWireUnwidened: Expected = sentWireUnwidened;`);
+    }
+    return {
+        pairId: id,
+        spec,
+        fileName: `pair_${id}.ts`,
+        direction,
+        sentEndpoint,
+        expectedEndpoint,
+        source: lines.join('\n') + '\n',
+        importLines,
+        gateLines,
+        assignmentLine,
+        wireAssignmentLine,
+        ...(unwidenedFromLine === undefined ? {} : { unwidenedFromLine }),
+    };
+}

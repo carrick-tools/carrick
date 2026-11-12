@@ -1,0 +1,483 @@
+/**
+ * Diagnostic parsing + bucket classification for the v2 check phase.
+ *
+ * The judge is the vendored `tsc` CLI with `--pretty false`, run from the
+ * workspace root so file locations print workspace-relative (no temp path in
+ * the location prefix). This module turns that text into per-pair verdicts,
+ * classifying by diagnostic code + file + line (never by line position alone):
+ *
+ *   poison (stub-file diagnostic)         -> unverifiable   [highest precedence]
+ *   surface import error (probe lines 1-2)-> unverifiable
+ *   IsAny gate fired (TS2344)             -> gate_caught_baked_any
+ *   IsUnknown/IsNever gate fired (TS2344) -> unverifiable
+ *   IsVoid gate fired (TS2344)            -> compatible with a note when the
+ *                                            consumer reads no response body;
+ *                                            else unverifiable (no body read)
+ *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
+ *   IsByteBody gate fired (TS2344)        -> unverifiable (bytes, even agreeing)
+ *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
+ *   assignment error, sent union taken in part by a weak expected type
+ *                                         -> unverifiable (carrick#1995)
+ *   assignment error on the published type that the sent side's unwidened
+ *   reading does not repeat               -> producer_wider (carrick#1538),
+ *                                            or compatible with a note when
+ *                                            the consumer sends (carrick#2011)
+ *   assignment-class error                -> incompatible
+ *   no diagnostics                        -> compatible     [lowest precedence]
+ *
+ * Gate precedence over the assignment line is load-bearing: an `unknown` side
+ * produces BOTH a gate TS2344 and an assignment TS2322, and reading the latter
+ * would mislabel an unverifiable pair as incompatible.
+ *
+ * Seam: node builtins + this bundle only.
+ */
+import { decisiveAssignmentLine, unwidenedAliasOf, } from './check-probe.js';
+import { scrubDiagnostic, scrubPaths } from './check-scrub.js';
+import { onlyDeclaredOpenMembers } from './deep-walk.js';
+import { describeFieldReport, fieldReportNotes, } from './check-fields.js';
+const PRIMARY_RE = /^(?<file>(?:[a-zA-Z]:)?[^(]*?)\((?<line>\d+),(?<col>\d+)\): error TS(?<code>\d+): (?<msg>.*)$/;
+/** Parse `tsc --pretty false` output into structured diagnostics. */
+export function parseTscOutput(stdout) {
+    const diags = [];
+    let current = null;
+    for (const rawLine of stdout.split('\n')) {
+        const line = rawLine.replace(/\r$/, '');
+        const m = line.match(PRIMARY_RE);
+        if (m && m.groups) {
+            current = {
+                file: m.groups.file.split('\\').join('/'),
+                line: Number(m.groups.line),
+                col: Number(m.groups.col),
+                code: Number(m.groups.code),
+                message: m.groups.msg,
+            };
+            diags.push(current);
+            continue;
+        }
+        // Indented continuation lines belong to the preceding primary diagnostic.
+        if (current && /^\s+\S/.test(line)) {
+            current.message += '\n' + line;
+            continue;
+        }
+        // Blank line or summary ("Found N errors.") ends the current run.
+        current = null;
+    }
+    return diags;
+}
+/** Assignment-class codes: a real structural mismatch on the value assignment. */
+const ASSIGNMENT_CODES = new Set([2322, 2559, 2739, 2740, 2741, 2769, 2345]);
+function sideForGate(name, plan) {
+    const [which, kind] = name.split(':');
+    const side = which === 'sent' ? plan.direction.sent : plan.direction.expected;
+    return { side, kind };
+}
+function endpointAliasFor(side, plan) {
+    return side === plan.direction.sent
+        ? plan.sentEndpoint.alias
+        : plan.expectedEndpoint.alias;
+}
+/** Classify one pair into exactly one bucket, honouring the precedence order. */
+export function classifyPair(input) {
+    const { plan, probeDiags, poisonReason, scrubCtx } = input;
+    // The lines of the unwidened reading (carrick#1538) answer one question, in
+    // 5b below. Their diagnostics are no part of what the published pair raised.
+    const codes = [
+        ...new Set(probeDiags.filter((d) => !onUnwidenedLines(plan, d)).map((d) => d.code)),
+    ].sort((a, b) => a - b);
+    // `notes` sits on `base` so EVERY bucket carries it, including the
+    // compatible one (carrick#1341). The two statements it holds are true of a
+    // pair that agreed — an optionality gap assigns, and the wire allowance is
+    // exactly what made the pair agree — so a channel only reachable from the
+    // mismatch branch would be the same missing channel the ticket is about.
+    const base = {
+        pair_id: plan.pairId,
+        pair_key: plan.spec.pair_key,
+        codes,
+        notes: pairNotes(input, scrubCtx),
+    };
+    // Every branch below this point except the last two returns a verdict about
+    // a type nobody could read; each states that in one place rather than
+    // repeating the reasoning.
+    const notAFact = (reason, side) => ({
+        resolved: false,
+        unresolved_reason: reason,
+        ...(side ? { unresolved_side: side } : {}),
+    });
+    // 1. Poison: a diagnostic in this pair's own alias closure (either side)
+    //    makes the pair unverifiable, never "no probe error -> compatible". A
+    //    sibling alias's poison in the same service no longer reaches here.
+    for (const side of ['producer', 'consumer']) {
+        const endpoint = plan.spec[side];
+        const reason = poisonReason(endpoint.service_name, endpoint.alias);
+        if (reason) {
+            return {
+                ...base,
+                bucket: 'unverifiable',
+                gate: `poison:${side}`,
+                diagnostic: `the type stub for service '${endpoint.service_name}' does not typecheck (its own declarations carry diagnostics); compatibility cannot be verified.`,
+                ...notAFact(`the ${side} stub does not typecheck`, side),
+            };
+        }
+    }
+    // 2. Surface import error (missing/renamed export): probe import lines.
+    const importDiag = probeDiags.find((d) => plan.importLines.includes(d.line));
+    if (importDiag) {
+        const side = plan.importLines[0] === importDiag.line ? plan.direction.sent : plan.direction.expected;
+        const alias = endpointAliasFor(side, plan);
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `import:${side}`,
+            diagnostic: `surface export '${alias}' for the ${side} is missing or renamed; compatibility cannot be verified.`,
+            ...notAFact(`the ${side} surface export is missing or renamed`, side),
+        };
+    }
+    // 3/4. Probe gates (TS2344). IsAny outranks IsUnknown/IsNever.
+    const gateDiags = probeDiags.filter((d) => d.code === 2344 && plan.gateLines.has(d.line));
+    const anyGate = gateDiags
+        .map((d) => plan.gateLines.get(d.line))
+        .find((name) => name.endsWith(':any'));
+    if (anyGate) {
+        const { side } = sideForGate(anyGate, plan);
+        return {
+            ...base,
+            bucket: 'gate_caught_baked_any',
+            gate: `${side}:any`,
+            diagnostic: `the ${side} type resolved to 'any' at check time; compatibility cannot be verified (a type inferred through a missing library bakes to any).`,
+            ...notAFact(`the ${side} type is 'any'`, side),
+        };
+    }
+    const decayGate = gateDiags
+        .map((d) => plan.gateLines.get(d.line))
+        .find((name) => name.endsWith(':unknown') || name.endsWith(':never'));
+    if (decayGate) {
+        const { side, kind } = sideForGate(decayGate, plan);
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${side}:${kind}`,
+            diagnostic: `the ${side} type resolved to '${kind}' at check time; compatibility cannot be verified.`,
+            ...notAFact(`the ${side} type is '${kind}'`, side),
+        };
+    }
+    // 4b. A side that states no contract (carrick#1162), below the decay gates so
+    //     an `unknown` side is reported as `unknown`: a `void`/`undefined`
+    //     response a call site reads no body from, and a form-encoded body whose
+    //     fields are runtime appends.
+    const shapeGate = gateDiags
+        .map((d) => plan.gateLines.get(d.line))
+        .find((name) => name.endsWith(':void') || name.endsWith(':form'));
+    if (shapeGate) {
+        const { side, kind } = sideForGate(shapeGate, plan);
+        // A call site that reads no response body is compatible with whatever the
+        // producer answers: nothing it does depends on the body. Only the
+        // response direction (http, graphql), where the consumer is the expected
+        // side; a void producer, or a consumer that sends void (a request, a
+        // socket or pub/sub payload), still states no contract. The producer's
+        // own top-type gates fired above, and `factness` still reads the producer
+        // side, so a producer with an `any` inside stays not a fact.
+        if (kind === 'void' && side === 'consumer' && plan.direction.expected === 'consumer') {
+            return {
+                ...base,
+                bucket: 'compatible',
+                notes: [...base.notes, CONSUMER_READS_NO_BODY_NOTE],
+                ...factness(input),
+            };
+        }
+        if (kind === 'void') {
+            return {
+                ...base,
+                bucket: 'unverifiable',
+                gate: `${side}:void`,
+                diagnostic: `the ${side} type is 'void' (it reads no body), so there is no contract to verify.`,
+                ...notAFact(`the ${side} type is 'void'`, side),
+            };
+        }
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${side}:form`,
+            diagnostic: `the ${side} sends a form-encoded body, whose fields are appended at runtime and cannot be compared with a declared shape.`,
+            ...notAFact(`the ${side} sends a form-encoded body`, side),
+        };
+    }
+    // 4c. A body of bytes (carrick#1793): a blob, a buffer or a stream has no JSON
+    //     shape, and the check cannot read a file's content. So a pair with
+    //     bytes on either side states no contract, whether the two sides
+    //     mismatch (a `Uint8Array` sent, read with `.blob()`) or agree (a stream
+    //     sent where a stream is read, carrick#1812). When both sides are bytes
+    //     the sent side is named, whatever order the diagnostics came in.
+    const firedGates = new Set(gateDiags.map((d) => plan.gateLines.get(d.line)));
+    const bytesGate = firedGates.has('sent:bytes')
+        ? 'sent:bytes'
+        : firedGates.has('expected:bytes')
+            ? 'expected:bytes'
+            : undefined;
+    if (bytesGate) {
+        const { side } = sideForGate(bytesGate, plan);
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${side}:bytes`,
+            diagnostic: `the ${side} body is bytes (a blob, a buffer or a stream), which has no JSON shape to compare with the other side.`,
+            ...notAFact(`the ${side} body is bytes`, side),
+        };
+    }
+    // 4d. A body read as raw text (carrick#1842): a `.text()` read, or a request
+    //     library's text format, takes the body unparsed, so `string` there
+    //     states no structural contract. Like bytes, the pair is not compared,
+    //     whether or not the other side's type assigns to `string`.
+    if (input.rawTextSide && plan.spec.protocol === 'http') {
+        const side = input.rawTextSide;
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${side}:text`,
+            diagnostic: `the ${side} reads the body as raw text, which has no JSON shape to compare with the other side.`,
+            ...notAFact(`the ${side} reads the body as raw text`, side),
+        };
+    }
+    // 4e. Pub/sub, one side the whole message and the other not (carrick#1979):
+    //     a subscriber's type is the message (topic key, tag, payload, stamped
+    //     fields) while a publisher's is the payload or a batch, so comparing
+    //     them reads every stamped field as missing. Not a fact either way, and
+    //     no side to retype: the pair is not compared.
+    const envelopeGate = firedGates.has('sent:envelope')
+        ? 'sent:envelope'
+        : firedGates.has('expected:envelope')
+            ? 'expected:envelope'
+            : undefined;
+    if (envelopeGate) {
+        // The gate names the side that states the topic: the whole message. On a
+        // pub/sub pair the producer is the subscriber and the consumer the publisher.
+        const { side: wholeSide } = sideForGate(envelopeGate, plan);
+        const role = (s) => (s === 'producer' ? 'subscriber' : 'publisher');
+        const other = wholeSide === 'producer' ? 'consumer' : 'producer';
+        const reason = `the ${role(wholeSide)}'s type is the whole message and the ${role(other)}'s type is not, so the two are not compared`;
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${wholeSide}:envelope`,
+            diagnostic: reason,
+            ...notAFact(reason),
+        };
+    }
+    // 5. Assignment-class error on the DECISIVE assignment line -> incompatible.
+    //
+    // On an `http` pair that line is the JSON wire assignment, not the declared
+    // one (carrick-tools/carrick-cloud#1119). The two cannot disagree in the
+    // direction that matters: the wire comparand short-circuits to the declared
+    // type whenever that already assigns, so an error there means the shapes
+    // disagree as declared AND as serialised. A pair whose declared forms
+    // disagree only over what serialisation changes (a producer `Date` read as
+    // the `string` it becomes) has no error on this line and is not a drift.
+    const decisiveLine = decisiveAssignmentLine(plan);
+    const assignDiag = probeDiags.find((d) => d.line === decisiveLine && ASSIGNMENT_CODES.has(d.code));
+    // 5a. Unless the mismatch is a sent union the expected type takes in part,
+    //     the members it rejects sharing no field with a type whose every field
+    //     is optional (carrick#1995). That is a route answering a body per
+    //     branch read by a caller of one branch: no member breaks a reader whose
+    //     every read allows absence, and which member the call receives is not
+    //     in the types. Not a fact either way, and no side to retype.
+    if (assignDiag && input.dispatchUnion) {
+        const { members, agreeing } = input.dispatchUnion;
+        const sent = plan.direction.sent;
+        const expected = plan.direction.expected;
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: `${sent}:union`,
+            diagnostic: `the ${sent} type is a union of ${members} bodies; the ${expected} type, every field optional, accepts ${agreeing} of them and shares no field with the other ${members - agreeing}, so the call reads one of the bodies the route answers and the types do not say which.`,
+            ...notAFact(`the ${sent} type is a union of bodies and the ${expected} type, every field optional, accepts only some of them`),
+        };
+    }
+    // 5b. Or the mismatch is the published type's alone (carrick#1538): a
+    //     literal widened where the handler's return was inferred. The handler's
+    //     return read with no literal widened fits what the other side expects,
+    //     so what travels agrees and only the published type is wider. Its own
+    //     bucket, which carries no diagnostic: a reason is read as a mismatch.
+    //     carrick#2011: the same for a request body, where the consumer sends
+    //     and its body was read with the literals the call writes kept. A
+    //     consumer has no class of its own on the wire, so the pair is the
+    //     compatible it is, and a note says the published type is wider.
+    if (assignDiag && unwidenedReadingFits(input)) {
+        if (plan.direction.sent === 'consumer') {
+            return {
+                ...base,
+                bucket: 'compatible',
+                notes: [...base.notes, CONSUMER_WIDER_NOTE],
+                ...factness(input),
+            };
+        }
+        return { ...base, bucket: 'producer_wider', ...factness(input) };
+    }
+    if (assignDiag) {
+        const text = scrubDiagnostic(assignDiag.message, scrubCtx, plan.sentEndpoint.alias, plan.expectedEndpoint.alias);
+        return {
+            ...base,
+            bucket: 'incompatible',
+            diagnostic: text + namedFields(input, scrubCtx),
+            ...factness(input),
+        };
+    }
+    // Any other diagnostic on the DECLARED assignment line that is not a known
+    // assignment code still means the pair could not be cleanly verified.
+    // A mismatch there with none on the wire line is not one of these: it is the
+    // pair the wire rule just cleared, and it falls through to `compatible`.
+    const scrub = (text) => scrubDiagnostic(text, scrubCtx, plan.sentEndpoint.alias, plan.expectedEndpoint.alias);
+    const otherAssign = probeDiags.find((d) => d.line === plan.assignmentLine && !ASSIGNMENT_CODES.has(d.code));
+    if (otherAssign) {
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: 'assignment:other',
+            diagnostic: scrub(otherAssign.message),
+            ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
+        };
+    }
+    // The same on the WIRE line: the serialised form was never judged (a type too
+    // deep to instantiate the transform over, say). What the DECLARED forms say
+    // is then the only judgment there is, and a mismatch in them is still a
+    // mismatch — reporting it as unverifiable would hide a real one. The
+    // unjudged wire form is named, because it is the reason the usual
+    // serialisation allowance did not apply.
+    const wireOther = plan.wireAssignmentLine === undefined
+        ? undefined
+        : probeDiags.find((d) => d.line === plan.wireAssignmentLine && !ASSIGNMENT_CODES.has(d.code));
+    if (wireOther) {
+        const declaredMismatch = probeDiags.find((d) => d.line === plan.assignmentLine && ASSIGNMENT_CODES.has(d.code));
+        if (declaredMismatch) {
+            return {
+                ...base,
+                bucket: 'incompatible',
+                diagnostic: scrub(declaredMismatch.message) +
+                    ' The serialised form of the sent type could not be computed, so this' +
+                    ' compares the types as declared.' +
+                    namedFields(input, scrubCtx),
+                ...factness(input),
+            };
+        }
+        return {
+            ...base,
+            bucket: 'unverifiable',
+            gate: 'assignment:other',
+            diagnostic: scrub(wireOther.message),
+            ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
+        };
+    }
+    // 6. No diagnostics -> compatible.
+    return { ...base, bucket: 'compatible', ...factness(input) };
+}
+/**
+ * The note on a request the consumer's unwidened reading cleared
+ * (carrick#2011).
+ */
+export const CONSUMER_WIDER_NOTE = "the consumer's published request type is wider than what the call sends: " +
+    'it widened a literal the call writes, and the values sent fit the producer';
+/** The note on a pair whose consumer reads no response body (carrick#1162). */
+export const CONSUMER_READS_NO_BODY_NOTE = 'the consumer reads no response body (its expected response is void), so the producer response is not compared with a read';
+function onUnwidenedLines(plan, diagnostic) {
+    return plan.unwidenedFromLine !== undefined && diagnostic.line >= plan.unwidenedFromLine;
+}
+/**
+ * Whether the sent side's unwidened reading clears a mismatch on its published
+ * type (carrick#1538). Every condition must hold, and each absence leaves the
+ * published verdict as it is:
+ *
+ * - the probe carries the reading (its stub ships the unwidened alias);
+ * - the compiler raised nothing on its lines: not on the import (the export is
+ *   there), not on its top-type gates, not on its assignment;
+ * - its own declarations typecheck (the alias is not poisoned);
+ * - the member-level walk ran over it and found no `any`/`unknown`, which
+ *   would assign to whatever the other side declares;
+ * - the same walk found none on the two published sides either, an open
+ *   member included (carrick#2591). A mismatch that is not a fact stays the
+ *   mismatch it was: the reading would be clearing it against a member that
+ *   accepts anything.
+ */
+function unwidenedReadingFits(input) {
+    const { plan, probeDiags, poisonReason } = input;
+    if (plan.unwidenedFromLine === undefined)
+        return false;
+    if (probeDiags.some((d) => onUnwidenedLines(plan, d)))
+        return false;
+    const sent = plan.sentEndpoint;
+    if (poisonReason(sent.service_name, unwidenedAliasOf(sent.alias)))
+        return false;
+    const walked = input.deepFindings?.sentUnwidened;
+    return walked !== undefined && walked.length === 0 && factness(input, true).resolved;
+}
+/**
+ * The field-level sentence appended to a mismatch diagnostic
+ * (carrick-tools/carrick-cloud#1118), or `''` when the walk found nothing to
+ * name. Scrubbed on the same terms as the tsc text: a printed member type can
+ * carry a stub-absolute `import("...")` path.
+ */
+/**
+ * The observations this pair states that are not its verdict (carrick#1341):
+ * the note that the comparison was made against the serialised form, and each
+ * optionality gap the walk found. Empty when the walk did not run or found
+ * nothing to add — never a claim that the two sides agree.
+ *
+ * Scrubbed on the same terms as the diagnostic: a printed member type can
+ * carry a stub-absolute `import("...")` path.
+ *
+ * A note is an OBSERVATION and never moves a bucket. Nothing in this function
+ * reaches `bucket`, `resolved` or `unresolved_reason`, and the pair's verdict
+ * is decided above before this is read.
+ */
+function pairNotes(input, scrubCtx) {
+    const report = input.fieldReport;
+    if (!report)
+        return [];
+    return fieldReportNotes(report, input.plan.direction.sent, input.plan.direction.expected).map((note) => scrubPaths(note, scrubCtx));
+}
+function namedFields(input, scrubCtx) {
+    const report = input.fieldReport;
+    if (!report)
+        return '';
+    const text = describeFieldReport(report, input.plan.direction.sent, input.plan.direction.expected);
+    return text === '' ? '' : scrubPaths(text, scrubCtx);
+}
+/**
+ * Whether a compared pair is a FACT about two known types (carrick#707, R1d).
+ *
+ * The probe gates only rule out a WHOLLY top-typed side. A pair whose producer
+ * declares `{ id: string; meta: any }` clears every gate and then reads
+ * compatible against literally any counterparty `meta`, because `any` is
+ * bidirectionally assignable. That is not a compatibility result, and a reader
+ * who acts on it acts on nothing. So `resolved` additionally requires the deep
+ * walk to have RUN over both sides in the assembled workspace and come back
+ * empty. A walk that could not run leaves the verdict not-a-fact: absence of
+ * findings is not evidence.
+ */
+function factness(input, strict = false) {
+    const findings = input.deepFindings;
+    if (!findings) {
+        return {
+            resolved: false,
+            unresolved_reason: 'the type could not be walked for member-level any/unknown after install, so the comparison is not established as a fact',
+        };
+    }
+    for (const side of ['sent', 'expected']) {
+        // Open members only (carrick#2591): the closed members were judged and an
+        // open one is never a mismatch, so the verdict is a fact about the type.
+        // A declared `unknown` is open on the receiving side alone.
+        if (!strict &&
+            onlyDeclaredOpenMembers(findings[side], side === 'expected', findings[side === 'sent' ? 'expected' : 'sent']))
+            continue;
+        const first = findings[side][0];
+        if (!first)
+            continue;
+        const label = side === 'sent' ? input.plan.direction.sent : input.plan.direction.expected;
+        const where = first.path === '' ? 'its root' : `'${first.path}'`;
+        return {
+            resolved: false,
+            unresolved_side: label,
+            unresolved_reason: first.kind === 'budget_exhausted'
+                ? `the ${label} type is too deep or wide to verify at ${where}`
+                : `the ${label} type carries '${first.kind}' at ${where}, which every counterparty shape satisfies`,
+        };
+    }
+    return { resolved: true };
+}

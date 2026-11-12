@@ -1,0 +1,214 @@
+/**
+ * Every file the sidecar writes or deletes goes through a {@link WriteGuard}
+ * (carrick#1748).
+ *
+ * A scan reads the repo it scans and never writes it. carrick#1742 showed how
+ * easily that breaks: the capture self-check reaches the repo's own sources
+ * through a `node_modules` link, and a pass that "only rewrites its own
+ * declarations" rewrote them. Each write site used to be safe only by its own
+ * reasoning. Now each run names the directories it owns (its scratch, the stub
+ * it emits, a runtime cache) and every write and delete is checked against
+ * them, on the RESOLVED path, before it happens.
+ *
+ * Resolution follows the operation:
+ *  - a write lands where the path's links lead, so the whole path is resolved,
+ *    and a path that does not exist yet resolves through its deepest existing
+ *    ancestor (a dangling link resolves through its target);
+ *  - a delete, or a new link, touches the directory entry itself, so only the
+ *    parent is resolved. Unlinking the stub's `node_modules` link is allowed;
+ *    writing through it into the repo's packages is refused.
+ *
+ * `test/no-raw-writes.test.ts` fails when any other source file calls a
+ * mutating `fs` API.
+ */
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+/** A write or delete the guard refused, or a root it would not accept. */
+export class WriteRefused extends Error {
+    constructor(message) {
+        super(`${message} (carrick#1748)`);
+        this.name = 'WriteRefused';
+    }
+}
+export class WriteGuard {
+    dirs;
+    files;
+    protect;
+    constructor(dirs, files, protect) {
+        this.dirs = dirs;
+        this.files = files;
+        this.protect = protect;
+    }
+    /**
+     * A guard over `roots`. Throws when a root equals or contains a protected
+     * tree, or when a directory root lies inside one anywhere but beneath a
+     * `.carrick` directory (carrick#1768).
+     */
+    static of(roots) {
+        const protect = (roots.protect ?? []).map(landing);
+        const dirs = (roots.dirs ?? []).map(landing);
+        const files = (roots.files ?? []).map(entry);
+        for (const root of [...dirs, ...files]) {
+            const covered = protect.find((tree) => within(root, tree));
+            if (covered !== undefined) {
+                throw new WriteRefused(`refused write root ${root}: it is or contains the scanned tree ${covered}`);
+            }
+        }
+        // Inside a scanned tree, a directory root is Carrick's only beneath a
+        // `.carrick` directory. Anywhere else it is the repo's own (a sibling
+        // service, say), and a stub dir is emptied before it is written. A file
+        // root is exempt: the surface entry has to sit inside rootDir.
+        for (const root of dirs) {
+            const inside = protect.find((tree) => within(tree, root) && !carrickOwned(tree, root));
+            if (inside !== undefined) {
+                throw new WriteRefused(`refused write root ${root}: it lies inside the scanned tree ${inside}, outside a .carrick directory`);
+            }
+        }
+        return new WriteGuard(dirs, files, protect);
+    }
+    /**
+     * A new, empty directory under `parent` (the OS temp dir by default) and a
+     * guard over it alone. `mkdtemp` picks an unused name, so creating it cannot
+     * overwrite anything; `parent` is created when missing.
+     */
+    static scratch(prefix, parent = os.tmpdir()) {
+        fs.mkdirSync(parent, { recursive: true });
+        const dir = fs.mkdtempSync(path.join(parent, prefix));
+        return { dir, guard: WriteGuard.of({ dirs: [dir] }) };
+    }
+    /** This guard with more roots, under the same protected trees. */
+    with(roots) {
+        return WriteGuard.of({
+            dirs: [...this.dirs, ...(roots.dirs ?? [])],
+            files: [...this.files, ...(roots.files ?? [])],
+            protect: [...this.protect],
+        });
+    }
+    /** A guard over `dir` alone, which must already be writable under this one. */
+    narrow(dir) {
+        this.check(dir, landing(dir), 'narrow to');
+        return WriteGuard.of({ dirs: [dir], protect: [...this.protect] });
+    }
+    /** Whether a write to `p` would land inside this guard's roots. */
+    allowsWrite(p) {
+        return this.holds(landing(p));
+    }
+    /** Throws unless `p` (a subprocess's working directory, say) lies inside the roots. */
+    assertWithin(p) {
+        this.check(p, landing(p), 'work in');
+    }
+    writeFile(p, data) {
+        this.check(p, landing(p), 'write');
+        fs.writeFileSync(p, data);
+    }
+    /** `mkdir -p`. A directory that already exists is no write and passes unchecked. */
+    mkdir(p) {
+        if (isDirectory(p))
+            return;
+        this.check(p, landing(p), 'create directory');
+        fs.mkdirSync(p, { recursive: true });
+    }
+    copyFile(from, to) {
+        this.check(to, landing(to), 'copy into');
+        fs.copyFileSync(from, to);
+    }
+    /** `cp -R`. Links in the source are copied as links, never written through. */
+    copyTree(from, to, filter) {
+        this.check(to, landing(to), 'copy into');
+        fs.cpSync(from, to, { recursive: true, filter });
+    }
+    /** `rm -rf`. A link is removed itself; its target is left alone. */
+    remove(p) {
+        this.check(p, entry(p), 'delete');
+        fs.rmSync(p, { recursive: true, force: true });
+    }
+    unlink(p) {
+        this.check(p, entry(p), 'delete');
+        fs.unlinkSync(p);
+    }
+    /**
+     * Move a file into place: both directory entries change, so both are
+     * checked as a delete is. A write that must never be read half-done is
+     * written beside its target and renamed over it.
+     */
+    rename(from, to) {
+        this.check(from, entry(from), 'move');
+        this.check(to, entry(to), 'move onto');
+        fs.renameSync(from, to);
+    }
+    symlink(target, linkPath, type) {
+        this.check(linkPath, entry(linkPath), 'link');
+        fs.symlinkSync(target, linkPath, type);
+    }
+    holds(resolved) {
+        return this.files.includes(resolved) || this.dirs.some((root) => within(root, resolved));
+    }
+    check(p, resolved, verb) {
+        if (this.holds(resolved))
+            return;
+        throw new WriteRefused(`refused to ${verb} ${p}` +
+            (resolved === path.resolve(p) ? '' : ` (resolves to ${resolved})`) +
+            ': outside this run\'s scratch, stub and cache roots');
+    }
+}
+/** Whether `p` is `root` or lies beneath it. Both are resolved paths. */
+function within(root, p) {
+    const rel = path.relative(root, p);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+/**
+ * Whether `root`, inside `tree`, lies beneath a `.carrick` directory between
+ * the two. `.carrick` itself is not enough: it holds the workspace's proposal,
+ * jobs and scan logs. Both are resolved paths.
+ */
+function carrickOwned(tree, root) {
+    return path.relative(tree, root).split(path.sep).slice(0, -1).includes('.carrick');
+}
+function isDirectory(p) {
+    try {
+        return fs.statSync(p).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Where a write to `p` lands: every link resolved, through the deepest
+ * existing ancestor when `p` does not exist yet, and through a dangling link's
+ * target (writing to a dangling link creates its target).
+ */
+function landing(p, hops = 0) {
+    const abs = path.resolve(p);
+    try {
+        return fs.realpathSync.native(abs);
+    }
+    catch {
+        // Missing, or a link whose target is missing.
+    }
+    let link;
+    try {
+        if (fs.lstatSync(abs).isSymbolicLink())
+            link = fs.readlinkSync(abs);
+    }
+    catch {
+        // Not there at all.
+    }
+    if (link !== undefined) {
+        if (hops > 40)
+            throw new WriteRefused(`refused ${abs}: too many symbolic links`);
+        return landing(path.resolve(path.dirname(abs), link), hops + 1);
+    }
+    const parent = path.dirname(abs);
+    if (parent === abs)
+        return abs;
+    return path.join(landing(parent, hops), path.basename(abs));
+}
+/** The directory entry `p` names: its parent resolved, its own name kept. */
+function entry(p) {
+    const abs = path.resolve(p);
+    const parent = path.dirname(abs);
+    if (parent === abs)
+        return abs;
+    return path.join(landing(parent), path.basename(abs));
+}
