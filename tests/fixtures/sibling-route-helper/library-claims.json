@@ -1,0 +1,37 @@
+{
+  "library_claims": [
+    {
+      "package": "fixture-route-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-route-server",
+          "export": "route",
+          "role": "server_framework",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": null,
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

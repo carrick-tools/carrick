@@ -150,3 +150,7 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/
 !tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/package.json
 !tests/fixtures/factory-closure/repo/services/web/node_modules/@fixture/pub/index.d.ts
+!tests/fixtures/sibling-route-helper/repo/node_modules/
+!tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/
+!tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/package.json
+!tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/index.d.ts

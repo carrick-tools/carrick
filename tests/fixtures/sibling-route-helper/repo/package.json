@@ -1,0 +1,8 @@
+{
+  "name": "sibling-route-helper",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-route-server": "^1.0.0"
+  }
+}
