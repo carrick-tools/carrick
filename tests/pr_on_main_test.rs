@@ -247,6 +247,24 @@ fn sidecar_for(repo: &Path) -> Option<TypeSidecar> {
 }
 
 async fn scan_with(store: &Store, repo: &Path, typed: bool) {
+    // PROOF-BRANCH ONLY (carrick#3711 L3): every scan runs as production
+    // does, with the sidecar, and the store answers `fetch`.
+    let _ = typed;
+    let typed = true;
+    let set_here = std::env::var("CARRICK_MOCK_FIXTURE_DIR").is_err();
+    if set_here {
+        unsafe {
+            std::env::set_var(
+                "CARRICK_MOCK_FIXTURE_DIR",
+                format!(
+                    "{}/",
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/local-mode-workspace/__llm__")
+                        .display()
+                ),
+            );
+        }
+    }
     let sidecar = if typed { sidecar_for(repo) } else { None };
     if typed {
         assert!(sidecar.is_some(), "the type cases need the built sidecar");
@@ -259,6 +277,9 @@ async fn scan_with(store: &Store, repo: &Path, typed: bool) {
     )
     .await
     .expect("scan failed");
+    if set_here {
+        unsafe { std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR") };
+    }
 }
 
 async fn scan(store: &Store, repo: &Path) {
