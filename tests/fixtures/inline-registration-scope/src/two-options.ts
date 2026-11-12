@@ -1,9 +1,8 @@
-import type { App } from 'fixture-plugin-server';
 import { itemDetailRoutes } from './item-detail';
 
-export async function api(app: App, opts: { prefix?: string }) {
+export async function api(app: any, opts: { prefix?: string }) {
   app.register(
-    async (api: App) => {
+    async (api: any) => {
       await api.register(itemDetailRoutes);
     },
     { prefix: opts.prefix ?? '/api/v1', assets: '/static' },

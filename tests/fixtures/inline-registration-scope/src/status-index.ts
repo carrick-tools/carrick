@@ -1,6 +1,5 @@
-import type { App } from 'fixture-plugin-server';
 import { statusRoutes } from './errors';
 
-export async function main(server: App) {
+export async function main(server: any) {
   server.register(statusRoutes, { prefix: '/internal' });
 }

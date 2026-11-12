@@ -193,7 +193,3 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/
 !tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/package.json
 !tests/fixtures/sibling-route-helper/repo/node_modules/fixture-route-server/index.d.ts
-!tests/fixtures/inline-registration-scope/node_modules/
-!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/
-!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/package.json
-!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/index.d.ts

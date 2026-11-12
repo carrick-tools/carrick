@@ -1,9 +1,8 @@
-import type { App } from 'fixture-plugin-server';
 import { itemRoutes } from './items';
 
-export async function api(app: App, opts: { legacy?: boolean }) {
+export async function api(app: any, opts: { legacy?: boolean }) {
   app.register(
-    async (api: App) => {
+    async (api: any) => {
       await api.register(itemRoutes);
     },
     { prefix: opts.legacy ? '/legacy' : '/api/v3' },

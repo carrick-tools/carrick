@@ -1,5 +1,3 @@
-import type { App } from 'fixture-plugin-server';
-
-export async function itemRoutes(app: App) {
+export async function itemRoutes(app: any) {
   app.get('/items', async () => []);
 }

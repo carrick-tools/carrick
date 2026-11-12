@@ -1,7 +1,5 @@
-import type { App } from 'fixture-plugin-server';
-
 // Handlers that answer in more than one way behind one route.
-export async function reportRoutes(app: App) {
+export async function reportRoutes(app: any) {
   // The mode is read off the query string: one operation, whatever it sends.
   app.get('/reports/:id', async (request: any) =>
     request.query.mode === 'advanced' ? { id: '1', lines: [] } : { id: '1' },
