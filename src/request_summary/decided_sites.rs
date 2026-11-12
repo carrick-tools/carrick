@@ -2346,6 +2346,9 @@ struct Walk<'a, 'i> {
     /// The functions some discovered site's chain enters: their callers are
     /// listed by discovery as sites of their own.
     entered: &'i HashSet<(PathBuf, String)>,
+    /// The calls a verified runner label names, by file and span start, with
+    /// the slot each is handed its function at (carrick#3481).
+    runners: &'i HashMap<(PathBuf, u32), ArgSlot>,
 }
 
 /// One value a maker call's name slot takes ([`Walk::made_with`]): the call
@@ -2846,6 +2849,26 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// The stop for a parameter that is a callback's own: `runs_by_library`
+    /// when the function holding it is written at the slot a verified runner
+    /// label names on the call that hands it (carrick#3481), else
+    /// `callback_parameter`.
+    fn callback_stop(&self, placed: &Placed<'a>) -> Stop {
+        let slot = placed.written_in.and_then(|written| {
+            self.runners
+                .get(&(placed.file.to_path_buf(), written.site.span_start))
+                .map(|slot| (slot, written))
+        });
+        match slot {
+            Some((slot, written))
+                if slot.arg == written.arg && written.path.as_slice() == slot.key.as_slice() =>
+            {
+                Stop::RunsByLibrary
+            }
+            _ => Stop::CallbackParameter,
+        }
+    }
+
     fn up_from(
         &mut self,
         down: &[Placed<'a>],
@@ -2855,7 +2878,8 @@ impl<'a> Walk<'a, '_> {
     ) {
         let placed = down[0];
         let Some(own) = to_definition(pieces, placed.depth) else {
-            self.open_lead(&placed, end, Stop::CallbackParameter);
+            let why = self.callback_stop(&placed);
+            self.open_lead(&placed, end, why);
             return;
         };
         let Some(key) = placed.key else {
@@ -3471,6 +3495,14 @@ fn decide(
     // The dry run's own resolver (carrick#3504 B10-2a2): its queries leave
     // the walk's resolver as it was.
     let dry_run = Resolver::new(inputs, &calls.siblings);
+    let runners: HashMap<(PathBuf, u32), ArgSlot> = discovered
+        .iter()
+        .filter_map(|site| {
+            let end = site.end.as_ref()?;
+            let slot = SiteLabel::runner(labels, end)?;
+            Some(((root.join(&end.file), end.span_start), slot.clone()))
+        })
+        .collect();
     let mut walk = Walk {
         calls: &calls,
         inputs,
@@ -3491,6 +3523,7 @@ fn decide(
         template: None,
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
+        runners: &runners,
     };
     for (at, site) in discovered.iter().enumerate() {
         let shifted = shifted[at].as_slice();
@@ -3714,7 +3747,8 @@ fn decide(
                 });
         }
         let Some(top) = values[0].clone() else {
-            walk.lead(&chain[0], end, Stop::CallbackParameter);
+            let why = walk.callback_stop(&chain[0]);
+            walk.lead(&chain[0], end, why);
             continue;
         };
         if walk.settles(&chain[0], &top, end) {
@@ -5198,6 +5232,56 @@ pub(crate) mod tests {
                 "{file}:{}",
                 line_of(&text, "client.prefetch({ key")
             )]
+        );
+    }
+
+    /// carrick#3481: a callback's own parameter, inside a function a labelled
+    /// runner runs, stops as `runs_by_library`; one inside a function handed
+    /// to a call no label names as a runner stays `callback_parameter`.
+    #[test]
+    fn a_callback_parameter_in_a_runner_run_function_stops_as_runs_by_library() {
+        const RUNS: &str = "src/slots/runs_params.ts";
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(RUNS)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "useSend", "role": "http_client", "label": "request_runner",
+                  "claims": [{ "kind": "make", "form": "call", "member": null,
+                               "runs": { "arg": 0, "key": "send" } }] }
+            ]))
+            .unwrap();
+        let mut labels = SiteLabel::from_exports(&exports);
+        labels.push(fetch_label());
+        let label = fetch_label();
+        let runner = |call: &str| {
+            let mut end = stated_end(&text, "cache-kit", "useSend", None, "http_client", call);
+            end.file = RUNS.into();
+            end
+        };
+        let fetch = |call: &str| bottom(&end_for(&label, RUNS, &text, call), "fetch");
+        let sites = [
+            bottom(&runner("useSend({ send: (u)"), "useSend"),
+            bottom(&runner("useSend({ send: (ctx)"), "useSend"),
+            fetch("fetch(u)"),
+            fetch("fetch(ctx.url)"),
+            fetch("fetch(w)"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        let reasons: Vec<(u32, Stop)> = decided
+            .leads
+            .iter()
+            .filter(|lead| lead.end.export == "fetch")
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (line_of(&text, "fetch(u)"), Stop::RunsByLibrary),
+                (line_of(&text, "fetch(ctx.url)"), Stop::RunsByLibrary),
+                (line_of(&text, "fetch(w)"), Stop::CallbackParameter),
+            ]
         );
     }
 
