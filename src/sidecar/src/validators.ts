@@ -612,6 +612,7 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       member: z.string().min(1).nullable(),
       base: ClaimSlotSchema.optional(),
       prefix: ClaimSlotSchema.optional(),
+      protocol: z.enum(['http', 'graphql', 'rpc', 'socket', 'message']).optional(),
       name: NameSlotSchema.optional(),
       handler: ClaimSlotSchema.optional(),
       runs: ClaimSlotSchema.optional(),

@@ -805,6 +805,8 @@ export type LibraryClaim =
       base?: ClaimSlot;
       /** A prefix every name the instance sends gets. */
       prefix?: ClaimSlot;
+      /** Amendment 11: `graphql` says the maker serves GraphQL operations over HTTP (`runs` required, `server_framework` only). */
+      protocol?: ClaimProtocol;
       /** A definition's id or a queue's name: bound to every op that names `{ bound: 'maker' }`. */
       name?: NameSlot;
       handler?: ClaimSlot;

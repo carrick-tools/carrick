@@ -118,6 +118,22 @@ const ROLE_PROTOCOLS: Readonly<Record<LibraryRole, ReadonlySet<string>>> = {
   none: new Set(),
 };
 
+/**
+ * A maker's `protocol` (amendment 11): only `graphql` is a make protocol, on
+ * `server_framework` only (any other role is `protocol_role`), and it takes
+ * `runs`, with `prefix` optional, and no `name`, `base`, `handler` or
+ * `key_labels`. Undefined when the check has no make protocol or it is well
+ * formed; the make is then judged as any other.
+ */
+function makeProtocolRefusal(check: LibraryCheck): 'claim_invalid' | 'protocol_role' | undefined {
+  const claim = check.claim;
+  if (claim.kind !== 'make' || claim.protocol === undefined) return undefined;
+  if (claim.protocol !== 'graphql') return 'claim_invalid';
+  if (check.role !== 'server_framework') return 'protocol_role';
+  const stray = claim.name !== undefined || claim.base !== undefined || claim.handler !== undefined || claim.key_labels !== undefined;
+  return claim.runs === undefined || stray ? 'claim_invalid' : undefined;
+}
+
 /** The type names a `document` name slot accepts; a string is accepted too. */
 const DOCUMENT_TYPES: ReadonlySet<string> = new Set([
   'DocumentNode',
@@ -964,6 +980,8 @@ export class LibraryClaimsVerifier {
 
       const judgeCheck = (index: number): Judged => {
         const check = checks[index];
+        const makeProtocol = makeProtocolRefusal(check);
+        if (makeProtocol !== undefined) return { outcome: unchecked(makeProtocol) };
         const rules = rulesFor(check);
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
