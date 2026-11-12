@@ -676,24 +676,46 @@ export function pendingFor(session: string, home?: string): Pending[] {
  * Answers this session has not been given, oldest first. A superseded answer
  * is silent; an answer is held back while the session holds a newer entry for
  * the same file (its newer answer, or the wait for it, is what to say).
+ *
+ * Only what may still be owed is read: the names are
+ * listed once, an answer is owed while it has no `.delivered`, and pending
+ * entries are read only from the oldest owed seq on (seqs sort by time, so
+ * nothing older can be newer than an owed answer). An owed answer no carrier
+ * would ever print (superseded, or outdated by a newer entry for its file) is
+ * claimed here, so the next call finds nothing owed and reads no file.
  */
 export function finishedFor(session: string, home?: string): Answer[] {
   const all = sessionNames(session, home);
   const delivered = new Set(all.filter((n) => n.endsWith(".delivered")).map((n) => seqOf(session, n)));
+  const owed = all
+    .filter((n) => n.endsWith(".answer.json"))
+    .map((n) => seqOf(session, n))
+    .filter((seq) => !delivered.has(seq));
+  if (owed.length === 0) return [];
+  const oldest = owed[0]!;
   const newest = new Map<string, string>();
+  const fileOf = new Map<string, string>();
   for (const name of all.filter((n) => n.endsWith(".pending.json"))) {
+    if (seqOf(session, name) < oldest) continue;
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
     if (entry === null) continue;
+    fileOf.set(entry.seq, entry.file);
     const held = newest.get(entry.file);
     if (held === undefined || held < entry.seq) newest.set(entry.file, entry.seq);
   }
   const out: Answer[] = [];
-  for (const name of all.filter((n) => n.endsWith(".answer.json"))) {
-    const seq = seqOf(session, name);
-    if (delivered.has(seq)) continue;
-    const answer = readJson<Answer>(path.join(sessionsDir(home), name));
-    if (answer === null || answer.state === "superseded") continue;
-    if ((newest.get(answer.file) ?? seq) > seq) continue;
+  for (const seq of owed) {
+    const file = fileOf.get(seq);
+    if (file !== undefined && (newest.get(file) ?? seq) > seq) {
+      claimDelivery(session, seq, home);
+      continue;
+    }
+    const answer = readJson<Answer>(path.join(sessionsDir(home), `${session}.recheck.${seq}.answer.json`));
+    if (answer === null) continue;
+    if (answer.state === "superseded" || (newest.get(answer.file) ?? seq) > seq) {
+      claimDelivery(session, seq, home);
+      continue;
+    }
     out.push(answer);
   }
   return out;
