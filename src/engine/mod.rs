@@ -8732,7 +8732,13 @@ fn append_deterministic_protocol_operations(
     );
     // A service the site pass never read writes none of the keys.
     if extractions.site.enabled {
-        crate::unread_sites::attach(cloud_data, site.unread.clone(), &site.leads);
+        let unread = crate::unread_sites::with_unanswered(
+            site.unread.clone(),
+            &site.leads,
+            &extractions.library.unanswered,
+            Path::new(repo_path),
+        );
+        crate::unread_sites::attach(cloud_data, unread, &site.leads);
         debug!(
             unread_sites = cloud_data.unread_sites_total.unwrap_or_default(),
             unread_on_row_line = site.unread_on_row_line,
@@ -9052,6 +9058,7 @@ fn stated_library_rows(
             .cloned()
             .collect(),
         names: library.names.clone(),
+        unanswered: library.unanswered.clone(),
     }
 }
 
@@ -29800,6 +29807,132 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 ..Default::default()
             })
         );
+    }
+
+    /// DS-V-2: the library sites one scan could not verify, read through a
+    /// stand-in whose script gives the answer to every check request, written
+    /// onto a blob the way the engine writes its unread sites.
+    fn library_unread_blob(
+        verifier: &str,
+        saved: Vec<crate::unread_sites::UnreadSite>,
+    ) -> Vec<(String, u32, Vec<crate::request_summary::Stop>, String)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let script = root.join("stand-in-sidecar.cjs");
+        let body = format!(
+            r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  {verifier}
+}});
+"#
+        );
+        std::fs::write(&script, body).expect("write stand-in");
+        let sidecar = TypeSidecar::spawn(&script).expect("spawn stand-in");
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        let library = read_library_rows(&sites, &claims, Some(&sidecar), &root);
+        assert!(library.rows.is_empty(), "no verified row either way");
+        let unread = crate::unread_sites::with_unanswered(saved, &[], &library.unanswered, &root);
+        let mut data = service_data("monorepo", None);
+        crate::unread_sites::attach(&mut data, unread, &[]);
+        let by_reason = data.unread_sites_by_reason.clone().unwrap_or_default();
+        let unanswered = by_reason
+            .get(&crate::request_summary::Stop::Unanswered)
+            .copied()
+            .unwrap_or(0);
+        data.unread_sites
+            .unwrap_or_default()
+            .into_iter()
+            .map(|site| {
+                (
+                    site.file,
+                    site.line,
+                    site.also,
+                    format!("{:?}/{}/{}", site.reason, site.slot, unanswered),
+                )
+            })
+            .collect()
+    }
+
+    /// DS-V-2: a scan whose verification died answers no check, so each
+    /// library site it would have read is saved, `unanswered`, at its name.
+    #[test]
+    fn library_sites_with_no_verdict_are_saved_unanswered() {
+        let saved = library_unread_blob("process.exit(1);", Vec::new());
+        assert_eq!(
+            saved,
+            vec![(
+                "index.ts".to_string(),
+                2,
+                vec![],
+                "Unanswered/name/1".to_string()
+            )]
+        );
+    }
+
+    /// DS-V-2: a site the site pass already saved at the same span keeps
+    /// one row and gains `unanswered` in `also`.
+    #[test]
+    fn a_site_already_saved_keeps_its_row_and_gains_unanswered_in_also() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let site = sites.sites.first().expect("one site").clone();
+        let held = crate::unread_sites::with_unanswered(
+            Vec::new(),
+            &[],
+            std::slice::from_ref(&site),
+            &root,
+        );
+        let mut earlier = held[0].clone();
+        earlier.reason = crate::request_summary::Stop::MissedInside;
+        earlier.also.clear();
+        let merged = crate::unread_sites::with_unanswered(vec![earlier], &[], &[site], &root);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].reason, crate::request_summary::Stop::MissedInside);
+        assert_eq!(
+            merged[0].also,
+            vec![crate::request_summary::Stop::Unanswered]
+        );
+    }
+
+    /// DS-V-2: a verdict of `failed` is a verdict, not a missing one: nothing
+    /// is saved.
+    #[test]
+    fn a_failed_verdict_saves_no_unanswered_site() {
+        let saved = library_unread_blob(
+            "return write({ request_id, status: 'success', verdicts: request.checks.map((check) => ({ claim_id: check.claim_id, receiver: check.receiver, verdict: 'failed', reason: 'no' })) });",
+            Vec::new(),
+        );
+        assert!(saved.is_empty(), "{saved:?}");
     }
 
     /// carrick#2021, ruled 2026-10-07: a scan in which the sidecar goes

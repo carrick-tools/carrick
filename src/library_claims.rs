@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::name_census::{LibraryNames, NameOutcome};
 use crate::operation::{GraphqlOperationKind, PubsubRole, SocketDirection};
@@ -905,6 +905,31 @@ pub struct LibraryRows {
     /// How the reader came by the name at each site it read a name slot of
     /// (carrick#3504 B10-0). Log-only: no row reads it.
     pub names: LibraryNames,
+    /// The sites `read` would have read when verification returned no
+    /// verdict at all: saved by the engine as unread sites, reason
+    /// `unanswered`. Empty whenever a verdict came back.
+    pub unanswered: Vec<LibrarySite>,
+}
+
+/// Every site a verified reading would read: a site of a read export that
+/// nothing in the service contests.
+fn readable_sites<'a>(
+    sites: &'a LibrarySites,
+    exports: &'a [ExportClaims],
+) -> impl Iterator<Item = (&'a ExportClaims, &'a LibrarySite)> {
+    exports
+        .iter()
+        .filter(|export| is_read_export(export))
+        .flat_map(move |export| {
+            sites
+                .sites
+                .iter()
+                .filter(move |site| {
+                    site.specifier == export.specifier && site.export == export.export
+                })
+                .filter(move |site| site.contest(|on, used| export.classify(on, used)).is_none())
+                .map(move |site| (export, site))
+        })
 }
 
 /// Read every library site through the claims that verify
@@ -926,7 +951,17 @@ pub fn read(
         Ok(verdicts) => verdicts,
         Err(error) => {
             warn!(%error, "library claims: verification failed; no rows");
-            return LibraryRows::default();
+            let unanswered: Vec<LibrarySite> = readable_sites(sites, exports)
+                .map(|(_, site)| site.clone())
+                .collect();
+            debug!(
+                saved = unanswered.len(),
+                "library claims: no verdict; saved sites"
+            );
+            return LibraryRows {
+                unanswered,
+                ..LibraryRows::default()
+            };
         }
     };
     let verified: HashSet<(String, String)> = checks
@@ -941,35 +976,34 @@ pub fn read(
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
     let mut names = LibraryNames::default();
-    for export in exports.iter().filter(|export| is_read_export(export)) {
-        let claims = export.claims_by_id();
-        for site in sites
-            .sites
-            .iter()
-            .filter(|site| site.specifier == export.specifier && site.export == export.export)
+    let mut held: Option<(&ExportClaims, Vec<(String, &LibraryClaim)>)> = None;
+    for (export, site) in readable_sites(sites, exports) {
+        if !held
+            .as_ref()
+            .is_some_and(|(of, _)| std::ptr::eq(*of, export))
         {
-            if site.contest(|on, used| export.classify(on, used)).is_some() {
-                continue;
-            }
-            let reading = Reading {
-                site,
-                export,
-                claims: &claims,
-                verified: &verified,
-                outcome: Cell::new(None),
-            };
-            let row = reading.row();
-            if let Some(outcome) = reading.outcome.get() {
-                names.note(outcome);
-            }
-            if let Some(row) = row {
-                stated.push((row, ReceiverKey::of(site)));
-            }
+            held = Some((export, export.claims_by_id()));
+        }
+        let claims = &held.as_ref().expect("set above").1;
+        let reading = Reading {
+            site,
+            export,
+            claims,
+            verified: &verified,
+            outcome: Cell::new(None),
+        };
+        let row = reading.row();
+        if let Some(outcome) = reading.outcome.get() {
+            names.note(outcome);
+        }
+        if let Some(row) = row {
+            stated.push((row, ReceiverKey::of(site)));
         }
     }
     LibraryRows {
         rows: heard_in_process(stated, exports),
         names,
+        unanswered: Vec::new(),
     }
 }
 
