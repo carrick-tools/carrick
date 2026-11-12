@@ -10910,11 +10910,20 @@ pub struct RequestSummaryIndex {
     /// row's request ([`SummaryRow::request_at`]) and the row's file and
     /// line. Read by [`Self::placements`].
     through: HashMap<RowAt, BTreeSet<(PathBuf, u32)>>,
-    /// The callers where a request was closed and stated no row (it does
-    /// not render), with the calls it was composed through to there:
-    /// keyed by the request's file and span start (C11 T1). Read by
+    /// The chains to callers saved as a stop ([`CallerStop`]): the request
+    /// was closed there and does not render (C11 T1). Read by
     /// [`Self::placements`].
-    closed_unstated: Vec<((PathBuf, u32), BTreeSet<(PathBuf, u32)>)>,
+    stopped: Vec<StoppedChain>,
+}
+
+/// A chain to a caller the summaries saved as a stop ([`CallerStop`]).
+#[derive(Debug)]
+struct StoppedChain {
+    /// The request's file and span start ([`SummaryRow::request_at`]).
+    request_at: (PathBuf, u32),
+    /// The calls the request was composed through to the caller, the
+    /// caller's own call included ([`Summary::through`]).
+    through: BTreeSet<(PathBuf, u32)>,
 }
 
 /// A summary row by its request ([`SummaryRow::request_at`]) and its own
@@ -11012,8 +11021,7 @@ impl RequestSummaryIndex {
     /// Where the rows of each request stand (carrick#2524): the request's
     /// file and span start ([`SummaryRow::request_at`]) to the file and line
     /// of every row stated for it, with the calls each row at a caller was
-    /// composed through, and the chains to callers where the request was
-    /// closed with no row (C11 T1).
+    /// composed through, and the chains to callers saved as a stop (C11 T1).
     pub fn placements(&self) -> decided_sites::SummaryPlacements {
         let mut placed = decided_sites::SummaryPlacements::default();
         for (file, sites) in &self.rows {
@@ -11023,8 +11031,8 @@ impl RequestSummaryIndex {
                 placed.place(row.request_at.clone(), at, through);
             }
         }
-        for (request, through) in &self.closed_unstated {
-            placed.close_unstated(request.clone(), through);
+        for chain in &self.stopped {
+            placed.stop(chain.request_at.clone(), &chain.through);
         }
         placed
     }
@@ -11674,17 +11682,20 @@ fn emit(
                         }
                         None => {
                             index.undetermined += 1;
-                            // The summaries answered this caller: no row
-                            // (C11 T1). A site on the same chain yields to
-                            // that answer (`RequestSummaryIndex::placements`).
-                            index.closed_unstated.push((
-                                (instantiated.site.file.clone(), instantiated.site.span_start),
-                                callee.through_call(effect, file, call.site.line),
-                            ));
                             // The request is closed at this caller and does
                             // not render: the caller is a site the send side
                             // could not compose (carrick#3688 F).
                             if let Some((reason, also)) = unrendered(&instantiated, file) {
+                                // The summaries answered this caller with a
+                                // stop (C11 T1): a site on the same chain
+                                // yields to it (`RequestSummaryIndex::placements`).
+                                index.stopped.push(StoppedChain {
+                                    request_at: (
+                                        instantiated.site.file.clone(),
+                                        instantiated.site.span_start,
+                                    ),
+                                    through: callee.through_call(effect, file, call.site.line),
+                                });
                                 let stop = CallerStop {
                                     file: file.to_path_buf(),
                                     line: call.site.line,

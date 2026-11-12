@@ -4005,9 +4005,9 @@ pub struct SummaryPlacements {
     /// A row with no entry records none.
     through: HashMap<(At, At), BTreeSet<At>>,
     /// Per request: the calls each chain was composed through to a caller
-    /// where the request was closed and stated no row (its path names no
-    /// route, or does not render). The summaries answered that caller.
-    closed_unstated: HashMap<At, Vec<BTreeSet<At>>>,
+    /// the summaries saved as a stop (the request closes there and does not
+    /// render, `super::CallerStop`). The summaries answered that caller.
+    stopped: HashMap<At, Vec<BTreeSet<At>>>,
 }
 
 impl SummaryPlacements {
@@ -4022,10 +4022,10 @@ impl SummaryPlacements {
         self.rows.entry(request).or_default().insert(row);
     }
 
-    /// `request` was closed at a caller with no row, composed through
-    /// `through` to there.
-    pub fn close_unstated(&mut self, request: At, through: &BTreeSet<At>) {
-        self.closed_unstated
+    /// `request` was saved as a stop at a caller, composed through `through`
+    /// to there.
+    pub fn stop(&mut self, request: At, through: &BTreeSet<At>) {
+        self.stopped
             .entry(request)
             .or_default()
             .push(through.clone());
@@ -4314,8 +4314,8 @@ impl Decided {
     /// (as [`SummaryPlacements`] records it), and every row of a request is up
     /// the chain of a site at the request itself. A site also yields where
     /// the summaries closed the request on a chain through its call and
-    /// stated no row there (a path that names no route): they answered that
-    /// caller, and the answer is no row. Any other site stands,
+    /// saved that caller as a stop (a path that names no route): they
+    /// answered it, with a reason. Any other site stands,
     /// beside the rows (C11 T1): it is a caller the summaries did not
     /// compose, and dropping it would lose its row. A site that sits where
     /// one of the rows stands also stands. Returns how many sites yielded;
@@ -4336,9 +4336,9 @@ impl Decided {
                 entry.push((rel(row), through));
             }
         }
-        // Per request: the chains the summaries closed with no row.
-        let unstated: HashMap<Rel, Vec<HashSet<Rel>>> = placed
-            .closed_unstated
+        // Per request: the chains to callers the summaries saved as a stop.
+        let stopped: HashMap<Rel, Vec<HashSet<Rel>>> = placed
+            .stopped
             .iter()
             .map(|(request, chains)| {
                 (
@@ -4366,7 +4366,7 @@ impl Decided {
             }
             let at_request = site.file == site.end.file && site.span_start == site.end.span_start;
             let answered = rows.iter().any(|(_, through)| through.contains(&at))
-                || unstated
+                || stopped
                     .get(&request)
                     .is_some_and(|chains| chains.iter().any(|through| through.contains(&at)));
             if at_request || answered {
