@@ -327,6 +327,12 @@ fn false_rows(rows: &[Value], payload: &Value) -> Vec<(usize, String)> {
         .filter(|f| f["kind"] == "missing_endpoint")
         .collect();
     for e in array(&payload["delta"]["removed_endpoints"]) {
+        // The PR check posts a removed row, and the call still made of it,
+        // only when the row is a fact (the renderer's `isFactRow`): a
+        // candidate or unstated row is no row of the check.
+        if e["edge_source"] != "fact" {
+            continue;
+        }
         if !expected("delta_removed", &e["method"], &e["path"]) {
             false_rows.push((3, format!("unexpected removed endpoint {e}")));
         }

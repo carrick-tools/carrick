@@ -2825,6 +2825,81 @@ fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
     );
 }
 
+/// A client call of a key its router's type lacks (carrick#3778 S0, a
+/// procedure the router no longer has) is a call row that names its
+/// procedure: the keys the code writes, and the router the first key is
+/// declared in. A call on a client typed `any` and another op on a present
+/// procedure are no rows.
+#[test]
+fn a_client_call_of_a_key_its_router_lacks_names_its_procedure() {
+    let (flat, graph) = client_rows(&scan_fixture("procedure-absent"));
+    let router = "workspace:src/router.ts#appRouter";
+    let want = vec![
+        format!("src/web/absent.ts:10 GET \"\" {router} shelf.gone request_summary"),
+        format!("src/web/absent.ts:12 GET \"\" {router} shelf.gone.deeper request_summary"),
+        format!("src/web/absent.ts:8 GET \"\" {router} shelf.list request_summary"),
+    ];
+    assert_eq!(flat, want);
+    assert_eq!(graph, want);
+}
+
+/// A call whose first key its router's type lacks names no router, and a
+/// call on a client typed `any` reads no key: each is saved unread with its
+/// reason. Another op on a present procedure is no procedure call at all.
+#[test]
+fn a_call_whose_router_cannot_be_named_or_whose_type_is_unread_is_saved_unread() {
+    let blobs = scan_fixture("procedure-absent");
+    let unread = unread_reasons(&blobs);
+    assert_eq!(
+        unread.get("src/web/absent.ts:14").map(String::as_str),
+        Some("procedure_first_key_absent"),
+        "{unread:#?}"
+    );
+    assert_eq!(
+        unread.get("src/web/absent.ts:17").map(String::as_str),
+        Some("procedure_path_unread"),
+        "{unread:#?}"
+    );
+    assert!(!unread.contains_key("src/web/absent.ts:16"), "{unread:#?}");
+    let (flat, _) = client_rows(&blobs);
+    assert!(
+        !flat
+            .iter()
+            .any(|row| row.starts_with("src/web/absent.ts:16")
+                || row.starts_with("src/web/absent.ts:14")
+                || row.starts_with("src/web/absent.ts:17")),
+        "{flat:#?}"
+    );
+}
+
+/// The split between a typed client and an untyped one: a typed client's
+/// call of a key its router lacks is a call row (S0), and its call of an op
+/// its type lacks on a present procedure is not read as an untyped client;
+/// a client whose router type does not resolve is saved `untyped_receiver`
+/// (carrick#3847).
+#[test]
+fn a_typed_client_missing_a_key_is_a_call_row_and_an_unresolved_router_is_untyped() {
+    let typed = scan_fixture("procedure-absent");
+    let (flat, _) = client_rows(&typed);
+    assert!(
+        flat.iter()
+            .any(|row| row.starts_with("src/web/absent.ts:10 ") && row.contains("shelf.gone")),
+        "{flat:#?}"
+    );
+    let typed_unread = unread_reasons(&typed);
+    assert_ne!(
+        typed_unread.get("src/web/absent.ts:16").map(String::as_str),
+        Some("untyped_receiver"),
+        "{typed_unread:#?}"
+    );
+    let untyped_unread = unread_reasons(&scan_fixture("procedure-client"));
+    assert_eq!(
+        untyped_unread.get("src/web/ghost.ts:7").map(String::as_str),
+        Some("untyped_receiver"),
+        "{untyped_unread:#?}"
+    );
+}
+
 /// The file reader's mocked answer states `GET /api/rpc/shelf.list` at the
 /// vanilla client's first call: the procedure row replaces it, and the call
 /// is one row.

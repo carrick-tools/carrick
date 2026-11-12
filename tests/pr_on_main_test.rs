@@ -2401,6 +2401,34 @@ fn an_operations_missing_file_does_not_raise_a_clean_title() {
     assert_eq!(wrong[0].0, 3);
 }
 
+/// The PR check posts a removed row only when it is a fact (the renderer's
+/// `isFactRow`), so a candidate removed row, or one that states no
+/// `edge_source`, is no false row of a closed-world seed, nor is the call
+/// still made of it (carrick#3778 S0).
+#[test]
+fn a_removed_row_the_renderer_does_not_post_is_no_false_row() {
+    let entry = serde_json::json!({"expect": {
+        "title": "no_contract_changes", "conclusion": "success", "rows": []}});
+    let payload = |row: serde_json::Value| {
+        serde_json::json!({
+            "delta": {"removed_endpoints": [row]},
+            "findings": [{"kind": "missing_endpoint", "method": "GET", "path": "/api/rpc/shelf.get"}],
+        })
+    };
+    let removed = |source: Option<&str>| {
+        let mut row = serde_json::json!({"method": "GET", "path": "/api/rpc/shelf.get"});
+        if let Some(source) = source {
+            row["edge_source"] = serde_json::json!(source);
+        }
+        seed_stages::wrong_scanner_stages(&entry, &payload(row))
+    };
+    assert_eq!(removed(Some("candidate")), Vec::new());
+    assert_eq!(removed(None), Vec::new());
+    let wrong = removed(Some("fact"));
+    assert_eq!(wrong.len(), 2, "{wrong:?}");
+    assert!(wrong.iter().all(|(stage, _)| *stage == 3), "{wrong:?}");
+}
+
 /// Every seed that takes part in runs has its stage asserted by a test that
 /// runs: a seed whose only test is `#[ignore]`d would carry a declaration
 /// nothing holds it to (carrick-cloud#2880).
@@ -3277,12 +3305,14 @@ async fn seed_trpc_output_field_removed() {
 //
 // Two services in one repo: `api` serves the `shelf` router, `web` calls it
 // through a typed client. One call (`shelf.gone`) is to a procedure nothing
-// serves; main has no row for it, and no seed's correct check carries one.
+// serves; main has a call row for it and no server row, and no seed's
+// correct check carries one.
 
 /// What the base tree reads: the three `shelf` procedures as `api` rows, and
-/// `web`'s two calls of served procedures as rows that name their procedure.
-/// The call of the unserved `shelf.gone` is no row (its type does not hold
-/// the key). Without this the seeds below would test nothing.
+/// each of `web`'s calls as a row that names its procedure. The call of the
+/// unserved `shelf.gone` is a row too, though the client's type lacks the
+/// key (carrick#3778 S0), naming the router its first key is declared in.
+/// Without this the seeds below would test nothing.
 #[tokio::test]
 async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
     let _serial = SERIAL.lock().await;
@@ -3311,7 +3341,132 @@ async fn rpc_shelf_main_reads_the_clients_calls_as_procedure_rows() {
         procedures("api", "endpoints"),
         ["shelf.add", "shelf.get", "shelf.list"]
     );
-    assert_eq!(procedures("web", "calls"), ["shelf.get", "shelf.list"]);
+    assert_eq!(
+        procedures("web", "calls"),
+        ["shelf.get", "shelf.gone", "shelf.list"]
+    );
+    let web = main
+        .shelf_rows
+        .iter()
+        .find(|row| row.service_name.as_deref() == Some("web"))
+        .unwrap();
+    let gone = serde_json::to_value(&web.calls)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["procedure"]["path"] == "shelf.gone")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (
+            &gone["file_path"],
+            &gone["procedure"]["router"]["file"],
+            &gone["procedure"]["router"]["binding"],
+        ),
+        (
+            &serde_json::json!("web/src/shelf.ts:10"),
+            &serde_json::json!("api/src/router.ts"),
+            &serde_json::json!("appRouter"),
+        ),
+        "{gone:#}"
+    );
+}
+
+/// The stored `web` row of the `rpc-shelf` tree with seed `name` applied.
+async fn shelf_seed_web_row(name: &str) -> serde_json::Value {
+    seed_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = seed_repo(tmp.path(), "rpc-shelf");
+    apply_seed(&repo, name);
+    commit(&repo, name);
+    let store = Store::default();
+    scan_seed_repo(&store, &repo).await;
+    let rows = store.repos.lock().unwrap().clone();
+    let web = rows
+        .iter()
+        .find(|row| row.service_name.as_deref() == Some("web"))
+        .unwrap_or_else(|| panic!("{name}: no stored row for web"));
+    serde_json::to_value(web).unwrap()
+}
+
+/// The procedure calls of a stored row, as `<file:line> <path> <router file>#<binding>`.
+fn procedure_calls(row: &serde_json::Value) -> Vec<String> {
+    let mut calls: Vec<String> = row["calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|call| call["procedure"].is_object())
+        .map(|call| {
+            format!(
+                "{} {} {}#{}",
+                call["file_path"].as_str().unwrap_or_default(),
+                call["procedure"]["path"].as_str().unwrap_or_default(),
+                call["procedure"]["router"]["file"]
+                    .as_str()
+                    .unwrap_or_default(),
+                call["procedure"]["router"]["binding"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    calls.sort();
+    calls
+}
+
+/// A call of a procedure the PR removed from the router, or renamed there
+/// only, stays a call row naming it (carrick#3778 S0): the client's type
+/// no longer has the key, so the compiler types the call an error, and the
+/// reader keeps the key the code writes. Its break row is S1b's.
+#[tokio::test]
+async fn a_call_of_a_procedure_the_pr_removed_stays_a_call_row() {
+    let _serial = SERIAL.lock().await;
+    for seed in [
+        "trpc-called-procedure-removed",
+        "trpc-called-procedure-renamed",
+    ] {
+        let web = shelf_seed_web_row(seed).await;
+        let calls = procedure_calls(&web);
+        assert!(
+            calls.contains(&"web/src/shelf.ts:8 shelf.get api/src/router.ts#appRouter".to_string()),
+            "{seed}: {calls:#?}"
+        );
+    }
+}
+
+/// A router the PR rewrote with keys the client's type reads as an index
+/// signature leaves each call unread with its reason, never a row: the keys
+/// are not absent, only unread (carrick#3778 S0).
+#[tokio::test]
+async fn a_router_the_pr_rewrote_unread_leaves_its_calls_unread() {
+    let _serial = SERIAL.lock().await;
+    let web = shelf_seed_web_row("trpc-router-rewritten-unread").await;
+    assert_eq!(procedure_calls(&web), Vec::<String>::new());
+    let mut reasons: Vec<String> = web["possible_calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|call| {
+            format!(
+                "{}:{} {}",
+                call["file_path"].as_str().unwrap_or_default(),
+                call["line_number"],
+                call["unread"]["reason"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        [
+            "web/src/shelf.ts:10 procedure_path_unread",
+            "web/src/shelf.ts:7 procedure_path_unread",
+            "web/src/shelf.ts:8 procedure_path_unread",
+        ]
+    );
 }
 
 /// The break row a PR posts for a removed procedure a client still calls: a
