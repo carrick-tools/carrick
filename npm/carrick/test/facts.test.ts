@@ -210,6 +210,8 @@ test("an edit inside a handler prints where it is called, once per session", asy
   const file = ws.at("orders-api/src/routes/orders.ts");
   const first = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);');
   assert.equal(first.code, 0);
+  // Some Node 24 releases warn when `node:sqlite` loads; a hook's stderr stays clean.
+  assert.doesNotMatch(first.stderr, /ExperimentalWarning/);
   assert.equal(
     context(first.stdout),
     "GET /orders/:id is called at web-app/src/api/orders.ts:8, web-app/src/dashboard/setup.ts:21, billing-worker/src/sync.ts:5",
