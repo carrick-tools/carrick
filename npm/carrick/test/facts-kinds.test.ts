@@ -1361,11 +1361,12 @@ test("R40.3: a checkout counts as partial from a promisor pack, an included conf
 });
 
 test("R40.4: in a partial clone a shell write and a created file run no git and print nothing", async (t) => {
-  const run = async (partial: boolean) => {
+  const run = async (partial: boolean, on = true) => {
     const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE)]);
     if (partial) fs.writeFileSync(path.join(ws.at("api"), ".git", "objects", "pack", "pack-0.promisor"), "");
     const git = countingGit(t);
     const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), PATH: git.path });
+    if (!on) delete env["CARRICK_FACT_LINES"];
     const hook = async (script: string, payload: Record<string, unknown>) =>
       context((await runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: "partial", cwd: ws.root, ...payload }, env })).stdout);
     const file = ws.at("api/src/orders.ts");
@@ -1375,13 +1376,30 @@ test("R40.4: in a partial clone a shell write and a created file run no git and 
     const content = "export function made() {\n  return 1;\n}\n";
     fs.writeFileSync(created, content);
     const write = await hook("post-edit.ts", { tool_name: "Write", tool_input: { file_path: created, content }, tool_response: { type: "create", filePath: created } });
-    return { shell, write, diff: git.calls(/ diff /), lsFiles: git.calls(/ ls-files /) };
+    return { shell, write, diff: git.calls(/ diff /), lsFiles: git.calls(/ ls-files /), all: git.calls(/./) };
   };
   // Control: a full clone asks git for both, and the shell write prints its fn line.
   const full = await run(false);
   assert.equal(full.shell, LOAD_LINE);
   assert.ok(full.diff > 0 && full.lsFiles > 0, JSON.stringify(full));
-  assert.deepEqual(await run(true), { shell: "", write: "", diff: 0, lsFiles: 0 });
+  // In a partial clone, no more git runs than with the fact lines switched off.
+  const off = await run(true, false);
+  assert.deepEqual(await run(true), { shell: "", write: "", diff: 0, lsFiles: 0, all: off.all });
+});
+
+test("R40.4: a mapped repo folder that is not itself a checkout's top proves no peer through the checkout around it", async (t) => {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, null);
+  const api = commitAll(ws.at("api"));
+  // The workspace itself is a repository whose top holds the same file at
+  // the same path; `web` has no git of its own.
+  fs.mkdirSync(ws.at("src"), { recursive: true });
+  fs.writeFileSync(ws.at("src/page.ts"), PAGE);
+  gitIn(ws.root, "init", "-q");
+  gitIn(ws.root, "add", "src/page.ts");
+  gitIn(ws.root, "commit", "-q", "-m", "outer");
+  const outer = gitIn(ws.root, "rev-parse", "HEAD").trim();
+  await rebuild(ws, [FN_PEER], { api, web: outer });
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, []);
 });
 
 test("R36.4: the facts git runner never lets git fetch or prompt", async (t) => {

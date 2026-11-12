@@ -15,10 +15,12 @@
 // is missing, over `MAX_FACT_FILE_BYTES`, or differs. Never throws.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { factsGitBudgetMs, gitFacts } from "./diff.ts";
 import type { FileMemo } from "./files.ts";
+import { checkoutOf } from "../hook/worktree.ts";
 
 /** A full object id: SHA-1 (40 hex) or SHA-256 (64 hex). Anything else (a branch, `HEAD`, a short id) proves nothing. */
 const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -90,6 +92,9 @@ function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: read
     }
     const clone = `${top}\0${commit}`;
     if (ctx.gitFailed || ctx.missing.has(clone)) return false;
+    // A repo folder that is not itself a checkout's top would be answered by
+    // the checkout around it: no proof.
+    if (checkoutOf(top)?.top !== fs.realpathSync(top)) return false;
     // In a partial clone `gitFacts` runs nothing and answers null (R40.4).
     const started = performance.now();
     const out = gitFacts(top, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", ...files], ctx.env);

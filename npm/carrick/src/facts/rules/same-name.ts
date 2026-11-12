@@ -8,7 +8,7 @@
 // said. A name shorter than 4 characters, or with a row in this very file,
 // says nothing; otherwise the first of up to 3 rows by (repo, file) whose file
 // still scans cleanly and declares exactly that name on the stated line
-// prints. A row in a repo not checked out here is stated from the index.
+// prints. A row in a repo not checked out here is silent (R40.2).
 
 import path from "node:path";
 import type { Candidate } from "../lines.ts";
