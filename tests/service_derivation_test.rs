@@ -867,3 +867,113 @@ fn derived_member_without_a_root_config_names_the_nearest_ancestor_tsconfig() {
         Some("../../tsconfig.json")
     );
 }
+
+/// A pnpm workspace whose `apps/*` glob holds a group folder of Deno apps,
+/// each with its own `deno.json` and no `package.json`, beside a Node member
+/// (carrick#3969). Invented layout.
+fn node_workspace_with_deno_apps(root: &Path) {
+    write(
+        root,
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    );
+    write(root, "apps/api/package.json", r#"{"name":"@sample/api"}"#);
+    write(root, "apps/api/src/server.ts", "export const api = 1;\n");
+    write(
+        root,
+        "packages/kit/package.json",
+        r#"{"name":"@sample/kit"}"#,
+    );
+    write(root, "packages/kit/index.ts", "export const kit = 1;\n");
+    // Two levels below the glob's folder: `apps/*` holds `apps/edge`.
+    write(root, "apps/edge/hello/deno.json", r#"{"tasks":{}}"#);
+    write(
+        root,
+        "apps/edge/hello/src/app.ts",
+        "import { Hono } from 'npm:hono@4';\nexport const app = new Hono();\napp.get('/healthz', (c) => c.json({ ok: true }));\n",
+    );
+    // A config nested inside that app is the app's own, not a second app.
+    write(root, "apps/edge/hello/tools/deno.json", "{}");
+    write(
+        root,
+        "apps/edge/hello/tools/gen.ts",
+        "export const gen = 1;\n",
+    );
+    // One level: the glob's folder is the app itself.
+    write(root, "apps/relay/deno.jsonc", "{ // relay\n}");
+    write(root, "apps/relay/main.ts", "export const relay = 1;\n");
+}
+
+#[test]
+fn a_deno_app_under_a_node_workspace_glob_is_derived() {
+    let dir = tempfile::tempdir().unwrap();
+    node_workspace_with_deno_apps(dir.path());
+    let derived = resolve(dir.path()).unwrap();
+    let directories: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.directory.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        directories,
+        ["apps/api", "apps/edge/hello", "apps/relay", "packages/kit"]
+    );
+    let names: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.service_name.as_deref().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "@sample/api",
+            "apps/edge/hello",
+            "apps/relay",
+            "@sample/kit"
+        ]
+    );
+    // The Deno apps are scanned as Deno: their own config, no tsconfig.
+    for service in &derived.services[1..3] {
+        assert!(service.tsconfig.is_none());
+        assert!(carrick::deno_support::service_manifest(dir.path(), service).is_some());
+    }
+    assert!(
+        derived.reason.contains("Deno manifests"),
+        "{}",
+        derived.reason
+    );
+    assert!(derived.skipped_patterns.is_empty());
+}
+
+#[test]
+fn a_folder_under_a_workspace_glob_without_a_deno_config_stays_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n");
+    write(root, "apps/api/package.json", r#"{"name":"@sample/api"}"#);
+    write(root, "apps/api/src/server.ts", "export const api = 1;\n");
+    // Source, no manifest of any kind.
+    write(root, "apps/scripts/run.ts", "export const run = 1;\n");
+    write(
+        root,
+        "apps/scripts/nested/more.ts",
+        "export const more = 1;\n",
+    );
+    // A Deno config under a test folder.
+    write(root, "apps/e2e/test/deno.json", "{}");
+    write(root, "apps/e2e/test/smoke.ts", "export const smoke = 1;\n");
+    // A Deno config inside a Node member is that member's own.
+    write(root, "apps/api/scripts/deno.json", "{}");
+    write(root, "apps/api/scripts/seed.ts", "export const seed = 1;\n");
+    // A Deno config no workspace glob holds.
+    write(root, "tools/deno/deno.json", "{}");
+    write(root, "tools/deno/task.ts", "export const task = 1;\n");
+    let derived = resolve(root).unwrap();
+    let directories: Vec<&str> = derived
+        .services
+        .iter()
+        .map(|s| s.directory.as_deref().unwrap())
+        .collect();
+    assert_eq!(directories, ["apps/api"]);
+    assert!(!derived.reason.contains("Deno"), "{}", derived.reason);
+}
