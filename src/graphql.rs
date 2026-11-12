@@ -1702,6 +1702,60 @@ pub fn extract_from_document_text(
     parse_document_text(text, file_path, base_line).unwrap_or_default()
 }
 
+/// The 1-based line of a field's name token in `text`. graphql-parser places a
+/// described field's position at its description, so with one the description
+/// string (a `"""` block or a `"` string) is skipped, then whitespace, commas
+/// and `#` comments, and the name's line is the answer. A field with no
+/// description keeps `line`.
+fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> usize {
+    if !described {
+        return line;
+    }
+    let mut start = 0;
+    for _ in 1..line {
+        match text[start..].find('\n') {
+            Some(i) => start += i + 1,
+            None => return line,
+        }
+    }
+    let Some((offset, _)) = text[start..].char_indices().nth(column.saturating_sub(1)) else {
+        return line;
+    };
+    let bytes = text.as_bytes();
+    let mut at = start + offset;
+    let closer = if text[at..].starts_with("\"\"\"") {
+        "\"\"\""
+    } else if text[at..].starts_with('"') {
+        "\""
+    } else {
+        return line;
+    };
+    at += closer.len();
+    while at < bytes.len() {
+        if bytes[at] == b'\\' {
+            at += 2;
+        } else if text[at..].starts_with(closer) {
+            at += closer.len();
+            break;
+        } else {
+            at += 1;
+        }
+    }
+    let mut at = at.min(bytes.len());
+    while at < bytes.len() {
+        match bytes[at] {
+            b' ' | b'\t' | b'\r' | b'\n' | b',' => at += 1,
+            b'#' => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    line + text[start..at.min(bytes.len())].matches('\n').count()
+}
+
 /// [`extract_from_document_text`], with `None` when the text parses as neither
 /// a schema nor an executable document, so a caller that reads a whole file
 /// can record it as unread (carrick#3758).
@@ -1775,7 +1829,12 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                 extraction.producers.push(GraphqlOp {
                     key: OperationKey::graphql(*kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
-                    line: to_line(field.position.line),
+                    line: to_line(field_name_line(
+                        text,
+                        field.position.line,
+                        field.position.column,
+                        field.description.is_some(),
+                    )),
                     document_line: base_line,
                     // Deterministic anchor: the root field's SDL type
                     // expression (e.g. `Order`, `Order!`, `[Order!]!`).
@@ -2401,6 +2460,41 @@ fn is_builtin_type(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    fn producer_lines(sdl: &str, base_line: u32) -> Vec<u32> {
+        extract_from_document_text(sdl, Path::new("schema.graphql"), base_line)
+            .producers
+            .iter()
+            .map(|op| op.line)
+            .collect()
+    }
+
+    /// A producer sits on its field's name line, not on the description above
+    /// it (carrick#1295): one-line and multi-line block strings, a `"` string,
+    /// no description, a description that reads like a field, an escaped
+    /// triple quote, a comment between description and name, and an embedded
+    /// document with a base line.
+    #[test]
+    fn a_described_field_is_on_its_name_line() {
+        let sdl = r#"type Query {
+  """Doc"""
+  one: Int
+  """
+  Many
+  lines
+  """
+  two: Int
+  "plain"
+  three: Int
+  plain: Int
+  """approve(id: ID!): Bill \""" x"""
+  # note
+  four: Int
+}
+"#;
+        assert_eq!(producer_lines(sdl, 1), vec![3, 8, 10, 11, 14]);
+        assert_eq!(producer_lines(sdl, 10), vec![12, 17, 19, 20, 23]);
+    }
 
     /// A repo with a `.graphql` file inside and a link to one outside it.
     /// Returns the temp dir and the repo root (canonical).
