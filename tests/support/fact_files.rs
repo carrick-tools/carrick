@@ -8,6 +8,9 @@
 
 #![allow(dead_code)]
 
+#[path = "real_packages.rs"]
+mod real_packages;
+
 use carrick::agents::file_orchestrator::FactFileSource;
 use carrick::request_summary::fact_files::FactFiles;
 use carrick::swc_scanner::{ScanResult, SwcScanner};
@@ -34,6 +37,44 @@ pub fn install_table_package(root: &Path) {
             r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
         ),
         ("__llm__/library-claims/default.json", TABLE_CLAIMS),
+    ];
+    for (relative, text) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+/// An installed HTTP client package for trees a test writes itself
+/// (carrick#3711 R2): `createClient()` builds a client whose
+/// `get({ url })` sends a GET to `url`. With its lockfile entry and its store
+/// answer under `__llm__`.
+pub fn install_client_package(root: &Path) {
+    let files = [
+        (
+            "node_modules/fixture-client/package.json",
+            r#"{ "name": "fixture-client", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/fixture-client/index.d.ts",
+            "export interface Client {\n  get<T = any>(options: { url: string; params?: unknown }): Promise<T>;\n}\ndeclare function createClient(): Client;\nexport default createClient;\n",
+        ),
+        (
+            "package.json",
+            r#"{ "name": "client-service", "version": "1.0.0", "private": true, "dependencies": { "fixture-client": "^1.0.0" } }"#,
+        ),
+        (
+            "package-lock.json",
+            r#"{ "name": "client-service", "version": "1.0.0", "lockfileVersion": 3, "requires": true, "packages": { "": { "name": "client-service", "version": "1.0.0", "dependencies": { "fixture-client": "^1.0.0" } }, "node_modules/fixture-client": { "version": "1.0.0", "resolved": "https://registry.npmjs.org/fixture-client/-/fixture-client-1.0.0.tgz" } } }"#,
+        ),
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
+        ),
+        (
+            "__llm__/library-claims/default.json",
+            r#"{ "library_claims": [ { "package": "fixture-client", "version": "1.0.0", "status": "answered", "exports": [ { "specifier": "fixture-client", "export": "default", "role": "http_client", "side": "client", "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }], "scopes": [], "ops": [ { "op": "request", "member": "get", "of": "instance:()", "name": { "arg": 0, "key": "url" }, "method_default": "GET", "picker": "fixture-picker" } ], "reserved": [], "calls": [], "patterns": [] } ] } ] }"#,
+        ),
     ];
     for (relative, text) in files {
         let path = root.join(relative);
@@ -110,11 +151,12 @@ pub fn sidecar_script() -> PathBuf {
 }
 
 /// The fact files of `repo`'s first service, its store answered from
-/// `repo/__llm__`. Sets `CARRICK_MOCK_ALL` and `CARRICK_MOCK_FIXTURE_DIR`
-/// (callers run serially) and leaves `CARRICK_MOCK_FIXTURE_DIR` unset after.
+/// `repo/__llm__`. Sets `CARRICK_MOCK_ALL`, and `CARRICK_MOCK_FIXTURE_DIR`
+/// for the walk only (callers run serially).
 pub async fn walked(repo: &Path) -> FactFiles {
     // SAFETY: the callers' tests run one at a time; env vars are
-    // process-global.
+    // process-global. The caller's own cassette dir is put back after.
+    let before = std::env::var_os("CARRICK_MOCK_FIXTURE_DIR");
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
         std::env::set_var("CARRICK_MOCK_FIXTURE_DIR", repo.join("__llm__"));
@@ -125,9 +167,52 @@ pub async fn walked(repo: &Path) -> FactFiles {
             .await
             .unwrap_or_else(|| panic!("{} asks the store nothing", repo.display()));
     unsafe {
-        std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR");
+        match before {
+            Some(dir) => std::env::set_var("CARRICK_MOCK_FIXTURE_DIR", dir),
+            None => std::env::remove_var("CARRICK_MOCK_FIXTURE_DIR"),
+        }
     }
     facts
+}
+
+/// The fact files of the committed tree at `fixture`, walked on a copy with
+/// the real-name stand-ins `installed` (`tests/fixtures/real-packages`) and
+/// the store's answer for `answered` (stand-ins, plus answers for packages a
+/// scan never installs, such as `lib-dom-fetch`). The tree itself is left
+/// alone: its other tests pin it as it is. The files are keyed by path
+/// relative to the tree, so they apply to the committed tree unchanged.
+pub fn walked_copy(fixture: &Path, installed: &[&str], answered: &[&str]) -> FactFiles {
+    let dir = tempfile::tempdir().expect("a copy dir");
+    let copy = dir.path().canonicalize().unwrap().join("repo");
+    copy_tree(fixture, &copy);
+    if !copy.join("package.json").exists() {
+        let dependencies: serde_json::Map<String, serde_json::Value> = installed
+            .iter()
+            .map(|name| (name.to_string(), serde_json::json!("*")))
+            .collect();
+        std::fs::write(
+            copy.join("package.json"),
+            serde_json::json!({ "name": "fixture", "private": true, "dependencies": dependencies })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    real_packages::install(&copy, installed);
+    real_packages::write_claims(&copy.join("__llm__"), answered);
+    walked_blocking(&copy)
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
 }
 
 /// [`walked`] from synchronous code, or from inside a test's runtime: on a
