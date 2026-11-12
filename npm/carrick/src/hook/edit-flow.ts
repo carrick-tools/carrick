@@ -22,6 +22,7 @@ import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 import type { Timing } from "./timings.ts";
 import { factLines } from "../facts/lines.ts";
 import type { FactEdit } from "../facts/lines.ts";
+import { isManifest } from "../facts/rules/packages.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -202,7 +203,10 @@ export async function editFlow(
   // possible moment, so the once-a-day stamp is spent only on a line that is
   // actually delivered, and inside `additionalContext` rather than on a bare
   // stdout line, which this host reads as a malformed hook response.
-  const mismatch = throttledVersionMismatch(choice.root, currentVersion());
+  // A call that touched only `package.json` files says only its fact lines and
+  // owed late answers, as before fact files: no version notice.
+  const sourceTouched = edited.length > 0 || (input.factOnly ?? []).some((file) => !isManifest(file));
+  const mismatch = sourceTouched ? throttledVersionMismatch(choice.root, currentVersion()) : null;
   if (mismatch) contexts.push(mismatch);
   if (told.length > 0 && session) markTold(session, told);
   if (led.length > 0 && session) markLed(session, led);

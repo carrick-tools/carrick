@@ -530,6 +530,17 @@ test("pkg: a bumped dependency names the other services' specs, with no probe, q
   }
 });
 
+test("pkg: with no fact file, a package.json edit prints nothing, not even a version notice", async (t) => {
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/package.json": before, "api/src/orders.ts": ORDERS }, null);
+  // A workspace an older carrick set up: a probed edit would carry the once-a-day notice.
+  fs.writeFileSync(path.join(ws.root, ".carrick", "cli-version"), "99.0.0\n");
+  const file = ws.at("api/package.json");
+  const run = await patchEdit(ws, file, [manifestHunk(file, before, MANIFEST(['    "zod": "^3.24.0"']))]);
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.stdout, "");
+});
+
 test("pkg: an added dependency (a comma on the line above) names only the added one", async (t) => {
   const rows = [ZOD, pkgRow("react", [["web", "^18.0.0", "package.json"]]), pkgRow("express", [["web", "^4.0.0", "package.json"], ["api", "^4.19.0", "package.json"]])];
   const { text } = await bump(t, MANIFEST(['    "express": "^4.19.0"']), MANIFEST(['    "express": "^4.19.0",', '    "react": "^18.2.0"']), rows);
@@ -943,6 +954,16 @@ test("R33.2: a commit the clone does not hold, a commit that is not a full id, a
     await rebuild(ws, [OP_PEER, FN_PEER], { web: commit });
     assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [], String(commit));
   }
+});
+
+test("R33.2: a commit one clone lacks silences only the lines naming that repo", async (t) => {
+  const jobs = { repo: "api", file: "src/jobs.ts", line: 1, name: "run" };
+  const fn = { ...fnRow("loadOrder", LOAD_LINE), others: [jobs] };
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "api/src/jobs.ts": "export function run() {}\n", "web/src/page.ts": PAGE }, [OP_PEER, fn]);
+  const api = spawnSync("git", ["-C", ws.at("api"), "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  // web's clone was never fetched to the index commit; api's was.
+  await rebuild(ws, [OP_PEER, fn], { web: "b".repeat(40), api });
+  assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines, [LOAD_LINE]);
 });
 
 test("R33.1: a peer in a repo not checked out here is stated from the index", async (t) => {
