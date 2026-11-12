@@ -133,6 +133,6 @@ describe('position_rows: the class a receiver of an inherited member holds', () 
 
   it('bumps the format version', () => {
     assert.strictEqual(version, POSITION_ROWS_VERSION);
-    assert.strictEqual(POSITION_ROWS_VERSION, 6);
+    assert.strictEqual(POSITION_ROWS_VERSION, 7);
   });
 });

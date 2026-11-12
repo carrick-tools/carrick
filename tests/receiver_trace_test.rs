@@ -2811,3 +2811,44 @@ fn a_model_row_at_a_procedure_call_folds_into_it() {
         );
     }
 }
+
+/// The client forms of `procedure-client-declared` hold a proxy whose printed
+/// type is not the alias the store labels it by: an alias of an alias
+/// (`createProxy`, held in a field typed by an in-repo alias of it), an alias
+/// of an intersection (`createExpandedHooks`), and one whose value keeps the
+/// alias (`createHandle`). The compiler engine writes the alias a receiver
+/// was declared as, so each call states its procedure and pairs.
+fn declared_client_rows() -> Vec<String> {
+    let router = "workspace:src/router.ts#appRouter";
+    let mut rows = vec![
+        format!("src/web/declared.ts:11 GET \"\" {router} shelf.list request_summary"),
+        format!("src/web/declared.ts:15 POST \"\" {router} shelf.add request_summary"),
+        format!("src/web/declared.ts:23 GET \"\" {router} shelf.list request_summary"),
+        format!("src/web/declared.ts:30 GET \"\" {router} shelf.list request_summary"),
+    ];
+    rows.sort();
+    rows
+}
+
+#[test]
+fn a_client_call_through_an_expanded_alias_states_its_procedure() {
+    let (flat, graph) = client_rows(&scan_fixture("procedure-client-declared"));
+    assert_eq!(flat, declared_client_rows());
+    assert_eq!(graph, declared_client_rows());
+}
+
+/// Each of those calls pairs with the server's procedure row.
+#[test]
+fn a_client_call_through_an_expanded_alias_pairs_its_procedure() {
+    let edges = matched_producers("procedure-client-declared");
+    let call = "http|GET|";
+    assert_eq!(
+        edges,
+        vec![
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
+        ]
+    );
+}

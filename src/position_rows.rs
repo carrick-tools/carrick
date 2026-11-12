@@ -44,7 +44,8 @@
 //! `impl` rows, whose go-to-implementation search was most of the walk and
 //! which nothing read (carrick#2432 asks for implementations where discovery
 //! stops); version 5 (carrick#2448) added [`Kind::TypedDecl`]; version 6
-//! added [`Kind::ReceiverType`]. A file of any other version is not
+//! added [`Kind::ReceiverType`]; version 7 widened the flags to sixteen bits
+//! and added [`FLAG_DECLARED_TYPE`]. A file of any other version is not
 //! read: its service reads as [`HoleReason::RowsMissing`]. A walk removes any
 //! earlier rows file before it writes. The rows of a service a later laptop
 //! pass carries are used again instead of walked, only when [`kept_rows`]
@@ -75,34 +76,42 @@ use crate::services::type_sidecar::{PositionRowsCounts, SidecarRecipe};
 pub const POSITIONS_DIR: &str = "positions";
 
 /// The format version the header carries.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The type is `any`, declared or inferred. Never set with [`FLAG_ERROR_TYPE`].
-pub const FLAG_ANY: u8 = 1;
+pub const FLAG_ANY: u16 = 1;
 /// The type is the compiler's error type: something did not resolve.
-pub const FLAG_ERROR_TYPE: u8 = 2;
+pub const FLAG_ERROR_TYPE: u16 = 2;
 /// The checker threw at this node; the row holds nothing else.
-pub const FLAG_CHECKER_THREW: u8 = 4;
+pub const FLAG_CHECKER_THREW: u16 = 4;
 /// The declaration is outside the checkout, not the default library and in
 /// no installed package, so `decl_file` is `null`.
-pub const FLAG_DECLARATION_UNNAMED: u8 = 8;
+pub const FLAG_DECLARATION_UNNAMED: u16 = 8;
 /// A [`Kind::Decl`] row standing for more rows than the walk lists (16); it
 /// names none.
-pub const FLAG_TOO_MANY: u8 = 16;
+pub const FLAG_TOO_MANY: u16 = 16;
 /// The declaration is published under the row's symbol name: its module
 /// exports it by that name, or it is a global (a script's top-level
 /// declaration, or one in `declare global`). A member of a class,
 /// interface, type literal or object literal never is.
-pub const FLAG_PUBLISHED: u8 = 32;
+pub const FLAG_PUBLISHED: u16 = 32;
 /// The declaration is what its module exports as `export =` or `default`.
-pub const FLAG_MODULE_DEFAULT: u8 = 64;
+pub const FLAG_MODULE_DEFAULT: u16 = 64;
 /// A [`Kind::Call`] row only: the call's declared return is the result of
 /// the function it is handed (`ReturnType<F>`, a type parameter the handed
 /// function returns, or an awaitable of one), so the library runs it and
-/// hands its result back (carrick#2634). The last free bit of the `u8`: the
-/// next flag widens the field and bumps the format. Pinned to the sidecar's
+/// hands its result back (carrick#2634). The last bit of the first byte; the
+/// flags are sixteen bits since format 7. Pinned to the sidecar's
 /// `FLAG_RUNS_HANDED` by `position-rows-runs-handed.test.ts`.
-pub const FLAG_RUNS_HANDED: u8 = 128;
+pub const FLAG_RUNS_HANDED: u16 = 128;
+/// A [`Kind::ReceiverType`] row only: the type alias a package declares that
+/// the receiver was *declared* as (a make's declared return, or an
+/// annotation walked through the checkout's own aliases), not a type the
+/// value holds. The compiler prints a proxy by what its alias expands to, so
+/// the alias is read from the declaration. At most one per receiver span;
+/// [`Self::receiver_declarations`] lists it beside the class rows. Pinned to
+/// the sidecar's `FLAG_DECLARED_TYPE` by `position-rows-declared-type.test.ts`.
+pub const FLAG_DECLARED_TYPE: u16 = 256;
 
 /// Line 1 of a rows file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +208,7 @@ pub struct Row(
     pub Option<u32>,
     pub Option<String>,
     pub Option<String>,
-    pub u8,
+    pub u16,
 );
 
 impl Row {
@@ -227,7 +236,7 @@ impl Row {
     pub fn type_text(&self) -> Option<&str> {
         self.7.as_deref()
     }
-    pub fn flags(&self) -> u8 {
+    pub fn flags(&self) -> u16 {
         self.8
     }
 }
@@ -1043,7 +1052,7 @@ mod tests {
         }
     }
 
-    fn row(kind: Kind, start: u32, end: u32, symbol: Option<&str>, flags: u8) -> Row {
+    fn row(kind: Kind, start: u32, end: u32, symbol: Option<&str>, flags: u16) -> Row {
         Row(
             kind,
             start,
@@ -1085,7 +1094,7 @@ mod tests {
                 },
             )
         };
-        let call = |flags: u8| row(Kind::Call, 0, 3, Some("f"), flags);
+        let call = |flags: u16| row(Kind::Call, 0, 3, Some("f"), flags);
         assert!(rows_of("src/a.ts", call(FLAG_ERROR_TYPE)).may_call_through_an_unresolved_import());
         assert!(!rows_of("src/a.ts", call(0)).may_call_through_an_unresolved_import());
         assert!(
@@ -1260,13 +1269,14 @@ mod tests {
         }
     }
 
-    /// carrick#2448, #2561: the reader reads version 5 only; a file of any
+    /// carrick#2448, #2561: the reader reads the current version only (a version-6
+    /// file, written before the flags widened, is one of the others); a file of any
     /// other version is an error, so `load_index` over a version-3 file (with
     /// its `impl` rows) left by an earlier build gives every lookup
     /// [`HoleReason::RowsMissing`] and the scan goes on.
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
-        for v in [3, 4] {
+        for v in [3, 4, 6] {
             let text = format!(
                 "{{\"v\":{v},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}}\n\
                  {{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[]}}\n"
@@ -1294,6 +1304,20 @@ mod tests {
                 .err(),
             Some(HoleReason::RowsMissing)
         );
+    }
+
+    /// A version-7 row carries the sixteen-bit flags: the declared-type bit
+    /// (256) reads, and the other bits beside it keep their meaning.
+    #[test]
+    fn a_row_with_the_declared_type_bit_reads() {
+        let text = format!(
+            "{{\"v\":{FORMAT_VERSION},\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}}\n\
+             {{\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"receiver_type\",0,6,\"ProxyOf\",\"node_modules/p/index.d.ts\",3,\"p\",null,288]]}}\n"
+        );
+        let rows = read_rows(text.as_bytes()).expect("a version-7 row reads");
+        let row = &rows.files[0].r[0];
+        assert_eq!(row.flags(), FLAG_DECLARED_TYPE | FLAG_PUBLISHED);
+        assert_eq!(row.symbol(), Some("ProxyOf"));
     }
 
     /// carrick#2448: the `decl` rows of a member read on a union share its
@@ -1485,21 +1509,21 @@ mod tests {
 
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1509,7 +1533,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
@@ -1545,7 +1569,7 @@ mod tests {
     ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![format!(
-            "{{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            "{{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
             files.len()
         )];
         let mut paths = Vec::new();

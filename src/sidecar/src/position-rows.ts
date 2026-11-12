@@ -65,7 +65,7 @@ import type { ProjectLoader } from './project-loader.js';
 import type { PositionRowsCounts } from './types.js';
 
 /** The format's version, written in the header. */
-export const POSITION_ROWS_VERSION = 6;
+export const POSITION_ROWS_VERSION = 7;
 
 /** The type is `any`, declared or inferred. Never set with the error type. */
 export const FLAG_ANY = 1;
@@ -92,11 +92,21 @@ export const FLAG_MODULE_DEFAULT = 64;
  * function returns, or an awaitable of one), so the library runs it and
  * hands its result back (carrick#2634). Set when the call passes at least
  * one argument at a function-typed parameter and every such parameter
- * meets that return. The last free bit of the `u8`: the next flag widens
- * the field and bumps the format. Pinned to `FLAG_RUNS_HANDED` in
- * `src/position_rows.rs` by `position-rows-runs-handed.test.ts`.
+ * meets that return. The last bit of the first byte: the flags widened to
+ * sixteen bits with {@link FLAG_DECLARED_TYPE} (format 7). Pinned to
+ * `FLAG_RUNS_HANDED` in `src/position_rows.rs` by
+ * `position-rows-runs-handed.test.ts`.
  */
 export const FLAG_RUNS_HANDED = 128;
+/**
+ * A `receiver_type` row only: the row names the type alias a package
+ * declares that the receiver was *declared* as, not a type the value holds
+ * ("declared, not held"). The compiler's printed type of a proxy is what the
+ * alias expands to (an alias of an alias, an intersection), so a reader cannot
+ * get the alias from the value. Pinned to `FLAG_DECLARED_TYPE` in
+ * `src/position_rows.rs` by `position-rows-declared-type.test.ts`.
+ */
+export const FLAG_DECLARED_TYPE = 256;
 
 /** The most `decl` rows one position lists. */
 export const DECL_CAP = 16;
@@ -502,6 +512,8 @@ export class PositionWalker {
         }
         if (kind === 'member' && !(row[8] & FLAG_CHECKER_THREW)) {
           rows.push(...this.receiverTypeRows(node, row));
+          const declared = this.declaredTypeRow(node);
+          if (declared) rows.push(declared);
         }
         if (kind === 'call' && !(row[8] & FLAG_CHECKER_THREW)) {
           const typed = this.typedDeclRow(node, row[1], row[2]);
@@ -864,6 +876,112 @@ export class PositionWalker {
   }
 
   /**
+   * The {@link FLAG_DECLARED_TYPE} row of a member read's receiver: the type
+   * alias a package declares that the receiver was declared as. Read from
+   * the declaration, never the value: the receiver symbol's annotation, else
+   * the declared return of the make its initializer calls (or the call the
+   * receiver is), walked through the checkout's own aliases to the first
+   * package alias (the first constituent of a union or intersection that has
+   * one). Only aliases: an interface or class is what the class rows are for.
+   * Only where the member read sits on a call's callee chain
+   * (`a.b.c()`); a plain property read gives none. At most one row per
+   * receiver span, outside {@link DECL_CAP}, and not subject to the
+   * same-package skip of the class rows. A throw writes none.
+   */
+  private declaredTypeRow(node: ts.Node): PositionRow | undefined {
+    if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return undefined;
+    if (!isOnCalleeChain(node)) return undefined;
+    try {
+      const receiver = node.expression;
+      const typeNode = this.declaredTypeNode(receiver);
+      if (!typeNode) return undefined;
+      const found = this.packageAlias(typeNode, new Set(), 0);
+      if (!found) return undefined;
+      const { symbol, declaration, declFile, declLine, declPackage } = found;
+      const start = receiver.getStart(node.getSourceFile());
+      const flags = this.publication(symbol, declaration) | FLAG_DECLARED_TYPE;
+      return ['receiver_type', start, receiver.getEnd(), ts.symbolName(symbol), declFile, declLine, declPackage, null, flags];
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The type node a receiver is declared by: its symbol's annotation, or the declared return of the call it is made by. */
+  private declaredTypeNode(receiver: ts.Expression): ts.TypeNode | undefined {
+    const expression = skipWrappers(receiver);
+    if (ts.isCallExpression(expression)) return this.returnTypeNode(expression);
+    const name = ts.isPropertyAccessExpression(expression)
+      ? expression.name
+      : ts.isIdentifier(expression)
+        ? expression
+        : undefined;
+    let symbol = name ? this.checker.getSymbolAtLocation(name) : undefined;
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+    const declaration = symbol?.valueDeclaration;
+    if (
+      !declaration ||
+      !(
+        ts.isVariableDeclaration(declaration) ||
+        ts.isPropertyDeclaration(declaration) ||
+        ts.isPropertySignature(declaration) ||
+        ts.isParameter(declaration)
+      )
+    ) {
+      return undefined;
+    }
+    if (declaration.type) return declaration.type;
+    const initializer = 'initializer' in declaration ? declaration.initializer : undefined;
+    if (!initializer || ts.isParameter(declaration)) return undefined;
+    const made = skipWrappers(initializer);
+    return ts.isCallExpression(made) ? this.returnTypeNode(made) : undefined;
+  }
+
+  /** The declared return type node of the signature a call resolves to. */
+  private returnTypeNode(call: ts.CallExpression): ts.TypeNode | undefined {
+    const type = this.checker.getResolvedSignature(call)?.declaration?.type;
+    return type && ts.isTypeNode(type) ? type : undefined;
+  }
+
+  /**
+   * The first type alias a package declares that `typeNode` names, through
+   * the checkout's own aliases (`type Runner = Inner`), a union or an
+   * intersection, in order. An alias, interface or class of the checkout
+   * that is not an alias is a stop; so is the default library.
+   */
+  private packageAlias(
+    typeNode: ts.TypeNode,
+    seen: Set<ts.Symbol>,
+    depth: number
+  ):
+    | { symbol: ts.Symbol; declaration: ts.Declaration; declFile: string; declLine: number; declPackage: string }
+    | undefined {
+    if (depth > DECLARED_WALK_DEPTH) return undefined;
+    if (ts.isParenthesizedTypeNode(typeNode)) return this.packageAlias(typeNode.type, seen, depth + 1);
+    if (ts.isUnionTypeNode(typeNode) || ts.isIntersectionTypeNode(typeNode)) {
+      for (const member of typeNode.types) {
+        const found = this.packageAlias(member, seen, depth + 1);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    if (!ts.isTypeReferenceNode(typeNode)) return undefined;
+    const name = ts.isQualifiedName(typeNode.typeName) ? typeNode.typeName.right : typeNode.typeName;
+    let symbol = this.checker.getSymbolAtLocation(name);
+    if (symbol && symbol.flags & ts.SymbolFlags.Alias) symbol = this.checker.getAliasedSymbol(symbol);
+    if (!symbol || seen.has(symbol) || !(symbol.flags & ts.SymbolFlags.TypeAlias)) return undefined;
+    seen.add(symbol);
+    const declaration = symbol.declarations?.find(ts.isTypeAliasDeclaration);
+    if (!declaration) return undefined;
+    const file = declaration.getSourceFile();
+    const { declFile, declLine, declPackage } = this.located(file, declaration.getStart(file));
+    if (declFile === null || declFile.startsWith('lib:')) return undefined;
+    if (declFile.startsWith('pkg:') || declFile.split('/').includes('node_modules')) {
+      return declPackage === null ? undefined : { symbol, declaration, declFile, declLine, declPackage };
+    }
+    return this.packageAlias(declaration.type, seen, depth + 1);
+  }
+
+  /**
    * The name a `receiver_type` row gives a class. A class written
    * `export default class Cursor` has the symbol name `default`, which is
    * its package's `default` only where it is declared in the file the
@@ -1088,6 +1206,38 @@ export class PositionWalker {
 /** A row's fields after its kind and span. */
 function tail(row: PositionRow): [string | null, string | null, number | null, string | null, string | null, number] {
   return [row[3], row[4], row[5], row[6], row[7], row[8]];
+}
+
+/** How far a declared type is walked through the checkout's own aliases. */
+const DECLARED_WALK_DEPTH = 8;
+
+/** An expression without the wrappers that do not change what it is: `(x)`, `x!`. */
+function skipWrappers(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current) || ts.isNonNullExpression(current)) current = current.expression;
+  return current;
+}
+
+/** Whether a member read is the callee, or an object on the callee's chain, of a call (`a.b.c()`). */
+function isOnCalleeChain(node: ts.Node): boolean {
+  let current: ts.Node = node;
+  for (;;) {
+    const parent: ts.Node | undefined = current.parent;
+    if (!parent) return false;
+    if (ts.isCallExpression(parent)) return parent.expression === current;
+    if (ts.isParenthesizedExpression(parent) || ts.isNonNullExpression(parent)) {
+      current = parent;
+      continue;
+    }
+    if (
+      (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+      parent.expression === current
+    ) {
+      current = parent;
+      continue;
+    }
+    return false;
+  }
 }
 
 /** Order two `decl_file` names, `null` last. */

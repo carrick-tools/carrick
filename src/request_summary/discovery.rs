@@ -79,8 +79,8 @@ use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_st
 use crate::library_store::LibraryAnswer;
 use crate::library_store::RUNTIME_TYPES;
 use crate::position_rows::{
-    FLAG_DECLARATION_UNNAMED, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED, FLAG_RUNS_HANDED, FLAG_TOO_MANY,
-    Kind, Row,
+    FLAG_DECLARATION_UNNAMED, FLAG_DECLARED_TYPE, FLAG_MODULE_DEFAULT, FLAG_PUBLISHED,
+    FLAG_RUNS_HANDED, FLAG_TOO_MANY, Kind, Row,
 };
 use crate::services::type_sidecar::{
     ClaimOn, LibraryCheck, LibraryClaim, LibraryOp, LibraryRole, MakeForm, SemanticsResult,
@@ -1715,20 +1715,49 @@ impl<'a> Walker<'a> {
                 .ok()
         };
         let proxy_type = |index: usize| at(index)?.type_text().and_then(type_root);
+        // The package alias the receiver was declared as, when the compiler
+        // engine wrote one (`FLAG_DECLARED_TYPE`): the printed type of a
+        // proxy is what its alias expands to, so the alias is read from the
+        // declaration. Written at the proxy's own span only.
+        let declared = |index: usize| {
+            let (lo, hi, _) = call.receiver_spans[index];
+            positions
+                .receiver_declarations(file, ir.swc_start(lo), ir.swc_start(hi))
+                .unwrap_or_default()
+                .iter()
+                .find(|row| row.flags() & FLAG_DECLARED_TYPE != 0)
+        };
         // The innermost object on the chain whose type the store labels
-        // with a path-named op on this member.
-        let (inner, export, join) = (0..call.receiver_spans.len()).find_map(|index| {
-            let root = proxy_type(index)?;
-            packages.iter().find_map(|package| {
-                let (export, join) = path_op(self.labels.exports, package, root, member)?;
-                Some((index, export, join))
-            })
+        // with a path-named op on this member: by the printed type, else by
+        // the declared one. `printed` is the root the proxy's own chain
+        // prints as, none for a declared match.
+        let (inner, export, join, printed) = (0..call.receiver_spans.len()).find_map(|index| {
+            if let Some(root) = proxy_type(index) {
+                let found = packages.iter().find_map(|package| {
+                    let (export, join) = path_op(self.labels.exports, package, root, member)?;
+                    Some((export, join))
+                });
+                if let Some((export, join)) = found {
+                    return Some((index, export, join, Some(root)));
+                }
+            }
+            let row = declared(index)?;
+            let name = row.symbol()?;
+            store_keys(row, self.labels.exports)
+                .iter()
+                .find_map(|package| {
+                    let (export, join) = path_op(self.labels.exports, package, name, member)?;
+                    Some((export, join))
+                })
+                .map(|(export, join)| (index, export, join, None))
         })?;
-        let root = proxy_type(inner)?;
-        let proxy = (inner..call.receiver_spans.len())
-            .take_while(|index| proxy_type(*index) == Some(root))
-            .last()
-            .unwrap_or(inner);
+        let proxy = match printed {
+            Some(root) => (inner..call.receiver_spans.len())
+                .take_while(|index| proxy_type(*index) == Some(root))
+                .last()
+                .unwrap_or(inner),
+            None => inner,
+        };
         let invoke = Invoke {
             file,
             call,
@@ -1988,6 +2017,11 @@ impl<'a> Walker<'a> {
                 }
                 let mut claiming: Vec<(String, &str)> = Vec::new();
                 for row in held {
+                    // A declared type is how `procedure_end` reads a proxy;
+                    // widening this read to it is its own measured change.
+                    if row.flags() & FLAG_DECLARED_TYPE != 0 {
+                        continue;
+                    }
                     let Some(name) = row.symbol() else {
                         continue;
                     };
@@ -5646,7 +5680,7 @@ export function listen(): void {
     #[test]
     fn a_row_without_the_publication_bits_reads_and_names_nothing() {
         let text = concat!(
-            r#"{"v":6,"typescript":"5.9.3","service":"api","files":1}"#,
+            r#"{"v":7,"typescript":"5.9.3","service":"api","files":1}"#,
             "\n",
             r#"{"f":"src/a.ts","h":"00","r":[["call",0,7,"greet","node_modules/p/index.d.ts",1,"p","string",0],["call",9,16,"make","node_modules/p/index.d.ts",3,"p","App",96]]}"#,
             "\n"

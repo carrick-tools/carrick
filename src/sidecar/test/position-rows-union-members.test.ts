@@ -93,8 +93,8 @@ describe('position_rows: a member on a union lists each declaration (carrick#244
     return out;
   };
 
-  it('writes format version 6', () => {
-    assert.strictEqual(JSON.parse(text.split('\n')[0]).v, 6);
+  it('writes format version 7', () => {
+    assert.strictEqual(JSON.parse(text.split('\n')[0]).v, 7);
   });
 
   it('lists both classes for a member read on a union of two classes', () => {

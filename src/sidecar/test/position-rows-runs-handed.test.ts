@@ -126,7 +126,7 @@ describe('position_rows: a call that runs the function it is handed (carrick#263
 
   it('pins the bit to the Rust constant', () => {
     const rust = fs.readFileSync(RUST_ROWS, 'utf8');
-    const match = /pub const FLAG_RUNS_HANDED: u8 = (\d+);/.exec(rust);
+    const match = /pub const FLAG_RUNS_HANDED: u16 = (\d+);/.exec(rust);
     assert.ok(match, 'src/position_rows.rs declares FLAG_RUNS_HANDED');
     assert.strictEqual(Number(match[1]), FLAG_RUNS_HANDED);
   });
