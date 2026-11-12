@@ -17,6 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { CheckResult } from "../contract.ts";
+import { safeId } from "./session-key.ts";
 import { linkedCheckoutTop } from "./worktree.ts";
 
 /** A session's accumulated record. */
@@ -81,11 +82,6 @@ export type SessionRecord = {
 
 /** Session files older than this are removed on the next write. */
 const KEEP_DAYS = 7;
-
-/** A file name a session id can never escape from. */
-export function safeId(sessionId: string): string | null {
-  return /^[A-Za-z0-9._-]{1,128}$/.test(sessionId) ? sessionId : null;
-}
 
 /** Where one session's record lives. */
 export function sessionFile(sessionId: string, home: string = os.homedir()): string | null {

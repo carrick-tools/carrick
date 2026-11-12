@@ -9,11 +9,12 @@
 // JSON object.
 
 import { readStdin } from "./stdin.ts";
+import { sessionKey } from "./session-key.ts";
 
 async function main(): Promise<void> {
   let session: string | undefined;
   try {
-    session = (JSON.parse((await readStdin()) || "{}") as { session_id?: string }).session_id;
+    session = sessionKey(JSON.parse((await readStdin()) || "{}") as { session_id?: string; agent_id?: string });
   } catch {
     return;
   }
