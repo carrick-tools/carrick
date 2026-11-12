@@ -10,6 +10,7 @@ import path from "node:path";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
+import { scanSource } from "../src/facts/match.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
 import { readTimings } from "../src/hook/timings.ts";
 
@@ -417,6 +418,55 @@ test("the timing record carries facts_ms", async (t) => {
   const records = readTimings(ws.root).filter((record) => record.hook === "post-edit");
   assert.equal(records.length, 1);
   assert.equal(typeof records[0]!.facts_ms, "number");
+});
+
+/** The spans `scanSource` finds, as `name: text`; null when the file did not read. */
+function spansOf(src: string, jsx = false): string[] | null {
+  const scan = scanSource(src, jsx);
+  return scan.ok ? scan.spans.map((span) => `${span.name}: ${src.slice(span.start, span.end)}`) : null;
+}
+
+test("generic functions, methods and arrows get their own spans", () => {
+  assert.deepEqual(spansOf('function f<T>(a: T) { api.get("/f") }'), ['f: function f<T>(a: T) { api.get("/f") }']);
+  assert.deepEqual(spansOf('class A { async find<T>(id: string) { return api.get("/a") } }'), [
+    'A.find: async find<T>(id: string) { return api.get("/a") }',
+  ]);
+  assert.deepEqual(spansOf('class B extends Base<{ id: string }> { find() { return api.get("/b") } }'), [
+    'B.find: find() { return api.get("/b") }',
+  ]);
+  assert.deepEqual(spansOf('const o = { order<T>() { api.get("/o") } }'), ['o.order: order<T>() { api.get("/o") }']);
+  assert.deepEqual(spansOf('const f = <T>(a: T): T => { api.get("/g"); return a }'), [
+    'f: const f = <T>(a: T): T => { api.get("/g"); return a }',
+  ]);
+  assert.deepEqual(spansOf('const g = async <T extends object>(a: T) => api.get("/g")'), [
+    'g: const g = async <T extends object>(a: T) => api.get("/g")',
+  ]);
+  // `<T,>` in a component file is a type parameter, not an element.
+  assert.deepEqual(spansOf("const pick = <T,>(a: T) => a;\nfunction load() {\n  return <div>{1}</div>;\n}\n", true), [
+    "pick: const pick = <T,>(a: T) => a",
+    "load: function load() {\n  return <div>{1}</div>;\n}",
+  ]);
+  // Overloads, declarations and function types still read.
+  assert.notEqual(spansOf("declare function d(a: string): void;\nexport function o(a: string): void;\nexport function o(a: any) { return a }\ntype F = <T>(a: T) => T;\n"), null);
+});
+
+test("a declaration the scanner cannot place makes the file unread, never its outer function", () => {
+  assert.equal(spansOf("function outer() {\n  function inner<T(a) { api.get('/x') }\n}\n"), null);
+  assert.equal(spansOf("class A { find<T(a) { return 1 } }"), null);
+});
+
+test("an edit inside a generic arrow nested in a function is the arrow's, not the outer function's", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /audit", repo: "orders-api", file: "src/a.ts", line: 2, name: "outer", text: "outer line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("orders-api/src/a.ts"),
+    'export function outer() {\n  api.post("/audit");\n  const inner = <T>(x: T) => {\n    return cache.set(x);\n  };\n}\n',
+  );
+  assert.deepEqual(await linesFor(ws, "orders-api/src/a.ts", "return cache.set(x);"), []);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/a.ts", 'api.post("/audit");'), ["outer line"]);
 });
 
 /** A linked worktree of `repo` at `<repo>/.claude/worktrees/<branch>`, holding a copy of the repo's files. */

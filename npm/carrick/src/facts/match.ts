@@ -58,6 +58,8 @@ function isIdPart(ch: string): boolean {
 /** After these a `<` in a `.tsx` or `.jsx` file opens an element. */
 const JSX_AFTER_PUNC = new Set(["(", ",", "=", ":", "?", "&&", "||", "??", "=>", "{", "[", ";", "!"]);
 const JSX_AFTER_WORD = new Set(["return", "yield", "await", "default"]);
+/** A `<` that opens type parameters in a `.tsx` file: `<T,>` or `<T extends X>`. */
+const TYPE_PARAMS_IN_JSX = /^<\s*[A-Za-z_$][\w$]*\s*(?:,|extends\s+[^=\s])/;
 
 /**
  * The tokens of `text`, or null when a string, template, comment, regex or
@@ -141,9 +143,12 @@ function lexAll(text: string, jsx: boolean): Token[] {
     return null;
   };
 
-  // Whether a `<` at `i` opens an element: in expression position, before a tag name or `>`.
+  // Whether a `<` at `i` opens an element: in expression position, before a
+  // tag name or `>`, and not a generic arrow's type parameters (`<T,>`,
+  // `<T extends X>`), which a component file must spell that way.
   const jsxStarts = (): boolean => {
     if (!jsx || !/[A-Za-z>]/.test(text[i + 1] ?? "")) return false;
+    if (TYPE_PARAMS_IN_JSX.test(text.slice(i, i + 200))) return false;
     const prev = prevSignificant();
     return (
       prev === undefined ||
@@ -370,6 +375,41 @@ export function scanSource(text: string, jsx = false): Scan {
     return token !== undefined && token.kind === kind && (value === undefined || token.value === value);
   };
   const punc = (index: number, value: string): boolean => is(index, "punc", value);
+  // Set when a declaration is seen that this scanner cannot place: the file is
+  // then not read at all, so an edit in it is never handed to an outer function.
+  let unplaced = false;
+
+  /** The index after the `>` closing a type parameter or argument list opened at `from`, or -1. */
+  const angleEnd = (from: number, limit: number): number => {
+    let depth = 0;
+    for (let k = from; k < limit; k += 1) {
+      const token = t(k)!;
+      if (token.kind !== "punc") continue;
+      if (OPEN[token.value]) {
+        k = match.get(k)!;
+        continue;
+      }
+      if (token.value === "<") depth += 1;
+      else if (token.value === ">") {
+        depth -= 1;
+        if (depth === 0) return k + 1;
+      } else if (token.value === ";" || CLOSE.has(token.value)) return -1;
+    }
+    return -1;
+  };
+
+  /**
+   * At the `<` of a call's type arguments (`new Map<string, T[]>(`), the
+   * index of the call's `(`, so their commas are not read as separators; else -1.
+   */
+  const typeArgsCall = (k: number, limit: number): number => {
+    if (!punc(k, "<") || !is(k - 1, "id")) return -1;
+    const after = angleEnd(k, limit);
+    return after > 0 && punc(after, "(") ? after : -1;
+  };
+
+  /** Past a type parameter list at `k` when there is one; -1 when it does not close. */
+  const pastTypeParams = (k: number, limit: number): number => (punc(k, "<") ? angleEnd(k, limit) : k);
 
   // Every call's direct string arguments.
   for (const [index, token] of tokens.entries()) {
@@ -445,6 +485,11 @@ export function scanSource(text: string, jsx = false): Scan {
         k = match.get(k)! + 1;
         continue;
       }
+      const call = typeArgsCall(k, limit);
+      if (call > 0) {
+        k = call;
+        continue;
+      }
       if (token.kind === "punc" && (token.value === "," || token.value === ";" || CLOSE.has(token.value))) return k;
       if (k > from) {
         const prev = t(k - 1)!;
@@ -473,14 +518,17 @@ export function scanSource(text: string, jsx = false): Scan {
       k += 1;
       if (punc(k, "*")) k += 1;
       if (is(k, "id")) k += 1;
-      if (!punc(k, "(")) return null;
+      k = pastTypeParams(k, limit);
+      if (k < 0 || !punc(k, "(")) return null;
       const body = bodyAfterParams(match.get(k)!, limit);
       if (body < 0) return null;
       return { bodyOpen: body, after: match.get(body)! + 1, exprFrom: -1 };
     }
     let arrow = -1;
     if (is(k, "id") && punc(k + 1, "=>")) arrow = k + 1;
-    else if (punc(k, "(")) {
+    else if (punc(k, "(") || punc(k, "<")) {
+      k = pastTypeParams(k, limit);
+      if (k < 0 || !punc(k, "(")) return null;
       const close = match.get(k)!;
       if (punc(close + 1, "=>")) arrow = close + 1;
       else if (punc(close + 1, ":")) {
@@ -510,12 +558,20 @@ export function scanSource(text: string, jsx = false): Scan {
       if (token.kind === "id" && token.value === "function") {
         let k = i + 1;
         if (punc(k, "*")) k += 1;
-        if (is(k, "id") && punc(k + 1, "(")) {
+        if (is(k, "id")) {
+          const params = pastTypeParams(k + 1, limit);
+          if (params < 0 || !punc(params, "(")) {
+            unplaced = true;
+            return;
+          }
           const fn = functionAt(i, limit);
           if (fn) {
             i = named(t(k)!.value, i, fn);
             continue;
           }
+          // An overload or `declare` signature: no body to place.
+          i = match.get(params)! + 1;
+          continue;
         }
       }
       if (token.kind === "id" && (token.value === "const" || token.value === "let" || token.value === "var") && is(i + 1, "id")) {
@@ -534,6 +590,12 @@ export function scanSource(text: string, jsx = false): Scan {
             i = named(name, i, fn);
             continue;
           }
+          // A function this scanner did not read (a generic it cannot close, an
+          // `async` or `function` value it cannot follow): not read at all.
+          if (punc(value, "<") || is(value, "id", "function") || (is(value, "id", "async") && !punc(value + 1, "."))) {
+            unplaced = true;
+            return;
+          }
           i = value;
           continue;
         }
@@ -541,8 +603,13 @@ export function scanSource(text: string, jsx = false): Scan {
       if (token.kind === "id" && token.value === "class" && is(i + 1, "id")) {
         const name = t(i + 1)!.value;
         let k = i + 2;
-        while (k < limit && !punc(k, "{")) {
-          k = punc(k, "(") || punc(k, "[") ? match.get(k)! + 1 : k + 1;
+        // The heritage clause up to the body; type arguments may hold `{`.
+        while (k >= 0 && k < limit && !punc(k, "{")) {
+          k = punc(k, "(") || punc(k, "[") ? match.get(k)! + 1 : punc(k, "<") ? angleEnd(k, limit) : k + 1;
+        }
+        if (k < 0) {
+          unplaced = true;
+          return;
         }
         if (k < limit) {
           walk(k + 1, match.get(k)!, { kind: "class", name });
@@ -565,6 +632,11 @@ export function scanSource(text: string, jsx = false): Scan {
     while (k < limit) {
       const token = t(k)!;
       if (token.kind === "punc" && separators.includes(token.value)) return k + 1;
+      const call = typeArgsCall(k, limit);
+      if (call > 0) {
+        k = call;
+        continue;
+      }
       if (token.kind === "punc" && OPEN[token.value]) {
         walk(k + 1, match.get(k)!, { kind: "code" });
         k = match.get(k)! + 1;
@@ -598,6 +670,13 @@ export function scanSource(text: string, jsx = false): Scan {
         continue;
       }
       if (punc(k, "?")) k += 1;
+      if (punc(k, "<")) {
+        k = angleEnd(k, limit);
+        if (k < 0 || !punc(k, "(")) {
+          unplaced = true;
+          return;
+        }
+      }
       if (punc(k, "(")) {
         const body = bodyAfterParams(match.get(k)!, limit);
         if (body >= 0) {
@@ -659,10 +738,18 @@ export function scanSource(text: string, jsx = false): Scan {
       } else if (punc(k, "[")) {
         k = match.get(k)! + 1;
       } else {
-        i = k + 1;
-        continue;
+        // A member this scanner does not know how to read.
+        unplaced = true;
+        return;
       }
       if (punc(k, "?") || punc(k, "!")) k += 1;
+      if (punc(k, "<")) {
+        k = angleEnd(k, limit);
+        if (k < 0 || !punc(k, "(")) {
+          unplaced = true;
+          return;
+        }
+      }
       if (punc(k, "(")) {
         const body = bodyAfterParams(match.get(k)!, limit);
         if (body >= 0) {
@@ -698,6 +785,7 @@ export function scanSource(text: string, jsx = false): Scan {
   }
 
   walk(0, tokens.length, { kind: "code" });
+  if (unplaced) return { ok: false, spans: [], calls: [] };
   return { ok: true, spans, calls };
 }
 
