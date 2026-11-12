@@ -30,6 +30,12 @@
 //! the model for its schema fields only when the service has schema fields to
 //! link it to (see `FileOrchestrator`), so a client app that imports an HTTP
 //! client instance in every component is not admitted for GraphQL.
+//!
+//! The schema-keyed field reader (carrick#1295,
+//! [`crate::graphql_resolver_anchor::root_field_claims`]) asks the same
+//! question of ANY package ([`PackageValueReader::module_scope_package_calls`]):
+//! its witness is the service's own schema, not detection's list, so the
+//! value need only come from outside this repo.
 
 use crate::import_bindings::BindingResolver;
 use crate::parser::parse_file;

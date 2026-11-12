@@ -34,7 +34,9 @@
 //! | `retireParcel` | nowhere admitted | `dist/schema.graphql:4` |
 //!
 //! Without the package in detection no file is admitted for its schema
-//! fields, and every field is served at its printed schema line.
+//! fields, and a model answer can leave a field out. Either way the fields
+//! are served where they are resolved: the printed schema says which root
+//! type each fields object belongs to (carrick#1295).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

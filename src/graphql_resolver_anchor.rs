@@ -38,7 +38,7 @@ use std::path::Path;
 
 use swc_common::{SourceMap, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    BlockStmtOrExpr, CallExpr, ClassMethod, Decl, DefaultDecl, Expr, ExprOrSpread, FnDecl,
+    ArrowFunctionBody, CallExpr, ClassMethod, Decl, DefaultDecl, Expr, ExprOrSpread, FnDecl,
     MethodProp, ModuleDecl, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, ReturnStmt,
     Stmt, VarDeclarator,
 };
@@ -506,8 +506,8 @@ impl ClaimWalk<'_> {
             Expr::Object(object) => self.object(object),
             Expr::Call(call) => self.call_arguments(call),
             Expr::Arrow(arrow) => match &*arrow.body {
-                BlockStmtOrExpr::Expr(body) => self.reach(body),
-                BlockStmtOrExpr::BlockStmt(block) => self.returns(&block.stmts),
+                ArrowFunctionBody::Expr(body) => self.reach(body),
+                ArrowFunctionBody::FunctionBody(block) => self.returns(&block.stmts),
             },
             Expr::Fn(function) => {
                 if let Some(body) = &function.function.body {
