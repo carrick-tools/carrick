@@ -1549,6 +1549,77 @@ fn procedure_routes_take_their_key_paths() {
     );
 }
 
+/// cloud#2743 item 5 (contract amendment 11, S2b-1): a make the store
+/// labels `protocol: "graphql"` is a GraphQL server, read by the procedure
+/// pass's own mount reader and written to `Decided::graphql_mounts`, which
+/// the run log states. In a service with no procedure router (`gql`): a
+/// server mounted under `/graphql` is mounted there, and one handed to
+/// nothing that mounts it is a mount whose path is unread
+/// (`graphql_mount_path_unread`). Beside a procedure router (`mixed`): the
+/// server's schema, bound by destructuring, is never walked as a procedure
+/// collection, so the walk stops nowhere, and the router's own procedure is
+/// served as before. No GraphQL row is written: nothing reads the mounts
+/// yet.
+#[test]
+fn a_graphql_make_is_a_mount_and_never_a_procedure_adapter() {
+    let (on, log) = scan_fixture_logged("graphql-mount");
+    let mut mounts: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.split("graphql_mounts=").nth(1))
+        .map(|rest| rest.split(" receiver trace").next().unwrap_or(rest).trim())
+        .collect();
+    mounts.sort();
+    assert_eq!(
+        mounts,
+        vec![
+            "services/gql/src/pathless.ts:9 graphql_mount_path_unread;\
+             services/gql/src/server.ts:8 /graphql;\
+             services/gql/src/standalone.ts:6 graphql_mount_path_unread",
+            "services/mixed/src/server.ts:19 /graphql",
+        ],
+        "graphql mounts in the run log"
+    );
+    assert!(
+        log.contains("routes served at a full path"),
+        "the receiver trace ran"
+    );
+    assert!(
+        !log.contains("procedure_walk_stopped"),
+        "a graphql make was walked as a procedure adapter"
+    );
+    let (graph, _) = endpoint_rows(&on);
+    assert_eq!(
+        graph,
+        vec!["services/mixed/src/kit.ts:6 GET /rpc/ping library_claim appRouter".to_string()]
+    );
+}
+
+/// cloud#2743 item 5 (S2b-1): a GraphQL server taken by a verified mount
+/// member that states no path serves at an endpoint of its own, which the
+/// code never writes. The mount stays, with the saved stop
+/// `graphql_mount_path_unread`, and its path is never `/`.
+#[test]
+fn graphql_mount_path_unread() {
+    let (_, log) = scan_fixture_logged("graphql-mount");
+    let pathless: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.split("graphql_mounts=").nth(1))
+        .flat_map(|rest| {
+            rest.split(" receiver trace")
+                .next()
+                .unwrap_or(rest)
+                .split(';')
+        })
+        .map(str::trim)
+        .filter(|mount| mount.starts_with("services/gql/src/pathless.ts:"))
+        .collect();
+    assert_eq!(
+        pathless,
+        vec!["services/gql/src/pathless.ts:9 graphql_mount_path_unread"],
+        "a verified graphql mount with no path"
+    );
+}
+
 /// carrick#3688 (A7): a procedure route no adapter serves is saved with the
 /// walk's own reason, not `owner_unknown`: an adapter handed to a call no
 /// verified mount reads, one with no prefix and no host call, a router no

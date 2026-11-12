@@ -71,7 +71,7 @@ pub use instances::{
     InstanceAt, InstanceEnd, InstanceHole, MakerCall, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
     origin_side,
 };
-pub use procedures::{Procedure, ProcedureAt, ProcedureLabels};
+pub use procedures::{GraphqlMount, Procedure, ProcedureAt, ProcedureLabels};
 pub use router_holder::router_holder;
 
 /// The hop discovery records where a walk enters a function through a value
@@ -1025,6 +1025,10 @@ pub struct Decided {
     /// at with no procedure to count it on (carrick#2474 R6c), once per
     /// adapter.
     pub procedure_stops: usize,
+    /// With the receiver trace on, where each GraphQL server a store make
+    /// labels is mounted (contract amendment 11, [`GraphqlMount`]). Read by
+    /// nothing yet; logged.
+    pub graphql_mounts: Vec<GraphqlMount>,
     /// With the receiver trace on, the router mounts it ignored because a
     /// file only tests import makes them (carrick#2775), by `file:line`.
     /// Counted in the run log.

@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "gql", "directory": "services/gql", "tsconfig": "tsconfig.json" },
+    { "name": "mixed", "directory": "services/mixed", "tsconfig": "tsconfig.json" }
+  ]
+}

@@ -143,6 +143,9 @@ pub enum Stop {
     /// subscription implies none by itself, so the call states no wire
     /// method (carrick#4048).
     ProcedureSubscriptionNotHttp,
+    /// A GraphQL server's mount states no path the code writes: a library
+    /// default endpoint, or a host with no verified mount.
+    GraphqlMountPathUnread,
     /// A word a later release added: read from a blob, never written by
     /// this build's own passes, and in no [`Stop::ALL`]. A reader says the
     /// raw word, with no phrase.
@@ -182,7 +185,7 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 56] = [
+    pub const ALL: [Stop; 57] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -239,6 +242,7 @@ impl Stop {
         Stop::ProcedureUnmounted,
         Stop::ProcedureNoAdapter,
         Stop::ProcedureSubscriptionNotHttp,
+        Stop::GraphqlMountPathUnread,
     ];
 
     /// The word as it is written on the wire.
@@ -300,6 +304,7 @@ impl Stop {
             Stop::ProcedureUnmounted => "procedure_unmounted",
             Stop::ProcedureNoAdapter => "procedure_no_adapter",
             Stop::ProcedureSubscriptionNotHttp => "procedure_subscription_not_http",
+            Stop::GraphqlMountPathUnread => "graphql_mount_path_unread",
             Stop::Unknown(UnknownWord(word)) => word,
         }
     }
