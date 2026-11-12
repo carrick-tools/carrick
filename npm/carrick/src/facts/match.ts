@@ -34,6 +34,8 @@ export type Scan = {
   ok: boolean;
   spans: NamedSpan[];
   calls: CallSpan[];
+  /** The token reads the scan made (`SCAN_STEP_BUDGET`). */
+  steps: number;
 };
 
 const OPEN: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
@@ -372,14 +374,39 @@ function matchBrackets(tokens: Token[]): Map<number, number> | null {
 
 type Ctx = { kind: "code" } | { kind: "class"; name: string } | { kind: "object"; path: string };
 
+/**
+ * The token reads one scan may make. Past it the scan gives up (`ok: false`),
+ * so no file under `MAX_FACT_FILE_BYTES` keeps a hook waiting (about 10 ms
+ * of reads past the tokenizer). Measured 2026-11-12: a 2,000-line file takes
+ * about 31,000, a 12,000-line, 514 KB source file about 141,000.
+ */
+export const SCAN_STEP_BUDGET = 1_000_000;
+
 /** Scan `text` for named spans and calls; `jsx` for a `.tsx` or `.jsx` file. */
-export function scanSource(text: string, jsx = false): Scan {
+export function scanSource(text: string, jsx = false, budget = SCAN_STEP_BUDGET): Scan {
   const tokens = tokenize(text, jsx);
   const match = tokens ? matchBrackets(tokens) : null;
-  if (!tokens || !match) return { ok: false, spans: [], calls: [] };
+  if (!tokens || !match) return { ok: false, spans: [], calls: [], steps: 0 };
+  try {
+    return scanTokens(tokens, match, budget);
+  } catch (error) {
+    if (error instanceof OverBudget) return { ok: false, spans: [], calls: [], steps: budget };
+    throw error;
+  }
+}
+
+class OverBudget extends Error {}
+
+function scanTokens(tokens: Token[], match: Map<number, number>, budget: number): Scan {
   const spans: NamedSpan[] = [];
   const calls: CallSpan[] = [];
-  const t = (index: number): Token | undefined => tokens[index];
+  let steps = 0;
+  // Every token read counts against the budget.
+  const t = (index: number): Token | undefined => {
+    steps += 1;
+    if (steps > budget) throw new OverBudget();
+    return tokens[index];
+  };
   const is = (index: number, kind: TokenKind, value?: string): boolean => {
     const token = t(index);
     return token !== undefined && token.kind === kind && (value === undefined || token.value === value);
@@ -390,8 +417,20 @@ export function scanSource(text: string, jsx = false): Scan {
   let unplaced = false;
 
   /** The index after the `>` closing a type parameter or argument list opened at `from`, or -1. */
+  // One scan answers every `<` it passes (`a < b` with no `;` after it would
+  // otherwise rescan to the end of its block once per `<`): `end` is the
+  // answer, `stop` the token the scan stopped at, `limited` when that was the limit.
+  const angles = new Map<number, { end: number; stop: number; limited: boolean }>();
   const angleEnd = (from: number, limit: number): number => {
-    let depth = 0;
+    const known = angles.get(from);
+    if (known !== undefined) {
+      if (known.stop < limit && !known.limited) return known.end;
+      if (known.stop >= limit) return -1;
+    }
+    const open: number[] = [];
+    const settle = (end: number, stop: number, limited: boolean) => {
+      for (const at of open) angles.set(at, { end, stop, limited });
+    };
     for (let k = from; k < limit; k += 1) {
       const token = t(k)!;
       if (token.kind !== "punc") continue;
@@ -399,12 +438,18 @@ export function scanSource(text: string, jsx = false): Scan {
         k = match.get(k)!;
         continue;
       }
-      if (token.value === "<") depth += 1;
+      if (token.value === "<") open.push(k);
       else if (token.value === ">") {
-        depth -= 1;
-        if (depth === 0) return k + 1;
-      } else if (token.value === ";" || CLOSE.has(token.value)) return -1;
+        const at = open.pop();
+        if (at === undefined) return -1;
+        angles.set(at, { end: k + 1, stop: k, limited: false });
+        if (open.length === 0) return k + 1;
+      } else if (token.value === ";" || CLOSE.has(token.value)) {
+        settle(-1, k, false);
+        return -1;
+      }
     }
+    settle(-1, limit, true);
     return -1;
   };
 
@@ -865,8 +910,8 @@ export function scanSource(text: string, jsx = false): Scan {
   }
 
   walk(0, tokens.length, { kind: "code" });
-  if (unplaced) return { ok: false, spans: [], calls: [] };
-  return { ok: true, spans, calls };
+  if (unplaced) return { ok: false, spans: [], calls: [], steps };
+  return { ok: true, spans, calls, steps };
 }
 
 /** A changed region of the file, as character offsets (end exclusive). */

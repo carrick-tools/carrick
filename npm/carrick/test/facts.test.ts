@@ -968,6 +968,23 @@ test("a declaration the scanner cannot place makes the file unread, never its ou
   assert.equal(spansOf("class A { find<T(a) { return 1 } }"), null);
 });
 
+test("R24.4: the scan's work grows with the file, and past its step budget the file is not read", async () => {
+  const { SCAN_STEP_BUDGET } = await import("../src/facts/match.ts");
+  // Semicolon-free code, where every `a < b` once rescanned to the end of its block.
+  const flat = Array.from({ length: 10_000 }, (_, i) => `export const f${i} = (a, b) => a < b`).join("\n");
+  const object = `export const o = {\n${Array.from({ length: 10_000 }, (_, i) => `  f${i}: (a, b) => a < b,`).join("\n")}\n}\n`;
+  for (const [name, text] of [["flat", flat], ["object", object]] as const) {
+    const scan = scanSource(text, false, Number.POSITIVE_INFINITY);
+    assert.equal(scan.ok, true, name);
+    assert.ok(scan.steps < SCAN_STEP_BUDGET, `${name}: ${scan.steps} steps`);
+  }
+  // A normal 2,000-line file reads well inside the budget.
+  const normal = Array.from({ length: 400 }, (_, i) => `export function f${i}(id: string) {\n  const order = load<Order>(id);\n  return api.get(\`/orders/\${id}\`);\n}\n`).join("");
+  assert.equal(scanSource(normal).ok, true);
+  // Past the budget: not read.
+  assert.equal(scanSource(normal, false, 1_000).ok, false);
+});
+
 test("R24.2: a type-predicate return type is read as a type, and one that does not read makes the file unread", async (t) => {
   assert.deepEqual(spansOf("function outer() {\n  function isX(v): v is { id: string } { return check(v); }\n}\n"), [
     "outer: function outer() {\n  function isX(v): v is { id: string } { return check(v); }\n}",
