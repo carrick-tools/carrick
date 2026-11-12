@@ -56,19 +56,18 @@ export function localRepos(root: string): Array<{ name: string; path: string; re
 }
 
 /**
- * The fact file's repos matched to their checkouts here. A header entry that
- * carries a remote (`owner/name`) maps only to the one checkout whose origin
- * names exactly that; one without maps only to the one checkout of exactly
- * its name. No match, or more than one, leaves the repo unmapped: its rows
- * are never read.
+ * The fact file's repos matched to their checkouts here. A header repo that
+ * is a remote (`owner/name`, as the index stores a GitHub repo) maps only to
+ * the one checkout whose origin names exactly that; a bare name maps only to
+ * the one checkout of exactly that name. No match, or more than one, leaves
+ * the repo unmapped: its rows are never read.
  */
-export function matchRepos(repos: ReadonlyArray<{ repo: string; remote?: string | null }>, local: ReturnType<typeof localRepos>): LocalRepo[] {
+export function matchRepos(repos: readonly string[], local: ReturnType<typeof localRepos>): LocalRepo[] {
   const out: LocalRepo[] = [];
-  for (const { repo, remote } of repos) {
-    const found =
-      typeof remote === "string" && remote !== ""
-        ? local.filter((entry) => entry.remote !== null && ownerName(entry.remote) === remote)
-        : local.filter((entry) => entry.name === repo);
+  for (const repo of repos) {
+    const found = repo.includes("/")
+      ? local.filter((entry) => entry.remote !== null && ownerName(entry.remote) === repo)
+      : local.filter((entry) => entry.name === repo);
     if (found.length === 1) out.push({ repo, path: found[0]!.path });
   }
   return out;
@@ -177,11 +176,9 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const bytes = Buffer.from(await staged.arrayBuffer());
     const gzipped = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
     const text = (gzipped ? zlib.gunzipSync(bytes) : bytes).toString("utf8");
-    const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown; remote?: unknown }> };
-    const repos = (header.repos ?? [])
-      .filter((entry): entry is { repo: string; remote?: unknown } => typeof entry.repo === "string")
-      .map((entry) => ({ repo: entry.repo, remote: typeof entry.remote === "string" ? entry.remote : null }));
-    const built = await buildFacts(text, factsPath(root), matchRepos(repos, localRepos(root)), now);
+    const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown }> };
+    const names = (header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string");
+    const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now);
     return built ? "written" : "none";
   } catch (error) {
     log("fact refresh failed", String(error));

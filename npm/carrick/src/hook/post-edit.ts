@@ -39,6 +39,7 @@ const CHECKED = /\.(ts|tsx|mts|cts|graphql|gql)$/;
 type Payload = {
   cwd?: string;
   session_id?: string;
+  tool_name?: string;
   tool_input?: {
     file_path?: string;
     filePath?: string;
@@ -160,6 +161,13 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     return out;
   }
   if (edited.length !== 1) return new Map();
+  // A `Write` (its result has a `type`: `create` or `update`) is placed only
+  // when it created the file; over an existing file it says nothing, even
+  // though its result carries hunks too.
+  const kind = payload.tool_response?.type;
+  if (payload.tool_name === "Write" || kind === "create" || kind === "update") {
+    return kind === "create" && (await untracked(edited[0]!)) ? new Map([[edited[0]!, { whole: true }]]) : new Map();
+  }
   const hunks = payload.tool_response?.structuredPatch;
   if (Array.isArray(hunks) && hunks.length > 0) {
     const lines: number[] = [];
@@ -178,7 +186,6 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     }
     return new Map([[edited[0]!, { lines, removed }]]);
   }
-  if (payload.tool_response?.type === "create") return (await untracked(edited[0]!)) ? new Map([[edited[0]!, { whole: true }]]) : new Map();
   const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(
     (text): text is string => typeof text === "string",
   );

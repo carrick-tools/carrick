@@ -406,6 +406,18 @@ test("a removed line touches a thing only when it was removed strictly inside it
   assert.equal(context(inside.stdout), "g line");
 });
 
+test("a replaced header line of a nested function is that function's, not its encloser's", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /audit", repo: "orders-api", file: "src/a.ts", line: 2, name: "outer", text: "outer line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  const file = ws.at("orders-api/src/a.ts");
+  fs.writeFileSync(file, 'export function outer() {\n  api.post("/audit");\n  const inner = <T>(x: T) => {\n    return cache.set(x);\n  };\n}\n');
+  const run = await patchEdit(ws, file, [{ newStart: 2, lines: ['   api.post("/audit");', "-  const inner = (x) => {", "+  const inner = <T>(x: T) => {", "     return cache.set(x);"] }]);
+  assert.equal(context(run.stdout), "");
+});
+
 test("a thing's span starts at export, default, async and decorators: its header line is its own", async (t) => {
   assert.deepEqual(spansOf("export async function g() { return 1 }\nexport default function h() {}\nexport const k = () => 1;\n"), [
     "g: export async function g() { return 1 }",
@@ -448,6 +460,22 @@ test("a Write over an existing file, whose changed lines are unknown, prints not
   const file = ws.at("orders-api/src/routes/orders.ts");
   const run = await payloadEdit(ws, { tool_name: "Write", tool_input: { file_path: file, content: fs.readFileSync(file, "utf8") }, tool_response: { type: "update" } });
   assert.equal(context(run.stdout), "");
+  // A Write's result also carries hunks (`structuredPatch`); a Write over a file still says nothing.
+  const at = fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes("res.status(204).end();")) + 1;
+  const withHunks = await payloadEdit(
+    ws,
+    {
+      tool_name: "Write",
+      tool_input: { file_path: file, content: fs.readFileSync(file, "utf8") },
+      tool_response: {
+        type: "update",
+        filePath: file,
+        structuredPatch: [{ oldStart: at, oldLines: 1, newStart: at, newLines: 1, lines: ["-  res.status(200).end();", "+  res.status(204).end();"] }],
+      },
+    },
+    "write-hunks",
+  );
+  assert.equal(context(withHunks.stdout), "");
 });
 
 test("a file this Write created, untracked in git, counts every named thing in it", async (t) => {
@@ -521,14 +549,17 @@ test("a fact file's repo maps to a checkout only by its exact remote, else its e
     { name: "jobs", path: "/w/jobs-2", remote: null },
   ];
   // The remote's last segment is not the repo.
-  assert.deepEqual(matchRepos([{ repo: "api" }], local), [{ repo: "api", path: "/w/api" }]);
-  assert.deepEqual(matchRepos([{ repo: "api-server" }], local), []);
+  assert.deepEqual(matchRepos(["api"], local), [{ repo: "api", path: "/w/api" }]);
+  assert.deepEqual(matchRepos(["api-server"], local), []);
   // An exact owner/name remote, in either spelling git accepts.
-  assert.deepEqual(matchRepos([{ repo: "frontend", remote: "acme/web" }], local), [{ repo: "frontend", path: "/w/web" }]);
-  // A header remote that matches no checkout is not rescued by the name.
-  assert.deepEqual(matchRepos([{ repo: "web", remote: "other/web" }], local), []);
+  assert.deepEqual(matchRepos(["acme/web", "acme/api-server"], local), [
+    { repo: "acme/web", path: "/w/web" },
+    { repo: "acme/api-server", path: "/w/api" },
+  ]);
+  // An owner/name that matches no checkout's origin is not rescued by the name.
+  assert.deepEqual(matchRepos(["other/web"], local), []);
   // Two checkouts of one name: ambiguous, not read.
-  assert.deepEqual(matchRepos([{ repo: "jobs" }], local), []);
+  assert.deepEqual(matchRepos(["jobs"], local), []);
 });
 
 test("a fact file for another project is not read", async (t) => {

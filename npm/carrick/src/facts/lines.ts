@@ -203,7 +203,11 @@ export async function factLines(
         : edit.snippets
           ? rangesOf(text, edit.snippets)
           : [{ start: 0, end: text.length }];
-      const gaps = byLine ? gapsOfLines(text, edit.removed ?? []) : [];
+      // A removal beside an added line is a replacement: the added line
+      // places it, and its gap (above an indented header) would name the encloser.
+      const added = new Set(edit.lines ?? []);
+      const removed = (edit.removed ?? []).filter((line) => !added.has(line) && !added.has(line - 1));
+      const gaps = byLine ? gapsOfLines(text, removed) : [];
       if (ranges.length === 0 && gaps.length === 0) continue;
       const reach = touched(text, scan, ranges, gaps);
       const rows: FactRow[] = [];
