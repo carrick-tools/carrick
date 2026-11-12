@@ -4,13 +4,15 @@
     "shared": ["orders-api", "storefront"],
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
-    "shelf": ["rpc-shelf"]
+    "shelf": ["rpc-shelf"],
+    "jobs": ["jobs-sender", "jobs-worker"]
   },
   "main_scans": {
     "shared": ["orders-api", "storefront", "orders-api"],
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
-    "shelf": ["rpc-shelf"]
+    "shelf": ["rpc-shelf"],
+    "jobs": ["jobs-sender", "jobs-worker", "jobs-sender"]
   },
   "seeds": [
     {
