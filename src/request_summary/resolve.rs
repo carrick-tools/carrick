@@ -1981,13 +1981,22 @@ impl ValueAt {
         }
     }
 
-    /// Whether [`Self::at`] reads `path` from a parameter that only a
-    /// spread hands on (ruling R-SP): the key's value is then left to the
-    /// parameter's callers, where before the rule it read as unread. When
-    /// those callers come back with nothing, the walk keeps the reason it
-    /// gave before the rule rather than stating `value_never_bound`
-    /// (carrick#4025, whose fix restates both).
+    /// Whether [`Self::at`] reads `path` through a spread and lands on a
+    /// parameter (ruling R-SP): the spread source is the parameter itself
+    /// (`{ ...args }`) or an object that writes the key from one
+    /// (`{ ...base }`, `base = { log }`, `log` a parameter). The key's value
+    /// is then left to the parameter's callers, where before the rule it
+    /// read as unread ([`unread_where_spread_unfilled`]).
     pub(super) fn spread_param_at(&self, path: &[String]) -> bool {
+        self.param_through_spread(path, false)
+    }
+
+    /// [`Self::spread_param_at`], `through` set once the read has passed a
+    /// spread.
+    fn param_through_spread(&self, path: &[String], through: bool) -> bool {
+        if matches!(self, Self::Param { .. }) {
+            return through;
+        }
         let Some((key, rest)) = path.split_first() else {
             return false;
         };
@@ -2001,12 +2010,14 @@ impl ValueAt {
             return false;
         };
         match fields.get(key) {
-            Some(values) => values.iter().any(|value| value.spread_param_at(rest)),
+            Some(values) => values
+                .iter()
+                .any(|value| value.param_through_spread(rest, through)),
             None if *open => spreads
                 .iter()
                 .flatten()
                 .flatten()
-                .any(|value| matches!(value, Self::Param { .. }) || value.spread_param_at(path)),
+                .any(|value| value.param_through_spread(path, true)),
             None => false,
         }
     }
@@ -2942,6 +2953,34 @@ pub(super) fn defaults_of<'a>(callee: Option<(&'a Path, &'a FnIr)>) -> Option<De
     callee.map(|(file, callee)| (file, callee.param_defaults.as_slice()))
 }
 
+/// The values a key holds, `unfilled` the writes of it read through a
+/// spread whose parameter's callers held nothing ([`ValueAt::spread_param_at`]).
+/// When nothing else is held, each such write keeps the reading it had
+/// before ruling R-SP, unread, one per write as before the rule, rather
+/// than stating that nothing binds the key: a function run only through a
+/// value, or a method another service calls, has no caller the resolver
+/// finds, though one writes the key (carrick#4025).
+pub(super) fn unread_where_spread_unfilled<R>(values: &mut Vec<Held<R>>, unfilled: usize) {
+    if values.is_empty() {
+        values.extend((0..unfilled).map(|_| Held::Stop(Stop::UnreadExpression)));
+    }
+}
+
+/// Count one write read through a spread (`spread`) whose parameter's
+/// callers held nothing (`held` empty). Before ruling R-SP the read stopped
+/// at the spread nearest the call, so the unfilled writes counted further
+/// up for this one (`unfilled` past `before`) collapse into it.
+pub(super) fn note_unfilled<R>(
+    unfilled: &mut usize,
+    before: usize,
+    spread: bool,
+    held: &[Held<R>],
+) {
+    if spread && held.is_empty() {
+        *unfilled = before + 1;
+    }
+}
+
 /// One per service run, built after the compiler rows are read: the one
 /// caller index and the constructions, and the guards one query holds.
 pub(super) struct Resolver<'a> {
@@ -3744,6 +3783,7 @@ impl<'a> Resolver<'a> {
         }
         let defaults: Defaults<'a> = (file, origin.defaults.as_slice());
         let mut out = Vec::new();
+        let mut unfilled = 0;
         for value in &from.values {
             match value {
                 ValueAt::Param {
@@ -3764,18 +3804,29 @@ impl<'a> Resolver<'a> {
                             construction: true,
                             bound: 0,
                         };
-                        for held in
-                            self.passed(follow, Some(at), *index, keys, Some(defaults), invoke)
-                        {
+                        let mut spread = false;
+                        for held in self.passed_noting(
+                            follow,
+                            Some(at),
+                            *index,
+                            keys,
+                            Some(defaults),
+                            invoke,
+                            &mut spread,
+                        ) {
                             match held {
                                 Held::Param(out_depth, index, keys) => {
-                                    out.extend(self.callers_pass(
+                                    let before = unfilled;
+                                    let held = self.callers_pass_noting(
                                         follow,
                                         (placed.file, placed.key, placed.depth),
                                         (out_depth, index, &keys),
                                         invoke,
                                         &mut Vec::new(),
-                                    ));
+                                        &mut unfilled,
+                                    );
+                                    note_unfilled(&mut unfilled, before, spread, &held);
+                                    out.extend(held);
                                 }
                                 other => out.push(other),
                             }
@@ -3787,6 +3838,7 @@ impl<'a> Resolver<'a> {
                 other => out.extend(self.read_value(follow, file, other, invoke, false)),
             }
         }
+        unread_where_spread_unfilled(&mut out, unfilled);
         self.fields_reading.borrow_mut().remove(&reading);
         Some(self.settle(out))
     }
@@ -3902,14 +3954,13 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
     ) -> Vec<Held<F::Reached>> {
-        self.callers_pass_noting(follow, at, param, invoke, passing, &mut false)
+        self.callers_pass_noting(follow, at, param, invoke, passing, &mut 0)
     }
 
-    /// [`Self::callers_pass`], setting `empty_through_spread` when a caller
-    /// writes the keys only through a spread of its own parameter
-    /// ([`Self::passed_noting`]) and that parameter's callers hold
-    /// nothing there. Before ruling R-SP that key read as unread; the walk
-    /// keeps that reading where nothing else is held (carrick#4025).
+    /// [`Self::callers_pass`], counting in `unfilled` the callers' writes
+    /// read through a spread of a parameter whose own callers held nothing
+    /// ([`unread_where_spread_unfilled`]), for the caller that sees every
+    /// value the key may hold to decide.
     pub(super) fn callers_pass_noting<F: Follow<'a>>(
         &self,
         follow: &mut F,
@@ -3917,7 +3968,7 @@ impl<'a> Resolver<'a> {
         param: (u8, usize, &[String]),
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
-        empty_through_spread: &mut bool,
+        unfilled: &mut usize,
     ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let (file, key, depth) = at;
@@ -3957,15 +4008,16 @@ impl<'a> Resolver<'a> {
             for value in passed {
                 match value {
                     Held::Param(out, index, keys) => {
+                        let before = *unfilled;
                         let held = self.callers_pass_noting(
                             follow,
                             (caller.file, caller.key, caller.depth),
                             (out, index, &keys),
                             invoke,
                             passing,
-                            empty_through_spread,
+                            unfilled,
                         );
-                        *empty_through_spread |= spread && held.is_empty();
+                        note_unfilled(unfilled, before, spread, &held);
                         values.extend(held);
                     }
                     other => values.push(other),

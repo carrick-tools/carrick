@@ -72,7 +72,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::implementations::{Followed, Implementations};
-use super::resolve::{Follow, Invoke, MAX_VALUES, Maker, Resolver, defaults_of};
+use super::resolve::{
+    Follow, Invoke, MAX_VALUES, Maker, Resolver, defaults_of, note_unfilled,
+    unread_where_spread_unfilled,
+};
 use super::row_calls::Reach;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_step};
@@ -3434,28 +3437,24 @@ impl<'a> Walker<'a> {
         let resolver = self.values;
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
-            let mut empty_through_spread = false;
+            let mut unfilled = 0;
             for (out, index, keys) in &open.refs {
+                let before = unfilled;
                 let held = resolver.callers_pass_noting(
                     self,
                     (file, key, depth),
                     (*out, *index, keys),
                     open.invoke,
                     &mut Vec::new(),
-                    &mut empty_through_spread,
+                    &mut unfilled,
                 );
-                empty_through_spread |= open.spread && held.is_empty();
+                note_unfilled(&mut unfilled, before, open.spread, &held);
                 values.extend(held);
             }
-            // A key a caller writes only through a spread of its own
-            // parameter, which that parameter's callers do not fill, and
-            // nothing else held: the key keeps the reading it had before
-            // ruling R-SP, unread, rather than stating that nothing binds
-            // it. Main says `value_never_bound` for the same parameter
-            // read with no spread; carrick#4025 restates both.
-            if values.is_empty() && empty_through_spread {
-                values.push(Held::Stop(Stop::UnreadExpression));
-            }
+            // A key written through a spread of a parameter its callers do
+            // not fill, and nothing else held: each write keeps the reading
+            // it had before ruling R-SP (carrick#4025).
+            unread_where_spread_unfilled(&mut values, unfilled);
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
         }
@@ -4383,6 +4382,77 @@ mod tests {
                 "gates.ts:{line} keeps the twin's reason, not value_never_bound\n{all}"
             );
         }
+    }
+
+    /// Ruling R-SP, must-stay (v1-agent on carrick#3856, #4025): where a
+    /// spread source writes a key from a parameter whose callers the
+    /// resolver does not find (a function run only through a value, a method
+    /// another service calls), each such write keeps the reading it had
+    /// before the rule, so the site states main's reason and never
+    /// `value_never_bound`. `meters.ts` spreads a local object that writes
+    /// `log` from a parameter; `refusals.ts` spreads the parameter in the
+    /// gate and in an arrow inside it; `panel.ts` builds a class with
+    /// `{ token, ...params }` and calls its field; `relay.ts` passes the key
+    /// through two spreads. `builder.ts` is the rule's read: `handle` read
+    /// through the builder method's `{ ...options, tag }`, `options` a
+    /// parameter of a function written inside the builder, is a callback
+    /// what runs that method fills. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_from_an_unfilled_parameter_keeps_mains_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let at = |file: &str, line: u32| -> (Vec<Option<Stop>>, Vec<Option<Stop>>) {
+            let of = |sites: &Vec<DiscoverySite>| -> Vec<Option<Stop>> {
+                sites
+                    .iter()
+                    .filter(|site| site.file.ends_with(file) && site.line == line)
+                    .map(|site| site.stop)
+                    .collect()
+            };
+            (of(&discovery.sites), of(&discovery.unfollowed))
+        };
+        let unread = (vec![Some(Stop::UnreadExpression)], Vec::new());
+        for (file, line) in [
+            ("through_value/meters.ts", 15),
+            ("through_value/refusals.ts", 9),
+        ] {
+            assert_eq!(at(file, line), unread, "{file}:{line}\n{all}");
+        }
+        assert_eq!(
+            at("through_value/panel.ts", 19),
+            (Vec::new(), vec![Some(Stop::ValueCallee)]),
+            "panel.ts:19\n{all}"
+        );
+        // The calls into the meter stop inside it, as before the rule: no
+        // site of their own.
+        for line in [23, 24, 33] {
+            assert_eq!(
+                at("through_value/meters.ts", line),
+                (Vec::new(), Vec::new()),
+                "meters.ts:{line}\n{all}"
+            );
+        }
+        // Two spreads on the way up are one unread write, as before the
+        // rule: the twin's reading.
+        assert_eq!(
+            at("through_value/relay.ts", 9),
+            at("through_value/gates.ts", 35),
+            "relay.ts:9\n{all}"
+        );
+        assert_eq!(
+            at("through_value/builder.ts", 8),
+            (vec![Some(Stop::InjectedCallee)], Vec::new()),
+            "builder.ts:8\n{all}"
+        );
+        // A key no spread source writes reads as a literal that does not
+        // write it.
+        assert_eq!(
+            at("through_value/clock.ts", 8),
+            at("through_value/clock.ts", 13),
+            "clock.ts:8\n{all}"
+        );
     }
 
     /// carrick#2448 T2: the method a maker call binds. `get` and `post` of

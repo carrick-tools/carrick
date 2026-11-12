@@ -20,6 +20,12 @@ stays unread. `x ?? y` with `x` absent reads `y` alone.
 | `writes/offline.ts:16`, `:23` | `listOffline({ ...base, signal })`, `base = { client: offline }` | `several_values`: the spread source writes `client`, a client that sends nothing |
 | `through_value/gates.ts:9`, `:23` | `log.warn(...)`, `log` read from `check({ ...args, tag })` and from `{ ...base, tag }` with `base = { ...args }`; `runGate` is run only as `deps.gate(...)` (`dispatch.ts`, which writes `log`) | the reason `gates.ts:35` states, never `value_never_bound`: no direct caller of `runGate` is found, so the key keeps the unread reading it had before the rule (carrick#4025) |
 | `through_value/gates.ts:35` | `log.warn(...)`, `log` read through `...JSON.parse(raw)` | the walk's reason for an unread key, on both sides of the rule (the twin) |
+| `through_value/meters.ts:15` | `log.warn(...)`, `log` read from `meterWith(deps, { ...base, scope })` at `:23` and `:24`, `base = { log, tag }` with `log` the pool meter's parameter; `meterPools` is run only as a value | `unread_expression`, as before the rule: each spread write keeps its unread reading when the parameter's callers hold nothing |
+| `through_value/meters.ts:23`, `:24`, `:33` | the calls into the meter | no site of their own: the walk stops inside the meter, as before the rule |
+| `through_value/refusals.ts:9` | `log.reject(...)`, `log` read from `refusal({ ...args, note })` in the gate and in an arrow inside it; the gate is run only as a value | `unread_expression`, as before the rule |
+| `through_value/panel.ts:19` | `this.onEvent(...)`, the field set from the constructor's options, built only as `new Panel({ token, ...params })` in a method this service never calls | `value_callee`, as before the rule, never `value_never_bound` |
+| `through_value/relay.ts:9` | `log.warn(...)`, `log` read through `leaf({ ...opts })` in `mid`, called as `mid({ ...args })` by a relay run only as a value | the reason `gates.ts:35` states: two spreads on the way up are one unread write, as before the rule |
+| `through_value/builder.ts:8` | `onInput(...)`, `handle` read through a builder method's `makeTask({ ...options, tag })`, `options` a parameter of the method written inside the builder | `injected_callee`: the spread is read, and the method's parameter is filled by what runs the method (the rule's read; main says `value_callee`) |
 | `writes/same.ts:7` | `options.run(...)`, the only caller `call({ ...base, signal })`, `const base = { run: send }` local to the caller | a site with no stop: the spread source writes `run`, so the key reads `send` and the call enters it |
 
 A module-level `base` spread whole stays unread, as the module-binding census
@@ -32,4 +38,5 @@ Tests: `src/request_summary/discovery.rs`,
 `a_key_a_library_callback_parameter_spread_keeps_several_values`,
 `a_key_a_spread_source_writes_is_read`,
 `a_key_a_spread_source_writes_another_client_keeps_several_values`,
-`a_key_through_a_parameter_run_only_as_a_value_keeps_the_unread_reason`.
+`a_key_through_a_parameter_run_only_as_a_value_keeps_the_unread_reason`,
+`a_key_a_spread_source_writes_from_an_unfilled_parameter_keeps_mains_reason`.
