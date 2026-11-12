@@ -28,7 +28,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::binding_scope::Declarations;
 use crate::local_http_wrapper::{LocalWrapperCall, collect_local_wrapper_calls};
 use crate::new_url_target::{NewUrlPathMap, collect_new_url_paths};
-use crate::operation::{Protocol, PubsubRole};
+use crate::operation::Protocol;
 use crate::parser::parse_file;
 use crate::type_manifest::is_http_method;
 use crate::uri_versioning::{RawVersion, RouteVersion, controller_version, handler_version};

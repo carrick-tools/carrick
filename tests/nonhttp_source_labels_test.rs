@@ -40,6 +40,10 @@ fn scan_in(storage: &Path, cache: &Path) -> Scan {
             format!("{}/", fixture_dir().join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
+        .env(
+            "CARRICK_SIDECAR_DIR",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"),
+        )
         // Nothing here reads a type.
         .env("CARRICK_ALLOW_MISSING_TYPES", "1");
     for var in [
@@ -125,21 +129,21 @@ fn expected() -> Vec<Row> {
             "endpoints",
             "pubsub|orders.cancelled",
             "src/orders.ts:10",
-            None,
+            Some("library_claim"),
             "route",
         ),
         row(
             "endpoints",
             "pubsub|orders.shipped",
             "src/orders.ts:15",
-            None,
+            Some("library_claim"),
             "route",
         ),
         row(
             "endpoints",
             "pubsub|payments.settled",
             "src/mocks/broker.ts:5",
-            None,
+            Some("library_claim"),
             "mock",
         ),
         row(
@@ -155,8 +159,9 @@ fn expected() -> Vec<Row> {
 }
 
 /// The model's row says `model`; the socket pass's row says `socket_call`
-/// (carrick#3091); the rows the scanner backfilled state no source; a producer under a mock tree is tagged; a chained call sits on its
-/// method's line; a socket listener is not also a pub/sub row.
+/// (carrick#3091); a receive the library store labels says `library_claim`; a
+/// producer under a mock tree is tagged; a chained call sits on its method's
+/// line; a socket listener is not also a pub/sub row.
 #[test]
 fn each_row_states_its_source_provenance_and_line() {
     let storage = tempfile::tempdir().expect("temp storage dir");
@@ -166,8 +171,7 @@ fn each_row_states_its_source_provenance_and_line() {
 }
 
 /// The second scan of an unchanged tree replays the model's cached answers on
-/// the incremental path. The backfill marker is never cached, so the
-/// backfill runs again and the scanner's rows still state no source.
+/// the incremental path and states the same rows.
 #[test]
 fn a_rescan_states_the_same_rows() {
     let storage = tempfile::tempdir().expect("temp storage dir");

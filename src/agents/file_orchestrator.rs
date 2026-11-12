@@ -21,7 +21,7 @@ use crate::{
     agents::{
         file_analyzer_agent::{
             AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
-            FileAnalyzerAgent, MountResult, PubsubOperation, ResolutionSource,
+            FileAnalyzerAgent, MountResult, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
         source_parts::{Limits, ShownLines, SourceCut, SourcePart},
