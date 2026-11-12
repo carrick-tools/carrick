@@ -26,6 +26,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 const REPO: &str = "fixture/held-documents";
 
 const SERVER: &str = "import { Hono } from 'hono';\n\nconst app = new Hono();\n\napp.get('/health', (c) => c.json({ ok: true }));\n\nexport default app;\n";
@@ -224,6 +227,10 @@ impl Workspace {
             "analyze-file/server.json",
             SERVER_ANSWER,
         );
+        // `hono` is installed from the public registry and the store labels
+        // its routes, so the route at `server.ts` is a candidate.
+        real_packages::install(&repo.join("apps/api"), &["hono"]);
+        real_packages::write_claims(&workspace.cassettes(), &["hono"]);
         git(&repo, &["init", "-q", "-b", "main"]);
         workspace.commit("A");
         workspace

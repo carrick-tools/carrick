@@ -18,6 +18,9 @@ use carrick::agents::file_orchestrator::{FILE_TOO_LARGE_CODE, WHOLE_PROMPT_MAX_B
 use std::path::Path;
 use std::process::Command;
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -71,6 +74,7 @@ fn repo_with_one_oversized_file(root: &Path) -> std::path::PathBuf {
              }}\n"
         ),
     );
+    real_packages::install(&repo, &["express"]);
     git(&repo, &["init", "-q", "-b", "main"]);
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "init"]);
@@ -89,10 +93,18 @@ fn scan(repo: &Path, scratch: &Path) -> Run {
     let cache = scratch.join("cache");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
+    // The store's answer for the installed package; every other answer is the
+    // generated mock.
+    let cassettes = scratch.join("cassettes");
+    real_packages::write_claims(&cassettes, &["express"]);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(".")
         .current_dir(repo)
         .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
         .env("CARRICK_SKIP_INTENTS", "1")
         .env("CARRICK_CACHE_DIR", &cache)
         .env("CARRICK_LOCAL_STORAGE_DIR", &store)
