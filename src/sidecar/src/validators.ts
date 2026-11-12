@@ -496,6 +496,8 @@ const ClaimSlotSchema = z
     key: z.string().min(1).optional(),
     at: z.array(z.string().min(1)).optional(),
     each: z.boolean().optional(),
+    // K1a: on a scope's `mounts` only (else `claim_invalid`, judged by the verifier).
+    handle: z.boolean().optional(),
   })
   .strict();
 
@@ -621,7 +623,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       kind: z.literal('scope'),
       member: z.string().min(1),
       form: z.enum(['call', 'decorate']).optional(),
-      // Exactly one of `name`, `collects` and `merges`: the verifier's verdict (#2474 R6a).
+      // Exactly one of `name`, `collects`, `merges` and `passes`, or none on a
+      // scope that binds: the verifier's verdict (#2474 R6a, K1a).
       name: NameSlotSchema.optional(),
       path: MemberPathSchema.optional(),
       on: ClaimOnSchema.optional(),
@@ -635,6 +638,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       collects: CollectsSchema.optional(),
       // Amendment 9: a rest slot of collections; the verifier's verdict pairs it.
       merges: ClaimSlotSchema.optional(),
+      // K1a: the member's value is its receiver, served at the receiver's address.
+      passes: z.boolean().optional(),
     })
     .strict(),
   z
