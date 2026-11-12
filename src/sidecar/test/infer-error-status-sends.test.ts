@@ -16,7 +16,7 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SidecarClient } from './helpers.js';
+import { SidecarClient, replySendClaims } from './helpers.js';
 
 const KIT_DTS = `export interface Res {
   statusCode: number;
@@ -29,6 +29,7 @@ const KIT_DTS = `export interface Res {
   cookie(name: string, value: string, options?: { httpOnly?: boolean; maxAge?: number }): Res;
 }
 export interface Req { body: unknown }
+export declare const reply: Res;
 export declare class App {
   post(path: string, handler: (req: Req, res: Res) => void | Promise<void>): App;
   get(path: string, handler: (req: Req, res: Res) => void | Promise<void>): App;
@@ -201,6 +202,7 @@ describe('carrick#2427 a located error send is not the route response', () => {
           expression_line: lineOf(expressionText, ROUTES_TS.indexOf(`('${route}'`)),
         },
       ],
+      server_claims: replySendClaims('res-kit', repoDir, ['reply'], ['json', 'send']),
     });
     return (res.inferred_types ?? []).find((t) => t.alias === alias);
   }
