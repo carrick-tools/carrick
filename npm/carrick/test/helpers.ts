@@ -13,7 +13,12 @@ import {
   type StatusResult,
 } from "../src/contract.ts";
 
-export const testDir = path.dirname(fileURLToPath(import.meta.url));
+// The fact lines are off unless CARRICK_FACT_LINES is "1" (`src/facts/enabled.ts`).
+// Tests that exercise them import this file, so it turns the switch on for the
+// test process and, through `fakeEnv`, for every hook child. The off test unsets it.
+process.env["CARRICK_FACT_LINES"] = "1";
+
+export const testDir =path.dirname(fileURLToPath(import.meta.url));
 export const pluginDir = path.dirname(testDir);
 export const fakeBin = path.join(testDir, "fake-carrick.mjs");
 

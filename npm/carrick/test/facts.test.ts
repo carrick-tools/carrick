@@ -15,11 +15,6 @@ import { scanSource } from "../src/facts/match.ts";
 import { FACTS_MARKER, refreshFacts, startFactsRefresh } from "../src/facts/fetch.ts";
 import { readTimings } from "../src/hook/timings.ts";
 
-// The fact lines are off unless CARRICK_FACT_LINES is "1" (`src/facts/enabled.ts`).
-// This file's tests exercise them, so it turns the switch on for itself; every
-// hook child spawned below inherits it through `fakeEnv`. The off tests unset it.
-process.env["CARRICK_FACT_LINES"] = "1";
-
 const WIRE = fixturePath("edit-facts.s1.ndjson");
 /** The pinned fixture's line for `getOrder`, the producer of `GET /orders/:id`. */
 const GET_ORDER_LINE =
