@@ -18,6 +18,7 @@ import { createLogger } from "../log.ts";
 import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
+import { splitRemote } from "../init/repos.ts";
 import { buildFacts, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
@@ -52,17 +53,28 @@ export function localRepos(root: string): Array<{ name: string; path: string; re
   }
 }
 
-/** The fact file's repos matched to their checkouts here: by name, then by the remote's full or last segment. */
-export function matchRepos(repos: string[], local: ReturnType<typeof localRepos>): LocalRepo[] {
+/**
+ * The fact file's repos matched to their checkouts here. A header entry that
+ * carries a remote (`owner/name`) maps only to the one checkout whose origin
+ * names exactly that; one without maps only to the one checkout of exactly
+ * its name. No match, or more than one, leaves the repo unmapped: its rows
+ * are never read.
+ */
+export function matchRepos(repos: ReadonlyArray<{ repo: string; remote?: string | null }>, local: ReturnType<typeof localRepos>): LocalRepo[] {
   const out: LocalRepo[] = [];
-  for (const repo of repos) {
+  for (const { repo, remote } of repos) {
     const found =
-      local.find((entry) => entry.name === repo) ??
-      local.find((entry) => entry.remote === repo) ??
-      local.find((entry) => entry.remote?.split("/").pop() === repo);
-    if (found) out.push({ repo, path: found.path });
+      typeof remote === "string" && remote !== ""
+        ? local.filter((entry) => entry.remote !== null && ownerName(entry.remote) === remote)
+        : local.filter((entry) => entry.name === repo);
+    if (found.length === 1) out.push({ repo, path: found[0]!.path });
   }
   return out;
+}
+
+/** The `owner/name` an origin names, in either spelling git accepts, or the text itself. */
+function ownerName(remote: string): string {
+  return splitRemote(remote)?.name ?? remote;
 }
 
 async function knownDigest(root: string): Promise<string | null> {
@@ -138,9 +150,11 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const bytes = Buffer.from(await staged.arrayBuffer());
     const gzipped = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
     const text = (gzipped ? zlib.gunzipSync(bytes) : bytes).toString("utf8");
-    const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown }> };
-    const names = (header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string");
-    const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now);
+    const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown; remote?: unknown }> };
+    const repos = (header.repos ?? [])
+      .filter((entry): entry is { repo: string; remote?: unknown } => typeof entry.repo === "string")
+      .map((entry) => ({ repo: entry.repo, remote: typeof entry.remote === "string" ? entry.remote : null }));
+    const built = await buildFacts(text, factsPath(root), matchRepos(repos, localRepos(root)), now);
     return built ? "written" : "none";
   } catch (error) {
     log("fact refresh failed", String(error));

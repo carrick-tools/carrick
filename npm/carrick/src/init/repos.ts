@@ -269,7 +269,7 @@ function sshHostname(host: string): string | null {
 const DEFAULT_PROBE: IdentityProbe = { remote: gitOrigin, sshHostname };
 
 /** The host and `owner/repo` a remote names, in either spelling git accepts. */
-function splitRemote(remote: string): { host: string; name: string | null; ssh: boolean } | null {
+export function splitRemote(remote: string): { host: string; name: string | null; ssh: boolean } | null {
   let host: string;
   let repoPath: string;
   let ssh: boolean;

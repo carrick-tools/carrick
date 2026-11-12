@@ -35,6 +35,10 @@ async function factsWorkspace(
   fs.mkdirSync(path.join(root, ".carrick"), { recursive: true });
   const ndjson = options.ndjson === undefined ? fs.readFileSync(WIRE, "utf8") : options.ndjson;
   if (ndjson !== null) {
+    // The workspace is the fact file's project.
+    const slug = (JSON.parse(ndjson.slice(0, ndjson.indexOf("\n"))) as { project_slug: string }).project_slug;
+    fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: slug }] } }));
     await buildFacts(
       ndjson,
       factsPath(root),
@@ -508,6 +512,35 @@ test("a file over 512 KB is skipped: a 2 MB generated file returns in under 50 m
   assert.ok(outcome.ms < 50, `took ${outcome.ms} ms`);
 });
 
+test("a fact file's repo maps to a checkout only by its exact remote, else its exact name", async () => {
+  const { matchRepos } = await import("../src/facts/fetch.ts");
+  const local = [
+    { name: "web", path: "/w/web", remote: "git@github.com:acme/web.git" },
+    { name: "api", path: "/w/api", remote: "https://github.com/acme/api-server" },
+    { name: "jobs", path: "/w/jobs-1", remote: null },
+    { name: "jobs", path: "/w/jobs-2", remote: null },
+  ];
+  // The remote's last segment is not the repo.
+  assert.deepEqual(matchRepos([{ repo: "api" }], local), [{ repo: "api", path: "/w/api" }]);
+  assert.deepEqual(matchRepos([{ repo: "api-server" }], local), []);
+  // An exact owner/name remote, in either spelling git accepts.
+  assert.deepEqual(matchRepos([{ repo: "frontend", remote: "acme/web" }], local), [{ repo: "frontend", path: "/w/web" }]);
+  // A header remote that matches no checkout is not rescued by the name.
+  assert.deepEqual(matchRepos([{ repo: "web", remote: "other/web" }], local), []);
+  // Two checkouts of one name: ambiguous, not read.
+  assert.deepEqual(matchRepos([{ repo: "jobs" }], local), []);
+});
+
+test("a fact file for another project is not read", async (t) => {
+  const ws = await factsWorkspace(t);
+  const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(204).end();"] };
+  assert.equal((await factLines(ws.root, [edited], undefined)).lines.length, 1);
+  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "another" }] } }));
+  assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
+  fs.rmSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"));
+  assert.deepEqual((await factLines(ws.root, [edited], undefined)).lines, []);
+});
+
 test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
   const ndjson = [
     header(["web-app"]),
@@ -637,7 +670,7 @@ test("a 404 or a building answer leaves no fact file", async (t) => {
 test("a fresh digest is fetched, unzipped and built; an unchanged one is one read", async (t) => {
   const ws = await factsWorkspace(t, { ndjson: null });
   fs.mkdirSync(path.join(ws.root, ".carrick", "hosted"), { recursive: true });
-  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo" }] } }));
+  fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
   fs.writeFileSync(
     path.join(ws.root, ".carrick", "index.json"),
     JSON.stringify({ repos: REPOS.map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }),

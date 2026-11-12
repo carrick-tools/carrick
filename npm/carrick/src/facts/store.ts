@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createLogger } from "../log.ts";
+import { snapshotProjectSlug } from "../hook/reuse.ts";
 
 const log = createLogger("carrick-facts");
 
@@ -111,6 +112,13 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     for (const raw of db.prepare("SELECT key, value FROM meta").all()) meta[String(raw["key"])] = String(raw["value"]);
     if (meta["schema"] !== String(SCHEMA)) {
       log(`fact file has schema ${meta["schema"] ?? "none"}, this package reads ${SCHEMA}; not read`);
+      db.close();
+      return null;
+    }
+    // A file for another project (a workspace re-pointed since it was built) is not this one's.
+    const project = snapshotProjectSlug(root);
+    if (!project || meta["project"] !== project) {
+      log(`fact file is for project ${meta["project"] ?? "none"}, this workspace is ${project || "unknown"}; not read`);
       db.close();
       return null;
     }
