@@ -410,12 +410,13 @@ function buildSurfaceSpanIndex(
 /**
  * A literal anchor passes the inferrer's marks to its record, where the check
  * phase reads them: a body read as raw text (carrick#1842), and a body whose
- * handler works when none is sent (carrick#2814). A symbol anchor passes the
+ * handler works when none is sent (carrick#2814). It also passes the driver's
+ * cause for a placeholder (carrick#3995), which only the index reads. A symbol anchor passes the
  * second only: the model named the body's type, the handler is still read.
  */
 function literalMarks(
   request: CaptureAnchorRequest
-): Pick<CaptureAliasRecord, 'raw_text_read' | 'absent_body_tolerated'> {
+): Pick<CaptureAliasRecord, 'raw_text_read' | 'absent_body_tolerated' | 'unread_cause'> {
   if (request.kind === 'symbol') {
     return request.absent_body_tolerated ? { absent_body_tolerated: true } : {};
   }

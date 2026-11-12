@@ -60,6 +60,12 @@ pub(crate) fn contains_disqualifying_top_type(text: &str) -> bool {
         .any(|keyword| scrubbed_text_uses_keyword_as_type(&scrubbed, keyword))
 }
 
+/// Whether `text` writes `any` as a type, in the same sense as
+/// [`contains_disqualifying_top_type`] (carrick#3995).
+pub(crate) fn text_uses_any_as_type(text: &str) -> bool {
+    scrubbed_text_uses_keyword_as_type(&strip_string_literal_contents(text), "any")
+}
+
 /// [`contains_disqualifying_top_type`] for one of the two keywords, over text
 /// whose string literals are already emptied.
 fn scrubbed_text_uses_keyword_as_type(scrubbed: &str, keyword: &str) -> bool {
@@ -574,6 +580,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: names.clone(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             })
             .collect();
         anchors.sort_by(|a, b| a.alias().cmp(b.alias()));
@@ -675,6 +682,7 @@ pub(crate) fn derive_capture_anchors(
                     printed_names: names.clone(),
                     raw_text_read: false,
                     absent_body_tolerated: false,
+                    unread_cause: None,
                 });
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
@@ -684,6 +692,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: names,
                 raw_text_read: raw_text.contains(alias),
                 absent_body_tolerated: absent_body.contains(alias),
+                unread_cause: None,
             });
             anchors.extend(unwidened);
             anchors.extend(mode_anchors(alias, request));
@@ -701,6 +710,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             });
             continue;
         }
@@ -719,6 +729,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             });
             continue;
         }
@@ -743,6 +754,7 @@ pub(crate) fn derive_capture_anchors(
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             });
             continue;
         }
@@ -791,6 +803,7 @@ pub(crate) fn derive_capture_anchors(
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         });
     }
 
@@ -813,6 +826,7 @@ pub(crate) fn derive_capture_anchors(
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         });
     }
 
@@ -4388,7 +4402,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         }
     }
 
@@ -7669,6 +7683,60 @@ mod tests {
         }
     }
 
+    /// carrick#3995: a literal the driver sends because no request located a
+    /// value (an unrequested manifest alias, a line-only body request) says
+    /// `not_located`. A decided abstain, a `request_config` answer and an
+    /// inferred text carry no cause.
+    #[test]
+    fn derive_anchors_marks_the_literals_no_request_located() {
+        let mut line_only = response_body_infer("Endpoint_line_Response");
+        line_only.span_start = None;
+        line_only.span_end = None;
+        let mut config = response_body_infer("Endpoint_spread_Request");
+        config.infer_kind = InferKind::RequestConfig;
+        config.member = Some("body".to_string());
+        let mut decided = inferred("Endpoint_redirect_Response", "unknown", None, None);
+        decided.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "no_success_payload".to_string(),
+            detail: None,
+        }];
+        let text = inferred("Endpoint_text_Response", "{ id: string; }", None, None);
+        let infer = vec![
+            line_only,
+            config,
+            response_body_infer("Endpoint_redirect_Response"),
+            response_body_infer("Endpoint_text_Response"),
+        ];
+        let manifest = vec!["Endpoint_unrequested_Response".to_string()];
+
+        let anchors =
+            derive_capture_anchors(&[], &infer, &[], &[decided, text], &manifest, "/repo");
+
+        let causes: Vec<(&str, Option<&str>)> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    unread_cause,
+                    ..
+                } => (alias.as_str(), *unread_cause),
+                other => panic!("expected a literal, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            causes,
+            vec![
+                ("Endpoint_line_Response", Some("not_located")),
+                ("Endpoint_spread_Request", None),
+                ("Endpoint_redirect_Response", None),
+                ("Endpoint_text_Response", None),
+                ("Endpoint_unrequested_Response", Some("not_located")),
+            ]
+        );
+    }
+
     /// carrick#2200: a handler that returns a status and a body string it
     /// serialised, where a return builds that string in a way the inferrer
     /// cannot read, is answered `unknown` with `serialised_body_unread`. That
@@ -8286,6 +8354,7 @@ mod tests {
             undeclared_names: Vec::new(),
             unresolved_in_tree: Vec::new(),
             surface_hash: None,
+            unread_cause: None,
         }
     }
 
@@ -8446,6 +8515,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             }],
             &HashMap::new(),
             None,
@@ -8595,6 +8665,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         }];
         let asked = || {
             std::fs::read_to_string(&attempts)
@@ -10767,6 +10838,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             });
             billing_anchors.push(CaptureAnchor::Literal {
                 alias: consumer.clone(),
@@ -10776,6 +10848,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             });
             orders_manifest.push(entry(
                 pair.key.clone(),
@@ -10867,6 +10940,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         };
         let mut anchors = vec![literal(&producer, "{ items: { id: string; }[]; }")];
         let mut manifest = vec![entry(
@@ -11190,6 +11264,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                     printed_names: Vec::new(),
                     raw_text_read: false,
                     absent_body_tolerated: false,
+                    unread_cause: None,
                 }],
                 &HashMap::new(),
                 None,
@@ -11670,6 +11745,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                     printed_names: Vec::new(),
                     raw_text_read: false,
                     absent_body_tolerated: false,
+                    unread_cause: None,
                 }],
                 &HashMap::new(),
                 None,
@@ -11853,6 +11929,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             }],
             &HashMap::new(),
             None,
@@ -12806,6 +12883,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             }],
             &HashMap::new(),
             None,

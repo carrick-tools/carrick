@@ -194,13 +194,25 @@ pub struct TypeManifestEntry {
     /// request summaries. Empty on every call they did not state.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stated_values: StatedValues,
-    /// The state v1 gave this entry before a top type inside its printed
-    /// shape demoted it to `Unknown` (carrick#1752). v1's text cannot say who
-    /// put the top type there; the capture's record can, later in the same
-    /// scan, and when it shows the source declared it, this is the state the
-    /// entry returns to. Scan-local: never written to the blob.
+    /// What v1 printed for this entry before a top type inside its printed
+    /// shape demoted it to `Unknown` (carrick#1752). `None` on every entry
+    /// v1 did not answer with a shape. Scan-local: never written to the blob.
     #[serde(skip)]
-    pub v1_state_before_demotion: Option<ManifestTypeState>,
+    pub v1_before_demotion: Option<V1Demotion>,
+}
+
+/// What a demoted v1 shape said, kept for the rest of the scan
+/// ([`TypeManifestEntry::v1_before_demotion`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V1Demotion {
+    /// The state v1 gave the entry. v1's text cannot say who put the top type
+    /// there; the capture's record can, later in the same scan, and when it
+    /// shows the source declared it, this is the state the entry returns to.
+    pub state: ManifestTypeState,
+    /// v1's text holds `any` as a type (carrick#3995). When nothing places
+    /// the top type, the entry's root finding says `any` rather than
+    /// `unknown`, because that is what a reader of the printed shape sees.
+    pub holds_any: bool,
 }
 
 /// A producer response's modes (carrick#2054): see
@@ -2485,7 +2497,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         };
 
         let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
