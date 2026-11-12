@@ -456,6 +456,24 @@ test("R24.5: hunks whose added lines are not the file's lines at those numbers a
   assert.equal(context(placed.stdout), "b line");
 });
 
+test("A-5: an Edit with no hunks reads only the lines its old and new text do not share", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /a", repo: "orders-api", file: "src/ab.ts", line: 3, name: "a", text: "a line" }),
+    row({ side: "consumer", protocol: "http", label: "POST /b", repo: "orders-api", file: "src/ab.ts", line: 7, name: "b", text: "b line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  const file = ws.at("orders-api/src/ab.ts");
+  const after = 'function a() {\n  trace("a", 2);\n  return api.post("/a");\n}\nfunction b() {\n  return api.post("/b");\n}\n';
+  fs.writeFileSync(file, after);
+  const run = (oldString: string, newString: string, session: string) =>
+    payloadEdit(ws, { tool_name: "Edit", tool_input: { file_path: file, old_string: oldString, new_string: newString } }, session);
+  const before = after.replace('trace("a", 2)', 'trace("a", 1)');
+  assert.equal(context((await run(before, after, "middle")).stdout), "a line");
+  // Nothing differs: nothing is said.
+  assert.equal(context((await run(after, after, "same")).stdout), "");
+});
+
 test("a thing's span starts at export, default, async and decorators: its header line is its own", async (t) => {
   assert.deepEqual(spansOf("export async function g() { return 1 }\nexport default function h() {}\nexport const k = () => 1;\n"), [
     "g: export async function g() { return 1 }",

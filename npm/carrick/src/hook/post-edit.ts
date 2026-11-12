@@ -43,8 +43,9 @@ type Payload = {
   tool_input?: {
     file_path?: string;
     filePath?: string;
-    edits?: Array<{ file_path?: string; new_string?: string }>;
-    /** Claude Code's `Edit`: the text the edit put in. */
+    edits?: Array<{ file_path?: string; old_string?: string; new_string?: string } | null>;
+    /** Claude Code's `Edit`: the text the edit replaced, and the text it put in. */
+    old_string?: string;
     new_string?: string;
     /** Codex's `apply_patch`: the patch text itself. */
     command?: unknown;
@@ -197,10 +198,28 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     }
     return new Map([[edited[0]!, { lines, removed }]]);
   }
-  const texts = [input.new_string, ...(Array.isArray(input.edits) ? input.edits : []).map((edit) => edit?.new_string)].filter(
-    (text): text is string => typeof text === "string",
-  );
+  const texts = [
+    changedMiddle(input.old_string, input.new_string),
+    ...(Array.isArray(input.edits) ? input.edits : []).map((edit) => changedMiddle(edit?.old_string, edit?.new_string)),
+  ].filter((text): text is string => typeof text === "string");
   return texts.length > 0 ? new Map([[edited[0]!, { snippets: texts }]]) : new Map();
+}
+
+/**
+ * The lines of `after` that differ from `before`: the lines both share at
+ * the start and at the end are trimmed, so text the edit only carried along
+ * (a neighbouring function) is not read as changed. Null when nothing differs.
+ */
+function changedMiddle(before: unknown, after: unknown): string | null {
+  if (typeof after !== "string") return null;
+  const old = typeof before === "string" ? before.split("\n") : [];
+  const now = after.split("\n");
+  let head = 0;
+  while (head < old.length && head < now.length && old[head] === now[head]) head += 1;
+  let tail = 0;
+  while (tail < old.length - head && tail < now.length - head && old[old.length - 1 - tail] === now[now.length - 1 - tail]) tail += 1;
+  const middle = now.slice(head, now.length - tail).join("\n");
+  return middle.trim().length > 0 ? middle : null;
 }
 
 try {
