@@ -72,11 +72,11 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `socket-field-rename` | listener's `OrderUpdate.status` to `state` (`src/realtime.ts:5`) | `type_mismatch` at `storefront` `src/live.ts:12`, `on_main: false`, `resolved`; marking: `CLIENT->SERVER order:update` label, `edge_source` | passes; `_marking` ignored, carrick#3090 and carrick#3091 |
 | `socket-field-removal` | the `order:shipped` emit drops `carrier` (`src/realtime.ts:12`) | `type_mismatch` `SERVER->CLIENT order:shipped` at `src/realtime.ts:12` | passes; shown waits on carrick-cloud#2829 |
 | `socket-listener-rename` | `order:update` to `order:changed` (`src/realtime.ts:11`) | `missing_endpoint` at `src/live.ts:12`; delta | passes; `_marking` ignored, carrick#3092 |
-| `socket-emit-rename` | `order:shipped` to `order:dispatched` (`src/realtime.ts:12`) | `missing_endpoint` at the PR's emit, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
+| `socket-emit-rename` | `order:shipped` to `order:dispatched` (`src/realtime.ts:12`) | `missing_endpoint` at the PR's emit, `orphaned_endpoint`, no delta row | passes; key row `removed_still_called`; shown waits on carrick-cloud#2829, #3438 |
 | `pubsub-field-rename` | subscriber's `PaymentSettled.amount` to `total` (`src/events.ts:5`) | `type_mismatch` `PUBSUB payments.settled` at `src/payments.ts:10` | passes; shown waits on carrick-cloud#2829 |
 | `pubsub-field-removal` | publish of `orders.shipped` drops `carrier` (`src/events.ts:15`) | `type_mismatch` `PUBSUB orders.shipped` at `src/events.ts:15` | passes; shown waits on carrick-cloud#2829 |
 | `pubsub-subscriber-rename` | `payments.settled` to `payments.cleared` (`src/events.ts:9`) | `missing_endpoint` at `src/payments.ts:10`; delta | passes; `_marking` ignored, carrick#3092 |
-| `pubsub-publish-rename` | `orders.shipped` to `orders.dispatched` (`src/events.ts:15`) | `missing_endpoint` at the PR's publish, `orphaned_endpoint`, no delta row | passes; `_marking` ignored, carrick#3092 |
+| `pubsub-publish-rename` | `orders.shipped` to `orders.dispatched` (`src/events.ts:15`) | `missing_endpoint` at the PR's publish, `orphaned_endpoint`, no delta row | passes; key row `removed_still_called`; shown waits on carrick-cloud#2829, #3438 |
 | `copied-helper` | adds `src/money.ts`, a copy of `storefront`'s `formatMinor` | `functions.changed` has `src/money.ts:formatMinor:added`, no finding; an optional reuse row | passes |
 | `dependency-added` | adds `@example/gql-client` `^2.0.0`; `storefront` is on 1 | `dependency_conflict` `@example/gql-client`, `major`, `changed_by_pr` with no `from` | passes |
 | `dependency-major-bump` | `zod` `^3.22.0` to `^4.0.0` | `dependency_conflict` `zod`, `major`, `changed_by_pr` | passes |
