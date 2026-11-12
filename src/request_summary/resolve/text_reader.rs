@@ -287,6 +287,25 @@ fn count_chain(counts: &mut Vec<(Vec<CallAt>, usize)>, chain: &[CallAt]) {
     }
 }
 
+/// Caps the values read through callers within each chain (carrick#3504
+/// B10-2a2, Q6): a chain with more than [`MAX_VALUES`] is one cap hole on
+/// that chain. Values across chains are never capped.
+fn cap_each_chain(out: &mut Vec<TextValue>) {
+    let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
+    for value in out.iter() {
+        count_chain(&mut counts, value.callers());
+    }
+    for (chain, count) in counts {
+        if count > MAX_VALUES {
+            out.retain(|value| value.callers() != chain.as_slice());
+            out.push(TextValue::Hole {
+                reason: guards::HoleReason::FanOutCap,
+                callers: chain,
+            });
+        }
+    }
+}
+
 /// What `term`, handed to a parameter, holds down `keys`: an object literal's
 /// last entry with each key (`None` where it writes none: the key is
 /// omitted), else a read of the key off the term, as
@@ -508,6 +527,38 @@ impl<'a> Resolver<'a> {
                 }
                 self.one_part(file, value)
             }
+            // A field its constructor sets from a parameter splits like a
+            // parameter read: each construction's term, with the field read
+            // as its hop (carrick#3678 S6-2).
+            ValueAt::Field {
+                lo,
+                hi,
+                class,
+                field,
+            } => {
+                let declared = {
+                    let _whole = CallersMode::set(&self.callers_mode, CallersRead::Whole);
+                    self.member_declared(file, (*lo, *hi), &mut Vec::new())
+                };
+                let hop = (
+                    SpanAt {
+                        file: file.to_path_buf(),
+                        lo: *lo,
+                        hi: *hi,
+                    },
+                    Vec::new(),
+                );
+                match declared {
+                    None => match self.field_texts(file, *class, field, Some(&hop)) {
+                        Some(values) => values
+                            .into_iter()
+                            .map(|value| TextValue::Pieced(value.into_pieced(Some(hop.0.clone()))))
+                            .collect(),
+                        None => self.one_part(file, value),
+                    },
+                    Some(_) => self.one_part(file, value),
+                }
+            }
             _ => self.one_part(file, value),
         }
     }
@@ -670,6 +721,12 @@ impl<'a> Resolver<'a> {
                 object,
                 key,
             } => self.text_of_member(file, (*lo, *hi), object, key),
+            ValueAt::Field {
+                lo,
+                hi,
+                class,
+                field,
+            } => self.text_of_field(file, (*lo, *hi), *class, field),
             ValueAt::BuiltIn {
                 lo,
                 hi,
@@ -1010,39 +1067,7 @@ impl<'a> Resolver<'a> {
             Ok(key) => key,
             Err(reason) => return hole(reason),
         };
-        if let Some(row) = self.row_at(file, lo, hi, Kind::Member)
-            && let Some(text) = typed_as_one_text(row)
-        {
-            note_all(
-                &mut read_from,
-                in_repo_declaration(row).into_iter().collect(),
-            );
-            return vec![TextValue::stated(text, read_from)];
-        }
-        // A `static` property of a class the module keeps (`C.P`): the row
-        // names the property, the binding table its initialiser.
-        if let Some(row) = self.row_at(file, lo, hi, Kind::Member)
-            && let Some((at, binding, declared)) = self.declared_entry(row)
-            && matches!(binding.kind, BindingKind::StaticField | BindingKind::Getter)
-        {
-            let Some(text) = &binding.text else {
-                return hole(UnreadExpression);
-            };
-            let Some(_reading) = self.reading_text(&at) else {
-                return hole(Recursion);
-            };
-            note_all(&mut read_from, vec![declared]);
-            let mut out = self.text_values(at.0, text);
-            for entry in &mut out {
-                if let TextValue::Text {
-                    read_from: from, ..
-                } = entry
-                {
-                    let mut all = read_from.clone();
-                    note_all(&mut all, std::mem::take(from));
-                    *from = all;
-                }
-            }
+        if let Some(out) = self.member_declared(file, (lo, hi), &mut read_from) {
             return out;
         }
         // An object literal written in place (`const { a } = { a: '/x' }`)
@@ -1142,6 +1167,137 @@ impl<'a> Resolver<'a> {
             }
         }
         out
+    }
+
+    /// What the member read at `lo..hi` of `file` is by its own row: the one
+    /// literal the compiler types it as, else a `static` property or a
+    /// getter the binding table holds, with the declarations read noted in
+    /// `read_from`. `None` where the row says neither.
+    fn member_declared(
+        &self,
+        file: &Path,
+        (lo, hi): (u32, u32),
+        read_from: &mut Vec<String>,
+    ) -> Option<Vec<TextValue>> {
+        use guards::HoleReason::*;
+        let hole = |reason| Some(vec![TextValue::hole(reason)]);
+        let row = self.row_at(file, lo, hi, Kind::Member)?;
+        if let Some(text) = typed_as_one_text(row) {
+            note_all(read_from, in_repo_declaration(row).into_iter().collect());
+            return Some(vec![TextValue::stated(text, read_from.clone())]);
+        }
+        // A `static` property of a class the module keeps (`C.P`): the row
+        // names the property, the binding table its initialiser.
+        let (at, binding, declared) = self.declared_entry(row)?;
+        if !matches!(binding.kind, BindingKind::StaticField | BindingKind::Getter) {
+            return None;
+        }
+        let Some(text) = &binding.text else {
+            return hole(UnreadExpression);
+        };
+        let Some(_reading) = self.reading_text(&at) else {
+            return hole(Recursion);
+        };
+        note_all(read_from, vec![declared]);
+        let mut out = self.text_values(at.0, text);
+        for entry in &mut out {
+            if let TextValue::Text {
+                read_from: from, ..
+            } = entry
+            {
+                let mut all = read_from.clone();
+                note_all(&mut all, std::mem::take(from));
+                *from = all;
+            }
+        }
+        Some(out)
+    }
+
+    /// `this.<field>` read at `lo..hi` of `file` in a member of the class
+    /// whose span starts at `class`: what its own row says
+    /// ([`Self::member_declared`]), else, read through callers, what each
+    /// construction of the class passes where its constructor sets the
+    /// field from a parameter ([`Self::field_texts`], carrick#3678 S6-2).
+    /// Anything else is the hole a member of no object the reader reads is.
+    fn text_of_field(
+        &self,
+        file: &Path,
+        (lo, hi): (u32, u32),
+        class: u32,
+        field: &str,
+    ) -> Vec<TextValue> {
+        if let Some(out) = self.member_declared(file, (lo, hi), &mut Vec::new()) {
+            return out;
+        }
+        if self.callers_mode.get() != CallersRead::Off
+            && let Some(out) = self.field_texts(file, class, field, None)
+        {
+            return out;
+        }
+        vec![TextValue::hole(guards::HoleReason::UnreadExpression)]
+    }
+
+    /// What `field` of the class whose span starts at `class` in `file`
+    /// holds, read through each construction of the class as
+    /// [`Self::param_texts`] reads a parameter through each call: the text
+    /// twin of [`Self::field_values`] (carrick#3678 S6-2). Each value
+    /// carries the construction it was read at, `fills` naming the
+    /// constructor, and goes on through the construction's own callers where
+    /// it hands its own parameter on. A class no file constructs is a
+    /// [`guards::HoleReason::NameNeverBound`] hole, as a function nothing
+    /// calls is.
+    ///
+    /// `None` where the class is not read through its constructions
+    /// ([`Self::field_origin`]), or the constructor sets the field from no
+    /// parameter, or with a fallback of its own: the field reads as before.
+    fn field_texts(
+        &self,
+        file: &Path,
+        class: u32,
+        field: &str,
+        read: Option<&(SpanAt, Vec<String>)>,
+    ) -> Option<Vec<TextValue>> {
+        use guards::HoleReason::*;
+        let file: &'a Path = self.inputs.files.get_key_value(file)?.0;
+        let (origin, from, built) = self.field_origin(file, class, field)?;
+        let (position, keys) = from.text.as_ref()?.plain_param()?;
+        let Some(_reading) = self.reading_text(&(file, class, format!("this.{field}"))) else {
+            return Some(vec![TextValue::hole(Recursion)]);
+        };
+        if built.is_empty() {
+            return Some(vec![TextValue::hole(NameNeverBound)]);
+        }
+        let fills = (file.to_path_buf(), format!("{}.constructor", origin.name));
+        let mut out: Vec<TextValue> = Vec::new();
+        for placed in &built {
+            let call = CallAt {
+                file: placed.file.to_path_buf(),
+                lo: placed.call.site.lo,
+                hi: placed.call.site.hi,
+                fills: fills.clone(),
+            };
+            let args = placed.call.passed_texts();
+            let values = if args.iter().take(position + 1).any(Option::is_none) {
+                vec![TextValue::hole(CallerArgMissing)]
+            } else {
+                match args
+                    .get(position)
+                    .and_then(Option::as_ref)
+                    .and_then(|term| handed(term, keys))
+                {
+                    Some(term) => self.text_values(placed.file, &term),
+                    None => vec![TextValue::hole(CallerArgMissing)],
+                }
+            };
+            for value in values {
+                let value = value.read_at(&call, read);
+                if !out.contains(&value) {
+                    out.push(value);
+                }
+            }
+        }
+        cap_each_chain(&mut out);
+        Some(out)
     }
 
     /// The value of the entry named `key` in `entries` (keys read in
@@ -1337,19 +1493,7 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
-        let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
-        for value in &out {
-            count_chain(&mut counts, value.callers());
-        }
-        for (chain, count) in counts {
-            if count > MAX_VALUES {
-                out.retain(|value| value.callers() != chain.as_slice());
-                out.push(TextValue::Hole {
-                    reason: FanOutCap,
-                    callers: chain,
-                });
-            }
-        }
+        cap_each_chain(&mut out);
         out
     }
 
@@ -1870,7 +2014,13 @@ mod tests {
     /// The file of the probes, and the term the one call of `callee` in it
     /// hands its first argument as.
     fn probe_arg(on: &Walked, callee: &str) -> (PathBuf, ValueAt) {
-        let path = on.path("services/web/src/callers.ts");
+        arg_in(on, "src/callers.ts", callee)
+    }
+
+    /// The file `file` of the service, and the term the one call of
+    /// `callee` in it hands its first argument as.
+    fn arg_in(on: &Walked, file: &str, callee: &str) -> (PathBuf, ValueAt) {
+        let path = on.path(&format!("services/web/{file}"));
         let mut found: Vec<ValueAt> = super::super::super::row_calls::every_call(&on.inputs.files)
             .into_iter()
             .filter(|(file, call, _)| *file == path && call.callee == callee)
@@ -1929,7 +2079,18 @@ mod tests {
         on: &Walked,
         callee: &str,
     ) -> Vec<(String, Vec<String>)> {
-        let (path, term) = probe_arg(on, callee);
+        through_callers_in(resolver, on, "src/callers.ts", callee)
+    }
+
+    /// What the probe `callee`'s argument in `file` reads as through
+    /// callers, sorted.
+    fn through_callers_in(
+        resolver: &Resolver<'_>,
+        on: &Walked,
+        file: &str,
+        callee: &str,
+    ) -> Vec<(String, Vec<String>)> {
+        let (path, term) = arg_in(on, file, callee);
         let mut got = flat(on, &resolver.texts_through_callers(&path, &term));
         got.sort();
         got
@@ -2041,6 +2202,126 @@ mod tests {
         assert_eq!(
             through_callers(&resolver, &on, "p_outer"),
             rows(&[("deep", &["outer(_)", "middle(\"deep\")"])])
+        );
+    }
+
+    // Fields a constructor sets from its parameters (carrick#3678 S6-2).
+    // Fixture `resolve-text`, `fields.ts`; its README holds the key.
+
+    /// carrick#3678 S6-2: read through callers, `this.<field>` set from a
+    /// constructor parameter is what each construction of the class passes
+    /// there, read through the construction (and on through its own
+    /// callers, as a parameter is). A field the compiler types as one
+    /// literal is that literal; a class refused its constructions, and a
+    /// field with a fallback, read as before.
+    #[test]
+    fn a_field_set_from_a_constructor_parameter_reads_each_construction_s_caller_text() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let read = |callee: &str| through_callers_in(&resolver, &on, "src/fields.ts", callee);
+        assert_eq!(
+            read("p_field_param"),
+            rows(&[(
+                "orders.a3.*",
+                &["ParamHub(_)", "subscribe(\"orders.a3.*\")"]
+            )])
+        );
+        assert_eq!(
+            read("p_field_lit"),
+            rows(&[("orders.lit", &["LitHub(\"orders.lit\")"])])
+        );
+        assert_eq!(
+            read("p_field_hub"),
+            rows(&[("orders.hub", &["InnerSub(_)", "subscribe(\"orders.hub\")"])])
+        );
+        assert_eq!(
+            read("p_field_assign"),
+            rows(&[("orders.assign", &["AssignHub(\"orders.assign\")"])])
+        );
+        assert_eq!(
+            read("p_field_twice"),
+            rows(&[
+                ("orders.one", &["TwiceHub(\"orders.one\")"]),
+                ("orders.two", &["TwiceHub(\"orders.two\")"]),
+            ])
+        );
+        assert_eq!(read("p_field_typed"), rows(&[("orders.typed", &[])]));
+        assert_eq!(
+            read("p_field_spread"),
+            rows(&[("hole:unread_expression", &[])])
+        );
+        assert_eq!(
+            read("p_field_fallback"),
+            rows(&[("hole:unread_expression", &[])])
+        );
+    }
+
+    /// carrick#3678 S6-2, R7 (pin, passes before S6-2): with no callers
+    /// read, every field probe reads exactly as before.
+    #[test]
+    fn a_field_reads_as_before_without_callers() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for callee in [
+            "p_field_param",
+            "p_field_lit",
+            "p_field_hub",
+            "p_field_assign",
+            "p_field_twice",
+            "p_field_spread",
+            "p_field_fallback",
+        ] {
+            let (path, term) = arg_in(&on, "src/fields.ts", callee);
+            assert_eq!(
+                resolver.text_values(&path, &term),
+                [TextValue::hole(guards::HoleReason::UnreadExpression)],
+                "{callee}"
+            );
+            assert_eq!(
+                resolver.one_text(&path, &term),
+                Err(guards::HoleReason::UnreadExpression),
+                "{callee}"
+            );
+        }
+        let (path, term) = arg_in(&on, "src/fields.ts", "p_field_typed");
+        assert_eq!(
+            flat(&on, &resolver.text_values(&path, &term)),
+            [("orders.typed".to_string(), Vec::new())]
+        );
+    }
+
+    /// carrick#3678 S6-2: read as parts, a field is passed through its
+    /// construction as a parameter is through a call: the field read is the
+    /// first hop, the construction's own parameter the next.
+    #[test]
+    fn a_field_read_as_parts_goes_through_its_construction() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, term) = arg_in(&on, "src/fields.ts", "p_field_param");
+        let got = resolver.pieces_through_callers(&path, &term);
+        let [value] = got.as_slice() else {
+            panic!("{got:?}");
+        };
+        assert_eq!(
+            described(&on, value),
+            [(
+                "orders.a3.*".to_string(),
+                vec![
+                    "ParamHub(_)".to_string(),
+                    "subscribe(\"orders.a3.*\")".to_string()
+                ]
+            )]
+        );
+        // The first hop reads the field where the labelled call writes it.
+        assert_eq!(
+            Some(value.parts[0].through[0].read.clone()),
+            span_of(&path, &term)
         );
     }
 
@@ -2195,14 +2476,7 @@ mod tests {
     /// The file of the piece probes, and the term the one call of `callee`
     /// in it hands its first argument as.
     fn piece_arg(on: &Walked, callee: &str) -> (PathBuf, ValueAt) {
-        let path = on.path("services/web/src/pieces.ts");
-        let mut found: Vec<ValueAt> = super::super::super::row_calls::every_call(&on.inputs.files)
-            .into_iter()
-            .filter(|(file, call, _)| *file == path && call.callee == callee)
-            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
-            .collect();
-        assert_eq!(found.len(), 1, "{callee}: {found:?}");
-        (path, found.remove(0))
+        arg_in(on, "src/pieces.ts", callee)
     }
 
     /// Q6: values across callers are never capped, one per chain.

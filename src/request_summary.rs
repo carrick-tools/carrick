@@ -5230,6 +5230,12 @@ struct Scope<'a> {
 }
 
 impl<'a> Scope<'a> {
+    /// Where the class this scope is a member of starts: what
+    /// `this.<field>` is read by ([`ValueAt::Field`]).
+    fn class(&self) -> Option<u32> {
+        self.fields.map(|fields| fields.class)
+    }
+
     fn module(module: &'a ModuleScope) -> Self {
         Self {
             params: Vec::new(),
@@ -8462,7 +8468,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             _ => None,
         };
         let arg_values = self.reader.arg_values(&call.args, self.scope, bound);
-        let arg_texts = resolve::args_text(&call.args, &|lo| lo);
+        let arg_texts = resolve::args_text(&call.args, &|lo| lo, self.scope.class());
         let language_call = match &call.callee {
             Callee::Expr(callee) => self
                 .reader

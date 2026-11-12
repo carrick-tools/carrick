@@ -203,6 +203,16 @@ fn states_text(value: &Value) -> bool {
 pub(super) type ParamDefaults = Vec<(usize, Vec<String>, Vec<ValueAt>)>;
 
 impl TextOrigin {
+    /// The constructor parameter the field's text is, by position, and the
+    /// keys down to it; `None` where the field falls back to a value the
+    /// constructor writes when a construction leaves it out, which the text
+    /// reader does not read (carrick#3678 S6-2).
+    pub(super) fn plain_param(&self) -> Option<(usize, &[String])> {
+        self.fallback
+            .is_none()
+            .then_some((self.position, self.keys.as_slice()))
+    }
+
     /// What the construction `call` passes for the field: `None` when it
     /// states no text the source writes there.
     fn at(&self, call: &CallIr) -> Option<Value> {
