@@ -203,8 +203,12 @@ agent to start something new once the task is done.
 | Hook | Governed code | What it does |
 |---|---|---|
 | `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/edit-flow.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/lead.ts` | re-checks the edited files, prints what needs acting on, queues a background re-check for an edit that needs a re-scan, and names the indexed function a new function looks like (`recheck.new_functions[].lead`, carrick#3249) |
-| `carrick hook stop` (Claude Code) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/stop-wait.ts` | delivers the background re-checks that finished, waits for the ones still running (`--wait-s`), and says which are still running after the wait |
-| `carrick hook user-prompt` (Codex) | `npm/carrick/src/hook/user-prompt.ts`, `npm/carrick/src/hook/late.ts` | delivers the background re-checks that finished, with the next prompt |
+| `carrick hook stop` (Claude Code) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/stop-wait.ts` | delivers finished background re-checks, names the files still being checked, and returns at once |
+| `carrick hook user-prompt` (Claude Code and Codex) | `npm/carrick/src/hook/user-prompt.ts`, `npm/carrick/src/hook/late.ts` | delivers the background re-checks that finished since the last hook ran, with the next prompt |
+| `carrick hook post-bash` (Claude Code) | `npm/carrick/src/hook/post-bash.ts`, `npm/carrick/src/hook/late.ts` | delivers finished background re-checks after any shell command |
+
+**No hook waits for a running re-check.** Its result arrives at the next hook
+event (the next edit, read, shell command or prompt) and is delivered once.
 
 The per-session store (`npm/carrick/src/hook/reuse.ts`, under
 `~/.carrick/sessions/<session_id>.json`, outside every repository) remembers
@@ -263,9 +267,11 @@ available to a line that must not block, so finished re-checks are delivered by
 of 2026-09-20 took this over a blocking `Stop` hook. It names no function a task
 added, as the Claude Code Stop hook does not (carrick#3436).
 
-**The limit that follows.** An answer arrives with the NEXT prompt, not at the
-end of the task that earned it, and a one-shot run with no following prompt
-(`codex exec "…"`) never sees it. Each answer is delivered once.
+**The limit that follows.** A result arrives at the next hook event, usually
+the next prompt, not when the task that earned it ends. A one-shot run with no
+following prompt (`codex exec "…"`) never sees a late result. Claude Code has the
+same limit for a result that lands after Stop, so `carrick init` installs
+`carrick hook user-prompt` there too.
 
 **The payload.** Codex has no `Edit`/`Write`/`MultiEdit` with a `file_path`. It
 edits through `apply_patch`, whose `tool_input` is `{ "command": "<patch text>"
