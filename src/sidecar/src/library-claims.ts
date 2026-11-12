@@ -1721,8 +1721,7 @@ function builtReceiver(check: LibraryCheck): string | undefined {
     if (claim.member === null) return claim.form === 'call' ? 'instance:()' : 'instance:new';
     return claim.form === 'call' ? `instance:${claim.member}` : `instance:new:${claim.member}`;
   }
-  // A pass-through's value is its receiver: it builds no new one (K1a).
-  if (claim.kind !== 'scope' || claim.passes === true || check.receiver.includes('>')) return undefined;
+  if (claim.kind !== 'scope' || check.receiver.includes('>')) return undefined;
   return `${check.receiver}>scope:${scopeStep(claim)}`;
 }
 
@@ -2734,7 +2733,11 @@ class DeclarationReader {
     built?: ts.Signature,
     collections?: () => readonly ts.Type[] | undefined
   ): Judged {
-    if (claim.form === 'decorate') return { outcome: this.decorateScopeOutcome(receiver, claim) };
+    // A pass-through is a call's value, never a decorator (K1a).
+    if (claim.form === 'decorate') {
+      if (claim.passes === true) return { outcome: unchecked('claim_invalid') };
+      return { outcome: this.decorateScopeOutcome(receiver, claim) };
+    }
     if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
     if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
     const passes = claim.passes === true;

@@ -179,6 +179,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
       onRouter('passes-named', scope('routes', { passes: true, name: { arg: 0 } })),
       onRouter('passes-mounts', scope('use', { passes: true, mounts: { arg: 0, handle: true } })),
       onApp('passes-runs', scope('register', { passes: true, runs: { arg: 0 }, yields: { param: 0, export: 'App', side: 'server' } })),
+      onRouter('passes-decorate', scope('routes', { form: 'decorate', name: { arg: 0 }, passes: true })),
     ]);
     assert.deepStrictEqual(
       [
@@ -190,6 +191,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
         read['passes-named'],
         read['passes-mounts'],
         read['passes-runs'],
+        read['passes-decorate'],
       ],
       [
         'verified',
@@ -197,6 +199,7 @@ describe('verify_library_claims: path-less mounts and pass-through members (K1a)
         'failed name_ambiguous', // a path the claim gives no part
         'failed name_ambiguous',
         'unchecked scope_unresolved',
+        'unchecked claim_invalid',
         'unchecked claim_invalid',
         'unchecked claim_invalid',
         'unchecked claim_invalid',
