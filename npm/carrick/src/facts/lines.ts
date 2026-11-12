@@ -3,13 +3,12 @@
 // `text` (the cloud writes the sentence; this package adds none).
 //
 // A row is found by (repo, name): the named things the changed lines sit in
-// (`match.ts`). Where two files in one repo hold rows under the same name, the
-// edited file decides; where only one does and it is another file that still
-// declares that name, the edit is to a different thing and nothing prints. A
+// (`match.ts`), declared once in the edited file. A row prints for its own
+// file, or for a file that is gone (the thing moved here); never on a guess. A
 // row with no name (an inline handler or a call at module top level) is found
-// by the operation string written in the call the edit reached: its `site`
-// when the file states one, else the last segment of the label's path. When
-// that string is not unique in the file, nothing prints.
+// only by its `site`, written as a string argument of the call around the
+// changed line, with an HTTP row's method as the callee's name; when that
+// pair is not unique in the file, or the row has no site, nothing prints.
 //
 // Each row is said once per session, claimed only once delivered (the caller
 // calls `markFacts` after printing). Never throws.
@@ -98,39 +97,33 @@ export function locate(file: string, repos: readonly LocalRepo[]): { repo: strin
   return best ? { repo: best.repo, rel: path.relative(real(best.path), abs), top: real(best.path) } : null;
 }
 
-/** The last segment of an operation string: a path's last part, or the whole event or topic name. */
-function lastSegment(value: string): string {
-  return value.includes("/") ? (value.split("/").filter(Boolean).pop() ?? "") : value;
+/** An HTTP row's method, lower case (`POST /orders` -> `post`); null for other protocols. */
+function methodOf(row: FactRow): string | null {
+  return row.protocol === "http" ? (row.label.split(" ")[0] ?? "").toLowerCase() : null;
 }
 
-/** The label's operation string with any dispatch case dropped (`POST /events {type=refund}` -> `/events`). */
-function labelTail(label: string): string {
-  return label.replace(/ \{[^}]*\}$/, "").split(" ").pop() ?? "";
+/** Whether `call` is written as `row`'s site: the site as a direct string argument, and an HTTP row's method as the callee's name. */
+function callFits(call: CallSpan, row: FactRow, method: string | null): boolean {
+  return call.literals.includes(row.site!) && (method === null || call.member?.toLowerCase() === method);
 }
 
-/** The rows with no name that the reached calls name by one string unique in the file. */
-function unnamedRows(rows: FactRow[], reached: CallSpan[], fileCalls: CallSpan[]): FactRow[] {
+/**
+ * The rows with no name that a reached call writes: the row's `site` is a
+ * direct string argument of the call around the changed line, an HTTP row's
+ * method is the callee's name (`.post(` for `POST ...`), and that (site,
+ * method) pair belongs to one row and one call in the file. A row with no
+ * site never matches.
+ */
+function unnamedRows(rows: FactRow[], reached: readonly CallSpan[], fileCalls: readonly CallSpan[]): FactRow[] {
   const out: FactRow[] = [];
-  const pick = (key: (row: FactRow) => string | null, holds: (literal: string, wanted: string) => boolean): FactRow[] => {
-    const found: FactRow[] = [];
-    for (const row of rows) {
-      const wanted = key(row);
-      if (!wanted) continue;
-      if (rows.filter((other) => key(other) === wanted).length !== 1) continue;
-      const callsHolding = fileCalls.filter((call) => call.literals.some((literal) => holds(literal, wanted)));
-      if (callsHolding.length !== 1 || !reached.includes(callsHolding[0]!)) continue;
-      found.push(row);
-    }
-    return found;
-  };
-  const bySite = pick((row) => row.site, (literal, wanted) => literal === wanted);
-  out.push(...bySite);
-  const rest = rows.filter((row) => !bySite.includes(row));
-  const tail = (row: FactRow): string | null => {
-    const segment = lastSegment(labelTail(row.label));
-    return segment || null;
-  };
-  for (const row of pick(tail, (literal, wanted) => lastSegment(literal) === wanted)) if (rest.includes(row)) out.push(row);
+  const reachedSet = new Set(reached);
+  for (const row of rows) {
+    if (row.site === null) continue;
+    const method = methodOf(row);
+    if (rows.filter((other) => other.site === row.site && methodOf(other) === method).length !== 1) continue;
+    const holding = fileCalls.filter((call) => callFits(call, row, method));
+    if (holding.length === 1 && reachedSet.has(holding[0]!)) out.push(row);
+  }
   return out;
 }
 
@@ -213,10 +206,7 @@ export async function factLines(
       }
       if (reach.calls.length > 0) {
         const unnamed = store.unnamed(at.repo, at.rel);
-        if (unnamed.length > 0) {
-          const fileCalls = touched(text, scan, [{ start: 0, end: text.length }]).calls;
-          rows.push(...unnamedRows(unnamed, reach.calls, fileCalls));
-        }
+        if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
       }
       for (const row of rows) {
         if (lines.length >= MAX_FACT_LINES) break;

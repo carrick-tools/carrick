@@ -133,12 +133,95 @@ test("naming rule 4: a call inside an anonymous callback is keyed to its named e
 });
 
 test("naming rule 5: a top-level call with no encloser is found by the operation string in its call", async (t) => {
-  const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "billing-worker/src/sync.ts", 'const order = await client.get("/orders/:id"'), [
-    "GET /orders/:id is served at orders-api/src/routes/orders.ts:12",
-  ]);
+  // Shaped like the cloud builder's rows: `site` is the string written at the call.
+  const ndjson = [
+    header(["billing-worker"]),
+    row({ side: "consumer", protocol: "http", label: "GET /orders/:id", repo: "billing-worker", file: "src/sync.ts", line: 4, name: null, site: "/orders/:id", source: "call", text: "sync line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  assert.deepEqual(await linesFor(ws, "billing-worker/src/sync.ts", 'const order = await client.get("/orders/:id"'), ["sync line"]);
   // A changed line outside that call reaches no row.
   assert.deepEqual(await linesFor(ws, "billing-worker/src/sync.ts", "console.log(order.status);"), []);
+});
+
+test("a row with no name and no site never prints; the label's path is not a site", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "producer", protocol: "http", label: "POST /orders", repo: "orders-api", file: "src/app.ts", line: 2, name: null, site: null, text: "orders line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(ws.at("orders-api/src/app.ts"), 'const col = db.collection("orders");\napp.post(`${base}/orders`, async (req, res) => { res.json(1); });\n');
+  assert.deepEqual(await linesFor(ws, "orders-api/src/app.ts", 'const col = db.collection("orders");'), []);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/app.ts", "res.json(1);"), []);
+});
+
+test("an unnamed HTTP row needs the call's method to be the label's, and the pair unique in the file", async (t) => {
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "producer", protocol: "http", label: "GET /orders/:id/notes", repo: "orders-api", file: "src/notes.ts", line: 1, name: null, site: "/:id/notes", text: "notes GET line" }),
+    row({ side: "producer", protocol: "http", label: "POST /orders/:id/notes", repo: "orders-api", file: "src/notes.ts", line: 4, name: null, site: "/:id/notes", text: "notes POST line" }),
+    row({ side: "producer", protocol: "http", label: "PUT /orders/:id/flags", repo: "orders-api", file: "src/notes.ts", line: 7, name: null, site: "/:id/flags", text: "flags PUT line" }),
+    row({ side: "producer", protocol: "http", label: "DELETE /orders/:id/tags", repo: "orders-api", file: "src/notes.ts", line: 10, name: null, site: "/:id/tags", text: "tags line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("orders-api/src/notes.ts"),
+    [
+      'router.get("/:id/notes", async (req, res) => {',
+      "  res.json(await notes(req.params.id, 1));",
+      "});",
+      'router.post("/:id/notes", async (req, res) => {',
+      "  res.json(await notes(req.params.id, 2));",
+      "});",
+      'router.get("/:id/flags", async (req, res) => {',
+      "  res.json(await flags(req.params.id));",
+      "});",
+      'router.delete("/:id/tags", async (req, res) => {',
+      "  res.json(await tags(req.params.id, 1));",
+      "});",
+      'router.delete("/:id/tags", async (req, res) => {',
+      "  res.json(await tags(req.params.id, 2));",
+      "});",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "orders-api/src/notes.ts", "res.json(await notes(req.params.id, 1));"), ["notes GET line"]);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/notes.ts", "res.json(await notes(req.params.id, 2));"), ["notes POST line"]);
+  // The call is `.get(`, the row is a PUT: nothing.
+  assert.deepEqual(await linesFor(ws, "orders-api/src/notes.ts", "res.json(await flags(req.params.id));"), []);
+  // The (site, method) pair is written twice: nothing.
+  assert.deepEqual(await linesFor(ws, "orders-api/src/notes.ts", "res.json(await tags(req.params.id, 1));"), []);
+});
+
+test("unnamed socket and pub/sub rows are found by their site in the call around the edit", async (t) => {
+  const ndjson = [
+    header(["gateway"]),
+    row({ side: "producer", protocol: "socket", label: "CLIENT->SERVER chat:send", repo: "gateway", file: "src/chat.ts", line: 4, name: null, site: "chat:send", text: "send line" }),
+    row({ side: "consumer", protocol: "socket", label: "SERVER->CLIENT chat:message", repo: "gateway", file: "src/chat.ts", line: 5, name: null, site: "chat:message", text: "message line" }),
+    row({ side: "producer", protocol: "pubsub", label: "PUBSUB orders.created", repo: "gateway", file: "src/chat.ts", line: 9, name: null, site: "orders.created", text: "created line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("gateway/src/chat.ts"),
+    [
+      'io.on("connection", (socket) => {',
+      "  const room = rooms.get(socket.id);",
+      "  if (!room) return;",
+      '  socket.on("chat:send", (payload) => {',
+      '    io.emit("chat:message", payload);',
+      "    audit(payload);",
+      "  });",
+      "});",
+      'bus.subscribe("orders.created", async (message) => {',
+      "  await mirror(message);",
+      "});",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "    audit(payload);"), ["send line"]);
+  assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "  await mirror(message);"), ["created line"]);
+  // Inside `connection` but outside the `chat:send` call: nothing.
+  assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "  const room = rooms.get(socket.id);"), []);
 });
 
 test("naming rule 6: one name in two files is told apart by the edited file", async (t) => {
@@ -250,10 +333,10 @@ test("an inline handler is found by the operation string written at its site, an
     ].join("\n"),
   );
   assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "res.json(await items(req.params.id));"), ["items line"]);
-  // The site literal is written in two calls of the file: nothing.
-  assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "res.json(await notes(req.params.id, 1));"), []);
-  // No site: the label's last segment as a string literal in the call the edit reached.
-  assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "relay(payload);"), ["typing line"]);
+  // The same site under two methods: each call is told apart by its method.
+  assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "res.json(await notes(req.params.id, 1));"), ["notes GET line"]);
+  // No site: nothing, whatever the label says.
+  assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "relay(payload);"), []);
 });
 
 test("text the edit put in that the file holds twice reaches nothing", async (t) => {

@@ -22,8 +22,12 @@ type Token = { kind: TokenKind; value: string; start: number; end: number; line:
 /** A named function-like thing and the text span it covers. */
 export type NamedSpan = { name: string; start: number; end: number };
 
-/** A call's argument list and the string literals passed to it directly. */
-export type CallSpan = { start: number; end: number; literals: string[] };
+/**
+ * A call: `from` where its callee starts (`router` in `router.post(`), `start`
+ * at its `(`, `end` after its `)`, the callee's last name (`post`), and the
+ * string literals passed to it directly.
+ */
+export type CallSpan = { from: number; start: number; end: number; member: string | null; literals: string[] };
 
 export type Scan = {
   /** False when the text did not tokenize cleanly; nothing else is set then. */
@@ -432,7 +436,12 @@ export function scanSource(text: string, jsx = false): Scan {
       }
       if (inner.kind === "str") literals.push(inner.value);
     }
-    calls.push({ start: token.start, end: tokens[close]!.end, literals });
+    // The callee: its last name, and where its member chain starts.
+    let last = punc(index - 1, "?.") ? index - 2 : index - 1;
+    const member = is(last, "id") ? t(last)!.value : null;
+    while (is(last, "id") && (punc(last - 1, ".") || punc(last - 1, "?.")) && is(last - 2, "id")) last -= 2;
+    const from = is(last, "id") ? t(last)!.start : t(index - 1)!.start;
+    calls.push({ from, start: token.start, end: tokens[close]!.end, member, literals });
   }
 
   /** Skips a type annotation after `:` up to the token where `stop` holds, jumping brackets. */
@@ -836,11 +845,13 @@ export type Touched = { names: string[]; calls: CallSpan[] };
 /**
  * The names an edit over `ranges` touched (the innermost named encloser of
  * each changed line, and every named thing inside a changed range), and the
- * calls outside every named thing that overlap a changed range.
+ * calls outside every named thing whose text (from the callee to the
+ * closing `)`) covers part of a changed line.
  */
 export function touched(text: string, scan: Scan, ranges: readonly Range[]): Touched {
   const names = new Set<string>();
-  const calls: CallSpan[] = [];
+  const calls = new Set<CallSpan>();
+  const topCalls = scan.calls.filter((call) => innermost(scan.spans, call.start) === null);
   for (const range of ranges) {
     // Each changed line, by its first non-blank character.
     let at = range.start;
@@ -852,15 +863,11 @@ export function touched(text: string, scan: Scan, ranges: readonly Range[]): Tou
       if (first < stop) {
         const span = innermost(scan.spans, first);
         if (span) names.add(span.name);
+        else for (const call of topCalls) if (call.from < stop && first < call.end) calls.add(call);
       }
       at = stop + 1;
     }
     for (const span of scan.spans) if (span.start >= range.start && span.end <= range.end) names.add(span.name);
-    for (const call of scan.calls) {
-      if (call.end <= range.start || call.start >= range.end) continue;
-      if (innermost(scan.spans, call.start) !== null) continue;
-      if (!calls.includes(call)) calls.push(call);
-    }
   }
-  return { names: [...names], calls };
+  return { names: [...names], calls: [...calls] };
 }
