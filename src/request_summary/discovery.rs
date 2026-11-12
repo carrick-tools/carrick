@@ -1222,6 +1222,10 @@ struct Open<'a> {
     /// The functions entered from where the walk started down to the body
     /// that holds `invoke`.
     chain: Vec<ChainHop>,
+    /// A ref came from a key a caller writes only through a spread of its
+    /// own parameter (ruling R-SP): when the refs' callers hold nothing,
+    /// the key keeps the reading it had before the rule (carrick#4025).
+    spread: bool,
 }
 
 /// One value a callee may hold, read (carrick#2432): `Reached` is what the
@@ -3243,6 +3247,7 @@ impl<'a> Walker<'a> {
     ) -> Outcome<'a> {
         for open in std::mem::take(&mut inner.open) {
             let mut values = open.known;
+            let mut spread = open.spread;
             for (depth, index, keys) in open.refs {
                 if depth == 1
                     && let Some(maker) = maker
@@ -3276,16 +3281,20 @@ impl<'a> Walker<'a> {
                     continue;
                 }
                 let resolver = self.values;
-                values.extend(resolver.passed(
+                values.extend(resolver.passed_noting(
                     self,
                     Some(invoke),
                     index,
                     &keys,
                     defaults_of(callee),
                     open.invoke,
+                    &mut spread,
                 ));
             }
-            let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
+            let mut settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
+            for open in &mut settled.open {
+                open.spread |= spread;
+            }
             inner.absorb(settled);
         }
         inner
@@ -3346,6 +3355,7 @@ impl<'a> Walker<'a> {
                     known,
                     invoke,
                     chain,
+                    spread: false,
                 }],
                 ..Outcome::default()
             };
@@ -3424,14 +3434,27 @@ impl<'a> Walker<'a> {
         let resolver = self.values;
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
+            let mut empty_through_spread = false;
             for (out, index, keys) in &open.refs {
-                values.extend(resolver.callers_pass(
+                let held = resolver.callers_pass_noting(
                     self,
                     (file, key, depth),
                     (*out, *index, keys),
                     open.invoke,
                     &mut Vec::new(),
-                ));
+                    &mut empty_through_spread,
+                );
+                empty_through_spread |= open.spread && held.is_empty();
+                values.extend(held);
+            }
+            // A key a caller writes only through a spread of its own
+            // parameter, which that parameter's callers do not fill, and
+            // nothing else held: the key keeps the reading it had before
+            // ruling R-SP, unread, rather than stating that nothing binds
+            // it. Main says `value_never_bound` for the same parameter
+            // read with no spread; carrick#4025 restates both.
+            if values.is_empty() && empty_through_spread {
+                values.push(Held::Stop(Stop::UnreadExpression));
             }
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
@@ -4320,6 +4343,44 @@ mod tests {
             assert!(
                 !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
                 "writes/offline.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay (v1-agent on carrick#4025): `args` reaches
+    /// `check` only through spreads (of the parameter, and of a local binding
+    /// that spreads it), and the gate holding it is run only through a value
+    /// (`deps.gate(...)`), so the resolver finds no caller of it, though one
+    /// writes `log`. The rule must not state `value_never_bound` there: each
+    /// `log.warn` keeps the reason a spread the resolver cannot read gives
+    /// (`checkParsed`, the same read through `...JSON.parse(raw)`). The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_through_a_parameter_run_only_as_a_value_keeps_the_unread_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        // A callee the walk stops at with no labelled end is listed among
+        // the calls it did not follow, or as a site.
+        let unfollowed_at = |line: u32| -> Vec<Option<Stop>> {
+            discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with("through_value/gates.ts") && site.line == line)
+                .map(|site| site.stop)
+                .collect()
+        };
+        let twin = unfollowed_at(35);
+        assert!(
+            !twin.is_empty() && !twin.contains(&Some(Stop::ValueNeverBound)),
+            "gates.ts:35 states the unread reason: {twin:?}\n{all}"
+        );
+        for line in [9, 23] {
+            let stops = unfollowed_at(line);
+            assert_eq!(
+                stops, twin,
+                "gates.ts:{line} keeps the twin's reason, not value_never_bound\n{all}"
             );
         }
     }

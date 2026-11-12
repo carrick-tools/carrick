@@ -18,6 +18,8 @@ stays unread. `x ?? y` with `x` absent reads `y` alone.
 | `callbacks.ts:17`, `:21` | `listWidgets({ ...key[0], signal })`, `listWidgets({ ...fnOptions })` | `several_values`: the sources are parameters of callbacks a library runs, not resolvable in this repository, so `client` stays unread (filed under the V1 shape hold) |
 | `unread/stored.ts:8`, `:15` | `listStored({ ...JSON.parse(raw), signal })` | `several_values`: the spread source is not read, so `client` stays unread |
 | `writes/offline.ts:16`, `:23` | `listOffline({ ...base, signal })`, `base = { client: offline }` | `several_values`: the spread source writes `client`, a client that sends nothing |
+| `through_value/gates.ts:9`, `:23` | `log.warn(...)`, `log` read from `check({ ...args, tag })` and from `{ ...base, tag }` with `base = { ...args }`; `runGate` is run only as `deps.gate(...)` (`dispatch.ts`, which writes `log`) | the reason `gates.ts:35` states, never `value_never_bound`: no direct caller of `runGate` is found, so the key keeps the unread reading it had before the rule (carrick#4025) |
+| `through_value/gates.ts:35` | `log.warn(...)`, `log` read through `...JSON.parse(raw)` | the walk's reason for an unread key, on both sides of the rule (the twin) |
 | `writes/same.ts:7` | `options.run(...)`, the only caller `call({ ...base, signal })`, `const base = { run: send }` local to the caller | a site with no stop: the spread source writes `run`, so the key reads `send` and the call enters it |
 
 A module-level `base` spread whole stays unread, as the module-binding census
@@ -29,4 +31,5 @@ Tests: `src/request_summary/discovery.rs`,
 `a_key_an_unread_spread_source_may_write_keeps_several_values`,
 `a_key_a_library_callback_parameter_spread_keeps_several_values`,
 `a_key_a_spread_source_writes_is_read`,
-`a_key_a_spread_source_writes_another_client_keeps_several_values`.
+`a_key_a_spread_source_writes_another_client_keeps_several_values`,
+`a_key_through_a_parameter_run_only_as_a_value_keeps_the_unread_reason`.

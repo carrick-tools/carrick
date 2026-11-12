@@ -1980,6 +1980,36 @@ impl ValueAt {
             _ => Some(vec![Self::Unread]),
         }
     }
+
+    /// Whether [`Self::at`] reads `path` from a parameter that only a
+    /// spread hands on (ruling R-SP): the key's value is then left to the
+    /// parameter's callers, where before the rule it read as unread. When
+    /// those callers come back with nothing, the walk keeps the reason it
+    /// gave before the rule rather than stating `value_never_bound`
+    /// (carrick#4025, whose fix restates both).
+    pub(super) fn spread_param_at(&self, path: &[String]) -> bool {
+        let Some((key, rest)) = path.split_first() else {
+            return false;
+        };
+        let Self::Object {
+            fields,
+            open,
+            spreads,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match fields.get(key) {
+            Some(values) => values.iter().any(|value| value.spread_param_at(rest)),
+            None if *open => spreads
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|value| matches!(value, Self::Param { .. }) || value.spread_param_at(path)),
+            None => false,
+        }
+    }
 }
 
 /// What the receiver walk reads the name `ident` as, where the scope holds
@@ -3786,6 +3816,23 @@ impl<'a> Resolver<'a> {
         defaults: Option<Defaults<'a>>,
         invoke: Invoke<'a>,
     ) -> Vec<Held<F::Reached>> {
+        self.passed_noting(follow, at, index, keys, defaults, invoke, &mut false)
+    }
+
+    /// [`Self::passed`], setting `through_spread` when the call writes the
+    /// keys only through a spread of a parameter
+    /// ([`ValueAt::spread_param_at`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn passed_noting<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        at: Option<Invoke<'a>>,
+        index: usize,
+        keys: &[String],
+        defaults: Option<Defaults<'a>>,
+        invoke: Invoke<'a>,
+        through_spread: &mut bool,
+    ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let mut written: Vec<ValueAt> = Vec::new();
         let mut defaulted = at.is_none();
@@ -3803,6 +3850,7 @@ impl<'a> Resolver<'a> {
                 _ if spread || own.is_none() => written.push(ValueAt::Unread),
                 Some(values) => {
                     for value in values {
+                        *through_spread |= value.spread_param_at(keys);
                         match value.at(keys) {
                             Some(values) => written.extend(values),
                             None => defaulted = true,
@@ -3854,6 +3902,23 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
     ) -> Vec<Held<F::Reached>> {
+        self.callers_pass_noting(follow, at, param, invoke, passing, &mut false)
+    }
+
+    /// [`Self::callers_pass`], setting `empty_through_spread` when a caller
+    /// writes the keys only through a spread of its own parameter
+    /// ([`Self::passed_noting`]) and that parameter's callers hold
+    /// nothing there. Before ruling R-SP that key read as unread; the walk
+    /// keeps that reading where nothing else is held (carrick#4025).
+    pub(super) fn callers_pass_noting<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        at: (&'a Path, Option<&'a str>, u8),
+        param: (u8, usize, &[String]),
+        invoke: Invoke<'a>,
+        passing: &mut Vec<(PathBuf, String)>,
+        empty_through_spread: &mut bool,
+    ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let (file, key, depth) = at;
         let (out, index, keys) = param;
@@ -3886,15 +3951,23 @@ impl<'a> Resolver<'a> {
                 construction: false,
                 bound: 0,
             };
-            for value in self.passed(follow, Some(at), index, keys, callee, invoke) {
+            let mut spread = false;
+            let passed =
+                self.passed_noting(follow, Some(at), index, keys, callee, invoke, &mut spread);
+            for value in passed {
                 match value {
-                    Held::Param(out, index, keys) => values.extend(self.callers_pass(
-                        follow,
-                        (caller.file, caller.key, caller.depth),
-                        (out, index, &keys),
-                        invoke,
-                        passing,
-                    )),
+                    Held::Param(out, index, keys) => {
+                        let held = self.callers_pass_noting(
+                            follow,
+                            (caller.file, caller.key, caller.depth),
+                            (out, index, &keys),
+                            invoke,
+                            passing,
+                            empty_through_spread,
+                        );
+                        *empty_through_spread |= spread && held.is_empty();
+                        values.extend(held);
+                    }
                     other => values.push(other),
                 }
             }
