@@ -40,7 +40,9 @@ type Payload = {
   tool_input?: {
     file_path?: string;
     filePath?: string;
-    edits?: Array<{ file_path?: string }>;
+    edits?: Array<{ file_path?: string; new_string?: string }>;
+    /** Claude Code's `Edit`: the text the edit put in. */
+    new_string?: string;
     /** Codex's `apply_patch`: the patch text itself. */
     command?: unknown;
   };
@@ -104,7 +106,20 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = edited[0]!;
-  await editFlow({ cwd, session, channel: channel.channel, timing }, edited);
+  await editFlow({ cwd, session, channel: channel.channel, timing, snippets: snippetsFromPayload(payload, edited) }, edited);
+}
+
+/**
+ * The text an `Edit` or `MultiEdit` put in its one file, keyed by the
+ * absolute path. A `Write` or a patch names no snippet: the file was written
+ * whole.
+ */
+function snippetsFromPayload(payload: Payload, edited: string[]): Map<string, string[]> {
+  const input = payload.tool_input ?? {};
+  const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(
+    (text): text is string => typeof text === "string",
+  );
+  return edited.length === 1 && texts.length > 0 ? new Map([[edited[0]!, texts]]) : new Map();
 }
 
 await timed("post-edit", main);

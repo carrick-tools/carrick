@@ -69,6 +69,12 @@ export type SessionRecord = {
    * printed: the same set of operations is named once per session.
    */
   said: string[];
+  /**
+   * Fact-file row key -> when its line was delivered and the absolute paths
+   * that line pointed at (`facts/lines.ts`): each row is said once per session,
+   * claimed only once the line is printed.
+   */
+  facts: Record<string, { at: number; named: string[] }>;
   /** RFC 3339, when this file was last written. Drives the prune below. */
   updated: string;
 };
@@ -114,6 +120,7 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
     stated: {},
     covered: {},
     said: [],
+    facts: {},
     updated: "",
   };
   const file = sessionFile(sessionId, home);
@@ -152,6 +159,16 @@ export function readSession(sessionId: string, home?: string): SessionRecord {
       stated: stamps(record.stated),
       covered: stamps(record.covered),
       said: Array.isArray(record.said) ? record.said.filter((entry): entry is string => typeof entry === "string") : [],
+      facts: Object.fromEntries(
+        Object.entries(record.facts ?? {}).filter(
+          (entry): entry is [string, { at: number; named: string[] }] =>
+            typeof entry[1] === "object" &&
+            entry[1] !== null &&
+            typeof entry[1].at === "number" &&
+            Array.isArray(entry[1].named) &&
+            entry[1].named.every((named) => typeof named === "string"),
+        ),
+      ),
       updated: typeof record.updated === "string" ? record.updated : "",
     };
   } catch {
@@ -305,6 +322,20 @@ export function markLed(sessionId: string, keys: string[], home?: string): void 
   if (keys.length === 0) return;
   const current = readSession(sessionId, home);
   current.led = [...new Set([...current.led, ...keys])];
+  current.updated = new Date().toISOString();
+  write(sessionId, current, home);
+}
+
+/** The fact-row keys this session has already been given a line for. */
+export function factsSaid(sessionId: string, home?: string): Set<string> {
+  return new Set(Object.keys(readSession(sessionId, home).facts));
+}
+
+/** Remember that this session has been given the fact lines under `claims`. */
+export function markFacts(sessionId: string, claims: Record<string, { at: number; named: string[] }>, home?: string): void {
+  if (Object.keys(claims).length === 0) return;
+  const current = readSession(sessionId, home);
+  Object.assign(current.facts, claims);
   current.updated = new Date().toISOString();
   write(sessionId, current, home);
 }

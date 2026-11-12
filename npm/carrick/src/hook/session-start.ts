@@ -37,6 +37,7 @@ import { outdatedFiles, outdatedInstall, versionMismatch } from "../init/outdate
 import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
 import { slowHookLines, timed } from "./timings.ts";
+import { startFactsRefresh } from "../facts/fetch.ts";
 
 const log = createLogger("carrick-session");
 
@@ -169,6 +170,10 @@ async function main(): Promise<void> {
       log("background hosted move not started", String(error));
     }
   }
+  // The fact file the edit hooks read (`facts/fetch.ts`): detached, silent,
+  // at most once per cooldown; it asks the cloud and costs one read when the
+  // project has not changed.
+  startFactsRefresh(choice.root);
   flush(lines, codex);
 }
 

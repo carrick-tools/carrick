@@ -1,0 +1,2 @@
+Carrick re-checked orders-api/src/routes/orders.ts after this edit: 1 contract problem.
+- orders-api/src/routes/orders.ts:18:3 call GET /api/users/:id [fact, imported_member] type_mismatch: the response no longer carries `email`, which this call reads. Read off the client member this call goes through. Producers: user-service src/routes/users.ts:42
