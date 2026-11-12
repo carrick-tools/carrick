@@ -6,10 +6,12 @@
 // digest and writer it already holds, so an unchanged project costs one read.
 // A new digest or writer answers with a presigned URL to gzipped NDJSON, which
 // is fetched (no credential, https amazonaws.com only), built into SQLite
-// under a temporary name and renamed (`store.ts`). `facts_building`,
-// `facts_unavailable`, a 404 (route not deployed) and every other error mean
-// no new facts: one log line. Only `facts_building` moves the next ask a
-// minute on (`runFactsRefresh`); the rest wait out the cooldown.
+// under a temporary name and renamed (`store.ts`). An error answer, a 404
+// (route not deployed) and every other failure mean no new facts: one log
+// line. Only an error marked `retriable: true` (a build in flight, whatever
+// its code) moves the next ask a minute on (`runFactsRefresh`); the rest wait
+// out the cooldown. The code is logged, never branched on: one code is sent
+// both ways.
 // Wire contract: carrick-cloud `docs/internal/reference/edit-facts-wire.md`.
 
 import fs from "node:fs";
@@ -26,11 +28,12 @@ import type { LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
 
-/** After `facts_building`, the next trigger may ask again this soon. */
+/** After a retriable error, the next trigger may ask again this soon. */
 export const FACTS_BUILDING_RETRY_MS = 60_000;
 export const FACTS_MARKER = "last-facts-refresh";
 
-export type RefreshOutcome = "unchanged" | "written" | "building" | "none";
+/** `retry`: the cloud answered a retriable error (a build in flight). */
+export type RefreshOutcome = "unchanged" | "written" | "retry" | "none";
 
 export type FactsRefreshOptions = {
   env?: NodeJS.ProcessEnv;
@@ -148,11 +151,12 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
       log(`facts answer not JSON (HTTP ${response.status})`);
       return "none";
     }
-    const error = answer["error"] as { code?: unknown } | undefined;
+    const error = answer["error"] as { code?: unknown; retriable?: unknown } | undefined;
     if (answer["success"] === false || !response.ok) {
       const code = typeof error?.code === "string" ? error.code : `HTTP ${response.status}`;
-      log(`facts not available: ${code}`);
-      return code === "facts_building" ? "building" : "none";
+      const retriable = error?.retriable === true;
+      log(`facts not available: ${code}${retriable ? " (retriable)" : ""}`);
+      return retriable ? "retry" : "none";
     }
     if (answer["unchanged"] === true) {
       await touchFetched(root, now);
@@ -212,18 +216,18 @@ export function startFactsRefresh(
 
 /**
  * One detached refresh (`refresh-run.ts`): bring the file up to date and,
- * after `facts_building` only, let the next trigger ask again a minute on.
- * Every other outcome (`facts_unavailable` included) waits out the cooldown.
+ * after a retriable error only, let the next trigger ask again a minute on.
+ * Every other outcome waits out the cooldown.
  */
 export async function runFactsRefresh(root: string, options: FactsRefreshOptions = {}): Promise<RefreshOutcome> {
   const outcome = await refreshFacts(root, options);
   log(`fact refresh: ${outcome}`);
-  if (outcome === "building") allowEarlyRetry(root, options.env ?? process.env, options.now ?? Date.now());
+  if (outcome === "retry") allowEarlyRetry(root, options.env ?? process.env, options.now ?? Date.now());
   return outcome;
 }
 
 /**
- * After `facts_building`, move the claim back so the next trigger, a minute
+ * After a retriable error, move the claim back so the next trigger, a minute
  * on, asks again rather than waiting out the whole cooldown.
  */
 export function allowEarlyRetry(root: string, env: NodeJS.ProcessEnv = process.env, now: number = Date.now()): void {

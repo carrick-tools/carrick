@@ -604,14 +604,20 @@ test("facts_unavailable is silent and does not schedule an early retry", async (
   const now = Date.parse("2026-01-01T12:00:00Z");
   const start = () => undefined;
   assert.equal(startFactsRefresh(ws.root, { env, now, start }), true);
-  const answer = (code: string) =>
-    (async () => new Response(JSON.stringify({ success: false, error: { code, message: "", retriable: code === "facts_building" } }))) as typeof fetch;
-  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable"), env, now }), "none");
+  const answer = (code: string, retriable: boolean, status = 200) =>
+    (async () => new Response(JSON.stringify({ success: false, error: { code, message: "", retriable } }), { status })) as typeof fetch;
+  // Not retriable: no facts, no early retry.
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable", false), env, now }), "none");
   assert.equal(fs.existsSync(factsPath(ws.root)), false);
   assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), false, "no early retry");
-  // A building answer does move the next ask a minute on.
-  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_building"), env, now }), "building");
+  // The same code, retriable (a build in flight, HTTP 409), moves the next ask a minute on: the flag decides, not the code.
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_unavailable", true, 409), env, now }), "retry");
   assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), true);
+  // And `facts_building` marked not retriable does not.
+  const later = now + 3_600_000;
+  assert.equal(startFactsRefresh(ws.root, { env, now: later, start }), true);
+  assert.equal(await runFactsRefresh(ws.root, { request: answer("facts_building", false), env, now: later }), "none");
+  assert.equal(startFactsRefresh(ws.root, { env, now: later + FACTS_BUILDING_RETRY_MS + 1_000, start }), false);
 });
 
 test("a staged URL is fetched only over https from an amazonaws.com host", async (t) => {
@@ -788,7 +794,7 @@ test("a file with another schema prints nothing and asks for schema 1", async (t
     bodies.push(JSON.parse(String(init?.body)));
     return new Response(JSON.stringify({ success: false, error: { code: "facts_building", message: "", retriable: true } }), { status: 200 });
   }) as typeof fetch;
-  assert.equal(await refreshFacts(ws.root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } }), "building");
+  assert.equal(await refreshFacts(ws.root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } }), "retry");
   assert.equal((bodies[0] as { schema: number }).schema, SCHEMA);
 });
 
