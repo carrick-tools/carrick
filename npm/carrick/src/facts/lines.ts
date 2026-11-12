@@ -112,9 +112,17 @@ function methodOf(row: FactRow): string | null {
   return row.protocol === "http" ? (row.label.split(" ")[0] ?? "").toLowerCase() : null;
 }
 
-/** Whether `call` is written as `row`'s site: the site as a direct string argument, and an HTTP row's method as the callee's name. */
+/**
+ * Whether `call` is written as `row`'s site: the site as a direct string
+ * argument, and an HTTP row's method as the callee's name. Any other
+ * protocol's producer (a listener, subscriber, resolver) also needs a
+ * function written in the call; its consumer (an emit, a publish) never
+ * fits, as the row does not say the callee's name.
+ */
 function callFits(call: CallSpan, row: FactRow, method: string | null): boolean {
-  return call.literals.includes(row.site!) && (method === null || call.member?.toLowerCase() === method);
+  if (!call.literals.includes(row.site!)) return false;
+  if (method !== null) return call.member?.toLowerCase() === method;
+  return row.side === "producer" && call.takesFunction;
 }
 
 /**

@@ -133,10 +133,10 @@ test("the pinned fixture's inline handlers are found by the site written in thei
   const ws = await factsWorkspace(t);
   // An HTTP handler written inline: `router.post("/", ...)` against `POST /orders`, site "/".
   assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(201).json(created);"), ["POST /orders is called at web-app/src/boot.ts:4"]);
-  // A socket handler inside the connection handler, and the emit inside it.
+  // A socket handler inside the connection handler. The emit inside it is an
+  // unnamed consumer row, silent until the row says the callee's name (R24.3).
   assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", 'io.emit("chat:message", payload);'), [
     "CLIENT->SERVER chat:send is emitted at web-app/src/chat/client.ts:15",
-    "SERVER->CLIENT chat:message is handled at web-app/src/chat/listen.ts:5",
   ]);
   // A pub/sub subscriber written inline.
   assert.deepEqual(await linesFor(ws, "billing-worker/src/subscribers.ts", "await mirror(message.orderId);"), [
@@ -241,6 +241,21 @@ test("unnamed socket and pub/sub rows are found by their site in the call around
   assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "  await mirror(message);"), ["created line"]);
   // Inside `connection` but outside the `chat:send` call: nothing.
   assert.deepEqual(await linesFor(ws, "gateway/src/chat.ts", "  const room = rooms.get(socket.id);"), []);
+});
+
+test("R24.3: an unnamed listener row needs a function in its call; an unnamed emit row is silent", async (t) => {
+  const ndjson = [
+    header(["gateway"]),
+    row({ side: "producer", protocol: "socket", label: "CLIENT->SERVER chat:send", repo: "gateway", file: "src/hub.ts", line: 2, name: null, site: "chat:send", text: "send line" }),
+    row({ side: "consumer", protocol: "socket", label: "SERVER->CLIENT chat:sent", repo: "gateway", file: "src/hub.ts", line: 4, name: null, site: "chat:sent", text: "sent line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("gateway/src/hub.ts"),
+    ['io.on(EV.SEND, (m) => {', "  relay(m);", "});", 'io.emit("chat:sent", 1);', 'metrics.count("chat:send");', ""].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "gateway/src/hub.ts", 'metrics.count("chat:send");'), []);
+  assert.deepEqual(await linesFor(ws, "gateway/src/hub.ts", 'io.emit("chat:sent", 1);'), []);
 });
 
 test("naming rule 6: one name in two files is told apart by the edited file", async (t) => {

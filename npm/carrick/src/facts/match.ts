@@ -25,9 +25,10 @@ export type NamedSpan = { name: string; start: number; end: number };
 /**
  * A call: `from` where its callee starts (`router` in `router.post(`), `start`
  * at its `(`, `end` after its `)`, the callee's last name (`post`), and the
- * string literals passed to it directly.
+ * string literals passed to it directly, and whether a function written in
+ * place (an arrow or `function`) is one of its arguments.
  */
-export type CallSpan = { from: number; start: number; end: number; member: string | null; literals: string[] };
+export type CallSpan = { from: number; start: number; end: number; member: string | null; literals: string[]; takesFunction: boolean };
 
 export type Scan = {
   /** False when the text did not tokenize cleanly; nothing else is set then. */
@@ -479,6 +480,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
     if (!callee) continue;
     const close = match.get(index)!;
     const literals: string[] = [];
+    let takesFunction = false;
     for (let k = index + 1; k < close; k += 1) {
       const inner = t(k)!;
       if (inner.kind === "punc" && OPEN[inner.value]) {
@@ -486,13 +488,14 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number)
         continue;
       }
       if (inner.kind === "str") literals.push(inner.value);
+      else if ((inner.kind === "punc" && inner.value === "=>") || (inner.kind === "id" && inner.value === "function")) takesFunction = true;
     }
     // The callee: its last name, and where its member chain starts.
     let last = punc(index - 1, "?.") ? index - 2 : index - 1;
     const member = is(last, "id") ? t(last)!.value : null;
     while (is(last, "id") && (punc(last - 1, ".") || punc(last - 1, "?.")) && is(last - 2, "id")) last -= 2;
     const from = is(last, "id") ? t(last)!.start : t(index - 1)!.start;
-    calls.push({ from, start: token.start, end: tokens[close]!.end, member, literals });
+    calls.push({ from, start: token.start, end: tokens[close]!.end, member, literals, takesFunction });
   }
 
   /** Skips a type annotation after `:` up to the token where `stop` holds, jumping brackets. */
