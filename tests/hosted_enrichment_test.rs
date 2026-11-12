@@ -6,6 +6,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 const TOKEN: &str = "synthetic-hosted-reader";
 
 fn git(path: &Path, args: &[&str]) -> String {
@@ -41,6 +44,17 @@ fn spawn(root: &Path, args: &[&str], token: Option<&str>) -> std::process::Outpu
         .env_remove("CARRICK_LOCAL_STORAGE_DIR")
         .env_remove("CARRICK_LOCAL_HOSTED_PREVIOUS")
         .env_remove("CARRICK_MOCK_ALL");
+    // A refresh scans the tree and asks the library store about the packages
+    // installed in it. The store is out of reach here, so a test that installs
+    // a package writes the store's answer for it to `<root>/cassettes`, and
+    // only the refresh reads it from there.
+    let cassettes = root.join("cassettes");
+    if args.first() == Some(&"refresh") && cassettes.join("library-claims/default.json").is_file() {
+        command.env("CARRICK_MOCK_ALL", "1").env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        );
+    }
     if let Some(token) = token {
         command.env("CARRICK_TOKEN", token);
     }
@@ -423,13 +437,15 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     let remote = tempfile::tempdir().unwrap();
     let upstream = remote.path().join("orders");
     std::fs::create_dir(&upstream).unwrap();
-    let source = "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\n";
+    let source = "import express from \"express\";\nconst app = express();\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\n";
     std::fs::write(upstream.join("app.ts"), source).unwrap();
     std::fs::write(
         upstream.join("package.json"),
-        r#"{"name":"orders","version":"1.0.0"}"#,
+        r#"{"name":"orders","version":"1.0.0","dependencies":{"express":"^4.19.2"}}"#,
     )
     .unwrap();
+    real_packages::install(&upstream, &["express"]);
+    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     std::fs::write(
         upstream.join("carrick.json"),
         r#"{"service_name":"orders","include":["."]}"#,
@@ -472,7 +488,7 @@ fn a_fetched_hosted_commit_is_replayed_by_the_refresh_the_sentence_names() {
     let start = source.find("app.get(").unwrap() + 1;
     let end = start + "app.get(\"/hosted\", handler)".len();
     hosted["file_results"] = json!({"app.ts":{"mounts":[],"data_calls":[],"endpoints":[{
-        "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET","path":"/hosted",
+        "candidate_id":format!("span:{start}-{end}"),"line_number":4,"owner_node":"app","method":"GET","path":"/hosted",
         "handler_name":"handler","pattern_matched":"fixture","call_expression_span_start":start,"call_expression_span_end":end,
         "resolution_source":"model"
     }]}});
@@ -742,6 +758,8 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     .unwrap();
     let server = "import express from \"express\";\nconst app = express();\napp.get(\"/orders\", (_req, res) => {\n  res.json([{ id: 1 }]);\n});\nexport default app;\n";
     std::fs::write(repo.join("packages/b/server.ts"), server).unwrap();
+    real_packages::install(&repo, &["express"]);
+    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     init_repo(&repo);
     git(
         &repo,

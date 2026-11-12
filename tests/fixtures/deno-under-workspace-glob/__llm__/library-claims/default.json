@@ -1,0 +1,203 @@
+{
+  "library_claims": [
+    {
+      "package": "express",
+      "version": "4.19.2",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "express",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [
+            {
+              "member": "use",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "mounts": {
+                "arg": 1
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "post",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "express",
+          "export": "Router",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "post",
+              "of": "instance:()",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "hono",
+      "version": "4.6.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "hono",
+          "export": "Hono",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "post",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "put",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "PUT",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "delete",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "DELETE",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "all",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
