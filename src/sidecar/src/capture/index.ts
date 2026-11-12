@@ -73,7 +73,7 @@ export { findServiceTsconfig, GoverningConfigs } from './service-config.js';
 // installed declaring file the way the capture's resolution walk does.
 export { WriteGuard } from './guarded-fs.js';
 export { installedPackageDirectory } from './installed-package-directory.js';
-export { isDeclarationFileName, packageNameOf } from './specifiers.js';
+export { isDeclarationFileName, isRelative, packageNameOf } from './specifiers.js';
 export type { InternalTypeChecker } from './node-builder.js';
 export { toPosix } from './installed-package.js';
 export { constituentsOf } from './result-label.js';
