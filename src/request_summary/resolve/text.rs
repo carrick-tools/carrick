@@ -80,6 +80,7 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, class: Option<u32>, depth: usi
                 lo,
                 hi,
                 branches: vec![next(&cond.cons), next(&cond.alt)],
+                nullish: false,
             }
         }
         Expr::Bin(bin) if matches!(bin.op, BinaryOp::NullishCoalescing | BinaryOp::LogicalOr) => {
@@ -88,6 +89,7 @@ fn lower(expr: &Expr, shift: &dyn Fn(u32) -> u32, class: Option<u32>, depth: usi
                 lo,
                 hi,
                 branches: vec![next(&bin.left), next(&bin.right)],
+                nullish: bin.op == BinaryOp::NullishCoalescing,
             }
         }
         Expr::Bin(bin) if bin.op == BinaryOp::Add => {
@@ -382,6 +384,7 @@ impl PatternMember<'_> {
                 lo: shift(self.span.lo.0),
                 hi: shift(self.span.hi.0),
                 branches: vec![member, text_of(default, shift)],
+                nullish: false,
             },
             None => member,
         }

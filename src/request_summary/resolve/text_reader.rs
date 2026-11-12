@@ -772,10 +772,24 @@ impl<'a> Resolver<'a> {
                 member: false,
                 ..
             } => self.text_of_name(file, *lo, *hi),
-            ValueAt::Alt { branches, .. } => branches
-                .iter()
-                .flat_map(|branch| self.text_of_branch(file, branch))
-                .collect(),
+            ValueAt::Alt {
+                branches, nullish, ..
+            } => {
+                // `a ?? b` holds `b` only where `a` may be nullish: a left
+                // the compiler types as one non-nullable text is the value
+                // alone. A nullable left is both sides, and a left no
+                // reader states stays a hole beside `b`, so no consumer
+                // takes `b` alone (carrick#3835).
+                let held = match branches.as_slice() {
+                    [left, _] if *nullish && self.is_non_nullable_text(file, left) => {
+                        &branches[..1]
+                    }
+                    all => all,
+                };
+                held.iter()
+                    .flat_map(|branch| self.text_of_branch(file, branch))
+                    .collect()
+            }
             ValueAt::Member {
                 lo,
                 hi,
@@ -914,6 +928,27 @@ impl<'a> Resolver<'a> {
             }
             _ => Err(UnreadExpression),
         }
+    }
+
+    /// Whether `value` is a name the compiler types as `string` or as
+    /// string literals alone: no `undefined`, no `null`, so a `??` after it
+    /// is never taken.
+    fn is_non_nullable_text(&self, file: &Path, value: &ValueAt) -> bool {
+        let ValueAt::Read {
+            lo,
+            hi,
+            member: false,
+            ..
+        } = value
+        else {
+            return false;
+        };
+        self.row_at(file, *lo, *hi, Kind::Ident)
+            .and_then(Row::type_text)
+            .is_some_and(|text| {
+                text.trim() == "string"
+                    || !super::super::site_record::literals_of_type(text).is_empty()
+            })
     }
 
     /// One branch of a choice. A name the compiler types as a union of
@@ -2211,6 +2246,13 @@ mod tests {
         };
         assert_eq!(texts("p_coalesce"), (vec!["/fallback".to_string()], 1));
         assert_eq!(texts("p_or"), (vec!["/or".to_string()], 1));
+        // carrick#3835: a left typed as one non-nullable text is the whole
+        // value of `??`; `||` keeps both sides (as `p_coalesce` does for a nullable left).
+        assert_eq!(texts("p_nullish_typed"), (vec!["/api".to_string()], 0));
+        assert_eq!(
+            texts("p_or_typed"),
+            (vec!["/api".to_string(), "/falsy".to_string()], 0)
+        );
         assert_eq!(
             texts("p_cond"),
             (vec!["/api".to_string(), "/other".to_string()], 0)
