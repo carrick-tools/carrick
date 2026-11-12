@@ -2712,7 +2712,7 @@ mod tests {
             return;
         };
         let resolver = Resolver::new(&on.inputs, &[]);
-        for (callee, parts) in [("p_local", 2), ("p_target", 1), ("p_renamed", 1)] {
+        for (callee, parts) in [("p_local", 2), ("p_target", 2), ("p_renamed", 1)] {
             let (path, term) = piece_arg(&on, callee);
             let ValueAt::Read { lo, hi, .. } = term else {
                 panic!("{callee}: {term:?}");

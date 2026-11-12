@@ -156,7 +156,7 @@ and the calls of the parameters it was passed through (innermost first).
 | `p_typed` (in `typed(kind: "jobs.run")`) | `jobs.run`, passed through `typed("jobs.run")`; read whole, `jobs.run` through no call |
 | `p_wide` (in `wide(name)`) | `w01` to `w17`, each passed through its own call: seventeen values, no cap |
 | `p_local` | `/orders/` then a `name_never_bound` hole at the initialiser's `id`: the summaries read `url` as its initialiser |
-| `p_target` (`const t = process.env.API_URL + id`) | one part at the read of `t`: the summaries read `t` by its name |
+| `p_target` (`const t = process.env.API_URL + id`) | an `unread_expression` hole at the environment read, then a `name_never_bound` hole at `id`: the summaries keep the pieces of a local of an unstated base and a parameter (carrick#3679) |
 | `p_renamed` (`const u = opts.url`) | one part at the read of `u`: the summaries read `u` by its name |
 
 Read at the labelled call's own function, each `p_local`, `p_target` and
