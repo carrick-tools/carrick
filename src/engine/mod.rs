@@ -2235,6 +2235,27 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         }
     }
 
+    // On a PR run, a field the PR deletes from a printed schema file is a break, not a doubt: the file's own diff states it.
+    // Read after the doubts above are set, from the schema file as the PR's
+    // fork point held it.
+    if pr_context().is_some()
+        && let Some(fork) = pr_base_commit(repo_path)
+            .and_then(|base| crate::git_state::pr_fork_point(repo_path, &base).ok())
+    {
+        for run in runs.iter_mut().filter(|run| !run.carried) {
+            let lifted = crate::graphql::SchemaCatalogue::lift_removals_made_by_pr(
+                &mut run.data.calls,
+                |schema| crate::git_state::file_at_commit(repo_path, &fork, &format!("./{schema}")),
+            );
+            if lifted > 0 {
+                debug!(
+                    "GraphQL operations: {lifted} undeclared selection(s) name a field this PR \
+                     removes from its schema file"
+                );
+            }
+        }
+    }
+
     // Whether this run leaves a service short of a complete index. A missing
     // function description alone does not: it never held an index back.
     let incomplete = runs.iter().any(|run| run.owed.thins_the_index());

@@ -1,0 +1,13 @@
+{
+  "services": [
+    {
+      "serviceName": "parcel-api",
+      "directory": "apps/api",
+      "graphqlSchemas": ["apps/api/dist/schema.graphql"]
+    },
+    {
+      "serviceName": "parcel-web",
+      "directory": "apps/web"
+    }
+  ]
+}

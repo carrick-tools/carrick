@@ -4950,3 +4950,171 @@ async fn a_break_on_main_past_a_carried_copy_is_on_main_for_a_version_bump_pr() 
     let finding = wrong_verb(&findings_of(&payload));
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 }
+
+// ---- GraphQL: a field the PR deletes from a printed schema --------------
+
+/// A fresh git repo holding a copy of `tests/fixtures/<name>`.
+fn plain_fixture_repo(root: &Path, name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let repo = unlinked(root).join(name);
+    copy_dir(&src, &repo);
+    git(&repo, &["init", "-q"]);
+    commit(&repo, "init");
+    repo
+}
+
+/// The PR result of `graphql-printed-removal` after `change`, against the
+/// index of its base commit. A code-first server prints its schema to a file
+/// named in `graphqlSchemas`; the client selects `Parcel.etaDays`.
+async fn printed_schema_pr_payload(
+    base_change: impl Fn(&Path),
+    change: impl Fn(&Path),
+) -> serde_json::Value {
+    seed_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = plain_fixture_repo(tmp.path(), "graphql-printed-removal");
+    base_change(&repo);
+    commit(&repo, "main: edit");
+    let _cassettes = Cassettes::from(&repo.join("__llm__"));
+    let store = Store::default();
+    scan_with(&store, &repo, true).await;
+    let base = head(&repo);
+    git(&repo, &["checkout", "-q", "-b", "pr"]);
+    change(&repo);
+    commit(&repo, "pr: edit");
+    event_with_base(tmp.path(), &base);
+    pr_payload_with(&store, &repo, true).await
+}
+
+fn parcel_page_finding(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    findings_of(payload).into_iter().find(|f| {
+        f["kind"] == "type_mismatch"
+            && f["call_sites"][0]
+                .as_str()
+                .is_some_and(|site| site.starts_with("apps/web/src/pages/ParcelPage.tsx"))
+    })
+}
+
+/// The code and its printed copy both drop `Parcel.etaDays`; the client, which
+/// the PR leaves alone, still selects it. The printed copy may be stale, but
+/// the PR's own diff of it removes the field, so the run states the break.
+#[tokio::test]
+async fn a_field_the_pr_deletes_from_a_printed_schema_breaks_the_client_that_selects_it() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |_| {},
+        |repo| {
+            edit(
+                repo,
+                "apps/api/src/server.ts",
+                &[("    etaDays: { type: GraphQLInt },\n", "")],
+            );
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "")],
+            );
+            edit(
+                repo,
+                "__llm__/analyze-file/server.json",
+                &[
+                    ("\"resolver_line\": 44", "\"resolver_line\": 43"),
+                    ("\"resolver_line\": 49", "\"resolver_line\": 48"),
+                ],
+            );
+        },
+    )
+    .await;
+    let finding = parcel_page_finding(&payload).unwrap_or_else(|| {
+        panic!(
+            "no type_mismatch at the client: {:#?}",
+            findings_of(&payload)
+        )
+    });
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+}
+
+/// A printed copy that already lacked the field on the base stays a doubt
+/// when the PR edits the file for another reason (carrick#3201).
+#[tokio::test]
+async fn a_printed_schema_that_already_lacked_the_field_stays_unverifiable() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |repo| {
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "")],
+            )
+        },
+        |repo| {
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[(
+                    "type Depot {",
+                    "type Aside {\n  note: String\n}\n\ntype Depot {",
+                )],
+            )
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}
+
+/// Two schemas could serve the client: the PR removes the field from one, and
+/// the doubt stays, since the other may still serve it.
+#[tokio::test]
+async fn a_field_deleted_from_one_of_two_served_schemas_stays_unverifiable() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |repo| {
+            std::fs::write(
+                repo.join("apps/api/dist/schema-ops.graphql"),
+                "type Query {\n  ping: String\n}\n",
+            )
+            .unwrap();
+            edit(
+                repo,
+                "carrick.json",
+                &[(
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\"]",
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\", \"apps/api/dist/schema-ops.graphql\"]",
+                )],
+            );
+        },
+        |repo| {
+            edit(
+                repo,
+                "apps/api/src/server.ts",
+                &[("    etaDays: { type: GraphQLInt },\n", "")],
+            );
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "")],
+            );
+            edit(
+                repo,
+                "__llm__/analyze-file/server.json",
+                &[
+                    ("\"resolver_line\": 44", "\"resolver_line\": 43"),
+                    ("\"resolver_line\": 49", "\"resolver_line\": 48"),
+                ],
+            );
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}

@@ -1295,6 +1295,48 @@ impl SchemaCatalogue {
         marked
     }
 
+    /// A printed-copy doubt does not stand for a field the PR itself deletes
+    /// from that file. A several-schemas doubt stays: another schema may still
+    /// serve the field. The doubt is that the file
+    /// may be stale against the code, so it may lack a field the code still
+    /// declares; a field the file declared before the PR and the PR's own diff
+    /// of it no longer declares is not that case. For each reading whose
+    /// doubt is the printed-copy one, `base_copy` gives the schema file as the
+    /// PR's base held it (`None` off a PR run, or where git cannot read it);
+    /// when that copy declared every field the reading names, the reading
+    /// loses its doubt and is a break. A printed file the PR leaves alone, and
+    /// a field the base copy also lacked, keep their doubt (carrick#3201).
+    /// Returns how many readings it lifted.
+    pub fn lift_removals_made_by_pr(
+        calls: &mut [crate::analyzer::ApiEndpointDetails],
+        base_copy: impl Fn(&str) -> Option<String>,
+    ) -> usize {
+        use crate::graphql_selection::{PartialSchema, SchemaFile};
+        let mut bases: HashMap<String, Option<SchemaFile>> = HashMap::new();
+        let mut lifted = 0;
+        for call in calls {
+            let Some(selection) = call.undeclared_selection.as_mut() else {
+                continue;
+            };
+            if selection.partial != Some(PartialSchema::PrintedFromCode) {
+                continue;
+            }
+            let base = bases
+                .entry(selection.schema.clone())
+                .or_insert_with(|| SchemaFile::parse(&base_copy(&selection.schema)?));
+            if base.as_ref().is_some_and(|base| {
+                selection
+                    .fields
+                    .iter()
+                    .all(|f| base.declares(&f.on_type, &f.field))
+            }) {
+                selection.partial = None;
+                lifted += 1;
+            }
+        }
+        lifted
+    }
+
     /// A service builds its GraphQL schema in code: every schema file under
     /// its walk `roots` may be a copy printed from that code, named in
     /// `graphqlSchemas` or not (carrick#3200).
