@@ -1491,6 +1491,37 @@ fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
     !holds_parameter(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
 }
 
+/// Whether `pieces` is a message name written as a template whose hole a
+/// caller fills (`team/${teamId}/added`, carrick#3784): text the source
+/// writes beside a parameter, at a call that is no HTTP request. Message
+/// names pair by exact text, so such a name is never stated with a
+/// placeholder; when no caller fills it, the call that writes it is saved.
+/// An HTTP path parameter already states a route at its own call
+/// ([`decides`]).
+fn is_message_template(pieces: &[Piece], end: &LabelledEnd) -> bool {
+    end.role != "http_client"
+        && holds_parameter(pieces)
+        && pieces
+            .iter()
+            .any(|piece| matches!(piece, Piece::Lit(text) if !text.is_empty()))
+}
+
+/// The call of `chain` that writes the name as a message template
+/// ([`is_message_template`]): the one nearest the labelled call whose value
+/// (`values`, as composed up the chain) is one.
+fn template_frame<'a>(
+    chain: &[Placed<'a>],
+    values: &[Option<Vec<Piece>>],
+    end: &LabelledEnd,
+) -> Option<Placed<'a>> {
+    (0..chain.len()).rev().find_map(|k| {
+        values[k]
+            .as_ref()
+            .filter(|pieces| is_message_template(pieces, end))
+            .map(|_| chain[k])
+    })
+}
+
 /// `pieces`, read where a call at `depth` inside its definition sits, as
 /// that definition's own body reads them: every parameter must be the
 /// definition's (an enclosing parameter exactly `depth` functions out).
@@ -2214,6 +2245,10 @@ struct Walk<'a, 'i> {
     /// pairs of `down` are value hops, each with the maker call its function
     /// was made by ([`method_value`]).
     value_hops: Vec<Option<Placed<'a>>>,
+    /// Set only while [`Walk::up`] carries a message name up from the call
+    /// that writes it as a template ([`template_frame`], carrick#3784): a
+    /// lead the walk meets above is also that call's.
+    template: Option<Placed<'a>>,
     /// Reads a name decided at one call as text, for a site stated at
     /// another (a maker-bound name, carrick#3527).
     fold: super::site_record::NameFold<'i>,
@@ -2668,21 +2703,49 @@ impl<'a> Walk<'a, '_> {
         end: &LabelledEnd,
         path: &mut Vec<(PathBuf, String)>,
     ) {
+        let entered = self.template.is_none() && is_message_template(pieces, end);
+        if entered {
+            self.template = Some(down[0]);
+        }
+        self.up_from(down, pieces, end, path);
+        if entered {
+            self.template = None;
+        }
+    }
+
+    /// A lead at `placed`, where the walk carrying a name up stopped, and
+    /// at the call that writes that name as a template, when the walk
+    /// passed one ([`Walk::template`], carrick#3784): the template's hole is
+    /// what stayed open, so its own call is saved with the same reason.
+    fn open_lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
+        self.lead(placed, end, why);
+        if let Some(template) = self.template {
+            self.lead(&template, end, why);
+        }
+    }
+
+    fn up_from(
+        &mut self,
+        down: &[Placed<'a>],
+        pieces: &[Piece],
+        end: &LabelledEnd,
+        path: &mut Vec<(PathBuf, String)>,
+    ) {
         let placed = down[0];
         let Some(own) = to_definition(pieces, placed.depth) else {
-            self.lead(&placed, end, Stop::CallbackParameter);
+            self.open_lead(&placed, end, Stop::CallbackParameter);
             return;
         };
         let Some(key) = placed.key else {
             // Module level holds no parameter of its own.
-            self.lead(&placed, end, Stop::NameNeverBound);
+            self.open_lead(&placed, end, Stop::NameNeverBound);
             return;
         };
         let callers = self.calls.callers_of(placed.file, key);
         if callers.is_empty() {
             match self.uncalled_key_defaults(&placed, &own, end) {
                 Some(value) => self.site(down, end, value, BTreeSet::new()),
-                None => self.lead(&placed, end, Stop::NameNeverBound),
+                None => self.open_lead(&placed, end, Stop::NameNeverBound),
             }
             return;
         }
@@ -3302,6 +3365,7 @@ fn decide(
         reached: None,
         scope_call: None,
         value_hops: Vec::new(),
+        template: None,
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
     };
@@ -3567,7 +3631,9 @@ fn decide(
                 ));
         if !covered {
             walked.push(format!("{}:{}", site.file, site.line));
+            walk.template = template_frame(&chain, &values, end);
             walk.up(&chain, &top, end, &mut Vec::new());
+            walk.template = None;
         }
     }
     walk.drop_withdrawn();

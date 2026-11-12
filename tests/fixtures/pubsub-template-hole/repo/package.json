@@ -1,0 +1,8 @@
+{
+  "name": "pubsub-template-hole-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/ev": "^1.2.0"
+  }
+}

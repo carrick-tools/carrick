@@ -1,0 +1,63 @@
+{
+ "library_claims": [
+  {
+   "package": "@fixture/ev",
+   "version": "1.2.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "@fixture/ev",
+     "export": "Hub",
+     "role": "in_process_bus",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "send",
+       "member": "publish",
+       "of": "instance:new",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "name_scope": {
+        "scope": "global",
+        "namespace": null
+       },
+       "picker": "fixture-picker"
+      },
+      {
+       "op": "receive",
+       "member": "listen",
+       "of": "instance:new",
+       "name": {
+        "arg": 0
+       },
+       "name_scope": {
+        "scope": "global",
+        "namespace": null
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": [
+      "*"
+     ]
+    }
+   ]
+  }
+ ]
+}
