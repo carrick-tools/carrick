@@ -1,0 +1,18 @@
+query Parcel($id: ID!) {
+  parcel(id: $id) {
+    id
+    weightGrams
+    etaDays
+  }
+}
+
+query Depot($code: String!) {
+  depot(code: $code) {
+    code
+    ...DepotPlace
+  }
+}
+
+fragment DepotPlace on Depot {
+  city
+}
