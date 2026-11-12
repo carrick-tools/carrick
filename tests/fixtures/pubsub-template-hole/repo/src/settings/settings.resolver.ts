@@ -10,6 +10,13 @@ export class SettingsResolver {
   ) {}
 
   @Mutation()
+  async enableAll(@Arg("names") names: SettingName[]) {
+    return Promise.all(
+      names.map((each) => this.settings.toggleSetting(each, true)),
+    );
+  }
+
+  @Mutation()
   async toggleSetting(@Arg("name") name: SettingName, @Arg("on") on: boolean) {
     return this.settings.toggleSetting(name, on);
   }

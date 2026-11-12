@@ -18,6 +18,11 @@ export class BoardResolver {
   }
 
   @Mutation()
+  async moveBoardToRoot(@Arg("boardId") boardId: string) {
+    return this.boards.reorder(boardId, null);
+  }
+
+  @Mutation()
   async createBoard(@Arg("title") title: string) {
     return this.boards.create(title);
   }

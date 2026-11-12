@@ -55,8 +55,11 @@ struct Blob {
     publishers: BTreeSet<String>,
     /// The topic of every pub/sub row, either side.
     topics: BTreeSet<String>,
-    /// Each pub/sub producer possible call, as `file:line reason`.
-    producer_leads: BTreeSet<String>,
+    /// Each pub/sub producer possible call, as `file:line reason`, one
+    /// entry per call the blob lists (repeats kept, to count them).
+    producer_leads: Vec<String>,
+    /// Each pub/sub unread site, as `file:line reason`, repeats kept.
+    unread: Vec<String>,
 }
 
 fn scan() -> Blob {
@@ -122,7 +125,8 @@ fn scan() -> Blob {
     let mut found = Blob {
         publishers: BTreeSet::new(),
         topics: BTreeSet::new(),
-        producer_leads: BTreeSet::new(),
+        producer_leads: Vec::new(),
+        unread: Vec::new(),
     };
     for side in ["endpoints", "calls"] {
         for row in blob[side].as_array().into_iter().flatten() {
@@ -141,11 +145,21 @@ fn scan() -> Blob {
     }
     for lead in blob["possible_calls"].as_array().into_iter().flatten() {
         if lead["kind"] == "pubsub" && lead["role"] == "producer" {
-            found.producer_leads.insert(format!(
+            found.producer_leads.push(format!(
                 "{}:{} {}",
                 lead["file_path"].as_str().unwrap(),
                 lead["line_number"],
                 lead["unread"]["reason"].as_str().unwrap()
+            ));
+        }
+    }
+    for site in blob["unread_sites"].as_array().into_iter().flatten() {
+        if site["kind"] == "pubsub" {
+            found.unread.push(format!(
+                "{}:{} {}",
+                site["file"].as_str().unwrap(),
+                site["line"],
+                site["reason"].as_str().unwrap()
             ));
         }
     }
@@ -172,35 +186,89 @@ fn at(file: &str, topic: &str, reason: &str) -> String {
     format!("{file}:{} {reason}", call_line(file, topic))
 }
 
+/// The first line of the fixture file `file` that holds `text`.
+fn line_of(file: &str, text: &str) -> usize {
+    let source = std::fs::read_to_string(fixture_dir().join("repo").join(file)).unwrap();
+    source
+        .lines()
+        .position(|line| line.contains(text))
+        .unwrap_or_else(|| panic!("{text} in {file}"))
+        + 1
+}
+
+/// The entries of `listed` at `file`'s line `line`, whatever their reason.
+fn entries_at(listed: &[String], file: &str, line: usize) -> Vec<String> {
+    let prefix = format!("{file}:{line} ");
+    listed
+        .iter()
+        .filter(|entry| entry.starts_with(&prefix))
+        .cloned()
+        .collect()
+}
+
 /// The three template shapes (a resolver argument beside an enum member, one
 /// hole in two branches, a member of a decorated parameter beside a call
 /// result) are each saved at the template call with the reason their
-/// framework-invoked callers leave the hole open.
+/// framework-invoked callers leave the hole open, exactly once in both blob
+/// lists. The board templates have two resolver callers that stop for the
+/// same reason (one entry). The settings template has two callers that stop
+/// for different reasons: both blob lists keep one entry per call, the first
+/// stop the walk meets, and discovered sites are walked in source order
+/// (file, span), so it is the first caller's reason (`enableAll`, whose
+/// argument is a callback's parameter). Each caller keeps its own entry with
+/// its own reason.
 #[test]
-fn each_template_a_resolver_fills_is_saved_at_its_own_call() {
+fn each_template_a_resolver_fills_is_saved_once_at_its_own_call() {
     let blob = scan();
-    for (file, topic) in [
+    for (file, topic, reason) in [
         (
             "src/settings/settings.service.ts",
             "`setting/${name}/changed`",
+            "callback_parameter",
         ),
         (
             "src/boards/board.service.ts",
             "`board_root/${boardId}/reordered`",
+            "name_never_bound",
         ),
         (
             "src/boards/board.service.ts",
             "`board_child/${boardId}/reordered`",
+            "name_never_bound",
         ),
         (
             "src/members/members.service.ts",
             "`owner/${ownerId}/invited`",
+            "name_never_bound",
         ),
     ] {
-        let want = at(file, topic, "name_never_bound");
+        let want = vec![at(file, topic, reason)];
+        let line = call_line(file, topic);
+        assert_eq!(
+            entries_at(&blob.producer_leads, file, line),
+            want,
+            "possible calls: {:?}",
+            blob.producer_leads
+        );
+        assert_eq!(
+            entries_at(&blob.unread, file, line),
+            want,
+            "unread sites: {:?}",
+            blob.unread
+        );
+    }
+    let resolver = "src/settings/settings.resolver.ts";
+    for (text, reason) in [
+        ("this.settings.toggleSetting(each", "callback_parameter"),
+        (
+            "return this.settings.toggleSetting(name",
+            "name_never_bound",
+        ),
+    ] {
+        let want = format!("{resolver}:{} {reason}", line_of(resolver, text));
         assert!(
             blob.producer_leads.contains(&want),
-            "{want} not saved: {:?}",
+            "{want} lost: {:?}",
             blob.producer_leads
         );
     }
@@ -236,13 +304,23 @@ fn no_placeholder_topic_is_stated_and_the_controls_hold() {
         "{:?}",
         blob.producer_leads
     );
-    for frame in [
-        "src/settings/settings.resolver.ts:14 name_never_bound",
-        "src/boards/board.resolver.ts:17 name_never_bound",
-        "src/members/members.resolver.ts:15 name_never_bound",
+    for (file, text) in [
+        (
+            "src/boards/board.resolver.ts",
+            "return this.boards.reorder(boardId, parentId)",
+        ),
+        (
+            "src/boards/board.resolver.ts",
+            "return this.boards.reorder(boardId, null)",
+        ),
+        (
+            "src/members/members.resolver.ts",
+            "return this.members.inviteMember(",
+        ),
     ] {
+        let frame = format!("{file}:{} name_never_bound", line_of(file, text));
         assert!(
-            blob.producer_leads.contains(frame),
+            blob.producer_leads.contains(&frame),
             "{frame} lost: {:?}",
             blob.producer_leads
         );
