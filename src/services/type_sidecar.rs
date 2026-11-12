@@ -973,6 +973,7 @@ pub enum LibraryRole {
 /// Amendment 7 of carrick#2434 adds `at` (a member path walked from the value
 /// there, `[]` stepping into an array element), `each` (a rest slot, every
 /// element read), and, on a slot that holds a name, `document` and `ref`.
+/// QW-1 adds `or_file` on a `handler` slot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimSlot {
     pub arg: u32,
@@ -982,6 +983,10 @@ pub struct ClaimSlot {
     pub at: Option<Box<[String]>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub each: bool,
+    /// On a `handler` slot only (QW-1): the function that runs, or the path
+    /// of a file that exports it. The sidecar refuses it on any other slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub or_file: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document: Option<ClaimDocument>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
@@ -5705,6 +5710,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// QW-1: a stored `handler { arg, or_file: true }` reaches the sidecar
+    /// with its flag, and a slot without it is written as before.
+    #[test]
+    fn claim_slot_carries_or_file_and_omits_it_when_false() {
+        let flagged: ClaimSlot = serde_json::from_str(r#"{"arg":1,"or_file":true}"#).unwrap();
+        assert!(flagged.or_file);
+        assert_eq!(
+            serde_json::to_string(&flagged).unwrap(),
+            r#"{"arg":1,"or_file":true}"#
+        );
+        let plain: ClaimSlot = serde_json::from_str(r#"{"arg":1,"key":"k"}"#).unwrap();
+        assert!(!plain.or_file);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"arg":1,"key":"k"}"#
+        );
+    }
 
     /// carrick#2100: the key the sidecar sets when the unwidened reading ran
     /// out of time. `infer-unwidened-response.test.ts` pins the same key on

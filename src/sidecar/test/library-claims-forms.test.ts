@@ -283,9 +283,9 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
 
     it('known gap: a name-only receive whose processor accepts a string stays ambiguous', () => {
       // The unassigned processor (`string | URL | null | fn`) competes with the
-      // name and a positional cannot be labelled. Admitting it needs a
-      // name-rule exception in the judge (nameSiblings), parked with its own
-      // ruling (carrick-cloud#3139). Flip this when that change lands.
+      // name and a positional cannot be labelled. The claim states the
+      // processor as `handler: { arg: 1, or_file: true }` instead
+      // (library-claims-or-file.test.ts); the name-only form stays ambiguous.
       assert.strictEqual(verdict(newReceive('Worker', { name: { arg: 0 } })), 'failed name_ambiguous');
     });
 
@@ -303,11 +303,13 @@ describe('verify_library_claims: forms and returns (carrick#3047)', () => {
       assert.strictEqual(verdict(define), 'failed handler_not_function');
     });
 
-    it('lists the processor as no function and with no keys (the lister is unchanged)', () => {
+    it('lists the processor as no function, a function or file, and with no keys', () => {
       const listed = verifier.listSurface(root, ['fixture-jobs'], 1_000_000);
       const worker = listed.surfaces[0].exports.find(e => e.export === 'Worker')!;
       const construct = worker.receivers.find(r => r.receiver === 'export')!.construct![0];
       assert.strictEqual(construct.params[1].function, false);
+      // QW-1: a claim here carries `or_file` (library-claims-or-file.test.ts).
+      assert.strictEqual(construct.params[1].function_or_file, true);
       assert.strictEqual(construct.params[1].keys, undefined);
     });
   });

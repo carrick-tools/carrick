@@ -959,7 +959,7 @@ export class LibraryClaimsVerifier {
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
-        if (placementInvalid(check.claim) || handleMisplaced(check.claim)) return { outcome: unchecked('claim_invalid') };
+        if (placementInvalid(check.claim) || handleMisplaced(check.claim) || orFileMisplaced(check.claim)) return { outcome: unchecked('claim_invalid') };
         if (check.claim.kind === 'op' && check.claim.protocol !== undefined) {
           if (!PROTOCOLS.has(check.claim.protocol)) return { outcome: unchecked('claim_invalid') };
           if (!ROLE_PROTOCOLS[check.role].has(check.claim.protocol)) return { outcome: unchecked('protocol_role') };
@@ -1594,23 +1594,39 @@ function placementInvalid(claim: LibraryClaim): boolean {
   return of === undefined || (of.maker === undefined && of.scope === undefined && of.type === undefined);
 }
 
+/** The slots a claim's name sits at: one slot, or each of its parts. */
+function nameSlots(claim: LibraryClaim): (ClaimSlot | undefined)[] {
+  const name = (claim as { name?: unknown }).name;
+  if (typeof name !== 'object' || name === null) return [];
+  if ('parts' in name) return [...(name as { parts: ClaimSlot[] }).parts];
+  return 'arg' in name ? [name as ClaimSlot] : [];
+}
+
 /**
  * `handle: true` sits only on a scope's `mounts` (K1a); on any other slot
  * the claim is `claim_invalid`. `handle: false` is no flag.
  */
 function handleMisplaced(claim: LibraryClaim): boolean {
-  const slots: (ClaimSlot | undefined)[] = [];
-  const name = (claim as { name?: unknown }).name;
-  if (typeof name === 'object' && name !== null) {
-    if ('parts' in name) slots.push(...(name as { parts: ClaimSlot[] }).parts);
-    else if ('arg' in name) slots.push(name as ClaimSlot);
-  }
+  const slots = nameSlots(claim);
   if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.handler, claim.runs);
   if (claim.kind === 'scope') slots.push(claim.runs, claim.merges);
   if (claim.kind === 'op') {
     slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.method_key, claim.base);
   }
   return slots.some(slot => slot?.handle === true);
+}
+
+/**
+ * `or_file: true` sits only on a make's or an op's `handler` (QW-1); on any
+ * other slot, a name or a name's parts included, the claim is
+ * `claim_invalid`. `or_file: false` is no flag.
+ */
+function orFileMisplaced(claim: LibraryClaim): boolean {
+  const slots = nameSlots(claim);
+  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.runs);
+  if (claim.kind === 'scope') slots.push(claim.runs, claim.merges, claim.mounts);
+  if (claim.kind === 'op') slots.push(claim.payload, claim.ack, claim.options, claim.method_key, claim.base);
+  return slots.some(slot => slot?.or_file === true);
 }
 
 /**
@@ -1853,6 +1869,13 @@ interface ClaimLayout {
   positional: Map<number, PartName>;
   /** Keyed parts by argument, then by key. */
   keyed: Map<number, Map<string, PartName>>;
+  /** Where a `handler` slot carries `or_file` (`slotKey`). */
+  orFile?: ReadonlySet<string>;
+}
+
+/** One slot's place in a `ClaimLayout`: its argument, and its key when it has one. */
+function slotKey(arg: number, key?: string): string {
+  return key === undefined ? String(arg) : `${arg}.${key}`;
 }
 
 /**
@@ -3904,8 +3927,10 @@ class DeclarationReader {
   private layout(parts: Partial<Record<PartName, ClaimSlot | undefined>>): { value: ClaimLayout } | { failure: Outcome } {
     const positional = new Map<number, PartName>();
     const keyed = new Map<number, Map<string, PartName>>();
+    const orFile = new Set<string>();
     for (const [part, slot] of Object.entries(parts) as [PartName, ClaimSlot | undefined][]) {
       if (slot === undefined) continue;
+      if (part === 'handler' && slot.or_file === true) orFile.add(slotKey(slot.arg, slot.key));
       if (slot.key === undefined) {
         if (positional.has(slot.arg) || keyed.has(slot.arg)) return { failure: failed('slots_overlap') };
         positional.set(slot.arg, part);
@@ -3917,7 +3942,7 @@ class DeclarationReader {
       keys.set(slot.key, part);
       keyed.set(slot.arg, keys);
     }
-    return { value: { positional, keyed } };
+    return { value: orFile.size > 0 ? { positional, keyed, orFile } : { positional, keyed } };
   }
 
   /**
@@ -3981,14 +4006,19 @@ class DeclarationReader {
     for (const [arg, part] of layout.positional) {
       if (part !== 'handler' && part !== 'ack' && part !== 'runs') continue;
       const declared = this.keyParameterAt(signature, arg);
-      const failure = part === 'runs' ? runsFailure(declared) : this.handlerFailure(declared);
+      const failure =
+        part === 'runs'
+          ? runsFailure(declared)
+          : part === 'handler' && layout.orFile?.has(slotKey(arg))
+            ? this.functionOrFileFailure(declared)
+            : this.handlerFailure(declared);
       if (failure) return { rank: 3, outcome: failure };
     }
     const views = new Map<number, ts.Type>();
     for (const [arg, keys] of layout.keyed) {
       const slot = this.keyParameterAt(signature, arg);
       if (slot === undefined) return { rank: 1, outcome: failed('param_missing') };
-      const view = this.viewFor(slot, keys, runsFailure);
+      const view = this.viewFor(slot, keys, runsFailure, key => layout.orFile?.has(slotKey(arg, key)) === true);
       if ('rank' in view) return view;
       views.set(arg, view.view);
     }
@@ -4002,7 +4032,12 @@ class DeclarationReader {
    * union member that is an object type and not a function type, declaring
    * every claimed key with the type its part needs.
    */
-  private viewFor(slot: Slot, keys: ReadonlyMap<string, PartName>, runsFailure: RunsPredicate): { view: ts.Type } | RankedFailure {
+  private viewFor(
+    slot: Slot,
+    keys: ReadonlyMap<string, PartName>,
+    runsFailure: RunsPredicate,
+    orFile: (key: string) => boolean = () => false
+  ): { view: ts.Type } | RankedFailure {
     if (slot === VARIADIC || !this.isObjectType(slot)) {
       return { rank: 1, outcome: this.slotFailure(slot, 'param_missing') };
     }
@@ -4046,7 +4081,7 @@ class DeclarationReader {
           }
         }
         if (part === 'handler' || part === 'ack') {
-          const bad = this.handlerFailure(type);
+          const bad = part === 'handler' && orFile(key) ? this.functionOrFileFailure(type) : this.handlerFailure(type);
           if (bad) {
             failure = { rank: 3, outcome: bad };
             break;
@@ -4307,6 +4342,51 @@ class DeclarationReader {
       if (signatures.every(signature => this.isUntypedSignature(signature))) return unchecked('handler_untyped');
     }
     return undefined;
+  }
+
+  /**
+   * A `handler` slot flagged `or_file` (QW-1): the function that runs, or the
+   * path of a file that exports it. The slot is read as `handlerFailure`
+   * reads it; its file parts (`isFilePart`) are dropped and every other part
+   * besides null and undefined is judged by the handler rule. At least one
+   * part must remain: a slot of only paths runs no handler of its own.
+   */
+  private functionOrFileFailure(declared: Slot | undefined): Outcome | undefined {
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('handler_untyped');
+    const rest = this.parts(slot).filter(part => !this.isFilePart(part));
+    if (rest.length === 0) return failed('handler_not_function');
+    for (const part of rest) {
+      const failure = this.handlerFailure(part);
+      if (failure) return failure;
+    }
+    return undefined;
+  }
+
+  /**
+   * The lister's mark for an `or_file` slot: not a handler as it stands, but
+   * one once its file parts are dropped. An `opts | fn` union is not: an
+   * options object is no file part.
+   */
+  private isFunctionOrFile(slot: Slot | undefined): boolean {
+    return this.handlerFailure(slot) !== undefined && this.functionOrFileFailure(slot) === undefined;
+  }
+
+  /**
+   * A part that names a file rather than being the function: string-like, or
+   * the platform `URL` (declared in a default library file or in the
+   * runtime's own `url` types), never a package's own class of that name.
+   */
+  private isFilePart(part: ts.Type): boolean {
+    if (isStringLike(part)) return true;
+    const symbol = part.getSymbol();
+    if (symbol === undefined || symbol.getName() !== 'URL') return false;
+    return (symbol.getDeclarations() ?? []).some(declaration => {
+      const file = declaration.getSourceFile();
+      if (this.program.isSourceFileDefaultLibrary(file)) return true;
+      return this.packageOf(file) === '@types/node' && path.basename(file.fileName) === 'url.d.ts';
+    });
   }
 
   /**
@@ -5749,6 +5829,7 @@ class DeclarationReader {
           accepts_string: slot !== undefined && this.acceptsString(this.throughConditional(slot)),
           function: this.handlerFailure(slot) === undefined,
         };
+        if (this.isFunctionOrFile(slot)) param.function_or_file = true;
         if (slot !== undefined && slot !== VARIADIC && this.isObjectType(slot) && this.handlerFailure(slot) !== undefined) {
           const keys = this.listKeys(slot, take);
           if (keys.length > 0) param.keys = keys;

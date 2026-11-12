@@ -498,6 +498,8 @@ const ClaimSlotSchema = z
     each: z.boolean().optional(),
     // K1a: on a scope's `mounts` only (else `claim_invalid`, judged by the verifier).
     handle: z.boolean().optional(),
+    // QW-1: on a `handler` slot only (else `claim_invalid`, judged by the verifier).
+    or_file: z.boolean().optional(),
   })
   .strict();
 
