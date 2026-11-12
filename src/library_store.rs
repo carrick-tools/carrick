@@ -178,6 +178,9 @@ pub struct Asked {
     /// The real packages asked on an alias's account: their exports are kept
     /// only under a specifier in `aliases`.
     aliased: BTreeSet<String>,
+    /// The packages the service wanted to ask about and left out at the
+    /// [`MAX_PACKAGES`] cap, so no answer can hold them (carrick#3992).
+    capped: BTreeSet<String>,
 }
 
 impl Asked {
@@ -207,6 +210,7 @@ impl Asked {
             spellings: BTreeMap::new(),
             aliases: BTreeMap::new(),
             aliased: BTreeSet::new(),
+            capped: BTreeSet::new(),
         }
     }
 
@@ -228,6 +232,7 @@ impl Asked {
             spellings: BTreeMap::new(),
             aliases: BTreeMap::new(),
             aliased: BTreeSet::new(),
+            capped: BTreeSet::new(),
         });
         let room = MAX_PACKAGES.saturating_sub(asked.request.packages.len());
         asked
@@ -277,9 +282,13 @@ impl Asked {
                     None if asked.request.packages.len() < MAX_PACKAGES => {
                         asked.request.packages.push(package);
                     }
-                    None => dropped += 1,
+                    None => {
+                        dropped += 1;
+                        asked.capped.insert(package.package);
+                    }
                 }
             }
+            asked.capped.extend(other.capped);
             for (module, spellings) in other.spellings {
                 asked.spellings.entry(module).or_default().extend(spellings);
             }
@@ -315,6 +324,26 @@ impl Asked {
             roles: self.request.roles.clone(),
             packages: kept,
         })
+    }
+
+    /// The packages this scan ends without a store answer for, beyond those
+    /// the answer names as pending or failed (carrick#3992): the asked
+    /// packages `answer` holds no entry for, and those left out at the cap.
+    /// An entry of any status is an answer: a package skipped for a stated
+    /// reason keeps that reading.
+    fn without_entry(&self, answer: &LibraryAnswer) -> BTreeSet<String> {
+        let asked = every_asked(self);
+        let capped: Vec<String> = self
+            .capped
+            .iter()
+            .filter(|package| !asked.contains(*package))
+            .cloned()
+            .collect();
+        asked
+            .into_iter()
+            .filter(|package| !answer.named.contains(package))
+            .chain(capped)
+            .collect()
     }
 
     /// The exports of `answered` the service can use: those of a package at
@@ -427,6 +456,7 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
             .1
             .insert(wire);
     }
+    let capped: BTreeSet<String> = by_package.keys().skip(MAX_PACKAGES).cloned().collect();
     let packages: Vec<RegistryPackage> = by_package
         .into_iter()
         .take(MAX_PACKAGES)
@@ -445,6 +475,7 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
         spellings,
         aliases,
         aliased,
+        capped,
     })
 }
 
@@ -1459,6 +1490,8 @@ pub struct LibraryAnswer {
     pub exports: Vec<ExportClaims>,
     /// Every package the store answered, with or without an export.
     pub answered_packages: BTreeSet<String>,
+    /// Every package any entry of the answer names, whatever its status.
+    pub named: BTreeSet<String>,
     /// Every package the store answered, with the version it answered.
     pub answered_versions: BTreeSet<(String, String)>,
     /// The packages the store has not finished (`pending`).
@@ -1499,6 +1532,9 @@ pub fn parse_answer(text: &str) -> LibraryAnswer {
     for entry in entries {
         let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
         let package = entry.get("package").and_then(Value::as_str);
+        if let Some(package) = package {
+            answer.named.insert(package.to_string());
+        }
         match status {
             "answered" => {
                 answer.answered += 1;
@@ -1811,8 +1847,10 @@ pub struct Settled {
     /// The packages the store answered `skipped` with `build_failed`.
     pub build_failed: BTreeSet<String>,
     /// The packages the scan ends without, decided once here: `pending` and
-    /// `build_failed`, or every package asked when the first ask failed.
-    /// The same definition as [`FirstAnswer::unanswered`], read at scan end.
+    /// `build_failed`, the packages asked that the answer holds no entry for,
+    /// and those left out at the cap (carrick#3992), or every package asked
+    /// when the first ask failed. A package skipped for a stated reason other
+    /// than `build_failed` keeps that reading.
     pub unanswered: BTreeSet<String>,
     /// The last reason the store gave each package in `pending`, for the run
     /// log only.
@@ -1916,7 +1954,7 @@ where
                 });
             }
             return Settled {
-                unanswered: every_asked(asked),
+                unanswered: every_asked(asked).union(&asked.capped).cloned().collect(),
                 asked: true,
                 failure: Some(failed),
                 ..Settled::default()
@@ -1931,6 +1969,7 @@ where
             ask_failed: false,
         });
     }
+    let without_entry = asked.without_entry(&first);
     let mut exports = first.exports;
     let mut pending: BTreeSet<String> =
         first.pending.difference(&first.building).cloned().collect();
@@ -1974,7 +2013,18 @@ where
         ?pending_by_reason,
         "library store: answered"
     );
-    let unanswered = pending.union(&build_failed).cloned().collect();
+    // Only what this scan asked: a store's answer may name more (an
+    // offline answer is the whole cassette), and a package the scan never
+    // asked about is no failure of its own (carrick#3992).
+    let every = every_asked(asked);
+    pending.retain(|package| every.contains(package));
+    build_failed.retain(|package| every.contains(package));
+    pending_reasons.retain(|package, _| pending.contains(package));
+    let unanswered = pending
+        .union(&build_failed)
+        .cloned()
+        .chain(without_entry)
+        .collect();
     Settled {
         exports: asked.claims(exports),
         pending,
