@@ -191,13 +191,12 @@ pub struct Item {
     pub kind: String,
     pub method: String,
     pub path: String,
-    /// The dispatch case this row is, as `Dispatch::key` spells it
-    /// (`body:action=get-type-reach`); with `method` and `path` the row's whole
-    /// identity. Absent on a plain route or call. A route with 26 cases states
-    /// 26 rows at one path, and without this a reader cannot tell them apart
-    /// (carrick#3956).
+    /// The dispatch case this row is, ready to append to `method path`:
+    /// ` {action=get-type-reach}` (`carrick_match::dispatch_label`). Absent on
+    /// a plain route or call. A route with 26 cases states 26 rows at one
+    /// path, and without this a reader cannot tell them apart (carrick#3956).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch: Option<String>,
+    pub dispatch_label: Option<String>,
     pub line: Option<u32>,
     pub col: Option<u32>,
     pub source: String,
@@ -1278,7 +1277,7 @@ mod tests {
                 kind: "route".to_string(),
                 method: "GET".to_string(),
                 path: "/api/orders/:id".to_string(),
-                dispatch: None,
+                dispatch_label: None,
                 line: Some(12),
                 col: None,
                 source: "fact".to_string(),

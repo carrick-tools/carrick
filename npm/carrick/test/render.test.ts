@@ -970,7 +970,7 @@ function dispatchRows(cases: string[]): CheckResult {
       kind: "route",
       method: "POST",
       path: "/types/check-or-upload",
-      dispatch: `body:action=${value}`,
+      dispatch_label: ` {action=${value}}`,
       line: 1,
       col: 1,
       source: "fact",

@@ -255,18 +255,6 @@ function verdictText(item: CheckItem): string {
   return detail ? ` ${head}: ${detail}` : ` ${head}`;
 }
 
-/**
- * The case a row states, spelled as the MCP listings spell it
- * (`dispatchSuffix` in carrick-cloud `mcp-server/src/utils/dispatch.ts`):
- * ` {action=start-scan}`. The scanner's key is `<location>:<field>=<value>`;
- * the location is dropped, as the listings drop it. Empty for a plain row.
- */
-export function dispatchSuffix(key: string | undefined): string {
-  if (!key) return "";
-  const at = key.indexOf(":");
-  return ` {${at >= 0 ? key.slice(at + 1) : key}}`;
-}
-
 /** One line for one route or call: where it is, what it is, what is known about it. */
 export function itemLine(
   item: CheckItem,
@@ -274,7 +262,7 @@ export function itemLine(
   options: { locatorsOnly?: boolean } = {},
 ): string {
   const where = `${file ?? "this file"}:${item.line ?? 1}:${item.col ?? 1}`;
-  const operation = [item.method, item.path].filter(Boolean).join(" ") + dispatchSuffix(item.dispatch);
+  const operation = [item.method, item.path].filter(Boolean).join(" ") + (item.dispatch_label ?? "");
   const counterparts = item.counterparts ?? [];
   // Locators only (carrick#2069): where the row is, what it is, and who is on
   // the other side. The Read hook has no edit to judge, so no verdict words.
