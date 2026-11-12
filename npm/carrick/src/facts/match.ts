@@ -110,28 +110,17 @@ function lexAll(text: string, jsx: boolean): Token[] {
       if (ch === "`") return { end: k + 1, plain };
       if (ch === "$" && text[k + 1] === "{") {
         plain = false;
-        k += 2;
-        let depth = 1;
-        while (k < n && depth > 0) {
-          const c = text[k]!;
-          if (c === "\n") line += 1;
-          if (c === "'" || c === '"') {
-            const close = skipString(k);
-            if (close === null) return null;
-            k = close;
-            continue;
-          }
-          if (c === "`") {
-            const inner = skipTemplate(k);
-            if (inner === null) return null;
-            k = inner.end;
-            continue;
-          }
-          if (c === "{") depth += 1;
-          else if (c === "}") depth -= 1;
-          k += 1;
-        }
-        if (depth > 0) return null;
+        // The substitution is code: read it with the main lexer so a `/` in
+        // operand position starts a regex here exactly as at top level. A
+        // `{` token stands in as the previous token (operand position) and
+        // the tokens it reads are dropped.
+        const mark = tokens.length;
+        tokens.push({ kind: "punc", value: "{", start: k, end: k + 2, line });
+        i = k + 2;
+        lex(true);
+        tokens.length = mark;
+        if (text[i] !== "}") return null;
+        k = i + 1;
         continue;
       }
       k += 1;
