@@ -586,6 +586,81 @@ pub fn pair_counts(
     )
 }
 
+/// One pair as the stored verdicts name it: producer service and operation,
+/// consumer service and operation (the four canonical fields of a match).
+pub type PairKey = (String, String, String, String);
+
+/// What main stored for each pair, from the `compat_verdicts` of main's copy
+/// of this repo and of its peers (the consumer's blob holds the row). A pair
+/// reads as the worse of the directions it states, each counted as
+/// [`pair_counts`] counts a verdict; a row that states neither direction says
+/// nothing and is left out.
+pub fn main_pair_verdicts(blobs: &[&[CloudRepoData]]) -> BTreeMap<PairKey, TypeVerdict> {
+    let mut stored = BTreeMap::new();
+    for row in blobs
+        .iter()
+        .flat_map(|blob| blob.iter())
+        .flat_map(|repo| repo.compat_verdicts.iter().flatten())
+    {
+        let stated = |direction: &Option<DirectionVerdict>| {
+            direction
+                .as_ref()
+                .map(|direction| counted_as(direction.verdict, direction.resolved))
+        };
+        let verdict = match (stated(&row.request), stated(&row.response)) {
+            (Some(request), Some(response)) => request.combine(response),
+            (one, other) => match one.or(other) {
+                Some(verdict) => verdict,
+                None => continue,
+            },
+        };
+        stored.insert(
+            (
+                row.producer_repo.clone(),
+                row.producer_key.clone(),
+                row.consumer_repo.clone(),
+                row.consumer_key.clone(),
+            ),
+            verdict,
+        );
+    }
+    stored
+}
+
+/// Count this run's pairs (as [`pair_counts`] selects them) whose verdict main
+/// stored as compatible or incompatible and that this run reads
+/// `unverifiable` or leaves `not_compared`. These are comparisons main made
+/// and this run did not: a reader that says "nothing to flag" over them
+/// states more than the run knows.
+pub fn pairs_left_uncompared(
+    matches: &[CrossRepoMatch],
+    ours: &BTreeSet<String>,
+    main: &BTreeMap<PairKey, TypeVerdict>,
+    resolved: impl Fn(&CrossRepoMatch) -> bool,
+) -> usize {
+    matches
+        .iter()
+        .filter(|pair| pair.relationship == carrick_match::MatchRelationship::ProducerConsumer)
+        .filter(|pair| ours.contains(&pair.producer_repo) || ours.contains(&pair.consumer_repo))
+        .filter(|pair| {
+            let key = (
+                pair.producer_repo.clone(),
+                pair.producer_key.clone(),
+                pair.consumer_repo.clone(),
+                pair.consumer_key.clone(),
+            );
+            let compared_on_main = matches!(
+                main.get(&key),
+                Some(TypeVerdict::Compatible | TypeVerdict::Incompatible)
+            );
+            let now = pair
+                .type_verdict
+                .map(|verdict| counted_as(verdict, resolved(pair)));
+            compared_on_main && matches!(now, None | Some(TypeVerdict::Unverifiable))
+        })
+        .count()
+}
+
 /// Count the SDK-mediated edges with a consumer or a producer in one of this
 /// repo's services, by type verdict (carrick#2284). `None` when there is none.
 ///
@@ -2867,6 +2942,78 @@ mod evidence_tests {
         assert_eq!(
             pair_counts(&matches, &BTreeSet::new(), |_| true),
             PairCounts::default()
+        );
+    }
+
+    /// Main's stored copy of a consumer service, with one pair row per entry
+    /// of `rows` as `(path, verdict, resolved)` for the response direction.
+    fn stored_consumer(consumer: &str, rows: &[(&str, &str, bool)]) -> CloudRepoData {
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(path, verdict, resolved)| {
+                serde_json::json!({
+                    "producer_repo": "api",
+                    "producer_key": format!("http|GET|{path}"),
+                    "consumer_repo": consumer,
+                    "consumer_key": format!("http|GET|{path}"),
+                    "response": { "verdict": verdict, "resolved": resolved },
+                    "scanner_version": env!("CARGO_PKG_VERSION"),
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "repo_name": consumer, "service_name": consumer,
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-09-25T14:23:32Z", "commit_hash": "aaaa1111",
+            "scanner_version": env!("CARGO_PKG_VERSION"),
+            "compat_verdicts": rows,
+        }))
+        .expect("a stored blob deserializes")
+    }
+
+    /// A pair main compared that the PR made unverifiable (or left
+    /// uncompared) is counted; the pairs main did not compare, and the pairs
+    /// this run still compares, are not.
+    #[test]
+    fn a_pair_main_compared_and_this_run_could_not_is_counted() {
+        let main = main_pair_verdicts(&[&[stored_consumer(
+            "web",
+            &[
+                ("/orders", "compatible", true),
+                ("/carts", "incompatible", true),
+                ("/rates", "unverifiable", true),
+                ("/stale", "compatible", false),
+                ("/kept", "compatible", true),
+            ],
+        )]]);
+        let matches = vec![
+            // Compared on main, unverifiable now.
+            pair("api", "web", "/orders", Some(TypeVerdict::Unverifiable)),
+            // Compared on main, never reached now.
+            pair("api", "web", "/carts", None),
+            // Main did not compare it: not counted whatever this run reads.
+            pair("api", "web", "/rates", Some(TypeVerdict::Unverifiable)),
+            // Main's compatible was over unknown types: nothing was compared.
+            pair("api", "web", "/stale", None),
+            // Still compared.
+            pair("api", "web", "/kept", Some(TypeVerdict::Compatible)),
+            // Main stored nothing for it.
+            pair("api", "web", "/new", None),
+            // Neither side in this repo.
+            pair("billing", "ledger", "/orders", None),
+        ];
+        assert_eq!(pairs_left_uncompared(&matches, &ours(), &main, |_| true), 2);
+        // A compatible verdict over types the run could not read is
+        // unverifiable, so it counts too.
+        let matches = vec![pair("api", "web", "/kept", Some(TypeVerdict::Compatible))];
+        assert_eq!(
+            pairs_left_uncompared(&matches, &ours(), &main, |_| false),
+            1
+        );
+        assert_eq!(
+            pairs_left_uncompared(&matches, &ours(), &BTreeMap::new(), |_| false),
+            0
         );
     }
 
