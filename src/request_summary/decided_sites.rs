@@ -3405,9 +3405,9 @@ impl<'a> Follow<'a> for Holds {
         None
     }
 
-    fn definition(&mut self, _: PathBuf, _: String, _: Invoke<'a>) -> () {}
+    fn definition(&mut self, _: PathBuf, _: String, _: Invoke<'a>) {}
 
-    fn written(&mut self, _: &'a Path, _: &'a FnIr, _: Invoke<'a>, _: Option<Maker<'a>>) -> () {}
+    fn written(&mut self, _: &'a Path, _: &'a FnIr, _: Invoke<'a>, _: Option<Maker<'a>>) {}
 }
 
 /// Each call below the first in `down`: its `file:line` and its callee as
