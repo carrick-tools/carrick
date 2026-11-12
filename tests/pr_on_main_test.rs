@@ -628,6 +628,7 @@ async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked
         payload["checked"],
         serde_json::json!({
             "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 2 },
+            "pairs_left_uncompared": 0,
             "dependencies": { "shared": 1, "changed": 1 },
         }),
         "{payload:#}"
