@@ -153,6 +153,21 @@ test("fn: a name declared twice in the edited file is silent", async (t) => {
   assert.equal(context((await patchEdit(ws, file, [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }])).stdout), "");
 });
 
+test("fn: two same-named functions in two files of one repo each get their own line in one session", async (t) => {
+  const OTHER_LINE = "loadOrder is called from web/src/admin.ts:7";
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "api/src/admin.ts": ORDERS }, [
+    fnRow("loadOrder", LOAD_LINE),
+    fnRow("loadOrder", OTHER_LINE, "src/admin.ts"),
+  ]);
+  const said: string[] = [];
+  for (const rel of ["api/src/orders.ts", "api/src/admin.ts"]) {
+    const file = ws.at(rel);
+    const at = lineOf(file, "const key");
+    said.push(context((await patchEdit(ws, file, [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }])).stdout));
+  }
+  assert.deepEqual(said, [LOAD_LINE, OTHER_LINE]);
+});
+
 const USES_LINE = /Other files use what this file declares/;
 
 test("fn: with a fact file the uses-count line is not printed, and no fallback is recorded", async (t) => {

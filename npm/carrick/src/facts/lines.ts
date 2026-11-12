@@ -337,7 +337,7 @@ export async function factLines(
           facts
             .callers(at.repo, name)
             .filter((fn) => fn.file === at.rel)
-            .map((fn) => ({ key: `fn::${fn.repo}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) })),
+            .map((fn) => ({ key: `fn::${fn.repo}::${fn.file}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) })),
         ),
       );
       isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file)));
