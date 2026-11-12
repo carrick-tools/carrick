@@ -22,7 +22,7 @@ import { createLogger } from "../log.ts";
 import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
-import { splitRemote } from "../init/repos.ts";
+import { splitRemote } from "../git-remote.ts";
 import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
