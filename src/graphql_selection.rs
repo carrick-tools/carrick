@@ -482,6 +482,14 @@ impl SchemaFile {
         self.composite.get(root)?.get(field).map(String::as_str)
     }
 
+    /// Whether this file declares `field` on the object or interface type
+    /// `on_type`.
+    pub fn declares(&self, on_type: &str, field: &str) -> bool {
+        self.composite
+            .get(on_type)
+            .is_some_and(|fields| fields.contains_key(field))
+    }
+
     /// The fields `selection`, selected under root field `field` of a `kind`
     /// operation, selects on a type this file does not declare them on. Empty
     /// when the file does not declare the root field: an operation the schema
