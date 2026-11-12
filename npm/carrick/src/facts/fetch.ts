@@ -13,18 +13,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
-import { fileURLToPath } from "node:url";
 import { API_BASE, readCredential } from "../auth/credentials.ts";
 import { createLogger } from "../log.ts";
-import { claimRefresh, cooldownMs, markerPath, startDetached } from "../hook/refresh.ts";
+import { hasMarker } from "../root.ts";
+import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
-import { buildFacts, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
+import { buildFacts, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
 
-/** A fact file older than this is refreshed by the next trigger. */
-export const FACTS_STALE_MS = 10 * 60_000;
 /** After `facts_building`, the next trigger may ask again this soon. */
 export const FACTS_BUILDING_RETRY_MS = 60_000;
 export const FACTS_MARKER = "last-facts-refresh";
@@ -150,12 +148,6 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
   }
 }
 
-/** The runner script beside this module (`.js` in the package, `.ts` from source). */
-function runnerCommand(root: string): { command: string; args: string[] } {
-  const here = fileURLToPath(import.meta.url);
-  return { command: process.execPath, args: [path.join(path.dirname(here), `refresh-run${path.extname(here)}`), root] };
-}
-
 /**
  * Start the refresh for `root` detached, at most once per `FACTS_STALE_MS`
  * across every hook and session. Returns whether it started. Never throws.
@@ -166,10 +158,12 @@ export function startFactsRefresh(
 ): boolean {
   const env = options.env ?? process.env;
   if (env["CARRICK_NO_FACTS_REFRESH"]) return false;
+  // A folder Carrick was never set up in gets nothing, not even a marker directory.
+  if (!hasMarker(root)) return false;
   try {
     const cooldown = cooldownMs(env, "CARRICK_FACTS_COOLDOWN_MS", FACTS_STALE_MS);
     if (!claimRefresh(markerPath(root, FACTS_MARKER), options.now ?? Date.now(), cooldown)) return false;
-    const { command, args } = runnerCommand(root);
+    const { command, args } = scriptBeside(import.meta.url, "refresh-run", root);
     (options.start ?? startDetached)(command, args, { ...env, CARRICK_NO_KEEP_AWAKE: "1" });
     return true;
   } catch (error) {

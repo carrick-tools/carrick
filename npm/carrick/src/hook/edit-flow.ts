@@ -36,11 +36,12 @@ export async function editFlow(
     channel: Channel;
     timing?: Timing;
     /**
-     * Absolute path -> the text the edit put in the file (an Edit's
-     * `new_string`). A file not named here was written whole (a Write, a
-     * patch, a shell write), and every named thing in it counts as touched.
+     * Absolute path -> where the edit changed the file: the lines of its
+     * patch, else the text it put in (an Edit's `new_string`). A file not
+     * named here was written whole (a Write, a patch, a shell write), and
+     * every named thing in it counts as touched.
      */
-    snippets?: ReadonlyMap<string, string[]>;
+    changes?: ReadonlyMap<string, { lines?: number[]; snippets?: string[] }>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked
@@ -167,7 +168,7 @@ export async function editFlow(
     choice.root,
     edited
       .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
-      .map((file) => ({ file, snippets: input.snippets?.get(file) ?? null })),
+      .map((file) => ({ file, ...input.changes?.get(file) })),
     session,
   );
   if (input.timing) input.timing.factsMs = facts.ms;

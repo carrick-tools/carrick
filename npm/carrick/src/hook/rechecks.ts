@@ -23,11 +23,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { binary, check, checkChanged } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
-import { startDetached } from "./refresh.ts";
+import { scriptBeside, startDetached } from "./refresh.ts";
 import { safeId, sessionsDir, writeAtomic } from "./reuse.ts";
 
 const log = createLogger("carrick-recheck");
@@ -382,15 +381,9 @@ export type EnsureOptions = {
   start?: (command: string, args: string[], env: NodeJS.ProcessEnv) => void;
 };
 
-/**
- * The command that runs `runQueue` for a workspace: the runner script beside
- * this module (`.js` in the package, `.ts` when a hook is run from source), so
- * it does not depend on which script started this process.
- */
+/** The command that runs `runQueue` for a workspace: the runner script beside this module. */
 function runnerCommand(root: string): { command: string; args: string[] } {
-  const here = fileURLToPath(import.meta.url);
-  const script = path.join(path.dirname(here), `recheck-run${path.extname(here)}`);
-  return { command: process.execPath, args: [script, root] };
+  return scriptBeside(import.meta.url, "recheck-run", root);
 }
 
 /**

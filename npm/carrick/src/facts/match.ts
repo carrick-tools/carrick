@@ -55,8 +55,25 @@ function isIdPart(ch: string): boolean {
   return /[A-Za-z0-9_$]/.test(ch) || ch.charCodeAt(0) > 127;
 }
 
-/** The tokens of `text`, or null when a string, template, comment or regex does not end. */
-export function tokenize(text: string): Token[] | null {
+/** After these a `<` in a `.tsx` or `.jsx` file opens an element. */
+const JSX_AFTER_PUNC = new Set(["(", ",", "=", ":", "?", "&&", "||", "??", "=>", "{", "[", ";", "!"]);
+const JSX_AFTER_WORD = new Set(["return", "yield", "await", "default"]);
+
+/**
+ * The tokens of `text`, or null when a string, template, comment, regex or
+ * (with `jsx`) element does not end. An element is one opaque token; the
+ * code in its `{...}` containers is tokenized after it.
+ */
+export function tokenize(text: string, jsx = false): Token[] | null {
+  try {
+    return lexAll(text, jsx);
+  } catch {
+    return null;
+  }
+}
+
+function lexAll(text: string, jsx: boolean): Token[] {
+  const BAIL = new Error("unreadable");
   const tokens: Token[] = [];
   let i = 0;
   let line = 1;
@@ -124,11 +141,106 @@ export function tokenize(text: string): Token[] | null {
     return null;
   };
 
+  // Whether a `<` at `i` opens an element: in expression position, before a tag name or `>`.
+  const jsxStarts = (): boolean => {
+    if (!jsx || !/[A-Za-z>]/.test(text[i + 1] ?? "")) return false;
+    const prev = prevSignificant();
+    return (
+      prev === undefined ||
+      (prev.kind === "punc" && JSX_AFTER_PUNC.has(prev.value)) ||
+      (prev.kind === "id" && JSX_AFTER_WORD.has(prev.value))
+    );
+  };
+
+  // A tag's inside, from after `<` to after its `>`; true when it closed itself (`/>`).
+  const jsxTag = (): boolean => {
+    while (i < n) {
+      const c = text[i]!;
+      if (c === "\n") {
+        line += 1;
+        i += 1;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        const close = skipString(i);
+        if (close === null) throw BAIL;
+        i = close;
+        continue;
+      }
+      if (c === "{") {
+        i += 1;
+        lex(true);
+        i += 1;
+        continue;
+      }
+      if (c === "/" && text[i + 1] === ">") {
+        i += 2;
+        return true;
+      }
+      if (c === ">") {
+        i += 1;
+        return false;
+      }
+      i += 1;
+    }
+    throw BAIL;
+  };
+
+  // One element from its `<` to after its closing tag.
+  const jsxElement = (): void => {
+    i += 1;
+    if (jsxTag()) return;
+    let depth = 1;
+    while (i < n) {
+      const c = text[i]!;
+      if (c === "\n") {
+        line += 1;
+        i += 1;
+        continue;
+      }
+      if (c === "{") {
+        i += 1;
+        lex(true);
+        i += 1;
+        continue;
+      }
+      if (c === "<") {
+        if (text[i + 1] === "/") {
+          const close = text.indexOf(">", i);
+          if (close < 0) throw BAIL;
+          i = close + 1;
+          depth -= 1;
+          if (depth === 0) return;
+          continue;
+        }
+        i += 1;
+        if (!jsxTag()) depth += 1;
+        continue;
+      }
+      i += 1;
+    }
+    throw BAIL;
+  };
+
+  // Tokens from `i` to the end, or (with `untilBrace`) to the `}` that closes
+  // the container it started in, leaving `i` on that `}`.
+  function lex(untilBrace: boolean): void {
+    let depth = 0;
   while (i < n) {
     const ch = text[i]!;
     if (ch === "\n") {
       line += 1;
       i += 1;
+      continue;
+    }
+    if (ch === "}" && untilBrace && depth === 0) return;
+    if (ch === "{") depth += 1;
+    else if (ch === "}") depth -= 1;
+    if (ch === "<" && jsxStarts()) {
+      const token: Token = { kind: "tpl", value: "", start: i, end: i, line };
+      tokens.push(token);
+      jsxElement();
+      token.end = i;
       continue;
     }
     if (ch === " " || ch === "\t" || ch === "\r" || ch === "\f" || ch === "\v" || ch === " " || ch === "﻿") {
@@ -141,7 +253,7 @@ export function tokenize(text: string): Token[] | null {
     }
     if (ch === "/" && text[i + 1] === "*") {
       const close = text.indexOf("*/", i + 2);
-      if (close < 0) return null;
+      if (close < 0) throw BAIL;
       for (let k = i; k < close; k += 1) if (text[k] === "\n") line += 1;
       i = close + 2;
       continue;
@@ -149,14 +261,14 @@ export function tokenize(text: string): Token[] | null {
     const startLine = line;
     if (ch === "'" || ch === '"') {
       const close = skipString(i);
-      if (close === null) return null;
+      if (close === null) throw BAIL;
       tokens.push({ kind: "str", value: unquote(text.slice(i + 1, close - 1)), start: i, end: close, line: startLine });
       i = close;
       continue;
     }
     if (ch === "`") {
       const done = skipTemplate(i);
-      if (done === null) return null;
+      if (done === null) throw BAIL;
       tokens.push({
         kind: done.plain ? "str" : "tpl",
         value: done.plain ? unquote(text.slice(i + 1, done.end - 1)) : "",
@@ -178,7 +290,7 @@ export function tokenize(text: string): Token[] | null {
         let inClass = false;
         while (k < n) {
           const c = text[k]!;
-          if (c === "\n") return null;
+          if (c === "\n") throw BAIL;
           if (c === "\\") {
             k += 2;
             continue;
@@ -188,7 +300,7 @@ export function tokenize(text: string): Token[] | null {
           else if (c === "/" && !inClass) break;
           k += 1;
         }
-        if (k >= n) return null;
+        if (k >= n) throw BAIL;
         k += 1;
         while (k < n && /[A-Za-z]/.test(text[k]!)) k += 1;
         tokens.push({ kind: "regex", value: "", start: i, end: k, line: startLine });
@@ -215,6 +327,10 @@ export function tokenize(text: string): Token[] | null {
     tokens.push({ kind: "punc", value, start: i, end: i + value.length, line: startLine });
     i += value.length;
   }
+    if (untilBrace) throw BAIL;
+  }
+
+  lex(false);
   return tokens;
 }
 
@@ -241,9 +357,9 @@ function matchBrackets(tokens: Token[]): Map<number, number> | null {
 
 type Ctx = { kind: "code" } | { kind: "class"; name: string } | { kind: "object"; path: string };
 
-/** Scan `text` for named spans and calls. */
-export function scanSource(text: string): Scan {
-  const tokens = tokenize(text);
+/** Scan `text` for named spans and calls; `jsx` for a `.tsx` or `.jsx` file. */
+export function scanSource(text: string, jsx = false): Scan {
+  const tokens = tokenize(text, jsx);
   const match = tokens ? matchBrackets(tokens) : null;
   if (!tokens || !match) return { ok: false, spans: [], calls: [] };
   const spans: NamedSpan[] = [];
@@ -588,16 +704,31 @@ export function scanSource(text: string): Scan {
 /** A changed region of the file, as character offsets (end exclusive). */
 export type Range = { start: number; end: number };
 
-/** Where `snippets` sit in `text` (every occurrence). Empty when none is found. */
+/**
+ * Where `snippets` sit in `text`. A snippet found nowhere, or in more than one
+ * place, gives no range: which copy the edit wrote is not known.
+ */
 export function rangesOf(text: string, snippets: readonly string[]): Range[] {
   const ranges: Range[] = [];
   for (const snippet of snippets) {
     if (snippet.trim().length === 0) continue;
-    let at = text.indexOf(snippet);
-    while (at >= 0) {
-      ranges.push({ start: at, end: at + snippet.length });
-      at = text.indexOf(snippet, at + snippet.length);
-    }
+    const at = text.indexOf(snippet);
+    if (at < 0 || text.indexOf(snippet, at + 1) >= 0) continue;
+    ranges.push({ start: at, end: at + snippet.length });
+  }
+  return ranges;
+}
+
+/** The ranges of the 1-based `lines` of `text`. */
+export function rangesOfLines(text: string, lines: readonly number[]): Range[] {
+  const starts = [0];
+  for (let at = text.indexOf("\n"); at >= 0; at = text.indexOf("\n", at + 1)) starts.push(at + 1);
+  const ranges: Range[] = [];
+  for (const line of new Set(lines)) {
+    const start = starts[line - 1];
+    if (start === undefined) continue;
+    const next = starts[line];
+    ranges.push({ start, end: next === undefined ? text.length : next - 1 });
   }
   return ranges;
 }

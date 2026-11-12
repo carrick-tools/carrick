@@ -46,6 +46,10 @@ type Payload = {
     /** Codex's `apply_patch`: the patch text itself. */
     command?: unknown;
   };
+  /** Claude Code's `Edit` and `MultiEdit` result: the hunks it applied. */
+  tool_response?: {
+    structuredPatch?: Array<{ newStart?: unknown; lines?: unknown }>;
+  };
 };
 
 /**
@@ -106,20 +110,37 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = edited[0]!;
-  await editFlow({ cwd, session, channel: channel.channel, timing, snippets: snippetsFromPayload(payload, edited) }, edited);
+  await editFlow({ cwd, session, channel: channel.channel, timing, changes: changesFromPayload(payload, edited) }, edited);
 }
 
 /**
- * The text an `Edit` or `MultiEdit` put in its one file, keyed by the
- * absolute path. A `Write` or a patch names no snippet: the file was written
- * whole.
+ * Where an `Edit` or `MultiEdit` changed its one file, keyed by the absolute
+ * path: the lines of the file as it is now that its hunks added, or where
+ * they removed lines; else the text it put in. A `Write` or a patch names
+ * neither: the file was written whole.
  */
-function snippetsFromPayload(payload: Payload, edited: string[]): Map<string, string[]> {
+function changesFromPayload(payload: Payload, edited: string[]): Map<string, { lines?: number[]; snippets?: string[] }> {
+  if (edited.length !== 1) return new Map();
+  const hunks = payload.tool_response?.structuredPatch;
+  if (Array.isArray(hunks) && hunks.length > 0) {
+    const lines: number[] = [];
+    for (const hunk of hunks) {
+      if (typeof hunk?.newStart !== "number" || !Array.isArray(hunk.lines)) return new Map();
+      let at = hunk.newStart;
+      for (const text of hunk.lines) {
+        if (typeof text !== "string" || text.startsWith("\\")) continue;
+        if (text.startsWith("+")) lines.push(at++);
+        else if (text.startsWith("-")) lines.push(at);
+        else at += 1;
+      }
+    }
+    return new Map([[edited[0]!, { lines }]]);
+  }
   const input = payload.tool_input ?? {};
   const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(
     (text): text is string => typeof text === "string",
   );
-  return edited.length === 1 && texts.length > 0 ? new Map([[edited[0]!, texts]]) : new Map();
+  return texts.length > 0 ? new Map([[edited[0]!, { snippets: texts }]]) : new Map();
 }
 
 await timed("post-edit", main);

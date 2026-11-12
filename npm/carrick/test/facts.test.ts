@@ -205,6 +205,83 @@ test("an inline handler is found by the operation string written at its site, an
   assert.deepEqual(await linesFor(ws, "orders-api/src/mounted.ts", "relay(payload);"), ["typing line"]);
 });
 
+test("text the edit put in that the file holds twice reaches nothing", async (t) => {
+  const ws = await factsWorkspace(t);
+  // `return;` is now in both handlers: the text cannot say which one the edit wrote.
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("res.status(204).end();", "res.status(204).end();\n  return;"));
+  assert.deepEqual(await linesFor(ws, "orders-api/src/routes/orders.ts", "  return;"), []);
+});
+
+test("an Edit's patch hunks place the change by line, deletions included", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const lineOf = (needle: string) => fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes(needle)) + 1;
+  const at = lineOf("res.status(204).end();");
+  const run = await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "patch",
+      cwd: ws.root,
+      // A deletion just above the line: the new text is empty, so only the hunk places it.
+      tool_input: { file_path: file, old_string: "  // gone\n", new_string: "" },
+      tool_response: { structuredPatch: [{ oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [" ctx", "-  // gone", " ctx"] }] },
+    },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+  });
+  assert.equal(context(run.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
+});
+
+test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
+  const ndjson = [
+    header(["web-app"]),
+    row({ side: "consumer", protocol: "http", label: "GET /orders/:id", repo: "web-app", file: "src/pages/order.tsx", line: 4, name: "OrderPage", text: "page line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("web-app/src/pages/order.tsx"),
+    [
+      "export function OrderPage({ id }: { id: string }) {",
+      "  const [order, setOrder] = useState<Order | null>(null);",
+      "  useEffect(() => {",
+      '    void api.get("/orders/" + id).then(setOrder);',
+      "  }, [id]);",
+      "  return (",
+      '    <div className="order">',
+      "      <h1>{order?.title}</h1>",
+      "      <p>Don't wait</p>",
+      "      <Item value={order} onPick={() => setOrder(null)} />",
+      "    </div>",
+      "  );",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  assert.deepEqual(await linesFor(ws, "web-app/src/pages/order.tsx", '    void api.get("/orders/" + id)'), ["page line"]);
+});
+
+test("the refresh starts once per cooldown, sooner after a building answer, and never outside a workspace", async (t) => {
+  const { startFactsRefresh, allowEarlyRetry, FACTS_BUILDING_RETRY_MS } = await import("../src/facts/fetch.ts");
+  const ws = await factsWorkspace(t, { ndjson: null });
+  const env = { ...process.env, CARRICK_NO_FACTS_REFRESH: "" };
+  const started: string[][] = [];
+  const start = (_command: string, args: string[]) => void started.push(args);
+  const now = Date.parse("2026-01-01T12:00:00Z");
+  assert.equal(startFactsRefresh(ws.root, { env, now, start }), true);
+  assert.match(started[0]![0]!, /refresh-run\.ts$/);
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + 30_000, start }), false, "inside the cooldown");
+  allowEarlyRetry(ws.root, env, now);
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS - 1_000, start }), false);
+  assert.equal(startFactsRefresh(ws.root, { env, now: now + FACTS_BUILDING_RETRY_MS + 1_000, start }), true);
+  // A folder Carrick was never set up in: nothing starts and no directory appears.
+  const bare = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-bare-")));
+  t.after(() => fs.rmSync(bare, { recursive: true, force: true }));
+  assert.equal(startFactsRefresh(bare, { env, now, start }), false);
+  assert.equal(fs.existsSync(path.join(bare, ".carrick")), false);
+  assert.equal(started.length, 2);
+});
+
 test("an edit inside a handler prints where it is called, once per session", async (t) => {
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");

@@ -20,9 +20,9 @@ import { performance } from "node:perf_hooks";
 import { createLogger } from "../log.ts";
 import { factsSaid } from "../hook/reuse.ts";
 import { linkedCheckoutTop } from "../hook/worktree.ts";
-import { rangesOf, scanSource, touched } from "./match.ts";
+import { rangesOf, rangesOfLines, scanSource, touched } from "./match.ts";
 import type { CallSpan, Scan } from "./match.ts";
-import { openFacts } from "./store.ts";
+import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
@@ -30,8 +30,15 @@ const log = createLogger("carrick-facts");
 /** At most this many fact lines for one action. */
 export const MAX_FACT_LINES = 3;
 
-/** One edited file and the text the edit put there (null: the whole file). */
-export type FactEdit = { file: string; snippets: string[] | null };
+/**
+ * One edited file and where the edit changed it: the 1-based lines of the
+ * file as it is now, else the text the edit put in; both null means the file
+ * was written whole.
+ */
+export type FactEdit = { file: string; lines?: number[] | null; snippets?: string[] | null };
+
+/** The files the declaration scanner reads. */
+const SCANNED = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 export type FactOutcome = {
   lines: string[];
@@ -39,12 +46,9 @@ export type FactOutcome = {
   claims: Record<string, { at: number; named: string[] }>;
   /** Time spent opening the fact file and matching. */
   ms: number;
-  /** The fact file is missing or older than `FACTS_STALE_MS`: start a background refresh. */
+  /** The fact file is missing, unreadable or older than `FACTS_STALE_MS`: start a background refresh. */
   stale: boolean;
 };
-
-/** A fact file fetched longer ago than this is refreshed (the trigger lives in `fetch.ts`). */
-const FACTS_STALE_MS = 10 * 60_000;
 
 /** The main checkout a linked worktree belongs to, from its `.git` file. */
 function mainCheckoutOf(worktreeTop: string): string | null {
@@ -63,6 +67,10 @@ function mainCheckoutOf(worktreeTop: string): string | null {
   } catch {
     return null;
   }
+}
+
+function isJsx(file: string): boolean {
+  return /\.(tsx|jsx)$/.test(file);
 }
 
 function real(dir: string): string {
@@ -137,7 +145,7 @@ function namedRows(store: FactStore, repo: string, name: string, rel: string, to
   // that file still declares the name, in which case it is another thing.
   const other = path.join(top, rows[0]!.file);
   try {
-    if (scanSource(fs.readFileSync(other, "utf8")).spans.some((span) => span.name === name)) return [];
+    if (scanSource(fs.readFileSync(other, "utf8"), isJsx(other)).spans.some((span) => span.name === name)) return [];
   } catch {
     // The file is gone: the thing moved here.
   }
@@ -171,6 +179,7 @@ export async function factLines(
     const where = new Map(store.repos.map((entry) => [entry.repo, entry.path]));
     for (const edit of edits) {
       if (lines.length >= MAX_FACT_LINES) break;
+      if (!SCANNED.test(edit.file)) continue;
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       let text: string;
@@ -179,12 +188,16 @@ export async function factLines(
       } catch {
         continue;
       }
-      const scan: Scan = scanSource(text);
+      const scan: Scan = scanSource(text, isJsx(edit.file));
       if (!scan.ok) {
         log(`${at.rel} did not read cleanly; no fact lines for it`);
         continue;
       }
-      const ranges = edit.snippets === null ? [{ start: 0, end: text.length }] : rangesOf(text, edit.snippets);
+      const ranges = edit.lines
+        ? rangesOfLines(text, edit.lines)
+        : edit.snippets
+          ? rangesOf(text, edit.snippets)
+          : [{ start: 0, end: text.length }];
       if (ranges.length === 0) continue;
       const reach = touched(text, scan, ranges);
       const rows: FactRow[] = [];

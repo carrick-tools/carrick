@@ -22,6 +22,9 @@ const log = createLogger("carrick-facts");
 /** The fact-file schema this package reads. */
 export const SCHEMA = 1;
 
+/** A fact file fetched longer ago than this is refreshed by the next trigger. */
+export const FACTS_STALE_MS = 10 * 60_000;
+
 /** One row of the fact file (`k: "op"`), as the wire states it. */
 export type FactRow = {
   side: "producer" | "consumer";
