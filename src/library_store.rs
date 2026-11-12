@@ -4286,6 +4286,69 @@ mod tests {
         );
     }
 
+    /// carrick#3992 T0: the settled answer counts only the failures of the
+    /// packages this scan asked about. An offline answer is the whole
+    /// cassette, which names packages no service asked for.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_of_a_package_not_asked_is_not_this_scans() {
+        let asked = Asked::naming(&["lib"]);
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"answered","exports":[]},
+            {"package":"unasked","version":"1.0.0","status":"skipped","reason":"build_failed"},
+            {"package":"unasked-too","version":"1.0.0","status":"pending","reason":"lister_unavailable"}]}"#;
+        let settled = FakeStore::new(vec![body.to_string()]).run(&asked).await;
+        assert!(
+            settled.build_failed.is_empty(),
+            "{:?}",
+            settled.build_failed
+        );
+        assert!(settled.pending.is_empty(), "{:?}", settled.pending);
+        assert!(settled.pending_reasons.is_empty());
+        assert!(settled.unanswered.is_empty(), "{:?}", settled.unanswered);
+    }
+
+    /// carrick#3992 T2a: a package asked about whose answer holds no entry is
+    /// unanswered, as one pending or failed is. One the answer holds an entry
+    /// for, answered with nothing or skipped for a stated reason, is not.
+    #[tokio::test(start_paused = true)]
+    async fn an_asked_package_the_answer_holds_no_entry_for_is_unanswered() {
+        let asked = Asked::naming(&["lib", "absent", "typeless", "empty"]);
+        let body = r#"{"library_claims":[
+            {"package":"lib","version":"1.0.0","status":"answered","exports":[]},
+            {"package":"empty","version":"1.0.0","status":"answered","exports":[]},
+            {"package":"typeless","version":"1.0.0","status":"skipped","reason":"no_types"},
+            {"package":"unasked","version":"1.0.0","status":"answered","exports":[]}]}"#;
+        let settled = FakeStore::new(vec![body.to_string()]).run(&asked).await;
+        assert_eq!(settled.unanswered, specifiers(&["absent"]));
+        assert!(settled.pending.is_empty() && settled.build_failed.is_empty());
+        let read = FakeStore::new(vec![body.to_string()]).read(&asked).await;
+        assert_eq!(read.unanswered, specifiers(&["absent"]));
+    }
+
+    /// carrick#3992 T2a: a package left out at the 200-package cap is
+    /// unanswered too: no answer can hold it.
+    #[tokio::test(start_paused = true)]
+    async fn a_package_left_out_at_the_cap_is_unanswered() {
+        let names: Vec<String> = (0..MAX_PACKAGES).map(|i| format!("p{i:03}")).collect();
+        let full = Asked::naming(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let (asked, dropped) = Asked::merged(Some(full), [Asked::naming(&["extra"])]);
+        assert_eq!(dropped, 1);
+        let entries: Vec<String> = names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"package":"{name}","version":"1.0.0","status":"answered","exports":[]}}"#
+                )
+            })
+            .collect();
+        let body = format!(r#"{{"library_claims":[{}]}}"#, entries.join(","));
+        let asked = asked.unwrap();
+        let settled = FakeStore::new(vec![body.clone()]).run(&asked).await;
+        assert_eq!(settled.unanswered, specifiers(&["extra"]));
+        let failed = FakeStore::new(vec![String::new()]).run(&asked).await;
+        assert!(failed.unanswered.contains("extra"));
+    }
+
     /// carrick#3684: a failed first ask ends the scan without every package
     /// it asked.
     #[tokio::test(start_paused = true)]

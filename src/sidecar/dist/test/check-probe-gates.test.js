@@ -1,0 +1,105 @@
+/**
+ * The probe's gate aliases, compiled by the real compiler (in memory).
+ *
+ * The classifier tests feed synthetic diagnostics, so they cannot see which
+ * gates a given type actually trips. This file swaps the probe's two surface
+ * imports for local aliases and reads the TS2344 gate lines tsc reports, so a
+ * gate that also fires on a top type (as `[any] extends [void]` does) fails
+ * here rather than silently changing the reported reason.
+ */
+import { describe, it } from 'node:test';
+import * as assert from 'node:assert';
+import ts from 'typescript';
+import { buildProbe } from '../src/capture/check-probe.js';
+const PKG = (s) => `@carrick/${s}`;
+function requestSpec() {
+    return {
+        pair_key: 'gates',
+        protocol: 'http',
+        type_kind: 'request',
+        producer: { service_name: 'orders', alias: 'Endpoint_a_Request' },
+        consumer: { service_name: 'web', alias: 'Call_a_Request' },
+    };
+}
+function responseSpec() {
+    return { ...requestSpec(), type_kind: 'response' };
+}
+/**
+ * Gate names tsc trips when the sent side is `sentType`, and the expected side
+ * `expectedType`. Only the `side` gates are returned.
+ */
+function firedGates(sentType, spec = requestSpec(), expectedType = '{ title: string }', side = 'sent') {
+    const plan = buildProbe(spec, PKG);
+    const lines = plan.source.split('\n');
+    const [sentImport, expectedImport] = plan.importLines;
+    lines[sentImport - 1] = `type Sent = ${sentType};`;
+    lines[expectedImport - 1] = `type Expected = ${expectedType};`;
+    const fileName = '/probe/pair.ts';
+    const text = lines.join('\n');
+    const options = {
+        strict: true,
+        noEmit: true,
+        target: ts.ScriptTarget.ES2022,
+        lib: ['lib.es2022.d.ts', 'lib.dom.d.ts'],
+        types: [],
+    };
+    const host = ts.createCompilerHost(options);
+    const readFile = host.getSourceFile.bind(host);
+    host.getSourceFile = (name, version, onError, create) => name === fileName
+        ? ts.createSourceFile(name, text, version)
+        : readFile(name, version, onError, create);
+    const program = ts.createProgram([fileName], options, host);
+    const source = program.getSourceFile(fileName);
+    return ts
+        .getPreEmitDiagnostics(program, source)
+        .filter((d) => d.code === 2344 && d.file?.fileName === fileName)
+        .map((d) => source.getLineAndCharacterOfPosition(d.start).line + 1)
+        .map((line) => plan.gateLines.get(line))
+        .filter((name) => name !== undefined && name.startsWith(`${side}:`))
+        .sort();
+}
+describe('probe gates under the real compiler (carrick#1162)', () => {
+    const cases = [
+        ['any', ['sent:any']],
+        ['unknown', ['sent:unknown']],
+        ['never', ['sent:never']],
+        ['void', ['sent:void']],
+        ['undefined', ['sent:void']],
+        ['FormData', ['sent:form']],
+        ['URLSearchParams', ['sent:form']],
+        // carrick#1793: a body of bytes, on either side of either http half.
+        ['Blob', ['sent:bytes']],
+        ['File', ['sent:bytes']],
+        ['Uint8Array', ['sent:bytes']],
+        ['ArrayBuffer', ['sent:bytes']],
+        ['ReadableStream<Uint8Array>', ['sent:bytes']],
+        ['Blob | null', ['sent:bytes']],
+        ['null', []],
+        ['string', []],
+        ['{ title: string }', []],
+        ['{ size: number; type: string }', []],
+        ['{ file: Blob }', []],
+    ];
+    for (const [sent, expected] of cases) {
+        it(`a sent side of \`${sent}\` trips exactly ${JSON.stringify(expected)}`, () => {
+            assert.deepStrictEqual(firedGates(sent), expected);
+        });
+    }
+});
+describe('the bytes gate under the real compiler (carrick#1793)', () => {
+    it('trips on the sent side of a response probe', () => {
+        assert.deepStrictEqual(firedGates('Uint8Array', responseSpec()), ['sent:bytes']);
+    });
+    it('trips on the expected side of a response probe', () => {
+        assert.deepStrictEqual(firedGates('{ title: string }', responseSpec(), 'Blob', 'expected'), ['expected:bytes']);
+        assert.deepStrictEqual(firedGates('{ title: string }', responseSpec(), 'ArrayBuffer', 'expected'), ['expected:bytes']);
+    });
+    it('does not trip on a JSON shape on the expected side', () => {
+        assert.deepStrictEqual(firedGates('{ title: string }', responseSpec(), '{ title: string }', 'expected'), []);
+    });
+    it('an any or unknown side trips its own gate, never the bytes gate', () => {
+        assert.deepStrictEqual(firedGates('any', responseSpec()), ['sent:any']);
+        assert.deepStrictEqual(firedGates('unknown', responseSpec()), ['sent:unknown']);
+        assert.deepStrictEqual(firedGates('never', responseSpec()), ['sent:never']);
+    });
+});

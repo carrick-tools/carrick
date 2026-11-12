@@ -1,0 +1,1644 @@
+/**
+ * Anchor resolution for the surface entry: guards for addressable anchors
+ * (symbol / handler_return) and the locator + node-builder path for
+ * anonymous inferred types. Produces the final alias line for each anchor,
+ * or a recorded demotion -- never a silently wrong line.
+ */
+import ts from 'typescript';
+import * as path from 'node:path';
+import { printTypeForDestination, substituteUndeclaredNames, undeclaredNamesIn, } from './node-builder.js';
+import { typeIsOrContainsMachinery } from './machinery.js';
+import { readResultLabel } from './result-label.js';
+import { installedPackageSpecifier } from './installed-package.js';
+import { realPath } from './service-config.js';
+import { statesNoShape, statusTableBody } from './status-table.js';
+import { unresolvedAtAnchor, unresolvedSpecifiersReachableFrom, } from './unresolved.js';
+/**
+ * Repo-root-relative source file -> the specifier the surface entry imports
+ * it by: its path from `entryDir`, in the form the entry resolves.
+ *
+ * With the extension removed (`./a`), where `resolveFromEntry` says the entry
+ * resolves that to the module. It does not always (carrick#1911): under
+ * `module` `node16`..`nodenext` an entry in a `"type": "module"` package is
+ * an ES module, which must name the file the module compiles to, and a `.mts`
+ * or `.cts` module has no extensionless form under any setting. There, and
+ * with no resolver to ask, the specifier is that output name: `./a.js` for
+ * `.ts` and `.tsx`, `./a.mjs` for `.mts`, `./a.cjs` for `.cts`, which every
+ * module setting maps back to the source and, in the stub, to its
+ * declaration.
+ */
+/**
+ * The absolute path of an anchor's `source_file`. The scanner sends a file
+ * outside the service root as an absolute path; `path.join` would nest it
+ * under the root, so a source file resolves with `path.resolve`: absolute
+ * stays absolute, relative is taken from the root.
+ */
+export function resolveSourceFile(repoRoot, sourceFile) {
+    return path.resolve(repoRoot, sourceFile);
+}
+export function entryRelativeSpecifier(entryDir, repoRoot, sourceFile, resolveFromEntry) {
+    const target = resolveSourceFile(repoRoot, sourceFile);
+    const from = (file) => {
+        const rel = path.relative(entryDir, file).split(path.sep).join('/');
+        return rel.startsWith('.') ? rel : `./${rel}`;
+    };
+    const bare = from(target.replace(/\.(ts|tsx|mts|cts)$/, ''));
+    const resolved = resolveFromEntry?.(bare);
+    if (resolved !== undefined && realPath(resolved) === realPath(target))
+        return bare;
+    const kind = /(?:\.d)?\.([cm]?)[jt]sx?$/.exec(target);
+    return kind ? from(`${target.slice(0, kind.index)}.${kind[1]}js`) : bare;
+}
+export function moduleExport(checker, sourceFile, name) {
+    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+    if (!moduleSymbol)
+        return undefined;
+    return checker
+        .getExportsOfModule(moduleSymbol)
+        .find((s) => s.getName() === name);
+}
+/**
+ * Resolve one anchor against the analysis program. `placeholder` is the
+ * anchor's own placeholder alias declaration in the entry file -- the
+ * destination node the node builder anchors to (banked correction 1).
+ */
+export function resolveAnchor(program, request, args) {
+    const checker = program.getTypeChecker();
+    const demote = (reason) => ({
+        request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        failureReason: reason,
+    });
+    if (request.kind === 'literal') {
+        const text = request.type_text.trim();
+        if (!text) {
+            return demote('empty literal type text');
+        }
+        const bareIdentifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text);
+        const siblingSpec = bareIdentifier
+            ? args.siblingSymbolSpecs?.get(text)
+            : undefined;
+        // carrick#1165: literal text is printed elsewhere (the v1 walk) and can
+        // name a type by a bare identifier that nothing in the program declares
+        // (a generated model that was never generated). The stub then self-checks
+        // such a name as an error placeholder, which no walk flags. A name a
+        // sibling symbol anchor imports is resolved by that import.
+        // carrick#1774: the text names types as they read where it was printed,
+        // so a name its source file means by a repo module's export is imported
+        // from that module (a string-union alias printed bare read `any`), and
+        // (carrick#1789) a name it imports from a package is imported from that
+        // package. carrick#1836: a name the source file cannot see is imported
+        // from the module the inference recorded it was printed for.
+        const scoped = siblingSpec
+            ? undefined
+            : qualifyNamesFromSource(text, program, request.source_file, request.printed_names, args);
+        const scopedText = scoped ?? text;
+        // carrick#1377: rewrite what nothing declares to `unknown` in place, so
+        // one member typed by a module the checkout does not have stops taking
+        // every member around it down with it.
+        const rewritten = siblingSpec || !args.placeholder
+            ? undefined
+            : substituteUndeclaredNamesInText(scopedText, program, args.placeholder);
+        const aliasBody = rewritten?.text ?? scopedText;
+        const undeclaredNames = siblingSpec || !args.placeholder
+            ? []
+            : undeclaredNamesInText(aliasBody, program, args.placeholder);
+        const unresolved = rewritten?.paths.length
+            ? {
+                paths: rewritten.paths,
+                specifiers: unresolvedSpecifiersForLiteral(program, request.source_file, args.repoRoot),
+            }
+            : undefined;
+        return {
+            request,
+            aliasText: siblingSpec ? `import('${siblingSpec}').${text}` : aliasBody,
+            // Literal anchors ARE the legacy-text tier (WP3 wiring of the design's
+            // structural_fallback): hand-produced type text riding the surface.
+            // The self-check still classifies decay; the fidelity metric counts
+            // them at this tier so the legacy dependence stays measurable and
+            // ratchetable. Demotions are distinguished by failureReason.
+            serialization: 'structural_fallback',
+            ...(undeclaredNames.length > 0 ? { undeclaredNames } : {}),
+            ...(unresolved ? { unresolved } : {}),
+        };
+    }
+    const sourceAbs = resolveSourceFile(args.repoRoot, request.source_file);
+    const sourceFile = program.getSourceFile(sourceAbs);
+    if (!sourceFile) {
+        return demote(`source file not in program: ${request.source_file}`);
+    }
+    const spec = entryRelativeSpecifier(args.entryDir, args.repoRoot, request.source_file, args.resolveFromEntry);
+    if (request.kind === 'symbol') {
+        const exported = moduleExport(checker, sourceFile, request.symbol_name);
+        if (!exported) {
+            return demote(`'${request.symbol_name}' is not an export of ${request.source_file}`);
+        }
+        // The anchor is the ELEMENT symbol; array_depth restores the use-site's
+        // `[]` levels (#248/#306) so an array-vs-scalar mismatch stays visible.
+        const arraySuffix = '[]'.repeat(Math.max(0, request.array_depth ?? 0));
+        // #438/#439: an LLM symbol anchor may name a schema VALUE const
+        // (`export const ZFooSchema = z.object({...})`) whose sibling
+        // `export type TFoo = z.infer<typeof ZFooSchema>` was the intended anchor.
+        // A value has no type-space meaning, so `import('./m').ZFooSchema` in TYPE
+        // position raises TS2694 in the stub tree and (before #438 part 2) poisons
+        // every producer pair. Guard structurally on symbol meaning, never on the
+        // name: resolve re-exports, then test for any type-space flag.
+        const resolvedExport = resolveSymbolAliases(checker, exported);
+        if (!symbolHasTypeMeaning(resolvedExport)) {
+            // #439 part 2: re-aim at a sibling type alias defined via a `typeof`
+            // type-query of this const (covers `z.infer<typeof C>` and equivalents;
+            // matched structurally, no library names). Guard A is the fallback.
+            const reaimed = reaimValueSymbolToTypeSibling(checker, sourceFile, {
+                request,
+                valueSymbol: resolvedExport,
+                spec,
+                arraySuffix,
+            });
+            if (reaimed)
+                return reaimed;
+            // #438 part 1: value-only export with no type sibling. Demote so the
+            // existing demotion/backfill path engages (honest `unknown`) instead of
+            // emitting a surface line that references a value in type position.
+            return demote(`'${request.symbol_name}' is a value export with no type-space meaning, ` +
+                `and no sibling type alias derives from it (e.g. \`typeof ${request.symbol_name}\`); ` +
+                'demoted so the surface line stays valid');
+        }
+        const arrayDepth = Math.max(0, request.array_depth ?? 0);
+        const declared = checker.getDeclaredTypeOfSymbol(resolvedExport);
+        // carrick#1841: a symbol named for what a consumer receives that is a
+        // response table keyed by status code (`{ 200: Item; 404: Problem }`) is
+        // not the body. The body is its 2xx rows, indexed out of the table so the
+        // compiler still emits it (`import('./m').Table[200]`). A table with no
+        // success body abstains, decided. The v1 bundle reads the same rule
+        // (`TypeBundler.statusTableBodyText`).
+        if (request.consumer_response) {
+            const table = statusTableBody(checker, declared, resolvedExport.declarations?.[0] ?? sourceFile);
+            if (table?.kind === 'no_body') {
+                return {
+                    request,
+                    aliasText: 'unknown',
+                    serialization: 'structural_fallback',
+                    abstainReason: `'${request.symbol_name}' is a response table keyed by status code with no ` +
+                        'success row that states a body, so this consumer states no response contract',
+                };
+            }
+            if (table?.kind === 'body') {
+                const rows = [...new Set(table.entries.map((entry) => entry.key))].map((key) => /^\d+$/.test(key)
+                    ? `import('${spec}').${request.symbol_name}[${key}]`
+                    : `import('${spec}').${request.symbol_name}[${JSON.stringify(key)}]`);
+                const body = rows.join(' | ');
+                // The success row IS the body, list or not. A depth on this request
+                // was read off the body (carrick#1967) and is already in the row, so
+                // it is not applied again.
+                const unresolvedBody = unresolvedAtAnchor(program, sourceFile, declared, resolvedExport.declarations?.[0] ?? sourceFile, '');
+                return {
+                    request,
+                    aliasText: body,
+                    serialization: 'emitted',
+                    ...(unresolvedBody ? { unresolved: unresolvedBody } : {}),
+                };
+            }
+        }
+        const unresolved = unresolvedAtAnchor(program, sourceFile, declared, resolvedExport.declarations?.[0] ?? sourceFile, '<0>'.repeat(arrayDepth));
+        return {
+            request,
+            aliasText: `import('${spec}').${request.symbol_name}${arraySuffix}`,
+            serialization: 'emitted',
+            ...(unresolved ? { unresolved } : {}),
+        };
+    }
+    if (request.kind === 'handler_return') {
+        // Design-doc Capture step 1 guards, all three verified failure modes.
+        const exported = moduleExport(checker, sourceFile, request.symbol_name);
+        if (!exported) {
+            return demote(`handler '${request.symbol_name}' is not an export of ${request.source_file}`);
+        }
+        const declaration = exported.valueDeclaration ?? exported.declarations?.[0];
+        const handlerType = checker.getTypeOfSymbolAtLocation(exported, declaration ?? sourceFile);
+        const callSignatures = handlerType.getCallSignatures();
+        if (callSignatures.length === 0) {
+            return demote(`handler '${request.symbol_name}' has no call signatures`);
+        }
+        if (callSignatures.length > 1) {
+            // ReturnType<> silently resolves the LAST overload only.
+            return demote(`handler '${request.symbol_name}' is an overload set (${callSignatures.length} signatures)`);
+        }
+        if ((callSignatures[0].getTypeParameters() ?? []).length > 0) {
+            // Type parameters erase to their constraint/unknown under ReturnType<>.
+            return demote(`handler '${request.symbol_name}' is generic`);
+        }
+        const returned = callSignatures[0].getReturnType();
+        const unresolved = unresolvedAtAnchor(program, sourceFile, checker.getAwaitedType(returned) ?? returned, declaration ?? sourceFile);
+        return {
+            request,
+            aliasText: `Awaited<ReturnType<typeof import('${spec}').${request.symbol_name}>>`,
+            serialization: 'emitted',
+            ...(unresolved ? { unresolved } : {}),
+        };
+    }
+    // kind === 'infer'
+    // #498: a `param_name` anchor targets what a handler RECEIVES. Resolve the
+    // parameter before anything else and treat the outcome as final — the
+    // expression locator below resolves the enclosing registration call, whose
+    // return type (`void`, a subscription handle) is not the payload, and it
+    // self-checks clean, so falling through would ship a confidently wrong
+    // contract instead of an honest `unknown`.
+    if (request.param_name !== undefined) {
+        const param = locateHandlerParam(sourceFile, request, request.param_name);
+        if (!param) {
+            return demote(`no handler parameter '${request.param_name}' resolved in ` +
+                `${request.source_file} (${paramLocatorHints(request)})`);
+        }
+        return finishInferAnchor(program, sourceFile, request, param, args.placeholder, undefined, args.repoRoot);
+    }
+    const found = locate(sourceFile, request);
+    if (!found) {
+        return demote(locatorFailureReason(request));
+    }
+    // carrick#1785: the line fallback takes the first expression on the line,
+    // and a declaration's NAME is an expression to `ts.isExpression`. On a line
+    // that declares something, that name is all the fallback finds, and its type
+    // is the declared entity's own (a whole alias, a function, a class), never a
+    // payload. The line names the declaration, so the anchor abstains: an
+    // abstain, not a demotion, because the backfill has nothing better to
+    // re-anchor it with (carrick#766). It does not walk on to the next node
+    // either, which on a function's line is its first parameter.
+    if (found.by === 'line') {
+        const declaration = declarationNamedBy(found.node);
+        if (declaration) {
+            return {
+                request,
+                aliasText: 'unknown',
+                serialization: 'structural_fallback',
+                abstainReason: `the line fallback resolved the name of ` +
+                    `${describeNode(sourceFile, request.source_file, declaration)}; a ` +
+                    `declaration's name is not a payload, so the anchor abstains rather ` +
+                    `than publish the declared entity's own type`,
+            };
+        }
+    }
+    let located = found.node;
+    // carrick#1162: a serialised body is the JSON of its argument. The call's own
+    // `string` result is never the payload's contract, and publishing it reads
+    // incompatible against every object-typed counterparty.
+    located = serialisedArgument(located);
+    // #439 part 1: a producer anchor whose locator landed inside a fluent
+    // builder chain's config-descriptor argument (an all-literal metadata
+    // object) must never capture that descriptor as the request type. Re-aim at
+    // the chain's payload/schema argument, or demote when it cannot be picked
+    // unambiguously — never leave the descriptor captured (the artifact behind
+    // v1's false-incompatible verdicts; kept coupled with #438's containment).
+    let reaimNote;
+    const builderReaim = reaimBuilderChainPayload(checker, located);
+    if (builderReaim.kind === 'demote') {
+        return demote(builderReaim.reason);
+    }
+    if (builderReaim.kind === 'reaim') {
+        located = builderReaim.node;
+        reaimNote = builderReaim.note;
+    }
+    return finishInferAnchor(program, sourceFile, request, located, args.placeholder, reaimNote, args.repoRoot);
+}
+/**
+ * Shared tail of the infer paths (locator-resolved node and #498
+ * parameter-resolved node alike): read the type at the node, unwrap the
+ * transport layer, run the #433 recovery and the carrick#371 machinery guard,
+ * and print through the node builder.
+ */
+function finishInferAnchor(program, sourceFile, request, located, placeholder, reaimNote, repoRoot) {
+    const checker = program.getTypeChecker();
+    const demote = (reason) => ({
+        request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        failureReason: reason,
+    });
+    const rawType = checker.getTypeAtLocation(located);
+    let type = rawType;
+    if ((request.unwrap ?? 'awaited') === 'awaited') {
+        type = checker.getAwaitedType(type) ?? type;
+    }
+    // carrick#2818: the library store labels which part of this call's result
+    // holds the response body. A label the type cannot satisfy states no
+    // contract, and the capture's own re-read of the raw call must not fill in.
+    if (request.result) {
+        const read = readResultLabel(checker, rawType, type, request.result, located);
+        if ('abstain' in read) {
+            return {
+                request,
+                aliasText: 'unknown',
+                serialization: 'structural_fallback',
+                abstainReason: read.abstain,
+            };
+        }
+        type = read.type;
+    }
+    // #433: the checker gave us nothing (whole top type) — try the syntactic
+    // recovery for an inline literal type argument of an unresolvable generic
+    // annotation. The literal is dependency-free source syntax; only the outer
+    // generic needed the missing package.
+    if (isTopType(type)) {
+        const literalNode = recoverInlineLiteralTypeArgument(checker, sourceFile, request, located);
+        if (literalNode) {
+            const recovered = checker.getTypeAtLocation(literalNode);
+            if (!isTopType(recovered))
+                type = recovered;
+        }
+    }
+    // carrick#2116: a narrowed `unknown` (the checker's own empty object type)
+    // and `object` state no shape, at the root or as a member of the root
+    // union. Printed they read `{}` and `object`, and would be judged as a
+    // shape that lacks every field. They are read as the `unknown` they are.
+    if (statesNoShape(checker, type)) {
+        type = checker.getUnknownType();
+    }
+    // carrick#766: a LINE-ONLY anchor whose type came back a bare top type has
+    // no evidence on either side, so it must abstain.
+    //
+    // The two halves of an infer anchor are the locator and the type at it. A
+    // span, an expression text or a parameter name is the scanner NAMING the
+    // payload: whatever that node's type turns out to be — including a whole
+    // `any` decayed through an uninstalled dependency — is a located fact about
+    // the payload, and the deep-any walk, the check's IsAny gate and the literal
+    // backfill are all built on it being published. Those anchors are untouched
+    // here.
+    //
+    // A line alone names nothing. `firstExpressionOnLine` picks whatever comes
+    // first on the line. When THAT resolves to a top type the capture holds no
+    // payload and no type, and `export type <alias> = any;` states "a type was
+    // inferred and it collapsed" — a claim the scan cannot back. The honest word
+    // is `unknown` ("no contract stated here"), with the node the line resolved
+    // as the reason.
+    //
+    // Live shape: a route whose handlers are built by a framework factory and
+    // re-exported at the bottom of the file. Both of the file's operations
+    // anchor at the export statement and the v1 walk abstains there
+    // (carrick#771). The export line itself now abstains earlier, as a
+    // declaration's name (carrick#1785); this guard still holds for a line whose
+    // first node is a value that decayed, such as the factory call's binding.
+    if (isTopType(type) && isLineOnly(request)) {
+        return {
+            request,
+            aliasText: 'unknown',
+            serialization: 'structural_fallback',
+            abstainReason: `line-only locator resolved ` +
+                `${describeNode(sourceFile, request.source_file, located)} whose type is a ` +
+                `bare top type ('${checker.typeToString(type)}'); the anchor names no ` +
+                `payload span, expression or parameter, so it abstains rather than ` +
+                `publish a top type as a contract`,
+        };
+    }
+    // carrick#371 fail-closed guard: a producer anchor whose resolved type IS or
+    // CONTAINS framework machinery (a raw `Response`/`Request`, a wrapper envelope
+    // `{ response: Response; error }`, a wrapper function `(req) => Promise<Response>`)
+    // must never be emitted as a comparable contract — that manufactures a false
+    // compat mismatch against the consumer's real payload. This is the capture
+    // fallback for the case the v1-inferrer machinery guard leaves behind: when v1
+    // abstains on the envelope, `derive_capture_anchors` re-routes the alias to
+    // this locator-based infer anchor, which then resolves the WRAPPER FUNCTION
+    // type. No source locator points at a distinct clean payload here (the payload
+    // lives inside the wrapper's response builder), so degrade to `unknown` —
+    // abstain, never a concrete verdict off the machinery.
+    if (typeIsOrContainsMachinery(program, type, located, repoRoot)) {
+        return demote('resolved type is or contains framework machinery (Response/Request-shaped); ' +
+            'degraded to unknown rather than emit a wrapper envelope as a response contract');
+    }
+    if (!placeholder) {
+        return demote('internal: no placeholder destination for infer anchor');
+    }
+    const printed = printTypeForDestination(program, type, placeholder);
+    if (!printed.text) {
+        return demote(printed.failure ?? 'node builder print failed');
+    }
+    const atAnchor = unresolvedAtAnchor(program, sourceFile, type, located);
+    // carrick#1377: a member the print named undeclared and this rewrote to
+    // `unknown` is an unresolved position too, whether or not the source type
+    // carried the compiler's placeholder at it (a bare name the print reused as
+    // written does not). Both lists feed the same labelling.
+    const unresolved = mergeUnresolved(atAnchor, printed.substitutedPaths, () => unresolvedSpecifiersReachableFrom(program, sourceFile));
+    return {
+        request,
+        aliasText: printed.text,
+        serialization: 'node_builder',
+        ...(reaimNote ? { reaimNote } : {}),
+        ...(printed.undeclaredNames ? { undeclaredNames: printed.undeclaredNames } : {}),
+        ...(unresolved ? { unresolved } : {}),
+    };
+}
+/**
+ * Fold substituted member positions into what the source program could not
+ * resolve. `specifiers` is a thunk: the reachable-import walk is only worth
+ * running for an anchor that actually substituted something.
+ */
+function mergeUnresolved(atAnchor, substitutedPaths, specifiers) {
+    if (!substitutedPaths || substitutedPaths.length === 0)
+        return atAnchor;
+    const paths = new Set([...(atAnchor?.paths ?? []), ...substitutedPaths]);
+    return {
+        paths: [...paths],
+        specifiers: atAnchor?.specifiers ?? specifiers(),
+    };
+}
+/**
+ * The unresolved specifiers a LITERAL anchor's source file reaches, or none
+ * when the anchor names no file (its text names a type with nothing behind it
+ * and the detail says only that).
+ */
+function unresolvedSpecifiersForLiteral(program, sourceFileRel, repoRoot) {
+    if (!sourceFileRel)
+        return [];
+    const sourceFile = program.getSourceFile(resolveSourceFile(repoRoot, sourceFileRel));
+    return sourceFile ? unresolvedSpecifiersReachableFrom(program, sourceFile) : [];
+}
+/** `undeclaredNamesIn` over type text rather than a built node. */
+function undeclaredNamesInText(text, program, destination) {
+    const parsed = parseLiteralAnchor(text);
+    return parsed ? undeclaredNamesIn(parsed, program, destination) : [];
+}
+/** `substituteUndeclaredNames` over type text rather than a built node. */
+function substituteUndeclaredNamesInText(text, program, destination) {
+    const parsed = parseLiteralAnchor(text);
+    if (!parsed)
+        return undefined;
+    const rewritten = substituteUndeclaredNames(parsed, program, destination);
+    if (rewritten.substitutions.length === 0)
+        return undefined;
+    const printer = ts.createPrinter({ removeComments: true });
+    return {
+        text: printer.printNode(ts.EmitHint.Unspecified, rewritten.node, parsed.getSourceFile()),
+        paths: rewritten.substitutions.map((entry) => entry.path),
+    };
+}
+/**
+ * carrick#1774: literal text with every type name read where it was printed.
+ *
+ * The text was printed in `sourceFileRel` (the v1 inferrer prints at the node,
+ * where the module's own declarations and imports are in scope), so a type
+ * reference in it means what its leftmost name resolves to in that file. The
+ * surface entry is another scope: there such a name names nothing (TS2304, a
+ * member that reads `any`) or a global of the same name (`Notification`).
+ * Each reference whose name the source resolves to a type that a module
+ * inside the repo exports becomes `import('<module>').<export>`, with its
+ * qualifier and type arguments kept. A name the source imports from an
+ * installed package becomes `import('<package specifier>').<export>`
+ * (carrick#1789): the stub ships no `node_modules`, but it pins the packages
+ * its surface imports, and the check phase installs them. Anything else is
+ * left as written: a global, a name only a function body declares, an
+ * unexported local, and a type declared outside the repo that no package
+ * import reaches.
+ *
+ * carrick#1836: a name the source file cannot see at all was printed without
+ * its scope (the inferrer's structural printer writes names bare). When the
+ * inference recorded one declaration for it (`printed`), the name is imported
+ * from that declaration's module, under the same repo rule. A name recorded
+ * for two declarations is left as written: the text no longer says which one
+ * a position meant.
+ *
+ * Returns the rewritten text, or undefined when nothing was rewritten, so a
+ * text with no such name stays byte-identical.
+ */
+function qualifyNamesFromSource(text, program, sourceFileRel, printed, args) {
+    if (!sourceFileRel)
+        return undefined;
+    const source = program.getSourceFile(resolveSourceFile(args.repoRoot, sourceFileRel));
+    const parsed = parseLiteralAnchor(text);
+    if (!source || !parsed)
+        return undefined;
+    const checker = program.getTypeChecker();
+    const meaning = ts.SymbolFlags.Type | ts.SymbolFlags.Namespace | ts.SymbolFlags.Alias;
+    // Names the text declares itself (`[K in ...]`, `<T>(...)`, `infer U`).
+    const typeParameters = new Set();
+    const collect = (node) => {
+        if (ts.isTypeParameterDeclaration(node))
+            typeParameters.add(node.name.text);
+        ts.forEachChild(node, collect);
+    };
+    collect(parsed);
+    const specOf = (file) => {
+        const rel = path.relative(args.repoRoot, file.fileName);
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel))
+            return undefined;
+        if (rel.split(path.sep).includes('node_modules'))
+            return undefined;
+        return entryRelativeSpecifier(args.entryDir, args.repoRoot, rel.split(path.sep).join('/'), args.resolveFromEntry);
+    };
+    const imports = new Map();
+    const importFor = (name) => {
+        if (imports.has(name))
+            return imports.get(name);
+        let found;
+        const atSource = checker.resolveName(name, source, meaning, false);
+        const target = atSource && resolveSymbolAliases(checker, atSource);
+        const declaringFile = target?.declarations?.[0]?.getSourceFile();
+        const spec = declaringFile && specOf(declaringFile);
+        if (target && declaringFile && spec) {
+            const moduleSymbol = checker.getSymbolAtLocation(declaringFile);
+            const exported = moduleSymbol
+                ? checker
+                    .getExportsOfModule(moduleSymbol)
+                    .filter((candidate) => resolveSymbolAliases(checker, candidate) === target)
+                : [];
+            const chosen = exported.find((candidate) => candidate.getName() === name) ?? exported[0];
+            if (chosen)
+                found = { spec, exportPath: [chosen.getName()] };
+        }
+        if (!found && atSource)
+            found = packageImportOf(program, atSource, args.resolveFromEntry);
+        if (!found && !atSource)
+            found = printedImportOf(program, name, printed, specOf);
+        imports.set(name, found);
+        return found;
+    };
+    const leftmost = (name) => ts.isIdentifier(name) ? name : leftmost(name.left);
+    const entityName = (parts) => parts
+        .slice(1)
+        .reduce((left, part) => ts.factory.createQualifiedName(left, part), ts.factory.createIdentifier(parts[0]));
+    const replaceLeftmost = (name, to) => ts.isIdentifier(name)
+        ? entityName(to)
+        : ts.factory.createQualifiedName(replaceLeftmost(name.left, to), name.right);
+    const dropLeftmost = (name) => ts.isIdentifier(name.left)
+        ? name.right
+        : ts.factory.createQualifiedName(dropLeftmost(name.left), name.right);
+    // What follows `import('<spec>')`: the export path, then the reference's
+    // own qualifier. Through a namespace import the namespace's name goes, and
+    // the next name must be something the package exports.
+    const qualifierFor = (typeName, target) => {
+        if ('exportPath' in target)
+            return replaceLeftmost(typeName, target.exportPath);
+        if (ts.isIdentifier(typeName))
+            return undefined;
+        const qualifier = dropLeftmost(typeName);
+        return target.namespaceExports.has(leftmost(qualifier).text) ? qualifier : undefined;
+    };
+    let rewrites = 0;
+    const rewrite = (node) => {
+        if (ts.isTypeReferenceNode(node)) {
+            const name = leftmost(node.typeName).text;
+            const target = typeParameters.has(name) ? undefined : importFor(name);
+            const qualifier = target && qualifierFor(node.typeName, target);
+            if (target && qualifier) {
+                rewrites += 1;
+                return ts.factory.createImportTypeNode(ts.factory.createLiteralTypeNode(ts.factory.createStringLiteral(target.spec)), undefined, qualifier, node.typeArguments?.map((argument) => rewrite(argument)), false);
+            }
+        }
+        return ts.visitEachChild(node, rewrite, /* context */ undefined);
+    };
+    const rewritten = rewrite(parsed);
+    if (rewrites === 0)
+        return undefined;
+    return ts
+        .createPrinter({ removeComments: true })
+        .printNode(ts.EmitHint.Unspecified, rewritten, parsed.getSourceFile());
+}
+/**
+ * carrick#1789: how the surface entry imports `local`, a name the source file
+ * binds with an import from an installed package, or undefined.
+ *
+ * The entry names the module the source's import resolves to by its file
+ * path, as the node builder names a library type it cannot reach by a bare
+ * specifier; the post-emit rewrite turns that path into the package's bare
+ * specifier and pins the installed version (`installedPackageSpecifier`). A
+ * bare specifier in the entry itself would be resolved from the entry: on a
+ * Deno service that goes through the graph's virtual `node_modules`, and the
+ * emitter then reads the package there, cannot name its types from the
+ * service's own modules (TS2742), and skips their declarations.
+ *
+ * Kept only when the module lies inside an installed package and the bare
+ * specifier that package gives resolves from the entry to the same file. So
+ * a tsconfig path alias to the repo's own module, a workspace package linked
+ * from the repo (no installed copy to pin), and an import of another
+ * installed copy than the entry reaches all stay as written.
+ */
+function packageImportOf(program, local, resolveFromEntry) {
+    if (!resolveFromEntry || !(local.flags & ts.SymbolFlags.Alias))
+        return undefined;
+    const declaration = local.declarations?.[0];
+    let statement;
+    let exportName;
+    if (declaration && ts.isImportSpecifier(declaration)) {
+        // `import { "a-b" as name }` has no qualifier an import type can write.
+        const exported = declaration.propertyName ?? declaration.name;
+        if (!ts.isIdentifier(exported))
+            return undefined;
+        statement = declaration.parent.parent.parent;
+        exportName = exported.text;
+    }
+    else if (declaration && ts.isImportClause(declaration)) {
+        statement = declaration.parent;
+        exportName = 'default';
+    }
+    else if (declaration && ts.isNamespaceImport(declaration)) {
+        statement = declaration.parent.parent;
+    }
+    else {
+        return undefined;
+    }
+    if (!ts.isImportDeclaration(statement))
+        return undefined;
+    const checker = program.getTypeChecker();
+    const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
+    const moduleFile = moduleSymbol?.declarations?.find(ts.isSourceFile);
+    if (!moduleSymbol || !moduleFile)
+        return undefined;
+    const installed = installedPackageSpecifier(moduleFile.fileName, exportName);
+    const fromEntry = installed && resolveFromEntry(installed.specifier);
+    if (!fromEntry || realPath(fromEntry) !== realPath(moduleFile.fileName))
+        return undefined;
+    const spec = moduleFile.fileName;
+    const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
+    if (exportName === undefined)
+        return { spec, namespaceExports: exported };
+    return exported.has(exportName) ? { spec, exportPath: [exportName] } : undefined;
+}
+/**
+ * carrick#1836: the import for `name` from the one declaration the inference
+ * recorded printing it for, or undefined.
+ *
+ * Undefined when the name was recorded for no declaration or for several,
+ * when the recorded module is not in this program or not inside the repo
+ * (`specOf`), and when its export path does not lead to a type there: a record
+ * that does not check out names nothing, and the text stays as written.
+ */
+function printedImportOf(program, name, printed, specOf) {
+    const recorded = (printed ?? []).filter((entry) => entry.name === name);
+    const identities = new Set(recorded.map((entry) => `${entry.file}\0${entry.export_path.join('.')}`));
+    if (identities.size !== 1)
+        return undefined;
+    const entry = recorded[0];
+    const declaring = program.getSourceFile(entry.file);
+    const spec = declaring && specOf(declaring);
+    if (!declaring || !spec)
+        return undefined;
+    const checker = program.getTypeChecker();
+    let current = checker.getSymbolAtLocation(declaring);
+    for (const part of entry.export_path) {
+        const next = current && checker.getExportsOfModule(current).find((s) => s.getName() === part);
+        current = next && resolveSymbolAliases(checker, next);
+    }
+    if (!current || !(current.flags & (ts.SymbolFlags.Type | ts.SymbolFlags.Namespace))) {
+        return undefined;
+    }
+    return { spec, exportPath: entry.export_path };
+}
+/** The type node of `type __LiteralAnchor = <text>;`, or undefined. */
+function parseLiteralAnchor(text) {
+    const parsed = ts.createSourceFile('literal-anchor.ts', `type __LiteralAnchor = ${text};`, ts.ScriptTarget.Latest, true);
+    const statement = parsed.statements[0];
+    return statement && ts.isTypeAliasDeclaration(statement) ? statement.type : undefined;
+}
+/**
+ * True when the anchor carries a LINE and nothing else — no payload span, no
+ * expression text, no parameter name. Such an anchor states where to look, not
+ * what to look at, so a top type resolved from it is not a fact about any
+ * payload (carrick#766).
+ */
+function isLineOnly(request) {
+    return (request.span_start == null &&
+        request.span_end == null &&
+        !request.expression_text &&
+        !request.param_name);
+}
+/**
+ * `<kind> at <file>:<line> (`<text>`)` for a node a locator resolved — what a
+ * reader needs to see why an alias abstained. The path is the REPO-RELATIVE
+ * one off the request, not `sourceFile.fileName`: the reason is published on
+ * the capture record, and an absolute path there is the scanner's checkout
+ * directory. The text is collapsed to one line and truncated, since a resolved
+ * node can be a whole function body.
+ */
+function describeNode(sourceFile, sourceFileRel, node) {
+    const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+    const raw = node.getText(sourceFile).replace(/\s+/g, ' ').trim();
+    const text = raw.length > 80 ? `${raw.slice(0, 77)}...` : raw;
+    return `${ts.SyntaxKind[node.kind]} at ${sourceFileRel}:${line} (\`${text}\`)`;
+}
+function isTopType(type) {
+    return ((type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) !== 0);
+}
+/**
+ * The checker's intrinsic ERROR type: resolution of the reference FAILED
+ * (missing package on a bare checkout, unresolvable symbol). Distinct from a
+ * legitimate `any`, whose intrinsic name is `any` — an author-written or
+ * alias-resolved `any` must never trigger the syntactic recovery.
+ * `intrinsicName` is internal but stable since TS 1.x (same standing as the
+ * internals node-builder.ts already mirrors).
+ */
+function isErrorType(type) {
+    if (!(type.flags & ts.TypeFlags.Any))
+        return false;
+    const name = type.intrinsicName;
+    return name === 'error' || name === 'unresolved';
+}
+/**
+ * #433 syntactic recovery: an infer anchor whose checker type decayed to a
+ * whole top type may sit under a DECLARED annotation of the form
+ * `SomeGeneric<{ ...literal... }>` where only the outer generic failed to
+ * resolve (error-typed; its package is absent on a bare checkout) while the
+ * literal type argument is dependency-free source syntax referencing only
+ * locally-resolvable symbols. Trigger is purely structural — no framework
+ * names anywhere:
+ *
+ *  1. Data-flow path: the payload node (the located node, or the anchor's
+ *     expression_text relocated) is an argument of a call — or IS a send
+ *     call — whose callee chain roots at an identifier whose declaration
+ *     carries the annotation (`res.json(payload)` -> `res`).
+ *  2. Registration path: the located node is a call registering inline
+ *     callbacks; the callbacks' parameter annotations are scanned.
+ *
+ * Either path recovers ONLY when exactly one literal type argument is in
+ * scope — ambiguity refuses recovery and the alias keeps decaying honestly.
+ * The recovered literal node's own type is printed through the normal
+ * node-builder path, so the alias still faces the real self-check.
+ */
+function recoverInlineLiteralTypeArgument(checker, sourceFile, request, located) {
+    const candidates = [located];
+    if (request.expression_text) {
+        const byText = nodeByExpressionText(sourceFile, request.expression_text, request.line_number);
+        if (byText && byText !== located)
+            candidates.push(byText);
+    }
+    // Data-flow first: the payload's own call names the annotated receiver.
+    for (const node of candidates) {
+        const call = governingCall(node);
+        if (!call)
+            continue;
+        const root = calleeRootIdentifier(call.expression);
+        if (!root)
+            continue;
+        const annotation = declaredAnnotationOf(checker, root);
+        if (!annotation || !isErroredGenericReference(checker, annotation))
+            continue;
+        // The payload carrier is identified; its annotation's verdict is FINAL —
+        // never fall through to the registration scan, which could pick a
+        // different parameter's literal for this payload.
+        const literals = literalTypeArguments(annotation);
+        if (literals.length !== 1)
+            return undefined;
+        return literalResolvesLocally(checker, literals[0]) ? literals[0] : undefined;
+    }
+    // Registration shape: the located call passes inline callbacks whose
+    // parameters carry the annotations. Ambiguity is counted BEFORE any
+    // resolvability filtering: two literal-carrying annotations refuse even
+    // when one of them would be rejected later — filtering first could crown
+    // the wrong parameter's literal.
+    for (const node of candidates) {
+        if (!ts.isCallExpression(node))
+            continue;
+        const literals = [];
+        for (const arg of node.arguments) {
+            if (!isFunctionArgument(arg))
+                continue;
+            for (const param of arg.parameters) {
+                if (param.type && isErroredGenericReference(checker, param.type)) {
+                    literals.push(...literalTypeArguments(param.type));
+                }
+            }
+        }
+        if (literals.length !== 1)
+            continue;
+        return literalResolvesLocally(checker, literals[0]) ? literals[0] : undefined;
+    }
+    return undefined;
+}
+/**
+ * The call whose ARGUMENT list carries `node` (payload in argument position),
+ * or `node` itself when it is a call (the send call). Calls that register
+ * callbacks are excluded: their receiver is the framework app/router value,
+ * not a payload carrier — those go through the registration path instead.
+ */
+function governingCall(node) {
+    if (ts.isCallExpression(node)) {
+        return node.arguments.some(isFunctionArgument) ? undefined : node;
+    }
+    const parent = node.parent;
+    if (parent !== undefined &&
+        ts.isCallExpression(parent) &&
+        node !== parent.expression &&
+        parent.arguments.includes(node)) {
+        return parent.arguments.some(isFunctionArgument) ? undefined : parent;
+    }
+    return undefined;
+}
+function isFunctionArgument(arg) {
+    return ts.isArrowFunction(arg) || ts.isFunctionExpression(arg);
+}
+/** Root identifier of a callee chain: `res.status(500).json` -> `res`. */
+function calleeRootIdentifier(expr) {
+    let current = expr;
+    while (ts.isPropertyAccessExpression(current) ||
+        ts.isElementAccessExpression(current) ||
+        ts.isCallExpression(current) ||
+        ts.isNonNullExpression(current) ||
+        ts.isParenthesizedExpression(current)) {
+        current = current.expression;
+    }
+    return ts.isIdentifier(current) ? current : undefined;
+}
+/** The explicit type annotation on the identifier's declaration, if any. */
+function declaredAnnotationOf(checker, identifier) {
+    const symbol = checker.getSymbolAtLocation(identifier);
+    const decl = symbol?.valueDeclaration ?? symbol?.declarations?.[0];
+    if (!decl)
+        return undefined;
+    if (ts.isParameter(decl) ||
+        ts.isVariableDeclaration(decl) ||
+        ts.isPropertySignature(decl) ||
+        ts.isPropertyDeclaration(decl)) {
+        return decl.type;
+    }
+    return undefined;
+}
+/**
+ * A generic type reference whose OUTER resolution failed: the annotation is
+ * `Name<...args>` and its own type is the checker's error type. A resolvable
+ * generic (however it resolves) never triggers recovery; its checker answer
+ * is the truth.
+ */
+function isErroredGenericReference(checker, annotation) {
+    return (ts.isTypeReferenceNode(annotation) &&
+        (annotation.typeArguments?.length ?? 0) > 0 &&
+        isErrorType(checker.getTypeFromTypeNode(annotation)));
+}
+/** Type-literal type arguments of a generic reference (parens unwrapped). */
+function literalTypeArguments(annotation) {
+    const literals = [];
+    for (const arg of annotation.typeArguments ?? []) {
+        let node = arg;
+        while (ts.isParenthesizedTypeNode(node))
+            node = node.type;
+        if (ts.isTypeLiteralNode(node))
+            literals.push(node);
+    }
+    return literals;
+}
+/**
+ * Every type reference inside the literal must itself RESOLVE. A literal
+ * leaning on a third-party type (`{ thing: LibThing }` with the lib absent)
+ * is not the tractable class — recovering it would bake `any` at a member;
+ * it keeps decaying honestly instead. Author-written `any`/`unknown`
+ * keywords are allowed through: they are the source's truth, and the
+ * self-check's deep walk still owns that verdict.
+ */
+function literalResolvesLocally(checker, literal) {
+    let resolves = true;
+    const visit = (node) => {
+        if (!resolves)
+            return;
+        if ((ts.isTypeReferenceNode(node) ||
+            ts.isImportTypeNode(node) ||
+            ts.isTypeQueryNode(node) ||
+            ts.isExpressionWithTypeArguments(node)) &&
+            isErrorType(checker.getTypeFromTypeNode(node))) {
+            resolves = false;
+            return;
+        }
+        node.forEachChild(visit);
+    };
+    visit(literal);
+    return resolves;
+}
+// ===========================================================================
+// carrick#498: handler-parameter anchors.
+//
+// A subscriber's contract is what its handler RECEIVES, so its anchor carries
+// a `param_name` locator instead of an expression. Resolving it needs the
+// handler function, and the only locator upstream can supply for an anonymous
+// inline handler is a line. Everything below is STRUCTURAL — argument
+// position and binding shape, never a method name, library, or topic string.
+// ===========================================================================
+/**
+ * v1's `findFunctionByLine` tolerance, mirrored so the two paths agree on how
+ * far an anchor may be from the function it names — and, since carrick#770, on
+ * what a forward match may cross (see [`separatedFromAnchor`]).
+ */
+const HANDLER_LINE_TOLERANCE = 2;
+/**
+ * The payload parameter named by `paramName` on the handler this anchor
+ * points at, or undefined when neither the handler nor the parameter can be
+ * picked. The caller demotes on undefined: an unresolved parameter must never
+ * fall back to the expression locator.
+ */
+function locateHandlerParam(sourceFile, request, paramName) {
+    for (const fn of handlerCandidates(sourceFile, request)) {
+        const target = resolveParamTarget(fn, paramName);
+        if (target)
+            return target;
+    }
+    return undefined;
+}
+/**
+ * Handler functions this anchor could be naming, most specific first:
+ *
+ *  1. the LAST function-typed argument of a call starting on the anchor's
+ *     line — the handler slot of a registration call, structurally (a
+ *     registration passes its routing key first and its handler last).
+ *     Several calls can start on one line (`wrap(bus.subscribe(t, h), g)`),
+ *     so they are ordered INNERMOST first: the innermost is the registration
+ *     the anchor's own line most nearly denotes, and it is the same
+ *     innermost-wins tie-break the v1 inferrer's `findFunctionByLine` uses;
+ *  2. any function whose declaration starts within
+ *     `HANDLER_LINE_TOLERANCE` lines of the anchor, innermost first — the
+ *     locator may name a binding on the handler's own signature lines rather
+ *     than the registration line;
+ *  3. the innermost function ENCLOSING the node the expression locator
+ *     resolves — covers a locator that landed in the handler body.
+ */
+function handlerCandidates(sourceFile, request) {
+    const out = [];
+    const push = (fn) => {
+        if (fn && !out.includes(fn))
+            out.push(fn);
+    };
+    const line = request.line_number;
+    if (line !== undefined) {
+        for (const call of callsStartingOnLine(sourceFile, line)) {
+            const handlerArgs = call.arguments.filter(isFunctionArgument);
+            push(handlerArgs[handlerArgs.length - 1]);
+        }
+        for (const fn of functionsNearLine(sourceFile, line))
+            push(fn);
+    }
+    push(enclosingFunction(locateNode(sourceFile, request)));
+    return out;
+}
+function callsStartingOnLine(sourceFile, line) {
+    const calls = [];
+    const visit = (node) => {
+        if (ts.isCallExpression(node) && startLineOf(sourceFile, node) === line) {
+            calls.push(node);
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    // Innermost (smallest span) first: a pre-order walk would otherwise hand
+    // back the OUTER call of a same-line nest, whose handler is not the one the
+    // anchor's line denotes.
+    return calls.sort((a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart()));
+}
+/**
+ * Functions declared within the line tolerance of `line`, ordered innermost
+ * (smallest span) first so a nested handler wins over its enclosing function.
+ *
+ * The tolerance is one-directional in effect, the same rule the v1 inferrer's
+ * `findFunctionByLine` applies (carrick#766/#770). Looking BACK is free: a
+ * function starting before the anchor is one the anchor sits inside or just
+ * after. Looking FORWARD reaches a handler that starts a line or two into the
+ * registration the anchor names — and, unguarded, also reaches the next
+ * declaration in the file when the anchor lands on a statement that declares no
+ * function at all. Nothing but trivia may sit between the anchor and the
+ * function it is taken to name.
+ */
+function functionsNearLine(sourceFile, line) {
+    const found = [];
+    const visit = (node) => {
+        if (isHandlerFunctionLike(node) &&
+            Math.abs(startLineOf(sourceFile, node) - line) <= HANDLER_LINE_TOLERANCE) {
+            found.push(node);
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    const windowStatements = statementsOpeningInWindow(sourceFile, line);
+    return found
+        .filter((fn) => startLineOf(sourceFile, fn) <= line ||
+        !separatedFromAnchor(sourceFile, windowStatements, fn))
+        .sort((a, b) => a.getEnd() - a.getStart() - (b.getEnd() - b.getStart()));
+}
+/**
+ * Statements opening inside the forward window `[line, line + tolerance]`.
+ *
+ * Statement LIST members, not every node the checker calls a statement: the
+ * members of a source file, a block, a module block or a case clause are the
+ * things that can stand between an anchor and a later declaration. Collected
+ * from the lists themselves because the raw compiler API has no total
+ * "is this a statement" predicate the way ts-morph does.
+ */
+function statementsOpeningInWindow(sourceFile, line) {
+    const found = [];
+    const consider = (statements) => {
+        for (const statement of statements) {
+            const start = startLineOf(sourceFile, statement);
+            if (start >= line && start <= line + HANDLER_LINE_TOLERANCE) {
+                found.push(statement);
+            }
+        }
+    };
+    const visit = (node) => {
+        if (ts.isSourceFile(node) ||
+            ts.isBlock(node) ||
+            ts.isModuleBlock(node) ||
+            ts.isCaseClause(node) ||
+            ts.isDefaultClause(node)) {
+            consider(node.statements);
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    return found;
+}
+/**
+ * Whether a statement opening in the forward window stands between the anchor
+ * and `fn` — it begins on an earlier line than `fn` and does not contain it.
+ *
+ * `broker.register('key', (payload) => …)` spread over three lines is one
+ * statement that CONTAINS its handler, so the handler is reachable.
+ * `export { handler };` followed by `function buildQuery(payload)` is two
+ * statements, and the second is not what the first names.
+ */
+function separatedFromAnchor(sourceFile, windowStatements, fn) {
+    const fnStart = fn.getStart(sourceFile);
+    const fnLine = startLineOf(sourceFile, fn);
+    return windowStatements.some((statement) => startLineOf(sourceFile, statement) < fnLine &&
+        !(statement.getStart(sourceFile) <= fnStart &&
+            statement.getEnd() >= fn.getEnd()));
+}
+function startLineOf(sourceFile, node) {
+    return (sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1);
+}
+function isHandlerFunctionLike(node) {
+    return (ts.isArrowFunction(node) ||
+        ts.isFunctionExpression(node) ||
+        ts.isFunctionDeclaration(node) ||
+        ts.isMethodDeclaration(node));
+}
+function enclosingFunction(node) {
+    let current = node;
+    while (current) {
+        if (isHandlerFunctionLike(current))
+            return current;
+        current = current.parent;
+    }
+    return undefined;
+}
+/**
+ * The three binding shapes a `function_param` locator can name, mirroring the
+ * v1 inferrer's `resolveParamTarget` so both anchor paths answer identically:
+ *
+ *  1. an exact parameter name (`(payload) => …` <- "payload");
+ *  2. a whole destructured binding pattern under whitespace normalisation
+ *     (`({ id, total }) => …` <- "{ id, total }") — the pattern's own type IS
+ *     the payload;
+ *  3. one named binding element inside a destructured parameter
+ *     (`({ payload }) => …` <- "payload") — the payload is a property of an
+ *     envelope parameter, and the checker projects the element's type.
+ */
+function resolveParamTarget(fn, paramName) {
+    const params = fn.parameters;
+    for (const param of params) {
+        if (ts.isIdentifier(param.name) && param.name.text === paramName) {
+            return param;
+        }
+    }
+    const wanted = paramName.replace(/\s+/g, ' ').trim();
+    for (const param of params) {
+        if ((ts.isObjectBindingPattern(param.name) ||
+            ts.isArrayBindingPattern(param.name)) &&
+            param.name.getText().replace(/\s+/g, ' ').trim() === wanted) {
+            return param;
+        }
+    }
+    for (const param of params) {
+        if (!ts.isObjectBindingPattern(param.name))
+            continue;
+        for (const element of param.name.elements) {
+            if (ts.isIdentifier(element.name) && element.name.text === paramName) {
+                return element;
+            }
+        }
+    }
+    return undefined;
+}
+function paramLocatorHints(request) {
+    return request.line_number !== undefined
+        ? `line ${request.line_number}`
+        : 'no line hint';
+}
+/**
+ * The argument of a `JSON.stringify(value)` call (through parentheses), or the
+ * node unchanged. The mirror of the v1 inferrer's `unwrapJsonStringifyArg`:
+ * the global serialiser is identified by the standard `JSON` object, the one
+ * name every runtime shares.
+ *
+ * carrick#2010: a property whose value is the serialiser call (`body:
+ * JSON.stringify(...)`, the node the line fallback prefers on that line) is
+ * read through to the call, and so to its argument.
+ */
+function serialisedArgument(node) {
+    let current = ts.isPropertyAssignment(node) ? node.initializer : node;
+    while (ts.isParenthesizedExpression(current))
+        current = current.expression;
+    if (ts.isCallExpression(current) &&
+        current.arguments.length > 0 &&
+        ts.isPropertyAccessExpression(current.expression) &&
+        ts.isIdentifier(current.expression.expression) &&
+        current.expression.expression.text === 'JSON' &&
+        current.expression.name.text === 'stringify') {
+        return current.arguments[0];
+    }
+    return node;
+}
+function locatorFailureReason(request) {
+    const hints = [];
+    if (request.span_start !== undefined)
+        hints.push(`span ${request.span_start}-${request.span_end}`);
+    if (request.expression_text)
+        hints.push(`expression '${request.expression_text.slice(0, 40)}'`);
+    if (request.line_number !== undefined)
+        hints.push(`line ${request.line_number}`);
+    return `no node located in ${request.source_file} (${hints.join(', ') || 'no locator hints'})`;
+}
+/**
+ * Locate the target node: tightest expression covering the byte span when
+ * given; else the expression matching expression_text on/after line_number;
+ * else the first expression starting on line_number.
+ */
+export function locateNode(sourceFile, request) {
+    return locate(sourceFile, request)?.node;
+}
+/** The node `locateNode` resolves, and which of its three locators found it. */
+function locate(sourceFile, request) {
+    if (request.span_start !== undefined && request.span_end !== undefined) {
+        const bySpan = tightestCoveringNode(sourceFile, request.span_start, request.span_end);
+        if (bySpan)
+            return { node: bySpan, by: 'span' };
+    }
+    if (request.expression_text) {
+        const byText = nodeByExpressionText(sourceFile, request.expression_text, request.line_number);
+        if (byText)
+            return { node: byText, by: 'text' };
+    }
+    if (request.line_number !== undefined) {
+        const byLine = firstExpressionOnLine(sourceFile, request.line_number);
+        if (byLine)
+            return { node: byLine, by: 'line' };
+    }
+    return undefined;
+}
+/**
+ * The declaration `node` is the name of, when it names one (carrick#1785): a
+ * type alias, interface, class, function, method, property, accessor, enum or
+ * enum member, namespace, or an import or export binding (whose `propertyName`
+ * names the binding too: `export { a as b }`).
+ *
+ * Not a binding whose name is also the value read at that position: a
+ * destructured element and a shorthand property keep resolving. A variable,
+ * a parameter and a property assignment never reach here, because each is a
+ * preferred target the line walk takes before its name.
+ */
+function declarationNamedBy(node) {
+    const parent = node.parent;
+    if (!parent)
+        return undefined;
+    // A specifier's only children are its names.
+    if (ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent))
+        return parent;
+    const named = ts.isTypeAliasDeclaration(parent) ||
+        ts.isInterfaceDeclaration(parent) ||
+        ts.isClassDeclaration(parent) ||
+        ts.isFunctionDeclaration(parent) ||
+        ts.isMethodDeclaration(parent) ||
+        ts.isMethodSignature(parent) ||
+        ts.isPropertyDeclaration(parent) ||
+        ts.isPropertySignature(parent) ||
+        ts.isGetAccessorDeclaration(parent) ||
+        ts.isSetAccessorDeclaration(parent) ||
+        ts.isEnumDeclaration(parent) ||
+        ts.isEnumMember(parent) ||
+        ts.isModuleDeclaration(parent) ||
+        ts.isImportClause(parent) ||
+        ts.isNamespaceImport(parent);
+    return named && parent.name === node ? parent : undefined;
+}
+function isPreferredTarget(node) {
+    return (ts.isExpression(node) ||
+        ts.isVariableDeclaration(node) ||
+        ts.isParameter(node) ||
+        ts.isPropertyAssignment(node));
+}
+/**
+ * The deepest node a span names: a value-space target covering it, or a TYPE
+ * node it covers exactly (carrick#1775). A span is the scanner naming a node,
+ * and a declared type is named by its type node: the property type a generated
+ * GraphQL document declaration states for a field sits inside a type alias,
+ * where no value-space node covers it. Exactness keeps a span that names no
+ * node from being read as whatever type happens to enclose it.
+ */
+function tightestCoveringNode(sourceFile, start, end) {
+    let best;
+    const visit = (node) => {
+        const nodeStart = node.getStart(sourceFile);
+        const nodeEnd = node.getEnd();
+        if (nodeStart <= start && nodeEnd >= end) {
+            if (isPreferredTarget(node) ||
+                (ts.isTypeNode(node) && nodeStart === start && nodeEnd === end)) {
+                best = node;
+            }
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    return best;
+}
+/**
+ * Locator text with insignificant whitespace removed: runs collapse to one
+ * space, and a member chain broken before its dot (`client\n  .list(…)`) reads
+ * as `client.list(…)` (carrick#1162), the same rule the v1 inferrer applies.
+ */
+function normalizeLocatorText(text) {
+    return text
+        .replace(/\s+/g, ' ')
+        .replace(/\s*(\?\.|\.)\s*/g, '$1')
+        .trim();
+}
+function nodeByExpressionText(sourceFile, text, fromLine) {
+    const wanted = normalizeLocatorText(text);
+    let best;
+    const visit = (node) => {
+        if (best)
+            return;
+        if (isPreferredTarget(node)) {
+            const nodeText = normalizeLocatorText(node.getText(sourceFile));
+            if (nodeText === wanted) {
+                // On or after the line, or COVERING it: a chain broken before its dot
+                // starts a line above the line the analyzer reports for the call.
+                const endLine = sourceFile.getLineAndCharacterOfPosition(node.getEnd()).line + 1;
+                if (fromLine === undefined || endLine >= fromLine) {
+                    best = node;
+                    return;
+                }
+            }
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    return best;
+}
+function firstExpressionOnLine(sourceFile, line) {
+    let best;
+    const visit = (node) => {
+        const nodeLine = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+        if (nodeLine === line && isPreferredTarget(node) && !best) {
+            best = node;
+            return;
+        }
+        node.forEachChild(visit);
+    };
+    visit(sourceFile);
+    return best;
+}
+// ===========================================================================
+// #438/#439 symbol-anchor guards: value-only demotion + const->type re-aim.
+// ===========================================================================
+/** Follow re-export aliases to the symbol they ultimately denote. */
+function resolveSymbolAliases(checker, symbol) {
+    let current = symbol;
+    // Bounded: alias chains are short; the guard is against a pathological cycle.
+    for (let i = 0; i < 16 && (current.flags & ts.SymbolFlags.Alias) !== 0; i++) {
+        let next;
+        try {
+            next = checker.getAliasedSymbol(current);
+        }
+        catch {
+            break;
+        }
+        if (!next || next === current)
+            break;
+        current = next;
+    }
+    return current;
+}
+/**
+ * True when the symbol can stand in TYPE position (class, interface, enum,
+ * type alias, type parameter, ...). A pure value export (const / let / var /
+ * function) has no type-space meaning, so referencing it as a type is TS2694.
+ * Structural — never a name check. `ts.SymbolFlags.Type` is the compiler's own
+ * composite of the type-space meanings.
+ */
+function symbolHasTypeMeaning(symbol) {
+    return (symbol.flags & ts.SymbolFlags.Type) !== 0;
+}
+/**
+ * #439 part 2: when a symbol anchor names a value-only export, look in the
+ * SAME module for a single exported type alias whose type node contains a
+ * `typeof <const>` type-query (covers `z.infer<typeof C>`, `Infer<typeof C>`,
+ * and any equivalent — matched structurally, no library names). Exactly one
+ * match re-aims; zero or several fall back to the value-only demotion (never
+ * guess which of an input/output pair is the request).
+ */
+function reaimValueSymbolToTypeSibling(checker, sourceFile, ctx) {
+    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+    if (!moduleSymbol)
+        return undefined;
+    const matches = [];
+    for (const exported of checker.getExportsOfModule(moduleSymbol)) {
+        const resolved = resolveSymbolAliases(checker, exported);
+        if ((resolved.flags & ts.SymbolFlags.TypeAlias) === 0)
+            continue;
+        const decl = resolved.declarations?.find(ts.isTypeAliasDeclaration);
+        if (!decl)
+            continue;
+        if (typeAliasRhsInfersConst(checker, decl.type, ctx.request.symbol_name, ctx.valueSymbol)) {
+            matches.push(exported.getName());
+        }
+    }
+    if (matches.length !== 1)
+        return undefined;
+    return {
+        request: ctx.request,
+        aliasText: `import('${ctx.spec}').${matches[0]}${ctx.arraySuffix}`,
+        serialization: 'emitted',
+        reaimNote: `symbol anchor '${ctx.request.symbol_name}' is a value; re-aimed at sibling ` +
+            `type alias '${matches[0]}' (derived via \`typeof ${ctx.request.symbol_name}\`)`,
+    };
+}
+/**
+ * True iff the type alias RHS IS the inferred type derived from a
+ * `typeof <const>` query — the ordinary `export type T = z.infer<typeof C>`
+ * shape — and NOT a wrapper that merely embeds it. Structurally: the whole
+ * type node is a generic type reference (`Infer<typeof C>` /
+ * `SomeGeneric<typeof C>`) whose DIRECT type arguments include a `typeof C`
+ * query.
+ *
+ * An object / union / intersection / array that embeds the query as a member
+ * or element (`{ data: Infer<typeof C>; meta: string }`) is a WRAPPER: re-aiming
+ * at it would capture the wrapper shape, not the payload, and (since the
+ * wrapper self-checks concretely) manufacture a false incompatible. Those fall
+ * back to the value-only demotion — a guaranteed abstain, never a wrong
+ * concrete verdict. A bare `typeof C` alias is also rejected: it denotes the
+ * schema wrapper value's type, not the inferred payload. Still no library-name
+ * checks: matched purely on shape.
+ */
+function typeAliasRhsInfersConst(checker, node, symbolName, valueSymbol) {
+    if (!ts.isTypeReferenceNode(node))
+        return false;
+    for (const arg of node.typeArguments ?? []) {
+        let inner = arg;
+        while (ts.isParenthesizedTypeNode(inner))
+            inner = inner.type;
+        if (ts.isTypeQueryNode(inner) &&
+            typeQueryMatchesSymbol(checker, inner, symbolName, valueSymbol)) {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Does a `typeof X` query denote `valueSymbol`? Symbol identity is primary
+ * (resolves through re-exports and works on a bare checkout: the value symbol
+ * resolves without the schema library present); a textual identifier match on
+ * `symbolName` is the fallback.
+ */
+function typeQueryMatchesSymbol(checker, query, symbolName, valueSymbol) {
+    const entity = query.exprName;
+    const idNode = ts.isQualifiedName(entity) ? entity.right : entity;
+    const queried = checker.getSymbolAtLocation(entity) ?? checker.getSymbolAtLocation(idNode);
+    if (queried && resolveSymbolAliases(checker, queried) === valueSymbol)
+        return true;
+    return ts.isIdentifier(idNode) && idNode.text === symbolName;
+}
+function reaimBuilderChainPayload(checker, located) {
+    const descriptor = enclosingChainDescriptorArgument(checker, located);
+    if (!descriptor)
+        return { kind: 'none' };
+    const chain = fluentChainCalls(descriptor.call);
+    if (chain.length < 2)
+        return { kind: 'none' };
+    const candidates = payloadCandidates(checker, chain, descriptor.argument);
+    if (candidates.length === 1) {
+        return {
+            kind: 'reaim',
+            node: candidates[0],
+            note: 'producer anchor landed on a builder-chain config descriptor; ' +
+                're-aimed at the chain schema argument',
+        };
+    }
+    // Zero (a descriptor with no schema argument) or several (ambiguous
+    // input/output schemas): never keep the descriptor captured.
+    return {
+        kind: 'demote',
+        reason: candidates.length === 0
+            ? 'producer anchor landed on a builder-chain config descriptor with no ' +
+                'identifiable schema argument; demoted to keep the request type honest'
+            : `producer anchor landed on a builder-chain config descriptor; ` +
+                `${candidates.length} schema arguments are present and cannot be ` +
+                'disambiguated structurally; demoted to keep the request type honest',
+    };
+}
+/**
+ * Walk up from the located node to the enclosing call argument that carries the
+ * descriptor signature: all-literal metadata, written inline or referenced by
+ * name (#497). Returns the call and the descriptor argument itself, or
+ * undefined when the located node is not inside such a descriptor. The argument
+ * comes back so the caller can exclude exactly that node from the payload
+ * candidates by identity.
+ */
+function enclosingChainDescriptorArgument(checker, located) {
+    let node = located;
+    while (node) {
+        const parent = node.parent;
+        if (parent &&
+            ts.isCallExpression(parent) &&
+            parent.arguments.includes(node) &&
+            isMetadataDescriptor(checker, node)) {
+            return { call: parent, argument: node };
+        }
+        node = parent;
+    }
+    return undefined;
+}
+/**
+ * A config-descriptor argument: a non-empty, all-literal object literal, either
+ * written inline or named by a reference whose declaration initialises it to
+ * one (#497 — `.meta(createWidgetMeta)` with the const in a sibling module).
+ *
+ * The REFERENCE spelling is deliberately STRICTER than the inline one, and the
+ * asymmetry is load-bearing. In this file's model an inline all-literal object
+ * argument is never a payload, so the inline test can stay loose. A reference is
+ * an ordinary identifier that `payloadCandidates` otherwise treats as a payload
+ * candidate, so classifying one as a descriptor takes it out of the running: a
+ * flat hand-rolled const (`const s = { id: 0, name: "" }` passed to `.input`)
+ * would be misread as the descriptor and the capture would re-aim onto the
+ * metadata beside it — manufacturing the exact defect #497 fixes. Requiring a
+ * nested object-literal property (the `{ openapi: { ... } }` shape both observed
+ * variants carry) separates a descriptor from a flat payload const without
+ * consulting a single method or library name.
+ */
+function isMetadataDescriptor(checker, arg) {
+    if (ts.isObjectLiteralExpression(arg))
+        return isAllLiteralMetadata(arg);
+    const literal = referencedObjectLiteral(checker, arg);
+    return (literal !== undefined &&
+        isAllLiteralMetadata(literal) &&
+        literal.properties.some((p) => ts.isPropertyAssignment(p) && ts.isObjectLiteralExpression(p.initializer)));
+}
+/**
+ * The object literal a reference ultimately initialises to, or undefined. Only
+ * plain name references are followed (an identifier or a property access);
+ * re-export aliases are resolved so an imported const reaches its declaration,
+ * and `as const` / `satisfies` / parenthesised initialisers are unwrapped.
+ */
+function referencedObjectLiteral(checker, arg) {
+    if (!ts.isIdentifier(arg) && !ts.isPropertyAccessExpression(arg))
+        return undefined;
+    const symbol = checker.getSymbolAtLocation(arg);
+    if (!symbol)
+        return undefined;
+    const declaration = resolveSymbolAliases(checker, symbol).valueDeclaration;
+    if (!declaration)
+        return undefined;
+    let initializer;
+    if (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) {
+        initializer = declaration.initializer;
+    }
+    while (initializer &&
+        (ts.isAsExpression(initializer) ||
+            ts.isSatisfiesExpression(initializer) ||
+            ts.isParenthesizedExpression(initializer) ||
+            ts.isTypeAssertionExpression(initializer))) {
+        initializer = initializer.expression;
+    }
+    return initializer && ts.isObjectLiteralExpression(initializer)
+        ? initializer
+        : undefined;
+}
+/**
+ * The full set of calls in the fluent chain containing `anyCall`
+ * (`x.a(...).b(...).c(...)` -> the three calls). Climbs to the outermost call,
+ * then descends the callee chain.
+ */
+function fluentChainCalls(anyCall) {
+    let outer = anyCall;
+    for (;;) {
+        const access = outer.parent;
+        if (access &&
+            (ts.isPropertyAccessExpression(access) || ts.isElementAccessExpression(access)) &&
+            access.expression === outer &&
+            access.parent &&
+            ts.isCallExpression(access.parent) &&
+            access.parent.expression === access) {
+            outer = access.parent;
+            continue;
+        }
+        break;
+    }
+    const calls = [];
+    let current = outer;
+    while (ts.isCallExpression(current)) {
+        calls.push(current);
+        const callee = current.expression;
+        if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
+            current = callee.expression;
+        }
+        else {
+            break;
+        }
+    }
+    return calls;
+}
+/**
+ * Chain arguments that carry type-space PAYLOAD meaning: a named or constructed
+ * schema (identifier / member access / call) whose RESOLVED type is an object
+ * shape. Two filters, both load-bearing:
+ *  - syntactic: inline object/array literals and inline functions (handlers)
+ *    are never candidates;
+ *  - semantic: a candidate whose resolved type is a primitive or literal
+ *    (`.tag(routeName)` with `routeName: string`), a bare callable (a named
+ *    handler), or a top type is REJECTED — capturing a string-literal type as a
+ *    request payload manufactures a false incompatible. Only an object-typed
+ *    argument is a real schema.
+ * With this filter the single-candidate re-aim fires only on a genuine schema,
+ * and a non-object, ambiguous (>1), or absent candidate abstains via demote.
+ *
+ * `descriptor` is the argument the anchor landed in, excluded by NODE IDENTITY
+ * (#497). Identity, not shape: an inline descriptor was already excluded by the
+ * syntactic filter, but a descriptor named by reference is an identifier like
+ * any other, and excluding it by shape would also strike out a payload schema
+ * that happens to be an all-literal const.
+ */
+function payloadCandidates(checker, chain, descriptor) {
+    const out = [];
+    for (const call of chain) {
+        for (const arg of call.arguments) {
+            if (arg === descriptor)
+                continue;
+            if ((ts.isIdentifier(arg) ||
+                ts.isPropertyAccessExpression(arg) ||
+                ts.isElementAccessExpression(arg) ||
+                ts.isCallExpression(arg)) &&
+                typeIsObjectPayload(checker.getTypeAtLocation(arg))) {
+                out.push(arg);
+            }
+        }
+    }
+    return out;
+}
+/**
+ * A type with object/payload meaning: a real object shape (or a union /
+ * intersection of them), never a primitive, string/number/boolean/bigint/enum
+ * literal, null/undefined/void, a top type (`any`/`unknown`/`never` — cannot be
+ * confirmed a payload), or a bare callable value (a handler function). This is
+ * the gate that keeps the builder-chain re-aim from capturing a non-schema.
+ */
+function typeIsObjectPayload(type) {
+    const nonObject = ts.TypeFlags.Any |
+        ts.TypeFlags.Unknown |
+        ts.TypeFlags.Never |
+        ts.TypeFlags.Null |
+        ts.TypeFlags.Undefined |
+        ts.TypeFlags.Void |
+        ts.TypeFlags.StringLike |
+        ts.TypeFlags.NumberLike |
+        ts.TypeFlags.BooleanLike |
+        ts.TypeFlags.BigIntLike |
+        ts.TypeFlags.ESSymbolLike |
+        ts.TypeFlags.EnumLike;
+    if (type.flags & nonObject)
+        return false;
+    if (type.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) {
+        // Every constituent must be an object shape: `string | { a }` is not a
+        // clean payload, while a union of objects stays eligible.
+        return type.types.every(typeIsObjectPayload);
+    }
+    if (type.flags & ts.TypeFlags.Object) {
+        // A bare callable (a named handler passed as a value) is not a payload; a
+        // schema object carries no top-level call/construct signature.
+        if (type.getCallSignatures().length > 0 ||
+            type.getConstructSignatures().length > 0) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+/** A non-empty object literal whose every property is a literal-typed value. */
+function isAllLiteralMetadata(obj) {
+    if (obj.properties.length === 0)
+        return false;
+    for (const prop of obj.properties) {
+        if (!ts.isPropertyAssignment(prop))
+            return false;
+        if (!isLiteralValueExpression(prop.initializer))
+            return false;
+    }
+    return true;
+}
+function isLiteralValueExpression(expr) {
+    switch (expr.kind) {
+        case ts.SyntaxKind.StringLiteral:
+        case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+        case ts.SyntaxKind.NumericLiteral:
+        case ts.SyntaxKind.TrueKeyword:
+        case ts.SyntaxKind.FalseKeyword:
+        case ts.SyntaxKind.NullKeyword:
+            return true;
+    }
+    if (ts.isPrefixUnaryExpression(expr))
+        return isLiteralValueExpression(expr.operand);
+    if (ts.isArrayLiteralExpression(expr)) {
+        return expr.elements.every(isLiteralValueExpression);
+    }
+    if (ts.isObjectLiteralExpression(expr))
+        return isAllLiteralMetadata(expr);
+    return false;
+}

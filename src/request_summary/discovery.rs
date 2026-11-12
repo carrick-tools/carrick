@@ -4594,6 +4594,67 @@ mod tests {
         );
     }
 
+    /// carrick#3992 T2a, step 0: a call through a `#private` field and one
+    /// through a public field, both holding a client from a package the
+    /// answer holds no entry for, are read by `package_reason` once the scan
+    /// ends without that package. The answer key is
+    /// `tests/fixtures/discovery-absent-package/README.md`.
+    #[test]
+    fn a_client_in_a_package_the_answer_lacks_is_unanswered_when_the_scan_ends_without_it() {
+        let Some(on) = walked("discovery-absent-package", "services/web", "web", &[], true) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-absent-package");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        let unready: BTreeSet<String> = ["fixture-graph".to_string()].into();
+        let plain = discover(&on.inputs, &Labels::of(&answer.exports), &on.repo);
+        let settled = discover(
+            &on.inputs,
+            &Labels::of(&answer.exports).ended_without(&unready),
+            &on.repo,
+        );
+        let span = |file: &str, needle: &str| -> (String, u32, u32) {
+            let text =
+                std::fs::read_to_string(fixture.join("repo/services/web/src").join(file)).unwrap();
+            let lo = text.find(needle).unwrap() as u32 + 1;
+            (
+                format!("services/web/src/{file}"),
+                lo,
+                lo + needle.len() as u32,
+            )
+        };
+        let held = |discovery: &Discovery, at: &(String, u32, u32)| {
+            discovery.unfollowed.iter().any(|site| {
+                (site.file.clone(), site.span_start, site.span_end) == *at
+                    && site.stop == Some(Stop::UnansweredPackage)
+            })
+        };
+        let context = format!(
+            "unfollowed {:?}\nfinished {:?}\nmissed_inside {:?}",
+            settled.unfollowed, settled.finished, settled.missed_inside
+        );
+        for needle in [
+            "this.#graph.api(\"/me\").get()",
+            "this.open.api(\"/me/messages\").get()",
+        ] {
+            let at = span("mailbox.ts", needle);
+            assert!(
+                held(&settled, &at),
+                "{needle} on the settled pass\n{context}"
+            );
+            assert!(!held(&plain, &at), "{needle} on the plain pass");
+        }
+        assert!(
+            settled
+                .finished
+                .contains(&span("answered.ts", "render(body)")),
+            "an answered package with nothing to label stays silent"
+        );
+    }
+
     /// carrick#3684: with nothing unready the settled pass is the plain one.
     #[test]
     fn with_nothing_unready_the_settled_pass_is_unchanged() {

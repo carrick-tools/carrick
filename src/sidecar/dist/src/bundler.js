@@ -1,0 +1,546 @@
+/**
+ * TypeBundler - the `bundle` action: each requested symbol's declaration text,
+ * read from the init'd ts-morph project.
+ */
+import { Node, ts, } from 'ts-morph';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { expandTypeStructural, } from './type-structural-expander.js';
+import { expandOriginOf, isExternalOrigin } from './origin.js';
+import { statusTableBody } from './capture/index.js';
+/**
+ * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
+ * realistically 1-3 levels (`[Order!]!`, at most `[[Order!]!]!`); this is a
+ * generous ceiling, not a realistic value. `array_depth` wraps via string
+ * repetition (`'[]'.repeat(depth)`), so an unbounded value from the model
+ * would let a single symbol blow up the emitted `.d.ts` (and the memory/CPU
+ * spent producing it). Depths above this are treated as unresolvable, same
+ * as any other symbol the bundler can't extract a type for.
+ */
+const MAX_ARRAY_DEPTH = 10;
+/** Whether `sourceFile` itself declares `name` in a form the bundle reads. */
+function declaresName(sourceFile, name) {
+    return Boolean(sourceFile.getInterface(name) ??
+        sourceFile.getTypeAlias(name) ??
+        sourceFile.getClass(name) ??
+        sourceFile.getEnum(name) ??
+        sourceFile.getVariableDeclaration(name) ??
+        sourceFile.getFunction(name));
+}
+/**
+ * Whether `sourceFile` declares `name` as a type: an interface, a type alias,
+ * a class or an enum. A variable or a function is a value only.
+ */
+function declaresType(sourceFile, name) {
+    return Boolean(sourceFile.getInterface(name) ??
+        sourceFile.getTypeAlias(name) ??
+        sourceFile.getClass(name) ??
+        sourceFile.getEnum(name));
+}
+/**
+ * The declarations `name` resolves to when imported from `sourceFile`
+ * (carrick#1605), or `ambiguous`.
+ *
+ * A name the module exports itself (declared there, `export { X }`, `export {
+ * X } from`, `export { X as Y } from`) wins over `export *`, and the checker
+ * follows it. Otherwise each `export *` is followed, at any depth. Two of them
+ * providing different declarations make the name ambiguous: TypeScript
+ * reports TS2308 and an ES module exports neither, while the checker's export
+ * table silently keeps the first, so the stars are walked here rather than
+ * read from it.
+ */
+function exportedDeclarations(sourceFile, name, seen) {
+    const key = sourceFile.getFilePath();
+    if (seen.has(key))
+        return [];
+    seen.add(key);
+    const ownExports = sourceFile.getSymbol()?.compilerSymbol.exports;
+    if (ownExports?.has(ts.escapeLeadingUnderscores(name))) {
+        return sourceFile.getExportedDeclarations().get(name) ?? [];
+    }
+    const found = [];
+    for (const declaration of sourceFile.getExportDeclarations()) {
+        // Only `export * from`: named and namespace re-exports are own exports.
+        if (declaration.hasNamedExports() || declaration.getNamespaceExport())
+            continue;
+        const target = declaration.getModuleSpecifierSourceFile();
+        if (!target)
+            continue;
+        const declarations = exportedDeclarations(target, name, seen);
+        if (declarations === 'ambiguous')
+            return declarations;
+        if (declarations.length > 0)
+            found.push(declarations);
+    }
+    const distinct = new Set(found.map(([first]) => `${first.getSourceFile().getFilePath()}:${first.getStart()}`));
+    if (distinct.size > 1)
+        return 'ambiguous';
+    return found[0] ?? [];
+}
+/** The name a re-exported declaration carries where it is declared. */
+function declaredName(declaration) {
+    if (Node.isInterfaceDeclaration(declaration) ||
+        Node.isTypeAliasDeclaration(declaration) ||
+        Node.isClassDeclaration(declaration) ||
+        Node.isEnumDeclaration(declaration) ||
+        Node.isVariableDeclaration(declaration) ||
+        Node.isFunctionDeclaration(declaration)) {
+        return declaration.getName();
+    }
+    return undefined;
+}
+/**
+ * Where `name`, as `sourceFile` exports it, is declared (carrick#1605). A name
+ * the file declares is its own. Otherwise it is followed the way an import of
+ * it is: a model names a type where the consumer imports it from, usually a
+ * barrel that only has `export *`.
+ */
+export function declarationSite(sourceFile, name, label, origin) {
+    if (declaresName(sourceFile, name))
+        return { sourceFile, name };
+    const declarations = exportedDeclarations(sourceFile, name, new Set());
+    if (declarations === 'ambiguous') {
+        return {
+            reason: `Symbol '${name}' is exported by more than one \`export *\` in ${label}`,
+        };
+    }
+    for (const declaration of declarations) {
+        const file = declaration.getSourceFile();
+        // An installed package's declaration names types from the package's own
+        // files, which the bundle does not carry, so its text would dangle. The
+        // failure is what it was before the walk, and inference keeps the row.
+        // A package of the checkout that a package manager links into
+        // `node_modules` is the user's own source and is followed (carrick#2304):
+        // the compiler marks it external too, so its flag alone cannot decide.
+        if (isExternalOrigin(origin.program, file.compilerNode, origin.repoRoot, origin.imports)) {
+            return { reason: `Symbol '${name}' is re-exported from an installed package in ${label}` };
+        }
+        const declared = declaredName(declaration);
+        if (declared && declaresName(declaration.getSourceFile(), declared)) {
+            return { sourceFile: declaration.getSourceFile(), name: declared };
+        }
+    }
+    return { reason: `Symbol '${name}' not found in ${label}` };
+}
+// =============================================================================
+// TypeBundler
+// =============================================================================
+/**
+ * TypeBundler - Legacy bundler using simpler approach
+ *
+ * This is a simplified replacement that doesn't use dts-bundle-generator.
+ * It extracts type definitions directly using ts-morph.
+ */
+export class TypeBundler {
+    project;
+    repoRoot;
+    constructor(options) {
+        this.project = options.project;
+        this.repoRoot = options.repoRoot;
+    }
+    /**
+     * Bundle the requested symbols into type definitions
+     *
+     * @param symbols - Array of symbol requests to bundle
+     * @returns BundleResult with the bundled content or errors
+     */
+    bundle(symbols) {
+        const manifest = [];
+        const symbolFailures = [];
+        const errors = [];
+        // Dedupe symbols
+        const uniqueSymbols = this.dedupeSymbols(symbols);
+        // Validate all symbols exist
+        const validatedSymbols = this.validateSymbols(uniqueSymbols, symbolFailures);
+        if (validatedSymbols.length === 0) {
+            return {
+                success: false,
+                symbol_failures: symbolFailures,
+                errors: symbolFailures.length > 0
+                    ? ['All requested symbols failed to resolve']
+                    : ['No symbols provided'],
+            };
+        }
+        try {
+            // Generate type definitions directly
+            const dtsLines = [
+                '// Generated by Carrick TypeBundler',
+                '// This file contains extracted type definitions',
+                '',
+            ];
+            for (const symbol of validatedSymbols) {
+                const typeInfo = this.extractTypeDefinition(symbol);
+                if (typeInfo) {
+                    dtsLines.push(typeInfo.definition);
+                    dtsLines.push('');
+                    manifest.push({
+                        alias: symbol.alias || symbol.symbol_name,
+                        original_name: symbol.symbol_name,
+                        source_file: symbol.source_file,
+                        type_string: typeInfo.typeString,
+                        is_explicit: true,
+                    });
+                }
+                else {
+                    symbolFailures.push({
+                        symbol_name: symbol.symbol_name,
+                        source_file: symbol.source_file,
+                        reason: `Could not extract type definition for '${symbol.symbol_name}'`,
+                    });
+                }
+            }
+            const dtsContent = dtsLines.join('\n');
+            return {
+                success: true,
+                dts_content: dtsContent,
+                manifest,
+                symbol_failures: symbolFailures.length > 0 ? symbolFailures : undefined,
+            };
+        }
+        catch (err) {
+            const error = err instanceof Error ? err.message : String(err);
+            this.logError(`Bundle generation failed: ${error}`);
+            errors.push(error);
+            return {
+                success: false,
+                symbol_failures: symbolFailures.length > 0 ? symbolFailures : undefined,
+                errors,
+            };
+        }
+    }
+    dedupeSymbols(symbols) {
+        const seen = new Set();
+        const unique = [];
+        for (const symbol of symbols) {
+            const key = `${symbol.source_file}::${symbol.symbol_name}::${symbol.alias || ''}`;
+            if (seen.has(key)) {
+                continue;
+            }
+            seen.add(key);
+            unique.push(symbol);
+        }
+        return unique;
+    }
+    validateSymbols(symbols, failures) {
+        const validated = [];
+        for (const symbol of symbols) {
+            const result = this.validateSymbol(symbol);
+            if (result.valid) {
+                validated.push(symbol);
+            }
+            else {
+                failures.push({
+                    symbol_name: symbol.symbol_name,
+                    source_file: symbol.source_file,
+                    reason: result.reason || 'Unknown error',
+                    ...(result.kind ? { kind: result.kind } : {}),
+                });
+            }
+        }
+        return validated;
+    }
+    validateSymbol(symbol) {
+        if (this.isPlaceholderSource(symbol.source_file)) {
+            return {
+                valid: false,
+                reason: `Unsupported source placeholder: ${symbol.source_file}`,
+            };
+        }
+        if (!this.isPathSource(symbol.source_file)) {
+            return { valid: true };
+        }
+        // Resolve the source file path
+        const absolutePath = path.isAbsolute(symbol.source_file)
+            ? symbol.source_file
+            : path.resolve(this.repoRoot, symbol.source_file);
+        // Check if file exists
+        if (!fs.existsSync(absolutePath)) {
+            return {
+                valid: false,
+                reason: `Source file not found: ${symbol.source_file}`,
+            };
+        }
+        // Get or add the source file to the project
+        let sourceFile;
+        try {
+            sourceFile =
+                this.project.getSourceFile(absolutePath) ||
+                    this.project.addSourceFileAtPath(absolutePath);
+        }
+        catch (err) {
+            return {
+                valid: false,
+                reason: `Failed to load source file: ${err instanceof Error ? err.message : String(err)}`,
+            };
+        }
+        const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file, this.expandOrigin());
+        if ('reason' in site)
+            return { valid: false, reason: site.reason };
+        // A model may name the value a handler reads its payload from (a service
+        // object, a function) as the payload's type. A value is not a type: the
+        // inference asked for the same alias defines it (blueprint row N10c).
+        if (!declaresType(site.sourceFile, site.name)) {
+            return {
+                valid: false,
+                reason: `Symbol '${symbol.symbol_name}' in ${symbol.source_file} is a value, not a type`,
+                kind: 'not_a_type',
+            };
+        }
+        return { valid: true };
+    }
+    /** Where a requested symbol is declared, or undefined when it cannot be found. */
+    siteOf(symbol) {
+        const absolutePath = path.isAbsolute(symbol.source_file)
+            ? symbol.source_file
+            : path.resolve(this.repoRoot, symbol.source_file);
+        const sourceFile = this.project.getSourceFile(absolutePath);
+        if (!sourceFile)
+            return undefined;
+        const site = declarationSite(sourceFile, symbol.symbol_name, symbol.source_file, this.expandOrigin());
+        return 'reason' in site ? undefined : site;
+    }
+    /**
+     * Structural body (`{ ... }`) for an interface/object type, with every nested
+     * named member inlined recursively. Returns null when the expansion is not a
+     * usable object body (e.g. the expander fell back to a bare name), so the
+     * caller can keep the verbatim declaration instead of emitting an invalid
+     * interface. The expander already guards recursion (depth + per-branch cycle
+     * set) and keeps builtins/`node_modules` types by name.
+     */
+    expandObjectBody(type) {
+        try {
+            const expanded = expandTypeStructural(type, this.expandOrigin());
+            return expanded.startsWith('{') ? expanded : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /**
+     * The program and service root the printer decides library origin from; see
+     * `ExpandOrigin`.
+     */
+    expandOrigin() {
+        return expandOriginOf(this.project, this.repoRoot);
+    }
+    extractTypeDefinition(symbol) {
+        const tableBody = symbol.consumer_response ? this.statusTableBodyText(symbol) : undefined;
+        if (tableBody !== undefined) {
+            // The success row IS the body, list or not. A depth on this request was
+            // read off the body (carrick#1967) and is already in the row, so it is
+            // not applied again; the capture's symbol anchor reads the same rule.
+            const alias = symbol.alias || symbol.symbol_name;
+            return { definition: `export type ${alias} = ${tableBody};`, typeString: tableBody };
+        }
+        const base = this.extractTypeDefinitionBase(symbol);
+        if (!base)
+            return null;
+        // #248: wrap the resolved element type in the SDL list depth. A GraphQL
+        // producer field `[Order!]!` backed by `interface Order` bundles `Order`
+        // with `array_depth: 1`; the alias becomes `Order[]` (arrays can't be
+        // interfaces, so it is always emitted as a type alias). The element's
+        // structurally-expanded body carries the shape, so downstream resolution
+        // and the eval's whitespace-collapsed `{...}[]` comparison both hold.
+        const depth = symbol.array_depth ?? 0;
+        if (depth <= 0)
+            return base;
+        // Reject rather than clamp: silently clamping would emit a type at a
+        // depth the model never asked for, which is wrong in a different way.
+        // Falling through to the symbol's normal "could not extract" failure
+        // keeps this on the existing per-symbol failure path (`symbol_failures`)
+        // instead of rejecting the whole batch.
+        if (depth > MAX_ARRAY_DEPTH)
+            return null;
+        // The wrap suffixes `typeString` with `[]`, which is only valid when it is
+        // a standalone type EXPRESSION. The base's fallback branches (interface
+        // whose expansion failed, class/enum/function) return declaration text,
+        // and `export type A = enum X {...}[]` is not parseable .d.ts — fail the
+        // symbol instead, same per-symbol path as an over-depth request.
+        if (!base.typeStringIsExpression)
+            return null;
+        const alias = symbol.alias || symbol.symbol_name;
+        // Parenthesise a union/intersection/function element so `(A | B)[]` doesn't
+        // misparse as `A | B[]` and `(() => T)[]` as `() => T[]`. Decide from the
+        // TYPE (not the string): a single object literal `{ a: A | B }` is NOT a
+        // top-level union and must stay unparenthesised (`{ a: A | B }[]`).
+        const element = this.elementNeedsArrayParens(symbol)
+            ? `(${base.typeString})`
+            : base.typeString;
+        const typeString = `${element}${'[]'.repeat(depth)}`;
+        return { definition: `export type ${alias} = ${typeString};`, typeString };
+    }
+    /**
+     * carrick#1841: what a consumer receives when the symbol the model named for
+     * its response is a response table keyed by status code (`{ 200: Item;
+     * 404: Problem }`): the table's 2xx values, expanded like any other body.
+     * `unknown` where the table states no success body (no 2xx row, or only
+     * rows such as `204: void`). `undefined` when the symbol is not a table, so
+     * the caller bundles it as written. The capture's symbol anchor reads the
+     * same rule (`capture/anchors.ts`), so both answers agree.
+     */
+    statusTableBodyText(symbol) {
+        const site = this.siteOf(symbol);
+        if (!site)
+            return undefined;
+        const declaration = site.sourceFile.getTypeAlias(site.name) ?? site.sourceFile.getInterface(site.name);
+        if (!declaration)
+            return undefined;
+        const table = declaration.getType();
+        const checker = this.project.getTypeChecker().compilerObject;
+        const read = statusTableBody(checker, table.compilerType, declaration.compilerNode);
+        if (!read)
+            return undefined;
+        if (read.kind === 'no_body')
+            return 'unknown';
+        const bodies = read.entries.map((entry) => {
+            const value = table.getProperty(entry.key)?.getTypeAtLocation(declaration);
+            return value ? expandTypeStructural(value, this.expandOrigin()) : 'unknown';
+        });
+        const distinct = [...new Set(bodies)];
+        return distinct.length === 1 ? distinct[0] : distinct.map((body) => `(${body})`).join(' | ');
+    }
+    /// Whether the element type must be parenthesised before an `[]` suffix.
+    /// Interfaces/classes/enums are always object/nominal (never a top-level
+    /// union), so only type aliases can carry a bare union/intersection/function
+    /// that would misparse; those are re-resolved from the source Type here
+    /// (this runs only on the rare array_depth path).
+    elementNeedsArrayParens(symbol) {
+        const site = this.siteOf(symbol);
+        if (!site)
+            return false;
+        const { sourceFile, name } = site;
+        const decl = sourceFile.getTypeAlias(name);
+        if (!decl)
+            return false;
+        const t = decl.getType();
+        return (t.isUnion() ||
+            t.isIntersection() ||
+            t.getCallSignatures().length > 0 ||
+            t.getConstructSignatures().length > 0);
+    }
+    // `typeStringIsExpression`: whether `typeString` is a standalone type
+    // expression (an object body, alias RHS, or `Type#getText()`), as opposed to
+    // verbatim declaration text from a fallback branch. Only expressions can be
+    // array-wrapped by `extractTypeDefinition`.
+    extractTypeDefinitionBase(symbol) {
+        const site = this.siteOf(symbol);
+        if (!site) {
+            return null;
+        }
+        // `symbolName` is the declaration's own name, which a renamed re-export
+        // (`export { Account as AccountView }`) does not share with the request;
+        // the bundle declares the name the symbol was requested under.
+        const { sourceFile, name: symbolName } = site;
+        const alias = symbol.alias || symbol.symbol_name;
+        // Try interface
+        const iface = sourceFile.getInterface(symbolName);
+        if (iface) {
+            // Inline nested named members structurally (`total: { amountCents: number;
+            // currency: string; }`, not `total: MoneyView`). The bundle carries only
+            // the alias declaration — never the source decls of nested types — so a
+            // bare named reference is dangling and resolves to `any` downstream. The
+            // expansion happens here, in the real source project, where the nested
+            // symbol still resolves. Falls back to the verbatim rename if the type
+            // can't be safely rendered as an object body.
+            const expanded = this.expandObjectBody(iface.getType());
+            const text = iface.getText();
+            if (expanded) {
+                const definition = `export interface ${alias} ${expanded}`;
+                return { definition, typeString: expanded, typeStringIsExpression: true };
+            }
+            const typeString = text;
+            const alreadyExported = text.trimStart().startsWith('export');
+            const definition = alias !== symbolName
+                ? (alreadyExported
+                    ? text.replace(`interface ${symbolName}`, `interface ${alias}`)
+                    : text.replace(`interface ${symbolName}`, `export interface ${alias}`))
+                : alreadyExported
+                    ? text
+                    : `export ${text}`;
+            return { definition, typeString, typeStringIsExpression: false };
+        }
+        // Try type alias
+        const typeAlias = sourceFile.getTypeAlias(symbolName);
+        if (typeAlias) {
+            // Same nested-member inlining as the interface branch above. A type alias
+            // can resolve to any shape (object, union, array, primitive); the
+            // structural expander renders each correctly and keeps builtins/library
+            // types by name, so the alias RHS is always emittable.
+            const text = typeAlias.getText();
+            const expanded = expandTypeStructural(typeAlias.getType(), this.expandOrigin());
+            if (expanded && expanded !== 'unknown') {
+                const definition = `export type ${alias} = ${expanded};`;
+                return { definition, typeString: expanded, typeStringIsExpression: true };
+            }
+            const typeString = typeAlias.getType().getText();
+            const alreadyExported = text.trimStart().startsWith('export');
+            const definition = alias !== symbolName
+                ? (alreadyExported
+                    ? text.replace(`type ${symbolName}`, `type ${alias}`)
+                    : text.replace(`type ${symbolName}`, `export type ${alias}`))
+                : alreadyExported
+                    ? text
+                    : `export ${text}`;
+            return { definition, typeString, typeStringIsExpression: true };
+        }
+        // Try class
+        const classDecl = sourceFile.getClass(symbolName);
+        if (classDecl) {
+            const text = classDecl.getText();
+            const typeString = text;
+            const alreadyExported = text.trimStart().startsWith('export');
+            const definition = alias !== symbolName
+                ? (alreadyExported
+                    ? text.replace(`class ${symbolName}`, `declare class ${alias}`)
+                    : text.replace(`class ${symbolName}`, `export declare class ${alias}`))
+                : alreadyExported
+                    ? text
+                    : `export declare ${text}`;
+            return { definition, typeString, typeStringIsExpression: false };
+        }
+        // Try enum
+        const enumDecl = sourceFile.getEnum(symbolName);
+        if (enumDecl) {
+            const text = enumDecl.getText();
+            const typeString = text;
+            const alreadyExported = text.trimStart().startsWith('export');
+            const definition = alias !== symbolName
+                ? (alreadyExported
+                    ? text.replace(`enum ${symbolName}`, `enum ${alias}`)
+                    : text.replace(`enum ${symbolName}`, `export enum ${alias}`))
+                : alreadyExported
+                    ? text
+                    : `export ${text}`;
+            return { definition, typeString, typeStringIsExpression: false };
+        }
+        // A variable or a function is a value, never bundled: `validateSymbol`
+        // fails it as `not_a_type` (blueprint row N10c).
+        return null;
+    }
+    isPathSource(sourceFile) {
+        if (sourceFile.startsWith('.') ||
+            sourceFile.startsWith('/') ||
+            path.isAbsolute(sourceFile)) {
+            return true;
+        }
+        const basePath = path.resolve(this.repoRoot, sourceFile);
+        if (fs.existsSync(basePath)) {
+            return true;
+        }
+        if (path.extname(sourceFile) !== '') {
+            return false;
+        }
+        const extensions = ['.ts', '.tsx', '.js', '.jsx', '.d.ts'];
+        return extensions.some((ext) => fs.existsSync(basePath + ext));
+    }
+    isPlaceholderSource(sourceFile) {
+        const trimmed = sourceFile.trim();
+        return trimmed === '' || trimmed === '%none%' || trimmed === '%inline%';
+    }
+    log(message) {
+        console.error(`[sidecar:bundler] ${message}`);
+    }
+    logError(message) {
+        console.error(`[sidecar:bundler:error] ${message}`);
+    }
+}
