@@ -1509,21 +1509,21 @@ mod tests {
 
     #[test]
     fn a_line_with_a_key_the_format_does_not_name_is_refused() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[],\"extra\":1}\n";
         assert!(read_rows(text.as_bytes()).is_err());
     }
 
     #[test]
     fn a_row_is_a_nine_element_array() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[[\"call\",0,3,\"f\",\"a.ts\",1,null,\"void\",0]]}\n";
         let file = read_rows(text.as_bytes()).expect("a valid file");
         let row = &file.files[0].r[0];
         assert_eq!(row.kind(), Kind::Call);
         assert_eq!((row.start(), row.end()), (0, 3));
         assert_eq!(row.symbol(), Some("f"));
-        let short = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let short = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                      {\"f\":\"a.ts\",\"r\":[[\"call\",0,3]]}\n";
         assert!(read_rows(short.as_bytes()).is_err());
     }
@@ -1533,7 +1533,7 @@ mod tests {
     /// compiler version; a member row, and a declaration in a package, give none.
     #[test]
     fn the_index_names_the_default_library_globals_the_code_uses() {
-        let text = "{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
+        let text = "{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":1}\n\
                     {\"f\":\"a.ts\",\"h\":\"00\",\"r\":[\
                     [\"ident\",0,5,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
                     [\"ident\",6,9,\"fetch\",\"lib:lib.dom.d.ts\",1,null,\"x\",0],\
@@ -1569,7 +1569,7 @@ mod tests {
     ) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let mut lines = vec![format!(
-            "{{\"v\":6,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
+            "{{\"v\":7,\"typescript\":\"6.0.2\",\"service\":\"api\",\"files\":{}}}",
             files.len()
         )];
         let mut paths = Vec::new();
