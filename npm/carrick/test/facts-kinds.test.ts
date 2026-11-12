@@ -1332,6 +1332,34 @@ test("R36.4: a partial clone lacking the index commit gets no peer proof and fet
   assert.equal(git.calls(/ls-tree/), 0);
 });
 
+test("R40.3: a checkout counts as partial from a promisor pack, an included config, or any promisor or filter key", async (t) => {
+  const marks: Record<string, (git: string) => void> = {
+    // Control: a plain clone proves its peer and prints.
+    none: () => {},
+    "promisor pack": (git) => fs.writeFileSync(path.join(git, "objects", "pack", "pack-0.promisor"), ""),
+    "included config": (git) => fs.appendFileSync(path.join(git, "config"), '[include]\n\tpath = more.config\n'),
+    "conditional include": (git) => fs.appendFileSync(path.join(git, "config"), '[includeIf "gitdir:~/"]\n\tpath = more.config\n'),
+    "bare promisor key": (git) => fs.appendFileSync(path.join(git, "config"), '[remote "origin"]\n\tpromisor\n'),
+    "promisor = yes": (git) => fs.appendFileSync(path.join(git, "config"), '[remote "origin"]\n\tpromisor = yes\n'),
+    "partialclonefilter = blob:none": (git) => fs.appendFileSync(path.join(git, "config"), '[remote "origin"]\n\tpartialclonefilter = blob:none\n'),
+  };
+  const said: Record<string, string[]> = {};
+  for (const [label, mark] of Object.entries(marks)) {
+    const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
+    mark(path.join(ws.at("web"), ".git"));
+    said[label] = (await factLines(ws.root, [inLoadOrder(ws)], undefined)).lines;
+  }
+  assert.deepEqual(said, {
+    none: [LOAD_LINE],
+    "promisor pack": [],
+    "included config": [],
+    "conditional include": [],
+    "bare promisor key": [],
+    "promisor = yes": [],
+    "partialclonefilter = blob:none": [],
+  });
+});
+
 test("R36.4: the facts git runner never lets git fetch or prompt", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
   const shim = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-git-env-"));

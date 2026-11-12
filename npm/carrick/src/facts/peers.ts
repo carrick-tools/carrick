@@ -80,16 +80,20 @@ export function inRepo(file: string): string | null {
 }
 
 /**
- * Whether the checkout at `top` is a partial clone (or not known not to be):
- * its shared git config names a promisor remote or a partial clone filter.
- * Read as a file, no git run. An unreadable config counts as partial.
+ * Whether the checkout at `top` is a partial clone (or not known not to be,
+ * R40.3): its shared git dir holds a promisor pack (`objects/pack/*.promisor`),
+ * or its config includes another file (`[include]`, `[includeIf]`: what that
+ * file says is not read) or has any `promisor`, `partialclonefilter` or
+ * `partialclone` key, whatever its value. Read as files, no git run. A git
+ * dir, pack folder or config that cannot be read counts as partial.
  */
 function isPartialClone(top: string): boolean {
   const common = commonGitDir(top);
   if (common === null) return true;
   try {
+    if (fs.readdirSync(path.join(common, "objects", "pack")).some((name) => name.endsWith(".promisor"))) return true;
     const config = fs.readFileSync(path.join(common, "config"), "utf8");
-    return /^\s*(?:promisor\s*=\s*true|partialclonefilter\s*=|partialclone\s*=)/im.test(config);
+    return /^\s*\[\s*include(?:if)?\b/im.test(config) || /^\s*(?:promisor|partialclonefilter|partialclone)\s*(?:[=;#]|$)/im.test(config);
   } catch {
     return true;
   }
