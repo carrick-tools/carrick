@@ -850,13 +850,54 @@ export function rangesOfLines(text: string, lines: readonly number[]): Range[] {
   return ranges;
 }
 
-/** The innermost named span holding `offset`, or null at the top level. */
-function innermost(spans: readonly NamedSpan[], offset: number): NamedSpan | null {
-  let best: NamedSpan | null = null;
-  for (const span of spans) {
-    if (span.start <= offset && offset < span.end && (best === null || span.end - span.start < best.end - best.start)) best = span;
+/** The largest index in `0..length` whose `key` is below `bound` (or at it, with `orEqual`), else -1. */
+function lastBelow(length: number, key: (index: number) => number, bound: number, orEqual: boolean): number {
+  let low = 0;
+  let high = length - 1;
+  let found = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const value = key(mid);
+    if (value < bound || (orEqual && value === bound)) {
+      found = mid;
+      low = mid + 1;
+    } else high = mid - 1;
   }
-  return best;
+  return found;
+}
+
+/**
+ * The named spans in start order with each one's parent (they nest: the
+ * walk records a thing before its body), so the innermost span holding an
+ * offset is found by one binary search and a walk up, not a pass over all.
+ */
+function spanIndex(spans: readonly NamedSpan[]) {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const parent: number[] = [];
+  const stack: number[] = [];
+  for (const [index, span] of sorted.entries()) {
+    while (stack.length > 0 && sorted[stack[stack.length - 1]!]!.end <= span.start) stack.pop();
+    parent.push(stack.length > 0 ? stack[stack.length - 1]! : -1);
+    stack.push(index);
+  }
+  return {
+    /** The innermost span holding `offset` (`start < offset` with `strict`), or null. */
+    at(offset: number, strict: boolean): NamedSpan | null {
+      let index = lastBelow(sorted.length, (k) => sorted[k]!.start, offset, !strict);
+      while (index >= 0 && sorted[index]!.end <= offset) index = parent[index]!;
+      return index >= 0 ? sorted[index]! : null;
+    },
+    /** Every span wholly inside `range`. */
+    within(range: Range): NamedSpan[] {
+      const out: NamedSpan[] = [];
+      for (let k = lastBelow(sorted.length, (j) => sorted[j]!.start, range.start, false) + 1; k < sorted.length; k += 1) {
+        const span = sorted[k]!;
+        if (span.start >= range.end) break;
+        if (span.end <= range.end) out.push(span);
+      }
+      return out;
+    },
+  };
 }
 
 /** What an edit touched: the named things, and the unnamed calls it reached. */
@@ -874,15 +915,15 @@ export type Touched = { names: string[]; calls: CallSpan[] };
 export function touched(text: string, scan: Scan, ranges: readonly Range[], gaps: readonly number[] = []): Touched {
   const names = new Set<string>();
   const calls = new Set<CallSpan>();
-  const topCalls = scan.calls.filter((call) => innermost(scan.spans, call.start) === null);
+  const index = spanIndex(scan.spans);
+  // Removals and changed lines that no named thing holds, in offset order.
+  const topGaps: number[] = [];
   for (const gap of gaps) {
-    let best: NamedSpan | null = null;
-    for (const span of scan.spans) {
-      if (span.start < gap && gap < span.end && (best === null || span.end - span.start < best.end - best.start)) best = span;
-    }
-    if (best) names.add(best.name);
-    else for (const call of topCalls) if (call.from < gap && gap < call.end) calls.add(call);
+    const span = index.at(gap, true);
+    if (span) names.add(span.name);
+    else topGaps.push(gap);
   }
+  const topLines: Array<{ first: number; stop: number }> = [];
   for (const range of ranges) {
     // Each changed line, by its first non-blank character.
     let at = range.start;
@@ -892,13 +933,27 @@ export function touched(text: string, scan: Scan, ranges: readonly Range[], gaps
       let first = at;
       while (first < stop && /\s/.test(text[first]!)) first += 1;
       if (first < stop) {
-        const span = innermost(scan.spans, first);
+        const span = index.at(first, false);
         if (span) names.add(span.name);
-        else for (const call of topCalls) if (call.from < stop && first < call.end) calls.add(call);
+        else topLines.push({ first, stop });
       }
       at = stop + 1;
     }
-    for (const span of scan.spans) if (span.start >= range.start && span.end <= range.end) names.add(span.name);
+    for (const span of index.within(range)) names.add(span.name);
+  }
+  if (topGaps.length === 0 && topLines.length === 0) return { names: [...names], calls: [] };
+  topGaps.sort((a, b) => a - b);
+  topLines.sort((a, b) => a.first - b.first);
+  for (const call of scan.calls) {
+    if (index.at(call.start, false) !== null) continue;
+    // The first removal after the callee starts, and the first changed line ending after it.
+    const gap = topGaps[lastBelow(topGaps.length, (k) => topGaps[k]!, call.from, true) + 1];
+    let hit = gap !== undefined && gap < call.end;
+    for (let k = lastBelow(topLines.length, (j) => topLines[j]!.stop, call.from, true) + 1; !hit && k < topLines.length; k += 1) {
+      if (topLines[k]!.first >= call.end) break;
+      hit = true;
+    }
+    if (hit) calls.add(call);
   }
   return { names: [...names], calls: [...calls] };
 }

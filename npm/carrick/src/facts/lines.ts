@@ -29,6 +29,9 @@ const log = createLogger("carrick-facts");
 /** At most this many fact lines for one action. */
 export const MAX_FACT_LINES = 3;
 
+/** A file larger than this gets no fact lines (and is not read). */
+export const MAX_FACT_FILE_BYTES = 512 * 1024;
+
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
  * file as it is now that it added (`lines`) and the lines it removed lines
@@ -184,6 +187,8 @@ export async function factLines(
       if (at === null) continue;
       let text: string;
       try {
+        // A file this large is generated or bundled: never read in a hook's time.
+        if (fs.statSync(edit.file).size > MAX_FACT_FILE_BYTES) continue;
         text = fs.readFileSync(edit.file, "utf8");
       } catch {
         continue;

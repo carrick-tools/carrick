@@ -24,6 +24,7 @@ import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import fs from "node:fs";
 import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
+import { MAX_FACT_FILE_BYTES } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
@@ -149,6 +150,7 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
         continue;
       }
       try {
+        if (fs.statSync(file).size > MAX_FACT_FILE_BYTES) continue;
         const placed = placeHunks(fs.readFileSync(file, "utf8"), change.hunks);
         if (placed) out.set(file, placed);
       } catch {

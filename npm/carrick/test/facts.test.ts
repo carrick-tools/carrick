@@ -490,6 +490,24 @@ test("Codex apply_patch: its hunks place the change; a hunk that cannot be place
   assert.match(context(added.stdout), /^GET \/orders\/:id is called at /);
 });
 
+test("a file over 512 KB is skipped: a 2 MB generated file returns in under 50 ms", async (t) => {
+  const ws = await factsWorkspace(t);
+  // Warm `node:sqlite` so the timing is the file's.
+  await linesFor(ws, "orders-api/src/routes/orders.ts", "res.status(204).end();");
+  const file = ws.at("orders-api/src/routes/generated.ts");
+  const parts: string[] = [];
+  let size = 0;
+  for (let i = 0; size < 2_000_000; i += 1) {
+    const part = `export function getOrder${i}(req, res) {\n  return api.get("/orders/${i}");\n}\n`;
+    parts.push(part);
+    size += part.length;
+  }
+  fs.writeFileSync(file, parts.join(""));
+  const outcome = await factLines(ws.root, [{ file, whole: true }], undefined);
+  assert.deepEqual(outcome.lines, []);
+  assert.ok(outcome.ms < 50, `took ${outcome.ms} ms`);
+});
+
 test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
   const ndjson = [
     header(["web-app"]),
