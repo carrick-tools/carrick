@@ -1295,12 +1295,13 @@ impl SchemaCatalogue {
         marked
     }
 
-    /// A doubt about a printed or several-schema file does not stand for a
-    /// field the PR itself deletes from that file. The doubt is that the file
+    /// A printed-copy doubt does not stand for a field the PR itself deletes
+    /// from that file. A several-schemas doubt stays: another schema may still
+    /// serve the field. The doubt is that the file
     /// may be stale against the code, so it may lack a field the code still
     /// declares; a field the file declared before the PR and the PR's own diff
     /// of it no longer declares is not that case. For each reading whose
-    /// doubt is one of those two, `base_copy` gives the schema file as the
+    /// doubt is the printed-copy one, `base_copy` gives the schema file as the
     /// PR's base held it (`None` off a PR run, or where git cannot read it);
     /// when that copy declared every field the reading names, the reading
     /// loses its doubt and is a break. A printed file the PR leaves alone, and
@@ -1317,10 +1318,7 @@ impl SchemaCatalogue {
             let Some(selection) = call.undeclared_selection.as_mut() else {
                 continue;
             };
-            if !matches!(
-                selection.partial,
-                Some(PartialSchema::PrintedFromCode | PartialSchema::SeveralSchemas)
-            ) {
+            if selection.partial != Some(PartialSchema::PrintedFromCode) {
                 continue;
             }
             let base = bases

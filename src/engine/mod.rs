@@ -2197,8 +2197,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         }
     }
 
-    // On a PR run, a field the PR deletes from a printed or one-of-several
-    // schema file is a break, not a doubt: the file's own diff states it.
+    // On a PR run, a field the PR deletes from a printed schema file is a break, not a doubt: the file's own diff states it.
     // Read after the doubts above are set, from the schema file as the PR's
     // fork point held it.
     if pr_context().is_some()

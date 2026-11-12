@@ -5068,3 +5068,53 @@ async fn a_printed_schema_that_already_lacked_the_field_stays_unverifiable() {
         findings_of(&payload)
     );
 }
+
+/// Two schemas could serve the client: the PR removes the field from one, and
+/// the doubt stays, since the other may still serve it.
+#[tokio::test]
+async fn a_field_deleted_from_one_of_two_served_schemas_stays_unverifiable() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(
+        |repo| {
+            std::fs::write(
+                repo.join("apps/api/dist/schema-ops.graphql"),
+                "type Query {\n  ping: String\n}\n",
+            )
+            .unwrap();
+            edit(
+                repo,
+                "carrick.json",
+                &[(
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\"]",
+                    "\"graphqlSchemas\": [\"apps/api/dist/schema.graphql\", \"apps/api/dist/schema-ops.graphql\"]",
+                )],
+            );
+        },
+        |repo| {
+            edit(
+                repo,
+                "apps/api/src/server.ts",
+                &[("    etaDays: { type: GraphQLInt },\n", "")],
+            );
+            edit(
+                repo,
+                "apps/api/dist/schema.graphql",
+                &[("  etaDays: Int\n", "")],
+            );
+            edit(
+                repo,
+                "__llm__/analyze-file/server.json",
+                &[
+                    ("\"resolver_line\": 44", "\"resolver_line\": 43"),
+                    ("\"resolver_line\": 49", "\"resolver_line\": 48"),
+                ],
+            );
+        },
+    )
+    .await;
+    assert!(
+        parcel_page_finding(&payload).is_none(),
+        "{:#?}",
+        findings_of(&payload)
+    );
+}
