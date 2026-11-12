@@ -60,6 +60,15 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE)
 }
 
+#[path = "support/fact_files.rs"]
+mod fact_files;
+
+/// The fact layer's files for the fixture, as a scan with `express`
+/// installed and answered hands them to the orchestrator (carrick#3711).
+fn facts() -> carrick::request_summary::fact_files::FactFiles {
+    fact_files::walked_copy(&fixture_root(), &["express"], &["express", "lib-dom-fetch"])
+}
+
 /// Fixed guidance, so the golden depends on the prompt BUILDER and not on what
 /// a guidance answer happened to say. It carries an id, which is what a
 /// dispatch requires: without one the cloud keys the whole message and the
@@ -112,8 +121,10 @@ fn files(root: &Path) -> Vec<PathBuf> {
 /// Run one dispatch over the fixture and take what it collected.
 async fn dispatch(guidance: FrameworkGuidance) -> Vec<AnalyzeRow> {
     let root = fixture_root();
+    let facts = facts();
     analysis_channel::begin_dispatch();
     FileOrchestrator::new(AgentService::new())
+        .with_fact_files(fact_files::source(&facts))
         .analyze_files(
             &files(&root),
             &std::collections::HashMap::new(),
