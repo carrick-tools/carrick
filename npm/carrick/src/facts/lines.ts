@@ -50,10 +50,13 @@ const MAX_PROOF_FAILURES = 3;
  * none of them the changed lines are not known, and nothing is said.
  * `removedText` is the text of each `removed` line, in order, when the
  * patch's other lines were checked against the file: with it the file before
- * the edit can be rebuilt.
+ * the edit can be rebuilt. `read` is a Read of the file (T5): the whole file
+ * is reached and only the op and fn lookups run; never `whole`, which would
+ * make every declaration new for the same-name rule.
  */
 export type FactEdit = {
   file: string;
+  read?: boolean;
   lines?: number[] | null;
   removed?: number[] | null;
   removedText?: string[] | null;
@@ -83,6 +86,14 @@ export type FactOutcome = {
    * With it the edit hook asks no probe and queues the edit (T12-2).
    */
   present: boolean;
+  /**
+   * The `read` files (as given) the fact file answered: the store holds fn
+   * rows, the file sits in a mapped repo, scanned cleanly, both lookups ran
+   * without throwing, and the file declares a named thing or holds an unnamed
+   * op row. Only for these does a Read skip the binary's `check`; when
+   * answered and nothing prints, nothing prints (T5, P7).
+   */
+  answered: string[];
 };
 
 /**
@@ -349,7 +360,8 @@ export async function factLines(
   const callersRead: string[] = [];
   let stale = true;
   let present = false;
-  const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, ms: Math.round((performance.now() - started) * 10) / 10 });
+  const answered: string[] = [];
+  const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, answered, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // The contract kind, by tier, joined after the loop: every tier-1 line before any tier 2, then tier 3.
@@ -392,11 +404,14 @@ export async function factLines(
       });
     // Each kind's lookup on its own: a row of one kind that throws (a field
     // ingest let through) loses only that kind's lines for the file.
-    const isolated = (kind: Exclude<Kind, "contract">, lookup: () => Candidate[]): void => {
+    // Returns whether the lookup ran without throwing.
+    const isolated = (kind: Exclude<Kind, "contract">, lookup: () => Candidate[]): boolean => {
       try {
         found[kind].push(...lookup());
+        return true;
       } catch (error) {
         log(`${kind} fact lines failed`, String(error));
+        return false;
       }
     };
     // The contract candidates of one row: its first two groups, each a line.
@@ -433,6 +448,7 @@ export async function factLines(
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       if (isManifest(edit.file)) {
+        if (edit.read) continue;
         const manifest = memo.text(edit.file);
         if (manifest !== null) isolated("pkg", () => packageLines(facts, at, checkouts, manifest, edit, memo));
         continue;
@@ -456,7 +472,7 @@ export async function factLines(
       const byLine = edit.lines || edit.removed;
       // Changed lines not known (a Write over a file, a shell write, a patch
       // hunk that cannot be placed): nothing is said.
-      if (!byLine && !edit.snippets && !edit.whole) continue;
+      if (!byLine && !edit.snippets && !edit.whole && !edit.read) continue;
       // A file over `MAX_FACT_FILE_BYTES` is generated or bundled: never read
       // in a hook's time. One that does not scan cleanly says nothing.
       const read = memo.scanned(edit.file);
@@ -484,7 +500,7 @@ export async function factLines(
       const names = reach.names.filter((name) => declared.get(name) === 1);
       // The op rows this edit reaches: tier 1 of the contract kind.
       const reachedOps: FactRow[] = [];
-      isolated("op", () => {
+      const opRan = isolated("op", () => {
         const rows: FactRow[] = [];
         for (const name of names) {
           const own = namedRows(facts, at.repo, name, at.rel);
@@ -517,7 +533,7 @@ export async function factLines(
         }
       }
       // The functions' callers in other files: only the row in this file.
-      isolated("fn", () =>
+      const fnRan = isolated("fn", () =>
         names.flatMap((name) =>
           facts
             .callers(at.repo, name)
@@ -527,10 +543,20 @@ export async function factLines(
               text: fn.text,
               named: pathsOf(fn.others),
               holds: peersHold(at, fn.others),
-              file: edit.file,
+              // A Read's fn lines never stand in for the uses-count line of an edit.
+              ...(edit.read ? {} : { file: edit.file }),
             })),
         ),
       );
+      if (edit.read) {
+        // No same-name line on a Read: every declaration would read as new.
+        try {
+          if (opRan && fnRan && facts.hasCallers() && (scan.spans.length > 0 || facts.unnamed(at.repo, at.rel).length > 0)) answered.push(edit.file);
+        } catch (error) {
+          log("read answer check failed", String(error));
+        }
+        continue;
+      }
       isolated("name", () => sameNameLines(facts, at, checkouts, text, scan, edit, isJsx(edit.file), memo));
     }
     for (const one of rest) {
@@ -551,6 +577,8 @@ export async function factLines(
     }
   } catch (error) {
     log("fact lines failed", String(error));
+    // Nothing printed, so nothing was answered: a Read keeps the binary path.
+    answered.length = 0;
   } finally {
     store?.close();
   }

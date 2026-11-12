@@ -39,7 +39,7 @@ export type TimingRecord = {
   outcome: Outcome;
   /** Post-edit only: the edited file, relative to the workspace. */
   file?: string;
-  /** Post-edit only: time spent opening the fact file and matching (`facts/lines.ts`), inside `duration_ms`. */
+  /** Post-edit and post-read: time spent opening the fact file and matching (`facts/lines.ts`), inside `duration_ms`. */
   facts_ms?: number;
   /**
    * Post-edit only, and only when true: the probe's uses-count line was
