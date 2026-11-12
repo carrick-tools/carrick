@@ -78,6 +78,19 @@ mod tests {
         IndexedUnread { line, reason }
     }
 
+    /// carrick#3989 S0: an index carrying a word a later release added
+    /// reads, and the item says the raw word with no phrase.
+    #[test]
+    fn an_unknown_reason_word_is_an_item_with_the_raw_word() {
+        let site: IndexedUnread = serde_json::from_value(serde_json::json!({
+            "line": 4, "reason": "a_word_from_a_later_release",
+        }))
+        .expect("an unknown reason word reads");
+        let rows = items("src/a.ts", &[site], &[]);
+        assert_eq!(rows[0].reason, "a_word_from_a_later_release");
+        assert_eq!(rows[0].phrase, "a_word_from_a_later_release");
+    }
+
     #[test]
     fn an_item_is_edited_only_on_a_line_a_hunk_wrote() {
         let hunks = [Hunk {
