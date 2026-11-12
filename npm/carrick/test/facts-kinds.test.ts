@@ -182,6 +182,80 @@ test("fn: with a fact file the uses-count line is not printed, and no fallback i
   assert.equal("uses_fallback" in records[0]!, false);
 });
 
+/** Run post-edit for `payload`'s tool call on `file`, the probe answering with uses. */
+function usesRun(ws: Ws, file: string, extra: Record<string, unknown>) {
+  return runHook("post-edit.ts", {
+    // A session per run: the uses line is told once per file per session.
+    payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: `uses-${path.basename(file)}-${String(extra["tool_name"] ?? "")}`, cwd: ws.root, tool_input: { file_path: file }, ...extra },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") }),
+  });
+}
+
+test("the uses-count line still prints where the fn lookup did not run for the file (ruling 9)", async (t) => {
+  const files = {
+    "api/src/orders.ts": ORDERS,
+    "api/src/schema.graphql": "type Query {\n  order(id: ID!): Order\n}\n",
+    "api/src/types.ts": "export interface Order {\n  id: string;\n}\n",
+    "api/src/broken.ts": "export function loadOrder(\n",
+  };
+  const rows = [fnRow("loadOrder", LOAD_LINE)];
+  const edit = (ws: Ws, rel: string, line: string) => {
+    const file = ws.at(rel);
+    return usesRun(ws, file, { tool_response: { structuredPatch: [{ oldStart: 1, oldLines: 0, newStart: lineOf(file, line), newLines: 1, lines: [`+${line}`] }] } });
+  };
+  const ws = await workspace(t, files, rows);
+  const said = {
+    graphql: context((await edit(ws, "api/src/schema.graphql", "  order(id: ID!): Order")).stdout),
+    typesOnly: context((await edit(ws, "api/src/types.ts", "  id: string;")).stdout),
+    writeOver: context((await usesRun(ws, ws.at("api/src/orders.ts"), { tool_name: "Write", tool_response: { type: "update" } })).stdout),
+    unparseable: context((await edit(ws, "api/src/broken.ts", "export function loadOrder(")).stdout),
+  };
+  // A fact file with no fn rows at all: the lookup has nothing to say for any file.
+  const empty = await workspace(t, files, [OP_LOAD]);
+  const noFn = context((await edit(empty, "api/src/orders.ts", "  const key = `order:${id}`;")).stdout);
+  for (const [what, text] of Object.entries({ ...said, noFn })) assert.match(text, USES_LINE, what);
+});
+
+/** A full re-check answer with a contract problem and the uses lines (for a late answer). */
+function lateFixture(t: { after: (fn: () => void) => void }): string {
+  const counterpart = JSON.parse(fs.readFileSync(fixturePath("check-counterpart.json"), "utf8")) as Record<string, unknown>;
+  const uses = JSON.parse(fs.readFileSync(fixturePath("check-uses.json"), "utf8")) as Record<string, unknown>;
+  const file = path.join(fs.realpathSync(os.tmpdir()), `carrick-late-uses-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(file, JSON.stringify({ ...counterpart, uses: uses["uses"], uses_lines: uses["uses_lines"] }));
+  t.after(() => fs.rmSync(file, { force: true }));
+  return file;
+}
+
+/** The late answer for an edit of orders.ts at `const key`, delivered by the next carrier. */
+async function lateAnswer(t: { after: (fn: () => void) => void }, rows: Array<Record<string, unknown>>): Promise<string> {
+  const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "README.md": "# r\n" }, rows);
+  const env = fakeEnv({
+    HOME: ws.home,
+    CLAUDE_PROJECT_DIR: ws.root,
+    CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
+    CARRICK_FAKE_FIXTURE: lateFixture(t),
+    CARRICK_FAKE_FULL_DELAY_MS: "100",
+  });
+  const file = ws.at("api/src/orders.ts");
+  const at = lineOf(file, "const key");
+  const payload = (target: string, extra: Record<string, unknown>) => ({ hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "late", cwd: ws.root, tool_input: { file_path: target }, ...extra });
+  await runHook("post-edit.ts", { payload: payload(file, { tool_response: { structuredPatch: [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }] } }), env });
+  const sessions = path.join(ws.home, ".carrick", "sessions");
+  const until = Date.now() + 20_000;
+  while (Date.now() < until && !(fs.existsSync(sessions) && fs.readdirSync(sessions).some((name) => name.endsWith(".answer.json")))) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return context((await runHook("post-edit.ts", { payload: payload(ws.at("README.md"), {}), env })).stdout);
+}
+
+test("a late answer prints the uses-count line exactly when the edit-time answer would have (ruling 9)", async (t) => {
+  const covered = await lateAnswer(t, [fnRow("loadOrder", LOAD_LINE)]);
+  const uncovered = await lateAnswer(t, [OP_LOAD]);
+  assert.match(covered, /contract problem/);
+  assert.match(uncovered, /contract problem/);
+  assert.deepEqual([USES_LINE.test(covered), USES_LINE.test(uncovered)], [false, true]);
+});
+
 test("no fact file: post-edit's output is byte-identical to before, and uses_fallback is recorded", async (t) => {
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, null);
   const file = ws.at("api/src/orders.ts");

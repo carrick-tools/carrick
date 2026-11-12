@@ -109,6 +109,8 @@ export type FactStore = {
   unnamed: (repo: string, file: string) => FactRow[];
   /** The `fn` rows of a function `name` in `repo`, in any file. */
   callers: (repo: string, name: string) => FnRow[];
+  /** The file holds at least one `fn` row (a file whose build skipped them, or an older one, holds none). */
+  hasCallers: boolean;
   /** Every declaration of a function `name`, in any repo, ordered by (repo, file). */
   declarations: (name: string) => NameRow[];
   /** The `pkg` row of a package, or null. */
@@ -165,6 +167,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const callers = open.prepare("SELECT * FROM fns WHERE repo = ? AND name = ? ORDER BY id");
     const declarations = open.prepare("SELECT * FROM names WHERE name = ? ORDER BY repo, file, line");
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
+    const hasCallers = open.prepare("SELECT 1 FROM fns LIMIT 1").get() !== undefined;
     handed = true;
     return {
       meta,
@@ -181,6 +184,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
           total: Number(raw["total"]),
           text: String(raw["text"]),
         })),
+      hasCallers,
       declarations: (name) =>
         declarations.all(name).map((raw) => ({
           name: String(raw["name"]),

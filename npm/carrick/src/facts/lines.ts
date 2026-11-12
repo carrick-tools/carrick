@@ -75,11 +75,14 @@ export type FactOutcome = {
   /** The fact file is missing, unreadable or older than `FACTS_STALE_MS`: start a background refresh. */
   stale: boolean;
   /**
-   * The edited files (as given) in a repo a readable fact file for this
-   * workspace maps: their callers come from the fact file, so the probe's
-   * uses-count line is not printed for them (v1-agent's Q2 ruling).
+   * The edited files (as given) whose callers the fact file answered: it
+   * holds at least one `fn` row, and the fn lookup ran for the file (it
+   * scanned cleanly, its changed lines are known, and they reached a named
+   * thing declared once). Only for these is the probe's uses-count line left
+   * out, at edit time and in a late answer (carrick#4017; plan section 26
+   * ruling 9).
    */
-  covered: string[];
+  callersRead: string[];
 };
 
 /**
@@ -237,9 +240,9 @@ export async function factLines(
   const now = options.now ?? Date.now();
   const lines: string[] = [];
   const claims: FactOutcome["claims"] = {};
-  const covered: string[] = [];
+  const callersRead: string[] = [];
   let stale = true;
-  const done = (): FactOutcome => ({ lines, claims, stale, covered, ms: Math.round((performance.now() - started) * 10) / 10 });
+  const done = (): FactOutcome => ({ lines, claims, stale, callersRead, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<(typeof KINDS)[number], Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
@@ -262,17 +265,18 @@ export async function factLines(
       });
     // Each kind's lookup on its own: a row of one kind that throws (a field
     // ingest let through) loses only that kind's lines for the file.
-    const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): void => {
+    const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): boolean => {
       try {
         found[kind].push(...lookup());
+        return true;
       } catch (error) {
         log(`${kind} fact lines failed`, String(error));
+        return false;
       }
     };
     for (const edit of edits) {
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
-      covered.push(edit.file);
       if (isManifest(edit.file)) {
         const manifest = readSmall(edit.file);
         if (manifest !== null) isolated("pkg", () => packageLines(facts, at, where, manifest, edit));
@@ -332,7 +336,9 @@ export async function factLines(
         return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others) }));
       });
       // The functions' callers in other files: only the row in this file.
-      isolated("fn", () =>
+      // When the fact file holds callers at all and the lookup ran for a
+      // named thing here, they stand in for the probe's uses-count line.
+      const callersRan = isolated("fn", () =>
         names.flatMap((name) =>
           facts
             .callers(at.repo, name)
@@ -340,6 +346,7 @@ export async function factLines(
             .map((fn) => ({ key: `fn::${fn.repo}::${fn.file}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) })),
         ),
       );
+      if (callersRan && facts.hasCallers && names.length > 0) callersRead.push(edit.file);
       isolated("name", () => sameNameLines(facts, at, where, text, scan, edit, isJsx(edit.file)));
     }
     // At most `MAX_FACT_LINES`, kind by kind, each line once per session.

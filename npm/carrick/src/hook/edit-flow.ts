@@ -107,7 +107,7 @@ export async function editFlow(
           session,
         )
       : null;
-  const covered = new Set(facts?.covered ?? []);
+  const covered = new Set(facts?.callersRead ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
@@ -144,7 +144,9 @@ export async function editFlow(
 
   const queued = new Set<string>();
   if (toQueue.length > 0 && session) {
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt);
+    // A file whose callers the fact lines answered keeps its late answer free
+    // of the uses-count line too, as this answer would have been.
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     // A queued file says nothing now: its answer is delivered with the next

@@ -90,6 +90,11 @@ export type QueueEntry = {
    * (`late.ts`); absent on an entry no Stop named.
    */
   named?: string[];
+  /**
+   * The edit-time fact lines answered this file's callers, so its answer
+   * leaves out the uses-count line (`facts/lines.ts` `callersRead`).
+   */
+  facts_callers?: true;
 };
 
 export type Answer = {
@@ -105,6 +110,8 @@ export type Answer = {
   kind?: "changed";
   /** The files Stop named when it queued a `changed` entry, carried from the entry. */
   named?: string[];
+  /** Carried from the entry: the late answer leaves out the uses-count line. */
+  facts_callers?: true;
   result?: CheckResult;
   /** What a `changed` entry's `check --changed` answered. */
   changed?: ChangedResult;
@@ -131,6 +138,8 @@ export type Pending = QueueEntry & { toldRunning: boolean };
 
 type Options = { home?: string };
 type ChangedOptions = Options & { named?: string[] };
+/** `factsCallers`: the files whose edit-time fact lines answered their callers. */
+type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string> };
 
 export function rechecksDir(root: string): string {
   return path.join(root, ".carrick", "rechecks");
@@ -212,7 +221,7 @@ export function enqueue(
   session: string,
   files: string[],
   now: number,
-  options: Options = {},
+  options: EnqueueOptions = {},
 ): QueueEntry[] {
   const queued: QueueEntry[] = [];
   for (const file of files) {
@@ -225,6 +234,7 @@ export function enqueue(
       root,
       enqueued_at: new Date(now).toISOString(),
       attempts: 0,
+      ...(options.factsCallers?.has(file) ? { facts_callers: true as const } : {}),
     };
     const pending = sessionPart(session, seq, "pending.json", options.home);
     if (pending === null) continue;
@@ -453,6 +463,7 @@ function writeAnswer(
     finished_at: new Date(finishedAt).toISOString(),
     ...(isChanged(entry) ? { kind: "changed" as const } : {}),
     ...(entry.named !== undefined ? { named: entry.named } : {}),
+    ...(entry.facts_callers ? { facts_callers: true as const } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);
