@@ -1850,7 +1850,10 @@ fn place(from: PlaceFrom, at: &str) -> Place {
 }
 
 /// The kind and role a label's role and op force, where they force one.
-pub(super) fn kind_and_role(
+/// The library reader reads the same kind rule (carrick#3504 B10-3,
+/// Q-B3e): where it forces none, a name the reader did not read before
+/// waits on the site path's kind question.
+pub(crate) fn kind_and_role(
     role: &str,
     op: Option<&str>,
 ) -> (Option<&'static str>, Option<&'static str>) {

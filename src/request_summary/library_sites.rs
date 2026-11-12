@@ -82,6 +82,11 @@
 //!     builder returns for its arguments, read once every module's uses are
 //!     known ([`LinkedNames`]).
 //!
+//!   The library reader reads a name slot through the text reader first
+//!   ([`SiteNames`], carrick#3504 B10-3), and keeps the readings above only
+//!   where the text reader has no compiler rows or holes an own builder's
+//!   call, counted in the `message names:` line.
+//!
 //! Seams left for later tickets:
 //!
 //! - **In-repo packages** (carrick#1666): a call the call graph resolves to a
@@ -570,9 +575,45 @@ pub struct LibrarySite {
     /// ([`SiteArg::names_a_binding`]). Read only by the name census
     /// ([`crate::name_census`]); no row depends on it.
     pub linked: bool,
+    /// The library call's arguments as the text reader reads them, by
+    /// position ([`LibrarySiteIr::arg_texts`]): on a site a caller fills,
+    /// the library call's own, read in `origin`'s file ([`SiteNames`]).
+    pub(super) arg_texts: Vec<Option<ValueAt>>,
+    /// The slots (argument, key) the library call writes as a call of one
+    /// of the service's own builders (`topicFor("x")`), before any binding
+    /// is read: where the text reader holes such a slot, today's reading
+    /// stands (carrick#3504 B10-3, until F4).
+    pub(super) builder_slots: BTreeSet<(usize, Option<String>)>,
+    /// On a site a caller fills: the slots a caller on the way writes as a
+    /// call of an own builder (`send(topicFor("x"))`), as written. Where the
+    /// text reader holes such a slot's chain, today's reading stands there
+    /// (B10-3, until F4). Empty on a library call.
+    pub(super) caller_builders: BTreeSet<(usize, Option<String>)>,
+    /// On a site a caller fills: the callers' calls from the library call
+    /// out to this one ([`CallerChain`]), so the text reader's value of the
+    /// same chain is told from another chain's at the same call. Empty on a
+    /// library call.
+    pub chain: CallerChain,
 }
 
+/// The calls a name was read through from a library call out to a caller, a
+/// parameter's caller at a time, innermost first: each call's file and its
+/// span in discovery numbering (carrick#3504 B10-3). Today's reading
+/// ([`LibrarySite::chain`]) and the text reader ([`PlacedName::chain`])
+/// walk the same calls, so two chains that end at one call are told apart
+/// by it.
+pub type CallerChain = Vec<(PathBuf, u32, u32)>;
+
 impl LibrarySite {
+    /// Whether the slot `arg` (its entry `key`) is written as a call of an
+    /// own builder on the way to this site: by the library call itself
+    /// ([`Self::builder_slots`]; a caller-filled site holds its library
+    /// call's) or by a caller between ([`Self::caller_builders`]).
+    pub(crate) fn builder_written(&self, arg: usize, key: Option<&str>) -> bool {
+        let slot = (arg, key.map(str::to_string));
+        self.builder_slots.contains(&slot) || self.caller_builders.contains(&slot)
+    }
+
     /// The contract's receiver ids the call may be made through, one check
     /// each (carrick#1689): `export`, or each of the set's makers'
     /// ([`SiteMaker::receiver_id`]), once, in the set's order.
@@ -1232,6 +1273,7 @@ impl SiteReader<'_> {
             let contested = client.contested_message || !client.returned.is_empty();
             let args = self.names.resolved_all(self.file, &site.args);
             let linked = site.args.iter().any(SiteArg::names_a_binding);
+            let builder_slots = builder_slots(&site.args);
             let library = match &client.instance {
                 None => LibrarySite {
                     file: self.file.to_path_buf(),
@@ -1251,6 +1293,10 @@ impl SiteReader<'_> {
                     export_uses: client.export_uses.clone(),
                     origin: None,
                     linked,
+                    arg_texts: site.arg_texts.clone(),
+                    builder_slots,
+                    caller_builders: BTreeSet::new(),
+                    chain: Vec::new(),
                 },
                 Some(_) => {
                     // What an own call holds is what the function returns,
@@ -1317,6 +1363,10 @@ impl SiteReader<'_> {
                         export_uses,
                         origin: None,
                         linked,
+                        arg_texts: site.arg_texts.clone(),
+                        builder_slots,
+                        caller_builders: BTreeSet::new(),
+                        chain: Vec::new(),
                     }
                 }
             };
@@ -1326,7 +1376,14 @@ impl SiteReader<'_> {
                 && library.args.iter().any(SiteArg::has_holes)
             {
                 let mut chain = Vec::new();
-                self.fill_from_callers(&library, &library.args, (self.file, key), &mut chain, out);
+                self.fill_from_callers(
+                    &library,
+                    &library.args,
+                    (&BTreeSet::new(), &Vec::new()),
+                    (self.file, key),
+                    &mut chain,
+                    out,
+                );
             }
             out.push(library);
         }
@@ -1452,11 +1509,15 @@ impl SiteReader<'_> {
     /// them), stated as `origin` again at the call (carrick#1562). A call
     /// that fills a hole with text states it; one that passes its own
     /// parameter on leaves the hole open for its own callers, up to the hop
-    /// cap. A spread argument at a call fills nothing.
+    /// cap. A spread argument at a call fills nothing. `on_the_way` is the
+    /// slots a caller between writes as a call of an own builder
+    /// ([`LibrarySite::caller_builders`]) and the callers' calls so far
+    /// ([`LibrarySite::chain`]).
     fn fill_from_callers(
         &self,
         origin: &LibrarySite,
         args: &[SiteArg],
+        on_the_way: (&BTreeSet<(usize, Option<String>)>, &CallerChain),
         function: (&Path, &str),
         chain: &mut Vec<(PathBuf, String)>,
         out: &mut Vec<LibrarySite>,
@@ -1465,11 +1526,20 @@ impl SiteReader<'_> {
             return;
         }
         chain.push((function.0.to_path_buf(), function.1.to_string()));
+        let (builders, via) = on_the_way;
         for caller in self.callers.of(function.0, function.1) {
-            let Some(passed) = &caller.call.site_args else {
+            let Some(written) = &caller.call.site_args else {
                 continue;
             };
-            let passed = self.names.resolved_all(caller.file, passed);
+            // The slots this caller writes as a builder's call, read before
+            // any binding is (as [`builder_slots`] reads a library call).
+            let as_written: Vec<SiteArg> = args
+                .iter()
+                .map(|arg| arg.filled(written, false).0)
+                .collect();
+            let mut builders = builders.clone();
+            builders.extend(builder_slots(&as_written));
+            let passed = self.names.resolved_all(caller.file, written);
             let mut filled = false;
             let derived: Vec<SiteArg> = args
                 .iter()
@@ -1479,6 +1549,12 @@ impl SiteReader<'_> {
                     arg
                 })
                 .collect();
+            let mut hops = via.clone();
+            hops.push((
+                caller.file.to_path_buf(),
+                caller.call.site.lo,
+                caller.call.site.hi,
+            ));
             if filled {
                 out.push(LibrarySite {
                     file: caller.file.to_path_buf(),
@@ -1491,6 +1567,8 @@ impl SiteReader<'_> {
                         span_start: origin.span_start,
                         line: origin.line,
                     }),
+                    caller_builders: builders.clone(),
+                    chain: hops.clone(),
                     ..origin.clone()
                 });
             }
@@ -1500,7 +1578,14 @@ impl SiteReader<'_> {
                     .iter()
                     .any(|(file, at)| file.as_path() == caller.file && at == key)
             {
-                self.fill_from_callers(origin, &derived, (caller.file, key), chain, out);
+                self.fill_from_callers(
+                    origin,
+                    &derived,
+                    (&builders, &hops),
+                    (caller.file, key),
+                    chain,
+                    out,
+                );
             }
         }
         chain.pop();
@@ -2025,6 +2110,286 @@ impl<'a> Callers<'a> {
     }
 }
 
+/// The slots (argument, key) `args` write as a call of an own builder, as
+/// written ([`LibrarySite::builder_slots`]).
+fn builder_slots(args: &[SiteArg]) -> BTreeSet<(usize, Option<String>)> {
+    let calls_a_builder = |pieces: &Vec<TextPiece>| {
+        pieces
+            .iter()
+            .any(|piece| matches!(piece, TextPiece::Named(named) if named.args.is_some()))
+    };
+    let mut out = BTreeSet::new();
+    for (at, arg) in args.iter().enumerate() {
+        if arg.holes.as_ref().is_some_and(calls_a_builder) {
+            out.insert((at, None));
+        }
+        for (key, pieces) in arg.object.iter().flat_map(|object| &object.holes) {
+            if calls_a_builder(pieces) {
+                out.insert((at, Some(key.clone())));
+            }
+        }
+    }
+    out
+}
+
+/// Where a name the text reader read through callers is stated: the
+/// outermost call of its chain ([`SiteNames`]), in SWC numbering, at the
+/// line of the member it names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NamePlace {
+    pub file: PathBuf,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub line: u32,
+}
+
+/// Why a name slot keeps today's reading ([`SlotName::Today`]): each is
+/// counted in the `message names:` line, and deleted when it counts zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameFallback {
+    /// The text reader has no compiler rows for the slot (a `rows_missing`
+    /// hole: no walk, or a failed one).
+    NoRows,
+}
+
+/// One value of a name slot at one place: the text, or why none is
+/// stated (a lead).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedName {
+    /// `None`: the library call itself.
+    pub place: Option<NamePlace>,
+    /// The caller chain the value was read through (empty at the library
+    /// call): the chain of today's caller-filled site it answers for.
+    pub chain: CallerChain,
+    pub name: Result<String, super::Stop>,
+}
+
+/// What the text reader reads a library site's name slot as (carrick#3504
+/// B10-3): today's reading, for a counted reason, or one value per caller
+/// chain, each placed at the chain's outermost call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotName {
+    Today(NameFallback),
+    Read(Vec<PlacedName>),
+}
+
+/// The library reader's one entry to the text reader (carrick#3504 B10-3):
+/// a site's name slot read through its callers
+/// ([`super::resolve::Resolver::texts_through_callers`]), with the library
+/// reader's policy applied per caller chain:
+///
+/// - every value of a chain is text, and there is one: the chain states it
+///   at its outermost call (the call itself when the chain is empty);
+/// - several texts on one chain: a `several_operations` lead there;
+/// - a hole on a chain: a lead there, with the hole's word;
+/// - a chain whose outermost call is no call the scan read: an `unplaced`
+///   lead at the call itself.
+///
+/// A slot the text reader has no compiler rows for keeps today's reading
+/// ([`SlotName::Today`]). So does a slot the call writes no term for (a
+/// spread, a key its object omits): `None`. Whether today's reading answers
+/// a hole (an own builder's call, the step cap) is the library reader's one
+/// rule, per chain (`today_answers` in `library_claims`).
+pub struct SiteNames<'a> {
+    inputs: &'a RequestSummaryInputs,
+    resolver: super::resolve::Resolver<'a>,
+    /// Each slot read so far, by its call's file and span start, with the
+    /// term read: calls of one chain share a start.
+    read: std::cell::RefCell<SlotReads>,
+}
+
+type SlotReads = HashMap<(PathBuf, u32, usize, Option<String>), Vec<(ValueAt, Option<SlotName>)>>;
+
+impl<'a> SiteNames<'a> {
+    pub fn of(inputs: &'a RequestSummaryInputs) -> Self {
+        SiteNames {
+            inputs,
+            resolver: super::resolve::Resolver::new(inputs, &[]),
+            read: std::cell::RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The same reader with the resolver's step cap at `cap`.
+    #[cfg(test)]
+    pub fn with_cap(inputs: &'a RequestSummaryInputs, cap: usize) -> Self {
+        SiteNames {
+            resolver: super::resolve::Resolver::new(inputs, &[]).with_cap(cap),
+            ..SiteNames::of(inputs)
+        }
+    }
+
+    /// Rewrites every value read so far that `to` names a new value for, in
+    /// place, at its own place and chain: a test reads a stop or a text the
+    /// fixture's source cannot reach offline (a differing text, the step
+    /// cap) on one chain of a real walk.
+    #[cfg(test)]
+    pub fn rewrite(&self, to: impl Fn(&PlacedName) -> Option<Result<String, super::Stop>>) {
+        for held in self.read.borrow_mut().values_mut() {
+            for (_, read) in held.iter_mut() {
+                if let Some(SlotName::Read(values)) = read {
+                    for value in values.iter_mut() {
+                        if let Some(name) = to(value) {
+                            value.name = name;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::rewrite`], for a value `to` replaces whole: its place and
+    /// chain too (a hole at the library call itself).
+    #[cfg(test)]
+    pub fn rewrite_values(&self, to: impl Fn(&PlacedName) -> Option<PlacedName>) {
+        for held in self.read.borrow_mut().values_mut() {
+            for (_, read) in held.iter_mut() {
+                if let Some(SlotName::Read(values)) = read {
+                    for value in values.iter_mut() {
+                        if let Some(new) = to(value) {
+                            *value = new;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `site`'s slot `arg` (its entry `key`), read as the text reader reads
+    /// it. A site a caller fills ([`LibrarySite::origin`]) is read as its
+    /// library call is.
+    pub fn read(&self, site: &LibrarySite, arg: usize, key: Option<&str>) -> Option<SlotName> {
+        let (file, span_start) = match &site.origin {
+            Some(origin) => (origin.file.clone(), origin.span_start),
+            None => (site.file.clone(), site.span_start),
+        };
+        let term = site.arg_texts.get(arg).cloned().flatten()?;
+        let term = match key {
+            None => term,
+            Some(key) => super::resolve::handed(&term, &[key.to_string()])?,
+        };
+        let at = (file, span_start, arg, key.map(str::to_string));
+        if let Some((_, read)) = self
+            .read
+            .borrow()
+            .get(&at)
+            .and_then(|held| held.iter().find(|(read, _)| *read == term))
+        {
+            return read.clone();
+        }
+        let read = self.read_slot(&at.0, &term);
+        self.read
+            .borrow_mut()
+            .entry(at)
+            .or_default()
+            .push((term, read.clone()));
+        read
+    }
+
+    fn read_slot(&self, file: &Path, term: &ValueAt) -> Option<SlotName> {
+        use super::guards::HoleReason;
+        let values = self.resolver.texts_through_callers(file, term);
+        if values.is_empty() {
+            return None;
+        }
+        let hole = |value: &super::resolve::TextValue| match value {
+            super::resolve::TextValue::Text { .. } => None,
+            super::resolve::TextValue::Hole { reason, .. } => Some(*reason),
+            super::resolve::TextValue::Pieced(_) => Some(HoleReason::UnreadExpression),
+        };
+        if values
+            .iter()
+            .any(|value| hole(value) == Some(HoleReason::RowsMissing))
+        {
+            return Some(SlotName::Today(NameFallback::NoRows));
+        }
+        // One group per caller chain, in the order read.
+        let mut chains: Vec<(&[_], Vec<&super::resolve::TextValue>)> = Vec::new();
+        for value in &values {
+            match chains
+                .iter_mut()
+                .find(|(chain, _)| *chain == value.callers())
+            {
+                Some((_, held)) => held.push(value),
+                None => chains.push((value.callers(), vec![value])),
+            }
+        }
+        let mut out = Vec::new();
+        for (calls, held) in chains {
+            let chain: CallerChain = calls
+                .iter()
+                .map(|call| (call.file.clone(), call.lo, call.hi))
+                .collect();
+            let place = match calls.last() {
+                None => None,
+                Some(outer) => match self.place(&outer.file, outer.lo, outer.hi) {
+                    Some(place) => Some(place),
+                    // A chain whose outermost call is no call the scan read
+                    // is a lead at the library call: `unplaced`.
+                    None => {
+                        tracing::debug!(
+                            file = %outer.file.display(),
+                            lo = outer.lo,
+                            "library names: a caller chain's outermost call is no call the scan read"
+                        );
+                        out.push(PlacedName {
+                            place: None,
+                            chain,
+                            name: Err(super::Stop::Unplaced),
+                        });
+                        continue;
+                    }
+                },
+            };
+            let name = match held.iter().find_map(|value| hole(value)) {
+                Some(reason) => Err(super::Stop::from(reason)),
+                None => {
+                    let mut texts: Vec<&str> = Vec::new();
+                    for value in &held {
+                        if let super::resolve::TextValue::Text { text, .. } = value
+                            && !texts.contains(&text.as_str())
+                        {
+                            texts.push(text);
+                        }
+                    }
+                    match texts.as_slice() {
+                        [one] => Ok(one.to_string()),
+                        _ => Err(super::Stop::SeveralOperations),
+                    }
+                }
+            };
+            out.push(PlacedName { place, chain, name });
+        }
+        Some(SlotName::Read(out))
+    }
+
+    /// The call at `lo..hi` (discovery numbering) of `file`, as a place.
+    fn place(&self, file: &Path, lo: u32, hi: u32) -> Option<NamePlace> {
+        fn find(body: &FnIr, lo: u32, hi: u32) -> Option<&super::CallIr> {
+            body.read_calls()
+                .map(|(call, _)| call)
+                .find(|call| call.site.lo == lo && call.site.hi == hi)
+                .or_else(|| {
+                    body.nested
+                        .iter()
+                        .chain(&body.detached)
+                        .find_map(|inner| find(inner, lo, hi))
+                })
+        }
+        let ir = self.inputs.files.get(file)?;
+        let call = ir
+            .functions
+            .values()
+            .chain(std::iter::once(&ir.module_level))
+            .find_map(|body| find(body, lo, hi))?;
+        Some(NamePlace {
+            file: file.to_path_buf(),
+            span_start: call.site.span_start,
+            span_end: call.site.span_end,
+            line: call.name_line,
+        })
+    }
+}
+
 /// A call or construction made through a library client, as one function
 /// body (or the module's own level) writes it.
 #[derive(Debug, Clone)]
@@ -2037,6 +2402,10 @@ pub(super) struct LibrarySiteIr {
     pub(super) path: Vec<String>,
     pub(super) member: Option<String>,
     pub(super) args: Vec<SiteArg>,
+    /// Each argument as the text reader reads it ([`super::resolve::args_text`],
+    /// carrick#3504 B10-3), by position: the terms a name slot is read
+    /// through ([`SiteNames`]).
+    pub(super) arg_texts: Vec<Option<ValueAt>>,
     /// The decorated member's name, set by the decorator reader
     /// ([`super::Reader::decorator_sites`]); `None` for any other site.
     pub(super) decorated: Option<String>,
@@ -2087,6 +2456,7 @@ impl Reader<'_> {
             path,
             member,
             args: site_args(args, scope),
+            arg_texts: super::resolve::args_text(args, &|lo| lo, scope.class()),
             decorated: None,
         })
     }
