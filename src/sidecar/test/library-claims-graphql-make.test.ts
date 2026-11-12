@@ -38,6 +38,14 @@ export interface GqlRequest {
 export type RequestHandler = (request: GqlRequest) => Promise<string>;
 export declare function createGqlServer(options: { schema: SchemaSource; endpoint?: string }): RequestHandler;
 export declare function createEagerServer(options: { schema: Schema; endpoint?: string }): RequestHandler;
+export interface GraphQLSchemaLike {
+  readonly kind: 'Schema';
+  readonly types: readonly string[];
+}
+export declare function createObjectServer(options: { schema: GraphQLSchemaLike; endpoint?: string }): RequestHandler;
+export declare function createSdlServer(options: { schema: string }): RequestHandler;
+export declare function createLooseServer(options: { schema: any }): RequestHandler;
+export declare function createUnknownServer(options: { schema: unknown }): RequestHandler;
 export declare function noSchema(options: { endpoint: string }): RequestHandler;
 `;
 
@@ -90,10 +98,24 @@ describe('verify_library_claims: a graphql make (S2a)', () => {
     );
   });
 
-  it('judges runs as an adapter make does: a schema object, not a function, is runs_not_function', () => {
+  it('runs is verified on a schema object or a factory function, by declared type only', () => {
+    const runs = { runs: { arg: 0, key: 'schema' } };
+    assert.strictEqual(verdict(make('server_framework', runs, 'createObjectServer')), 'verified');
+    assert.strictEqual(verdict(make('server_framework', runs, 'createEagerServer')), 'verified');
+    assert.strictEqual(verdict(make('server_framework', runs, 'createGqlServer')), 'verified');
+  });
+
+  it('runs on a primitive fails runs_not_schema; any and unknown read unchecked runs_untyped', () => {
+    const runs = { runs: { arg: 0, key: 'schema' } };
+    assert.strictEqual(verdict(make('server_framework', runs, 'createSdlServer')), 'failed runs_not_schema');
+    assert.strictEqual(verdict(make('server_framework', runs, 'createLooseServer')), 'unchecked runs_untyped');
+    assert.strictEqual(verdict(make('server_framework', runs, 'createUnknownServer')), 'unchecked runs_untyped');
+  });
+
+  it('a graphql make whose runs key is absent fails key as before', () => {
     assert.strictEqual(
-      verdict(make('server_framework', { runs: { arg: 0, key: 'schema' } }, 'createEagerServer')),
-      'failed runs_not_function'
+      verdict(make('server_framework', { runs: { arg: 0, key: 'nope' } }, 'createObjectServer')),
+      'failed key_missing'
     );
   });
 
