@@ -267,6 +267,10 @@ pub fn from_scan(
         let Some((line, text)) = discovery.missed_at.get(at) else {
             continue;
         };
+        // A call whose walk reached only route registrations in a sibling's
+        // code registers a route this service serves: an HTTP one, whose
+        // labelled end is the sibling's (carrick#2474 R5b).
+        let route = discovery.sibling_routes_at.get(at);
         out.push(UnreadSite {
             file: at.0.clone(),
             line: *line,
@@ -278,9 +282,17 @@ pub fn from_scan(
             callee: callee(text),
             stop_at: None,
             depth: 0,
-            labelled_end: None,
-            kind: None,
-            role: None,
+            labelled_end: route.map(|end| LabelledEndRef {
+                package: end.package.clone(),
+                export: end.export.clone(),
+                member: end.member.clone(),
+            }),
+            kind: route
+                .and_then(|_| kind_of("server_framework"))
+                .map(str::to_string),
+            role: route
+                .and_then(|_| role_of("server_framework", Some("receive")))
+                .map(str::to_string),
             ends: Vec::new(),
             listed: false,
         });
