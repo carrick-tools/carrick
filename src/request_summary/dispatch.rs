@@ -496,7 +496,6 @@ mod tests {
             name_scope: None,
             name_at_maker: false,
             package: "fixture-router".into(),
-            version: None,
             export: "Router".into(),
             member: Some("get".into()),
             role: "server_framework".into(),

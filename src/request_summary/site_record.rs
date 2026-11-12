@@ -1811,35 +1811,30 @@ impl StatedBuilder {
     }
 }
 
-/// A procedure call's method label in the wire method tRPC's HTTP adapter
-/// serves it on (carrick#3186): the server's procedure rows are HTTP rows on
-/// that method (query GET, mutation POST), so the client row states it too.
-/// The label's own word is read first (`QUERY`, `MUTATE`, `SUBSCRIBE` or an
-/// HTTP method word); where the label states none, the member's name decides
+/// A procedure call's method label in the wire method the library's HTTP
+/// adapter serves it on (carrick#3186): the server's procedure rows are HTTP
+/// rows on that method (query GET, mutation POST), so the client row states
+/// it too. The label's own word is read first (`QUERY`, `MUTATE` or an HTTP
+/// method word); where the label states none, the member's name decides
 /// (`useMutation` and `mutationOptions` are POST, `useQuery` and
 /// `queryOptions` GET). A slot the code writes (`from`) is left alone.
 ///
-/// A subscription is GET only where the adapter streams it over SSE (major 11
-/// and up). Below that, or where the installed version is not known, the
-/// adapter refuses it (tRPC 10: "Subscriptions should use wsLink"), so no
-/// method is stated and the stop says why (carrick#4048).
+/// A subscription kind word, or a subscription member where the label states
+/// no word, implies no HTTP method: it states one only where the label
+/// itself states an HTTP method word (`GET` for an SSE adapter). Otherwise
+/// no method is stated and the stop says why (carrick#4048).
 fn procedure_wire_label(
     mut label: MethodLabel,
     member: Option<&str>,
-    version: Option<&str>,
 ) -> (MethodLabel, Option<Stop>) {
     let is_subscription = |word: &str| word.to_ascii_lowercase().contains("subscri");
-    let streams = version
-        .and_then(|version| version.split('.').next())
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 11);
     let stated = label.literal.as_deref().or(label.default.as_deref());
     let subscription = match (stated, label.from.is_some()) {
         (Some(word), _) => is_subscription(word),
         (None, false) => member.is_some_and(is_subscription),
         (None, true) => false,
     };
-    if subscription && !streams {
+    if subscription {
         label.literal = None;
         label.default = None;
         return (label, Some(Stop::ProcedureSubscriptionNotHttp));
@@ -1848,7 +1843,7 @@ fn procedure_wire_label(
         let word = word.to_ascii_lowercase();
         if word.contains("mutat") {
             "POST".to_string()
-        } else if word.contains("query") || word.contains("subscri") {
+        } else if word.contains("query") {
             "GET".to_string()
         } else {
             word.to_ascii_uppercase()
@@ -2166,11 +2161,7 @@ fn record(
     // site is a lead with its stop, never a row (carrick#4048).
     let mut no_wire_method = false;
     if procedure {
-        let (wire, stop) = procedure_wire_label(
-            method_label,
-            label.member.as_deref(),
-            label.version.as_deref(),
-        );
+        let (wire, stop) = procedure_wire_label(method_label, label.member.as_deref());
         method_label = wire;
         if let Some(stop) = stop {
             no_wire_method = true;
@@ -2637,7 +2628,7 @@ mod tests {
             literal: literal.map(str::to_string),
         };
         let stated = |label: MethodLabel, member: &str| {
-            let (label, stop) = procedure_wire_label(label, Some(member), Some("10.45.3"));
+            let (label, stop) = procedure_wire_label(label, Some(member));
             assert_eq!(stop, None);
             label.literal.or(label.default)
         };
@@ -2664,34 +2655,26 @@ mod tests {
         assert_eq!(stated(label(None, None), "invalidate"), None);
     }
 
-    /// carrick#4048: a subscription is GET only where the adapter streams it
-    /// (major 11 and up). Below that, or at an unknown version, it states no
-    /// method and carries its stop; a query keeps GET at every version.
+    /// carrick#4048: a subscription kind word or member implies no HTTP
+    /// method; it states one only where the label states an HTTP method word.
+    /// A query keeps GET.
     #[test]
-    fn a_procedure_subscription_states_get_only_where_the_adapter_streams_it() {
-        let subscribe = |literal: Option<&str>, member: &str, version: Option<&str>| {
+    fn a_procedure_subscription_states_a_method_only_where_the_label_does() {
+        let subscribe = |literal: Option<&str>, member: &str| {
             let label = MethodLabel {
                 from: None,
                 default: None,
                 literal: literal.map(str::to_string),
             };
-            let (label, stop) = procedure_wire_label(label, Some(member), version);
+            let (label, stop) = procedure_wire_label(label, Some(member));
             (label.literal.or(label.default), stop)
         };
         let refused = (None, Some(Stop::ProcedureSubscriptionNotHttp));
         let get = (Some("GET".to_string()), None);
-        assert_eq!(
-            subscribe(Some("SUBSCRIBE"), "subscribe", Some("10.45.3")),
-            refused
-        );
-        assert_eq!(subscribe(None, "useSubscription", Some("10.45.3")), refused);
-        assert_eq!(subscribe(Some("SUBSCRIBE"), "subscribe", None), refused);
-        assert_eq!(
-            subscribe(Some("SUBSCRIBE"), "subscribe", Some("11.0.0")),
-            get
-        );
-        assert_eq!(subscribe(None, "useSubscription", Some("11.0.0-rc.1")), get);
-        assert_eq!(subscribe(Some("QUERY"), "query", Some("10.45.3")), get);
+        assert_eq!(subscribe(Some("SUBSCRIBE"), "subscribe"), refused);
+        assert_eq!(subscribe(None, "useSubscription"), refused);
+        assert_eq!(subscribe(Some("GET"), "subscribe"), get);
+        assert_eq!(subscribe(Some("QUERY"), "query"), get);
     }
 
     /// carrick#3213: a name written as a template folds only where every

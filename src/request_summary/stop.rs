@@ -139,9 +139,9 @@ pub enum Stop {
     ProcedureUnmounted,
     /// No adapter reaches the router that holds a procedure.
     ProcedureNoAdapter,
-    /// A procedure subscription on a library version whose HTTP adapter
-    /// does not serve subscriptions (tRPC 10 refuses them: they use a
-    /// websocket link), so the call states no wire method (carrick#4048).
+    /// A procedure subscription whose label states no HTTP method: a
+    /// subscription implies none by itself, so the call states no wire
+    /// method (carrick#4048).
     ProcedureSubscriptionNotHttp,
     /// A word a later release added: read from a blob, never written by
     /// this build's own passes, and in no [`Stop::ALL`]. A reader says the

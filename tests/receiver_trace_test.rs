@@ -2797,12 +2797,12 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
     );
 }
 
-/// carrick#4048: a subscription call on a library version whose HTTP adapter
-/// refuses subscriptions (tRPC 10) states no wire method: no row, and the
-/// call is saved unread with its reason. The same call at a version that
-/// streams them (11) keeps its GET row (`procedure_client_rows`).
+/// carrick#4048: a subscription call whose label states no HTTP method
+/// (`SUBSCRIBE`) states no wire method: no row, and the call is saved unread
+/// with its reason. The same call whose label states `GET` (an SSE adapter)
+/// keeps its GET row (`procedure_client_rows`).
 #[test]
-fn a_v10_subscription_call_is_saved_unread_and_states_no_get_row() {
+fn a_subscription_call_with_no_method_word_is_saved_unread() {
     let blobs = scan_fixture("procedure-client");
     let (flat, graph) = client_rows(&blobs);
     for rows in [&flat, &graph] {

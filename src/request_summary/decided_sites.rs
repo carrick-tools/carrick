@@ -224,10 +224,6 @@ pub struct MethodLabel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteLabel {
     pub package: String,
-    /// The package's installed version, as the store answered it (carrick#4048).
-    /// Never sent: the label's wire shape is unchanged.
-    #[serde(skip)]
-    pub version: Option<String>,
     pub export: String,
     #[serde(default)]
     pub member: Option<String>,
@@ -347,8 +343,6 @@ impl SiteLabel {
         struct Package {
             package: String,
             #[serde(default)]
-            version: Option<String>,
-            #[serde(default)]
             exports: Vec<Export>,
         }
         let packages: Vec<Package> = answer
@@ -364,7 +358,6 @@ impl SiteLabel {
                     labels.push(SiteLabel {
                         new: false,
                         package: package.package.clone(),
-                        version: package.version.clone(),
                         export: export.export.clone(),
                         member: op.member,
                         role: export.role.clone(),
@@ -423,7 +416,6 @@ impl SiteLabel {
                     labels.push(SiteLabel {
                         new: false,
                         package: export.package.clone(),
-                        version: Some(export.version.clone()),
                         export: export.export.clone(),
                         member: member.clone(),
                         role: role.clone(),
@@ -541,7 +533,6 @@ impl SiteLabel {
                 labels.push(SiteLabel {
                     new,
                     package: export.package.clone(),
-                    version: Some(export.version.clone()),
                     export: export.export.clone(),
                     member: member.clone(),
                     role: role.clone(),
@@ -4809,7 +4800,6 @@ pub(crate) mod tests {
                     name_scope: None,
                     name_at_maker: false,
                     package: "@fixture/http".into(),
-                    version: None,
                     export: "createClient".into(),
                     member: Some("post".into()),
                     role: "http_client".into(),
@@ -4836,7 +4826,6 @@ pub(crate) mod tests {
                     // A name bound to the maker is read there (carrick#3527).
                     name_at_maker: true,
                     package: "@fixture/http".into(),
-                    version: None,
                     export: "createClient".into(),
                     member: Some("send".into()),
                     role: "http_client".into(),
@@ -5744,7 +5733,6 @@ pub(crate) mod tests {
             name_scope: None,
             name_at_maker: false,
             package: "@fixture/wire".into(),
-            version: None,
             export: "connect".into(),
             member: Some(member.into()),
             role: "socket".into(),
@@ -5770,7 +5758,6 @@ pub(crate) mod tests {
             name_scope: None,
             name_at_maker: false,
             package: "lib:lib.dom.d.ts".into(),
-            version: None,
             export: "fetch".into(),
             member: None,
             role: "http_client".into(),
@@ -5804,7 +5791,6 @@ pub(crate) mod tests {
             name_scope: None,
             name_at_maker: false,
             package: "node:child_process".into(),
-            version: None,
             export: "ChildProcess".into(),
             member: Some("send".into()),
             role: "in_process_bus".into(),
@@ -6686,7 +6672,6 @@ pub(crate) mod tests {
             name_scope: None,
             name_at_maker: false,
             package: "@fixture/http".into(),
-            version: None,
             export: "default".into(),
             member: Some("get".into()),
             role: "http_client".into(),
