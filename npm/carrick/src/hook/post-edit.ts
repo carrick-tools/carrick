@@ -30,6 +30,7 @@ import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
 import { sessionKey } from "./session-key.ts";
+import { isManifest } from "../facts/rules/packages.ts";
 import { createLogger } from "../log.ts";
 import { timed, type Timing } from "./timings.ts";
 
@@ -108,7 +109,9 @@ async function main(timing: Timing): Promise<void> {
   const absolute = (file: string) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file));
   const named = filesFromPayload(payload);
   const edited = named.filter((file) => CHECKED.test(file)).map(absolute);
-  const factOnly = named.filter((file) => FACT_ONLY.test(file)).map(absolute);
+  // JavaScript (`FACT_FILE`) and a `package.json` (`facts/rules/packages.ts`)
+  // reach the fact lines only: the probe and re-check never run on them.
+  const factOnly = named.filter((file) => FACT_ONLY.test(file) || isManifest(file)).map(absolute);
   const session = sessionKey(payload);
   if (edited.length === 0 && factOnly.length === 0) {
     // Nothing of ours to check in this edit, but a finished background answer

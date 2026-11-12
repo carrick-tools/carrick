@@ -51,8 +51,9 @@ export async function editFlow(
      */
     shell?: boolean;
     /**
-     * Files the fact path reads that the probe does not (JavaScript, `FACT_FILE`):
-     * they get fact lines and nothing else, so `edited` may be empty.
+     * Files the fact path reads that the probe does not (JavaScript,
+     * `FACT_FILE`; a `package.json`): they get fact lines and nothing else,
+     * are never probed, queued or recorded as an edit, so `edited` may be empty.
      */
     factOnly?: string[];
   },

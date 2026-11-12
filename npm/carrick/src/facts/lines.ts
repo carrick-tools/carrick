@@ -24,6 +24,16 @@ import type { CallSpan, Scan } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import { sameNameLines } from "./rules/same-name.ts";
+import { isManifest, packageLines } from "./rules/packages.ts";
+
+/** A file's text, or null when it is unreadable or over `MAX_FACT_FILE_BYTES`. */
+function readSmall(file: string): string | null {
+  try {
+    return fs.statSync(file).size > MAX_FACT_FILE_BYTES ? null : fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
 import type { FactRow, FactStore, LocalRepo } from "./store.ts";
 
 const log = createLogger("carrick-facts");
@@ -240,6 +250,11 @@ export async function factLines(
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       covered.push(edit.file);
+      if (isManifest(edit.file)) {
+        const manifest = readSmall(edit.file);
+        if (manifest !== null) found.pkg.push(...packageLines(store, at, where, manifest, edit));
+        continue;
+      }
       if (!SCANNED.test(edit.file)) continue;
       const byLine = edit.lines || edit.removed;
       // Changed lines not known (a Write over a file, a shell write, a patch
