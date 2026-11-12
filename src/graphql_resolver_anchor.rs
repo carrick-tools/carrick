@@ -38,12 +38,16 @@ use std::path::Path;
 
 use swc_common::{SourceMap, Spanned, sync::Lrc};
 use swc_ecma_ast::{
-    ClassMethod, Decl, DefaultDecl, Expr, ExprOrSpread, FnDecl, MethodProp, ModuleDecl, ModuleItem,
-    ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt, VarDeclarator,
+    BlockStmtOrExpr, CallExpr, ClassMethod, Decl, DefaultDecl, Expr, ExprOrSpread, FnDecl,
+    MethodProp, ModuleDecl, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, ReturnStmt,
+    Stmt, VarDeclarator,
 };
 use swc_ecma_visit::{Visit, VisitWith};
 
+use crate::graphql::SdlTypeFields;
+use crate::graphql_schema_builder::PackageValueReader;
 use crate::import_bindings::DEFAULT_EXPORT;
+use crate::operation::GraphqlOperationKind;
 
 /// Nested calls a field value is read through (`t.field(withAuth({ … }))`).
 const CALL_DEPTH: usize = 3;
@@ -413,6 +417,193 @@ fn prop_name(name: &PropName) -> Option<String> {
     }
 }
 
+/// A root field the service's own schema says a property of this file
+/// defines (carrick#1295): `kind`, `field` and the 1-based line of the
+/// property's key, which [`resolver_anchor`] reads down to the resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootFieldClaim {
+    pub kind: GraphqlOperationKind,
+    pub field: String,
+    pub line: u32,
+}
+
+/// The root fields the object literals of `content` define, keyed by the
+/// service's schema (carrick#1295).
+///
+/// A schema built in code states, per object, which type its keys are the
+/// fields of only through the library's own call (`kit.queryFields(...)`),
+/// which no library-agnostic reader can name. The printed schema states it
+/// instead: an object whose static keys are all fields of exactly ONE type in
+/// `schema`, and that type a root operation type, is that type's fields
+/// object. A property of it is claimed when all of these hold:
+///
+/// - The object is reached from a call that runs when the module loads,
+///   through a value that came out of a package
+///   ([`PackageValueReader::module_scope_package_calls`]), only through call
+///   arguments, function bodies and their top-level returns, parentheses and
+///   object property values. A request body built inside a handler
+///   (`client.recall({ parcel: id })`) is never one.
+/// - Its value reads as a field definition: a function, a call or config
+///   object carrying a resolver ([`ResolverAnchor::Function`], or
+///   [`ResolverAnchor::Unresolvable`] when the structure is there and the
+///   function is not), or a name that leads to a function or an import. A
+///   literal (`crates: true`), a bare member and a name bound to anything
+///   else define no field.
+///
+/// An object that is a root's fields object is not read further: its values
+/// are field definitions, and the objects inside them (arguments, configs,
+/// query shapes) are not fields objects.
+pub fn root_field_claims(
+    file_path: &Path,
+    content: &str,
+    schema: &SdlTypeFields,
+    reader: &mut PackageValueReader,
+) -> Vec<RootFieldClaim> {
+    if schema.roots.is_empty() || std::env::var_os("CARRICK_RED_STUB").is_none() {
+        return Vec::new();
+    }
+    let Some((source_map, module)) =
+        crate::swc_scanner::parse_standalone_module(file_path, content)
+    else {
+        return Vec::new();
+    };
+    let mut walk = ClaimWalk {
+        file_path,
+        content,
+        schema,
+        source_map,
+        named: HashMap::new(),
+        claims: Vec::new(),
+    };
+    for call in reader.module_scope_package_calls(file_path, &module) {
+        walk.call_arguments(call);
+    }
+    walk.claims
+}
+
+struct ClaimWalk<'a> {
+    file_path: &'a Path,
+    content: &'a str,
+    schema: &'a SdlTypeFields,
+    source_map: Lrc<SourceMap>,
+    /// Binding name -> whether it leads to a function or an import.
+    named: HashMap<String, bool>,
+    claims: Vec<RootFieldClaim>,
+}
+
+impl ClaimWalk<'_> {
+    fn call_arguments(&mut self, call: &CallExpr) {
+        for ExprOrSpread { spread, expr } in &call.args {
+            if spread.is_none() {
+                self.reach(expr);
+            }
+        }
+    }
+
+    /// Read `expr` for the objects it reaches.
+    fn reach(&mut self, expr: &Expr) {
+        match unwrap_expr(expr) {
+            Expr::Object(object) => self.object(object),
+            Expr::Call(call) => self.call_arguments(call),
+            Expr::Arrow(arrow) => match &*arrow.body {
+                BlockStmtOrExpr::Expr(body) => self.reach(body),
+                BlockStmtOrExpr::BlockStmt(block) => self.returns(&block.stmts),
+            },
+            Expr::Fn(function) => {
+                if let Some(body) = &function.function.body {
+                    self.returns(&body.stmts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A function body's own `return` values; nested blocks and functions
+    /// are not read.
+    fn returns(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            if let Stmt::Return(ReturnStmt { arg: Some(arg), .. }) = statement {
+                self.reach(arg);
+            }
+        }
+    }
+
+    fn object(&mut self, object: &ObjectLit) {
+        let keyed: Vec<(String, &Prop)> = object
+            .props
+            .iter()
+            .filter_map(|prop| match prop {
+                PropOrSpread::Prop(prop) => static_key(prop).map(|key| (key, &**prop)),
+                PropOrSpread::Spread(_) => None,
+            })
+            .collect();
+        if keyed.is_empty() {
+            return;
+        }
+        let Some(kind) = self
+            .schema
+            .sole_root_holding(keyed.iter().map(|(key, _)| key.as_str()))
+        else {
+            for (_, prop) in keyed {
+                if let Prop::KeyValue(kv) = prop {
+                    self.reach(&kv.value);
+                }
+            }
+            return;
+        };
+        for (field, prop) in keyed {
+            if !self.defines_a_field(prop) {
+                continue;
+            }
+            let key_span = match prop {
+                Prop::KeyValue(kv) => kv.key.span(),
+                Prop::Method(method) => method.key.span(),
+                other => other.span(),
+            };
+            self.claims.push(RootFieldClaim {
+                kind,
+                field,
+                line: self.source_map.lookup_char_pos(key_span.lo).line as u32,
+            });
+        }
+    }
+
+    /// Whether a property of a root's fields object reads as a field
+    /// definition.
+    fn defines_a_field(&mut self, prop: &Prop) -> bool {
+        match anchor_from_prop(prop) {
+            ResolverAnchor::Function { .. } => true,
+            // Structure found and its function not: a call or a config object
+            // carrying the resolver (`t.field({ resolve: store.run })`). A bare
+            // member (`crates: store.list`) is a value, not a definition.
+            ResolverAnchor::Unresolvable => matches!(
+                prop,
+                Prop::KeyValue(kv) if matches!(unwrap_expr(&kv.value), Expr::Call(_) | Expr::Object(_))
+            ),
+            ResolverAnchor::Named(name) => {
+                let (file_path, content) = (self.file_path, self.content);
+                *self
+                    .named
+                    .entry(name)
+                    .or_insert_with_key(|name| named_resolver(file_path, content, name).is_some())
+            }
+            ResolverAnchor::Absent => false,
+        }
+    }
+}
+
+/// A property's key when it is written as a name or a string.
+fn static_key(prop: &Prop) -> Option<String> {
+    match prop {
+        Prop::KeyValue(kv) => prop_name(&kv.key),
+        Prop::Method(method) => prop_name(&method.key),
+        Prop::Getter(getter) => prop_name(&getter.key),
+        Prop::Setter(setter) => prop_name(&setter.key),
+        Prop::Shorthand(ident) => Some(ident.sym.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +949,188 @@ function countParcels(): number {
             None,
             "a default export that republishes a binding is one hop too far"
         );
+    }
+
+    // ---- root_field_claims (carrick#1295) ----
+
+    const CRATE_SCHEMA: &str = "\
+type Query {
+  crate(id: ID!): Crate
+  crates: [Crate!]!
+  health: String!
+}
+
+type Mutation {
+  sealCrate(id: ID!): Crate!
+  relabelCrate(id: ID!, label: String!): Crate!
+}
+
+type Crate {
+  id: ID!
+  label: String!
+  crate: Crate
+}
+";
+
+    /// `(kind field, line)` for every claim the reader makes on `content`.
+    fn claims(content: &str) -> Vec<(String, u32)> {
+        let schema = crate::graphql::extract_from_document_text(
+            CRATE_SCHEMA,
+            &PathBuf::from("schema.graphql"),
+            1,
+        )
+        .schema_types;
+        let mut reader = PackageValueReader::new(None);
+        root_field_claims(&PathBuf::from("crates.ts"), content, &schema, &mut reader)
+            .into_iter()
+            .map(|claim| (format!("{:?} {}", claim.kind, claim.field), claim.line))
+            .collect()
+    }
+
+    fn at_lines(items: &[(&str, u32)]) -> Vec<(String, u32)> {
+        items
+            .iter()
+            .map(|(field, line)| (field.to_string(), *line))
+            .collect()
+    }
+
+    /// (a) A keyed builder's fields object claims each field at its property.
+    #[test]
+    fn a_root_fields_object_claims_each_field_at_its_property() {
+        let content = "\
+import { kit } from '@example/kit';
+import { listCrates } from './store';
+
+kit.queryFields((t) => ({
+  crate: t.field({
+    type: 'Crate',
+    resolve: (_root, args) => ({ id: args.id }),
+  }),
+  crates: t.field({
+    type: ['Crate'],
+    resolve: listCrates,
+  }),
+}));
+";
+        assert_eq!(
+            claims(content),
+            at_lines(&[("Query crate", 5), ("Query crates", 9)])
+        );
+    }
+
+    /// (b) A fields callback inside a config object is reached too.
+    #[test]
+    fn a_fields_callback_in_a_config_object_claims_its_fields() {
+        let content = "\
+import { kit } from '@example/kit';
+
+kit.queryType({
+  fields: (t) => ({
+    health: t.string({ resolve: () => 'ok' }),
+  }),
+});
+";
+        assert_eq!(claims(content), at_lines(&[("Query health", 5)]));
+    }
+
+    /// (c) An object built inside a function body is not a fields object,
+    /// whatever its keys are.
+    #[test]
+    fn an_object_inside_a_function_body_claims_nothing() {
+        let content = "\
+import { kit } from '@example/kit';
+
+export function register() {
+  kit.queryFields(() => ({ crates: () => [] }));
+}
+";
+        assert_eq!(claims(content), at_lines(&[]));
+    }
+
+    /// (d) A property whose value is a literal or a plain data object
+    /// defines no field.
+    #[test]
+    fn literal_and_data_values_claim_nothing() {
+        let content = "\
+import { kit } from '@example/kit';
+
+kit.select({ crates: true });
+kit.select({ crates: { select: { id: true } } });
+";
+        assert_eq!(claims(content), at_lines(&[]));
+    }
+
+    /// (e) Keys that two types declare are ambiguous between them.
+    #[test]
+    fn keys_two_types_declare_claim_nothing() {
+        let content = "\
+import { kit } from '@example/kit';
+
+kit.resolvers({ crate: (x: unknown) => x });
+";
+        assert_eq!(claims(content), at_lines(&[]));
+    }
+
+    /// (f) A non-root type's fields object claims nothing.
+    #[test]
+    fn a_non_root_fields_object_claims_nothing() {
+        let content = "\
+import { kit } from '@example/kit';
+
+kit.objectType('Crate', {
+  fields: (t) => ({
+    id: t.exposeID('id'),
+    label: t.exposeString('label'),
+    crate: t.field({ type: 'Crate', resolve: (c) => c }),
+  }),
+});
+";
+        assert_eq!(claims(content), at_lines(&[]));
+    }
+
+    /// (g) A field call whose resolver is a member the reader cannot follow
+    /// is still a field definition.
+    #[test]
+    fn a_field_call_with_a_member_resolver_claims_the_field() {
+        let content = "\
+import { kit } from '@example/kit';
+import * as store from './store';
+
+kit.mutationFields((t) => ({
+  sealCrate: t.field({
+    type: 'Crate',
+    resolve: store.run,
+  }),
+}));
+";
+        assert_eq!(claims(content), at_lines(&[("Mutation sealCrate", 5)]));
+    }
+
+    /// (h) A name bound to an object, not a function, defines no field; nor
+    /// does a bare member.
+    #[test]
+    fn a_name_bound_to_an_object_or_a_bare_member_claims_nothing() {
+        let content = "\
+import { kit } from '@example/kit';
+import * as store from './store';
+
+const crateShape = { id: true };
+
+kit.select({ crates: crateShape });
+kit.select({ health: store.health });
+";
+        assert_eq!(claims(content), at_lines(&[]));
+    }
+
+    /// A call through a value of this module's own making is not a schema
+    /// builder's.
+    #[test]
+    fn a_call_through_a_local_value_claims_nothing() {
+        let content = "\
+const kit = { queryFields: (f: unknown) => f };
+
+kit.queryFields(() => ({ crates: () => [] }));
+";
+        assert_eq!(claims(content), at_lines(&[]));
     }
 }

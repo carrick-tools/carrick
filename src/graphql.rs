@@ -187,6 +187,9 @@ pub struct GraphqlExtraction {
     /// can be printed with the input types another file declares. First
     /// declaration wins.
     pub input_declarations: BTreeMap<String, SdlInputDeclaration>,
+    /// The field names every type in those schemas declares, and which of
+    /// them are root operation types (carrick#1295).
+    pub schema_types: SdlTypeFields,
 }
 
 impl GraphqlExtraction {
@@ -200,6 +203,56 @@ impl GraphqlExtraction {
         for (name, declaration) in other.input_declarations {
             self.input_declarations.entry(name).or_insert(declaration);
         }
+        self.schema_types.merge(other.schema_types);
+    }
+}
+
+/// The field names of every object, interface and input type a service's
+/// schemas declare, extensions included and unioned by type name, with the
+/// root operation types among them (carrick#1295). It answers one question
+/// for the schema-keyed field reader: which single type, if any, holds every
+/// key of an object literal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SdlTypeFields {
+    /// Type name -> the names of its fields.
+    pub fields: BTreeMap<String, BTreeSet<String>>,
+    /// Root operation type name -> the operation kind it serves.
+    pub roots: BTreeMap<String, GraphqlOperationKind>,
+}
+
+impl SdlTypeFields {
+    fn merge(&mut self, other: SdlTypeFields) {
+        for (name, fields) in other.fields {
+            self.fields.entry(name).or_default().extend(fields);
+        }
+        for (name, kind) in other.roots {
+            self.roots.entry(name).or_insert(kind);
+        }
+    }
+
+    fn add(&mut self, type_name: &str, field_names: impl IntoIterator<Item = String>) {
+        self.fields
+            .entry(type_name.to_string())
+            .or_default()
+            .extend(field_names);
+    }
+
+    /// The root operation kind whose type is the ONLY type declaring every
+    /// one of `keys`. `None` when no type does, when two or more do (the keys
+    /// are ambiguous between them), or when the one that does is not a root.
+    pub fn sole_root_holding<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k str> + Clone,
+    ) -> Option<GraphqlOperationKind> {
+        let mut holders = self
+            .fields
+            .iter()
+            .filter(|(_, fields)| keys.clone().into_iter().all(|key| fields.contains(key)));
+        let (name, _) = holders.next()?;
+        if holders.next().is_some() {
+            return None;
+        }
+        self.roots.get(name).copied()
     }
 }
 
@@ -595,6 +648,7 @@ pub fn scan_walk_roots(
                 .entry(name)
                 .or_insert(declaration);
         }
+        extraction.schema_types.merge(declared.schema_types);
     }
     for path in graphql_files_under(scan_roots) {
         if !seen_sdl.insert(path.clone()) {
@@ -2225,8 +2279,30 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     has_type_system_definitions = true;
                     (&ext.name, &ext.fields)
                 }
+                Definition::TypeDefinition(TypeDefinition::Interface(interface)) => {
+                    has_type_system_definitions = true;
+                    let names = interface.fields.iter().map(|field| field.name.clone());
+                    extraction.schema_types.add(&interface.name, names);
+                    continue;
+                }
+                Definition::TypeExtension(TypeExtension::Interface(interface)) => {
+                    has_type_system_definitions = true;
+                    let names = interface.fields.iter().map(|field| field.name.clone());
+                    extraction.schema_types.add(&interface.name, names);
+                    continue;
+                }
+                Definition::TypeExtension(TypeExtension::InputObject(input)) => {
+                    has_type_system_definitions = true;
+                    let names = input.fields.iter().map(|field| field.name.clone());
+                    extraction.schema_types.add(&input.name, names);
+                    continue;
+                }
                 Definition::TypeDefinition(other) => {
                     has_type_system_definitions = true;
+                    if let TypeDefinition::InputObject(input) = other {
+                        let names = input.fields.iter().map(|field| field.name.clone());
+                        extraction.schema_types.add(&input.name, names);
+                    }
                     if let Some((name, declaration)) = input_declaration(other) {
                         extraction
                             .input_declarations
@@ -2241,9 +2317,13 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                 }
                 Definition::SchemaDefinition(_) => continue,
             };
+            extraction
+                .schema_types
+                .add(name, fields.iter().map(|field| field.name.clone()));
             let Some((_, kind)) = roots.iter().find(|(root, _)| root == name) else {
                 continue;
             };
+            extraction.schema_types.roots.insert(name.clone(), *kind);
             for field in fields {
                 extraction.producers.push(GraphqlOp {
                     key: OperationKey::graphql(*kind, field.name.clone()),

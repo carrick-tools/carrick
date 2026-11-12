@@ -34,8 +34,8 @@
 use crate::import_bindings::BindingResolver;
 use crate::parser::parse_file;
 use crate::receiver_origin::{ReceiverOrigins, collect_receiver_origins, origin_root};
-use crate::workspace_resolver::WorkspaceIndex;
-use std::collections::{HashMap, HashSet};
+use crate::workspace_resolver::{Resolution, WorkspaceIndex};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use swc_common::{
     SourceMap,
@@ -43,8 +43,8 @@ use swc_common::{
     sync::Lrc,
 };
 use swc_ecma_ast::{
-    Callee, Decl, Expr, ImportDecl, ImportSpecifier, Module, ModuleDecl, ModuleExportName,
-    ModuleItem, Stmt,
+    CallExpr, Callee, Decl, Expr, ImportDecl, ImportSpecifier, Module, ModuleDecl,
+    ModuleExportName, ModuleItem, Stmt,
 };
 
 /// Reads which files call through a value from a listed package, caching what
@@ -53,8 +53,22 @@ pub struct PackageValueReader {
     source_map: Lrc<SourceMap>,
     handler: Handler,
     resolver: BindingResolver,
+    /// Says whether a specifier names a module of this repo, for
+    /// [`Packages::Any`].
+    workspace: Option<WorkspaceIndex>,
     /// Module → its receiver origins and its named imports.
     modules: HashMap<PathBuf, (ReceiverOrigins, HashMap<String, String>)>,
+}
+
+/// Which packages a traced value may come out of.
+#[derive(Clone, Copy)]
+enum Packages<'a> {
+    /// The packages detection names, or subpaths of them.
+    Listed(&'a [String]),
+    /// Any specifier that does not name a module of this repo (carrick#1295):
+    /// the schema-keyed field reader keys on the service's own schema, not on
+    /// detection's list.
+    Any,
 }
 
 /// How many modules an imported value is followed through before the answer
@@ -68,7 +82,7 @@ impl PackageValueReader {
         let source_map: Lrc<SourceMap> = Default::default();
         let handler =
             Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(source_map.clone()));
-        let resolver = match workspace {
+        let resolver = match workspace.clone() {
             Some(workspace) => BindingResolver::with_workspace(workspace),
             None => BindingResolver::new(),
         };
@@ -76,6 +90,7 @@ impl PackageValueReader {
             source_map,
             handler,
             resolver,
+            workspace,
             modules: HashMap::new(),
         }
     }
@@ -91,25 +106,78 @@ impl PackageValueReader {
         if packages.is_empty() {
             return false;
         }
-        let origins = collect_receiver_origins(module);
-        let imports = named_imports(module);
-        for receiver in &module_scope_call_receivers(module) {
-            let Some(specifier) = origins.get(receiver) else {
-                continue;
-            };
-            if is_listed(specifier, packages) {
-                return true;
-            }
-            // The receiver IS an import from a module of this repo: follow it
-            // to the module that binds it.
-            let Some(imported) = imports.get(receiver) else {
-                continue;
-            };
-            if self.import_comes_from(file, specifier, imported, packages) {
-                return true;
+        let facts = (collect_receiver_origins(module), named_imports(module));
+        module_scope_calls(module)
+            .into_iter()
+            .any(|call| self.receiver_from_package(file, &facts, call, Packages::Listed(packages)))
+    }
+
+    /// The calls that run when `module`, the source of `file`, loads (an
+    /// expression statement, a declarator initialiser or a default export at
+    /// module scope) through a value that came out of any package, that is
+    /// any specifier that is not a module of this repo (carrick#1295). The
+    /// schema-keyed field reader walks their arguments.
+    pub fn module_scope_package_calls<'m>(
+        &mut self,
+        file: &Path,
+        module: &'m Module,
+    ) -> Vec<&'m CallExpr> {
+        let facts = (collect_receiver_origins(module), named_imports(module));
+        module_scope_calls(module)
+            .into_iter()
+            .filter(|call| self.receiver_from_package(file, &facts, call, Packages::Any))
+            .collect()
+    }
+
+    /// Whether the root of `call`'s callee is a value that came out of one of
+    /// `packages`, read from the calling module's `(origins, imports)` or,
+    /// through its imports, where the value is declared.
+    fn receiver_from_package(
+        &mut self,
+        file: &Path,
+        (origins, imports): &(ReceiverOrigins, HashMap<String, String>),
+        call: &CallExpr,
+        packages: Packages<'_>,
+    ) -> bool {
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        let Some(receiver) = origin_root(callee).map(|root| root.sym.to_string()) else {
+            return false;
+        };
+        let Some(specifier) = origins.get(&receiver) else {
+            return false;
+        };
+        if self.admits(file, specifier, packages) {
+            return true;
+        }
+        // The receiver IS an import from a module of this repo: follow it
+        // to the module that binds it.
+        let Some(imported) = imports.get(&receiver) else {
+            return false;
+        };
+        self.import_comes_from(file, specifier, imported, packages)
+    }
+
+    /// Whether `specifier`, imported by `importer`, names one of `packages`.
+    fn admits(&self, importer: &Path, specifier: &str, packages: Packages<'_>) -> bool {
+        match packages {
+            Packages::Listed(packages) => is_listed(specifier, packages),
+            // A relative specifier is this repo. So is one the repo's own
+            // config maps to a file here (an alias, a workspace package), and
+            // one it maps to a path where nothing is: an alias whose generated
+            // target is missing names this repo's code, not a package.
+            Packages::Any => {
+                !specifier.starts_with('.')
+                    && !specifier.starts_with('/')
+                    && self.workspace.as_ref().is_none_or(|workspace| {
+                        matches!(
+                            workspace.resolve(importer, specifier),
+                            Resolution::External { .. } | Resolution::Unresolved
+                        )
+                    })
             }
         }
-        false
     }
 
     /// Whether the binding `importer` imports as `imported` from `specifier`
@@ -122,7 +190,7 @@ impl PackageValueReader {
         importer: &Path,
         specifier: &str,
         imported: &str,
-        packages: &[String],
+        packages: Packages<'_>,
     ) -> bool {
         let mut importer = importer.to_path_buf();
         let mut specifier = specifier.to_string();
@@ -138,7 +206,7 @@ impl PackageValueReader {
             let Some(origin) = origins.get(&local_name) else {
                 return false;
             };
-            if is_listed(origin, packages) {
+            if self.admits(&binding.file, origin, packages) {
                 return true;
             }
             let Some(next) = imports.get(&local_name) else {
@@ -204,12 +272,12 @@ fn named_imports(module: &Module) -> HashMap<String, String> {
     imports
 }
 
-/// The root identifier of the callee of every call that runs when the module
-/// loads: an expression statement, a declarator initialiser, or a default
-/// export, at module scope. `builder` for `builder.mutationFields(...)` and
-/// for `export const schema = builder.toSchema()`. Calls inside a function,
-/// including a callback passed to one of these calls, are not read.
-fn module_scope_call_receivers(module: &Module) -> HashSet<String> {
+/// Every call that runs when the module loads: an expression statement, a
+/// declarator initialiser, or a default export, at module scope.
+/// `builder.mutationFields(...)` and `export const schema =
+/// builder.toSchema()`. Calls inside a function, including a callback passed
+/// to one of these calls, are not read.
+fn module_scope_calls(module: &Module) -> Vec<&CallExpr> {
     let mut expressions: Vec<&Expr> = Vec::new();
     for item in &module.body {
         match item {
@@ -231,10 +299,7 @@ fn module_scope_call_receivers(module: &Module) -> HashSet<String> {
     expressions
         .into_iter()
         .filter_map(|expr| match unwrap_value(expr) {
-            Expr::Call(call) => match &call.callee {
-                Callee::Expr(callee) => origin_root(callee).map(|root| root.sym.to_string()),
-                _ => None,
-            },
+            Expr::Call(call) => Some(call),
             _ => None,
         })
         .collect()
