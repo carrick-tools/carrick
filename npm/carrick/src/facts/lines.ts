@@ -63,6 +63,8 @@ export type FactEdit = {
 
 export type FactOutcome = {
   lines: string[];
+  /** The row keys of `lines`, in order: a second call in the same action passes them as `options.exclude`. */
+  used: string[];
   /** Row key -> delivery stamp and the absolute paths the line pointed at; claim with `markFacts` once printed. */
   claims: Record<string, { at: number; named: string[] }>;
   /** Time spent opening the fact file and matching. */
@@ -208,21 +210,79 @@ function rowKey(row: FactRow): string {
   return `${row.repo}::${row.name ?? row.file}::${row.side}::${row.label}`;
 }
 
-/** Open the fact file and the lines for `edits`. */
+/** A candidate's check, isolated like the lookups (R36.6): one that throws is a failed check, the line silent. */
+function held(kind: (typeof KINDS)[number], candidate: Candidate): boolean {
+  try {
+    return candidate.holds ? candidate.holds() : true;
+  } catch (error) {
+    log(`${kind} fact check failed`, String(error));
+    return false;
+  }
+}
+
+/**
+ * The lines to print from `found`: at most `limit` (default `MAX_FACT_LINES`),
+ * kind by kind and, inside a kind, in the order the lookups found them (T2,
+ * P1), each once per session. A key in `said` or `options.exclude` (printed
+ * earlier in this action by another call) is skipped. A line past the limit
+ * is not claimed and is not mentioned. The name kind stops after
+ * `MAX_NAME_FAILURES` failed checks (R33.5): each one may scan a whole other
+ * file. Op and fn share a bound of `MAX_PROOF_FAILURES` failed peer proofs
+ * (R36.3): each may run git. Only a failed check counts, never a line
+ * skipped as said, excluded or capped. Each printed line is added to `claims`.
+ */
+export function pickLines(
+  found: Record<(typeof KINDS)[number], readonly Candidate[]>,
+  said: ReadonlySet<string>,
+  claims: FactOutcome["claims"],
+  now: number,
+  options: { limit?: number; exclude?: ReadonlySet<string> } = {},
+): { lines: string[]; used: string[] } {
+  const limit = options.limit ?? MAX_FACT_LINES;
+  const lines: string[] = [];
+  const used: string[] = [];
+  let proofFailures = 0;
+  for (const kind of KINDS) {
+    let failed = 0;
+    const proved = kind === "op" || kind === "fn";
+    for (const candidate of found[kind]) {
+      if (lines.length >= limit) break;
+      if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
+      if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
+      if (said.has(candidate.key) || candidate.key in claims || options.exclude?.has(candidate.key)) continue;
+      if (!held(kind, candidate)) {
+        failed += 1;
+        if (proved) proofFailures += 1;
+        continue;
+      }
+      lines.push(candidate.text);
+      used.push(candidate.key);
+      claims[candidate.key] = { at: now, named: candidate.named };
+    }
+  }
+  return { lines, used };
+}
+
+/**
+ * Open the fact file and the lines for `edits`. `options.limit` and
+ * `options.exclude` (keys an earlier call in the same action printed, from
+ * its `used`) let several calls share one cap.
+ */
 export async function factLines(
   root: string,
   edits: readonly FactEdit[],
   session: string | undefined,
-  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv } = {},
+  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string> } = {},
 ): Promise<FactOutcome> {
   const started = performance.now();
   const now = options.now ?? Date.now();
   const lines: string[] = [];
+  const used: string[] = [];
   const claims: FactOutcome["claims"] = {};
   const callersRead: string[] = [];
   let stale = true;
   let present = false;
-  const done = (): FactOutcome => ({ lines, claims, stale, callersRead, present, ms: Math.round((performance.now() - started) * 10) / 10 });
+  const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<(typeof KINDS)[number], Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
@@ -259,16 +319,6 @@ export async function factLines(
         const base = where.get(other.repo);
         return base ? [path.join(base, other.file)] : [];
       });
-    // A candidate's check, isolated like the lookups (R36.6): one that throws
-    // is a failed check, the line silent.
-    const held = (kind: (typeof KINDS)[number], candidate: Candidate): boolean => {
-      try {
-        return candidate.holds ? candidate.holds() : true;
-      } catch (error) {
-        log(`${kind} fact check failed`, String(error));
-        return false;
-      }
-    };
     // Each kind's lookup on its own: a row of one kind that throws (a field
     // ingest let through) loses only that kind's lines for the file.
     const isolated = (kind: (typeof KINDS)[number], lookup: () => Candidate[]): void => {
@@ -351,29 +401,9 @@ export async function factLines(
       );
       isolated("name", () => sameNameLines(facts, at, checkouts, text, scan, edit, isJsx(edit.file), memo));
     }
-    // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
-    // The name kind stops after `MAX_NAME_FAILURES` failed checks (R33.5):
-    // each one may scan a whole other file. Op and fn share a bound of
-    // `MAX_PROOF_FAILURES` failed peer proofs (R36.3): each may run git.
-    // Only a failed check counts, never a line skipped as said or capped.
-    let proofFailures = 0;
-    for (const kind of KINDS) {
-      let failed = 0;
-      const proved = kind === "op" || kind === "fn";
-      for (const candidate of found[kind]) {
-        if (lines.length >= MAX_FACT_LINES) break;
-        if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
-        if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
-        if (said.has(candidate.key) || candidate.key in claims) continue;
-        if (!held(kind, candidate)) {
-          failed += 1;
-          if (proved) proofFailures += 1;
-          continue;
-        }
-        lines.push(candidate.text);
-        claims[candidate.key] = { at: now, named: candidate.named };
-      }
-    }
+    const picked = pickLines(found, said, claims, now, { limit: options.limit, exclude: options.exclude });
+    lines.push(...picked.lines);
+    used.push(...picked.used);
     // A file's callers are answered only where its fn line printed now or
     // was said earlier in this session (R33.6).
     for (const candidate of found.fn) {
