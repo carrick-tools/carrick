@@ -359,6 +359,29 @@ export interface ListProgramFilesRequest extends BaseRequest {
  * same for each loose statement, its exports, its export targets, its
  * bindings (local, imported name or -1, origin file and name pairs), its
  * whole-module locals, and its stems (target file or -1, locals, stems).
+ *
+ * Two repos read this format (carrick#3101): the PR scan, from its own build
+ * only, and carrick-cloud, from every build, to answer who uses a type
+ * (carrick-cloud#3414). So any change to a key, a value's shape or what a
+ * value means bumps `version`; a reader treats any other version as no graph.
+ * `test/type-users-graph.test.ts` pins version 1 against
+ * `test/fixtures/type-users/graph.expected.json`, which carrick-cloud vendors
+ * by sha256. What version 1 means, beyond the shape below:
+ * - Paths are relative to the scan root (`getScanRoot`), with `/` separators.
+ * - `d` is every top-level name, import bindings included: a name the file
+ *   declares is in `d` and is not a binding. A default export adds `default`.
+ * - Each `r` row is a declared name, then every identifier its statements
+ *   hold that is a binding or a name of `d`, the name itself first. Any
+ *   identifier counts: an object key or a shadowing local spelled like a
+ *   binding is kept, a string is not, and a type the compiler only infers is
+ *   never there.
+ * - A binding's origins are resolved through re-exports to the declaring
+ *   file. Name `*` is the whole module; a namespace import lists `*` and then
+ *   each export. An `import('m').T` type binds a local that starts with NUL,
+ *   imports no name, and is mentioned by the statement holding it.
+ * - An `export * from 'm'` is the `e` entry `*` followed by the quoted
+ *   specifier; it adds no binding.
+ * - Order inside an array is the walk's and is not part of the format.
  */
 export interface SerialGraph {
   version: 1;

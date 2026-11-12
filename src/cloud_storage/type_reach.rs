@@ -27,7 +27,11 @@ pub const TYPE_REACH_CAP_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TypeReachRecord {
     /// [`TYPE_REACH_RECORD_VERSION`] when written. The graph's own
-    /// `version` is the walk's format, which only the sidecar reads.
+    /// `version` is the walk's format (`SerialGraph` in the sidecar). The
+    /// sidecar reads it on a PR scan, and carrick-cloud reads it from every
+    /// build to answer who uses a type (carrick-cloud#3414), so the sidecar
+    /// bumps it on any change; `src/sidecar/test/type-users-graph.test.ts`
+    /// pins version 1.
     pub version: u32,
     /// The scanner build that wrote the record.
     #[serde(default)]
