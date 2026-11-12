@@ -32,7 +32,7 @@
 //!
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
@@ -42,9 +42,10 @@ use tracing::{debug, warn};
 use crate::name_census::{LibraryNames, NameOutcome};
 use crate::operation::{GraphqlOperationKind, PubsubRole, SocketDirection};
 use crate::request_summary::decided_sites::reserved_on;
+use crate::request_summary::site_record::kind_and_role;
 use crate::request_summary::{
-    LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector, SiteMaker,
-    SiteReceiver,
+    CallerChain, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, NameFallback,
+    NamePlace, On, PlacedName, Selector, SiteMaker, SiteNames, SiteReceiver, SlotName, Stop,
 };
 use crate::services::type_sidecar::{
     BoundName, ClaimOn, ClaimProtocol, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp,
@@ -905,40 +906,61 @@ pub struct LibraryRows {
     /// How the reader came by the name at each site it read a name slot of
     /// (carrick#3504 B10-0). Log-only: no row reads it.
     pub names: LibraryNames,
+    /// Each verified site whose name slot the text reader reads as no name,
+    /// with why (carrick#3504 B10-3): saved as an unread site
+    /// ([`crate::unread_sites::from_scan`]), never a row.
+    pub leads: Vec<LibraryLead>,
     /// The sites `read` would have read when verification returned no
     /// verdict at all: saved by the engine as unread sites, reason
     /// `unanswered`. Empty whenever a verdict came back.
     pub unanswered: Vec<LibrarySite>,
 }
 
-/// Every site a verified reading would read: a site of a read export that
-/// nothing in the service contests.
+/// Every site a verified reading of `export` would read: a site of the
+/// export that nothing in the service contests. The reading loop and the
+/// no-verdict save both ask this.
 fn readable_sites<'a>(
     sites: &'a LibrarySites,
-    exports: &'a [ExportClaims],
-) -> impl Iterator<Item = (&'a ExportClaims, &'a LibrarySite)> {
-    exports
+    export: &'a ExportClaims,
+) -> impl Iterator<Item = &'a LibrarySite> {
+    sites
+        .sites
         .iter()
-        .filter(|export| is_read_export(export))
-        .flat_map(move |export| {
-            sites
-                .sites
-                .iter()
-                .filter(move |site| {
-                    site.specifier == export.specifier && site.export == export.export
-                })
-                .filter(move |site| site.contest(|on, used| export.classify(on, used)).is_none())
-                .map(move |site| (export, site))
-        })
+        .filter(move |site| site.specifier == export.specifier && site.export == export.export)
+        .filter(move |site| site.contest(|on, used| export.classify(on, used)).is_none())
+}
+
+/// A verified library site the reader states no name at (carrick#3504
+/// B10-3), placed where the name would be stated: the library call, or the
+/// outermost call of the caller chain the text reader read it through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryLead {
+    pub file: PathBuf,
+    pub line: u32,
+    /// In SWC numbering.
+    pub span_start: u32,
+    pub span_end: u32,
+    pub reason: Stop,
+    /// The package, export and member the labelled library call names.
+    pub package: String,
+    pub export: String,
+    pub member: Option<String>,
+    /// The protocol (`pubsub`, `socket`, `graphql`), when the role says one.
+    pub kind: Option<&'static str>,
+    /// `producer` or `consumer`, when the op says one.
+    pub role: Option<&'static str>,
 }
 
 /// Read every library site through the claims that verify
 /// ([`checks`], then `verify`). `verify` answers one verdict per check, in
 /// order; an error, or any other answer, states nothing. No message-role
-/// export, or no site through one, asks nothing.
+/// export, or no site through one, asks nothing. A name slot is read
+/// through `names` (carrick#3504 B10-3); with none, as each site's own
+/// arguments state it.
 pub fn read(
     sites: &LibrarySites,
     exports: &[ExportClaims],
+    names: Option<&SiteNames<'_>>,
     verify: impl FnOnce(&[LibraryCheck]) -> Result<Vec<SemanticsResult>, String>,
 ) -> LibraryRows {
     let checks = checks(sites, exports);
@@ -951,8 +973,11 @@ pub fn read(
         Ok(verdicts) => verdicts,
         Err(error) => {
             warn!(%error, "library claims: verification failed; no rows");
-            let unanswered: Vec<LibrarySite> = readable_sites(sites, exports)
-                .map(|(_, site)| site.clone())
+            let unanswered: Vec<LibrarySite> = exports
+                .iter()
+                .filter(|export| is_read_export(export))
+                .flat_map(|export| readable_sites(sites, export))
+                .cloned()
                 .collect();
             debug!(
                 saved = unanswered.len(),
@@ -975,34 +1000,124 @@ pub fn read(
         .map(|(check, _)| (check.claim_id.clone(), check.receiver.clone()))
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
-    let mut names = LibraryNames::default();
-    let mut held: Option<(&ExportClaims, Vec<(String, &LibraryClaim)>)> = None;
-    for (export, site) in readable_sites(sites, exports) {
-        if !held
-            .as_ref()
-            .is_some_and(|(of, _)| std::ptr::eq(*of, export))
-        {
-            held = Some((export, export.claims_by_id()));
-        }
-        let claims = &held.as_ref().expect("set above").1;
-        let reading = Reading {
-            site,
+    let mut outcomes = LibraryNames::default();
+    let mut leads: Vec<LibraryLead> = Vec::new();
+    for export in exports.iter().filter(|export| is_read_export(export)) {
+        let claims = export.claims_by_id();
+        let of_export: Vec<&LibrarySite> = readable_sites(sites, export).collect();
+        // The reading of the site at `index`, at `at`; with `today`, as
+        // today's reading reads it (no text reader).
+        let reading = |index: usize, at: Option<&(NamePlace, String)>, today: bool| Reading {
+            site: of_export[index],
             export,
-            claims,
+            claims: &claims,
             verified: &verified,
+            names: if today { None } else { names },
+            at: at.cloned(),
             outcome: Cell::new(None),
+            placed: RefCell::new(BTreeSet::new()),
+            leads: RefCell::new(Vec::new()),
+            led: RefCell::new(Vec::new()),
+            sites: &sites.sites,
         };
-        let row = reading.row();
-        if let Some(outcome) = reading.outcome.get() {
-            names.note(outcome);
+        // Library calls first: each states its rows at itself and at the
+        // outermost call of each caller chain the text reader read the name
+        // through, and its leads. `named` is every name a library call
+        // states at a caller place, `led` every caller chain it saves a lead
+        // at the outermost call of (two chains can end at one call: one
+        // chain's lead never stands for another's).
+        let mut read_sites: Vec<SiteRead> = vec![SiteRead::default(); of_export.len()];
+        let mut named: HashSet<(PathBuf, u32, PathBuf, u32, String)> = HashSet::new();
+        let mut led: HashSet<(PathBuf, u32, CallerChain)> = HashSet::new();
+        for (index, site) in of_export.iter().enumerate() {
+            if site.origin.is_some() {
+                continue;
+            }
+            let here = reading(index, None, false);
+            let mut rows: Vec<LibraryRow> = here.row().into_iter().collect();
+            for place in here.placed.take() {
+                rows.extend(reading(index, Some(&place), false).row());
+            }
+            let site_leads = here.leads.take();
+            let call = (site.file.clone(), site.span_start);
+            for row in &rows {
+                named.insert((
+                    call.0.clone(),
+                    call.1,
+                    row.file.clone(),
+                    row.span_start,
+                    row.name.clone(),
+                ));
+            }
+            for chain in here.led.take() {
+                led.insert((call.0.clone(), call.1, chain));
+            }
+            read_sites[index] = SiteRead {
+                rows,
+                outcome: here.outcome.get(),
+                leads: site_leads,
+            };
         }
-        if let Some(row) = row {
-            stated.push((row, ReceiverKey::of(site)));
+        // Then each site a caller fills. Where its library call states no
+        // lead on its chain and not today's name there (a part the claim
+        // positions is written at the caller, not at the library call:
+        // `send({ topic, messages })` handed on whole; or a chain that stops
+        // nearer the library call than this caller on a hole today's reading
+        // does not answer, its lead saved where it stops), today's reading
+        // of the caller stands, counted `caller_today`.
+        for (index, site) in of_export.iter().enumerate() {
+            let Some(origin) = &site.origin else {
+                continue;
+            };
+            let here = reading(index, None, false);
+            let mut read = SiteRead {
+                rows: here.row().into_iter().collect(),
+                outcome: here.outcome.get(),
+                leads: here.leads.take(),
+            };
+            let on_chain = (origin.file.clone(), origin.span_start, site.chain.clone());
+            if read.rows.is_empty() && names.is_some() && !led.contains(&on_chain) {
+                let today = reading(index, None, true);
+                if let Some(row) = today.row() {
+                    let stated = (
+                        origin.file.clone(),
+                        origin.span_start,
+                        site.file.clone(),
+                        site.span_start,
+                        row.name.clone(),
+                    );
+                    if named.contains(&stated) {
+                        // Another chain states the same name at this call:
+                        // no row is lost, so no `lead_today_stated`.
+                        if read.outcome == Some(NameOutcome::LeadTodayStated) {
+                            read.outcome = Some(NameOutcome::Filled);
+                        }
+                    } else {
+                        read.rows = vec![row];
+                        read.outcome = Some(NameOutcome::CallerToday);
+                    }
+                }
+            }
+            read_sites[index] = read;
+        }
+        for (site, read) in of_export.iter().zip(read_sites) {
+            if let Some(outcome) = read.outcome {
+                outcomes.note(outcome);
+            }
+            for row in read.rows {
+                stated.push((row, ReceiverKey::of(site)));
+            }
+            for lead in read.leads {
+                if !leads.contains(&lead) {
+                    leads.push(lead);
+                }
+            }
         }
     }
     LibraryRows {
         rows: heard_in_process(stated, exports),
-        names,
+        names: outcomes,
+        leads,
         unanswered: Vec::new(),
     }
 }
@@ -1065,17 +1180,45 @@ fn heard_in_process(
         .collect()
 }
 
+/// What [`read`] read at one site: its rows, how its name slot was read,
+/// and its leads.
+#[derive(Debug, Clone, Default)]
+struct SiteRead {
+    rows: Vec<LibraryRow>,
+    outcome: Option<NameOutcome>,
+    leads: Vec<LibraryLead>,
+}
+
 /// One site, read through its export's claims.
-struct Reading<'a> {
+struct Reading<'a, 'n> {
     site: &'a LibrarySite,
     export: &'a ExportClaims,
     claims: &'a [(String, &'a LibraryClaim)],
     verified: &'a HashSet<(String, String)>,
+    /// The text reader's reading of a name slot (B10-3).
+    names: Option<&'a SiteNames<'n>>,
+    /// `None`: the reading at the library call itself. Otherwise the
+    /// outermost call of a caller chain the text reader read the name
+    /// through, with the name read there: only that name is stated, and
+    /// the row is stated there. Two chains that settle at one call with two
+    /// names are two readings.
+    at: Option<(NamePlace, String)>,
     /// How the first name slot the reading reached was read (B10-0).
     outcome: Cell<Option<NameOutcome>>,
+    /// The places, each with a name, the name slots read at the library
+    /// call name at a caller.
+    placed: RefCell<BTreeSet<(NamePlace, String)>>,
+    /// The leads the reading at the library call saved.
+    leads: RefCell<Vec<LibraryLead>>,
+    /// The caller chains the reading at the library call saved a lead at
+    /// the outermost call of.
+    led: RefCell<Vec<CallerChain>>,
+    /// Every site of the service: the callers today's reading fills are
+    /// sites of their own ([`LibrarySite::origin`]).
+    sites: &'a [LibrarySite],
 }
 
-impl Reading<'_> {
+impl Reading<'_, '_> {
     fn verified(&self, id: &str, receiver: &str) -> bool {
         self.verified
             .contains(&(id.to_string(), receiver.to_string()))
@@ -1111,11 +1254,12 @@ impl Reading<'_> {
         claim_ids: BTreeSet<String>,
         definition: bool,
     ) -> LibraryRow {
+        let (file, line, span_start, span_end) = self.place();
         LibraryRow {
-            file: self.site.file.clone(),
-            line: self.site.line,
-            span_start: self.site.span_start,
-            span_end: self.site.span_end,
+            file,
+            line,
+            span_start,
+            span_end,
             kind,
             name,
             name_scope,
@@ -1152,20 +1296,13 @@ impl Reading<'_> {
         {
             return None;
         }
-        self.noted(site_outcome(
-            self.site,
-            slot_arg(name_slot),
-            slot_key(name_slot),
-        ));
-        let name = self
-            .site
-            .literal(slot_arg(name_slot), slot_key(name_slot))?;
-        if !self.name_ok(name, (Some(ClaimOn::Export), &None)) {
+        let name = self.name(slot_arg(name_slot), slot_key(name_slot), LibraryOp::Receive)?;
+        if !self.name_ok(&name, (Some(ClaimOn::Export), &None)) {
             return None;
         }
         Some(self.stated(
             LibraryRowKind::Pubsub(PubsubRole::Subscriber),
-            name.to_string(),
+            name,
             scoped(self.export.role, name_scope.clone()),
             BTreeSet::from([id.clone()]),
             true,
@@ -1230,15 +1367,19 @@ impl Reading<'_> {
             if !supplied {
                 return None;
             }
-            let first_read: String;
+            // A `by_origin` export has no side of its own (see `row_kind`).
+            // Read before the name: an op that is no message row saves no
+            // lead.
+            let side = self.export.side.filter(|_| self.export.side_rule.is_none());
+            let kind = row_kind(self.export.role, *op, side, *protocol, method.as_deref())?;
             let (text, scope) = match name.as_deref()? {
-                OpName::Slot(slot) => {
-                    self.noted(site_outcome(self.site, slot_arg(slot), slot_key(slot)));
-                    (
-                        self.site.literal(slot_arg(slot), slot_key(slot))?,
-                        name_scope.clone(),
-                    )
-                }
+                OpName::Slot(slot) => (
+                    self.name(slot_arg(slot), slot_key(slot), *op)?,
+                    name_scope.clone(),
+                ),
+                // A maker-bound name is the one the maker was handed, where
+                // it is written (B10-3, Q-B3b): it is stated at the library
+                // call only.
                 OpName::Bound {
                     bound: BoundName::Maker,
                     ..
@@ -1252,36 +1393,38 @@ impl Reading<'_> {
                     else {
                         return None;
                     };
+                    if self.at.is_some() {
+                        return None;
+                    }
                     self.noted(match maker.literal(slot_arg(slot), slot_key(slot)) {
-                        Some(_) => NameOutcome::Literal,
+                        Some(_) => NameOutcome::Made,
                         None if maker.args.get(slot_arg(slot)).is_some_and(|arg| arg.spread) => {
                             NameOutcome::StopSpread
                         }
                         None => NameOutcome::StopUnread,
                     });
                     (
-                        maker.literal(slot_arg(slot), slot_key(slot))?,
+                        maker.literal(slot_arg(slot), slot_key(slot))?.to_string(),
                         name_scope.clone(),
                     )
                 }
                 // The name of the member a decorator is applied to
-                // (amendment 8).
+                // (amendment 8), stated at the library call only.
                 OpName::Bound {
                     bound: BoundName::Decorated,
                     ..
                 } => {
+                    if self.at.is_some() {
+                        return None;
+                    }
                     self.noted(match self.site.decorated {
                         Some(_) => NameOutcome::Literal,
                         None => NameOutcome::StopUnread,
                     });
-                    (self.site.decorated.as_deref()?, None)
+                    (self.site.decorated.clone()?, None)
                 }
                 // The first entry the call fills (amendment 8).
-                OpName::First(first) => {
-                    self.noted(first_outcome(self.site, &first.first));
-                    first_read = first_name(self.site, &first.first)?;
-                    (first_read.as_str(), None)
-                }
+                OpName::First(first) => (self.first(&first.first, *op)?, None),
                 // A name a scope member binds is carrick#1678's; one a
                 // router key binds is #2474 R6c's.
                 // The names amendment 7 adds are read from H3 on.
@@ -1289,19 +1432,16 @@ impl Reading<'_> {
                     return None;
                 }
             };
-            if !self.name_ok(text, (*on, of)) {
+            if !self.name_ok(&text, (*on, of)) {
                 return None;
             }
-            // A `by_origin` export has no side of its own (see `row_kind`).
-            let side = self.export.side.filter(|_| self.export.side_rule.is_none());
-            let kind = row_kind(self.export.role, *op, side, *protocol, method.as_deref())?;
             // A GraphQL field pairs by its root type and name under a served
             // schema: it carries no scope.
             let scope = match kind {
                 LibraryRowKind::Graphql(_) => None,
                 _ => scoped(self.export.role, scope),
             };
-            let this = (kind, text.to_string(), scope);
+            let this = (kind, text, scope);
             match &read {
                 Some(seen) if *seen != this => return None,
                 _ => read = Some(this),
@@ -1315,6 +1455,312 @@ impl Reading<'_> {
             name_scope,
             claim_ids,
         })
+    }
+
+    /// Where this reading states a row: the library call, or the caller
+    /// chain's outermost call it reads (file, line, SWC span).
+    fn place(&self) -> (PathBuf, u32, u32, u32) {
+        match &self.at {
+            Some((at, _)) => (at.file.clone(), at.line, at.span_start, at.span_end),
+            None => (
+                self.site.file.clone(),
+                self.site.line,
+                self.site.span_start,
+                self.site.span_end,
+            ),
+        }
+    }
+
+    /// The name the slot `arg` (its entry `key`) states at this reading's
+    /// place (carrick#3504 B10-3), read through the text reader
+    /// ([`SiteNames`]). At the library call, a name the text reader places
+    /// at a caller is noted there for its own reading, and a value it
+    /// states no name for is saved as a lead. A slot the text reader leaves
+    /// to today's reading, and every slot read without it, reads the site's
+    /// own arguments. A site a caller fills is its library call again, so
+    /// a slot the text reader reads states nothing there.
+    fn name(&self, arg: usize, key: Option<&str>, op: LibraryOp) -> Option<String> {
+        let today = || self.site.literal(arg, key).map(str::to_string);
+        let read = match read_slot(self.site, arg, key) {
+            // The call does not fill the slot, or fills it with no name.
+            SlotRead::Next => None,
+            _ => self.names.and_then(|names| names.read(self.site, arg, key)),
+        };
+        let placed = match read {
+            Some(SlotName::Read(placed)) => placed,
+            today_read => {
+                if self.at.is_some() {
+                    return None;
+                }
+                self.noted(match today_read {
+                    Some(SlotName::Today(NameFallback::NoRows)) => NameOutcome::NoRows,
+                    _ => site_outcome(self.site, arg, key),
+                });
+                return today();
+            }
+        };
+        if self.site.origin.is_some() {
+            if self.at.is_some() {
+                return None;
+            }
+            let text = today()?;
+            // Only the text reader's value on this site's own caller chain
+            // decides here: read out to this call (`own`), or stopped nearer
+            // the library call (`short`: a prefix of the chain, placed where
+            // it stopped, or the library call's own value, the empty chain).
+            // Another chain that ends at this call decides nothing.
+            let own = |value: &PlacedName| {
+                value.chain == self.site.chain
+                    && value.place.as_ref().is_some_and(|place| {
+                        place.file == self.site.file && place.span_start == self.site.span_start
+                    })
+            };
+            let short = |value: &PlacedName| {
+                (value.place.is_some() || value.chain.is_empty())
+                    && value.chain.len() < self.site.chain.len()
+                    && self.site.chain.starts_with(&value.chain)
+            };
+            // Stopped short: the value nearest this call (the empty chain
+            // is a prefix of every chain).
+            let value = placed.iter().find(|value| own(value)).or_else(|| {
+                placed
+                    .iter()
+                    .filter(|value| short(value))
+                    .max_by_key(|value| value.chain.len())
+            });
+            match value.map(|value| (own(value), &value.name)) {
+                // The library call's reading states today's name here itself.
+                Some((true, Ok(name))) if *name == text => return None,
+                // The reader's name differs from today's here: today's name
+                // stands, counted (Q-B3f), and the place is logged with both
+                // names for the compare to name.
+                Some((true, Ok(name))) => {
+                    tracing::debug!(
+                        file = %self.site.file.display(),
+                        line = self.site.line,
+                        reader = %name,
+                        today = %text,
+                        "library names: the text reader's name differs from today's"
+                    );
+                    self.noted(NameOutcome::TextDiffers);
+                    return Some(text);
+                }
+                // The chain stops in a hole today's reading answers (an own
+                // builder written on the way, the step cap), here or one call
+                // nearer the library call: today's reading stands here.
+                Some((_, Err(reason))) => {
+                    if let Some(answered) = today_answers(self.site, *reason, arg, key) {
+                        self.noted(answered);
+                        return Some(text);
+                    }
+                }
+                _ => {}
+            }
+            // A caller today's reading fills, where the text reader states no
+            // name on its chain here: counted as the row it does not keep
+            // (`caller_today` below restates it unless the chain's lead is
+            // saved here).
+            self.noted(NameOutcome::LeadTodayStated);
+            return None;
+        }
+        if let Some((at, name)) = &self.at {
+            let read_here = placed
+                .iter()
+                .any(|value| value.place.as_ref() == Some(at) && value.name.as_ref() == Ok(name));
+            return read_here.then(|| name.clone());
+        }
+        let mut here = None;
+        let mut outcome = None;
+        let mut differs = false;
+        for PlacedName { place, chain, name } in placed {
+            match (place, name) {
+                (None, Ok(_)) if self.kind_asked() && today().is_none() => {
+                    outcome.get_or_insert(NameOutcome::KindAsked);
+                }
+                (None, Ok(text)) => {
+                    outcome.get_or_insert(if self.site.linked {
+                        NameOutcome::Linked
+                    } else {
+                        NameOutcome::Literal
+                    });
+                    // Where the reader's text differs from today's, today's
+                    // name is the one stated (Q-B3f).
+                    let own = today();
+                    let todays: Vec<&str> = own.as_deref().into_iter().collect();
+                    if text_differs(&todays, &text) {
+                        differs = true;
+                        tracing::debug!(
+                            file = %self.site.file.display(),
+                            line = self.site.line,
+                            reader = %text,
+                            today = ?todays,
+                            "library names: the text reader's name differs from today's"
+                        );
+                    }
+                    here = reader_name(&todays, text).or_else(today);
+                }
+                (Some(place), Ok(text)) => {
+                    // Today's reading of this chain's caller there.
+                    let todays: Vec<&str> = self
+                        .on_chain(&place, &chain)
+                        .filter_map(|site| site.literal(arg, key))
+                        .collect();
+                    if self.kind_asked() && todays.is_empty() {
+                        outcome.get_or_insert(NameOutcome::KindAsked);
+                        continue;
+                    }
+                    outcome.get_or_insert(NameOutcome::Filled);
+                    // No row where it differs: the chain's caller site
+                    // states today's name there and counts `text_differs`
+                    // (Q-B3f).
+                    if let Some(text) = reader_name(&todays, text) {
+                        self.placed.borrow_mut().insert((place, text));
+                    }
+                }
+                (Some(place), Err(reason)) => {
+                    // A hole where today's reading of this chain's caller
+                    // states the name and answers the hole: the caller's own
+                    // reading states it (see the caller arm above), so no
+                    // lead.
+                    let kept = self.on_chain(&place, &chain).find_map(|site| {
+                        site.literal(arg, key)
+                            .and_then(|_| today_answers(site, reason, arg, key))
+                    });
+                    match kept {
+                        Some(kept) => {
+                            outcome.get_or_insert(kept);
+                        }
+                        None => {
+                            self.lead(Some(place), reason, op);
+                            self.led.borrow_mut().push(chain);
+                        }
+                    }
+                }
+                // A hole at the call itself today's reading answers (the
+                // call writes an own builder's call) keeps today's name, here
+                // or at each caller that fills it (the caller arm above).
+                (None, Err(reason)) => {
+                    let today_reads = today().is_some()
+                        || self.sites.iter().any(|site| {
+                            site.origin.as_ref().is_some_and(|origin| {
+                                origin.file == self.site.file
+                                    && origin.span_start == self.site.span_start
+                            }) && site.literal(arg, key).is_some()
+                        });
+                    match today_answers(self.site, reason, arg, key).filter(|_| today_reads) {
+                        Some(answered) => {
+                            outcome.get_or_insert(answered);
+                            here = today();
+                        }
+                        None => self.lead(None, reason, op),
+                    }
+                }
+            }
+        }
+        // A text the reader reads where today's reading reads another at
+        // the call itself is counted first: it is a name that moves.
+        if differs {
+            outcome = Some(NameOutcome::TextDiffers);
+        }
+        self.noted(match outcome {
+            Some(outcome) => outcome,
+            None if today().is_some() => NameOutcome::LeadTodayStated,
+            None => NameOutcome::Lead,
+        });
+        here
+    }
+
+    /// The site a caller fills at `place` with this library call
+    /// ([`LibrarySite::origin`]) through the caller chain `chain`: today's
+    /// reading of the same chain the text reader read there. Two chains
+    /// that end at one call are two sites there.
+    fn on_chain<'s>(
+        &'s self,
+        place: &'s NamePlace,
+        chain: &'s CallerChain,
+    ) -> impl Iterator<Item = &'s LibrarySite> {
+        self.sites.iter().filter(move |site| {
+            site.origin.as_ref().is_some_and(|origin| {
+                origin.file == self.site.file && origin.span_start == self.site.span_start
+            }) && site.specifier == self.site.specifier
+                && site.export == self.site.export
+                && site.file == place.file
+                && site.span_start == place.span_start
+                && site.chain == *chain
+        })
+    }
+
+    /// Whether the label leaves the kind open (a broker carries topics and
+    /// job names alike, an in-process channel events or messages): the
+    /// site path's kind rule ([`kind_and_role`]). A name the text reader
+    /// reads there that today's reading did not then states no row: the
+    /// site path asks the kind, and its answer states the row (B10-3,
+    /// Q-B3e), so a job name is never stated as a queue name.
+    fn kind_asked(&self) -> bool {
+        let role = serde_json::to_value(self.export.role)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        kind_and_role(&role, None).0.is_none()
+    }
+
+    /// The name a `first` list reads at a call (contract amendment 8): each
+    /// entry in order, the first the call fills, read as [`Self::name`]
+    /// reads a slot. `None` when an entry states no name, or none fills.
+    fn first(&self, first: &[NameEntry], op: LibraryOp) -> Option<String> {
+        for entry in first {
+            match entry {
+                NameEntry::Decorated(_) => {
+                    if self.at.is_some() {
+                        return None;
+                    }
+                    self.noted(match self.site.decorated {
+                        Some(_) => NameOutcome::Literal,
+                        None => NameOutcome::StopUnread,
+                    });
+                    return self.site.decorated.clone();
+                }
+                NameEntry::Slot(slot) => {
+                    let (arg, key) = (slot.arg as usize, slot.key.as_deref());
+                    if !matches!(read_slot(self.site, arg, key), SlotRead::Next) {
+                        return self.name(arg, key, op);
+                    }
+                }
+            }
+        }
+        if self.at.is_none() {
+            self.noted(NameOutcome::StopUnread);
+        }
+        None
+    }
+
+    /// Saves a lead of `reason` at `place` (the library call when `None`),
+    /// once.
+    fn lead(&self, place: Option<NamePlace>, reason: Stop, op: LibraryOp) {
+        let (file, line, span_start, span_end) = match place {
+            Some(place) => (place.file, place.line, place.span_start, place.span_end),
+            None => self.place(),
+        };
+        let role = serde_json::to_value(self.export.role)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let lead = LibraryLead {
+            file,
+            line,
+            span_start,
+            span_end,
+            reason,
+            package: self.export.package.clone(),
+            export: self.export.export.clone(),
+            member: self.site.member.clone(),
+            kind: crate::possible_calls::kind_of(&role),
+            role: crate::possible_calls::role_of(&role, Some(op_name(op))),
+        };
+        let mut leads = self.leads.borrow_mut();
+        if !leads.contains(&lead) {
+            leads.push(lead);
+        }
     }
 
     /// A name one row can state: not empty, no wildcard character of the
@@ -1353,7 +1799,7 @@ struct Through {
 /// What one `first` slot reads at a call (contract amendment 8).
 enum SlotRead {
     /// A string literal: the name.
-    Named(String),
+    Named,
     /// The call does not fill the slot, or fills it with a value that is no
     /// string: the next entry.
     Next,
@@ -1361,29 +1807,6 @@ enum SlotRead {
     /// a spread): nothing is read, as a name that might be overridden by it
     /// would be wrong.
     Stop,
-}
-
-/// The name a `first` list reads at a call: each entry in order, the first
-/// the call fills. `None` when an entry stops the reading, or none fills.
-///
-/// The `name_unread` lead the ruling asks for a stop is not recorded: this
-/// reader has no lead channel yet. The plain slot reader
-/// ([`LibrarySite::literal`]) is unchanged, so socket and broker rows do not
-/// move.
-fn first_name(site: &LibrarySite, first: &[NameEntry]) -> Option<String> {
-    for entry in first {
-        match entry {
-            NameEntry::Decorated(_) => return site.decorated.clone(),
-            NameEntry::Slot(slot) => {
-                match read_slot(site, slot.arg as usize, slot.key.as_deref()) {
-                    SlotRead::Named(name) => return Some(name),
-                    SlotRead::Next => {}
-                    SlotRead::Stop => return None,
-                }
-            }
-        }
-    }
-    None
 }
 
 fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
@@ -1398,13 +1821,13 @@ fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
     let other = arg.function || arg.non_string;
     match key {
         None => match &arg.text {
-            Some(text) => SlotRead::Named(text.clone()),
+            Some(_) => SlotRead::Named,
             None if other || arg.object.is_some() => SlotRead::Next,
             None => SlotRead::Stop,
         },
         Some(key) => match &arg.object {
             Some(object) => match object.fields.get(key) {
-                Some(Some(text)) => SlotRead::Named(text.clone()),
+                Some(Some(_)) => SlotRead::Named,
                 Some(None) => SlotRead::Stop,
                 None if object.open => SlotRead::Stop,
                 None => SlotRead::Next,
@@ -1415,41 +1838,55 @@ fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
     }
 }
 
+/// Whether today's reading answers a hole the text reader read at `site`'s
+/// slot `arg` (its entry `key`), and as what (B10-3): the step cap stopped
+/// the chain (`capped`), or the library call or a caller on the way writes
+/// the slot as a call of an own builder (`r1_builder`, Q-B3a's builder
+/// rule, until F4). Any other hole is a lead. The one place the builder
+/// rule is decided: at the library call (`site` the call) and per caller
+/// chain (`site` the chain's caller-filled site).
+fn today_answers(
+    site: &LibrarySite,
+    reason: Stop,
+    arg: usize,
+    key: Option<&str>,
+) -> Option<NameOutcome> {
+    if reason == Stop::FanOutCap {
+        Some(NameOutcome::Capped)
+    } else if site.builder_written(arg, key) {
+        Some(NameOutcome::R1Builder)
+    } else {
+        None
+    }
+}
+
+/// Whether the text reader's `text` differs from what today's reading
+/// states at the same place (`todays`, one text per site there): none of
+/// them is it. `false` where today's reading states nothing there.
+fn text_differs(todays: &[&str], text: &str) -> bool {
+    !todays.is_empty() && !todays.contains(&text)
+}
+
+/// The text reader's `text` where it states the name: not where it differs
+/// from today's (Q-B3f: one name at one site, today's, counted
+/// `text_differs` until the compare traces the site true).
+fn reader_name(todays: &[&str], text: String) -> Option<String> {
+    (!text_differs(todays, &text)).then_some(text)
+}
+
 /// How a site's own argument at `arg` (or its `key`) reads as a name
 /// (carrick#3504 B10-0): where the text came from when there is one, and
 /// why there is none when there is not.
 fn site_outcome(site: &LibrarySite, arg: usize, key: Option<&str>) -> NameOutcome {
     match read_slot(site, arg, key) {
-        SlotRead::Named(_) if site.origin.is_some() => NameOutcome::Filled,
-        SlotRead::Named(_) if site.linked => NameOutcome::Linked,
-        SlotRead::Named(_) => NameOutcome::Literal,
+        SlotRead::Named if site.origin.is_some() => NameOutcome::Filled,
+        SlotRead::Named if site.linked => NameOutcome::Linked,
+        SlotRead::Named => NameOutcome::Literal,
         SlotRead::Stop if site.args.get(arg).is_some_and(|arg| arg.spread) => {
             NameOutcome::StopSpread
         }
         SlotRead::Next | SlotRead::Stop => NameOutcome::StopUnread,
     }
-}
-
-/// [`site_outcome`] for a `first` list: the outcome of the entry that names,
-/// or of the one that stops the reading.
-fn first_outcome(site: &LibrarySite, first: &[NameEntry]) -> NameOutcome {
-    for entry in first {
-        match entry {
-            NameEntry::Decorated(_) => {
-                return match site.decorated {
-                    Some(_) => NameOutcome::Literal,
-                    None => NameOutcome::StopUnread,
-                };
-            }
-            NameEntry::Slot(slot) => {
-                let arg = slot.arg as usize;
-                if !matches!(read_slot(site, arg, slot.key.as_deref()), SlotRead::Next) {
-                    return site_outcome(site, arg, slot.key.as_deref());
-                }
-            }
-        }
-    }
-    NameOutcome::StopUnread
 }
 
 fn slot_arg(slot: &ClaimSlot) -> usize {
@@ -1601,7 +2038,7 @@ mod tests {
         verified: impl Fn(&LibraryCheck) -> bool,
     ) -> Vec<LibraryRow> {
         let asked = std::cell::RefCell::new(Vec::new());
-        read(sites, exports, verifier(&asked, verified)).rows
+        read(sites, exports, None, verifier(&asked, verified)).rows
     }
 
     /// carrick#2819: a result label rides the claim it sits on, and no
@@ -1877,7 +2314,7 @@ mod tests {
             }\n",
         )]);
         let asked = std::cell::RefCell::new(Vec::new());
-        let rows = read(&sites, &[command], verifier(&asked, all)).rows;
+        let rows = read(&sites, &[command], None, verifier(&asked, all)).rows;
         let stated: Vec<(u32, LibraryRowKind, &str)> = rows
             .iter()
             .map(|row| (row.line, row.kind, row.name.as_str()))
@@ -1939,7 +2376,7 @@ mod tests {
             }\n";
         let sites = sites_of(&[("src/lobby.ts", source)]);
         let asked = std::cell::RefCell::new(Vec::new());
-        let rows = read(&sites, &[gateway_claims()], verifier(&asked, all)).rows;
+        let rows = read(&sites, &[gateway_claims()], None, verifier(&asked, all)).rows;
         let stated: Vec<(u32, LibraryRowKind, &str)> = rows
             .iter()
             .map(|row| (row.line, row.kind, row.name.as_str()))
@@ -2134,10 +2571,10 @@ mod tests {
             ),
         ]);
         let asked = std::cell::RefCell::new(Vec::new());
-        let names = read(&sites, &[bus()], verifier(&asked, all)).names;
+        let names = read(&sites, &[bus()], None, verifier(&asked, all)).names;
         assert_eq!(
             names.line(),
-            "literal=1 linked=1 filled=1 stop_spread=1 stop_unread=2",
+            "literal=1 linked=1 filled=1 made=0 no_rows=0 r1_builder=0 stop_spread=1 stop_unread=2 lead=0 lead_today_stated=0 kind_asked=0 capped=0 caller_today=0 text_differs=0",
             "{names:?}"
         );
     }
@@ -2544,6 +2981,7 @@ mod tests {
         let rows = read(
             &sites,
             &[bus()],
+            None,
             verifier(&asked, |check| !check.claim_id.contains(":send:")),
         );
         assert!(
@@ -2560,12 +2998,12 @@ mod tests {
         );
         assert_eq!(asked.borrow().len(), 3);
 
-        let failed = read(&sites, &[bus()], |_| Err("sidecar gone".to_string()));
+        let failed = read(&sites, &[bus()], None, |_| Err("sidecar gone".to_string()));
         assert!(failed.rows.is_empty());
-        let short = read(&sites, &[bus()], |_| Ok(Vec::new()));
+        let short = read(&sites, &[bus()], None, |_| Ok(Vec::new()));
         assert!(short.rows.is_empty());
         // Every verdict one place along: each names another check.
-        let swapped = read(&sites, &[bus()], |checks| {
+        let swapped = read(&sites, &[bus()], None, |checks| {
             Ok(checks
                 .iter()
                 .cycle()
@@ -3256,7 +3694,7 @@ mod tests {
         http.role = LibraryRole::HttpClient;
         let sites = sites_of(&[("src/orders.ts", BUS_SERVICE)]);
         let asked = std::cell::RefCell::new(Vec::new());
-        let rows = read(&sites, &[http], verifier(&asked, all));
+        let rows = read(&sites, &[http], None, verifier(&asked, all));
         assert!(rows.rows.is_empty());
         assert!(
             asked.borrow().is_empty(),
@@ -3304,8 +3742,8 @@ mod tests {
         let network = vec![bus(), http, server];
         let asked_message = std::cell::RefCell::new(Vec::new());
         let asked_network = std::cell::RefCell::new(Vec::new());
-        let from_message = read(&sites, &message, verifier(&asked_message, all));
-        let from_network = read(&sites, &network, verifier(&asked_network, all));
+        let from_message = read(&sites, &message, None, verifier(&asked_message, all));
+        let from_network = read(&sites, &network, None, verifier(&asked_network, all));
         assert!(!from_message.rows.is_empty(), "the bus states its rows");
         assert_eq!(from_network, from_message);
         assert_eq!(
@@ -3359,5 +3797,1312 @@ mod tests {
             "a broker claim that states no scope writes none (carrick#3531)"
         );
         assert!(names("instance:new:Cluster").is_empty());
+    }
+
+    /// The `resolve-text` fixture's `web` service with `files` added (paths
+    /// under the service) and every test package declared, read with the
+    /// compiler's rows or with none, then through `exports` with every check
+    /// verified and every name slot read through the text reader
+    /// (carrick#3504 B10-3). `None` where the sidecar is not built.
+    fn read_walked(
+        files: &[(&str, &str)],
+        exports: &[ExportClaims],
+        with_rows: bool,
+    ) -> Option<(LibraryRows, PathBuf)> {
+        let mut edit: Vec<(&str, &str)> = vec![("package.json", MANIFEST)];
+        edit.extend_from_slice(files);
+        let on = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            with_rows,
+        )?;
+        let sites = library_sites(&on.inputs);
+        let names = SiteNames::of(&on.inputs);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = read(&sites, exports, Some(&names), verifier(&asked, all));
+        Some((rows, on.repo.clone()))
+    }
+
+    /// The rows by file name, line and name, sorted.
+    fn placed(rows: &LibraryRows) -> Vec<(String, u32, String)> {
+        let mut out: Vec<(String, u32, String)> = rows
+            .rows
+            .iter()
+            .map(|row| {
+                let file = row.file.file_name().unwrap().to_string_lossy().into_owned();
+                (file, row.line, row.name.clone())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    const NAMES_WRAPPER: &str = "import { bus } from \"@fixture/bus\";\n\
+        export function send(topic: string) { bus.publish(topic, {}); }\n\
+        export function sendOrder(kind: string) { send(`orders.${kind}`); }\n";
+
+    /// A name the text reader reads through callers is stated at the
+    /// outermost call of each caller chain, a constant at the call itself,
+    /// and nothing falls back to today's reading (carrick#3504 B10-3).
+    #[test]
+    fn a_name_read_through_callers_is_stated_where_each_chain_settles() {
+        let Some((rows, _)) = read_walked(
+            &[
+                ("src/wrapper.ts", NAMES_WRAPPER),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { send, sendOrder } from \"./wrapper\";\n\
+                     const TOPIC = \"orders.const\";\n\
+                     export function a() {\n\
+                     \x20 send(\"orders.direct\");\n\
+                     \x20 sendOrder(\"shipped\");\n\
+                     \x20 bus.publish(TOPIC, {});\n\
+                     }\n",
+                ),
+            ],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&rows),
+            vec![
+                ("use.ts".to_string(), 5, "orders.direct".to_string()),
+                ("use.ts".to_string(), 6, "orders.shipped".to_string()),
+                ("use.ts".to_string(), 7, "orders.const".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
+        assert_eq!(rows.names.count(NameOutcome::Filled), 1, "{:?}", rows.names);
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
+    /// A wrapper with seventeen callers names seventeen sites: the cap
+    /// counts within one caller chain (carrick#3504 B10-2a2, Q6), so the text
+    /// reader reads each caller's name (a pin: today's reading names them
+    /// too).
+    #[test]
+    fn a_wrapper_with_seventeen_callers_names_seventeen_sites() {
+        let mut calls =
+            String::from("import { send } from \"./wrapper\";\nexport function many() {\n");
+        for at in 0..17 {
+            calls.push_str(&format!("  send(\"wide.{at}\");\n"));
+        }
+        calls.push_str("}\n");
+        let Some((rows, _)) = read_walked(
+            &[("src/wrapper.ts", NAMES_WRAPPER), ("src/many.ts", &calls)],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        let named: BTreeSet<String> = rows.rows.iter().map(|row| row.name.clone()).collect();
+        assert_eq!(named.len(), 17, "{rows:#?}");
+        assert!(named.iter().all(|name| name.starts_with("wide.")));
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
+        // Nothing calls `sendOrder`: its call of `send` is a lead.
+        let leads: Vec<(u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        assert_eq!(leads, vec![(3, Stop::NameNeverBound)], "{:?}", rows.leads);
+    }
+
+    /// A name the text reader states no text for, with the compiler's rows,
+    /// is a lead with the hole's word, never a row: an environment read
+    /// beside a default, and a choice between two names at one place
+    /// (`several_operations`). The leads go into the unread sites, slot
+    /// `name` (carrick#3504 B10-3, Q-B3c).
+    #[test]
+    fn a_name_the_reader_cannot_read_is_a_lead_with_its_stop() {
+        let Some((rows, repo)) = read_walked(
+            &[(
+                "src/leads.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 declare const settings: { topic: string };\n\
+                 export function fromSettings() { bus.publish(settings.topic ?? \"orders\", {}); }\n\
+                 export function choose(flag: boolean) { bus.publish(flag ? \"a.one\" : \"a.two\", {}); }\n",
+            )],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        let mut leads: Vec<(u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        leads.sort();
+        assert_eq!(leads.len(), 2, "{:?}", rows.leads);
+        assert_eq!(leads[0].0, 3);
+        assert_ne!(leads[0].1, Stop::RowsMissing);
+        assert_eq!(leads[1], (4, Stop::SeveralOperations));
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
+
+        let unread = crate::unread_sites::from_scan(
+            &crate::request_summary::discovery::Discovery::default(),
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &rows.leads,
+            &repo,
+        );
+        let mut saved: Vec<String> = unread
+            .iter()
+            .map(|site| {
+                format!(
+                    "{}:{} {} {:?} {:?}",
+                    site.file, site.line, site.slot, site.kind, site.role
+                )
+            })
+            .collect();
+        saved.sort();
+        let file = "services/web/src/leads.ts";
+        assert_eq!(
+            saved,
+            vec![
+                format!("{file}:3 name Some(\"pubsub\") Some(\"producer\")"),
+                format!("{file}:4 name Some(\"pubsub\") Some(\"producer\")"),
+            ]
+        );
+    }
+
+    /// Where the walk gave the text reader no compiler rows, today's reading
+    /// stands, counted `no_rows`, and no lead is saved (carrick#3504 B10-3,
+    /// Q-B3a): a failed walk loses no row.
+    #[test]
+    fn a_slot_without_rows_keeps_today_s_name_counted_no_rows() {
+        let Some((rows, _)) = read_walked(
+            &[
+                ("src/wrapper.ts", NAMES_WRAPPER),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { send } from \"./wrapper\";\n\
+                     const TOPIC = \"orders.const\";\n\
+                     export function a() {\n\
+                     \x20 send(\"orders.direct\");\n\
+                     \x20 bus.publish(TOPIC, {});\n\
+                     }\n",
+                ),
+            ],
+            &[bus()],
+            false,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&rows),
+            vec![
+                ("use.ts".to_string(), 5, "orders.direct".to_string()),
+                ("use.ts".to_string(), 6, "orders.const".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        // The wrapper's call, the caller that fills it, and the constant.
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 3, "{:?}", rows.names);
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
+    /// A name the maker that made the receiver was handed stays on the maker
+    /// reading (`made`, carrick#3504 B10-3, Q-B3b): a factory called twice
+    /// with two names names each holder's site with its own.
+    #[test]
+    fn a_maker_bound_queue_name_keeps_made_s_name() {
+        let queue = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "Queue", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null, "name": { "arg": 0 },
+                  "name_scope": { "scope": "global", "namespace": "queue" } },
+                { "kind": "op", "op": "send", "member": "add", "on": "instance",
+                  "name": { "bound": "maker" }, "payload": { "arg": 1 } }
+            ]
+        }));
+        let Some((rows, _)) = read_walked(
+            &[(
+                "src/mail.ts",
+                "import { Queue } from \"@fixture/queue\";\n\
+                 function createQueue(name: string) { return new Queue(name); }\n\
+                 const emails = createQueue(\"emails\");\n\
+                 const reports = createQueue(\"reports\");\n\
+                 export async function welcome() { await emails.add(\"welcome\", {}); }\n\
+                 export async function weekly() { await reports.add(\"weekly\", {}); }\n",
+            )],
+            &[queue],
+            true,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&rows),
+            vec![
+                ("mail.ts".to_string(), 5, "emails".to_string()),
+                ("mail.ts".to_string(), 6, "reports".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(rows.names.count(NameOutcome::Made), 2, "{:?}", rows.names);
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
+    /// A name an own builder returns keeps today's reading where the text
+    /// reader holes the call (carrick#3504 B10-3, `r1_builder`, until F4),
+    /// with the compiler's rows: a builder, a builder function, a builder in
+    /// an object, one that declares a constant first, and one handed a
+    /// parameter, filled at its caller.
+    #[test]
+    fn a_builder_name_keeps_today_s_reading_with_rows() {
+        let Some((rows, _)) = read_walked(
+            &[
+                (
+                    "src/topics.ts",
+                    "export const PREFIX = \"svc\";\n\
+                     export const topicFor = (kind: string) => `${PREFIX}.${kind}`;\n\
+                     export function auditTopic(name: string) { return `audit.${name}`; }\n\
+                     export const ROUTES = { byId: (id: string) => `jobs.${id}` };\n\
+                     export function twoSteps(name: string) { const topic = `two.${name}`; return topic; }\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { topicFor, auditTopic, ROUTES, twoSteps } from \"./topics\";\n\
+                     export function a(kind: string) {\n\
+                     \x20 bus.publish(topicFor(\"x\"), {});\n\
+                     \x20 bus.publish(auditTopic(\"y\"), {});\n\
+                     \x20 bus.publish(ROUTES.byId(\"7\"), {});\n\
+                     \x20 bus.publish(twoSteps(\"z\"), {});\n\
+                     \x20 bus.publish(topicFor(kind), {});\n\
+                     }\n",
+                ),
+                (
+                    "src/caller.ts",
+                    "import { a } from \"./use\";\n\
+                     export function go() { a(\"filled\"); }\n",
+                ),
+            ],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&rows),
+            vec![
+                ("caller.ts".to_string(), 2, "svc.filled".to_string()),
+                ("use.ts".to_string(), 4, "svc.x".to_string()),
+                ("use.ts".to_string(), 5, "audit.y".to_string()),
+                ("use.ts".to_string(), 6, "jobs.7".to_string()),
+                ("use.ts".to_string(), 7, "two.z".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        // The five calls, and the caller that fills the one handed a
+        // parameter.
+        assert_eq!(
+            rows.names.count(NameOutcome::R1Builder),
+            6,
+            "{:?}",
+            rows.names
+        );
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
+    /// An own builder's call the text reader holes, handed a parameter no
+    /// caller fills with text, is a lead at the library call: today's
+    /// reading states no name for it anywhere, so the builder rule keeps
+    /// nothing (a pin of the rule decided once, in `today_answers`).
+    #[test]
+    fn a_builder_today_reads_nowhere_is_a_lead() {
+        let Some((rows, _)) = read_walked(
+            &[
+                (
+                    "src/topics.ts",
+                    "export const topicFor = (kind: string) => `svc.${kind}`;\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { topicFor } from \"./topics\";\n\
+                     export function a(kind: string) { bus.publish(topicFor(kind), {}); }\n",
+                ),
+            ],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        assert_eq!(rows.leads.len(), 1, "{:?}", rows.leads);
+        assert_eq!(rows.leads[0].line, 3, "{:?}", rows.leads);
+        assert_eq!(rows.names.count(NameOutcome::Lead), 1, "{:?}", rows.names);
+        assert_eq!(
+            rows.names.count(NameOutcome::R1Builder),
+            0,
+            "{:?}",
+            rows.names
+        );
+    }
+
+    /// `files` read as [`read_walked`] reads them with the compiler's rows,
+    /// twice: today's reading (no text reader) and the text reader's (its
+    /// step cap at `cap`, when set).
+    fn read_twice(
+        files: &[(&str, &str)],
+        exports: &[ExportClaims],
+        cap: Option<usize>,
+    ) -> Option<(
+        crate::request_summary::fixture_walk::Walked,
+        LibraryRows,
+        LibraryRows,
+    )> {
+        let mut edit: Vec<(&str, &str)> = vec![("package.json", MANIFEST)];
+        edit.extend_from_slice(files);
+        let on = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        )?;
+        let sites = library_sites(&on.inputs);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let today = read(&sites, exports, None, verifier(&asked, all));
+        let names = match cap {
+            Some(cap) => SiteNames::with_cap(&on.inputs, cap),
+            None => SiteNames::of(&on.inputs),
+        };
+        let rowed = read(&sites, exports, Some(&names), verifier(&asked, all));
+        Some((on, today, rowed))
+    }
+
+    /// Every row today's reading states, the text reader states too, at the
+    /// same place.
+    fn today_stands(today: &LibraryRows, rowed: &LibraryRows) {
+        let read = placed(rowed);
+        let lost: Vec<_> = placed(today)
+            .into_iter()
+            .filter(|row| !read.contains(row))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "rows today's reading states, lost: {lost:?}\n{:#?}\n{:?}",
+            rowed.rows,
+            rowed.names
+        );
+    }
+
+    /// Two caller chains of the wrapper `send` in `wrapper` (beside the
+    /// builder `topicFor`) that end at one call in `caller` (`src/use.ts`),
+    /// each with its own stop: read as [`read_twice`] reads them, with
+    /// every value the text reader reads that `to` names a new value for
+    /// rewritten first, at its own place and chain (a differing text or the
+    /// step cap, which no source here reaches offline). `None` where the
+    /// sidecar is not built.
+    fn two_chains(
+        wrapper: &str,
+        caller: &str,
+        to: impl Fn(&crate::request_summary::PlacedName) -> Option<Result<String, Stop>>,
+    ) -> Option<(LibraryRows, LibraryRows)> {
+        two_chains_with(wrapper, caller, |names| names.rewrite(to))
+    }
+
+    /// [`two_chains`], with `change` applied to the values the text reader
+    /// read before the second reading.
+    fn two_chains_with(
+        wrapper: &str,
+        caller: &str,
+        change: impl FnOnce(&SiteNames<'_>),
+    ) -> Option<(LibraryRows, LibraryRows)> {
+        let edit: Vec<(&str, &str)> = vec![
+            ("package.json", MANIFEST),
+            ("src/wrapper.ts", wrapper),
+            (
+                "src/topics.ts",
+                "export const topicFor = (kind: string) => `svc.${kind}`;\n",
+            ),
+            ("src/use.ts", caller),
+        ];
+        let on = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        )?;
+        let sites = library_sites(&on.inputs);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let today = read(&sites, &[bus()], None, verifier(&asked, all));
+        let names = SiteNames::of(&on.inputs);
+        for site in sites.sites.iter().filter(|site| site.origin.is_none()) {
+            names.read(site, 0, None);
+        }
+        change(&names);
+        let rowed = read(&sites, &[bus()], Some(&names), verifier(&asked, all));
+        Some((today, rowed))
+    }
+
+    /// `from`'s text read as `to` on its chain.
+    fn renamed(
+        from: &'static str,
+        to: Result<&'static str, Stop>,
+    ) -> impl Fn(&crate::request_summary::PlacedName) -> Option<Result<String, Stop>> {
+        move |value| (value.name.as_deref() == Ok(from)).then(|| to.map(str::to_string))
+    }
+
+    /// Leads by file name, line and stop.
+    fn leads_of(rows: &LibraryRows) -> Vec<(String, u32, Stop)> {
+        let mut out: Vec<(String, u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| {
+                let file = lead
+                    .file
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (file, lead.line, lead.reason)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    const BUILDER_AND_PASSED: &str = "import { bus } from \"@fixture/bus\";\n\
+        import { topicFor } from \"./topics\";\n\
+        export function send(t: string) { bus.publish(t, {}); }\n\
+        export function two(id: string, o: string) { send(topicFor(id)); send(o); }\n";
+
+    const TWO_TEMPLATES: &str = "import { bus } from \"@fixture/bus\";\n\
+        export function send(t: string) { bus.publish(t, {}); }\n\
+        export function two(id: string) { send(`a.${id}`); send(`b.${id}`); }\n";
+
+    /// A chain that stops at one call with a hole today's reading does not
+    /// answer on that chain saves its lead there, even where another chain
+    /// at that call holds a builder today's reading answers: a choice of two
+    /// names (`several_operations`) and the step cap, beside
+    /// `send(topicFor(id))` (review 2, finding 1).
+    #[test]
+    fn a_hole_on_one_chain_is_not_answered_by_another_chain_s_builder() {
+        let caller = "import { two } from \"./wrapper\";\n\
+                      export function go(f: boolean) { two(\"x\", f ? \"b.one\" : \"b.two\"); }\n";
+        for (stop, to) in [
+            (Stop::FanOutCap, Some(Stop::FanOutCap)),
+            (Stop::SeveralOperations, None),
+        ] {
+            let Some((today, rowed)) = two_chains(BUILDER_AND_PASSED, caller, |value| {
+                let several = value.name == Err(Stop::SeveralOperations);
+                to.filter(|_| several).map(Err)
+            }) else {
+                return;
+            };
+            assert!(
+                placed(&today).contains(&("use.ts".to_string(), 2, "svc.x".to_string())),
+                "{today:#?}"
+            );
+            today_stands(&today, &rowed);
+            assert!(
+                leads_of(&rowed).contains(&("use.ts".to_string(), 2, stop)),
+                "{stop:?}: {:?}",
+                rowed.leads
+            );
+            assert!(
+                rowed.names.count(NameOutcome::R1Builder) >= 1,
+                "{:?}",
+                rowed.names
+            );
+        }
+    }
+
+    /// Where the text reader's name differs from today's on two chains at
+    /// one call, each chain's site counts `text_differs` and keeps today's
+    /// name, and neither reader name is stated (review 2, finding 2;
+    /// Q-B3f).
+    #[test]
+    fn each_differing_chain_counts_text_differs_at_its_site() {
+        let caller = "import { two } from \"./wrapper\";\n\
+                      export function go() { two(\"x\"); }\n";
+        let Some((today, rowed)) = two_chains(TWO_TEMPLATES, caller, |value| {
+            renamed("a.x", Ok("a.other"))(value).or_else(|| renamed("b.x", Ok("b.other"))(value))
+        }) else {
+            return;
+        };
+        today_stands(&today, &rowed);
+        assert!(
+            rowed.rows.iter().all(|row| !row.name.ends_with(".other")),
+            "{:#?}",
+            rowed.rows
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::TextDiffers),
+            2,
+            "{:?}",
+            rowed.names
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::CallerToday),
+            0,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// A chain's lead at one call does not block another chain's fallback
+    /// there: where one chain holes and the other's text differs from
+    /// today's, the differing chain keeps today's row, counted
+    /// `text_differs`, and the holed chain's lead is saved (review 2,
+    /// finding 3).
+    #[test]
+    fn a_lead_on_one_chain_keeps_another_chain_s_row() {
+        let caller = "import { two } from \"./wrapper\";\n\
+                      export function go() { two(\"x\"); }\n";
+        let Some((_, rowed)) = two_chains(TWO_TEMPLATES, caller, |value| {
+            renamed("a.x", Err(Stop::UnreadExpression))(value)
+                .or_else(|| renamed("b.x", Ok("b.other"))(value))
+        }) else {
+            return;
+        };
+        assert!(
+            placed(&rowed).contains(&("use.ts".to_string(), 2, "b.x".to_string())),
+            "{:#?}\n{:?}",
+            rowed.rows,
+            rowed.names
+        );
+        assert!(
+            leads_of(&rowed).contains(&("use.ts".to_string(), 2, Stop::UnreadExpression)),
+            "{:?}",
+            rowed.leads
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::TextDiffers),
+            1,
+            "{:?}",
+            rowed.names
+        );
+        // The holed chain's lead stops `caller_today` there (the `led`
+        // check): today's `a.x` is dropped, counted `lead_today_stated`.
+        assert!(
+            !placed(&rowed).contains(&("use.ts".to_string(), 2, "a.x".to_string())),
+            "{:#?}",
+            rowed.rows
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::LeadTodayStated),
+            1,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// A caller site whose chain no value of the text reader answers (a
+    /// hole at the library call itself, today's reading does not answer)
+    /// falls back to today's row; where another chain at that call already
+    /// states the same name, no row is lost, so the site is counted
+    /// `filled`, not `lead_today_stated` (review 3, N3).
+    #[test]
+    fn a_name_another_chain_states_is_not_a_lost_row() {
+        let caller = "import { two } from \"./wrapper\";\n\
+                      export function go() { two(\"x\"); }\n";
+        // Both chains read `a.x` today.
+        let same = "import { bus } from \"@fixture/bus\";\n\
+            export function send(t: string) { bus.publish(t, {}); }\n\
+            export function two(id: string) { send(`a.${id}`); send(`a.${id}`); }\n";
+        let holed = std::cell::Cell::new(false);
+        let Some((today, rowed)) = two_chains_with(same, caller, |names| {
+            names.rewrite_values(|value| {
+                // The first chain's value becomes the library call's own
+                // hole; the other chain keeps its own, which states the name.
+                (!holed.replace(true))
+                    .then(|| crate::request_summary::PlacedName {
+                        place: None,
+                        chain: Vec::new(),
+                        name: Err(Stop::SeveralOperations),
+                    })
+                    .filter(|_| value.name.is_ok())
+            });
+        }) else {
+            return;
+        };
+        assert!(
+            placed(&today).contains(&("use.ts".to_string(), 2, "a.x".to_string())),
+            "{today:#?}"
+        );
+        assert!(
+            placed(&rowed).contains(&("use.ts".to_string(), 2, "a.x".to_string())),
+            "{:#?}\n{:?}",
+            rowed.rows,
+            rowed.names
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::LeadTodayStated),
+            0,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// A name the text reader newly reads at a caller asks the kind, even
+    /// where another library call of the same wrapper is filled there by
+    /// today's reading (review 2, finding 4; Q-B3e).
+    #[test]
+    fn another_library_call_s_filled_caller_does_not_skip_the_kind_question() {
+        let wrapper = "import { bus } from \"@fixture/bus\";\n\
+                       export function w(a: string, b: string) {\n\
+                       \x20 bus.publish(a, {});\n\
+                       \x20 bus.publish(b, {});\n\
+                       }\n";
+        let caller = "import { w } from \"./wrapper\";\n\
+                      export function go(f: boolean) { w(\"x\", f ? \"y\" : \"y\"); }\n";
+        let Some((today, rowed)) = two_chains(wrapper, caller, |_| None) else {
+            return;
+        };
+        assert!(
+            placed(&today).contains(&("use.ts".to_string(), 2, "x".to_string())),
+            "{today:#?}"
+        );
+        assert!(
+            placed(&today).iter().all(|(_, _, name)| name != "y"),
+            "today's reading reads no `y`: {today:#?}"
+        );
+        today_stands(&today, &rowed);
+        assert!(
+            placed(&rowed).iter().all(|(_, _, name)| name != "y"),
+            "{:#?}",
+            rowed.rows
+        );
+        assert!(
+            rowed.names.count(NameOutcome::KindAsked) >= 1,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// Two caller chains of one wrapper that settle at the same outermost
+    /// call state both names there (review finding 1).
+    #[test]
+    fn two_chains_settling_at_one_call_state_both_names() {
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                (
+                    "src/wrapper.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     export function send(t: string) { bus.publish(t, {}); }\n\
+                     export function two(id: string) { send(`a.${id}`); send(`b.${id}`); }\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { two } from \"./wrapper\";\n\
+                     export function go() { two(\"x\"); }\n",
+                ),
+            ],
+            &[bus()],
+            None,
+        ) else {
+            return;
+        };
+        let want = vec![
+            ("use.ts".to_string(), 2, "a.x".to_string()),
+            ("use.ts".to_string(), 2, "b.x".to_string()),
+        ];
+        assert_eq!(placed(&today), want, "{today:#?}");
+        today_stands(&today, &rowed);
+        assert_eq!(placed(&rowed), want);
+        // Both are the text reader's rows, not today's kept.
+        assert_eq!(
+            rowed.names.count(NameOutcome::CallerToday),
+            0,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// A chain that stops at an own builder written between the library
+    /// call and the caller that fills it (`send(topicFor(id))` inside
+    /// `two`, filled by `two("x")`) keeps today's name at that caller, beside
+    /// another chain's name there, and in a one-chain wrapper (`mid`); the
+    /// lead stays at the builder's call. A name the library call writes
+    /// itself, beside a payload a caller fills (`fixed`), states what today's
+    /// reading states. No row is stated twice.
+    #[test]
+    fn a_chain_stopped_at_a_builder_between_keeps_today_s_name_at_its_caller() {
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                (
+                    "src/wrapper.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { topicFor } from \"./topics\";\n\
+                     export function send(t: string) { bus.publish(t, {}); }\n\
+                     export function two(id: string) { send(`a.${id}`); send(topicFor(id)); }\n\
+                     export function mid(k: string) { send(topicFor(k)); }\n\
+                     export function fixed(d: unknown) { bus.publish(\"fixed.name\", d); }\n",
+                ),
+                (
+                    "src/topics.ts",
+                    "export const topicFor = (kind: string) => `svc.${kind}`;\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { two, mid, fixed } from \"./wrapper\";\n\
+                     export function go() { two(\"x\"); }\n\
+                     export function one() { mid(\"y\"); }\n\
+                     export function payload() { fixed({}); }\n",
+                ),
+            ],
+            &[bus()],
+            None,
+        ) else {
+            return;
+        };
+        for want in [
+            ("use.ts".to_string(), 2, "a.x".to_string()),
+            ("use.ts".to_string(), 2, "svc.x".to_string()),
+            ("use.ts".to_string(), 3, "svc.y".to_string()),
+        ] {
+            assert!(placed(&today).contains(&want), "{want:?} {today:#?}");
+        }
+        today_stands(&today, &rowed);
+        let mut seen = placed(&rowed);
+        seen.dedup();
+        assert_eq!(seen, placed(&rowed), "no row twice");
+    }
+
+    /// A name in an object a wrapper hands on whole, beside another part
+    /// the claim positions, is stated at the caller that writes the object:
+    /// an op (`send({ topic, messages })`) and a definition
+    /// (`task({ id, run })`) (review finding 2).
+    #[test]
+    fn a_name_in_an_object_handed_on_whole_is_stated_at_its_caller() {
+        let producer = export(json!({
+            "package": "@fixture/bus", "version": "1.4.0", "specifier": "@fixture/bus",
+            "export": "producer", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "send", "on": "export",
+                  "name": { "arg": 0, "key": "topic" }, "payload": { "arg": 0, "key": "messages" } }
+            ]
+        }));
+        let jobs = export(json!({
+            "package": "@fixture/jobs", "version": "3.1.0", "specifier": "@fixture/jobs",
+            "export": "task", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "call", "member": null,
+                  "name": { "arg": 0, "key": "id" }, "handler": { "arg": 0, "key": "run" },
+                  "name_scope": { "scope": "service", "namespace": "task" } }
+            ]
+        }));
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                (
+                    "src/wrapper.ts",
+                    "import { producer } from \"@fixture/bus\";\n\
+                     import { task } from \"@fixture/jobs\";\n\
+                     export function send(r: { topic: string; messages: unknown[] }) { return producer.send(r); }\n\
+                     export function define(o: { id: string; run: () => Promise<void> }) { return task(o); }\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { send, define } from \"./wrapper\";\n\
+                     export function go() { send({ topic: \"orders\", messages: [] }); }\n\
+                     export const job = define({ id: \"nightly\", run: async () => {} });\n",
+                ),
+            ],
+            &[producer, jobs],
+            None,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&today),
+            vec![
+                ("use.ts".to_string(), 2, "orders".to_string()),
+                ("use.ts".to_string(), 3, "nightly".to_string()),
+            ],
+            "{today:#?}"
+        );
+        today_stands(&today, &rowed);
+        assert_eq!(
+            rowed.names.count(NameOutcome::CallerToday),
+            2,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// An own builder written at a wrapper's caller (`send(topicFor("x"))`)
+    /// keeps today's name there, counted `r1_builder`, and saves no lead
+    /// (review finding 3; Q-B3a's builder rule, until F4).
+    #[test]
+    fn a_builder_written_at_a_caller_keeps_today_s_name() {
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                ("src/wrapper.ts", NAMES_WRAPPER),
+                (
+                    "src/topics.ts",
+                    "export const topicFor = (kind: string) => `svc.${kind}`;\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { send } from \"./wrapper\";\n\
+                     import { topicFor } from \"./topics\";\n\
+                     export function go() { send(topicFor(\"x\")); }\n",
+                ),
+            ],
+            &[bus()],
+            None,
+        ) else {
+            return;
+        };
+        assert!(
+            placed(&today).contains(&("use.ts".to_string(), 3, "svc.x".to_string())),
+            "{today:#?}"
+        );
+        today_stands(&today, &rowed);
+        assert!(
+            rowed
+                .leads
+                .iter()
+                .all(|lead| !lead.file.ends_with("use.ts")),
+            "{:?}",
+            rowed.leads
+        );
+        assert!(
+            rowed.names.count(NameOutcome::R1Builder) >= 1,
+            "{:?}",
+            rowed.names
+        );
+    }
+
+    /// Past the resolver's step cap, each further caller of a wrapper keeps
+    /// today's name, counted `capped`, and saves no lead (review finding
+    /// 4): the cap counts across every caller of one slot.
+    #[test]
+    fn callers_past_the_step_cap_keep_today_s_names() {
+        let mut calls =
+            String::from("import { send } from \"./wrapper\";\nexport function many() {\n");
+        for at in 0..17 {
+            calls.push_str(&format!("  send(\"wide.{at}\");\n"));
+        }
+        calls.push_str("}\n");
+        let Some((_, today, rowed)) = read_twice(
+            &[("src/wrapper.ts", NAMES_WRAPPER), ("src/many.ts", &calls)],
+            &[bus()],
+            Some(8),
+        ) else {
+            return;
+        };
+        let wide = |rows: &LibraryRows| {
+            rows.rows
+                .iter()
+                .filter(|row| row.name.starts_with("wide."))
+                .count()
+        };
+        assert_eq!(wide(&today), 17, "{today:#?}");
+        today_stands(&today, &rowed);
+        assert!(
+            rowed.names.count(NameOutcome::Capped) >= 1,
+            "{:?}",
+            rowed.names
+        );
+        // `sendOrder`'s call, which no caller fills, stays a lead.
+        assert!(
+            rowed
+                .leads
+                .iter()
+                .all(|lead| !lead.file.ends_with("many.ts")),
+            "{:?}",
+            rowed.leads
+        );
+    }
+
+    /// The four lost-row shapes in one service: every row today's reading
+    /// states stands (review findings 1-4, together), read with the
+    /// resolver's own step cap and with a cap of 8, which the wide wrapper
+    /// passes (and which can stop the other shapes' chains first).
+    #[test]
+    fn the_four_lost_row_shapes_together_lose_no_row() {
+        let producer = export(json!({
+            "package": "@fixture/queue", "version": "2.0.0", "specifier": "@fixture/queue",
+            "export": "producer", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "send", "on": "export",
+                  "name": { "arg": 0, "key": "topic" }, "payload": { "arg": 0, "key": "messages" } }
+            ]
+        }));
+        let mut calls = String::from(
+            "import { send, two, handOn } from \"./wrapper\";\n\
+             import { topicFor } from \"./topics\";\n\
+             export function go() {\n\
+             \x20 two(\"x\");\n\
+             \x20 handOn({ topic: \"orders\", messages: [] });\n\
+             \x20 send(topicFor(\"y\"));\n",
+        );
+        for at in 0..12 {
+            calls.push_str(&format!("  send(\"wide.{at}\");\n"));
+        }
+        calls.push_str("}\n");
+        let files = [
+            (
+                "src/wrapper.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { producer } from \"@fixture/queue\";\n\
+                 export function send(t: string) { bus.publish(t, {}); }\n\
+                 export function two(id: string) { send(`a.${id}`); send(`b.${id}`); }\n\
+                 export function handOn(r: { topic: string; messages: unknown[] }) { return producer.send(r); }\n",
+            ),
+            (
+                "src/topics.ts",
+                "export const topicFor = (kind: string) => `svc.${kind}`;\n",
+            ),
+            ("src/use.ts", calls.as_str()),
+        ];
+        for cap in [None, Some(8)] {
+            let Some((_, today, rowed)) = read_twice(&files, &[bus(), producer.clone()], cap)
+            else {
+                return;
+            };
+            assert!(placed(&today).len() >= 16, "{today:#?}");
+            today_stands(&today, &rowed);
+            let mut seen = placed(&rowed);
+            seen.dedup();
+            assert_eq!(seen, placed(&rowed), "no row twice ({cap:?})");
+        }
+    }
+
+    /// A text differs from today's only where today's reading states one
+    /// and none of what it states is the text.
+    #[test]
+    fn a_text_differs_only_from_a_stated_other_text() {
+        assert!(!text_differs(&[], "a"));
+        assert!(!text_differs(&["a"], "a"));
+        assert!(!text_differs(&["b", "a"], "a"));
+        assert!(text_differs(&["b"], "a"));
+    }
+
+    /// Where the text reader's name differs from today's at a caller, the
+    /// reader states no name there: today's is the only row, and the site
+    /// counts `text_differs` (Q-B3f). No source shape the readers split on
+    /// is reachable offline, so this pins the decision both call sites in
+    /// `name()` use.
+    #[test]
+    fn a_differing_name_is_not_stated_beside_today_s() {
+        assert_eq!(reader_name(&[], "a".into()), Some("a".into()));
+        assert_eq!(reader_name(&["a"], "a".into()), Some("a".into()));
+        assert_eq!(reader_name(&["b", "a"], "a".into()), Some("a".into()));
+        assert_eq!(reader_name(&["b"], "a".into()), None);
+    }
+
+    /// A call the site path decides a name at saves no library lead beside
+    /// it: the site pass's own reading stands (review finding 5).
+    #[test]
+    fn a_library_lead_at_a_decided_site_is_not_saved() {
+        // The package's declarations, so the compiler names the export the
+        // site path follows the call to.
+        let files = [
+            (
+                "node_modules/@fixture/bus/package.json",
+                "{ \"name\": \"@fixture/bus\", \"version\": \"1.4.0\", \"types\": \"index.d.ts\" }\n",
+            ),
+            (
+                "node_modules/@fixture/bus/index.d.ts",
+                "export declare const bus: { publish(topic: string, data: unknown): void };\n",
+            ),
+            (
+                "src/leads.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 declare const settings: { topic: string };\n\
+                 export function fromSettings() { bus.publish(settings.topic ?? \"orders\", {}); }\n",
+            ),
+        ];
+        let exports = [bus()];
+        let Some((on, _, rowed)) = read_twice(&files, &exports, None) else {
+            return;
+        };
+        assert_eq!(rowed.leads.len(), 1, "{:?}", rowed.leads);
+        let discovery = crate::request_summary::discovery::discover(
+            &on.inputs,
+            &crate::request_summary::discovery::Labels::of(&exports),
+            &on.repo,
+        );
+        let discovered: Vec<crate::request_summary::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(&exports);
+        let decided = crate::request_summary::decided_sites::decided_sites(
+            &on.inputs,
+            &on.repo,
+            &discovered,
+            &labels,
+        );
+        let lead = &rowed.leads[0];
+        let file = crate::site_rows::relative(&on.repo, &lead.file.to_string_lossy());
+        assert!(
+            decided.sites.iter().any(|site| site.file == file
+                && site.span_start == lead.span_start
+                && site.span_end == lead.span_end),
+            "the site path decides the call: {:#?} {lead:?}",
+            decided.sites
+        );
+        let unread = crate::unread_sites::from_scan(
+            &crate::request_summary::discovery::Discovery::default(),
+            &decided,
+            &[],
+            &rowed.leads,
+            &on.repo,
+        );
+        assert!(unread.iter().all(|site| site.slot != "name"), "{unread:#?}");
+    }
+
+    /// The bus with a keyed name too: `add({ name })`.
+    fn keyed_bus() -> ExportClaims {
+        export(json!({
+            "package": "@fixture/bus", "version": "1.4.0", "specifier": "@fixture/bus",
+            "export": "bus", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "publish", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } },
+                { "kind": "op", "op": "send", "member": "add", "on": "export",
+                  "name": { "arg": 0, "key": "name" } }
+            ]
+        }))
+    }
+
+    /// The rowed twins of `library_sites`' four pinned name tests
+    /// (carrick#3504 B10-3, Q-B3d): with the compiler's rows the text reader
+    /// reads each slot, and every row today's reading states is stated
+    /// again, at the same place. `want` is the rows; the census must count
+    /// no row today's reading states that the text reader leaves.
+    fn rowed_twin(files: &[(&str, &str)], want: &[(&str, u32, &str)]) {
+        let Some((rows, _)) = read_walked(files, &[keyed_bus()], true) else {
+            return;
+        };
+        let want: Vec<(String, u32, String)> = want
+            .iter()
+            .map(|(file, line, name)| (file.to_string(), *line, name.to_string()))
+            .collect();
+        assert_eq!(placed(&rows), want, "{rows:#?}");
+        assert_eq!(
+            rows.names.count(NameOutcome::LeadTodayStated),
+            0,
+            "{:?} {:#?}",
+            rows.names,
+            rows.leads
+        );
+        assert_eq!(rows.names.count(NameOutcome::NoRows), 0, "{:?}", rows.names);
+    }
+
+    #[test]
+    fn rowed_a_name_passed_as_a_parameter_is_read_where_the_caller_writes_it() {
+        rowed_twin(
+            &[
+                (
+                    "src/bus.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     export async function publish(topic: string, data: unknown) {\n\
+                     \x20 await bus.publish(topic, data);\n\
+                     }\n\
+                     export async function publishOrder(kind: string, data: unknown) {\n\
+                     \x20 await publish(`orders.${kind}`, data);\n\
+                     }\n\
+                     export async function audit(data: string) {\n\
+                     \x20 await bus.publish(\"audit\", data);\n\
+                     }\n\
+                     export function enqueue(job: { name: string }) {\n\
+                     \x20 bus.add(job);\n\
+                     }\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { publish, publishOrder, audit, enqueue } from \"./bus\";\n\
+                     const TOPIC = \"users.created\";\n\
+                     export async function a(x: unknown, dynamic: string) {\n\
+                     \x20 await publish(\"users.deleted\", x);\n\
+                     \x20 await publish(TOPIC, x);\n\
+                     \x20 await publishOrder(\"shipped\", x);\n\
+                     \x20 await audit(\"payload\");\n\
+                     \x20 await publish(dynamic, x);\n\
+                     \x20 const args: [string] = [\"spread\"];\n\
+                     \x20 await publish(...args, \"late\");\n\
+                     \x20 enqueue({ name: \"welcome\" });\n\
+                     }\n",
+                ),
+            ],
+            &[
+                ("bus.ts", 9, "audit"),
+                ("use.ts", 4, "users.deleted"),
+                ("use.ts", 5, "users.created"),
+                ("use.ts", 6, "orders.shipped"),
+                ("use.ts", 11, "welcome"),
+            ],
+        );
+    }
+
+    /// The constants module the rowed name twins read.
+    const TOPICS_MODULE: &str = "export const TOPICS = { orders: { created: \"orders.created\" }, users: \"users\" } as const;\n\
+         export const PREFIX = \"svc\";\n\
+         export const topicFor = (kind: string) => `${PREFIX}.${kind}`;\n\
+         export function auditTopic(name: string) { return `audit.${name}`; }\n\
+         export const ROUTES = { byId: (id: string) => `jobs.${id}` };\n\
+         export const MUTABLE = { a: \"mutable.a\" };\n\
+         export function twoSteps(name: string) { const topic = `two.${name}`; return topic; }\n";
+
+    #[test]
+    fn rowed_a_name_read_through_a_map_a_constant_or_a_builder_is_its_text() {
+        rowed_twin(
+            &[
+                ("src/topics.ts", TOPICS_MODULE),
+                (
+                    "src/other.ts",
+                    "import { MUTABLE } from \"./topics\";\n\
+                     MUTABLE.a = \"changed\";\n",
+                ),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { TOPICS, PREFIX, topicFor, auditTopic, ROUTES, MUTABLE, twoSteps } from \"./topics\";\n\
+                     const LOCAL = { shipped: \"orders.shipped\" };\n\
+                     const NESTED = { inner: { x: \"nested.x\" } };\n\
+                     const alias = NESTED.inner;\n\
+                     export function a(kind: string) {\n\
+                     \x20 bus.publish(TOPICS.orders.created, {});\n\
+                     \x20 bus.publish(PREFIX, {});\n\
+                     \x20 bus.publish(topicFor(\"x\"), {});\n\
+                     \x20 bus.publish(auditTopic(\"y\"), {});\n\
+                     \x20 bus.publish(ROUTES.byId(\"7\"), {});\n\
+                     \x20 bus.publish(LOCAL.shipped, {});\n\
+                     \x20 bus.publish(MUTABLE.a, {});\n\
+                     \x20 bus.publish(NESTED.inner.x, {});\n\
+                     \x20 bus.publish(topicFor(kind), {});\n\
+                     \x20 bus.publish(twoSteps(\"z\"), {});\n\
+                     \x20 bus.publish(TOPICS.users, alias);\n\
+                     }\n",
+                ),
+                (
+                    "src/caller.ts",
+                    "import { a } from \"./use\";\n\
+                     export function go() { a(\"filled\"); }\n",
+                ),
+            ],
+            &[
+                ("caller.ts", 2, "svc.filled"),
+                ("use.ts", 7, "orders.created"),
+                ("use.ts", 8, "svc"),
+                ("use.ts", 9, "svc.x"),
+                ("use.ts", 10, "audit.y"),
+                ("use.ts", 11, "jobs.7"),
+                ("use.ts", 12, "orders.shipped"),
+                ("use.ts", 16, "two.z"),
+                ("use.ts", 17, "users"),
+            ],
+        );
+    }
+
+    /// A constant a builder's call initialises keeps today's reading too:
+    /// its value is a call term the text reader holes (`r1_builder`).
+    #[test]
+    fn rowed_a_constant_a_builder_initialises_keeps_today_s_name() {
+        rowed_twin(
+            &[
+                ("src/topics.ts", TOPICS_MODULE),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { topicFor } from \"./topics\";\n\
+                     const BUILT = topicFor(\"built\");\n\
+                     export function a() { bus.publish(BUILT, {}); }\n",
+                ),
+            ],
+            &[("use.ts", 4, "svc.built")],
+        );
+    }
+
+    #[test]
+    fn rowed_an_object_used_any_way_but_read_holds_no_name() {
+        rowed_twin(
+            &[
+                (
+                    "src/topics.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { register } from \"./registry\";\n\
+                     const HANDED = { a: \"handed.a\" };\n\
+                     const SPREAD = { a: \"spread.a\" };\n\
+                     const RETURNED = { a: \"returned.a\" };\n\
+                     const COMPUTED = { a: \"computed.a\" };\n\
+                     const OPTIONAL = { inner: { a: \"optional.a\" } };\n\
+                     const KEPT = { a: \"kept.a\" };\n\
+                     const TESTED_INNER = { inner: { a: \"tested.a\" } };\n\
+                     const TESTED_TEXT = { a: \"tested.text\" };\n\
+                     register(HANDED);\n\
+                     export const copy = { ...SPREAD };\n\
+                     export function give() { return RETURNED; }\n\
+                     export function pick(key: \"a\") { return COMPUTED[key]; }\n\
+                     export function maybe() { return OPTIONAL?.inner; }\n\
+                     export function check() { if (TESTED_INNER.inner || TESTED_TEXT.a) { return 1; } return 0; }\n\
+                     export function send() {\n\
+                     \x20 bus.publish(HANDED.a, {});\n\
+                     \x20 bus.publish(SPREAD.a, {});\n\
+                     \x20 bus.publish(RETURNED.a, {});\n\
+                     \x20 bus.publish(COMPUTED.a, {});\n\
+                     \x20 bus.publish(OPTIONAL.inner.a, {});\n\
+                     \x20 bus.publish(KEPT.a, {});\n\
+                     \x20 bus.publish(TESTED_INNER.inner.a, {});\n\
+                     \x20 bus.publish(TESTED_TEXT.a, {});\n\
+                     }\n",
+                ),
+                (
+                    "src/registry.ts",
+                    "export function register(value: unknown) {}\n",
+                ),
+            ],
+            // The text reader's write census reads an object read by a
+            // computed key as kept (a read changes nothing), so it reads
+            // `computed.a`, which today's reading does not: a broker's name
+            // read anew waits on the site path's kind question and states no
+            // library row (Q-B3e).
+            &[
+                ("topics.ts", 23, "kept.a"),
+                ("topics.ts", 25, "tested.text"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rowed_a_constant_object_any_module_may_change_is_read_as_nothing() {
+        let user = "import { bus } from \"@fixture/bus\";\n\
+                    import { TOPICS, PREFIX } from \"./topics\";\n\
+                    export function a() {\n\
+                    \x20 bus.publish(TOPICS.users, {});\n\
+                    \x20 bus.publish(PREFIX, {});\n\
+                    }\n";
+        rowed_twin(
+            &[("src/topics.ts", TOPICS_MODULE), ("src/use.ts", user)],
+            &[("use.ts", 4, "users"), ("use.ts", 5, "svc")],
+        );
+        rowed_twin(
+            &[
+                ("src/topics.ts", TOPICS_MODULE),
+                ("src/use.ts", user),
+                (
+                    "src/all.ts",
+                    "import * as topics from \"./topics\";\n\
+                     export const every = topics;\n",
+                ),
+            ],
+            // The text reader reads the entry through the declaration its
+            // rows name whatever a namespace import does with the module,
+            // where today's reading reads nothing: a broker's name read
+            // anew waits on the site path's kind question and states no
+            // library row (Q-B3e). `PREFIX` today's reading reads.
+            &[("use.ts", 5, "svc")],
+        );
     }
 }

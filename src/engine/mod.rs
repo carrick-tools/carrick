@@ -5896,6 +5896,7 @@ async fn analyze_current_repo_incremental(
                 analysis.builds_graphql_schema_in_code,
             );
             let (library, claims, unready) = library_rows(
+                &request_inputs,
                 library_ask.as_deref(),
                 library_answer,
                 sidecar,
@@ -5929,6 +5930,7 @@ async fn analyze_current_repo_incremental(
                 SiteContext {
                     placements: Some(&placements),
                     caller_stops: &caller_stops,
+                    library_leads: &protocol_extractions.library.leads,
                     library: library_ask.as_ref().map(|ask| &ask.sites),
                     declarations: declarations.as_ref(),
                     implementations: Some(&implementations),
@@ -7259,6 +7261,7 @@ fn first_discovery(
 /// upload ([`crate::scan_health::record_library_packages`]). Nothing
 /// asked reads nothing.
 fn library_rows(
+    inputs: &crate::request_summary::RequestSummaryInputs,
     ask: Option<&LibraryAsk>,
     settled: crate::library_store::Settled,
     sidecar: Option<&TypeSidecar>,
@@ -7288,7 +7291,7 @@ fn library_rows(
         });
     }
     (
-        read_library_rows(&ask.sites, &settled.exports, sidecar, from_dir),
+        read_library_rows(inputs, &ask.sites, &settled.exports, sidecar, from_dir),
         settled.exports,
         unready,
     )
@@ -7477,6 +7480,9 @@ struct SiteContext<'a> {
     /// The callers whose request the send side could not compose
     /// (carrick#3688 F), saved as unread sites.
     caller_stops: &'a [crate::request_summary::CallerStop],
+    /// The verified library sites whose name the library reader states
+    /// none for (carrick#3504 B10-3), saved as unread sites.
+    library_leads: &'a [crate::library_claims::LibraryLead],
     library: Option<&'a crate::request_summary::LibrarySites>,
     /// For the receiver trace (carrick#2474 R1): the member declarations
     /// verified op claims resolve to ([`member_declarations`]). `None` only
@@ -7834,7 +7840,13 @@ fn site_records_of(
     SiteRecordsOf {
         discovered: discovery.sites.len(),
         reached_label,
-        unread: crate::unread_sites::from_scan(&discovery, &decided, context.caller_stops, root),
+        unread: crate::unread_sites::from_scan(
+            &discovery,
+            &decided,
+            context.caller_stops,
+            context.library_leads,
+            root,
+        ),
         decided,
         records,
         labels,
@@ -7898,8 +7910,10 @@ async fn dispatch_rows_of(
 /// `sites` read through `claims`, each verified by the sidecar against the
 /// package's own declarations, from `from_dir` (the service root, as for the
 /// client semantics). Verification runs on every scan and is never cached.
-/// No claims, or no sidecar, read nothing.
+/// No claims, or no sidecar, read nothing. A name slot is read through the
+/// text reader over `inputs` (carrick#3504 B10-3).
 fn read_library_rows(
+    inputs: &crate::request_summary::RequestSummaryInputs,
     sites: &crate::request_summary::LibrarySites,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
@@ -7908,7 +7922,8 @@ fn read_library_rows(
     let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
         return crate::library_claims::LibraryRows::default();
     };
-    crate::library_claims::read(sites, claims, |checks| {
+    let names = crate::request_summary::SiteNames::of(inputs);
+    crate::library_claims::read(sites, claims, Some(&names), |checks| {
         sidecar
             .verify_library_claims(from_dir, checks)
             .map(|answer| {
@@ -9250,6 +9265,7 @@ fn stated_library_rows(
             .cloned()
             .collect(),
         names: library.names.clone(),
+        leads: library.leads.clone(),
         unanswered: library.unanswered.clone(),
     }
 }
@@ -14324,6 +14340,7 @@ async fn analyze_current_repo(
         analysis_result.builds_graphql_schema_in_code,
     );
     let (library, claims, unready) = library_rows(
+        &request_inputs,
         library_ask.as_deref(),
         library_answer,
         sidecar,
@@ -14355,6 +14372,7 @@ async fn analyze_current_repo(
         SiteContext {
             placements: Some(&placements),
             caller_stops: &caller_stops,
+            library_leads: &protocol_extractions.library.leads,
             library: library_ask.as_ref().map(|ask| &ask.sites),
             declarations: declarations.as_ref(),
             implementations: Some(&implementations),
@@ -15143,7 +15161,13 @@ mod tests {
                 None,
             )
             .await;
-            let _ = super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+            let _ = super::library_rows(
+                &crate::request_summary::RequestSummaryInputs::default(),
+                Some(&ask),
+                settled,
+                None,
+                std::path::Path::new("."),
+            );
         })
         .await;
         assert_eq!(
@@ -15196,7 +15220,13 @@ mod tests {
                     None,
                 )
                 .await;
-                super::library_rows(Some(&ask), settled, None, std::path::Path::new("."));
+                super::library_rows(
+                    &crate::request_summary::RequestSummaryInputs::default(),
+                    Some(&ask),
+                    settled,
+                    None,
+                    std::path::Path::new("."),
+                );
             })
             .await;
             crate::scan_health::library_ask_failed_for(name.as_deref())
@@ -15257,7 +15287,14 @@ mod tests {
                 None,
             )
             .await;
-            unready = super::library_rows(Some(&ask), settled, None, std::path::Path::new(".")).2;
+            unready = super::library_rows(
+                &crate::request_summary::RequestSummaryInputs::default(),
+                Some(&ask),
+                settled,
+                None,
+                std::path::Path::new("."),
+            )
+            .2;
         })
         .await;
         assert_eq!(
@@ -28173,6 +28210,288 @@ unfollowed_member_calls_total: 0,
         assert_eq!(of.decided.sites.len(), 1, "decided sites");
     }
 
+    /// carrick#3504 B10-3: the library reader and the site path name each
+    /// message site of the fixture alike, with the compiler's rows: a
+    /// literal, a constant, a parameter its caller fills, and one filled two
+    /// callers out, each at the call where the name settles.
+    #[tokio::test]
+    async fn the_library_reader_and_the_site_path_name_the_same_site_alike() {
+        let edit = [
+            (
+                "package.json",
+                r#"{ "name": "web", "version": "1.0.0", "dependencies": { "@fixture/bus": "^1.0.0" } }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/package.json",
+                r#"{ "name": "@fixture/bus", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/index.d.ts",
+                "export interface Bus {\n  publish(topic: string, data: unknown): Promise<void>;\n}\nexport declare const bus: Bus;\n",
+            ),
+            (
+                "src/wrapper.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 export function send(topic: string) { return bus.publish(topic, {}); }\n\
+                 export function sendOrder(kind: string) { return send(`orders.${kind}`); }\n",
+            ),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { send, sendOrder } from \"./wrapper\";\n\
+                 const TOPIC = \"orders.const\";\n\
+                 export async function a() {\n\
+                 \x20 await bus.publish(\"orders.literal\", {});\n\
+                 \x20 await bus.publish(TOPIC, {});\n\
+                 \x20 await send(\"orders.direct\");\n\
+                 \x20 await sendOrder(\"shipped\");\n\
+                 }\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"@fixture/bus","version":"1.0.0","status":"answered",
+            "exports":[{"specifier":"@fixture/bus","export":"bus","role":"broker",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let want: Vec<(String, u32, String)> = [
+            (5, "orders.literal"),
+            (6, "orders.const"),
+            (7, "orders.direct"),
+            (8, "orders.shipped"),
+        ]
+        .into_iter()
+        .map(|(line, name)| {
+            (
+                "services/web/src/use.ts".to_string(),
+                line,
+                name.to_string(),
+            )
+        })
+        .collect();
+
+        let sites = crate::request_summary::library_sites(&on.inputs);
+        let names = crate::request_summary::SiteNames::of(&on.inputs);
+        let library = crate::library_claims::read(&sites, &exports, Some(&names), |checks| {
+            Ok(checks
+                .iter()
+                .map(|check| crate::services::type_sidecar::SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: crate::services::type_sidecar::SemanticsVerdict::Verified,
+                    reason: None,
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        let mut from_library: Vec<(String, u32, String)> = library
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    crate::site_rows::relative(&on.repo, &row.file.to_string_lossy()),
+                    row.line,
+                    row.name.clone(),
+                )
+            })
+            .collect();
+        from_library.sort();
+        assert_eq!(from_library, want, "the library reader: {library:#?}");
+
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        // The site path's name for each site it decides: every piece text
+        // the code states, at the call where the name settles.
+        let mut from_site: Vec<(String, u32, String)> = of
+            .decided
+            .sites
+            .iter()
+            .filter_map(|site| {
+                let mut name = String::new();
+                for piece in &site.name {
+                    match piece {
+                        crate::request_summary::Piece::Lit(text) => name.push_str(text),
+                        _ => return None,
+                    }
+                }
+                Some((site.file.clone(), site.line, name))
+            })
+            .collect();
+        from_site.sort();
+        assert_eq!(from_site, want, "the site path: {:#?}", of.decided.sites);
+    }
+
+    /// carrick#3504 B10-3, Q-B3e: a broker name the library reader now reads
+    /// that is not a literal (here destructured from a constant object)
+    /// states no library row; the site path asks the broker's kind, and its
+    /// answer decides. Answered `job`, no queue row stands; unanswered, the
+    /// site is a possible call; answered `topic`, its one row stands. A
+    /// literal name is the library reader's row, as before.
+    #[tokio::test]
+    async fn a_broker_name_read_anew_waits_on_the_site_path_s_kind() {
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
+        let edit = [
+            (
+                "package.json",
+                r#"{ "name": "web", "version": "1.0.0", "dependencies": { "@fixture/bus": "^1.0.0" } }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/package.json",
+                r#"{ "name": "@fixture/bus", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/index.d.ts",
+                "export interface Bus {\n  publish(topic: string, data: unknown): Promise<void>;\n}\nexport declare const bus: Bus;\n",
+            ),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 const { topic } = { topic: \"orders.destructured\" };\n\
+                 export async function a() {\n\
+                 \x20 await bus.publish(\"orders.literal\", {});\n\
+                 \x20 await bus.publish(topic, {});\n\
+                 }\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"@fixture/bus","version":"1.0.0","status":"answered",
+            "exports":[{"specifier":"@fixture/bus","export":"bus","role":"broker",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let file = "services/web/src/use.ts";
+
+        let sites = crate::request_summary::library_sites(&on.inputs);
+        let names = crate::request_summary::SiteNames::of(&on.inputs);
+        let library = crate::library_claims::read(&sites, &exports, Some(&names), |checks| {
+            Ok(checks
+                .iter()
+                .map(|check| crate::services::type_sidecar::SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: crate::services::type_sidecar::SemanticsVerdict::Verified,
+                    reason: None,
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        let from_library: Vec<(u32, String)> = library
+            .rows
+            .iter()
+            .map(|row| (row.line, row.name.clone()))
+            .collect();
+        assert_eq!(
+            from_library,
+            vec![(4, "orders.literal".to_string())],
+            "only the literal is the library reader's row: {library:#?}"
+        );
+        assert_eq!(
+            library
+                .names
+                .count(crate::name_census::NameOutcome::KindAsked),
+            1,
+            "{:?}",
+            library.names
+        );
+        assert!(library.leads.is_empty(), "{:?}", library.leads);
+
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        let record = of
+            .records
+            .iter()
+            .find(|record| record.anchors.call.file == file && record.anchors.call.line == 5)
+            .expect("the destructured name's call is a decided site");
+        assert!(
+            record.state.asked.contains(&Slot::Kind),
+            "{:?}",
+            record.state
+        );
+        let rows_with = |kind: Option<&str>| {
+            let mut answers = SiteAnswers::default();
+            if let Some(kind) = kind {
+                let said = |text: &str| {
+                    Some(SlotAnswer {
+                        value: Some(SlotValue::Text(text.to_string())),
+                        confidence: 0.95,
+                        orders_agree: true,
+                    })
+                };
+                let mut answered = Answered::default();
+                for slot in &record.state.asked {
+                    match slot {
+                        Slot::Kind => answered.kind = said(kind),
+                        Slot::Role => answered.role = said("sends"),
+                        Slot::Name => answered.name = said("orders.destructured"),
+                        _ => {}
+                    }
+                }
+                answers
+                    .answered
+                    .insert(crate::site_rows::site_id(&record.anchors), answered);
+            }
+            crate::site_rows::of(&of.decided, &of.records, &of.labels, &answers)
+        };
+        let at_line = |rows: &crate::site_rows::SiteRows| -> Vec<crate::operation::OperationKey> {
+            rows.rows
+                .iter()
+                .filter(|row| row.file == file && row.line == 5)
+                .map(|row| row.key.clone())
+                .collect()
+        };
+        let job = rows_with(Some("job"));
+        assert!(
+            at_line(&job).is_empty(),
+            "a job name is no queue row: {:#?}",
+            job.rows
+        );
+        let unanswered = rows_with(None);
+        assert!(at_line(&unanswered).is_empty(), "{:#?}", unanswered.rows);
+        assert!(
+            unanswered
+                .leads
+                .iter()
+                .any(|lead| lead.file_path == file && lead.line_number == 5),
+            "unanswered, the site is a possible call: {:#?}",
+            unanswered.leads
+        );
+        let topic = rows_with(Some("topic"));
+        assert_eq!(
+            at_line(&topic),
+            vec![crate::operation::OperationKey::pubsub(
+                "orders.destructured"
+            )],
+            "{:#?}",
+            topic.rows
+        );
+    }
+
     /// carrick#2538: a message listener on a forked child process is an
     /// in-process end. The row it writes stays in its service, so it never
     /// pairs with a publisher of the same name in another service, whatever
@@ -30077,9 +30396,10 @@ unfollowed_member_calls_total: 0,
             "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
         )
         .expect("write");
-        let sites = crate::request_summary::library_sites(&discover_request_inputs(dir.path()));
+        let inputs = discover_request_inputs(dir.path());
+        let sites = crate::request_summary::library_sites(&inputs);
         assert!(
-            read_library_rows(&sites, &[], None, dir.path())
+            read_library_rows(&inputs, &sites, &[], None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -30093,7 +30413,7 @@ unfollowed_member_calls_total: 0,
             .expect("claims"),
         ];
         assert!(
-            read_library_rows(&sites, &claims, None, dir.path())
+            read_library_rows(&inputs, &sites, &claims, None, dir.path())
                 .rows
                 .is_empty()
         );
@@ -30148,7 +30468,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         sidecar
             .wait_ready(std::time::Duration::from_secs(20))
             .expect("the stand-in answers init");
-        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let inputs = discover_request_inputs(&root);
+        let sites = crate::request_summary::library_sites(&inputs);
         let claims: Vec<crate::library_claims::ExportClaims> = vec![
             serde_json::from_value(serde_json::json!({
                 "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
@@ -30158,7 +30479,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             }))
             .expect("claims"),
         ];
-        let rows = read_library_rows(&sites, &claims, Some(&sidecar), &root);
+        let rows = read_library_rows(&inputs, &sites, &claims, Some(&sidecar), &root);
         assert_eq!(rows.rows.len(), 1, "the fresh process verified the claim");
     }
 
@@ -30204,7 +30525,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         sidecar
             .wait_ready(std::time::Duration::from_secs(20))
             .expect("the stand-in answers init");
-        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let inputs = discover_request_inputs(&root);
+        let sites = crate::request_summary::library_sites(&inputs);
         let claims: Vec<crate::library_claims::ExportClaims> = vec![
             serde_json::from_value(serde_json::json!({
                 "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
@@ -30219,7 +30541,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         crate::scan_health::forget_service_losses(Some(SERVICE));
 
         let rows = crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
-            read_library_rows(&sites, &claims, Some(&sidecar), &root)
+            read_library_rows(&inputs, &sites, &claims, Some(&sidecar), &root)
         });
         assert!(
             rows.rows.is_empty(),
@@ -30275,7 +30597,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         sidecar
             .wait_ready(std::time::Duration::from_secs(20))
             .expect("the stand-in answers init");
-        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let inputs = discover_request_inputs(&root);
+        let sites = crate::request_summary::library_sites(&inputs);
         let claims: Vec<crate::library_claims::ExportClaims> = vec![
             serde_json::from_value(serde_json::json!({
                 "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
@@ -30285,7 +30608,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             }))
             .expect("claims"),
         ];
-        let library = read_library_rows(&sites, &claims, Some(&sidecar), &root);
+        let library = read_library_rows(&inputs, &sites, &claims, Some(&sidecar), &root);
         assert!(library.rows.is_empty(), "no verified row either way");
         let unread = crate::unread_sites::with_unanswered(saved, &[], &library.unanswered, &root);
         let mut data = service_data("monorepo", None);

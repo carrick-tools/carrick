@@ -276,8 +276,9 @@ pub use guards::{
 
 #[allow(unused_imports)]
 pub use library_sites::{
-    Contest, Holder, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, On, Selector,
-    SiteArg, SiteMaker, SiteObject, SiteReceiver, library_sites, package_name,
+    CallerChain, Contest, Holder, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire,
+    NameFallback, NamePlace, On, PlacedName, Selector, SiteArg, SiteMaker, SiteNames, SiteObject,
+    SiteReceiver, SlotName, library_sites, package_name,
 };
 
 use std::borrow::Cow;

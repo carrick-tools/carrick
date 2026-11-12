@@ -6,7 +6,9 @@
 //! - **One producer.** [`from_scan`] reads the stops the site pass holds
 //!   (discovery's unfollowed calls, its walks that stopped with no labelled
 //!   end, its walks that missed a call inside, the decided pass's unplaced
-//!   calls and caller cycles, and the class-only GraphQL calls). [`attach`]
+//!   calls and caller cycles, and the class-only GraphQL calls), and the
+//!   library reader's name leads ([`crate::library_claims::LibraryLead`],
+//!   carrick#3504 B10-3) at a call none of those names. [`attach`]
 //!   joins them to the possible calls the fold lists, and writes both
 //!   fields from that one list: `possible_calls` is the projection of the
 //!   listed rows ([`crate::possible_calls`]), byte for byte what it was
@@ -35,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cloud_storage::CloudRepoData;
+use crate::library_claims::LibraryLead;
 use crate::possible_calls::{
     LabelledEndRef, PossibleCall, PossibleEnd, Unread, kind_of, labelled_end, role_of, slot_of,
 };
@@ -245,6 +248,34 @@ impl UnreadSite {
     }
 }
 
+impl UnreadSite {
+    /// A verified library site whose name the library reader states none
+    /// for (carrick#3504 B10-3): the slot is its name.
+    fn of_library(lead: &LibraryLead, root: &Path) -> Self {
+        UnreadSite {
+            file: crate::site_rows::relative(root, &lead.file.to_string_lossy()),
+            line: lead.line,
+            span_start: lead.span_start,
+            span_end: lead.span_end,
+            reason: lead.reason,
+            also: Vec::new(),
+            slot: "name".to_string(),
+            callee: None,
+            stop_at: None,
+            depth: 0,
+            labelled_end: Some(LabelledEndRef {
+                package: lead.package.clone(),
+                export: lead.export.clone(),
+                member: lead.member.clone(),
+            }),
+            kind: lead.kind.map(str::to_string),
+            role: lead.role.map(str::to_string),
+            ends: Vec::new(),
+            listed: false,
+        }
+    }
+}
+
 /// The callee text as the blob carries it; none when the call writes none.
 fn callee(text: &str) -> Option<String> {
     let cut = crate::unfollowed_calls::cut_receiver(text);
@@ -262,6 +293,7 @@ pub fn from_scan(
     discovery: &Discovery,
     decided: &Decided,
     callers: &[CallerStop],
+    library: &[LibraryLead],
     root: &Path,
 ) -> Vec<UnreadSite> {
     let mut out: Vec<UnreadSite> = Vec::new();
@@ -341,6 +373,38 @@ pub fn from_scan(
                 ..UnreadSite::listed(&crate::possible_calls::from_lead(lead))
             }),
     );
+    // The library reader's leads (carrick#3504 B10-3), at a call no other
+    // row here names and the site pass decides no name at: the site pass's
+    // own reading of a call stands.
+    // A second chain's lead at the same call, with another stop, joins the
+    // first lead's `also`.
+    let mut led_here: Vec<usize> = Vec::new();
+    for lead in library {
+        let site = UnreadSite::of_library(lead, root);
+        let decided_here = decided
+            .sites
+            .iter()
+            .any(|held| (held.file.as_str(), held.span_start, held.span_end) == site.at());
+        if decided_here {
+            continue;
+        }
+        match out.iter().position(|held| held.at() == site.at()) {
+            None => {
+                led_here.push(out.len());
+                out.push(site);
+            }
+            Some(index) if led_here.contains(&index) => {
+                let held = &mut out[index];
+                if held.reason != site.reason
+                    && !held.also.contains(&site.reason)
+                    && held.also.len() < 4
+                {
+                    held.also.push(site.reason);
+                }
+            }
+            Some(_) => {}
+        }
+    }
     out
 }
 
@@ -1160,7 +1224,13 @@ mod tests {
         discovery
             .unanswered_at
             .insert(at, ["fixture-pending".to_string()].into());
-        let rows = from_scan(&discovery, &Decided::default(), &[], Path::new("/repo"));
+        let rows = from_scan(
+            &discovery,
+            &Decided::default(),
+            &[],
+            &[],
+            Path::new("/repo"),
+        );
         let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
         assert_eq!(by_file("src/o.ts").reason, Stop::MissedInside);
         assert_eq!(by_file("src/o.ts").also, vec![Stop::UnansweredPackage]);
@@ -1222,7 +1292,7 @@ mod tests {
             }],
             ..Decided::default()
         };
-        let rows = from_scan(&discovery, &decided, &[], Path::new("/repo"));
+        let rows = from_scan(&discovery, &decided, &[], &[], Path::new("/repo"));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::NoBody);
         assert_eq!(rows[0].stop_at.as_deref(), Some("src/b.ts:40"));
@@ -1259,6 +1329,7 @@ mod tests {
             &Discovery::default(),
             &Decided::default(),
             &[caller],
+            &[],
             Path::new("/repo"),
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1270,5 +1341,37 @@ mod tests {
             (row.slot.as_str(), row.kind.as_deref(), row.role.as_deref()),
             ("path", Some("http"), Some("consumer"))
         );
+    }
+
+    /// Two chains' leads at one call, each with its own stop, are one row:
+    /// the first lead's stop is the reason and the second's joins `also`.
+    #[test]
+    fn two_library_leads_at_one_call_are_both_kept() {
+        let lead = |reason: Stop| LibraryLead {
+            file: "/repo/src/use.ts".into(),
+            line: 2,
+            span_start: 20,
+            span_end: 30,
+            reason,
+            package: "fixture-bus".to_string(),
+            export: "bus".to_string(),
+            member: Some("publish".to_string()),
+            kind: Some("pubsub"),
+            role: Some("producer"),
+        };
+        let rows = from_scan(
+            &Discovery::default(),
+            &Decided::default(),
+            &[],
+            &[
+                lead(Stop::UnreadExpression),
+                lead(Stop::FanOutCap),
+                lead(Stop::FanOutCap),
+            ],
+            Path::new("/repo"),
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].reason, Stop::UnreadExpression);
+        assert_eq!(rows[0].also, vec![Stop::FanOutCap]);
     }
 }

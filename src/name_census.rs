@@ -64,10 +64,41 @@ pub enum NameOutcome {
     Linked,
     /// The name is a parameter's, read as the text a caller passes.
     Filled,
+    /// The name is the one the maker that made the receiver was handed,
+    /// read where the maker is written (carrick#3504 B10-3, Q-B3b).
+    Made,
+    /// Today's reading, kept: the text reader has no compiler rows for the
+    /// slot (B10-3, Q-B3a).
+    NoRows,
+    /// Today's reading, kept: the slot calls an own builder the text reader
+    /// holes (B10-3, until F4).
+    R1Builder,
     /// A spread stands where the name is, so nothing is read.
     StopSpread,
     /// Anything else the reader cannot read as text.
     StopUnread,
+    /// The text reader states no name, and the reader saves a lead
+    /// (B10-3).
+    Lead,
+    /// A lead where today's reading stated a text: a row the text reader
+    /// does not keep (B10-3).
+    LeadTodayStated,
+    /// A name the text reader reads where today's reading read none, on a
+    /// label that does not say topic or job name: the reader states no row,
+    /// and the site path's kind question decides (B10-3, Q-B3e).
+    KindAsked,
+    /// Today's reading, kept at a caller: a cap of the text reader (its
+    /// step cap, or more values or chains than it follows) stopped the
+    /// chain that ends there (B10-3).
+    Capped,
+    /// Today's reading, kept at a caller the library call's reading states
+    /// no row and no lead at: a claimed part the caller writes and the
+    /// library call does not (`send({ topic, messages })` handed on whole)
+    /// (B10-3).
+    CallerToday,
+    /// The text reader states a text where today's reading states another
+    /// at the same place: a row whose name moves (B10-3).
+    TextDiffers,
 }
 
 impl Word for NameOutcome {
@@ -75,8 +106,17 @@ impl Word for NameOutcome {
         NameOutcome::Literal,
         NameOutcome::Linked,
         NameOutcome::Filled,
+        NameOutcome::Made,
+        NameOutcome::NoRows,
+        NameOutcome::R1Builder,
         NameOutcome::StopSpread,
         NameOutcome::StopUnread,
+        NameOutcome::Lead,
+        NameOutcome::LeadTodayStated,
+        NameOutcome::KindAsked,
+        NameOutcome::Capped,
+        NameOutcome::CallerToday,
+        NameOutcome::TextDiffers,
     ];
 
     fn word(self) -> &'static str {
@@ -84,8 +124,17 @@ impl Word for NameOutcome {
             NameOutcome::Literal => "literal",
             NameOutcome::Linked => "linked",
             NameOutcome::Filled => "filled",
+            NameOutcome::Made => "made",
+            NameOutcome::NoRows => "no_rows",
+            NameOutcome::R1Builder => "r1_builder",
             NameOutcome::StopSpread => "stop_spread",
             NameOutcome::StopUnread => "stop_unread",
+            NameOutcome::Lead => "lead",
+            NameOutcome::LeadTodayStated => "lead_today_stated",
+            NameOutcome::KindAsked => "kind_asked",
+            NameOutcome::Capped => "capped",
+            NameOutcome::CallerToday => "caller_today",
+            NameOutcome::TextDiffers => "text_differs",
         }
     }
 }

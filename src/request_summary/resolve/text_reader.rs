@@ -410,7 +410,6 @@ impl<'a> Resolver<'a> {
     /// The one entry that reads through callers: every other entry point
     /// answers a parameter as before, and [`Self::one_text`] refuses a text
     /// a caller decides.
-    #[allow(dead_code)]
     pub(in crate::request_summary) fn texts_through_callers(
         &self,
         file: &Path,
