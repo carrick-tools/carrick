@@ -1597,7 +1597,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         walked,
     );
     let walk_slots = std::sync::Arc::new(walk_lane::Slots::new(services.len()));
+    let optional_deno: Vec<bool> = analysed
+        .iter()
+        .map(|service| crate::deno_support::optional_app(Path::new(repo_path), service, declared))
+        .collect();
+    // Asked only when a service could be left out, so a run with none never
+    // starts `deno`.
+    let deno_missing =
+        optional_deno.iter().any(|optional| *optional) && !crate::deno_support::runtime_supported();
+    let without_deno: std::sync::Arc<[bool]> = optional_deno
+        .into_iter()
+        .map(|optional| optional && deno_missing)
+        .collect();
     let scan = std::sync::Arc::new(ServiceScan {
+        without_deno,
         repo_path: repo_path.to_string(),
         siblings: siblings::SiblingRegistry::new(
             repo_path,
@@ -1738,6 +1751,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     let mut first_failure = None;
     // Services nobody declared whose walk read no source (carrick#2298).
     let mut without_source = Vec::new();
+    // Deno apps nobody declared, left unread for a missing Deno
+    // (carrick#3969). They stay in the declared set noted above, so the
+    // cloud keeps their stored rows.
+    let mut without_deno = Vec::new();
     for (index, service) in services.iter().enumerate() {
         let Some(at) = scan_index[index] else {
             // Carried, which only a service with a stored generation is, and
@@ -1757,6 +1774,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             Err(error) if !declared && error.is::<NoSourceFiles>() => {
                 without_source.push((index, error));
             }
+            Err(error) if error.is::<NoDenoRuntime>() => {
+                without_deno.push((index, error));
+            }
             Err(error) => {
                 first_failure.get_or_insert((index, error));
             }
@@ -1766,6 +1786,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // the failure it always was.
     if runs.is_empty() && first_failure.is_none() && !without_source.is_empty() {
         first_failure = Some(without_source.remove(0));
+    }
+    // Nothing else read: the missing Deno is the run's failure, as it was
+    // before the app could be left out.
+    if runs.is_empty() && first_failure.is_none() && !without_deno.is_empty() {
+        first_failure = Some(without_deno.remove(0));
     }
     if let Some((index, error)) = first_failure {
         // Not a model failure — those defer, they do not reach here — so
@@ -1821,27 +1846,40 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
     // The services left out take no further part: everything below reads
     // `services`, `scan_index` and `runs` position for position.
+    let label_of = |index: &usize| {
+        let service = &services[*index];
+        service
+            .service_name
+            .clone()
+            .or_else(|| service.directory.clone())
+            .unwrap_or_else(|| "(root)".to_string())
+    };
     let services_without_source: Vec<String> = without_source
         .iter()
-        .map(|(index, _)| {
-            let service = &services[*index];
-            service
-                .service_name
-                .clone()
-                .or_else(|| service.directory.clone())
-                .unwrap_or_else(|| "(root)".to_string())
-        })
+        .map(|(index, _)| label_of(index))
+        .collect();
+    let services_without_deno: Vec<String> = without_deno
+        .iter()
+        .map(|(index, _)| label_of(index))
         .collect();
     let (services, scan_index): (Vec<Config>, Vec<Option<usize>>) = services
         .into_iter()
         .zip(scan_index)
         .enumerate()
-        .filter(|(index, _)| !without_source.iter().any(|(left_out, _)| left_out == index))
+        .filter(|(index, _)| {
+            !without_source
+                .iter()
+                .chain(&without_deno)
+                .any(|(left_out, _)| left_out == index)
+        })
         .map(|(_, kept)| kept)
         .unzip();
     // What the index lacks is not told to a person reading the scan: the
     // debug log keeps it (carrick#2298).
-    for line in without_source_lines(&members_without_source, &services_without_source) {
+    for line in without_source_lines(&members_without_source, &services_without_source)
+        .into_iter()
+        .chain(without_deno_lines(&services_without_deno))
+    {
         debug!("{line}");
     }
 
@@ -3099,6 +3137,11 @@ struct ServiceScan {
     /// the services' analyses meet (carrick#3131); `None` when the run asks
     /// nothing ahead.
     ahead: Option<std::sync::Arc<answers_ahead::Board>>,
+    /// The services of [`Self::services`] the run leaves out unread because
+    /// they need a Deno this machine lacks (carrick#3969): position for
+    /// position, `true` for each [`crate::deno_support::optional_app`] when
+    /// no supported Deno answers.
+    without_deno: std::sync::Arc<[bool]>,
 }
 
 /// One service's analysis in this run, and what it still owes.
@@ -3487,6 +3530,9 @@ impl ServiceScan {
         heap_cap_mb: Option<u64>,
     ) -> Result<ServiceRun, Box<dyn std::error::Error + Send + Sync>> {
         let service = &self.services[index];
+        if self.without_deno[index] {
+            return Err(Box::new(NoDenoRuntime));
+        }
         // Every prompt-lambda call a service makes happens inside its
         // analysis, and each one carries its name so the cloud's logs can say
         // which tree of a monorepo spent the money (carrick#1221); every loss
@@ -12506,6 +12552,42 @@ impl std::fmt::Display for NoSourceFiles {
 }
 
 impl std::error::Error for NoSourceFiles {}
+
+/// A Deno app nobody declared, left unread because no Deno 2.9.4 or newer
+/// answers on this machine (carrick#3969). Like [`NoSourceFiles`] for a
+/// service nobody declared, it leaves the service out rather than failing
+/// the run: a repository that scanned before the app was derived must not
+/// start failing on a machine without Deno.
+#[derive(Debug)]
+struct NoDenoRuntime;
+
+impl std::fmt::Display for NoDenoRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Deno is required to scan this service. Install Deno 2.9.4 or newer and make `deno` available on PATH."
+        )
+    }
+}
+
+impl std::error::Error for NoDenoRuntime {}
+
+/// The reason word for a Deno app left unread because no supported Deno
+/// answers (carrick#3969), beside `skipped_no_source`.
+const SKIPPED_NO_DENO: &str = "skipped_no_deno";
+
+/// What the debug log says about each Deno app the run left out unread
+/// (carrick#3969): its reason word, then what would read it.
+fn without_deno_lines(services: &[String]) -> Vec<String> {
+    services
+        .iter()
+        .map(|service| {
+            format!(
+                "{SKIPPED_NO_DENO}: {service}: left out, needs Deno 2.9.4 or newer on PATH to read"
+            )
+        })
+        .collect()
+}
 
 /// What the debug log says about the services the run left out because they
 /// hold no source (carrick#2298): the workspace members the derivation

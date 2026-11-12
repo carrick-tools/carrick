@@ -636,8 +636,10 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let services = service_derivation::resolve_for_scan(Path::new(&args.repo_path))?;
-    deno_support::require_runtime(Path::new(&args.repo_path), &services)?;
+    let service_derivation::ScanServices {
+        services, declared, ..
+    } = service_derivation::scan_services(Path::new(&args.repo_path))?;
+    deno_support::require_runtime(Path::new(&args.repo_path), &services, declared)?;
     // Before the sidecar, before the first model call, and before anything is
     // charged for: a tree that is not prepared indexes `any` where a package
     // or a generated module should be, and the user is told nothing
