@@ -8,25 +8,42 @@
 // hooks print it once.
 
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedLines, renderPostToolUse } from "../render.ts";
+import { answersTheEdit, changedCleanLine, changedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
-import { markLed, markTold, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { leadLines } from "./lead.ts";
 
 const log = createLogger("carrick-late");
 
 /** The words for one finished answer, or null when there is nothing to say. */
 export function lateContext(answer: Answer, uses: boolean): string | null {
-  // The whole-change check a Stop queued (carrick#3466) speaks only with a
-  // problem: a clean run, a run that could not check and a run that gave no
-  // answer print nothing (a failure is logged by `deliverLate`).
+  // The whole-change check a Stop queued (carrick#3466) speaks with a problem.
+  // A clean run speaks only for the files Stop named, once per set
+  // (`deliverLate`); a run that could not check and a run that gave no answer
+  // print nothing (a failure is logged by `deliverLate`).
   if (isChanged(answer)) return answer.changed ? changedLines(answer.changed) || null : null;
   // A re-check that stopped, gave no answer or answered nothing prints
   // nothing: a failure is logged by `deliverLate`, and the Stop hook names a
   // file left unchecked.
   if (!answer.result || answer.result.error || !answersTheEdit(answer.result)) return null;
   return renderPostToolUse(answer.result, answer.relative, { uses, late: true });
+}
+
+/**
+ * The clean line for a `check --changed` that answered with no problem over
+ * files a Stop named as still checking (hook-wording audit decision 1: a
+ * finding or a named clean result, once per set). Null for any other answer,
+ * and for a set already said this session.
+ */
+function cleanNamedLine(session: string, answer: Answer): string | null {
+  if (!isChanged(answer) || answer.changed?.exit !== 0) return null;
+  const files = [...new Set(answer.named ?? [])].sort();
+  if (files.length === 0) return null;
+  const key = `clean:${files.join("\n")}`;
+  if (wasSaid(session, answer.root, key)) return null;
+  markSaid(session, answer.root, key);
+  return changedCleanLine(files);
 }
 
 /**
@@ -42,7 +59,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
       const uses = key === null || !wasTold(session, key);
-      const context = lateContext(answer, uses);
+      const context = lateContext(answer, uses) ?? cleanNamedLine(session, answer);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
       // A lead the probe already delivered is in `led`; this one is for a file

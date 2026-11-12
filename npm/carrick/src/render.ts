@@ -470,6 +470,17 @@ export function changedLines(changed: ChangedResult): string {
   return "";
 }
 
+/**
+ * The one line for a clean `check --changed` whose files a Stop named as not
+ * yet checked: the files (up to 3, then a count) and that no contract problem
+ * was found. The answer to the line `notCoveredLine` promised.
+ */
+export function changedCleanLine(files: ReadonlyArray<string>): string {
+  const shown = files.slice(0, 3).join(", ");
+  const rest = files.length > 3 ? ` and ${files.length - 3} more` : "";
+  return `Carrick checked ${shown}${rest} and found no contract problem.`;
+}
+
 /** `UnreadItem::line` in src/local_mode/contract.rs, with the caller's own path for the file. */
 function unreadLine(item: UnreadItem, where: string): string {
   return `Carrick could not read the call at ${where}:${item.line}: ${item.phrase}.`;

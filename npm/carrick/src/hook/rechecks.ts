@@ -84,6 +84,12 @@ export type QueueEntry = {
    * per-file entry and Stop never waits for it. Absent: one edited file.
    */
   kind?: "changed";
+  /**
+   * The files the Stop that queued a `changed` entry named as not yet checked
+   * (workspace-relative). A clean answer is delivered only for a named set
+   * (`late.ts`); absent on an entry no Stop named.
+   */
+  named?: string[];
 };
 
 export type Answer = {
@@ -97,6 +103,8 @@ export type Answer = {
   started_at: string | null;
   finished_at: string;
   kind?: "changed";
+  /** The files Stop named when it queued a `changed` entry, carried from the entry. */
+  named?: string[];
   result?: CheckResult;
   /** What a `changed` entry's `check --changed` answered. */
   changed?: ChangedResult;
@@ -122,6 +130,7 @@ const LOCK_TOUCH_MS = 30_000;
 export type Pending = QueueEntry & { toldRunning: boolean };
 
 type Options = { home?: string };
+type ChangedOptions = Options & { named?: string[] };
 
 export function rechecksDir(root: string): string {
   return path.join(root, ".carrick", "rechecks");
@@ -240,7 +249,7 @@ export function enqueue(
  * same session supersedes an older one that has not started. Null when the
  * queue refused it.
  */
-export function enqueueChanged(root: string, session: string, now: number, options: Options = {}): QueueEntry | null {
+export function enqueueChanged(root: string, session: string, now: number, options: ChangedOptions = {}): QueueEntry | null {
   const seq = nextSeq(now);
   const entry: QueueEntry = {
     seq,
@@ -251,6 +260,7 @@ export function enqueueChanged(root: string, session: string, now: number, optio
     enqueued_at: new Date(now).toISOString(),
     attempts: 0,
     kind: "changed",
+    ...(options.named !== undefined && options.named.length > 0 ? { named: options.named } : {}),
   };
   const pending = sessionPart(session, seq, "pending.json", options.home);
   if (pending === null) return null;
@@ -448,6 +458,7 @@ function writeAnswer(
     started_at: startedAt === null ? null : new Date(startedAt).toISOString(),
     finished_at: new Date(finishedAt).toISOString(),
     ...(isChanged(entry) ? { kind: "changed" as const } : {}),
+    ...(entry.named !== undefined ? { named: entry.named } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);

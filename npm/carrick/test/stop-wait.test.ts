@@ -224,6 +224,51 @@ test("the whole-change check Stop queued, answering later with a problem, is pri
   assert.equal((await promptHook(home, workspace.root)).stdout, "", "once");
 });
 
+/** The whole-change check answering clean, as the runner writes it: the queued entry plus its result. */
+function answerChangedClean(home: string, entry: QueueEntry): void {
+  const changed = parseChangedResult(fs.readFileSync(fixturePath("check-changed-clean.json"), "utf8"), 0)!;
+  writeAtomic(
+    path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.answer.json`),
+    `${JSON.stringify({ ...entry, state: "answered", started_at: entry.enqueued_at, finished_at: new Date().toISOString(), changed })}\n`,
+  );
+}
+
+test("a clean whole-change check for files Stop named as still checking is printed once, as one line naming them", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  queue(workspace.root, home, workspace.file);
+  assert.match(context((await stopWith(home)).stdout), NOT_CHECKED);
+
+  const [changedEntry] = changedQueued(workspace.root);
+  answerChangedClean(home, changedEntry!);
+  const prompt = await promptHook(home, workspace.root);
+  assert.match(
+    context(prompt.stdout),
+    /^Carrick checked user-service\/src\/routes\/users\.ts and found no contract problem\.$/,
+  );
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once: the next prompt says nothing");
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once: the next tool hook says nothing");
+
+  // The same files named again by a later Stop and answered clean again: not said twice.
+  edit(workspace.root, home, workspace.file, Date.now() + 60_000);
+  await stopWith(home);
+  const again = changedQueued(workspace.root).find((entry) => entry.seq !== changedEntry!.seq);
+  assert.ok(again, "the second Stop queued its own check");
+  answerChangedClean(home, again!);
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once per set of files");
+});
+
+test("a clean whole-change check for a set Stop never named prints nothing", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  // Queued by something other than a Stop that named files (an older install's entry has no names).
+  const entry = enqueueChanged(workspace.root, SESSION, Date.now(), { home })!;
+  answerChangedClean(home, entry);
+  assert.equal((await promptHook(home, workspace.root)).stdout, "");
+});
+
 test("stop with nothing pending returns at once and names no function (carrick#3436)", async (t) => {
   const { workspace, home } = setup(t);
   // A session file an older install wrote, still listing a function it found.
