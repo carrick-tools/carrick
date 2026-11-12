@@ -49,6 +49,8 @@ const REGEX_AFTER_WORD = new Set([
 const PUNCS = ["...", "===", "!==", "**=", "??=", "&&=", "||=", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "+=", "-=", "*=", "/=", "%=", "++", "--"];
 /** Words before a declaration that belong to its span. */
 const DECLARATION_PREFIXES = new Set(["export", "default", "async", "declare"]);
+/** Words after `class` that start its heritage, not its name. */
+const HERITAGE = new Set(["extends", "implements"]);
 /** Words in a type after which a `{` opens an object type, not a body. */
 const TYPE_OPERATORS = new Set(["is", "asserts", "keyof", "typeof", "extends", "infer", "readonly", "unique"]);
 const CLASS_MODIFIERS = new Set([
@@ -579,6 +581,34 @@ export function scanSource(text: string, jsx = false): Scan {
     return fn.after;
   };
 
+  /**
+   * Walks the class whose `class` keyword is at `at` as `name`, and records
+   * it as a span from `spanFrom` when that is set (a class expression).
+   * Returns the index after its body; -1 when there is no body before
+   * `limit` or its heritage does not read (then `unplaced` is set).
+   */
+  const classAt = (at: number, limit: number, name: string, spanFrom: number): number => {
+    let k = at + 1;
+    if (is(k, "id") && !HERITAGE.has(t(k)!.value)) k += 1;
+    // The heritage clause up to the body; type arguments may hold `{`.
+    while (k >= 0 && k < limit && !punc(k, "{")) {
+      k = punc(k, "(") || punc(k, "[") ? match.get(k)! + 1 : punc(k, "<") ? angleEnd(k, limit) : k + 1;
+    }
+    if (k < 0) {
+      unplaced = true;
+      return -1;
+    }
+    if (k >= limit) return -1;
+    const close = match.get(k)!;
+    if (spanFrom >= 0) {
+      let first = spanFrom;
+      while (first > 0 && is(first - 1, "id") && DECLARATION_PREFIXES.has(t(first - 1)!.value)) first -= 1;
+      spans.push({ name, start: tokens[first]!.start, end: tokens[close]!.end });
+    }
+    walk(k + 1, close, { kind: "class", name });
+    return close + 1;
+  };
+
   const walkCode = (from: number, limit: number): void => {
     let i = from;
     while (i < limit) {
@@ -613,6 +643,14 @@ export function scanSource(text: string, jsx = false): Scan {
             i = match.get(value)! + 1;
             continue;
           }
+          if (is(value, "id", "class")) {
+            const after = classAt(value, limit, name, i);
+            if (unplaced) return;
+            if (after > 0) {
+              i = after;
+              continue;
+            }
+          }
           const fn = functionAt(value, limit);
           if (fn) {
             i = named(name, i, fn);
@@ -628,20 +666,34 @@ export function scanSource(text: string, jsx = false): Scan {
           continue;
         }
       }
-      if (token.kind === "id" && token.value === "class" && is(i + 1, "id")) {
-        const name = t(i + 1)!.value;
-        let k = i + 2;
-        // The heritage clause up to the body; type arguments may hold `{`.
-        while (k >= 0 && k < limit && !punc(k, "{")) {
-          k = punc(k, "(") || punc(k, "[") ? match.get(k)! + 1 : punc(k, "<") ? angleEnd(k, limit) : k + 1;
+      if (token.kind === "id" && token.value === "class" && !punc(i - 1, ".") && !punc(i - 1, "?.") && !punc(i + 1, ":")) {
+        // A class with no name of its own (an expression) is its own thing,
+        // named by nothing a row can carry: an edit in it is never its encloser's.
+        const own = is(i + 1, "id") && !HERITAGE.has(t(i + 1)!.value);
+        const after = classAt(i, limit, own ? t(i + 1)!.value : "(class)", own ? -1 : i);
+        if (unplaced) return;
+        if (after > 0) {
+          i = after;
+          continue;
         }
-        if (k < 0) {
-          unplaced = true;
-          return;
+      }
+      // An assignment of a function or class to a name or member
+      // (`obj.h = function () {}`, `Foo.prototype.m = () => {}`): its own
+      // thing, named by the target's last name.
+      if (token.kind === "id" && punc(i + 1, "=") && !is(i - 1, "id", "type")) {
+        let start = i;
+        while ((punc(start - 1, ".") || punc(start - 1, "?.")) && is(start - 2, "id")) start -= 2;
+        if (is(i + 2, "id", "class")) {
+          const after = classAt(i + 2, limit, token.value, start);
+          if (unplaced) return;
+          if (after > 0) {
+            i = after;
+            continue;
+          }
         }
-        if (k < limit) {
-          walk(k + 1, match.get(k)!, { kind: "class", name });
-          i = match.get(k)! + 1;
+        const fn = functionAt(i + 2, limit);
+        if (fn) {
+          i = named(token.value, start, fn);
           continue;
         }
       }

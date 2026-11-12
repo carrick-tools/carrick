@@ -991,6 +991,30 @@ test("R24.2: a type-predicate return type is read as a type, and one that does n
   assert.deepEqual(await linesFor(ws, "orders-api/src/p.ts", "return check(v);"), []);
 });
 
+test("R24.8: class expressions and functions assigned to members get their own spans", async (t) => {
+  assert.deepEqual(spansOf("function outer() {\n  const C = class { m() { a(); } };\n}\n"), [
+    "outer: function outer() {\n  const C = class { m() { a(); } };\n}",
+    "C: const C = class { m() { a(); } }",
+    "C.m: m() { a(); }",
+  ]);
+  assert.deepEqual(spansOf("function outer() {\n  obj.h = function () { a(); };\n  Foo.prototype.bar = () => { b(); };\n}\n"), [
+    "outer: function outer() {\n  obj.h = function () { a(); };\n  Foo.prototype.bar = () => { b(); };\n}",
+    "h: obj.h = function () { a(); }",
+    "bar: Foo.prototype.bar = () => { b(); }",
+  ]);
+  const ndjson = [
+    header(["orders-api"]),
+    row({ side: "consumer", protocol: "http", label: "POST /audit", repo: "orders-api", file: "src/m.ts", line: 2, name: "outer", text: "outer line" }),
+  ].join("\n");
+  const ws = await factsWorkspace(t, { ndjson: `${ndjson}\n` });
+  fs.writeFileSync(
+    ws.at("orders-api/src/m.ts"),
+    'export function outer() {\n  api.post("/audit");\n  const C = class {\n    m() {\n      one();\n    }\n  };\n  obj.h = function () {\n    two();\n  };\n  Foo.prototype.bar = () => {\n    three();\n  };\n}\n',
+  );
+  for (const inner of ["one();", "two();", "three();"]) assert.deepEqual(await linesFor(ws, "orders-api/src/m.ts", inner), [], inner);
+  assert.deepEqual(await linesFor(ws, "orders-api/src/m.ts", 'api.post("/audit");'), ["outer line"]);
+});
+
 test("an edit inside a generic arrow nested in a function is the arrow's, not the outer function's", async (t) => {
   const ndjson = [
     header(["orders-api"]),
