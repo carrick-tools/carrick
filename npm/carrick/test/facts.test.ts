@@ -1308,6 +1308,33 @@ test("with a fact file, a sub-agent's edit is probed in hand and queues nothing 
   for (const { entry } of newestPerFile("parent.sub1", ws.home).values()) assert.equal(entry.instead_of_probe, undefined);
 });
 
+// R46.3 on the shell path: a sub-agent's shell write is probed in hand too.
+test("with a fact file, a sub-agent's shell write is probed in hand and queues nothing in place of the probe", async (t) => {
+  const ws = await factsWorkspace(t);
+  const argvLog = path.join(ws.home, "argv.log");
+  const file = ws.at("orders-api/src/events/publish.ts");
+  fs.utimesSync(file, new Date(), new Date());
+  const run = await runHook("post-bash.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      session_id: "parent",
+      agent_id: "sub1",
+      cwd: ws.root,
+      tool_input: { command: `sed -i 's/204/205/' ${file}` },
+      tool_response: { stdout: "" },
+    },
+    env: fakeEnv({
+      HOME: ws.home,
+      CLAUDE_PROJECT_DIR: ws.root,
+      CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+      CARRICK_FAKE_ARGV_LOG: argvLog,
+    }),
+  });
+  assert.equal(probeCalls(argvLog), 1, `probed in hand: ${run.stdout}`);
+  for (const { entry } of newestPerFile("parent.sub1", ws.home).values()) assert.equal(entry.instead_of_probe, undefined);
+});
+
 // R46.5: an answer the binary refused (no index) states nothing at Stop, as
 // the probe's refusal did: no "did not check", no `check --changed`.
 test("with a fact file, an error answer queued in place of the probe is not stated at Stop", async (t) => {

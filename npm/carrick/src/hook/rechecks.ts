@@ -863,12 +863,6 @@ export function claimDelivery(session: string, seq: string, home?: string, now: 
   return createExclusive(file, `${JSON.stringify({ delivered_at: new Date(now).toISOString() })}\n`);
 }
 
-/** Whether some caller has claimed the right to print one answer (`claimDelivery`). */
-export function wasDelivered(session: string, seq: string, home?: string): boolean {
-  const file = sessionPart(session, seq, "delivered", home);
-  return file !== null && fs.existsSync(file);
-}
-
 /** Claim the right to say one entry is still running: true for exactly one caller. */
 export function markToldRunning(session: string, seq: string, home?: string): boolean {
   const file = sessionPart(session, seq, "told-running", home);

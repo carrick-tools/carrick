@@ -710,6 +710,68 @@ test("a second Stop over the same operations prints nothing, a new operation pri
   assert.match(third.lines.join("\n"), /^Carrick checked the 2 operations this session changed/);
 });
 
+/** A clean answer that judged one operation of `relative` (a route at `line`). */
+function cleanJudged(relative: string, routePath: string, line: number): CheckResult {
+  return { ...clean(), file: relative, items: [judgedRoute(routePath, line)], recheck: { ran: "extraction+types", elapsed_ms: 1 } };
+}
+
+/** A second TS file in the workspace's service, beside the edited one. */
+function otherFile(workspace: { service: string }): string {
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  return other;
+}
+
+// R51.1: a flagged answer that answered the edit counts at Stop exactly as an
+// unflagged one, whether or not a carrier has already claimed it.
+test("Stop counts two flagged clean answers as 2 operations when a carrier already delivered the first", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const other = otherFile(workspace);
+  const first = Date.now() - 5000;
+  const a = enqueue(workspace.root, SESSION, [workspace.file], first, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, first, home, [workspace.file]);
+  answer(home, a, cleanJudged("src/routes/users.ts", "/api/users", 10));
+  await bashHook(home, workspace.root);
+  assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${a.seq}.delivered`)), "the carrier delivered the first");
+  const second = Date.now();
+  const b = enqueue(workspace.root, SESSION, [other], second, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, second, home, [other]);
+  answer(home, b, cleanJudged("src/routes/orders.ts", "/api/orders", 5));
+  const said = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.match(said, /^Carrick checked the 2 operations this session changed \(.*\): both sides agree\.$/, said);
+});
+
+test("Stop counts a flagged finding and a flagged clean answer as the 2 files this session edited", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const other = otherFile(workspace);
+  const now = Date.now();
+  const [a, b] = enqueue(workspace.root, SESSION, [workspace.file, other], now, { home, insteadOfProbe: true });
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file, other]);
+  answer(home, a!, problem());
+  answer(home, b!, cleanJudged("src/routes/orders.ts", "/api/orders", 5));
+  const said = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.ok(said.startsWith("Carrick checked the 2 files this session edited (user-service): "), said);
+});
+
+test("Stop says both sides agree for one flagged clean answer with a judged operation, and the next carrier still prints its uses line once", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  answer(home, entry, { ...cleanJudged("src/routes/users.ts", "/api/users", 10), uses_lines: fixture("check-stale-uses.json").uses_lines! });
+  const stop = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.equal(
+    stop,
+    "Carrick checked the 1 operation this session changed (GET /api/users at user-service/src/routes/users.ts:10): both sides agree.",
+  );
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once");
+});
+
 test("a Stop whose only gap is a file no service reads prints nothing and queues nothing", async (t) => {
   const { workspace, home } = setup(t);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);

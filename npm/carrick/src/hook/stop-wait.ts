@@ -50,7 +50,6 @@ import {
   pendingFor,
   type Answer,
   type Pending,
-  wasDelivered,
 } from "./rechecks.ts";
 import { markSaid, markStated, readSession, wasSaid } from "./reuse.ts";
 import { worktreeGone } from "./worktree.ts";
@@ -192,12 +191,9 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       coverage.files -= 1;
       continue;
     }
-    // One the next carrier still owes is a gap below as any answer is; one
-    // that answered the edit is not this Stop's to state (R46.2).
-    const covered = () => {
-      if (answer.instead_of_probe && !wasDelivered(session, entry.seq, home)) coverage.files -= 1;
-      else coverage.covered.push(answer);
-    };
+    // An answer that answered the edit counts here as any answer does,
+    // flagged or not (R51.1); one that did not is a gap below.
+    const covered = () => coverage.covered.push(answer);
     const result = answer.result;
     if (answer.state !== "answered" || result === undefined) {
       gap(answer.failure ?? "the re-check gave no answer");
