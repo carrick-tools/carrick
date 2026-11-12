@@ -17,7 +17,6 @@ import {
   type RunningScan,
   type StatusResult,
   type StatusService,
-  type UnreadItem,
 } from "./contract.ts";
 import type { SyncRecord, SyncedRepo } from "./hosted-snapshot.ts";
 
@@ -481,11 +480,6 @@ export function changedCleanLine(files: ReadonlyArray<string>): string {
   return `Carrick checked ${shown}${rest} and found no contract problem.`;
 }
 
-/** `UnreadItem::line` in src/local_mode/contract.rs, with the caller's own path for the file. */
-function unreadLine(item: UnreadItem, where: string): string {
-  return `Carrick could not read the call at ${where}:${item.line}: ${item.phrase}.`;
-}
-
 function deletedLine(result: CheckResult, where: string): string {
   const consumers = (result.items ?? []).reduce(
     (total, item) => total + (item.counterparts ?? []).length,
@@ -594,12 +588,8 @@ export function renderPostToolUse(
     const hidden = problems.length - Math.min(problems.length, MAX_EDIT_PROBLEMS);
     if (hidden > 0) lines.push(`- and ${hidden} more: \`carrick check ${where}\` lists them.`);
     lines.push(...movedLines(result));
-    // A call the scan did not read, on a line this edit wrote: one line each,
-    // the CLI's own sentence for it (`UnreadItem::line`, carrick#3688 U4).
-    // The CLI marks `edited`; an edit elsewhere in the file says nothing.
-    for (const item of (result.unread ?? []).filter((unread) => unread.edited === true)) {
-      lines.push(cutLine(unreadLine(item, where)));
-    }
+    // Unread calls are not printed here: the agent cannot act on a limit of the
+    // scan. `carrick check <file>` and `carrick status` still show them (carrick#3932).
   }
   const uses = options.uses === false ? 0 : (result.uses_lines ?? []).length;
   if (uses > 0) {
