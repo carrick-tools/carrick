@@ -232,6 +232,11 @@ pub struct Discovery {
     /// file and SWC span: what an unread site states of it
     /// ([`crate::unread_sites`], carrick#3688 U3).
     pub missed_at: BTreeMap<(String, u32, u32), (u32, String)>,
+    /// The `missed_inside` calls whose walk reached only server-framework
+    /// ends in a sibling's code, by file and SWC span, each with the first
+    /// such end: the call registers a route this service serves, so its
+    /// unread site is an HTTP one ([`crate::unread_sites`], carrick#2474 R5b).
+    pub sibling_routes_at: BTreeMap<(String, u32, u32), SiteEnd>,
     pub counts: BTreeMap<String, usize>,
     /// For each call recorded with no end (a stopped site or `missed_inside`),
     /// by file and SWC span: the store keys of the packages the walk passed a
@@ -2958,6 +2963,7 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let mut sibling_routes = 0;
+            let mut sibling_end: Option<SiteEnd> = None;
             for found in outcome.ends {
                 // A route registered in a sibling's code (a plugin another
                 // service declares, registered here) is served by this
@@ -2971,6 +2977,7 @@ impl<'a> Walker<'a> {
                         .contains_key(&self.root.join(&found.end.file))
                 {
                     sibling_routes += 1;
+                    sibling_end.get_or_insert_with(|| found.end.clone());
                     continue;
                 }
                 // One of the labelled exports a callee's disagreeing values
@@ -3000,6 +3007,9 @@ impl<'a> Walker<'a> {
                     discovery
                         .missed_at
                         .insert(at.clone(), (call.site.line, call.callee_text.clone()));
+                    if let Some(end) = sibling_end {
+                        discovery.sibling_routes_at.insert(at.clone(), end);
+                    }
                     discovery.missed_inside.push(at);
                 }
             }
@@ -5849,6 +5859,62 @@ export function listen(): void {
         assert_eq!(
             records_in(&discovery, "services/web/src/maybe.ts"),
             texts(&["4 socket?.send -> fixture-socket Socket send"])
+        );
+    }
+
+    /// A route registered through a helper in a sibling service is this
+    /// service's own route: the call's unread site is `missed_inside` as
+    /// before, and says it is an HTTP one, with the sibling's registration
+    /// as its labelled end. A plain missed call says neither. The answer key
+    /// is `tests/fixtures/sibling-route-helper/README.md`.
+    #[test]
+    fn a_route_registered_through_a_sibling_helper_is_saved_as_http() {
+        let Some(on) = super::super::fixture_walk::walked_services(
+            "sibling-route-helper",
+            &[("services/api", "api"), ("packages/kit", "kit")],
+            true,
+        ) else {
+            return;
+        };
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sibling-route-helper");
+        let answer = crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        );
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let labels = Labels::of_answer(&answer);
+        let [api, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let discovery = discover_with(api, &[kit], &labels, &on.repo);
+        let rows = crate::unread_sites::from_scan(
+            &discovery,
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &on.repo,
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.file == "services/api/src/server.ts" && row.line == 7)
+            .unwrap_or_else(|| panic!("no unread site at server.ts:7: {rows:#?}"));
+        assert_eq!(row.reason, Stop::MissedInside, "{row:?}");
+        assert_eq!(row.kind.as_deref(), Some("http"), "{row:?}");
+        assert_eq!(row.role.as_deref(), Some("producer"), "{row:?}");
+        let end = row.labelled_end.as_ref().expect("the sibling's end");
+        assert_eq!(
+            (
+                end.package.as_str(),
+                end.export.as_str(),
+                end.member.as_deref()
+            ),
+            ("fixture-route-server", "server", Some("post")),
+        );
+        // Every other unread site of the service keeps no kind.
+        assert!(
+            rows.iter()
+                .filter(|other| other.line != 7)
+                .all(|other| other.kind.is_none()),
+            "{rows:#?}"
         );
     }
 
