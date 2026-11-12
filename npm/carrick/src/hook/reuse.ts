@@ -83,6 +83,10 @@ export type SessionRecord = {
 /** Session files older than this are removed on the next write. */
 const KEEP_DAYS = 7;
 
+/** A write prunes at most this often; the stamp file below holds the last time. */
+const PRUNE_EVERY_MS = 60 * 60 * 1000;
+const PRUNE_STAMP = ".pruned-at";
+
 /** Where one session's record lives. */
 export function sessionFile(sessionId: string, home: string = os.homedir()): string | null {
   const id = safeId(sessionId);
@@ -207,7 +211,28 @@ function write(sessionId: string, record: SessionRecord, home?: string): void {
   const file = sessionFile(sessionId, home);
   if (file === null) return;
   writeAtomic(file, `${JSON.stringify(record, null, 2)}\n`);
-  prune(home);
+  pruneIfDue(home);
+}
+
+/**
+ * Prune when `.pruned-at` is missing or an hour old, touching it first so a
+ * second writer racing this one skips. The stamp has no `.json` suffix, so
+ * `sessionRecords` does not count it and `removeSessions` deletes it.
+ */
+function pruneIfDue(home?: string, now: number = Date.now()): void {
+  const stamp = path.join(sessionsDir(home), PRUNE_STAMP);
+  try {
+    if (now - fs.statSync(stamp).mtimeMs < PRUNE_EVERY_MS) return;
+  } catch {
+    // No stamp yet: due.
+  }
+  try {
+    fs.writeFileSync(stamp, "");
+    fs.utimesSync(stamp, now / 1000, now / 1000);
+  } catch {
+    return;
+  }
+  prune(home, now);
 }
 
 /**
@@ -271,7 +296,7 @@ export function removeSessions(home?: string): number {
   for (const name of names) {
     try {
       fs.unlinkSync(path.join(dir, name));
-      removed += 1;
+      if (name !== PRUNE_STAMP) removed += 1;
     } catch {
       // Already gone, or not ours to remove.
     }
