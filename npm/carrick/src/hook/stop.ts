@@ -27,6 +27,7 @@ import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { markInvoker } from "./invoker.ts";
 import { stopAnswers } from "./stop-wait.ts";
+import { timed, type Timing } from "./timings.ts";
 
 const log = createLogger("carrick-stop");
 
@@ -44,7 +45,7 @@ export function emission(context: string): string {
   });
 }
 
-async function main(): Promise<void> {
+async function main(timing: Timing): Promise<void> {
   markInvoker("stop");
   // `off` silences every surface this package has, and this is one of them.
   // The `lsp` channel is NOT excluded: it decides who delivers a verdict about
@@ -71,7 +72,9 @@ async function main(): Promise<void> {
   // ones still running, named without waiting. An older entry's `--wait-s` is
   // ignored: Stop never holds up the agent.
   const parts: string[] = [];
+  const waitStarted = Date.now();
   const late = stopAnswers(session);
+  timing.waitedMs = Date.now() - waitStarted;
   parts.push(...late.lines);
 
   // The other thing a task's end is a good moment for: the `carrick` these
@@ -86,5 +89,5 @@ async function main(): Promise<void> {
   process.stdout.write(emission(parts.join("\n\n")));
 }
 
-await main();
+await timed("stop", main);
 process.exit(0);

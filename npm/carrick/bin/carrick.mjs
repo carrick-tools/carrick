@@ -204,7 +204,7 @@ async function renderNative(args) {
 }
 
 /** Run the scanner binary, streaming its output and answering with its code. */
-async function runNative(args) {
+async function runNative(args, { after } = {}) {
   const { resolveNativeBinary, nativeEnv, overrideLine } = await import("../dist/native.js");
   const { relaySignals } = await import("../dist/scan.js");
   const lookup = resolveNativeBinary();
@@ -234,6 +234,16 @@ async function runNative(args) {
     // through this shim looks like a Ctrl-C of the scanner.
     if (signal) {
       process.kill(process.pid, signal);
+      return;
+    }
+    // `after` is this package's own line under the binary's answer.
+    if (after && code === 0) {
+      Promise.resolve(after())
+        .then((line) => {
+          if (line) process.stdout.write(`${line}\n`);
+        })
+        .catch(() => {})
+        .finally(() => process.exit(code));
       return;
     }
     process.exit(code ?? 1);
@@ -423,7 +433,17 @@ switch (command) {
   }
   default: {
     const { isRendered } = await import("../dist/scan.js");
-    if (isRendered(command, rest)) await renderNative(argv);
+    // The binary answers `status`; this package adds the hooks' own timing line
+    // under it (`hook/timings.ts`), never to `--json`, which a hook parses.
+    if (command === "status" && !rest.some((a) => a === "--json" || a === "--help" || a === "-h")) {
+      await runNative(argv, {
+        after: async () => {
+          const { statusTimingsLine } = await import("../dist/hook/timings.js");
+          const at = rest.indexOf("--workspace");
+          return statusTimingsLine((at >= 0 && rest[at + 1]) || process.cwd());
+        },
+      });
+    } else if (isRendered(command, rest)) await renderNative(argv);
     else await runNative(argv);
   }
 }
