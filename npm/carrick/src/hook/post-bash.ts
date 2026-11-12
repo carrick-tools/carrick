@@ -132,7 +132,11 @@ async function main(): Promise<void> {
         if (found) changes.set(file, found);
       }
     }
-    await editFlow({ cwd: payload.cwd ?? null, session, channel: channel.channel, shell: true, changes, factOnly }, toEdit, answers);
+    await editFlow(
+      { cwd: payload.cwd ?? null, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, shell: true, changes, factOnly },
+      toEdit,
+      answers,
+    );
     return;
   }
   const { deliverLate, emitPostToolUse } = await import("./late.ts");

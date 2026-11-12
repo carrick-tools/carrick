@@ -23,9 +23,22 @@ export function probeTimeoutMs(): number {
   return 600;
 }
 
-/** Whether the probe left this edit for the background re-check: no answer, or `deferred`. */
+/**
+ * Whether an answer is one the probe leaves for the background re-check
+ * rather than printing in hand: no answer, or `deferred`. The one test of "in
+ * hand or queued", read by the edit hook for the probe's answer and by
+ * `late.ts` for a runner's answer queued in place of the probe (R46.4). A
+ * runner never answers `deferred`; a re-scan it started and did not finish is
+ * the same case: it ran out of time (`deadline`), or it failed after deciding
+ * what to re-read (`scope` on a `none`, which the probe, stopping before that
+ * decision, never carries; `src/local_mode/recheck.rs` `run`).
+ */
 export function needsBackground(result: CheckResult | null): boolean {
-  return result === null || result.recheck?.deferred === true;
+  if (result === null) return true;
+  const recheck = result.recheck;
+  if (recheck === undefined) return false;
+  if (recheck.deferred === true || recheck.deadline === true) return true;
+  return recheck.ran === "none" && recheck.scope !== undefined;
 }
 
 /**

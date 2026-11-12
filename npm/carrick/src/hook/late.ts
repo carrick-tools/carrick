@@ -15,6 +15,7 @@ import { claimDelivery, isChanged, owedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
 import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { leadLines } from "./lead.ts";
+import { needsBackground } from "./probe.ts";
 
 const log = createLogger("carrick-late");
 
@@ -31,9 +32,40 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
   if (!answer.result || answer.result.error) return null;
   // An answer queued in place of the edit-time probe (a fact-file workspace)
   // says what the probe's answer would have said in hand, the uses-count line
-  // on a result that does not answer the edit included (T12-2).
-  if (!answer.instead_of_probe && !answersTheEdit(answer.result)) return null;
+  // on a result that does not answer the edit included (T12-2). Only where the
+  // probe would have printed it: one it would have left for the background
+  // re-check (`needsBackground`) is gated as any late answer is (R46.4).
+  const inHand = answer.instead_of_probe === true && !needsBackground(answer.result);
+  if (!inHand && !answersTheEdit(answer.result)) return null;
   return renderPostToolUse(answer.result, answer.relative, { uses, late: true });
+}
+
+/**
+ * What a carrier prints for one finished answer it has claimed, oldest first:
+ * its lead lines, then its words (`lateContext`), with the uses-count and lead
+ * keys marked as told. Shared by `deliverLate` and by the Stop hook for an
+ * answer queued in place of the probe (R46.2), so both print it the same way.
+ */
+export function deliverOne(session: string, answer: Answer, home?: string): string[] {
+  const contexts: string[] = [];
+  const key = answer.result ? toldKey(answer.result, answer.relative) : null;
+  // As the edit-time answer would have: no uses-count line where the fact
+  // lines answered the file's callers.
+  const uses = !answer.facts_callers && (key === null || !wasTold(session, key, home));
+  const context = isChanged(answer) ? changedLine(session, answer, home) : lateContext(answer, uses);
+  // A lead the probe already delivered is in `led`; this one is for a file
+  // whose probe had no answer (carrick#3249).
+  const found = answer.result
+    ? leadLines(answer.result, answer.relative, (leadKey) => !wasLed(session, leadKey, home), log)
+    : null;
+  if (found && found.lines.length > 0) {
+    contexts.push(...found.lines);
+    markLed(session, found.keys, home);
+  }
+  if (!context) return contexts;
+  contexts.push(context);
+  if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
+  return contexts;
 }
 
 /**
@@ -95,25 +127,9 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
         if (adopted) contexts.push(adopted);
         continue;
       }
-      const key = answer.result ? toldKey(answer.result, answer.relative) : null;
-      // As the edit-time answer would have: no uses-count line where the fact
-      // lines answered the file's callers.
-      const uses = !answer.facts_callers && (key === null || !wasTold(session, key));
-      const context = isChanged(answer) ? changedLine(session, answer) : lateContext(answer, uses);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
-      // A lead the probe already delivered is in `led`; this one is for a file
-      // whose probe had no answer (carrick#3249).
-      const found = answer.result
-        ? leadLines(answer.result, answer.relative, (leadKey) => !wasLed(session, leadKey), log)
-        : null;
-      if (found && found.lines.length > 0) {
-        contexts.push(...found.lines);
-        markLed(session, found.keys);
-      }
-      if (!context) continue;
-      contexts.push(context);
-      if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key]);
+      contexts.push(...deliverOne(session, answer));
     }
   } catch (error) {
     log("late delivery failed", String(error));

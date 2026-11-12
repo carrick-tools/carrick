@@ -37,7 +37,7 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { adoptedLine, changedLine, hasFindings } from "./late.ts";
+import { adoptedLine, changedLine, deliverOne, hasFindings } from "./late.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
@@ -50,6 +50,7 @@ import {
   pendingFor,
   type Answer,
   type Pending,
+  wasDelivered,
 } from "./rechecks.ts";
 import { markSaid, markStated, readSession, wasSaid } from "./reuse.ts";
 import { worktreeGone } from "./worktree.ts";
@@ -114,12 +115,16 @@ export type StopResult = {
 /**
  * Claim the right to print each finished answer: the ones this call owns. The
  * session's own answers go through the session check below; an ended
- * sub-agent's (carrick#4074) are `adopted` and print their findings alone.
+ * sub-agent's (carrick#4074) are `adopted` and print their findings alone. An
+ * answer queued in place of the edit-time probe is delivered whole or not at
+ * all (R46.2): Stop claims it only with a finding it prints, and otherwise
+ * leaves it for the next carrier, which prints all of it.
  */
 function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[] } {
   const own: Answer[] = [];
   const adopted: Answer[] = [];
   for (const { owner, answer } of owedFor(session, home)) {
+    if (answer.instead_of_probe && !hasFindings(answer)) continue;
     if (!claimDelivery(owner, answer.seq, home, now)) continue;
     (owner === session ? own : adopted).push(answer);
   }
@@ -179,6 +184,13 @@ export function sessionCoverage(session: string, root: string, home?: string, no
     if (answer === null) {
       const seconds = Math.max(0, Math.round((now - Date.parse(entry.enqueued_at)) / 1000));
       gap(`its re-check is still running after ${seconds} s`);
+      continue;
+    }
+    // An answer queued in place of the probe is not this Stop's to state
+    // while the next carrier still owes it (R46.2), nor ever when the binary
+    // refused the file, as the probe's refusal was not recorded (R46.5).
+    if (answer.instead_of_probe && (answer.result?.error || !wasDelivered(session, entry.seq, home))) {
+      coverage.files -= 1;
       continue;
     }
     const result = answer.result;
@@ -243,8 +255,10 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     const coverage = sessionCoverage(session, root, home, clock());
     if (coverage.files === 0) continue;
     if (coverage.gaps.length === 0) {
+      // An answer queued in place of the probe prints its own lines below, as
+      // the probe's would have: its problems are counted here, not listed.
       const fresh = delivered
-        .filter((answer) => answer.root === root && !isChanged(answer) && answer.result !== undefined)
+        .filter((answer) => answer.root === root && !isChanged(answer) && !answer.instead_of_probe && answer.result !== undefined)
         .map((answer) => ({ result: answer.result!, where: answer.relative }));
       const said = sessionCheckedLines(
         coverage.covered.map((answer) => ({ result: answer.result!, where: answer.relative })),
@@ -255,7 +269,9 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
         stated.set(root, said.text);
         if (said.key !== null) markSaid(session, root, said.key, home);
       }
-      for (const answer of delivered) if (answer.root === root && !isChanged(answer)) folded.add(answer.seq);
+      for (const answer of delivered) {
+        if (answer.root === root && !isChanged(answer) && !answer.instead_of_probe) folded.add(answer.seq);
+      }
       markStated(session, root, coverage.upTo, true, home);
       continue;
     }
@@ -291,6 +307,12 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   const rest = delivered.filter((answer) => !isChanged(answer) && !folded.has(answer.seq));
   if (rest.some(actionable)) {
     for (const answer of rest) {
+      // Queued in place of the probe: printed whole, as the next carrier
+      // would have printed it (R46.2).
+      if (answer.instead_of_probe) {
+        lines.push(...deliverOne(session, answer, home));
+        continue;
+      }
       const text = render(answer);
       if (text) lines.push(text);
     }

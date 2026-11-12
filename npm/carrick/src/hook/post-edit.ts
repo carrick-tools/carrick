@@ -133,7 +133,7 @@ async function main(timing: Timing): Promise<void> {
 
   timing.file = (edited[0] ?? factOnly[0])!;
   const changes = factsOn ? await changesFromPayload(payload, [...edited, ...factOnly], cwd) : undefined;
-  await editFlow({ cwd, session, channel: channel.channel, timing, changes, factOnly }, edited);
+  await editFlow({ cwd, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, timing, changes, factOnly }, edited);
 }
 
 type Change = Omit<FactEdit, "file">;

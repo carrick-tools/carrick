@@ -415,18 +415,47 @@ test("stop says a re-check is still running, once, without waiting, and delivers
   assert.equal(fourth.stdout, "", "delivered once");
 });
 
-// Pins a gap T12-2 leaves (Stop is unchanged): an answer queued in place of
-// the probe is claimed by Stop when Stop is its next carrier, and Stop renders
-// no uses-count line, so a uses-only answer says nothing of its uses there.
-test("Stop claims an answer queued in place of the probe and prints no uses line for it", async (t) => {
+// R46.2: an answer queued in place of the probe is delivered whole or not at
+// all. With nothing Stop would print for it, Stop leaves it unclaimed and does
+// not count it; the next carrier prints what the probe would have in hand.
+test("Stop leaves an answer queued in place of the probe with no finding unclaimed, and the next carrier prints its uses line", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
-  const entry = enqueue(workspace.root, SESSION, [workspace.file], Date.now(), { home, insteadOfProbe: true })[0]!;
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
   assert.equal(entry.instead_of_probe, true);
   answer(home, entry, fixture("check-stale-uses.json"));
   const run = await stopWith(home);
-  assert.doesNotMatch(run.stdout, /Other files use what this file declares/);
+  assert.equal(run.stdout, "", "nothing for it at Stop: not unchecked, not running");
+  assert.equal(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), false, "unclaimed");
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+});
+
+// R46.2: with a finding Stop prints, Stop prints the answer as the next
+// carrier would have (problem, uses and lead lines), once, and claims it.
+test("Stop prints an answer queued in place of the probe whole when it holds a finding, and nothing prints it again", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], Date.now(), { home, insteadOfProbe: true })[0]!;
+  const lead = fixture("check-deferred-lead.json").recheck!.new_functions!;
+  const whole: CheckResult = {
+    ...problem(),
+    recheck: { ran: "extraction+types", elapsed_ms: 1, new_functions: lead },
+    uses_lines: fixture("check-stale-uses.json").uses_lines!,
+  };
+  answer(home, entry, whole);
+  const run = await stopWith(home);
+  const said = context(run.stdout);
+  const once = (pattern: RegExp) =>
+    assert.equal((said.match(new RegExp(pattern.source, `${pattern.flags}g`)) ?? []).length, 1, `${pattern} once in:\n${said}`);
+  once(/contract problems/);
+  once(/^- .*type_mismatch/m);
+  once(/Other files use what this file declares/);
+  once(/`slugify` looks like `toSlug`/);
   assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), "claimed at Stop");
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "the next carrier prints nothing of it");
 });
 
 test("a clean late answer alone prints nothing and is marked delivered; beside a problem both print", async (t) => {

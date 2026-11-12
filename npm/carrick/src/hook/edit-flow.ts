@@ -20,6 +20,7 @@ import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 import type { Timing } from "./timings.ts";
+import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
@@ -36,6 +37,12 @@ export async function editFlow(
   input: {
     cwd: string | null;
     session: string | undefined;
+    /**
+     * The payload carries an `agent_id`: a sub-agent's edit. Nothing reads a
+     * sub-agent's late answers once it ends, so its edit keeps the probe in
+     * hand, fact file or not (R46.3).
+     */
+    subAgent?: boolean;
     channel: Channel;
     timing?: Timing;
     /**
@@ -111,20 +118,42 @@ export async function editFlow(
   // below. Every other file is queued for the background runner
   // (carrick#3198). With a fact file the fact lines print now and every file
   // is queued in place of the probe: its answer, problem and uses lines and
-  // leads included, arrives on the next carrier (T12-2).
-  const insteadOfProbe = queueable && facts?.present === true;
+  // leads included, arrives on the next carrier (T12-2). A sub-agent's edit
+  // keeps the probe (R46.3), and a file the queue did not take is probed in
+  // hand as before (R46.1).
+  const insteadOfProbe = queueable && facts?.present === true && !input.subAgent;
+  const queued = new Set<string>();
+  if (insteadOfProbe && edited.length > 0) {
+    const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe });
+    if (entries.length > 0) ensureRunner(choice.root);
+    for (const entry of entries) queued.add(entry.file);
+  }
+  const probed = [...relatives.keys()].filter((index) => !queued.has(edited[index]!));
   const answers =
-    edited.length > 0 && !insteadOfProbe ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
+    probed.length > 0
+      ? await probeEdits(
+          probed.map((index) => relatives[index]!),
+          choice.root,
+        )
+      : { results: [], failure: null, ms: 0 };
   if (input.timing) input.timing.waitedMs = answers.ms;
+  // Each file's probe answer by its place in `edited`; null for a file queued
+  // in place of the probe or one the probe gave no answer for.
+  const results: Array<CheckResult | null> = relatives.map(() => null);
+  for (const [at, index] of probed.entries()) results[index] = answers.results[at] ?? null;
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
   const leads = new Map<number, LeadLines>();
   for (const [index, relative] of relatives.entries()) {
-    const result = answers.results[index] ?? null;
+    if (queued.has(edited[index]!)) {
+      log("queued in place of the probe:", relative);
+      continue;
+    }
+    const result = results[index] ?? null;
     if (!result) {
       // A probe with no answer queues every file; one unreadable file in a
       // patch of four is no reason to say nothing about the other three.
-      log(insteadOfProbe ? "queued in place of the probe:" : "no answer for", relative, answers.failure ?? "");
+      log("no answer for", relative, answers.failure ?? "");
       if (queueable) toQueue.push(index);
       continue;
     }
@@ -150,14 +179,10 @@ export async function editFlow(
     if (context) rendered.set(index, context);
   }
 
-  const queued = new Set<string>();
   if (toQueue.length > 0 && session) {
     // A file whose callers the fact lines answered keeps its late answer free
     // of the uses-count line too, as this answer would have been.
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, {
-      factsCallers: covered,
-      insteadOfProbe,
-    });
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     // A queued file says nothing now: its answer is delivered with the next
@@ -173,7 +198,7 @@ export async function editFlow(
   if (session && channel.channel === "hook") {
     const recorded: string[] = [];
     for (const [index, file] of edited.entries()) {
-      const result = answers.results[index] ?? null;
+      const result = results[index] ?? null;
       if (result?.error) continue;
       // A subagent's own worktree is not this session's change (carrick#3543).
       if (inOtherWorktree(file, cwd ?? process.cwd())) continue;

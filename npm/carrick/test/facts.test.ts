@@ -7,8 +7,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
-import { drainRunner, fakeEnv, fixturePath, runHook, testDir, waitForSessionAnswers } from "./helpers.ts";
+import { spawn, spawnSync } from "node:child_process";
+import { drainRunner, fakeEnv, fixturePath, pluginDir, runHook, testDir, waitForSessionAnswers } from "./helpers.ts";
 import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -64,13 +64,14 @@ function edit(
   ws: FactsWorkspace,
   file: string,
   newString: string,
-  options: { session?: string; probe?: string; cwd?: string; env?: Record<string, string> } = {},
+  options: { session?: string; probe?: string; cwd?: string; env?: Record<string, string>; agent?: string } = {},
 ) {
   return runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
       tool_name: "Edit",
       session_id: options.session ?? "facts-session",
+      ...(options.agent ? { agent_id: options.agent } : {}),
       cwd: options.cwd ?? ws.root,
       tool_input: { file_path: file, old_string: "x", new_string: newString },
     },
@@ -1214,6 +1215,69 @@ test("a fact-file edit whose runner answer does not answer the edit still delive
     .replaceAll("<root>", ws.root)
     .trimEnd();
   assert.equal(context(next.stdout), expected);
+});
+
+/** Run the Stop hook for `session` in the workspace, as a settings entry does. */
+function stop(ws: FactsWorkspace, session: string): Promise<string> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(pluginDir, "src", "hook", "stop.ts")], {
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+    child.on("close", () => resolve(stdout));
+    child.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: session, cwd: ws.root }));
+  });
+}
+
+const PROBLEM_HEAD = "Carrick re-checked orders-api/src/routes/orders.ts after this edit: 1 contract problem.";
+
+// R46.1: a file the queue did not take is probed in hand and printed as
+// before fact files: a queue folder that cannot be made, a session id no file
+// name can carry.
+test("with a fact file, a file the queue refuses is probed in hand and printed as before", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const text = 'const order = await db.orders.find(req.params["id"]);';
+  // A plain file where the queue folder goes.
+  fs.writeFileSync(path.join(ws.root, ".carrick", "rechecks"), "");
+  t.after(() => fs.rmSync(path.join(ws.root, ".carrick", "rechecks"), { force: true }));
+  const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart.json" })).stdout);
+  assert.ok(refused.startsWith(`${PROBLEM_HEAD}\n- `), refused);
+  assert.ok(refused.endsWith(`\n\n${GET_ORDER_LINE}`), refused);
+  assert.match(await stop(ws, "refused"), /Carrick checked the 1 file this session edited \(order-service\): 1 contract problem\./);
+  fs.rmSync(path.join(ws.root, ".carrick", "rechecks"));
+  const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart.json" })).stdout);
+  assert.ok(unsafe.startsWith(`${PROBLEM_HEAD}\n- `), unsafe);
+});
+
+// R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.
+test("with a fact file, a sub-agent's edit is probed in hand and queues nothing in place of the probe", async (t) => {
+  const ws = await factsWorkspace(t);
+  const argvLog = path.join(ws.home, "argv.log");
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
+    session: "parent",
+    agent: "sub1",
+    probe: "check-counterpart.json",
+    env: { CARRICK_FAKE_ARGV_LOG: argvLog },
+  });
+  const said = context(run.stdout);
+  assert.ok(said.startsWith(`${PROBLEM_HEAD}\n- `), said);
+  assert.equal(probeCalls(argvLog), 1);
+  for (const { entry } of newestPerFile("parent.sub1", ws.home).values()) assert.equal(entry.instead_of_probe, undefined);
+});
+
+// R46.5: an answer the binary refused (no index) states nothing at Stop, as
+// the probe's refusal did: no "did not check", no `check --changed`.
+test("with a fact file, an error answer queued in place of the probe is not stated at Stop", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', { session: "err", probe: "check-not-indexed.json" });
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
+  await waitForAnswer(ws, "err");
+  assert.equal(await stop(ws, "err"), "");
 });
 
 test("the timing record carries facts_ms", async (t) => {
