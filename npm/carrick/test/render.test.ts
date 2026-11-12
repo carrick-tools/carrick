@@ -985,7 +985,7 @@ test("the Read hook prints each dispatch case once, with its case", () => {
   const lines = (out ?? "").split("\n").filter((line) => line.startsWith("- index.ts"));
   assert.equal(lines.length, 3, out ?? "");
   assert.equal(new Set(lines).size, 3);
-  assert.match(lines[2], /route POST \/types\/check-or-upload \{action=get-type-reach\}\./);
+  assert.match(lines[2] ?? "",/route POST \/types\/check-or-upload \{action=get-type-reach\}\./);
 });
 
 test("the Read hook never prints an identical line twice, and keeps its cap", () => {
