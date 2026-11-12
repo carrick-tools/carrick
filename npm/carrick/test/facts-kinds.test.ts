@@ -432,10 +432,11 @@ test("at most 3 fact lines per action, in the order op, fn, name", async (t) => 
     "}",
     "",
   ].join("\n");
-  const op = (label: string, text: string) => ({ k: "op", side: "consumer", protocol: "http", label, service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [], total: 0, source: "call", text });
+  // One row per (side, protocol): one thing with two facts, so both print (R24.1).
+  const op = (side: string, label: string, text: string) => ({ k: "op", side, protocol: "http", label, service: "api", repo: "api", file: "src/orders.ts", line: 2, name: "loadOrder", site: null, others: [], total: 0, source: "call", text });
   const ws = await workspace(t, { "api/src/orders.ts": src, "web/src/stdin.ts": "export function readStdin() {}\n" }, [
-    op("GET /orders", "op line 1"),
-    op("POST /orders", "op line 2"),
+    op("consumer", "GET /orders", "op line 1"),
+    op("producer", "POST /orders", "op line 2"),
     fnRow("loadOrder", LOAD_LINE),
     nameRow("readStdin", "web", "src/stdin.ts"),
   ]);
