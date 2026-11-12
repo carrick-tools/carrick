@@ -44,7 +44,7 @@ import {
   type AssembledWorkspace,
 } from './check-workspace.js';
 import { buildPoisonIndexes, type StubPoisonIndex } from './check-poison.js';
-import { openProbeProgram, probeDeepFindings } from './check-deep.js';
+import { openProbeProgram, pairForeignFindings, probeDeepFindings } from './check-deep.js';
 import { onlyDeclaredOpenMembers } from './deep-walk.js';
 import { pairFieldReports } from './check-fields.js';
 import { pairDispatchUnions } from './check-union.js';
@@ -679,6 +679,9 @@ export async function runCheck(
   // And which pairs compared a union the expected side takes only in part,
   // the rest failing by nothing but the weak-type check (carrick#1995).
   const unionsByPair = pairDispatchUnions(probeProgram, probing);
+  // And which sides read a declaration only another service declares
+  // (carrick#1047 J1-1).
+  const foreignByPair = pairForeignFindings(probeProgram, probing, ws);
   const tProbeProgram = Date.now();
 
   const verdicts = sortVerdicts([
@@ -692,6 +695,7 @@ export async function runCheck(
         fieldReport: fieldsByPair.get(plan.pairId),
         dispatchUnion: unionsByPair.get(plan.pairId),
         rawTextSide: rawTextSideOf(plan, aliasRecords),
+        foreign: foreignByPair.get(plan.pairId),
       })
     ),
     ...preGated,

@@ -36,7 +36,7 @@ import ts from 'typescript';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { findAugmentationFiles } from './augmentations.js';
+import { declaresAugmentation, findAugmentationFiles } from './augmentations.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import type { CaptureAliasRecord, CaptureAnchorRequest, SelfCheckOutcome } from './api.js';
 import type { ResolvedAnchor } from './anchors.js';
@@ -669,6 +669,16 @@ interface StubJudgeInputs {
   pinned: Array<[string, string]>;
   resolution: string | null;
   bareCheckout: boolean;
+}
+
+/**
+ * Whether a stub tree file declares into global scope, so that a program
+ * loading it beside another stub changes what that stub's names mean
+ * (carrick#1047 J-R5): a script (no import or export), or a module that
+ * declares a global or module augmentation.
+ */
+export function isGlobalScopeFile(source: ts.SourceFile): boolean {
+  return !ts.isExternalModule(source) || declaresAugmentation(source);
 }
 
 /**

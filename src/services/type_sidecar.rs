@@ -706,6 +706,22 @@ pub struct CheckVerdict {
     /// check — the same terms every other additive field here is read on.
     #[serde(default)]
     pub notes: Vec<String>,
+    /// On a `foreign:<side>` verdict only (carrick#1047 J1-1): why that side
+    /// could not be judged.
+    #[serde(default)]
+    pub foreign_kind: Option<ForeignKind>,
+}
+
+/// Why a `foreign:<side>` verdict could not judge that side (carrick#1047).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForeignKind {
+    /// Its type reads another service's declaration.
+    Hit,
+    /// The walk ran out of budget before it could rule one out.
+    Budget,
+    /// No program could be built to walk it in.
+    NoProgram,
 }
 
 /// One side of a checked pair.

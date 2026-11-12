@@ -644,6 +644,13 @@ export interface CheckVerdict {
    * observation as a verdict.
    */
   notes: string[];
+  /**
+   * On a `foreign:<side>` verdict only (carrick#1047 J1-1): why that side
+   * could not be judged. `hit`: its type reads another service's
+   * declaration. `budget`: the walk ran out of budget before it could rule
+   * one out. `no_program`: no program could be built to walk it in.
+   */
+  foreign_kind?: 'hit' | 'budget' | 'no_program';
 }
 
 /**

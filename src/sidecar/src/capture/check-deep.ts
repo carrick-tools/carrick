@@ -26,8 +26,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import type { TypeProvenance } from './api.js';
-import { findDisqualifyingTopTypes, provenanceOf } from './deep-walk.js';
-import { UNWIDENED_LOCAL_NAME, type ProbePlan } from './check-probe.js';
+import { findDisqualifyingTopTypes, findForeignDeclarationPositions, provenanceOf } from './deep-walk.js';
+import { UNWIDENED_LOCAL_NAME, type ProbePlan, type Side } from './check-probe.js';
+import type { AssembledWorkspace } from './check-workspace.js';
+import { isGlobalScopeFile } from './self-check.js';
 
 /** Deep findings for one pair, per probe side. */
 export interface PairDeepFindings {
@@ -113,10 +115,26 @@ export function probeDeepFindings(
  */
 function walkImportedAlias(
   file: ts.SourceFile,
-  localName: 'Sent' | 'Expected' | typeof UNWIDENED_LOCAL_NAME,
+  localName: ProbeLocalName,
   program: ts.Program,
   checker: ts.TypeChecker
 ): TypeProvenance[] | undefined {
+  const imported = importedAliasType(file, localName, checker);
+  if (!imported) return undefined;
+  return findDisqualifyingTopTypes(imported.type, program, checker, imported.at).map((finding) =>
+    provenanceOf(finding)
+  );
+}
+
+type ProbeLocalName = 'Sent' | 'Expected' | typeof UNWIDENED_LOCAL_NAME;
+
+/** The declared type of one of the probe's imported surface aliases, and the
+ * import name it is read at; `undefined` when it does not resolve. */
+function importedAliasType(
+  file: ts.SourceFile,
+  localName: ProbeLocalName,
+  checker: ts.TypeChecker
+): { type: ts.Type; at: ts.Node } | undefined {
   for (const statement of file.statements) {
     if (!ts.isImportDeclaration(statement)) continue;
     const bindings = statement.importClause?.namedBindings;
@@ -129,10 +147,173 @@ function walkImportedAlias(
         local.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(local) : local;
       const type = checker.getDeclaredTypeOfSymbol(target);
       if (!type) return undefined;
-      return findDisqualifyingTopTypes(type, program, checker, element.name).map(
-        (finding) => provenanceOf(finding)
-      );
+      return { type, at: element.name };
     }
   }
   return undefined;
+}
+
+/**
+ * What one side of a pair reads of another service's declarations
+ * (carrick#1047 J1-1): the first position and the service that declares it,
+ * where the walk ran out of budget before it could rule one out, or
+ * `unwalked` when no program could be built to walk it in.
+ */
+export type SideForeign = { service: string; path: string } | { exhaustedAt: string } | 'unwalked';
+
+/** Per side of a pair; a side absent here reads only its own service. */
+export type PairForeignFindings = Partial<Record<Side, SideForeign>>;
+
+/**
+ * Which probed sides read a declaration that only another service declares
+ * (carrick#1047 J1-1).
+ *
+ * Each service compiles alone. The judge loads every probed stub into one
+ * program, so a global-scope file of one stub (a script, a `declare global`, a
+ * module augmentation) can merge into a name another stub's type reads, and
+ * that type is then one neither service compiles. A side can only read
+ * another stub's declaration through such a file: a stub that names a sibling
+ * by its package name does not resolve in this workspace (carrick#2970). So a
+ * side is walked only when the program holds a global-scope file of another
+ * stub, and otherwise costs nothing.
+ *
+ * A declaration in another stub's tree is not foreign when its text equals a
+ * declaration of the same symbol in the side's own tree: a typing file two
+ * services both carry says the same thing in each.
+ *
+ * Nor is one that merges into a built-in global, one TypeScript's default
+ * library declares (`interface Array<T>`, `Date`, `Promise`), unless it lies
+ * in the tree of the pair's other side. Both sides read the same built-in in
+ * the judge's program, so a third service's augmentation of it cannot move
+ * the verdict; the other side's can, as that side's own compile has it and
+ * this side's does not.
+ *
+ * Fails closed. A walk out of budget is `exhaustedAt`; a run with no program
+ * whose workspace holds another stub's global-scope file is `unwalked`.
+ */
+export function pairForeignFindings(
+  opened: ProbeProgram | undefined,
+  plans: ProbePlan[],
+  ws: AssembledWorkspace
+): Map<string, PairForeignFindings> {
+  const results = new Map<string, PairForeignFindings>();
+  const dirOfService = new Map(ws.stubs.map((s) => [s.serviceName, s.packageDir]));
+  const roots = [...new Set([ws.workspaceDir, fs.realpathSync(ws.workspaceDir)])].map((r) =>
+    path.join(r, 'packages').split(path.sep).join('/') + '/'
+  );
+  const stubDirs = new Set(ws.stubs.map((s) => s.packageDir));
+  /** The stub package dir a file lies in, outside its installed packages. */
+  const stubDirOf = (fileName: string): string | undefined => {
+    const normal = fileName.split(path.sep).join('/');
+    for (const root of roots) {
+      if (!normal.startsWith(root)) continue;
+      const rest = normal.slice(root.length);
+      const dir = rest.slice(0, rest.indexOf('/'));
+      if (rest.includes('/node_modules/') || !stubDirs.has(dir)) return undefined;
+      return dir;
+    }
+    return undefined;
+  };
+
+  const globalDirs = opened
+    ? new Set(
+        opened.program
+          .getSourceFiles()
+          .filter((sf) => stubDirOf(sf.fileName) !== undefined && isGlobalScopeFile(sf))
+          .map((sf) => stubDirOf(sf.fileName)!)
+      )
+    : globalScopeDirsOnDisk(ws);
+  const reachable = (dir: string | undefined): boolean =>
+    [...globalDirs].some((g) => g !== dir);
+  if (![...dirOfService.values()].some(reachable)) return results;
+
+  const sideOf = (plan: ProbePlan, side: Side) => plan.spec[side].service_name;
+  if (!opened) {
+    for (const plan of plans) {
+      const found: PairForeignFindings = {};
+      for (const side of ['producer', 'consumer'] as const) {
+        if (reachable(dirOfService.get(sideOf(plan, side)))) found[side] = 'unwalked';
+      }
+      if (Object.keys(found).length > 0) results.set(plan.pairId, found);
+    }
+    return results;
+  }
+
+  const { program, checker, probesDir } = opened;
+  const normalText = (d: ts.Declaration): string => d.getText().replace(/\s+/g, ' ');
+  /** Whether `d` is, or is written inside, an interface or class that merges
+   * into a symbol the default library declares: the augmentation itself, a
+   * member it adds, or a type literal written in that member. */
+  const mergesIntoDefaultLibrary = (d: ts.Declaration): boolean => {
+    for (let n: ts.Node | undefined = d; n && !ts.isSourceFile(n); n = n.parent) {
+      if (!ts.isInterfaceDeclaration(n) && !ts.isClassDeclaration(n)) continue;
+      const merged = n.name ? checker.getSymbolAtLocation(n.name) : undefined;
+      return (merged?.declarations ?? []).some((x) => program.isSourceFileDefaultLibrary(x.getSourceFile()));
+    }
+    return false;
+  };
+  for (const plan of plans) {
+    const file = program.getSourceFile(path.join(probesDir, 'probes', plan.fileName));
+    if (!file) continue;
+    const found: PairForeignFindings = {};
+    for (const side of ['producer', 'consumer'] as const) {
+      const own = dirOfService.get(sideOf(plan, side));
+      if (!reachable(own)) continue;
+      const other = dirOfService.get(sideOf(plan, side === 'producer' ? 'consumer' : 'producer'));
+      const foreignOf = (symbol: ts.Symbol): string | undefined => {
+        const declarations = symbol.declarations ?? [];
+        const ownTexts = new Set(
+          declarations.filter((d) => stubDirOf(d.getSourceFile().fileName) === own).map(normalText)
+        );
+        for (const d of declarations) {
+          const dir = stubDirOf(d.getSourceFile().fileName);
+          if (dir === undefined || dir === own || ownTexts.has(normalText(d))) continue;
+          if (dir !== other && mergesIntoDefaultLibrary(d)) continue;
+          return ws.serviceOfPackageDir(dir) ?? dir;
+        }
+        return undefined;
+      };
+      // The sent side is read twice where the probe carries its unwidened
+      // reading (carrick#1538), and either reading may clear the pair.
+      const names: ProbeLocalName[] =
+        side === plan.direction.sent
+          ? plan.unwidenedFromLine === undefined
+            ? ['Sent']
+            : ['Sent', UNWIDENED_LOCAL_NAME]
+          : ['Expected'];
+      for (const name of names) {
+        const imported = importedAliasType(file, name, checker);
+        if (!imported) continue;
+        const walk = findForeignDeclarationPositions(imported.type, program, checker, imported.at, foreignOf);
+        if (walk.hit) {
+          found[side] = walk.hit;
+          break;
+        }
+        if (walk.exhaustedAt !== undefined) found[side] = { exhaustedAt: walk.exhaustedAt };
+      }
+    }
+    if (Object.keys(found).length > 0) results.set(plan.pairId, found);
+  }
+  return results;
+}
+
+/** The stub dirs whose emitted tree holds a global-scope file, read from
+ * disk: the answer when no program could be built. */
+function globalScopeDirsOnDisk(ws: AssembledWorkspace): Set<string> {
+  const dirs = new Set<string>();
+  for (const stub of ws.stubs) {
+    const typesDir = path.join(ws.workspaceDir, 'packages', stub.packageDir, 'types');
+    const files = fs.existsSync(typesDir)
+      ? (fs.readdirSync(typesDir, { recursive: true }) as string[]).filter((f) => /\.[cm]?ts$/.test(f))
+      : [];
+    for (const rel of files) {
+      const abs = path.join(typesDir, rel);
+      const source = ts.createSourceFile(abs, fs.readFileSync(abs, 'utf8'), ts.ScriptTarget.Latest);
+      if (isGlobalScopeFile(source)) {
+        dirs.add(stub.packageDir);
+        break;
+      }
+    }
+  }
+  return dirs;
 }

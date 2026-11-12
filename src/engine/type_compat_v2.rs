@@ -2578,6 +2578,9 @@ pub(crate) fn run_check(
                     );
                     crate::scan_health::record_type_memory_death(kind, end.heap_cap_mb);
                 }
+                if let Some(line) = foreign_gate_line(&result.verdicts) {
+                    info!("{line}");
+                }
                 let by_key: BTreeMap<&str, &crate::services::type_sidecar::CheckVerdict> = result
                     .verdicts
                     .iter()
@@ -3123,6 +3126,11 @@ pub(crate) fn stored_call_locators(
 ///
 /// A proven mismatch is never a candidate: the retype may only lift a verdict
 /// that compared nothing, never downgrade one that found a break.
+///
+/// Nor is a consumer whose type reads another service's declaration
+/// (`foreign:consumer`, carrick#1047): the retype pastes the producer's text
+/// into the consumer's program, where a global that text names would bind to
+/// the consumer's declaration, a second cross-service read.
 fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> bool {
     verdict.bucket != VerdictBucket::Incompatible
         && verdict.unresolved_side == Some(VerdictSide::Consumer)
@@ -3131,7 +3139,42 @@ fn consumer_to_blame(verdict: &crate::services::type_sidecar::CheckVerdict) -> b
                 || gate.ends_with(":form")
                 || gate.ends_with(":bytes")
                 || gate.ends_with(":text")
+                || gate.starts_with("foreign:")
         })
+}
+
+/// The INFO line counting the pairs whose type reads another service's
+/// declaration (carrick#1047), or nothing when there are none. The pairs are
+/// counted by side and by why the side could not be judged.
+fn foreign_gate_line(verdicts: &[crate::services::type_sidecar::CheckVerdict]) -> Option<String> {
+    use crate::services::type_sidecar::ForeignKind;
+    let foreign: Vec<_> = verdicts
+        .iter()
+        .filter(|v| v.gate.as_deref().is_some_and(|g| g.starts_with("foreign:")))
+        .collect();
+    let side = |gate: &str| {
+        foreign
+            .iter()
+            .filter(|v| v.gate.as_deref() == Some(gate))
+            .count()
+    };
+    let kind = |kind: ForeignKind| {
+        foreign
+            .iter()
+            .filter(|v| v.foreign_kind == Some(kind))
+            .count()
+    };
+    (!foreign.is_empty()).then(|| {
+        format!(
+            "v2 check foreign: {} pair(s) read another service's declaration ({} producer, {} consumer; hits {}, budget {}, no_program {})",
+            foreign.len(),
+            side("foreign:producer"),
+            side("foreign:consumer"),
+            kind(ForeignKind::Hit),
+            kind(ForeignKind::Budget),
+            kind(ForeignKind::NoProgram),
+        )
+    })
 }
 
 /// Said on every pair the retype decided.
@@ -4208,7 +4251,7 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
 /// Every other gate comes from the two types and settles: the capture's
 /// pre-gate (`capture:<side>:<kind>`), the probe gates (`<side>:any`,
 /// `:unknown`, `:never`, `:void`, `:form`, `:bytes`, `:text`, `:envelope`,
-/// `:union`), `poison:<side>`, `import:<side>`, `assignment:other`, and the
+/// `:union`), `poison:<side>`, `foreign:<side>`, `import:<side>`, `assignment:other`, and the
 /// gates this module sets (`producer:mode`, `same_service`, `retype:consumer`,
 /// `producer:` and `consumer:unwidened_out_of_budget`, whose mark is stored
 /// in the blob and so read alike by every run of it).
@@ -5762,6 +5805,7 @@ mod tests {
                 unresolved_reason: Some("why".to_string()),
                 unresolved_side: side,
                 notes: Vec::new(),
+                foreign_kind: None,
             }
         };
         let consumer = Some(VerdictSide::Consumer);
@@ -5801,6 +5845,62 @@ mod tests {
             consumer,
             Some("consumer:text")
         )));
+        // Its type reads another service's declaration (carrick#1047): the
+        // retype would read it a second time across services.
+        assert!(!consumer_to_blame(&verdict(
+            consumer,
+            Some("foreign:consumer")
+        )));
+    }
+
+    #[test]
+    fn a_foreign_gate_settles_and_is_counted() {
+        // It comes from the two types and the stubs loaded beside them, not
+        // from how the run went (carrick#1047).
+        assert!(!gate_from_run("foreign:producer"));
+        assert!(!gate_from_run("foreign:consumer"));
+        use crate::services::type_sidecar::ForeignKind;
+        let verdict = |gate: Option<&str>, kind: Option<ForeignKind>| {
+            crate::services::type_sidecar::CheckVerdict {
+                pair_id: "id".to_string(),
+                pair_key: "key".to_string(),
+                bucket: VerdictBucket::Unverifiable,
+                gate: gate.map(str::to_string),
+                diagnostic: None,
+                codes: Vec::new(),
+                resolved: false,
+                unresolved_reason: None,
+                unresolved_side: None,
+                notes: Vec::new(),
+                foreign_kind: kind,
+            }
+        };
+        assert_eq!(
+            foreign_gate_line(&[
+                verdict(Some("foreign:producer"), Some(ForeignKind::Hit)),
+                verdict(Some("foreign:producer"), Some(ForeignKind::Budget)),
+                verdict(Some("foreign:consumer"), Some(ForeignKind::Hit)),
+                verdict(Some("foreign:consumer"), Some(ForeignKind::NoProgram)),
+                verdict(Some("poison:producer"), None),
+                verdict(None, None),
+            ])
+            .as_deref(),
+            Some(
+                "v2 check foreign: 4 pair(s) read another service's declaration (2 producer, 2 consumer; hits 2, budget 1, no_program 1)"
+            )
+        );
+        // The kind reads off the wire as the compiler engine writes it.
+        let wire: crate::services::type_sidecar::CheckVerdict =
+            serde_json::from_value(serde_json::json!({
+                "pair_id": "id", "pair_key": "key", "bucket": "unverifiable",
+                "gate": "foreign:consumer", "codes": [], "foreign_kind": "no_program"
+            }))
+            .unwrap();
+        assert_eq!(wire.foreign_kind, Some(ForeignKind::NoProgram));
+        assert_eq!(
+            foreign_gate_line(&[verdict(Some("poison:consumer"), None)]),
+            None
+        );
     }
 
     #[test]
@@ -5951,6 +6051,7 @@ mod tests {
             unresolved_reason: Some("the consumer type carries 'any' at 'meta'".to_string()),
             unresolved_side: Some(VerdictSide::Consumer),
             notes: Vec::new(),
+            foreign_kind: None,
         };
         assert!(
             !consumer_to_blame(&verdict),
