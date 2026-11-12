@@ -32,10 +32,11 @@ export const MAX_FACT_LINES = 3;
 /**
  * One edited file and where the edit changed it: the 1-based lines of the
  * file as it is now that it added (`lines`) and the lines it removed lines
- * just above (`removed`), else the text the edit put in (`snippets`); none of
- * them means the file was written whole.
+ * just above (`removed`), else the text the edit put in (`snippets`), else
+ * `whole` for a file the call created (every named thing in it counts). With
+ * none of them the changed lines are not known, and nothing is said.
  */
-export type FactEdit = { file: string; lines?: number[] | null; removed?: number[] | null; snippets?: string[] | null };
+export type FactEdit = { file: string; lines?: number[] | null; removed?: number[] | null; snippets?: string[] | null; whole?: boolean };
 
 /** The files the declaration scanner reads. */
 const SCANNED = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -175,6 +176,10 @@ export async function factLines(
     for (const edit of edits) {
       if (lines.length >= MAX_FACT_LINES) break;
       if (!SCANNED.test(edit.file)) continue;
+      const byLine = edit.lines || edit.removed;
+      // Changed lines not known (a Write over a file, a shell write, a patch
+      // hunk that cannot be placed): nothing is said.
+      if (!byLine && !edit.snippets && !edit.whole) continue;
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
       let text: string;
@@ -188,7 +193,6 @@ export async function factLines(
         log(`${at.rel} did not read cleanly; no fact lines for it`);
         continue;
       }
-      const byLine = edit.lines || edit.removed;
       const ranges = byLine
         ? rangesOfLines(text, edit.lines ?? [])
         : edit.snippets

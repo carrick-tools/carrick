@@ -37,11 +37,12 @@ export async function editFlow(
     timing?: Timing;
     /**
      * Absolute path -> where the edit changed the file: the lines of its
-     * patch, else the text it put in (an Edit's `new_string`). A file not
-     * named here was written whole (a Write, a patch, a shell write), and
-     * every named thing in it counts as touched.
+     * patch, else the text it put in (an Edit's `new_string`), else `whole`
+     * for a file the call created. A file not named here (a Write over a
+     * file, a shell write, a patch hunk that cannot be placed) gets no fact
+     * lines: which lines changed is not known.
      */
-    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[] }>;
+    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean }>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked

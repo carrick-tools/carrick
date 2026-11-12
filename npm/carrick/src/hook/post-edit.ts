@@ -22,7 +22,8 @@
 import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
-import { patchedFiles } from "./apply-patch.ts";
+import fs from "node:fs";
+import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
@@ -46,9 +47,10 @@ type Payload = {
     /** Codex's `apply_patch`: the patch text itself. */
     command?: unknown;
   };
-  /** Claude Code's `Edit` and `MultiEdit` result: the hunks it applied. */
+  /** Claude Code's `Edit` and `MultiEdit` result: the hunks it applied; a `Write`'s also says whether it created the file. */
   tool_response?: {
     structuredPatch?: Array<{ newStart?: unknown; lines?: unknown }>;
+    type?: unknown;
   };
 };
 
@@ -110,16 +112,51 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = edited[0]!;
-  await editFlow({ cwd, session, channel: channel.channel, timing, changes: changesFromPayload(payload, edited) }, edited);
+  await editFlow({ cwd, session, channel: channel.channel, timing, changes: await changesFromPayload(payload, edited, cwd) }, edited);
+}
+
+type Change = { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean };
+
+/**
+ * Whether git, asked in the file's folder, says it does not track `file`;
+ * false when git cannot say. Loaded only on this path, which a created file
+ * alone takes.
+ */
+async function untracked(file: string): Promise<boolean> {
+  const { trackedPaths } = await import("../init/repo-copies.ts");
+  const tracked = trackedPaths(path.dirname(file), [path.basename(file)]);
+  return tracked !== null && tracked.size === 0;
 }
 
 /**
- * Where an `Edit` or `MultiEdit` changed its one file, keyed by the absolute
- * path: the lines of the file as it is now that its hunks added, or where
- * they removed lines; else the text it put in. A `Write` or a patch names
- * neither: the file was written whole.
+ * Where the edit changed each file, keyed by the absolute path: the lines of
+ * the file as it is now that its hunks added and where they removed lines
+ * (an `Edit` or `MultiEdit`'s patch, a Codex `apply_patch` hunk placed in the
+ * file), else the text it put in, else `whole` for a file this call created
+ * that git does not track. A file left out (a `Write` over an existing file,
+ * a hunk that cannot be placed) gets no fact lines (`facts/lines.ts`).
  */
-function changesFromPayload(payload: Payload, edited: string[]): Map<string, { lines?: number[]; removed?: number[]; snippets?: string[] }> {
+async function changesFromPayload(payload: Payload, edited: string[], cwd: string | null): Promise<Map<string, Change>> {
+  const input = payload.tool_input ?? {};
+  const named = input.file_path ?? input.filePath ?? input.edits?.[0]?.file_path ?? null;
+  if (named === null && typeof input.command === "string") {
+    const out = new Map<string, Change>();
+    for (const [relative, change] of patchEdits(input.command)) {
+      const file = path.isAbsolute(relative) ? relative : path.resolve(cwd ?? process.cwd(), relative);
+      if (change === null || !edited.includes(file)) continue;
+      if ("added" in change) {
+        if (await untracked(file)) out.set(file, { whole: true });
+        continue;
+      }
+      try {
+        const placed = placeHunks(fs.readFileSync(file, "utf8"), change.hunks);
+        if (placed) out.set(file, placed);
+      } catch {
+        // Unreadable now: nothing said about it.
+      }
+    }
+    return out;
+  }
   if (edited.length !== 1) return new Map();
   const hunks = payload.tool_response?.structuredPatch;
   if (Array.isArray(hunks) && hunks.length > 0) {
@@ -139,7 +176,7 @@ function changesFromPayload(payload: Payload, edited: string[]): Map<string, { l
     }
     return new Map([[edited[0]!, { lines, removed }]]);
   }
-  const input = payload.tool_input ?? {};
+  if (payload.tool_response?.type === "create") return (await untracked(edited[0]!)) ? new Map([[edited[0]!, { whole: true }]]) : new Map();
   const texts = [input.new_string, ...(input.edits ?? []).map((edit) => edit.new_string)].filter(
     (text): text is string => typeof text === "string",
   );

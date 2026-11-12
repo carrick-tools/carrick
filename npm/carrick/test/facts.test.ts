@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -418,6 +419,77 @@ test("a thing's span starts at export, default, async and decorators: its header
   assert.equal(context(run.stdout), "g line");
 });
 
+/** Run the post-edit hook with a whole payload (a Write, or Codex's `apply_patch`). */
+function payloadEdit(ws: FactsWorkspace, payload: Record<string, unknown>, session = "whole") {
+  return runHook("post-edit.ts", {
+    payload: { hook_event_name: "PostToolUse", session_id: session, cwd: ws.root, ...payload },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+  });
+}
+
+/** Make `repo` in the workspace a git repository with its files committed. */
+function gitRepo(ws: FactsWorkspace, repo: string): void {
+  const dir = ws.at(repo);
+  const git = (...args: string[]) => {
+    const run = spawnSync("git", ["-C", dir, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+  };
+  git("init", "-q");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+}
+
+test("a Write over an existing file, whose changed lines are unknown, prints nothing", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await payloadEdit(ws, { tool_name: "Write", tool_input: { file_path: file, content: fs.readFileSync(file, "utf8") }, tool_response: { type: "update" } });
+  assert.equal(context(run.stdout), "");
+});
+
+test("a file this Write created, untracked in git, counts every named thing in it", async (t) => {
+  const ws = await factsWorkspace(t);
+  gitRepo(ws, "orders-api");
+  const file = ws.at("orders-api/src/routes/fresh.ts");
+  const text = fs.readFileSync(ws.at("orders-api/src/routes/orders.ts"), "utf8");
+  fs.writeFileSync(file, text);
+  const payload = { tool_name: "Write", tool_input: { file_path: file, content: text }, tool_response: { type: "create", filePath: file } };
+  // Its rows are another file's, still on disk: nothing, by the named-row rule.
+  assert.equal(context((await payloadEdit(ws, payload)).stdout), "");
+  // A tracked file is never "created by this call".
+  fs.rmSync(file);
+  const tracked = ws.at("orders-api/src/routes/orders.ts");
+  const again = await payloadEdit(ws, { ...payload, tool_input: { file_path: tracked, content: text }, tool_response: { type: "create", filePath: tracked } }, "tracked");
+  assert.equal(context(again.stdout), "");
+  // The repo's own file, deleted and written again by this call: every thing counts.
+  fs.rmSync(tracked);
+  spawnSync("git", ["-C", ws.at("orders-api"), "rm", "-q", "--cached", "src/routes/orders.ts"]);
+  fs.writeFileSync(tracked, text);
+  const created = await payloadEdit(ws, { ...payload, tool_input: { file_path: tracked, content: text }, tool_response: { type: "create", filePath: tracked } }, "created");
+  assert.match(context(created.stdout), /^GET \/orders\/:id is called at /);
+});
+
+test("Codex apply_patch: its hunks place the change; a hunk that cannot be placed prints nothing", async (t) => {
+  const ws = await factsWorkspace(t);
+  const patch = (body: string[]) => ["*** Begin Patch", "*** Update File: orders-api/src/routes/orders.ts", ...body, "*** End Patch", ""].join("\n");
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("  res.status(204).end();", "  res.status(205).end();"));
+  const placed = await payloadEdit(ws, {
+    tool_name: "apply_patch",
+    tool_input: { command: patch(["@@ export async function cancelOrder", '   await db.orders.cancel(req.params["id"]);', "-  res.status(204).end();", "+  res.status(205).end();"]) },
+  });
+  assert.equal(context(placed.stdout), "POST /orders/:id/cancel is called at web-app/src/api/order-client.ts:17");
+  // The hunk's new text is nowhere in the file: nothing.
+  const lost = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: patch(["@@", "-  res.status(204).end();", "+  res.status(299).end();"]) } }, "lost");
+  assert.equal(context(lost.stdout), "");
+  // `*** Add File` of a file git does not track: every thing in it counts.
+  gitRepo(ws, "orders-api");
+  spawnSync("git", ["-C", ws.at("orders-api"), "rm", "-q", "--cached", "src/routes/orders.ts"]);
+  const text = fs.readFileSync(file, "utf8");
+  const add = ["*** Begin Patch", "*** Add File: orders-api/src/routes/orders.ts", ...text.trimEnd().split("\n").map((line) => `+${line}`), "*** End Patch", ""].join("\n");
+  const added = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: add } }, "added");
+  assert.match(context(added.stdout), /^GET \/orders\/:id is called at /);
+});
+
 test("a component file with markup is read: the call in its effect is found by the component's name", async (t) => {
   const ndjson = [
     header(["web-app"]),
@@ -694,11 +766,9 @@ test("a file another session wrote in another worktree prints nothing here", asy
   const theirs = path.join(top, "src", "events", "publish.ts");
   fs.utimesSync(theirs, new Date(), new Date());
   assert.equal(context((await shell(theirs, ws.at("web-app"))).stdout), "");
-  // The same write in the session's own checkout speaks.
+  // The same write in the session's own checkout: a shell write names no
+  // changed lines, so it prints nothing either.
   const own = ws.at("orders-api/src/events/publish.ts");
   fs.utimesSync(own, new Date(), new Date());
-  assert.equal(
-    context((await shell(own, ws.at("orders-api"))).stdout),
-    "PUBSUB orders.created is served at billing-worker/src/subscribers/created.ts:7",
-  );
+  assert.equal(context((await shell(own, ws.at("orders-api"))).stdout), "");
 });
