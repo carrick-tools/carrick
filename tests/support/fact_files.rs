@@ -13,6 +13,90 @@ use carrick::request_summary::fact_files::FactFiles;
 use carrick::swc_scanner::{ScanResult, SwcScanner};
 use std::path::{Path, PathBuf};
 
+/// An installed route-table package for trees a test writes itself
+/// (carrick#3711 R2): `makeTable()` builds a table whose `get` and `post`
+/// register routes, and whose `route(path)` returns the verbs registered on
+/// one path. With its lockfile entry and its store answer under `__llm__`.
+pub fn install_table_package(root: &Path) {
+    let files = [
+        (
+            "node_modules/fixture-table/package.json",
+            r#"{ "name": "fixture-table", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        ("node_modules/fixture-table/index.d.ts", TABLE_TYPES),
+        (
+            "package.json",
+            r#"{ "name": "table-service", "version": "1.0.0", "private": true, "dependencies": { "fixture-table": "^1.0.0" } }"#,
+        ),
+        ("package-lock.json", TABLE_LOCK),
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
+        ),
+        ("__llm__/library-claims/default.json", TABLE_CLAIMS),
+    ];
+    for (relative, text) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+const TABLE_TYPES: &str = "export interface Request {\n  path: string;\n}\n\
+export interface Reply {\n  send(body: unknown): void;\n}\n\
+export type Handler = (request: Request, reply: Reply) => unknown;\n\
+/** What `Table.route` returns: the verbs registered on one path. */\n\
+export interface Route {\n  get(...handlers: Handler[]): this;\n  post(...handlers: Handler[]): this;\n}\n\
+export interface Table {\n  get(path: string, ...handlers: Handler[]): this;\n  post(path: string, ...handlers: Handler[]): this;\n  route(path: string): Route;\n}\n\
+declare function makeTable(): Table;\nexport default makeTable;\n";
+
+const TABLE_LOCK: &str = r#"{
+  "name": "table-service",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "table-service", "version": "1.0.0", "dependencies": { "fixture-table": "^1.0.0" } },
+    "node_modules/fixture-table": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/fixture-table/-/fixture-table-1.0.0.tgz"
+    }
+  }
+}
+"#;
+
+const TABLE_CLAIMS: &str = r#"{
+  "library_claims": [
+    {
+      "package": "fixture-table",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-table",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [
+            { "member": "route", "of": "instance:()", "name": { "arg": 0 }, "picker": "fixture-picker" }
+          ],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" },
+            { "op": "receive", "member": "get", "of": "instance:()>scope:route", "name": { "bound": "scope" }, "handler": { "arg": 0 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:()>scope:route", "name": { "bound": "scope" }, "handler": { "arg": 0 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}
+"#;
+
 /// The built sidecar. CI builds it before the Rust tests; without it these
 /// tests prove nothing, so its absence fails them rather than skipping.
 pub fn sidecar_script() -> PathBuf {
