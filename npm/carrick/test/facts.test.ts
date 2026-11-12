@@ -1246,10 +1246,32 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
   const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart.json" })).stdout);
   assert.ok(refused.startsWith(`${PROBLEM_HEAD}\n- `), refused);
   assert.ok(refused.endsWith(`\n\n${GET_ORDER_LINE}`), refused);
-  assert.match(await stop(ws, "refused"), /Carrick checked the 1 file this session edited \(order-service\): 1 contract problem\./);
+  // What this Stop said with CARRICK_FACT_LINES unset (review run, S3).
+  assert.equal(
+    await stop(ws, "refused"),
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "Stop",
+        additionalContext: "Carrick checked the 1 file this session edited (order-service): 1 contract problem.",
+      },
+    }),
+  );
   fs.rmSync(path.join(ws.root, ".carrick", "rechecks"));
   const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart.json" })).stdout);
   assert.ok(unsafe.startsWith(`${PROBLEM_HEAD}\n- `), unsafe);
+});
+
+// R46.2 end to end: a lead with nothing for Stop is not lost when Stop comes
+// next. Stop leaves the answer for the next carrier, which prints the lead.
+test("with a fact file, a lead queued in place of the probe survives a Stop and prints on the next carrier", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', { session: "lead", probe: "check-deferred-lead.json" });
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
+  await waitForAnswer(ws, "lead");
+  assert.equal(await stop(ws, "lead"), "");
+  const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
+  assert.equal(context(next.stdout), "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.");
 });
 
 // R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.

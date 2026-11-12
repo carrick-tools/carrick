@@ -38,7 +38,7 @@ export function needsBackground(result: CheckResult | null): boolean {
   const recheck = result.recheck;
   if (recheck === undefined) return false;
   if (recheck.deferred === true || recheck.deadline === true) return true;
-  return recheck.ran === "none" && recheck.scope !== undefined;
+  return recheck.ran === "none" && recheck.scope != null;
 }
 
 /**

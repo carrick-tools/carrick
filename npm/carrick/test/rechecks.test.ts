@@ -292,7 +292,7 @@ test("an answer queued in place of the probe is gated as before when the probe w
   });
   // The probe would have printed this one in hand (a known miss): its uses line arrives late.
   assert.match(lateContext(answer(base, true), true) ?? "", /Other files use what this file declares/);
-  const ranOut = { ...base, recheck: { ran: "none" as const, elapsed_ms: 180_000, deadline: true, scope, reason: "ran past its budget" } };
+  const ranOut = { ...base, recheck: { ran: "none" as const, elapsed_ms: 180_000, deadline: true, reason: "ran past its budget" } };
   const failed = { ...base, recheck: { ran: "none" as const, elapsed_ms: 900, scope, reason: "the re-scan failed" } };
   for (const result of [ranOut, failed]) {
     assert.equal(lateContext(answer(result, false), true), null, "unflagged: gated");

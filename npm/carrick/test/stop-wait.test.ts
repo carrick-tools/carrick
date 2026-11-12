@@ -438,7 +438,10 @@ test("Stop leaves an answer queued in place of the probe with no finding unclaim
 test("Stop prints an answer queued in place of the probe whole when it holds a finding, and nothing prints it again", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
-  const entry = enqueue(workspace.root, SESSION, [workspace.file], Date.now(), { home, insteadOfProbe: true })[0]!;
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  // Recorded, as the edit hook records every file it queues.
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
   const lead = fixture("check-deferred-lead.json").recheck!.new_functions!;
   const whole: CheckResult = {
     ...problem(),
@@ -450,7 +453,9 @@ test("Stop prints an answer queued in place of the probe whole when it holds a f
   const said = context(run.stdout);
   const once = (pattern: RegExp) =>
     assert.equal((said.match(new RegExp(pattern.source, `${pattern.flags}g`)) ?? []).length, 1, `${pattern} once in:\n${said}`);
-  once(/contract problems/);
+  // The session's count, then the answer as the next carrier would print it.
+  assert.ok(said.startsWith("Carrick checked the 1 file this session edited (user-service): 2 contract problems.\n\n"), said);
+  once(/after your earlier edit to it: 2 contract problems\./);
   once(/^- .*type_mismatch/m);
   once(/Other files use what this file declares/);
   once(/`slugify` looks like `toSlug`/);
