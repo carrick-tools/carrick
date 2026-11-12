@@ -123,4 +123,39 @@ describe('verify_library_claims: mounts at a rest parameter (carrick#2661)', () 
       'verified', // Handler | number: the instance fits the handler member
     ]);
   });
+
+  it('judges a handle twin by the handler rule (K1a)', async () => {
+    const twin = (id: string, member: string) => ({
+      ...claim(id, member, 'instance:()', 'createApp'),
+      claim: { kind: 'scope', member, name: { arg: 0 }, mounts: { arg: 1, handle: true }, of: 'instance:()' },
+    });
+    const response = await client.send<Response>(
+      {
+        request_id: 'mounts-rest-handle',
+        action: 'verify_library_claims',
+        from_dir: root,
+        checks: [
+          {
+            claim_id: 'make',
+            package: 'fixture-rest',
+            export: 'createApp',
+            role: 'server_framework',
+            receiver: 'export',
+            claim: { kind: 'make', form: 'call', member: null },
+          },
+          claim('useHandlers', 'useHandlers', 'instance:()', 'createApp'),
+          twin('useHandlers-handle', 'useHandlers'),
+          twin('use-handle', 'use'),
+        ],
+      },
+      60_000
+    );
+    assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
+    const read = response.verdicts!.map(v => (v.verdict === 'verified' ? 'verified' : `${v.verdict} ${v.reason}`));
+    assert.deepStrictEqual(read.slice(1), [
+      'failed mounts_not_instance', // unflagged: unchanged
+      'verified', // its handle twin: the handlers are declared functions
+      'verified', // Array<Handler | App>: every part is callable
+    ]);
+  });
 });

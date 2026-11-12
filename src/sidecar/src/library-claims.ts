@@ -959,7 +959,7 @@ export class LibraryClaimsVerifier {
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
         if ((roles.get(exportKey(check))?.size ?? 0) > 1) return { outcome: unchecked('role_conflict') };
-        if (placementInvalid(check.claim)) return { outcome: unchecked('claim_invalid') };
+        if (placementInvalid(check.claim) || handleMisplaced(check.claim)) return { outcome: unchecked('claim_invalid') };
         if (check.claim.kind === 'op' && check.claim.protocol !== undefined) {
           if (!PROTOCOLS.has(check.claim.protocol)) return { outcome: unchecked('claim_invalid') };
           if (!ROLE_PROTOCOLS[check.role].has(check.claim.protocol)) return { outcome: unchecked('protocol_role') };
@@ -1592,6 +1592,25 @@ function placementInvalid(claim: LibraryClaim): boolean {
   if (claim.on !== undefined) return true;
   const of = parseReceiver(claim.of);
   return of === undefined || (of.maker === undefined && of.scope === undefined && of.type === undefined);
+}
+
+/**
+ * `handle: true` sits only on a scope's `mounts` (K1a); on any other slot
+ * the claim is `claim_invalid`. `handle: false` is no flag.
+ */
+function handleMisplaced(claim: LibraryClaim): boolean {
+  const slots: (ClaimSlot | undefined)[] = [];
+  const name = (claim as { name?: unknown }).name;
+  if (typeof name === 'object' && name !== null) {
+    if ('parts' in name) slots.push(...(name as { parts: ClaimSlot[] }).parts);
+    else if ('arg' in name) slots.push(name as ClaimSlot);
+  }
+  if (claim.kind === 'make') slots.push(claim.base, claim.prefix, claim.handler, claim.runs);
+  if (claim.kind === 'scope') slots.push(claim.runs, claim.merges);
+  if (claim.kind === 'op') {
+    slots.push(claim.payload, claim.handler, claim.ack, claim.options, claim.method_key, claim.base);
+  }
+  return slots.some(slot => slot?.handle === true);
 }
 
 /**
@@ -2699,6 +2718,14 @@ class DeclarationReader {
    * `arg`, read through a rest (`parameterAt`), takes what a verified
    * `collects` scope of the request returns (`collectionSlotOutcome`), and
    * the return is read as a plain scope's is.
+   *
+   * Path-less mounts and pass-throughs (K1a): a scope that binds (`mounts`,
+   * or `runs` with `yields`) may carry none of the four, and then binds no
+   * name. `mounts: { ..., handle: true }` is judged by `handlerFailure`
+   * (the slot takes a middleware) instead of `mountsOutcome`. `passes: true`
+   * stands alone: the member's value is its receiver, its call takes no
+   * string the claim leaves unread (`nameSiblings`), and its return opens no
+   * `>scope:` receiver.
    */
   private judgeScope(
     receiver: MessageReceiver,
@@ -2706,11 +2733,23 @@ class DeclarationReader {
     built?: ts.Signature,
     collections?: () => readonly ts.Type[] | undefined
   ): Judged {
-    if (claim.form === 'decorate') return { outcome: this.decorateScopeOutcome(receiver, claim) };
+    // A pass-through is a call's value, never a decorator (K1a).
+    if (claim.form === 'decorate') {
+      if (claim.passes === true) return { outcome: unchecked('claim_invalid') };
+      return { outcome: this.decorateScopeOutcome(receiver, claim) };
+    }
     if ((claim.runs === undefined) !== (claim.yields === undefined)) return { outcome: unchecked('claim_invalid') };
     if (claim.mounts !== undefined && claim.runs !== undefined) return { outcome: unchecked('claim_invalid') };
-    const carried = [claim.name, claim.collects, claim.merges].filter(part => part !== undefined).length;
-    if (carried !== 1) return { outcome: unchecked('claim_invalid') };
+    const passes = claim.passes === true;
+    const binds = claim.runs !== undefined || claim.mounts !== undefined;
+    // A pass-through stands alone (K1a).
+    if (passes && (binds || claim.yields !== undefined)) return { outcome: unchecked('claim_invalid') };
+    const carried = [claim.name, claim.collects, claim.merges, passes || undefined].filter(
+      part => part !== undefined
+    ).length;
+    // Exactly one carries the scope; a scope that binds may carry none (K1a).
+    if (carried > 1 || (carried === 0 && !binds)) return { outcome: unchecked('claim_invalid') };
+    const namelessMount = carried === 0 && claim.mounts !== undefined;
     if (
       (claim.collects !== undefined || claim.merges !== undefined) &&
       (claim.runs !== undefined || claim.mounts !== undefined)
@@ -2725,7 +2764,6 @@ class DeclarationReader {
       return { outcome: unchecked('claim_invalid') };
     }
     const collected = merges === undefined ? undefined : collections?.();
-    const binds = claim.runs !== undefined || claim.mounts !== undefined;
     const layout = this.layout({ name: claim.name, runs: claim.runs, mounts: claim.mounts });
     if ('failure' in layout) return { outcome: layout.failure };
     const callee = this.ownCallee(receiver, claim.path ?? [], claim.member, 'call');
@@ -2735,13 +2773,30 @@ class DeclarationReader {
     const holding: ts.Signature[] = [];
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
-      let result = this.messageSignatureOutcome(signature, layout.value, labels);
+      // A pass-through's call, and a name-less mount's, takes no string the
+      // claim leaves unread (D2, `nameSiblings`): one taking a path would
+      // serve under it. For the mount that is `claim_invalid` (K1a ruling).
+      let result = this.messageSignatureOutcome(
+        signature,
+        layout.value,
+        labels,
+        undefined,
+        passes || namelessMount ? [] : undefined
+      );
+      if (namelessMount && result.outcome.verdict === 'failed' && result.outcome.reason === 'name_ambiguous') {
+        // Above every other overload's failure: the claim is the wrong spelling.
+        result = { rank: 7, outcome: unchecked('claim_invalid') };
+      }
       if (result.rank === Infinity && claim.yields !== undefined) {
         const given = this.yieldsOutcome(signature, claim.runs!, claim.yields, receiver);
         if (given) result = { rank: 5, outcome: given };
       }
       if (result.rank === Infinity && claim.mounts !== undefined) {
-        const mounted = this.mountsOutcome(signature, claim.mounts, receiver);
+        // `handle` (K1a): the slot takes a middleware, judged as a handler is.
+        const mounted =
+          claim.mounts.handle === true
+            ? this.handlerFailure(this.mountedSlot(signature, claim.mounts))
+            : this.mountsOutcome(signature, claim.mounts, receiver);
         if (mounted) result = { rank: 5, outcome: mounted };
       }
       if (result.rank === Infinity && claim.collects !== undefined) {
@@ -2764,7 +2819,8 @@ class DeclarationReader {
       // The member's own declarations, as a verified op carries them (#2636).
       const declarations = this.declarationsOf({ signatures: holding, named: callee.named });
       const outcome: Outcome = declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED;
-      return binds ? { outcome } : { outcome, holding };
+      // A binding scope and a pass-through open no `>scope:` receiver.
+      return binds || passes ? { outcome } : { outcome, holding };
     }
     return { outcome: best!.outcome };
   }
@@ -2780,11 +2836,7 @@ class DeclarationReader {
    * Undefined when it holds.
    */
   private mountsOutcome(signature: ts.Signature, mounts: ClaimSlot, receiver: Holder): Outcome | undefined {
-    let declared = this.keyParameterAt(signature, mounts.arg);
-    if (declared !== undefined && mounts.key !== undefined) {
-      const property = this.declaredProperty(declared, mounts.key);
-      declared = property ? this.checker.getTypeOfSymbol(property) : undefined;
-    }
+    const declared = this.mountedSlot(signature, mounts);
     if (declared === undefined) return failed('param_missing');
     const slot = this.throughConstraint(declared);
     if (slot === VARIADIC) return unchecked('mounts_untyped');
@@ -2796,6 +2848,14 @@ class DeclarationReader {
     const erased = this.fitsErased(receiver.type, slot, signature.typeParameters ?? []);
     if (erased !== undefined) return erased ? undefined : failed('mounts_not_instance');
     return this.checker.isTypeAssignableTo(receiver.type, slot) ? undefined : failed('mounts_not_instance');
+  }
+
+  /** The parameter a scope's `mounts` names: through a rest, then at `key`. */
+  private mountedSlot(signature: ts.Signature, mounts: ClaimSlot): Slot | undefined {
+    const declared = this.keyParameterAt(signature, mounts.arg);
+    if (declared === undefined || mounts.key === undefined) return declared;
+    const property = this.declaredProperty(declared, mounts.key);
+    return property ? this.checker.getTypeOfSymbol(property) : undefined;
   }
 
   /**

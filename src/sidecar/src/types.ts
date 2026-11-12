@@ -612,6 +612,12 @@ export interface ClaimSlot extends SlotPosition {
   at?: string[];
   /** A rest slot: every element is read (amendment 7). */
   each?: boolean;
+  /**
+   * On a scope's `mounts` only (K1a): the slot takes a handler (a
+   * middleware), judged by the handler rule rather than the instance rule.
+   * `false` is no flag.
+   */
+  handle?: boolean;
 }
 
 /** A slot that holds a name: also read as a GraphQL document, or as the name of a function or class (amendment 7). */
@@ -785,7 +791,10 @@ export type LibraryClaim =
       member: string;
       /** Amendment 7: absent is `call`; `decorate` is a class decorator whose name prefixes its methods' ops. */
       form?: 'call' | 'decorate';
-      /** Exactly one of `name`, `collects` and `merges` (#2474 R6a). */
+      /**
+       * Exactly one of `name`, `collects`, `merges` and `passes`, or none when
+       * the scope binds (`mounts`, or `runs` with `yields`) (#2474 R6a, K1a).
+       */
       name?: NameSlot;
       path?: string[];
       on?: ClaimOn;
@@ -811,6 +820,12 @@ export type LibraryClaim =
        * serving all their procedures at the same level.
        */
       merges?: ClaimSlot;
+      /**
+       * A pass-through (K1a): the call's value is the receiver itself, served
+       * at the receiver's own address. Alone: no other field beside it. Its
+       * return opens no `>scope:` receiver. `false` is no flag.
+       */
+      passes?: boolean;
     }
   | {
       kind: 'op';
