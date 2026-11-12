@@ -18,7 +18,7 @@
 //! silenced it.
 //!
 //! Answer key: the five root fields of `apps/web/dist/graphql/schema.graphql`,
-//! read by hand.
+//! read by hand, each served in the module whose builder call defines it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -170,20 +170,23 @@ fn rows(items: &[(&str, &str)]) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-const PRINTED: &str = "apps/web/dist/graphql/schema.graphql";
-
 #[test]
 fn declared_schema_attributes_its_root_fields_to_the_serving_service() {
     let scan = scan(&fixture_dir());
 
+    // The declared schema keys the builder's fields objects, so each field is
+    // served where its module defines it, though the model is asked about
+    // none of them (carrick#1295).
+    let queries = "apps/api/src/graphql/widgets/queries.ts";
+    let mutations = "apps/api/src/graphql/widgets/mutations.ts";
     assert_eq!(
         scan.graphql_rows("widgets-api", "endpoints"),
         rows(&[
-            ("mutation|createWidget", PRINTED),
-            ("mutation|disposeWidget", PRINTED),
-            ("query|health", PRINTED),
-            ("query|widget", PRINTED),
-            ("query|widgets", PRINTED),
+            ("mutation|createWidget", mutations),
+            ("mutation|disposeWidget", mutations),
+            ("query|health", "apps/api/src/graphql/builder.ts"),
+            ("query|widget", queries),
+            ("query|widgets", queries),
         ]),
         "every root field of the declared schema is a widgets-api producer"
     );
