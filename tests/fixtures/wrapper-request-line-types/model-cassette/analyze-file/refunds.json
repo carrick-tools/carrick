@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/v1/${endpoint}",
+      "method": "POST",
+      "pattern_matched": "http.post(",
+      "call_expression_text": "http.post<Refund>(`/v1${endpoint}`, { body: 5 })",
+      "call_expression_line": 5,
+      "payload_expression_text": "{ body: 5 }",
+      "payload_expression_line": 5,
+      "primary_type_symbol": "Refund",
+      "type_import_source": "../types"
+    }
+  ],
+  "pubsub_operations": []
+}

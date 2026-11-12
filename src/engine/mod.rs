@@ -13547,6 +13547,10 @@ fn stamp_stated_values(
 ///   request body. A row whose function sends a declared parameter unchanged
 ///   keeps its entry, typed from that declaration.
 ///
+/// Neither, for a row that carries the anchors of a request line whose own
+/// row was withdrawn ([`crate::agents::file_analyzer_agent::DataCallResult::request_line`],
+/// carrick#3961): both sides are read at that line.
+///
 /// An entry left at `unknown` would still make the site a party to the type
 /// check, read `unverifiable` there and carry that up to its pair, so the
 /// entry goes, as it does for a call with no internal producer.
@@ -13562,19 +13566,25 @@ fn drop_call_through_entries(
     let unstated: HashSet<(&str, u32, String, ManifestTypeKind)> = file_results
         .iter()
         .flat_map(|(file_path, result)| {
-            result.data_calls.iter().flat_map(move |call| {
-                let response = call.at_caller.then_some(ManifestTypeKind::Response);
-                let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built))
-                    .then_some(ManifestTypeKind::Request);
-                response.into_iter().chain(request).map(move |kind| {
-                    (
-                        file_path.as_str(),
-                        normalize_line(call.line_number),
-                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
-                        kind,
-                    )
+            // A row that carries its request line's anchors (carrick#3961)
+            // states both sides from there.
+            result
+                .data_calls
+                .iter()
+                .filter(|call| call.request_line.is_none())
+                .flat_map(move |call| {
+                    let response = call.at_caller.then_some(ManifestTypeKind::Response);
+                    let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built))
+                        .then_some(ManifestTypeKind::Request);
+                    response.into_iter().chain(request).map(move |kind| {
+                        (
+                            file_path.as_str(),
+                            normalize_line(call.line_number),
+                            normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                            kind,
+                        )
+                    })
                 })
-            })
         })
         .collect();
     if unstated.is_empty() {
@@ -13595,10 +13605,13 @@ fn drop_call_through_entries(
 }
 
 /// The anchor a file-analyzer result stated for one source site: the symbol,
-/// and the import specifier the file brought it in through.
+/// the import specifier the file brought it in through, and that file.
 struct AnchorAtSite {
     symbol: String,
     import_source: Option<String>,
+    /// The file whose imports name the symbol: the site's own, or the
+    /// request line's for a row carrying its anchors (carrick#3961).
+    using_file: String,
 }
 
 /// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
@@ -13640,16 +13653,25 @@ fn stamp_manifest_anchor_symbols(
                     .or_insert_with(|| AnchorAtSite {
                         symbol: symbol.clone(),
                         import_source: endpoint.type_import_source.clone(),
+                        using_file: file_path.clone(),
                     });
             }
         }
         for call in &result.data_calls {
-            if let Some(symbol) = call.primary_type_symbol.as_ref() {
+            // A row at a caller types its response from the request line
+            // whose anchors it carries (carrick#3961), declared as that
+            // line's file names it.
+            let (anchor, using_file) = match call.request_line.as_deref() {
+                Some(moved) if call.at_caller => (&moved.call, moved.file.as_str()),
+                _ => (call, file_path.as_str()),
+            };
+            if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
                 symbols
                     .entry((file_path.clone(), normalize_line(call.line_number)))
                     .or_insert_with(|| AnchorAtSite {
                         symbol: symbol.clone(),
-                        import_source: call.type_import_source.clone(),
+                        import_source: anchor.type_import_source.clone(),
+                        using_file: using_file.to_string(),
                     });
             }
         }
@@ -13672,9 +13694,16 @@ fn stamp_manifest_anchor_symbols(
         };
         entry.primary_type_symbol = Some(anchor.symbol.clone());
         entry.defined_in = homes
-            .entry((entry.file_path.clone(), anchor.symbol.clone()))
+            .entry((anchor.using_file.clone(), anchor.symbol.clone()))
             .or_insert_with(|| {
-                anchor_declaration_site(&entry.file_path, anchor, repo_path, modules, &cm, &handler)
+                anchor_declaration_site(
+                    &anchor.using_file,
+                    anchor,
+                    repo_path,
+                    modules,
+                    &cm,
+                    &handler,
+                )
             })
             .clone();
     }
@@ -18722,6 +18751,7 @@ unfollowed_member_calls_total: 0,
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -18892,6 +18922,7 @@ unfollowed_member_calls_total: 0,
             at_caller,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let declared =
             crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
@@ -21210,6 +21241,7 @@ unfollowed_member_calls_total: 0,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
         let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
@@ -21313,6 +21345,7 @@ unfollowed_member_calls_total: 0,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let mut result = FileAnalysisResult {
             data_calls: vec![
@@ -26148,6 +26181,7 @@ unfollowed_member_calls_total: 0,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(

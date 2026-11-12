@@ -250,3 +250,243 @@ fn caller_rows_and_unread_sites_are_unchanged() {
         .collect();
     assert_eq!(unread, want);
 }
+
+// The types a withdrawn request line held move to its callers' rows
+// (carrick#3961), over `tests/fixtures/wrapper-request-line-types`: a
+// consumer service `web` whose two wrappers leave the path to their callers
+// and build the body themselves, and a producer service `api` serving both
+// paths. The model's row at each request line states a response type and a
+// payload; the callers' own calls type neither side. (A caller that types a
+// side from its own call keeps its own: the type requests' unit test.)
+
+const CHECKOUT: &str = "web/src/checkout.ts";
+
+fn types_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wrapper-request-line-types")
+}
+
+/// Whether the live sidecar can run. CI builds it before the Rust tests, so
+/// a skip there would make a green tick mean nothing.
+fn sidecar_available() -> bool {
+    let node = Command::new("node").arg("--version").output().is_ok();
+    let built = std::env::var_os("CARRICK_SIDECAR_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar"))
+        .join("dist/src/index.js")
+        .exists();
+    assert!(
+        (node && built) || std::env::var("CI").is_err(),
+        "node or the built sidecar is missing in CI, so this test would silently not run"
+    );
+    node && built
+}
+
+/// Every service's blob from one offline scan of the types fixture, keyed by
+/// service name.
+fn typed_blobs() -> &'static BTreeMap<String, serde_json::Value> {
+    static BLOBS: OnceLock<BTreeMap<String, serde_json::Value>> = OnceLock::new();
+    BLOBS.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = tmp.path().join("workspace");
+        copy_dir(&types_fixture_dir().join("repo"), &repo);
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["add", "-A", "-f"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let cassettes = tmp.path().join("cassettes");
+        std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
+        std::fs::copy(
+            types_fixture_dir().join("library-claims.json"),
+            cassettes.join("library-claims/default.json"),
+        )
+        .unwrap();
+        copy_dir(&types_fixture_dir().join("model-cassette"), &cassettes);
+        let storage = tmp.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+        cmd.arg(".")
+            .current_dir(&repo)
+            .env("CARRICK_LOCAL_STORAGE_DIR", &storage)
+            .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+            .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
+            .env("HOME", &home)
+            .env("CARRICK_MOCK_ALL", "1")
+            .env(
+                "CARRICK_MOCK_FIXTURE_DIR",
+                format!("{}/", cassettes.display()),
+            )
+            .env("CARRICK_SKIP_INTENTS", "1");
+        for var in [
+            "GITHUB_REPOSITORY",
+            "GITHUB_REF",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_EVENT_PATH",
+            "GITHUB_SHA",
+            "GITHUB_RUN_ID",
+            "GITHUB_ACTIONS",
+            "GITHUB_WORKSPACE",
+            "CI",
+            "CARRICK_OUTPUT_JSON",
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        ] {
+            cmd.env_remove(var);
+        }
+        let output = cmd.output().expect("spawn carrick");
+        assert!(
+            output.status.success(),
+            "scan exited non-zero:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut blobs = BTreeMap::new();
+        for entry in std::fs::read_dir(&storage).expect("the store reads") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let blob: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let service = blob["service_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                blobs.insert(service, blob);
+            }
+        }
+        blobs
+    })
+}
+
+fn web() -> &'static serde_json::Value {
+    typed_blobs()
+        .get("web")
+        .unwrap_or_else(|| panic!("a blob for web: {:?}", typed_blobs().keys()))
+}
+
+/// The consumer type entries in `file`, as `(line, type_kind, path)`.
+fn consumer_entries(file: &str) -> Vec<(u64, String, String)> {
+    let mut entries: Vec<(u64, String, String)> = web()["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["role"] == "consumer" && entry["file_path"] == file)
+        .map(|entry| {
+            (
+                entry["line_number"].as_u64().unwrap_or_default(),
+                entry["type_kind"].as_str().unwrap_or_default().to_string(),
+                entry["path"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The `(producer, side, verdict)` stored for the call at `file:line`.
+fn verdicts_at(file: &str, line: u32) -> Vec<(String, String, String)> {
+    let site = format!("{file}:{line}");
+    let mut found: Vec<(String, String, String)> = typed_blobs()
+        .values()
+        .flat_map(|blob| {
+            blob["compat_verdicts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .flat_map(|pair| {
+            let producer = pair["producer_key"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            pair["sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|at| at["consumer_location"] == site.as_str())
+                .flat_map(|at| {
+                    ["request", "response"]
+                        .into_iter()
+                        .filter_map(|side| {
+                            at[side]["verdict"].as_str().map(|verdict| {
+                                (producer.clone(), side.to_string(), verdict.to_string())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The request lines state no row and keep no type: their callers hold both.
+#[test]
+fn a_withdrawn_request_line_leaves_no_row_and_no_type_at_its_line() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let at_request_lines: Vec<&serde_json::Value> = web()["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            let at = row["file_path"].as_str().unwrap_or_default();
+            at.starts_with("web/src/net/")
+        })
+        .collect();
+    assert!(at_request_lines.is_empty(), "{at_request_lines:#?}");
+    assert_eq!(consumer_entries("web/src/net/orders.ts"), []);
+    assert_eq!(consumer_entries("web/src/net/refunds.ts"), []);
+}
+
+/// Each caller row holds one request and one response type, read at the
+/// request line it states.
+#[test]
+fn each_caller_row_holds_one_type_per_side() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let orders = "/v1/orders".to_string();
+    let refunds = "/v1/refunds".to_string();
+    assert_eq!(
+        consumer_entries(CHECKOUT),
+        [
+            (4, "request".to_string(), orders.clone()),
+            (4, "response".to_string(), orders.clone()),
+            (5, "request".to_string(), orders.clone()),
+            (5, "response".to_string(), orders),
+            (6, "request".to_string(), refunds.clone()),
+            (6, "response".to_string(), refunds),
+        ]
+    );
+}
+
+/// The pair against the producer is judged at each caller, on both sides.
+#[test]
+fn the_pair_is_judged_at_each_caller() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let both = |producer: &str| {
+        vec![
+            (
+                producer.to_string(),
+                "request".to_string(),
+                "compatible".to_string(),
+            ),
+            (
+                producer.to_string(),
+                "response".to_string(),
+                "compatible".to_string(),
+            ),
+        ]
+    };
+    assert_eq!(verdicts_at(CHECKOUT, 4), both("http|POST|/v1/orders"));
+    assert_eq!(verdicts_at(CHECKOUT, 5), both("http|POST|/v1/orders"));
+    assert_eq!(verdicts_at(CHECKOUT, 6), both("http|POST|/v1/refunds"));
+}

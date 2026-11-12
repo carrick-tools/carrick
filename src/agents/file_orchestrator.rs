@@ -21,7 +21,7 @@ use crate::{
     agents::{
         file_analyzer_agent::{
             AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
-            FileAnalyzerAgent, MountResult, PubsubOperation, ResolutionSource,
+            FileAnalyzerAgent, MountResult, PubsubOperation, RequestLineAnchors, ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
         source_parts::{Limits, ShownLines, SourceCut, SourcePart},
@@ -752,6 +752,9 @@ pub struct ProcessingStats {
     /// Model rows withdrawn at a request line whose callers' rows state the
     /// request (carrick#3961). Logged only.
     pub model_rows_stated_at_callers: usize,
+    /// Of those, the ones whose type anchors went to their callers' rows
+    /// (carrick#3961). Logged only.
+    pub request_lines_carried_to_callers: usize,
     /// Candidates in files the model was never asked about — local mode, where
     /// no model runs — that no deterministic row covers. What the paid scan
     /// would classify, counted so a free pass is distinguishable from an empty
@@ -4550,6 +4553,41 @@ impl FileOrchestrator {
             );
         }
 
+        // A request line its callers' rows state (carrick#3961) gives up its
+        // model row only where every one of those rows stands as a row, to
+        // carry the type anchors the model row held there.
+        let summary_sites: HashSet<(PathBuf, u32)> = analyzed
+            .iter()
+            .flat_map(|(pf, _)| {
+                pf.resolved
+                    .iter()
+                    .filter(|resolved| resolved.source == ResolutionSource::RequestSummary)
+                    .filter_map(|resolved| {
+                        resolved
+                            .span
+                            .map(|(start, _)| (PathBuf::from(&pf.path_str), start))
+                    })
+            })
+            .collect();
+        let answered: HashMap<String, BTreeSet<u32>> = analyzed
+            .iter()
+            .map(|(pf, _)| {
+                let file = PathBuf::from(&pf.path_str);
+                let starts = summaries
+                    .answered_at_callers(&file)
+                    .into_iter()
+                    .filter(|start| {
+                        summaries
+                            .stating_callers(&(file.clone(), *start))
+                            .iter()
+                            .all(|caller| summary_sites.contains(caller))
+                    })
+                    .collect();
+                (pf.path_str.clone(), starts)
+            })
+            .collect();
+        let mut withdrawn_at: HashMap<(PathBuf, u32), DataCallResult> = HashMap::new();
+
         // PHASE 3 (serial): emit the deterministic rows for each file, join
         // the model's answer onto them, and fold the result into the
         // aggregate.
@@ -4568,6 +4606,7 @@ impl FileOrchestrator {
                     // whatever the model says, and the join by span decides
                     // what the model adds to it.
                     let mut adjusted = FileAnalysisResult::default();
+                    let mut withdrawn: Vec<DataCallResult> = Vec::new();
                     let overrules = Self::emit_resolved_rows(
                         &mut adjusted,
                         std::mem::take(&mut pf.resolved),
@@ -4579,11 +4618,17 @@ impl FileOrchestrator {
                         &pf.candidate_map,
                         &overrules,
                         summaries.verbs(Path::new(&pf.path_str)),
-                        &summaries.answered_at_callers(Path::new(&pf.path_str)),
+                        answered.get(&pf.path_str).unwrap_or(&BTreeSet::new()),
+                        &mut withdrawn,
                         &pf.path_str,
                         pf.route_module_claimed,
                         &mut stats,
                     );
+                    for call in withdrawn {
+                        if let Some(start) = call.call_expression_span_start {
+                            withdrawn_at.insert((PathBuf::from(&pf.path_str), start), call);
+                        }
+                    }
 
                     run_post_join_passes(
                         &mut adjusted,
@@ -4703,6 +4748,7 @@ impl FileOrchestrator {
                 }
             }
         }
+        Self::carry_request_line_anchors(&mut file_results, &withdrawn_at, &summaries, &mut stats);
 
         // PHASE 4 (#580 part b): join each route table's paths to the
         // controller classes they bind. Cross-file, so it runs once every
@@ -4807,6 +4853,10 @@ impl FileOrchestrator {
         debug!(
             "  - Model rows withdrawn, their callers state the request: {}",
             stats.model_rows_stated_at_callers
+        );
+        debug!(
+            "  - Of those, type anchors moved to their callers' rows: {}",
+            stats.request_lines_carried_to_callers
         );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
@@ -5708,70 +5758,93 @@ impl FileOrchestrator {
                 // the response body. Such a row states no consumer response
                 // type from any of them, so it gets no response verdict and
                 // leaves the check-time retype no locator to rewrite.
-                if !data_call.at_caller {
-                    if let (Some(symbol), Some(import_source)) = (
-                        &data_call.primary_type_symbol,
-                        &data_call.type_import_source,
-                    ) {
+                //
+                // A row that states a request whose own line states no row,
+                // its callers' rows stating it (carrick#3961), carries the
+                // anchors the model's row there held: the types are read at
+                // that line, under this row's aliases. A side this row
+                // types from its own call keeps its own anchor.
+                let request_line = data_call.request_line.as_deref().map(|moved| {
+                    (
+                        &moved.call,
+                        moved.file.as_str(),
+                        Self::to_absolute_path(&moved.file, &repo_root_absolute),
+                        u32::try_from(moved.call.line_number.max(1)).unwrap_or(1),
+                    )
+                });
+                let response_from = if data_call.at_caller {
+                    request_line.clone()
+                } else {
+                    Some((
+                        data_call,
+                        file_path.as_str(),
+                        file_path_absolute.clone(),
+                        line_number,
+                    ))
+                };
+                if let Some((anchor, anchor_file, anchor_absolute, anchor_line)) = response_from {
+                    if let (Some(symbol), Some(import_source)) =
+                        (&anchor.primary_type_symbol, &anchor.type_import_source)
+                    {
                         // Explicit type with import source - bundle it
                         push_explicit(
                             symbol.clone(),
-                            Self::resolve_import_path(&file_path_absolute, import_source, modules),
+                            Self::resolve_import_path(&anchor_absolute, import_source, modules),
                             Some(response_alias.clone()),
                             true,
                         );
-                    } else if data_call.primary_type_symbol.is_some()
-                        && data_call.type_import_source.is_none()
+                    } else if anchor.primary_type_symbol.is_some()
+                        && anchor.type_import_source.is_none()
                     {
                         // Type symbol exists but no import - it might be in the same file
-                        if let Some(ref symbol) = data_call.primary_type_symbol {
+                        if let Some(ref symbol) = anchor.primary_type_symbol {
                             push_explicit(
                                 symbol.clone(),
-                                file_path_absolute.clone(),
+                                anchor_absolute.clone(),
                                 Some(response_alias.clone()),
                                 true,
                             );
                         }
-                    } else if data_call.type_import_source.is_some()
-                        && data_call.primary_type_symbol.is_none()
+                    } else if anchor.type_import_source.is_some()
+                        && anchor.primary_type_symbol.is_none()
                     {
                         warn!(
                             "[FileOrchestrator] Data call at {}:{} has import source {:?} but no symbol; relying on inference",
-                            file_path, line_number, data_call.type_import_source
+                            anchor_file, anchor_line, anchor.type_import_source
                         );
                     }
 
                     *call_result.borrow_mut() = self
                         .result_index
                         .at(
-                            crate::utils::repo_relative_source_path(file_path, repo_path),
-                            data_call
+                            crate::utils::repo_relative_source_path(anchor_file, repo_path),
+                            anchor
                                 .call_expression_span_start
-                                .zip(data_call.call_expression_span_end),
-                            line_number,
+                                .zip(anchor.call_expression_span_end),
+                            anchor_line,
                         )
                         .cloned();
                     let call_inferred = push_infer(
-                        &file_path_absolute,
-                        line_number,
+                        &anchor_absolute,
+                        anchor_line,
                         InferKind::CallResult,
                         response_alias.clone(),
                         InferLocator::Text {
-                            expression_text: data_call.call_expression_text.as_deref(),
-                            expression_line: data_call.call_expression_line,
+                            expression_text: anchor.call_expression_text.as_deref(),
+                            expression_line: anchor.call_expression_line,
                         },
                     ) || push_infer(
-                        &file_path_absolute,
-                        line_number,
+                        &anchor_absolute,
+                        anchor_line,
                         InferKind::CallResult,
                         response_alias.clone(),
                         InferLocator::Span {
-                            span_start: data_call.call_expression_span_start,
-                            span_end: data_call.call_expression_span_end,
+                            span_start: anchor.call_expression_span_start,
+                            span_end: anchor.call_expression_span_end,
                         },
                     );
                     *call_result.borrow_mut() = None;
-                    if !call_inferred && let Some(symbol) = data_call.primary_type_symbol.as_ref() {
+                    if !call_inferred && let Some(symbol) = anchor.primary_type_symbol.as_ref() {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
                 }
@@ -5785,7 +5858,7 @@ impl FileOrchestrator {
                 // builds its own body leaves the site none, its own request
                 // line states it.
                 if should_infer_request_body(&method) {
-                    match &data_call.call_body {
+                    let own_request = match &data_call.call_body {
                         // A request spec states its URL on the call's one
                         // object argument, and the body rides on that object
                         // too, written there or spread in (carrick#1841). The
@@ -5803,33 +5876,45 @@ impl FileOrchestrator {
                                     span_start: data_call.call_expression_span_start,
                                     span_end: data_call.call_expression_span_end,
                                 },
-                            );
+                            )
                         }
-                        None => {
-                            push_infer(
-                                &file_path_absolute,
-                                line_number,
-                                InferKind::RequestBody,
-                                request_alias.clone(),
-                                InferLocator::Text {
-                                    expression_text: data_call.payload_expression_text.as_deref(),
-                                    expression_line: data_call.payload_expression_line,
-                                },
-                            );
-                        }
-                        Some(CallBody::Param(param)) => {
-                            push_infer(
-                                &Self::to_absolute_path(&param.file, &repo_root_absolute),
-                                param.line,
-                                InferKind::RequestBody,
-                                request_alias.clone(),
-                                InferLocator::Span {
-                                    span_start: Some(param.span_start),
-                                    span_end: Some(param.span_end),
-                                },
-                            );
-                        }
-                        Some(CallBody::Built) => {}
+                        None => push_infer(
+                            &file_path_absolute,
+                            line_number,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: data_call.payload_expression_text.as_deref(),
+                                expression_line: data_call.payload_expression_line,
+                            },
+                        ),
+                        Some(CallBody::Param(param)) => push_infer(
+                            &Self::to_absolute_path(&param.file, &repo_root_absolute),
+                            param.line,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Span {
+                                span_start: Some(param.span_start),
+                                span_end: Some(param.span_end),
+                            },
+                        ),
+                        Some(CallBody::Built) => false,
+                    };
+                    // The body the request line sends, where this row's own
+                    // call states none (carrick#3961).
+                    if !own_request
+                        && let Some((anchor, _, anchor_absolute, anchor_line)) = &request_line
+                    {
+                        push_infer(
+                            anchor_absolute,
+                            *anchor_line,
+                            InferKind::RequestBody,
+                            request_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: anchor.payload_expression_text.as_deref(),
+                                expression_line: anchor.payload_expression_line,
+                            },
+                        );
                     }
                 }
             }
@@ -8641,6 +8726,7 @@ impl FileOrchestrator {
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 })),
             });
         }
@@ -8775,8 +8861,76 @@ impl FileOrchestrator {
                 at_caller: row.at_caller,
                 call_body: row.call_body.clone(),
                 static_asset: None,
+                request_line: None,
             })),
         }
+    }
+
+    /// Put the type anchors of each model row withdrawn at a request line
+    /// its callers' rows state (carrick#3961) on every one of those rows:
+    /// the model row was the only place its request and response types were
+    /// read, and the callers' rows are now the request's rows
+    /// ([`DataCallResult::request_line`]). `withdrawn` is keyed by the
+    /// request line's file and span start, as
+    /// [`SummaryRow::request_at`](crate::request_summary::SummaryRow) is.
+    ///
+    /// A row at a caller whose site states several requests takes the one
+    /// whose verb and target it carries.
+    fn carry_request_line_anchors(
+        file_results: &mut HashMap<String, FileAnalysisResult>,
+        withdrawn: &HashMap<(PathBuf, u32), DataCallResult>,
+        summaries: &crate::request_summary::RequestSummaryIndex,
+        stats: &mut ProcessingStats,
+    ) {
+        if withdrawn.is_empty() {
+            return;
+        }
+        let mut carried: HashSet<(PathBuf, u32)> = HashSet::new();
+        for (file, result) in file_results.iter_mut() {
+            let Some(sites) = summaries.rows(Path::new(file)) else {
+                continue;
+            };
+            for call in &mut result.data_calls {
+                let Some(rows) = call
+                    .call_expression_span_start
+                    .and_then(|start| sites.get(&start))
+                else {
+                    continue;
+                };
+                let stating: Vec<&crate::request_summary::SummaryRow> = rows
+                    .iter()
+                    .filter(|row| {
+                        row.reaches_request.is_none() && withdrawn.contains_key(&row.request_at)
+                    })
+                    .collect();
+                let row = match stating.as_slice() {
+                    [] => continue,
+                    [only] => *only,
+                    several => match several.iter().find(|row| {
+                        call.method.as_deref() == Some(row.method.as_str())
+                            && call.target == row.target
+                    }) {
+                        Some(row) => *row,
+                        None => continue,
+                    },
+                };
+                call.request_line = Some(Box::new(RequestLineAnchors {
+                    file: row.request_at.0.to_string_lossy().into_owned(),
+                    call: withdrawn[&row.request_at].clone(),
+                }));
+                carried.insert(row.request_at.clone());
+            }
+        }
+        for (file, start) in withdrawn.keys() {
+            if !carried.contains(&(file.clone(), *start)) {
+                debug!(
+                    "The model's call at {}:{} was withdrawn and no caller's row took its type anchors",
+                    file.display(),
+                    start
+                );
+            }
+        }
+        stats.request_lines_carried_to_callers += carried.len();
     }
 
     /// The value a call sends for the field its target dispatches on, where
@@ -9010,6 +9164,7 @@ impl FileOrchestrator {
             // function, the imported-member join (carrick#1782).
             call_body: None,
             static_asset: None,
+            request_line: None,
         }
     }
 
@@ -9113,6 +9268,7 @@ impl FileOrchestrator {
         overrules: &[Resolved],
         stated_verbs: &[StatedVerb],
         answered_at_callers: &BTreeSet<u32>,
+        withdrawn: &mut Vec<DataCallResult>,
         file_path: &str,
         route_module_claimed: bool,
         stats: &mut ProcessingStats,
@@ -9649,13 +9805,15 @@ impl FileOrchestrator {
             // A request line that leaves its path to its callers, each of
             // which states the request in a row of its own (carrick#3961):
             // a row here is the same request stated once more, whatever
-            // path it reads.
+            // path it reads. Its type anchors go to those rows
+            // ([`Self::carry_request_line_anchors`]).
             if span.is_some_and(|start| answered_at_callers.contains(&start)) {
                 debug!(
                     "Withdrawing the model's call at {}:{}: its callers' rows state the request",
                     file_path, call.line_number
                 );
                 stats.model_rows_stated_at_callers += 1;
+                withdrawn.push(call);
                 continue;
             }
             if let Some(overrule) = overrules
@@ -14482,6 +14640,7 @@ export * from "./aFetch.js";"#,
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -14543,6 +14702,7 @@ export * from "./aFetch.js";"#,
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 }
             };
 
@@ -14632,6 +14792,7 @@ export * from "./aFetch.js";"#,
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 }],
                 ..Default::default()
             },
@@ -14805,6 +14966,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         }
     }
 
@@ -14829,6 +14991,7 @@ export * from "./aFetch.js";"#,
             &[],
             &[],
             &BTreeSet::new(),
+            &mut Vec::new(),
             "src/client.ts",
             false,
             &mut stats,
@@ -15015,6 +15178,7 @@ export * from "./aFetch.js";"#,
             &[],
             &[],
             &BTreeSet::new(),
+            &mut Vec::new(),
             "src/client.ts",
             false,
             &mut stats,
@@ -15295,6 +15459,7 @@ export * from "./aFetch.js";"#,
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             }],
             ..Default::default()
         };
@@ -15394,6 +15559,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
 
         let mut file_results = HashMap::new();
@@ -15529,6 +15695,7 @@ export * from "./aFetch.js";"#,
                         at_caller: false,
                         call_body: None,
                         static_asset: None,
+                        request_line: None,
                     }],
                     graphql_operations: vec![],
                     pubsub_operations: vec![],
@@ -15617,6 +15784,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
 
         let mut file_results = HashMap::new();
@@ -15720,6 +15888,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -15816,6 +15985,7 @@ export * from "./aFetch.js";"#,
                         at_caller: false,
                         call_body: None,
                         static_asset: None,
+                        request_line: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -15844,6 +16014,7 @@ export * from "./aFetch.js";"#,
                         at_caller: false,
                         call_body: None,
                         static_asset: None,
+                        request_line: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -15909,6 +16080,7 @@ export * from "./aFetch.js";"#,
                     at_caller: false,
                     call_body: None,
                     static_asset: None,
+                    request_line: None,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -15977,6 +16149,7 @@ export * from "./aFetch.js";"#,
                         at_caller: false,
                         call_body: None,
                         static_asset: None,
+                        request_line: None,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -16005,6 +16178,7 @@ export * from "./aFetch.js";"#,
                         at_caller: false,
                         call_body: None,
                         static_asset: None,
+                        request_line: None,
                     },
                 ],
                 graphql_operations: vec![],
@@ -16245,6 +16419,7 @@ export * from "./aFetch.js";"#,
             at_caller,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16366,6 +16541,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body,
             static_asset: None,
+            request_line: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16453,6 +16629,186 @@ export * from "./aFetch.js";"#,
         assert_eq!(call_id(&body_alias), call_id(&result_at_30));
     }
 
+    /// carrick#3961: a row at a caller that states a request whose own line
+    /// gave up its model row carries that row's anchors. Each side is asked
+    /// for once, under the caller row's own alias: at the request line where
+    /// the caller's own call types nothing (the response, and the body of a
+    /// function that builds it), and from the caller's own fact where it does
+    /// (a function that sends a declared parameter). A caller row carrying no
+    /// anchors asks for neither.
+    #[test]
+    fn a_caller_row_reads_the_sides_its_own_call_does_not_type_at_the_request_line() {
+        let agent_service = AgentService::new();
+        let orchestrator = FileOrchestrator::new(agent_service);
+        let repo = repo_with_source("src/page.ts", 700);
+        let wrapper = "import { http } from '@fixture/http';\nimport type { Order } from '../types';\n\nexport function placeOrder(endpoint: string, order: Order) {\n  return http.post<Order>(`/v1${endpoint}`, { body: 'book' });\n}\n";
+        let wrapper_path = repo.path().join("src/net/orders.ts");
+        std::fs::create_dir_all(wrapper_path.parent().expect("dir")).expect("wrapper dir");
+        std::fs::write(&wrapper_path, wrapper).expect("wrapper source");
+        let name_at = u32::try_from(wrapper.find("order:").expect("param")).expect("offset");
+        let declared = CallBody::Param(crate::forwarded_body::DeclaredParam {
+            file: wrapper_path.to_string_lossy().into_owned(),
+            span_start: name_at + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: name_at + crate::swc_scanner::SWC_SPAN_BASE + 5,
+            line: 4,
+        });
+        let model_row = DataCallResult {
+            call_kind: None,
+            candidate_id: "@line:5".to_string(),
+            line_number: 5,
+            target: "/v1/${endpoint}".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "http.post(".to_string(),
+            call_expression_span_start: Some(200),
+            call_expression_span_end: Some(260),
+            call_expression_text: Some(
+                "http.post<Order>(`/v1${endpoint}`, { body: 'book' })".to_string(),
+            ),
+            call_expression_line: Some(5),
+            payload_expression_text: Some("{ body: 'book' }".to_string()),
+            payload_expression_line: Some(5),
+            primary_type_symbol: Some("Order".to_string()),
+            type_import_source: Some("../types".to_string()),
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::Model),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+            static_asset: None,
+            request_line: None,
+        };
+        let anchors = RequestLineAnchors {
+            file: wrapper_path.to_string_lossy().into_owned(),
+            call: model_row,
+        };
+        let caller = |line: i32, call_body: Option<CallBody>, carried: bool| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{}-{}", line * 10, line * 10 + 20),
+            line_number: line,
+            target: "/v1/orders".to_string(),
+            method: Some("POST".to_string()),
+            pattern_matched: "placeOrder".to_string(),
+            call_expression_span_start: Some(u32::try_from(line).expect("line") * 10),
+            call_expression_span_end: Some(u32::try_from(line).expect("line") * 10 + 20),
+            call_expression_text: None,
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::RequestSummary),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: true,
+            call_body,
+            static_asset: None,
+            request_line: carried.then(|| Box::new(anchors.clone())),
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/page.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    caller(10, Some(CallBody::Built), true),
+                    caller(20, Some(declared), true),
+                    caller(30, Some(CallBody::Built), false),
+                ],
+                ..FileAnalysisResult::default()
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (explicit, infer, _inline) = orchestrator.collect_type_requests(
+            &file_results,
+            &repo.path().to_string_lossy(),
+            &graph,
+            &Config::default(),
+            &repo_modules(repo.path()),
+        );
+
+        // The caller row's alias for a side, by the call id it carries.
+        let call_id = |alias: &str| alias.rsplit("_Call").next().map(str::to_string);
+        let wrapper_file = wrapper_path.to_string_lossy().into_owned();
+        let asked = |kind: InferKind| -> Vec<(String, u32, Option<String>)> {
+            let mut asked: Vec<(String, u32, Option<String>)> = infer
+                .iter()
+                .filter(|item| item.infer_kind == kind)
+                .map(|item| {
+                    (
+                        item.file_path.clone(),
+                        item.line_number,
+                        item.expression_text.clone(),
+                    )
+                })
+                .collect();
+            asked.sort();
+            asked
+        };
+        // The response: read at the request line, once per carrying row.
+        let call_text = Some("http.post<Order>(`/v1${endpoint}`, { body: 'book' })".to_string());
+        assert_eq!(
+            asked(InferKind::CallResult),
+            vec![
+                (wrapper_file.clone(), 5, call_text.clone()),
+                (wrapper_file.clone(), 5, call_text),
+            ],
+            "{infer:#?}"
+        );
+        let result_ids: BTreeSet<Option<String>> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::CallResult)
+            .map(|item| call_id(item.alias.as_deref().expect("alias")))
+            .collect();
+        assert_eq!(result_ids.len(), 2, "one per caller row: {infer:#?}");
+        let explicit_order: Vec<&SymbolRequest> = explicit
+            .iter()
+            .filter(|request| request.symbol_name == "Order")
+            .collect();
+        assert_eq!(explicit_order.len(), 2, "{explicit:#?}");
+        assert!(
+            explicit_order
+                .iter()
+                .all(|request| request.source_file.ends_with("src/net/../types.ts")),
+            "the symbol resolves where the request line imports it: {explicit_order:#?}"
+        );
+        // The body: the request line's payload for the function that builds
+        // it, the caller's own parameter for the one that sends it.
+        let bodies: Vec<&InferRequestItem> = infer
+            .iter()
+            .filter(|item| item.infer_kind == InferKind::RequestBody)
+            .collect();
+        assert_eq!(bodies.len(), 2, "{bodies:#?}");
+        assert!(bodies.iter().any(|item| {
+            item.file_path == wrapper_file
+                && item.line_number == 5
+                && item.expression_text.as_deref() == Some("{ body: 'book' }")
+        }));
+        assert!(bodies.iter().any(|item| {
+            item.file_path == wrapper_file
+                && item.line_number == 4
+                && item.span_start == Some(name_at)
+        }));
+        let body_ids: BTreeSet<Option<String>> = bodies
+            .iter()
+            .map(|item| call_id(item.alias.as_deref().expect("alias")))
+            .collect();
+        assert_eq!(body_ids, result_ids, "each side under its own row's alias");
+    }
+
     /// carrick#1841, request half: a request spec states its URL on the
     /// call's one object argument (`client.post({ url: "/items", ...options
     /// })`), and the body rides on that object, written there or spread in.
@@ -16505,6 +16861,7 @@ export * from "./aFetch.js";"#,
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -17259,6 +17616,7 @@ export * from "./aFetch.js";"#,
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -17370,6 +17728,7 @@ export * from "./aFetch.js";"#,
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -17740,6 +18099,7 @@ export * from "./aFetch.js";"#,
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -19629,6 +19989,7 @@ export { routes };
             &overrules,
             &[],
             &BTreeSet::new(),
+            &mut Vec::new(),
             file_path,
             route_module_claimed,
             &mut stats,
@@ -20498,6 +20859,7 @@ export { routes };
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         }
     }
 
@@ -21491,6 +21853,7 @@ export { routes };
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
         let facts = crate::request_summary::fact_files::FactFiles {
             graphql_client_calls: BTreeMap::from([(
@@ -23244,6 +23607,7 @@ export function publishWrapped(order: OrderPlaced): void {
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         }
     }
 

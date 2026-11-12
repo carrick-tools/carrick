@@ -11129,6 +11129,25 @@ impl RequestSummaryIndex {
             .collect()
     }
 
+    /// The call sites, by file and span start, whose rows state the request
+    /// at `request_at` (its file and span start) as a request their callee
+    /// leaves open ([`Self::answered_at_callers`], carrick#3961).
+    pub fn stating_callers(&self, request_at: &(PathBuf, u32)) -> BTreeSet<(PathBuf, u32)> {
+        self.rows
+            .iter()
+            .flat_map(|(file, sites)| {
+                sites
+                    .iter()
+                    .filter(|(_, rows)| {
+                        rows.iter().any(|row| {
+                            row.request_at == *request_at && row.reaches_request.is_none()
+                        })
+                    })
+                    .map(move |(start, _)| (file.clone(), *start))
+            })
+            .collect()
+    }
+
     /// Call sites of `file` whose callee provably sends nothing, by span
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {
