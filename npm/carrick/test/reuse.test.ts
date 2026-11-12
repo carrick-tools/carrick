@@ -14,6 +14,7 @@ import {
   recordEdit,
   removeSessions,
   sessionFile,
+  sessionRecords,
   sessionsDir,
   markRead,
   markTold,
@@ -93,6 +94,34 @@ test("records nothing will read again are pruned", (t) => {
   assert.equal(fs.existsSync(sessionFile("new", dir)!), true);
 });
 
+test("a session write prunes at most once an hour", (t) => {
+  const { dir, cleanup } = home();
+  t.after(cleanup);
+
+  markRead("a", "/w/a.ts", dir);
+  const old = path.join(sessionsDir(dir), "ancient.json");
+  fs.writeFileSync(old, "{}");
+  const eightDays = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(old, eightDays, eightDays);
+  markRead("b", "/w/b.ts", dir);
+  assert.equal(fs.existsSync(old), true);
+
+  const stamp = path.join(sessionsDir(dir), ".pruned-at");
+  const twoHours = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(stamp, twoHours, twoHours);
+  markRead("c", "/w/c.ts", dir);
+  assert.equal(fs.existsSync(old), false);
+  // The stamp is not a session record.
+  assert.equal(sessionRecords(dir), 3);
+
+  const reads = t.mock.method(fs, "readdirSync");
+  for (let i = 0; i < 10; i += 1) markRead(`n${i}`, "/w/a.ts", dir);
+  const sessionReads = reads.mock.calls.filter(
+    (c) => String(c.arguments[0]) === sessionsDir(dir),
+  ).length;
+  assert.ok(sessionReads <= 1, `read the sessions folder ${sessionReads} times`);
+});
+
 test("remove deletes every record and the directory holding them", (t) => {
   const { dir, cleanup } = home();
   t.after(cleanup);
@@ -168,7 +197,10 @@ test("a read file survives a write and a read back, and a write leaves no temp f
   const after = readSession("sess-read", dir);
   assert.deepEqual(after.read, ["/w/api/src/a.ts"]);
   assert.deepEqual(after.told, ["/w/api::src/a.ts"]);
-  assert.deepEqual(fs.readdirSync(sessionsDir(dir)), ["sess-read.json"]);
+  assert.deepEqual(
+    fs.readdirSync(sessionsDir(dir)).filter((name) => name !== ".pruned-at"),
+    ["sess-read.json"],
+  );
 
   // A write replaces the file rather than emptying it in place, so a reader
   // that arrives mid-write sees the old record whole and not an empty one: the

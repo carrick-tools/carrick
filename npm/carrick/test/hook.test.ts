@@ -1289,7 +1289,7 @@ test("a payload with no agent_id keeps the record at <session_id>.json, as befor
   const first = contextOf((await edit()).stdout);
   assert.ok(first.startsWith(EDIT_USES) && !first.includes("\n"), first);
   assert.equal(contextOf((await edit()).stdout), "");
-  const records = fs.readdirSync(path.join(home, ".carrick", "sessions")).filter((n) => !n.includes(".recheck."));
+  const records = fs.readdirSync(path.join(home, ".carrick", "sessions")).filter((n) => !n.includes(".recheck.") && n !== ".pruned-at");
   assert.deepEqual(records, ["sess-a3.json"]);
   assert.ok(Object.keys(readSession("sess-a3", home).files).length > 0);
 });
