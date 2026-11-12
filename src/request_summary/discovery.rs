@@ -7261,7 +7261,9 @@ export function listen(): void {
         assert_eq!(
             lines_in(&decided, "oneline.ts", true),
             texts(&[
-                "src/oneline.ts:9 <- /v1/s.list via src/oneline.ts:14 use - > src/oneline.ts:13 use /v1",
+                "src/oneline.ts:10 <- /v1/s.remove via src/oneline.ts:16 use - > src/oneline.ts:15 use /v1",
+                "src/oneline.ts:11 <- /v1/s.create via src/oneline.ts:16 use - > src/oneline.ts:15 use /v1",
+                "src/oneline.ts:9 <- /v1/s.list via src/oneline.ts:16 use - > src/oneline.ts:15 use /v1",
             ])
         );
     }

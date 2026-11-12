@@ -7,6 +7,8 @@ function ok(ctx: Ctx): void {
 
 const sub = router();
 sub.post("/s.list", ok);
+sub.post("/s.remove", ok);
+sub.post("/s.create", ok);
 
 // An app and a router made on one line are two instances, not one.
 const app = createApp(); const outer = router();
