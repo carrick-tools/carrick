@@ -53,7 +53,19 @@ export type FactOutcome = {
   ms: number;
   /** The fact file is missing, unreadable or older than `FACTS_STALE_MS`: start a background refresh. */
   stale: boolean;
+  /**
+   * The edited files (as given) in a repo a readable fact file for this
+   * workspace maps: their callers come from the fact file, so the probe's
+   * uses-count line is not printed for them (v1-agent's Q2 ruling).
+   */
+  covered: string[];
 };
+
+/** A line one rule found, before the cap: its once-per-session key and the paths it points at. */
+type Candidate = { key: string; text: string; named: string[] };
+
+/** The row kinds in the order their lines print, before the cap of `MAX_FACT_LINES`. */
+const KINDS = ["op", "fn", "name", "pkg"] as const;
 
 /** The main checkout a linked worktree belongs to, from its `.git` file. */
 function mainCheckoutOf(worktreeTop: string): string | null {
@@ -191,9 +203,11 @@ export async function factLines(
   const now = options.now ?? Date.now();
   const lines: string[] = [];
   const claims: FactOutcome["claims"] = {};
+  const covered: string[] = [];
   let stale = true;
-  const done = (): FactOutcome => ({ lines, claims, stale, ms: Math.round((performance.now() - started) * 10) / 10 });
+  const done = (): FactOutcome => ({ lines, claims, stale, covered, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
+  const found: Record<(typeof KINDS)[number], Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
   if (!factsEnabled(options.env)) {
     stale = false;
@@ -206,15 +220,20 @@ export async function factLines(
     stale = !Number.isFinite(fetched) || now - fetched > FACTS_STALE_MS;
     const said = session ? factsSaid(session, options.home) : new Set<string>();
     const where = new Map(store.repos.map((entry) => [entry.repo, entry.path]));
+    const pathsOf = (others: ReadonlyArray<{ repo: string; file: string }>): string[] =>
+      others.flatMap((other) => {
+        const base = where.get(other.repo);
+        return base ? [path.join(base, other.file)] : [];
+      });
     for (const edit of edits) {
-      if (lines.length >= MAX_FACT_LINES) break;
+      const at = locate(edit.file, store.repos);
+      if (at === null) continue;
+      covered.push(edit.file);
       if (!SCANNED.test(edit.file)) continue;
       const byLine = edit.lines || edit.removed;
       // Changed lines not known (a Write over a file, a shell write, a patch
       // hunk that cannot be placed): nothing is said.
       if (!byLine && !edit.snippets && !edit.whole) continue;
-      const at = locate(edit.file, store.repos);
-      if (at === null) continue;
       let text: string;
       try {
         // A file this large is generated or bundled: never read in a hook's time.
@@ -247,6 +266,11 @@ export async function factLines(
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
       for (const name of reach.names) {
         if (declared.get(name) !== 1) continue;
+        // The function's callers in other files: only the row in this file.
+        for (const fn of store.callers(at.repo, name)) {
+          if (fn.file !== at.rel) continue;
+          found.fn.push({ key: `fn::${fn.repo}::${fn.name}`, text: fn.text, named: pathsOf(fn.others) });
+        }
         const own = namedRows(store, at.repo, name, at.rel);
         if (!holdsSeveral(own)) {
           rows.push(...own);
@@ -260,17 +284,15 @@ export async function factLines(
         const unnamed = store.unnamed(at.repo, at.rel);
         if (unnamed.length > 0) rows.push(...unnamedRows(unnamed, reach.calls, scan.calls));
       }
-      for (const row of rows) {
+      for (const row of rows) found.op.push({ key: rowKey(row), text: row.text, named: pathsOf(row.others) });
+    }
+    // At most `MAX_FACT_LINES`, kind by kind, each line once per session.
+    for (const kind of KINDS) {
+      for (const candidate of found[kind]) {
         if (lines.length >= MAX_FACT_LINES) break;
-        const key = rowKey(row);
-        if (said.has(key) || key in claims) continue;
-        lines.push(row.text);
-        const named: string[] = [];
-        for (const other of row.others) {
-          const base = where.get(other.repo);
-          if (base) named.push(path.join(base, other.file));
-        }
-        claims[key] = { at: now, named };
+        if (said.has(candidate.key) || candidate.key in claims) continue;
+        lines.push(candidate.text);
+        claims[candidate.key] = { at: now, named: candidate.named };
       }
     }
   } catch (error) {

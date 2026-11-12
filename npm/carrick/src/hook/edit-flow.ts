@@ -90,6 +90,22 @@ export async function editFlow(
   // file is queued for the background runner (carrick#3198).
   const answers = edited.length > 0 ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
   if (input.timing) input.timing.waitedMs = answers.ms;
+  // Where each operation the edited code serves or calls sits in other
+  // files, and who calls the edited functions, from the fact file
+  // (`facts/lines.ts`): read locally, beside the probe's answer, never
+  // instead of it. Read before the probe's answer is rendered: a file the
+  // fact file covers gets its callers from there, not the uses-count line.
+  const facts =
+    channel.channel === "hook"
+      ? await factLines(
+          choice.root,
+          [...edited, ...(input.factOnly ?? [])]
+            .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
+            .map((file) => ({ file, ...input.changes?.get(file) })),
+          session,
+        )
+      : null;
+  const covered = new Set(facts?.covered ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
@@ -111,8 +127,13 @@ export async function editFlow(
       continue;
     }
     const key = toldKey(result, relative);
-    const show = !session || !wasTold(session, key);
-    if (show && result.uses_lines?.length) told.push(key);
+    // With a fact file for this file's repo, its callers are fact lines
+    // (v1-agent's Q2 ruling); the uses-count line is the fallback without one.
+    const show = !covered.has(edited[index]!) && (!session || !wasTold(session, key));
+    if (show && result.uses_lines?.length) {
+      told.push(key);
+      if (input.timing) input.timing.usesFallback = true;
+    }
     const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) rendered.set(index, context);
@@ -163,20 +184,10 @@ export async function editFlow(
     }
   }
 
-  if (channel.channel !== "hook") {
+  if (facts === null) {
     log(`the ${channel.channel} channel owns delivery in this install; printing nothing`);
     return;
   }
-  // Where each operation the edited code serves or calls sits in other
-  // files, from the fact file (`facts/lines.ts`): read locally, beside the
-  // probe's answer, never instead of it.
-  const facts = await factLines(
-    choice.root,
-    [...edited, ...(input.factOnly ?? [])]
-      .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
-      .map((file) => ({ file, ...input.changes?.get(file) })),
-    session,
-  );
   if (input.timing) input.timing.factsMs = facts.ms;
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.

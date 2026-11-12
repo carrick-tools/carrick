@@ -2,9 +2,12 @@
 // (`fetch.ts`) from the cloud's NDJSON and opened read-only by the hooks.
 //
 // Wire contract: carrick-cloud `docs/internal/reference/edit-facts-wire.md`
-// (schema 1). The file lives at `<root>/.carrick/facts/edit-facts.s<schema>.sqlite`
+// (schema 1). The file lives at `<root>/.carrick/facts/edit-facts.s<schema>.l<LOCAL>.sqlite`
 // and is written under a temporary name and renamed, so a hook never opens a
-// half-built file. A `meta` table holds the project, digest, schema, writer,
+// half-built file. `LOCAL` is this package's table layout: a new row kind's
+// table bumps it, so a file built by an older package is never found (and
+// never read with a table missing); the refresh then fetches the whole file,
+// as it does when there is none. A `meta` table holds the project, digest, schema, writer,
 // built_at, fetched_at and each repo's commit; a file whose schema is not
 // `SCHEMA` is not read.
 //
@@ -42,8 +45,22 @@ export type FactRow = {
   text: string;
 };
 
+/** A function's callers in other files (`k: "fn"`), as the wire states it. */
+export type FnRow = {
+  repo: string;
+  file: string;
+  line: number;
+  name: string;
+  others: Array<{ repo: string; file: string; line: number; name: string }>;
+  total: number;
+  text: string;
+};
+
+/** This package's table layout; bumped with every table a new row kind adds. */
+export const LOCAL_LAYOUT = 2;
+
 export function factsPath(root: string, schema: number = SCHEMA): string {
-  return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.sqlite`);
+  return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.l${LOCAL_LAYOUT}.sqlite`);
 }
 
 type Sqlite = typeof import("node:sqlite");
@@ -78,6 +95,8 @@ export type FactStore = {
   repos: LocalRepo[];
   byName: (repo: string, name: string) => FactRow[];
   unnamed: (repo: string, file: string) => FactRow[];
+  /** The `fn` rows of a function `name` in `repo`, in any file. */
+  callers: (repo: string, name: string) => FnRow[];
   close: () => void;
 };
 
@@ -127,12 +146,23 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const repos = open.prepare("SELECT repo, path FROM repos").all().map((raw) => ({ repo: String(raw["repo"]), path: String(raw["path"]) }));
     const byName = open.prepare("SELECT * FROM rows WHERE repo = ? AND name = ? ORDER BY id");
     const unnamed = open.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
+    const callers = open.prepare("SELECT * FROM fns WHERE repo = ? AND name = ? ORDER BY id");
     handed = true;
     return {
       meta,
       repos,
       byName: (repo, name) => byName.all(repo, name).map((raw) => toRow(raw as Record<string, unknown>)),
       unnamed: (repo, rel) => unnamed.all(repo, rel).map((raw) => toRow(raw as Record<string, unknown>)),
+      callers: (repo, name) =>
+        callers.all(repo, name).map((raw) => ({
+          repo: String(raw["repo"]),
+          file: String(raw["file"]),
+          line: Number(raw["line"]),
+          name: String(raw["name"]),
+          others: JSON.parse(String(raw["others"])) as FnRow["others"],
+          total: Number(raw["total"]),
+          text: String(raw["text"]),
+        })),
       close: () => open.close(),
     };
   } catch (error) {
@@ -208,6 +238,9 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         id INTEGER PRIMARY KEY, side TEXT, protocol TEXT, label TEXT, service TEXT, repo TEXT,
         file TEXT, line INTEGER, name TEXT, site TEXT, others TEXT, text TEXT
       );
+      CREATE TABLE fns (
+        id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, others TEXT, total INTEGER, text TEXT
+      );
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     const commits = Object.fromEntries((header.repos ?? []).map((repo) => [repo.repo, repo.commit]));
@@ -227,9 +260,22 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const row = db.prepare(
       "INSERT INTO rows (side, protocol, label, service, repo, file, line, name, site, others, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
+    const fn = db.prepare("INSERT INTO fns (repo, file, line, name, others, total, text) VALUES (?, ?, ?, ?, ?, ?, ?)");
     db.exec("BEGIN");
     for (const line of lines.slice(1)) {
       const raw = JSON.parse(line) as Record<string, unknown>;
+      if (raw["k"] === "fn") {
+        fn.run(
+          String(raw["repo"]),
+          String(raw["file"]),
+          Number(raw["line"]),
+          String(raw["name"]),
+          JSON.stringify(Array.isArray(raw["others"]) ? raw["others"] : []),
+          Number(raw["total"] ?? 0),
+          String(raw["text"]),
+        );
+        continue;
+      }
       // A row kind this package does not know is skipped (the wire adds kinds without a schema bump).
       if (raw["k"] !== "op") continue;
       row.run(
@@ -247,7 +293,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       );
     }
     db.exec("COMMIT");
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name);");
   } finally {
     closeQuietly(db);
   }
