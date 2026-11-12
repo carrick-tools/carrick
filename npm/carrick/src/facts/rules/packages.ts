@@ -9,8 +9,9 @@
 // added to the line above a new last dependency changes nothing). The row
 // prints unless every other service in it already has exactly the new spec,
 // and only when each other service checked out here still holds its stated
-// spec on disk (R33.4); a row listing another manifest of the edited repo, or
-// whose entry for the edited manifest has no `others_text`, says nothing.
+// spec on disk (R33.4). A row that does not hold the edited manifest but
+// lists another of its repo's, or whose entry for the edited manifest has no
+// `others_text`, says nothing.
 // `deno.json(c)` and import maps are a named gap.
 
 import path from "node:path";
@@ -75,7 +76,7 @@ function specIn(manifest: Record<string, unknown> | null, section: string, name:
 /** The `pkg` lines for one edited manifest. */
 export function packageLines(
   store: FactStore,
-  at: { repo: string; rel: string },
+  at: { repo: string; rel: string; top: string },
   where: ReadonlyMap<string, string>,
   text: string,
   change: { lines?: number[] | null; removed?: number[] | null; removedText?: string[] | null },
@@ -111,25 +112,29 @@ export function packageLines(
     if (row === null) continue;
     const others = row.services.filter((service) => !(service.repo === at.repo && service.manifest === at.rel));
     if (others.length === 0 || others.every((service) => service.spec === spec)) continue;
-    // Another manifest of this very repo in the row: the edited one is not in
-    // it, and the sentence's spec for this repo cannot be told apart (R33.4, F4).
-    if (others.some((service) => service.repo === at.repo)) continue;
+    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
+    // The edited manifest is not in the row, but the row lists its repo: one
+    // of those entries may be this manifest under another path, so the
+    // sentence could state its old spec (R33.4, F4). With its own entry
+    // found, other entries of the same repo are checked on disk like any other.
+    if (!own && others.some((service) => service.repo === at.repo)) continue;
     // The edited manifest's own entry carries the sentence without it, which
     // would otherwise state its old spec; an entry with none says nothing
     // (R33.4, F5). A manifest the row does not hold, in a repo it does not
     // list, prints the row's sentence.
-    const own = row.services.find((service) => service.repo === at.repo && service.manifest === at.rel);
     const text = own ? own.others_text : row.text;
     if (!text) continue;
+    // A service of the edited repo is read in the edited manifest's checkout.
+    const baseOf = (repo: string): string | undefined => (repo === at.repo ? at.top : where.get(repo));
     const named = others.flatMap((service) => {
-      const base = where.get(service.repo);
+      const base = baseOf(service.repo);
       return base ? [path.join(base, service.manifest)] : [];
     });
     // Each other service checked out here must still hold the stated spec on
     // disk (R33.1, R33.4); one in a repo not checked out is stated from the index.
     const holds = (): boolean =>
       others.every((service) => {
-        const base = where.get(service.repo);
+        const base = baseOf(service.repo);
         if (base === undefined) return true;
         const manifest = memo.text(path.join(base, service.manifest));
         const parsed = manifest === null ? null : parse(manifest);

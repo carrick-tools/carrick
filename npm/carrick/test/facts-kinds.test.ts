@@ -596,6 +596,23 @@ test("R33.4: pkg is silent when another service's manifest does not parse, or ho
   assert.deepEqual([broken.text, empty.text], ["", ""]);
 });
 
+test("R33.4: in a single-repo monorepo the edited manifest's entry prints the other service's spec, while it holds on disk", async (t) => {
+  const MONO = pkgRow("zod", [
+    ["api", "^3.22.0", "packages/a/package.json"],
+    ["api", "^3.23.8", "packages/b/package.json"],
+  ]);
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/packages/a/package.json": before, "api/src/orders.ts": ORDERS }, [MONO]);
+  const file = ws.at("api/packages/a/package.json");
+  const said = context((await patchEdit(ws, file, [manifestHunk(file, before, MANIFEST(['    "zod": "^3.24.0"']))], { session: "mono-1" })).stdout);
+  assert.equal(said, "zod is ^3.23.8 in api");
+  // The other service's manifest changed on disk since: its stated spec is not proven.
+  fs.writeFileSync(ws.at("api/packages/b/package.json"), '{\n  "dependencies": {\n    "zod": "^3.25.0"\n  }\n}\n');
+  fs.writeFileSync(file, before);
+  const again = context((await patchEdit(ws, file, [manifestHunk(file, before, MANIFEST(['    "zod": "^3.24.0"']))], { session: "mono-2" })).stdout);
+  assert.equal(again, "");
+});
+
 test("R33.4: pkg states a service in a repo not checked out here from the index", async (t) => {
   const ws = await workspace(t, { "api/package.json": MANIFEST(['    "zod": "^3.22.0"']), "api/src/orders.ts": ORDERS }, [ZOD]);
   assert.equal(fs.existsSync(ws.at("web")), false);
