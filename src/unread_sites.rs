@@ -316,6 +316,59 @@ pub fn from_scan(
     out
 }
 
+/// The library sites a scan could not verify (no verdict came back) added to
+/// `stops`, one `unanswered` site each at the site's name slot. A site
+/// already saved at the same span keeps its row and gets `unanswered` in
+/// `also`; a site that is a possible call (`listed`) is already saved.
+pub fn with_unanswered(
+    mut stops: Vec<UnreadSite>,
+    listed: &[PossibleCall],
+    unanswered: &[crate::request_summary::LibrarySite],
+    root: &Path,
+) -> Vec<UnreadSite> {
+    for site in unanswered {
+        let file = crate::site_rows::relative(root, &site.file.to_string_lossy());
+        let at = (file.as_str(), site.span_start, site.span_end);
+        if listed
+            .iter()
+            .any(|call| (call.file_path.as_str(), call.span_start, call.span_end) == at)
+        {
+            continue;
+        }
+        if let Some(held) = stops.iter_mut().find(|row| row.at() == at) {
+            if held.reason != Stop::Unanswered
+                && !held.also.contains(&Stop::Unanswered)
+                && held.also.len() < 4
+            {
+                held.also.push(Stop::Unanswered);
+            }
+            continue;
+        }
+        let path: Vec<&str> = std::iter::once(site.export.as_str())
+            .chain(site.path.iter().map(String::as_str))
+            .chain(site.member.as_deref())
+            .collect();
+        stops.push(UnreadSite {
+            file: file.clone(),
+            line: site.line,
+            span_start: site.span_start,
+            span_end: site.span_end,
+            reason: Stop::Unanswered,
+            also: Vec::new(),
+            slot: "name".to_string(),
+            callee: callee(&path.join(".")),
+            stop_at: None,
+            depth: 0,
+            labelled_end: None,
+            kind: None,
+            role: None,
+            ends: Vec::new(),
+            listed: false,
+        });
+    }
+    stops
+}
+
 /// A saved site that reached a decorator export: where it is, and what the
 /// label says of it.
 struct DecoratorEnd {
