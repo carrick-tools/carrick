@@ -29660,6 +29660,69 @@ unfollowed_member_calls_total: 0,
         );
     }
 
+    /// A sidecar whose process died before the library verification is
+    /// replaced and asked again, so the service still states its library row.
+    /// The stand-in dies on its first request after `init` (V8's heap line,
+    /// exit 134) and answers `verified` from the next process on.
+    #[test]
+    fn library_rows_survive_a_sidecar_death_before_verification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let marker = root.join("died-once");
+        let script = root.join("dies-first-sidecar.cjs");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  if (!fs.existsSync({marker:?})) {{
+    fs.writeFileSync({marker:?}, 'x');
+    fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+    process.exit(134);
+  }}
+  write({{
+    request_id,
+    status: 'success',
+    verdicts: request.checks.map((check) => ({{
+      claim_id: check.claim_id, receiver: check.receiver, verdict: 'verified',
+    }})),
+  }});
+}});
+"#,
+                marker = marker.to_string_lossy()
+            ),
+        )
+        .expect("write stand-in");
+        let sidecar = TypeSidecar::spawn(&script).expect("spawn stand-in");
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        let sites = crate::request_summary::library_sites(&discover_request_inputs(&root));
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        let rows = read_library_rows(&sites, &claims, Some(&sidecar), &root);
+        assert_eq!(rows.rows.len(), 1, "the fresh process verified the claim");
+    }
+
     /// carrick#2021: library-claim checks the sidecar's time limit did not
     /// reach are counted against the service whose analysis asked them, and
     /// its boundary carries the count when the run takes the boundaries for

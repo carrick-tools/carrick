@@ -3206,6 +3206,15 @@ impl ProcessDeath {
     }
 }
 
+/// Whether an operation whose process died once is asked again of a fresh
+/// process of the same size: always, unless the run stops on a memory death
+/// (`fail_on_memory`, `CARRICK_FAIL_ON_TYPE_MEMORY`) and this death is one
+/// (carrick#2209). The one rule the capture and the library verification
+/// both read.
+pub fn retries_after(death: &ProcessDeath, fail_on_memory: bool) -> bool {
+    !(fail_on_memory && death.memory_death().is_some())
+}
+
 /// What it takes to start another sidecar like one already running: its
 /// script, its operation deadline and its scan root. Owned, so a thread of
 /// its own can start one (carrick#1066).
@@ -4257,10 +4266,35 @@ impl TypeSidecar {
     /// `(package, export)` in ONE request: two roles for one export, and an
     /// instance or scope op whose maker or scope claim is not in the same
     /// request, are judged across the request.
+    ///
+    /// **A process that died is replaced, and the question asked once more.**
+    /// The verification runs after everything that can kill the process
+    /// (inference, signatures), so a death before it, or during it, would
+    /// otherwise cost the service every library row and the member
+    /// declarations with them. A fresh process rebuilds its program on this
+    /// request and reads nothing an earlier request added. A second death is
+    /// returned, and one more process is left in place for the rest of the
+    /// scan. No retry for a timeout (the process was already replaced and the
+    /// answer would come back the same), for a [`Self::record_only`] process,
+    /// or when the run stops on a memory death and this was one
+    /// ([`retries_after`]).
     pub fn verify_library_claims(
         &self,
         from_dir: &Path,
         checks: &[LibraryCheck],
+    ) -> Result<LibraryClaimsAnswer, SidecarError> {
+        self.verify_library_claims_stopping_on_memory(
+            from_dir,
+            checks,
+            crate::scan_health::fail_on_type_memory_from_env(),
+        )
+    }
+
+    fn verify_library_claims_stopping_on_memory(
+        &self,
+        from_dir: &Path,
+        checks: &[LibraryCheck],
+        fail_on_memory: bool,
     ) -> Result<LibraryClaimsAnswer, SidecarError> {
         self.ensure_ready()?;
         if checks.is_empty() {
@@ -4270,6 +4304,40 @@ impl TypeSidecar {
                 duration_ms: None,
             });
         }
+        let error = match self.ask_library_claims(from_dir, checks) {
+            Err(error) if error.is_process_death() && !self.record_only => error,
+            answer => return answer,
+        };
+        // Read before anything else is asked: the restart replaces the process.
+        let died = self.how_the_process_died();
+        if !retries_after(&died, fail_on_memory) {
+            warn!(
+                "The type sidecar died of memory during the library verification ({error}); not \
+                 retried at the same size, as this run stops on a memory death"
+            );
+            return Err(error);
+        }
+        warn!(
+            "The type sidecar died during the library verification ({error}); retrying once in a \
+             fresh process"
+        );
+        self.restart(
+            "the sidecar died before or during the library verification, which is retried once",
+        )?;
+        let second = self.ask_library_claims(from_dir, checks);
+        if matches!(&second, Err(error) if error.is_process_death()) {
+            // The scan goes on asking this sidecar: leave a live one.
+            let _ = self.restart("the sidecar died during the library verification and its retry");
+        }
+        second
+    }
+
+    fn ask_library_claims(
+        &self,
+        from_dir: &Path,
+        checks: &[LibraryCheck],
+    ) -> Result<LibraryClaimsAnswer, SidecarError> {
+        self.ensure_ready()?;
         let request = SidecarRequest::VerifyLibraryClaims {
             request_id: self.next_request_id(),
             from_dir: from_dir.to_string_lossy().into_owned(),
@@ -8852,5 +8920,164 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
         let back: ResultShape = serde_json::from_str(r#"{"parse":"json"}"#).unwrap();
         assert_eq!(back, ResultShape::Parse("json".into()));
+    }
+
+    /// A stand-in sidecar for the library verification's retry. It answers
+    /// `init`; on its first request after `init` (the one named by `dies_on`,
+    /// or any when `any`) in a process that finds no marker file it writes the
+    /// marker, prints V8's heap line and exits 134; a process that finds the
+    /// marker answers `verified` for every check. `always` dies on every
+    /// verify. Each process start appends a line to the spawn log.
+    fn dying_library_sidecar(root: &Path, dies_on: &str, always: bool) -> (PathBuf, PathBuf) {
+        let marker = root.join("died-once");
+        let spawns = root.join("spawns.log");
+        let script = root.join("dying-sidecar.cjs");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+fs.appendFileSync({spawns:?}, 'spawn\n');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+const die = () => {{
+  fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+  process.exit(134);
+}};
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  const named = {dies_on:?} === 'any' || request.action === {dies_on:?};
+  if ({always} && request.action === 'verify_library_claims') die();
+  if (named && !fs.existsSync({marker:?})) {{ fs.writeFileSync({marker:?}, 'x'); die(); }}
+  write({{
+    request_id,
+    status: 'success',
+    verdicts: (request.checks || []).map((check) => ({{
+      claim_id: check.claim_id, receiver: check.receiver, verdict: 'verified',
+    }})),
+  }});
+}});
+"#,
+                spawns = spawns.to_string_lossy(),
+                marker = marker.to_string_lossy(),
+                dies_on = dies_on,
+                always = always,
+            ),
+        )
+        .expect("write stand-in");
+        (script, spawns)
+    }
+
+    fn one_library_check() -> Vec<LibraryCheck> {
+        vec![LibraryCheck {
+            claim_id: "a".into(),
+            package: "@fixture/bus".into(),
+            export: "bus".into(),
+            role: LibraryRole::Broker,
+            receiver: "export".into(),
+            claim: LibraryClaim::Make {
+                form: MakeForm::Call,
+                member: None,
+                base: None,
+                prefix: None,
+                name: None,
+                handler: None,
+                runs: None,
+                key_labels: BTreeMap::new(),
+                name_scope: None,
+                picker: None,
+                result: None,
+            },
+        }]
+    }
+
+    fn ready_dying_sidecar(root: &Path, dies_on: &str, always: bool) -> (TypeSidecar, PathBuf) {
+        let (script, spawns) = dying_library_sidecar(root, dies_on, always);
+        let sidecar = TypeSidecar::spawn(&script).expect("spawn stand-in");
+        sidecar.start_init(root, None);
+        sidecar
+            .wait_ready(Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        (sidecar, spawns)
+    }
+
+    fn spawn_count(spawns: &Path) -> usize {
+        std::fs::read_to_string(spawns)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn verify_library_claims_asks_a_fresh_process_after_a_death_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (sidecar, spawns) = ready_dying_sidecar(&root, "any", false);
+        let infer = [InferRequestItem {
+            member: None,
+            result: None,
+            file_path: "src/a.ts".to_string(),
+            line_number: 1,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::Expression,
+            alias: Some("A".to_string()),
+            param_name: None,
+            route_path: None,
+        }];
+        assert!(
+            sidecar.infer_types(&infer, None).is_err(),
+            "the process dies on infer"
+        );
+        let checks = one_library_check();
+        let answer = sidecar
+            .verify_library_claims_stopping_on_memory(&root, &checks, false)
+            .expect("a fresh process answers");
+        assert_eq!(answer.verdicts.len(), checks.len());
+        assert_eq!(spawn_count(&spawns), 2);
+    }
+
+    #[test]
+    fn verify_library_claims_asks_a_fresh_process_after_a_death_during_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (sidecar, spawns) = ready_dying_sidecar(&root, "verify_library_claims", false);
+        let checks = one_library_check();
+        let answer = sidecar
+            .verify_library_claims_stopping_on_memory(&root, &checks, false)
+            .expect("a fresh process answers");
+        assert_eq!(answer.verdicts.len(), checks.len());
+        assert_eq!(spawn_count(&spawns), 2);
+    }
+
+    #[test]
+    fn verify_library_claims_is_not_retried_when_the_run_stops_on_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (sidecar, spawns) = ready_dying_sidecar(&root, "verify_library_claims", false);
+        let result =
+            sidecar.verify_library_claims_stopping_on_memory(&root, &one_library_check(), true);
+        assert!(result.is_err(), "the death is returned");
+        assert_eq!(spawn_count(&spawns), 1, "no second process was started");
+    }
+
+    #[test]
+    fn verify_library_claims_returns_the_second_death_and_leaves_a_live_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (sidecar, spawns) = ready_dying_sidecar(&root, "never", true);
+        let first = sidecar.pid();
+        let result =
+            sidecar.verify_library_claims_stopping_on_memory(&root, &one_library_check(), false);
+        assert!(
+            matches!(&result, Err(error) if error.is_process_death()),
+            "{result:?}"
+        );
+        assert_ne!(sidecar.pid(), first, "a fresh process is left in place");
+        assert_eq!(spawn_count(&spawns), 3, "first, the retry, the one left");
     }
 }
