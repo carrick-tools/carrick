@@ -28,6 +28,7 @@ import { MAX_FACT_FILE_BYTES } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
+import { sessionKey } from "./session-key.ts";
 import { createLogger } from "../log.ts";
 import { timed, type Timing } from "./timings.ts";
 
@@ -39,6 +40,7 @@ const CHECKED = /\.(ts|tsx|mts|cts|graphql|gql)$/;
 type Payload = {
   cwd?: string;
   session_id?: string;
+  agent_id?: string;
   tool_name?: string;
   tool_input?: {
     file_path?: string;
@@ -103,7 +105,7 @@ async function main(timing: Timing): Promise<void> {
   const edited = filesFromPayload(payload)
     .filter((file) => CHECKED.test(file))
     .map((file) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file)));
-  const session = payload.session_id;
+  const session = sessionKey(payload);
   if (edited.length === 0) {
     // Nothing of ours to check in this edit, but a finished background answer
     // is still owed to the model (B3: every carrier delivers).

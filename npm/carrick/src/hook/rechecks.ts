@@ -27,7 +27,8 @@ import { binary, check, checkChanged } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import { scriptBeside, startDetached } from "./refresh.ts";
-import { safeId, sessionsDir, writeAtomic } from "./reuse.ts";
+import { sessionsDir, writeAtomic } from "./reuse.ts";
+import { safeId } from "./session-key.ts";
 
 const log = createLogger("carrick-recheck");
 

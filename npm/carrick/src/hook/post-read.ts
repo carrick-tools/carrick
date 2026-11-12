@@ -18,6 +18,7 @@ import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
 import { wasRead } from "./reuse.ts";
+import { sessionKey } from "./session-key.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse as emit } from "./late.ts";
 import { answerRead } from "./read-answer.ts";
@@ -30,6 +31,7 @@ const CHECKED = /\.(ts|tsx|mts|cts)$/;
 type Payload = {
   cwd?: string;
   session_id?: string;
+  agent_id?: string;
   tool_input?: { file_path?: string };
 };
 
@@ -51,7 +53,7 @@ async function main(timing: Timing): Promise<void> {
   }
   // A finished background re-check is owed to the model whatever this Read
   // is: delivered before the early returns below, in the same one object.
-  const session = payload.session_id;
+  const session = sessionKey(payload);
   const late = deliverLate(session);
   const named = payload.tool_input?.file_path;
   if (!named || !CHECKED.test(named)) return emit(late);

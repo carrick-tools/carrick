@@ -21,6 +21,7 @@
 // Reference: `docs/reference/task-skills.md`, "What the hooks deliver".
 
 import { readStdin } from "./stdin.ts";
+import { sessionKey } from "./session-key.ts";
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
@@ -33,6 +34,7 @@ const log = createLogger("carrick-stop");
 
 type Payload = {
   session_id?: string;
+  agent_id?: string;
 };
 
 /** The one channel a Stop hook has that the model reads. */
@@ -62,7 +64,7 @@ async function main(timing: Timing): Promise<void> {
     log("unparseable payload", String(error));
     return;
   }
-  const session = payload.session_id;
+  const session = sessionKey(payload);
   if (!session) {
     log("no session id in the payload; nothing to look up");
     return;

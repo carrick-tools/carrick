@@ -1226,3 +1226,97 @@ test("a slow probe leaves the edit queued and the hook back in under a second", 
   // Queued: the runner ran the full re-check and wrote its answer for the next hook to carry.
   await waitForAnswers(home, "sess-nw1", 1);
 });
+
+// ---------------------------------------------------------------------------
+// A sub-agent's calls carry `agent_id` and keep the parent's `session_id`
+// (carrick#3965): its record is its own, and the parent's Stop never reads it.
+
+function answerNames(home: string, prefix: string): string[] {
+  try {
+    return fs
+      .readdirSync(path.join(home, ".carrick", "sessions"))
+      .filter((name) => name.startsWith(`${prefix}.recheck.`) && name.endsWith(".answer.json"));
+  } catch {
+    return [];
+  }
+}
+
+test("an edit whose payload carries agent_id is not in the parent session's files, and the parent's Stop prints nothing for it (carrick#3965)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-a1", agent_id: "agent-x", agent_type: "general-purpose" },
+    env,
+  });
+  assert.deepEqual(Object.keys(readSession("sess-a1", home).files), [], "the parent's record holds nothing");
+  assert.ok(Object.keys(readSession("sess-a1.agent-x", home).files).length > 0, "the sub-agent's own record holds the edit");
+
+  const stop = await runHook("stop.ts", {
+    payload: { hook_event_name: "Stop", session_id: "sess-a1" },
+    env: fakeEnv({ HOME: home }),
+  });
+  assert.equal(stop.stdout, "");
+});
+
+test("the same sub-agent's second edit of one thing is still told once (carrick#3965)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+  const edit = (extra: Record<string, string>) =>
+    runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-a2", ...extra }, env });
+
+  const first = contextOf((await edit({ agent_id: "agent-y" })).stdout);
+  const second = contextOf((await edit({ agent_id: "agent-y" })).stdout);
+  assert.ok(first.includes(EDIT_USES), first);
+  assert.equal(second, "", "its own record holds the mark");
+  // The parent has not been told: its record is separate.
+  assert.ok(contextOf((await edit({})).stdout).includes(EDIT_USES));
+  // Another sub-agent of the same session has its own record too.
+  assert.ok(contextOf((await edit({ agent_id: "agent-z" })).stdout).includes(EDIT_USES));
+});
+
+test("a payload with no agent_id keeps the record at <session_id>.json, as before (carrick#3965)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
+  const edit = () => runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-a3" }, env });
+
+  const first = contextOf((await edit()).stdout);
+  assert.ok(first.startsWith(EDIT_USES) && !first.includes("\n"), first);
+  assert.equal(contextOf((await edit()).stdout), "");
+  const records = fs.readdirSync(path.join(home, ".carrick", "sessions")).filter((n) => !n.includes(".recheck."));
+  assert.deepEqual(records, ["sess-a3.json"]);
+  assert.ok(Object.keys(readSession("sess-a3", home).files).length > 0);
+});
+
+test("a late answer queued by a sub-agent's edit is not delivered at the parent's Stop (carrick#3965)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  const home = fakeHome(t);
+  const env = deferredEnv(home, { CARRICK_FAKE_FULL_DELAY_MS: "200" });
+
+  await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-a4", agent_id: "agent-q" },
+    env,
+  });
+  const until = Date.now() + 20_000;
+  while (Date.now() < until && answerNames(home, "sess-a4.agent-q").length < 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(answerNames(home, "sess-a4.agent-q").length, 1, "the runner answered under the sub-agent's key");
+
+  const stop = await runHook("stop.ts", { payload: { hook_event_name: "Stop", session_id: "sess-a4" }, env });
+  assert.equal(stop.stdout, "", "the parent's Stop does not carry the sub-agent's answer");
+
+  // Delivered to the sub-agent's own next call.
+  const next = await runHook("post-read.ts", {
+    payload: { ...readPayload(workspace, "sess-a4"), agent_id: "agent-q" },
+    env,
+  });
+  assert.ok(contextOf(next.stdout).includes(LATE_USERS), next.stdout);
+});

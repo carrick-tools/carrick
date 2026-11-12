@@ -21,6 +21,7 @@
 // Whatever happens it exits 0 and prints at most the one JSON object.
 
 import { readStdin } from "./stdin.ts";
+import { sessionKey } from "./session-key.ts";
 import path from "node:path";
 import fs from "node:fs";
 import { bashTargets, MENTIONS_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
@@ -37,6 +38,7 @@ const SEARCH_WORD = /\b(grep|rg|egrep|fgrep)\b/;
 type Payload = {
   cwd?: string;
   session_id?: string;
+  agent_id?: string;
   tool_input?: { command?: string };
   /** What the command printed: a string, or an object carrying `stdout`. */
   tool_response?: string | { stdout?: string };
@@ -56,15 +58,15 @@ async function main(): Promise<void> {
     return;
   }
   const command = payload.tool_input?.command;
-  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(payload.session_id);
+  if (!command || !(MENTIONS_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(sessionKey(payload));
   const cwd = payload.cwd ?? process.cwd();
   const { reads, writes } = bashTargets(command, path.resolve(cwd));
   const candidates = writes.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? writes : [];
   // A search for a function's name: the index sites its output did not print.
   const searched = SEARCH_WORD.test(command) ? searchedNames(command, path.resolve(cwd)) : { names: [], operands: [] };
-  if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return lateOnly(payload.session_id);
+  if (reads.length === 0 && candidates.length === 0 && searched.names.length === 0) return lateOnly(sessionKey(payload));
 
-  const session = payload.session_id;
+  const session = sessionKey(payload);
   const { markInvoker } = await import("./invoker.ts");
   const { resolveChannel } = await import("../channel.ts");
   const channel = resolveChannel({ hooksInstalled: true });
