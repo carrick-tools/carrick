@@ -421,6 +421,21 @@ test("pkg: silent when the file does not parse", async (t) => {
   assert.equal(text, "");
 });
 
+test("pkg: silent for a package moved to another section with the same spec, and for a manifest under node_modules", async (t) => {
+  const TS = pkgRow("typescript", [
+    ["api", "^5.0.0", "package.json"],
+    ["web", "^5.4.0", "package.json"],
+  ]);
+  const manifest = (deps: string[], dev: string[]) =>
+    ["{", '  "name": "api",', '  "dependencies": {', ...deps, "  },", '  "devDependencies": {', ...dev, "  }", "}", ""].join("\n");
+  const moved = await bump(t, manifest(['    "zod": "^3.22.0"'], ['    "typescript": "^5.0.0"']), manifest(['    "zod": "^3.22.0",', '    "typescript": "^5.0.0"'], []), [ZOD, TS]);
+  const before = MANIFEST(['    "zod": "^3.22.0"']);
+  const ws = await workspace(t, { "api/node_modules/foo/package.json": before, "web/package.json": "{}\n", "api/src/orders.ts": ORDERS }, [ZOD]);
+  const file = ws.at("api/node_modules/foo/package.json");
+  const vendored = context((await patchEdit(ws, file, [manifestHunk(file, before, MANIFEST(['    "zod": "^3.24.0"']))])).stdout);
+  assert.deepEqual([moved.text, vendored], ["", ""]);
+});
+
 test("pkg: silent for an unchanged dependency and a package with no row", async (t) => {
   const { text } = await bump(t, MANIFEST(['    "zod": "^3.22.0"']), MANIFEST(['    "zod": "^3.22.0"'], ' '));
   assert.equal(text, "");

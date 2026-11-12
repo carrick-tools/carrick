@@ -20,8 +20,9 @@ const SECTIONS = new Set(["dependencies", "devDependencies", "peerDependencies",
 /** One `"key": "value"` pair on a line, with the raw (still escaped) text of each. */
 const PAIR = /^\s*"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,?\s*$/;
 
+/** A `package.json` of the repo's own; one under `node_modules/` is an installed package's, never read. */
 export function isManifest(file: string): boolean {
-  return path.basename(file) === "package.json";
+  return path.basename(file) === "package.json" && !file.split(/[\\/]/).includes("node_modules");
 }
 
 /**
@@ -97,7 +98,9 @@ export function packageLines(
     } catch {
       continue;
     }
-    if (specIn(now, section, name) !== spec || specIn(then, section, name) === spec) continue;
+    // Already this spec before the edit, in any of the four sections: a move
+    // between sections changes no version.
+    if (specIn(now, section, name) !== spec || [...SECTIONS].some((any) => specIn(then, any, name) === spec)) continue;
     const row = store.packageRow(name);
     if (row === null) continue;
     const others = row.services.filter((service) => !(service.repo === at.repo && service.manifest === at.rel));
