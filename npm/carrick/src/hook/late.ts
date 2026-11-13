@@ -8,9 +8,10 @@
 // hooks print it once.
 
 import { resolveChannel } from "../channel.ts";
+import { problemItems } from "../contract.ts";
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedCleanLine, changedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, finishedFor, isChanged } from "./rechecks.ts";
+import { answersTheEdit, changedCleanLine, changedLines, movedLines, renderPostToolUse } from "../render.ts";
+import { claimDelivery, isChanged, owedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
 import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { leadLines } from "./lead.ts";
@@ -47,6 +48,23 @@ function cleanNamedLine(session: string, answer: Answer, home?: string): string 
   return changedCleanLine(files);
 }
 
+/** Whether an answer holds a row to act on: a problem, a moved row, a deletion. */
+export function hasFindings(answer: Answer): boolean {
+  const result = answer.result;
+  if (answer.state !== "answered" || result === undefined || result.error || !answersTheEdit(result)) return false;
+  return Boolean(result.deleted) || problemItems(result).length > 0 || movedLines(result).length > 0;
+}
+
+/**
+ * What the main session says for an ended sub-agent's answer (carrick#4074):
+ * the findings alone. No uses-count line and no leads, which a parent with
+ * many sub-agents would get once per file it never edited.
+ */
+export function adoptedLine(answer: Answer): string | null {
+  if (isChanged(answer)) return lateContext(answer, false);
+  return hasFindings(answer) ? lateContext(answer, false) : null;
+}
+
 /**
  * The one reader of a finished `check --changed` answer, for every hook that
  * speaks it (the carriers and Stop): a problem, or the clean line for the set a
@@ -64,9 +82,15 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
   if (!session) return [];
   const contexts: string[] = [];
   try {
-    for (const answer of finishedFor(session)) {
-      if (!claimDelivery(session, answer.seq, undefined, now)) continue;
+    for (const { owner, answer } of owedFor(session)) {
+      if (!claimDelivery(owner, answer.seq, undefined, now)) continue;
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
+      if (owner !== session) {
+        const adopted = adoptedLine(answer);
+        log(`late answer ${answer.relative} of an ended sub-agent delivered`);
+        if (adopted) contexts.push(adopted);
+        continue;
+      }
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
       const uses = key === null || !wasTold(session, key);
       const context = isChanged(answer) ? changedLine(session, answer) : lateContext(answer, uses);

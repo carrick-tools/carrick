@@ -37,13 +37,13 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { changedLine } from "./late.ts";
+import { adoptedLine, changedLine, hasFindings } from "./late.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
   enqueueChanged,
   ensureRunner,
-  finishedFor,
+  owedFor,
   isChanged,
   markToldRunning,
   newestPerFile,
@@ -81,13 +81,6 @@ function actionable(answer: Answer): boolean {
   return (result.recheck?.scope?.stale ?? []).length > 0;
 }
 
-/** Whether an answer holds a row to act on: a problem, a moved row, a deletion. */
-function hasFindings(answer: Answer): boolean {
-  const result = answer.result;
-  if (answer.state !== "answered" || result === undefined || result.error || !answersTheEdit(result)) return false;
-  return Boolean(result.deleted) || problemItems(result).length > 0 || movedLines(result).length > 0;
-}
-
 /** One answer's lines, for a reader who was not told this edit was being re-checked. */
 function render(answer: Answer): string {
   const where = answer.relative;
@@ -118,13 +111,19 @@ export type StopResult = {
   lines: string[];
 };
 
-/** Claim the right to print each finished answer: the ones this call owns. */
-function collect(session: string, home: string | undefined, now: number): Answer[] {
-  const mine: Answer[] = [];
-  for (const answer of finishedFor(session, home)) {
-    if (claimDelivery(session, answer.seq, home, now)) mine.push(answer);
+/**
+ * Claim the right to print each finished answer: the ones this call owns. The
+ * session's own answers go through the session check below; an ended
+ * sub-agent's (carrick#4074) are `adopted` and print their findings alone.
+ */
+function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[] } {
+  const own: Answer[] = [];
+  const adopted: Answer[] = [];
+  for (const { owner, answer } of owedFor(session, home)) {
+    if (!claimDelivery(owner, answer.seq, home, now)) continue;
+    (owner === session ? own : adopted).push(answer);
   }
-  return mine;
+  return { own, adopted };
 }
 
 export type Coverage = {
@@ -227,7 +226,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       log("could not restart the re-check runner", String(error));
     }
   }
-  const delivered: Answer[] = collect(session, home, clock());
+  const { own: delivered, adopted } = collect(session, home, clock());
 
   // The session's check, per workspace with an edit Stop has not yet spoken
   // about. A clean `check --changed` the agent ran since that edit already
@@ -295,6 +294,14 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       const text = render(answer);
       if (text) lines.push(text);
     }
+  }
+
+  // An ended sub-agent's findings skip the session's check above: its files
+  // are not this session's edits (#3965), so they are neither "this session
+  // edited" nor folded into the clean line.
+  for (const answer of adopted) {
+    const text = adoptedLine(answer);
+    if (text) lines.push(text);
   }
 
   // Still running: said once per entry, and the agent's next hook event after

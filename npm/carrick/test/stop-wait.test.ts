@@ -24,7 +24,7 @@ import {
 } from "../src/hook/rechecks.ts";
 import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
 import { checkedSinceLastEdit, checkMarkerPath } from "../src/hook/checked.ts";
-import { readSession, recordEdit, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
+import { readSession, recordEdit, sessionRecords, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 
@@ -458,6 +458,8 @@ test("the Stop entry carries no wait, and the prompt hook carries what lands aft
   assert.equal(entry.timeout, STOP_TIMEOUT_S);
   assert.equal(entry.statusMessage, undefined, "nothing to wait for, so nothing to show while waiting");
   assert.equal(hooks.UserPromptSubmit![0]!.hooks[0]!.command, "carrick hook user-prompt");
+  // An ended sub-agent's late answers are owed to the main session (carrick#4074).
+  assert.equal(hooks.SubagentStop![0]!.hooks[0]!.command, "carrick hook subagent-stop");
 });
 
 // A `carrick check --changed` that ran after the session's last edit has
@@ -868,4 +870,133 @@ test("stop delivers a finished check --changed answer: its verdict, never a clau
   assert.match(text, /^Carrick ran `carrick check --changed` for this session's change: 1 contract problem in 1 changed file\.$/m);
   assert.match(text, /^- order-service\/src\/client\.ts:14 call GET \/users\/:id: the response type does not match: email is missing/m);
   assert.doesNotMatch(text, CLAUSE);
+});
+
+// --- carrick#4074: an ended sub-agent's late answers reach the main session once ---
+//
+// A sub-agent's re-checks are filed under `<session>.<agent>`. Once it has
+// ended, none of its hooks runs again, so an answer landing after that was
+// never read. `carrick hook subagent-stop` marks the end; the main session's
+// readers (the carriers and Stop) then deliver what the ended agent is owed,
+// findings only.
+
+const AGENT = "agent-x";
+const SUB = `${SESSION}.${AGENT}`;
+
+function subagentStop(home: string, payload: Record<string, unknown> = { agent_id: AGENT }): Promise<HookRun> {
+  return runHook("subagent-stop.ts", {
+    payload: { hook_event_name: "SubagentStop", session_id: SESSION, ...payload },
+    env: fakeEnv({ HOME: home }),
+  });
+}
+
+function endedMarkers(home: string): string[] {
+  try {
+    return fs.readdirSync(sessionsDir(home)).filter((name) => name.endsWith(".ended"));
+  } catch {
+    return [];
+  }
+}
+
+/** A tool hook of the sub-agent itself: a Read with no file, which only carries late answers. */
+function subagentCarrier(home: string, root: string, agent = AGENT): Promise<HookRun> {
+  return runHook("post-read.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Read", session_id: SESSION, agent_id: agent, cwd: root, tool_input: {} },
+    env: fakeEnv({ HOME: home }),
+  });
+}
+
+function said(run: HookRun): string {
+  return run.stdout ? (JSON.parse(run.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext : "";
+}
+
+test("SubagentStop prints nothing and writes the marker; a payload with no agent_id writes nothing", async (t) => {
+  const { home } = setup(t);
+  const run = await subagentStop(home);
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, "");
+  assert.deepEqual(endedMarkers(home), [`${SUB}.ended`]);
+  assert.equal(sessionRecords(home), 0, "the marker is not a session record");
+
+  const other = setup(t).home;
+  const none = await subagentStop(other, {});
+  assert.equal(none.code, 0);
+  assert.equal(none.stdout, "");
+  assert.deepEqual(endedMarkers(other), []);
+});
+
+test("a sub-agent's answer that lands after its SubagentStop is delivered once by the main session's next prompt, and the next tool hook says nothing", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file, SUB);
+  await subagentStop(home);
+  answer(home, entry, problem());
+
+  const prompt = await promptHook(home, workspace.root);
+  const text = (JSON.parse(prompt.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext;
+  assert.match(text, /contract problem/);
+  assert.match(text, /users\.ts/);
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once: the next tool hook says nothing");
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "once: the next prompt says nothing");
+});
+
+test("the main Stop carries an ended sub-agent's problem answer, once, beside the main session's own clean line", async (t) => {
+  const { workspace, home } = setup(t);
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  // The main session's own edit: covered, clean, not yet stated.
+  edit(workspace.root, home, workspace.file, Date.now() - 5000);
+  const judged = reread(clean());
+  judged.items = [judgedRoute("/api/users", 10)];
+  answer(home, queue(workspace.root, home, workspace.file), judged);
+  // The sub-agent's edit of another file, answered with a problem after it ended.
+  const subEntry = queue(workspace.root, home, other, SUB);
+  await subagentStop(home);
+  answer(home, subEntry, reread(problem()));
+
+  const first = stopAnswers(SESSION, { home, ensure: () => false }).lines;
+  const text = first.join("\n");
+  assert.match(first[0]!, /^Carrick checked the 1 operation this session changed \(GET \/api\/users at user-service\/src\/routes\/users\.ts:10\)/);
+  assert.doesNotMatch(first[0]!, /orders\.ts/, "the sub-agent's file is not the session's own edit");
+  assert.match(text, /orders\.ts/);
+  assert.match(text, /contract problem/);
+  assert.equal(text.split("\n").filter((line) => /contract problem/.test(line)).length, 1);
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, [], "once: the next Stop says nothing");
+});
+
+test("an answer for a still-running sub-agent (no SubagentStop) is delivered to that sub-agent, not the main session", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file, SUB);
+  answer(home, entry, problem());
+
+  assert.equal((await promptHook(home, workspace.root)).stdout, "");
+  assert.deepEqual(stopAnswers(SESSION, { home, ensure: () => false }).lines, []);
+  assert.match(said(await subagentCarrier(home, workspace.root)), /contract problem/);
+});
+
+test("a sub-agent resumed after SubagentStop: its next hook re-opens it, and an answer landing then goes to it", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  await subagentStop(home);
+  assert.deepEqual(endedMarkers(home), [`${SUB}.ended`]);
+
+  assert.equal((await subagentCarrier(home, workspace.root)).stdout, "", "nothing owed yet");
+  assert.deepEqual(endedMarkers(home), [], "the sub-agent's own hook deleted the marker");
+
+  const entry = queue(workspace.root, home, workspace.file, SUB);
+  answer(home, entry, problem());
+  assert.equal((await promptHook(home, workspace.root)).stdout, "", "the main session adopts nothing for a resumed sub-agent");
+  assert.match(said(await subagentCarrier(home, workspace.root)), /contract problem/);
+});
+
+test("an answer the main session adopted is not delivered again to the resumed sub-agent", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const entry = queue(workspace.root, home, workspace.file, SUB);
+  await subagentStop(home);
+  answer(home, entry, problem());
+  assert.match(said(await promptHook(home, workspace.root)), /contract problem/);
+
+  assert.equal(said(await subagentCarrier(home, workspace.root)), "", "claimed once, under its owner's key");
 });

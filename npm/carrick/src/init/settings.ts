@@ -120,6 +120,13 @@ export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
         hooks: [{ type: "command", command: `${command} hook stop`, timeout: STOP_TIMEOUT_S }],
       },
     ],
+    // A sub-agent's end: marks it, so what its re-checks answer after it has
+    // ended reaches the main session (`rechecks.ts` `owedFor`). Prints nothing.
+    SubagentStop: [
+      {
+        hooks: [{ type: "command", command: `${command} hook subagent-stop`, timeout: 5 }],
+      },
+    ],
     // A re-check that answered after Stop returned reaches the model with the
     // next prompt, when no tool hook has carried it first (`late.ts`).
     UserPromptSubmit: [

@@ -647,10 +647,55 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
 
 // --- the session's side ----------------------------------------------------
 
-function sessionNames(session: string, home?: string): string[] {
+/** The sessions folder's file names, listed once for a hook call that reads several keys. */
+export function sessionListing(home?: string): string[] {
+  return names(sessionsDir(home));
+}
+
+function sessionNames(session: string, home?: string, listing?: readonly string[]): string[] {
   if (safeId(session) === null) return [];
   const prefix = `${session}.recheck.`;
-  return names(sessionsDir(home)).filter((name) => name.startsWith(prefix));
+  return (listing ?? names(sessionsDir(home))).filter((name) => name.startsWith(prefix));
+}
+
+// --- an ended sub-agent (carrick#4074) -------------------------------------
+//
+// A sub-agent's re-checks are filed under `<session>.<agent>`, and none of its
+// hooks runs once it has ended, so an answer landing after that was never read.
+// `carrick hook subagent-stop` leaves `<session>.<agent>.ended` (not `.json`:
+// `sessionRecords` counts those); the main session's readers then take what
+// the ended agent is owed. A sub-agent resumed later deletes its own marker
+// with its next hook, so its own late answers stay its own.
+
+const ENDED = ".ended";
+
+function endedFile(key: string, home?: string): string | null {
+  return safeId(key) === null ? null : path.join(sessionsDir(home), `${key}${ENDED}`);
+}
+
+/** Mark the sub-agent `key` (`<session>.<agent>`) as ended. Never throws. */
+export function markEnded(key: string, home?: string, now: number = Date.now()): void {
+  const file = endedFile(key, home);
+  if (file === null) return;
+  try {
+    writeAtomic(file, `${JSON.stringify({ ended_at: new Date(now).toISOString() })}\n`);
+  } catch (error) {
+    log("could not mark the sub-agent ended", String(error));
+  }
+}
+
+/**
+ * The keys (`<session>.<agent>`) of the sub-agents of `session` that have
+ * ended. An agent id is one flat segment, so a marker with a dot after the
+ * session belongs to a deeper key (a sub-agent's own, or a session id that
+ * itself holds a dot) and is not this reader's to adopt.
+ */
+function endedAgents(session: string, listing: readonly string[]): string[] {
+  const prefix = `${session}.`;
+  return listing
+    .filter((name) => name.startsWith(prefix) && name.endsWith(ENDED))
+    .map((name) => name.slice(0, -ENDED.length))
+    .filter((key) => key.length > prefix.length && !key.slice(prefix.length).includes("."));
 }
 
 function seqOf(session: string, name: string): string {
@@ -684,8 +729,8 @@ export function pendingFor(session: string, home?: string): Pending[] {
  * would ever print (superseded, or outdated by a newer entry for its file) is
  * claimed here, so the next call finds nothing owed and reads no file.
  */
-export function finishedFor(session: string, home?: string): Answer[] {
-  const all = sessionNames(session, home);
+export function finishedFor(session: string, home?: string, listing?: readonly string[]): Answer[] {
+  const all = sessionNames(session, home, listing);
   const delivered = new Set(all.filter((n) => n.endsWith(".delivered")).map((n) => seqOf(session, n)));
   const owed = all
     .filter((n) => n.endsWith(".answer.json"))
@@ -717,6 +762,36 @@ export function finishedFor(session: string, home?: string): Answer[] {
       continue;
     }
     out.push(answer);
+  }
+  return out;
+}
+
+/** A finished answer and the key it is filed under: the reader's own, or an ended sub-agent's. */
+export type Owed = { owner: string; answer: Answer };
+
+/**
+ * Every finished answer `reader` is owed: its own, then each ended sub-agent's
+ * (carrick#4074). First of all it deletes the reader's own `.ended` marker:
+ * a hook of a sub-agent's own means it was resumed, and its late answers are
+ * its own again (a main session never has one). A sub-agent reader adopts
+ * nothing, since no marker is filed under its key. The caller claims each
+ * answer under `owner`, so an adopted answer is never said twice. One listing
+ * of the sessions folder serves the reader and every ended agent.
+ */
+export function owedFor(reader: string, home?: string): Owed[] {
+  let listing = sessionListing(home);
+  const own = endedFile(reader, home);
+  if (own !== null && listing.includes(`${reader}${ENDED}`)) {
+    try {
+      fs.unlinkSync(own);
+    } catch {
+      // Another hook of the same agent deleted it first.
+    }
+    listing = listing.filter((name) => name !== `${reader}${ENDED}`);
+  }
+  const out: Owed[] = finishedFor(reader, home, listing).map((answer) => ({ owner: reader, answer }));
+  for (const owner of endedAgents(reader, listing)) {
+    for (const answer of finishedFor(owner, home, listing)) out.push({ owner, answer });
   }
   return out;
 }
