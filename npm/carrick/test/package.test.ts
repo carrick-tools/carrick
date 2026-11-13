@@ -158,11 +158,13 @@ test("the host manifests name this CLI's commands, and travel with the package",
     "carrick hook post-read",
     "carrick hook session-start",
     "carrick hook stop",
+    "carrick hook subagent-stop",
     "carrick hook user-prompt",
   ]);
   // The plugin's Stop and prompt entries are the ones `carrick init` writes.
   assert.deepEqual(hooks["hooks"]["Stop"], carrickHooks()["Stop"]);
   assert.deepEqual(hooks["hooks"]["UserPromptSubmit"], carrickHooks()["UserPromptSubmit"]);
+  assert.deepEqual(hooks["hooks"]["SubagentStop"], carrickHooks()["SubagentStop"]);
   const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);

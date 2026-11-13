@@ -17,7 +17,7 @@ import { performance } from "node:perf_hooks";
 import { initialisedRoot } from "../init/outdated.ts";
 import { writeAtomic } from "./reuse.ts";
 
-export type TimedHook = "session-start" | "post-read" | "post-edit" | "prompt-submit" | "stop";
+export type TimedHook = "session-start" | "post-read" | "post-edit" | "prompt-submit" | "stop" | "subagent-stop";
 
 export type Outcome = "printed" | "silent" | "error";
 
@@ -43,7 +43,7 @@ export const WINDOW_MS = 7 * 24 * 60 * 60_000;
 /** A hook whose p90 is above this is named at session start. */
 export const SLOW_HOOK_MS = 1000;
 
-const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "prompt-submit", "stop"];
+const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "prompt-submit", "stop", "subagent-stop"];
 
 export function timingsPath(root: string): string {
   return path.join(root, ".carrick", "hook-timings.jsonl");

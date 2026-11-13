@@ -43,6 +43,7 @@ const HOOKS = {
   "recheck-run": "../dist/hook/recheck-run.js",
   "session-start": "../dist/hook/session-start.js",
   stop: "../dist/hook/stop.js",
+  "subagent-stop": "../dist/hook/subagent-stop.js",
   "user-prompt": "../dist/hook/user-prompt.js",
 };
 
