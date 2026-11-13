@@ -1574,6 +1574,7 @@ impl CallWalker<'_, '_, '_> {
             constructs: true,
             language_call: None,
             bound: Vec::new(),
+            path_guards: Vec::new(),
         };
         self.ir.constructions.push(construction);
     }
@@ -1635,6 +1636,7 @@ impl CallWalker<'_, '_, '_> {
             constructs: false,
             language_call: None,
             bound: Vec::new(),
+            path_guards: Vec::new(),
         });
     }
 

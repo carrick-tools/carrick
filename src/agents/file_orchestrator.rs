@@ -4606,6 +4606,23 @@ impl FileOrchestrator {
             if let Some(silent) = summaries.silent(file) {
                 pf.silent_sites = silent.clone();
             }
+            // The name join's member at a call whose text rules out the
+            // member's request (carrick#4093): the call never sends it.
+            if let Some(ruled_out) = summaries.ruled_out(file) {
+                let canonical = |path: &Path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+                };
+                let before = pf.resolved_members.len();
+                pf.resolved_members.retain(|span, (module, resolved)| {
+                    !ruled_out.get(span).is_some_and(|requests| {
+                        requests.iter().any(|(request_file, start)| {
+                            *start == resolved.member.request_start
+                                && canonical(request_file) == canonical(module)
+                        })
+                    })
+                });
+                stats.imported_members_refused += before - pf.resolved_members.len();
+            }
             if let Some(reached) = summaries.reached(file) {
                 stats.imported_members_refused += Self::refuse_members_the_compiler_contradicts(
                     &mut pf.resolved_members,

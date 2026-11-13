@@ -1120,6 +1120,11 @@ struct CallIr {
     /// copy the decided step reads a discovery site's chain through
     /// ([`Self::with_bound`]).
     bound: Vec<Value>,
+    /// The tests of the body's parameters every path to the call takes, as
+    /// a caller decides them (carrick#4093, [`Reader::path_guards`]): a
+    /// request stated through the call is sent only where each goes the
+    /// path's way ([`Effect::path_guards`]).
+    path_guards: Vec<WayGuard>,
 }
 
 /// A call written as a function's `call` or `apply` member: what the
@@ -1204,6 +1209,8 @@ impl CallIr {
     /// call's arguments after `this` fill the parameters ahead of its own
     /// ([`Self::passed_arg`]). Only for a `bind` that
     /// [`Self::args_are_closed_text`] holds for.
+    ///
+    /// The bound copy keeps the call's own [`Self::path_guards`].
     fn with_bound(&self, bind: &CallIr) -> CallIr {
         CallIr {
             bound: bind.args.iter().skip(1).cloned().collect(),
@@ -6936,6 +6943,17 @@ impl Reader<'_> {
             }
             self.walk(stmt, scope, ir);
         }
+        // The tests of parameters every path to each call takes, read once
+        // the walk has recorded every comparison (carrick#4093): a request
+        // after `if (verb === "GET") return;` is sent by no caller that
+        // passes `"GET"`.
+        let points: Vec<u32> = ir.calls.iter().map(|call| call.site.lo).collect();
+        let tests = resolve::flow::tests_at(stmts, &points);
+        for call in &mut ir.calls {
+            if let Some(tests) = tests.get(&call.site.lo) {
+                call.path_guards = self.path_guards(tests, scope);
+            }
+        }
     }
 
     /// The binding table entries one declarator states, read in `scope`:
@@ -8798,6 +8816,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             constructs: matches!(call.callee, Callee::Super(_)),
             language_call,
             bound: Vec::new(),
+            path_guards: Vec::new(),
         });
     }
 
@@ -8874,6 +8893,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 constructs: false,
                 language_call: None,
                 bound: Vec::new(),
+                path_guards: Vec::new(),
             });
         }
         element.visit_children_with(self);
@@ -9600,6 +9620,13 @@ struct Effect {
     /// (carrick#3679): one decided the way's way is spent, one decided the
     /// other way rules the effect out ([`Self::ruled_out`]).
     guards: Vec<WayGuard>,
+    /// The tests of parameters on every path to the call that states the
+    /// request (carrick#4093, [`CallIr::path_guards`]), decided like
+    /// [`Self::guards`] at each call that fills the parameter. Unlike those,
+    /// an open one holds no request open ([`Self::has_params`]): the URL is
+    /// one, and the line that sends it still states it for the callers
+    /// nothing here decides.
+    path_guards: Vec<WayGuard>,
     /// A guard was decided against this way: no call of the function sends
     /// it.
     ruled_out: bool,
@@ -9718,6 +9745,7 @@ impl Effect {
                     semantics: shape.semantics.clone(),
                     key_defaults: key_defaults.clone(),
                     guards,
+                    path_guards: Vec::new(),
                     ruled_out: false,
                 };
                 effect.settle_keys();
@@ -9865,8 +9893,31 @@ impl Effect {
                     ..guard.clone()
                 })
                 .collect(),
+            path_guards: self
+                .path_guards
+                .iter()
+                .map(|guard| WayGuard {
+                    subject: lift(&guard.subject),
+                    ..guard.clone()
+                })
+                .collect(),
             ruled_out: self.ruled_out,
         }
+    }
+
+    /// This effect as stated through a call the tests `guards` lie on the
+    /// path to (carrick#4093): each joins [`Self::path_guards`], and one the
+    /// effect already holds taken the other way rules it out.
+    fn on_path(mut self, guards: &[WayGuard]) -> Effect {
+        for guard in guards {
+            let held = self.guards.iter().chain(&self.path_guards);
+            if held.clone().any(|other| other.contradicts(guard)) {
+                self.ruled_out = true;
+            } else if !held.clone().any(|other| other == guard) {
+                self.path_guards.push(guard.clone());
+            }
+        }
+        self
     }
 
     /// Whether any piece is still one of the summarised function's parameters.
@@ -10129,12 +10180,16 @@ impl Effect {
             semantics: self.semantics.clone(),
             key_defaults,
             guards: Vec::new(),
+            path_guards: Vec::new(),
             ruled_out: self.ruled_out,
         };
         // Each test of a parameter against what the caller wrote there
-        // (carrick#3679): text decides it, the caller's own parameter leaves
+        // (carrick#3679), a test on the path to the request's call too
+        // (carrick#4093): text decides it, the caller's own parameter leaves
         // it to the caller's callers, and anything else leaves the way.
-        for guard in &self.guards {
+        let tests = (self.guards.iter().map(|guard| (guard, false)))
+            .chain(self.path_guards.iter().map(|guard| (guard, true)));
+        for (guard, on_path) in tests {
             let subject = concat(guard.subject.iter().map(|piece| match piece {
                 Piece::Param(index, _) => match args.get(*index) {
                     Some(Value::Str(arg)) => arg.clone(),
@@ -10159,6 +10214,7 @@ impl Effect {
                 ..guard.clone()
             };
             match filled.verdict() {
+                Verdict::Open if on_path => instantiated.path_guards.push(filled),
                 Verdict::Open => instantiated.guards.push(filled),
                 Verdict::RuledOut => instantiated.ruled_out = true,
                 Verdict::Kept | Verdict::Undecided => {}
@@ -11088,6 +11144,9 @@ fn declared_client(
 /// Each file's calls by span, and what each reaches.
 type ReachedByFile = HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>;
 
+/// [`RequestSummaryIndex::ruled_out`]: per file, by a call's span start.
+type RuledOutByFile = HashMap<PathBuf, BTreeMap<u32, BTreeSet<(PathBuf, u32)>>>;
+
 /// The function a call reaches by the compiler's rows, and the requests that
 /// function sends (carrick#4120). Paths are as walked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11105,6 +11164,12 @@ pub struct ReachedCallee {
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
+    /// The requests a call's text rules out and the call sends no other
+    /// way (carrick#3679, carrick#4093), by the call's span start: the file
+    /// each is written in and the span start of its call, as
+    /// [`ReachedCallee::requests`] names them. Read by the imported-member
+    /// join, which drops a member whose request is one of them.
+    ruled_out: Box<RuledOutByFile>,
     /// The function each call of the service's files reaches by the
     /// compiler's rows, keyed by the call's span. Read by the imported-member
     /// join, which drops a member the compiler says the call does not reach
@@ -11423,6 +11488,12 @@ impl RequestSummaryIndex {
         self.silent.get(file)
     }
 
+    /// The requests each call of `file` rules out ([`Self::ruled_out`]),
+    /// by the call's span start.
+    pub fn ruled_out(&self, file: &Path) -> Option<&BTreeMap<u32, BTreeSet<(PathBuf, u32)>>> {
+        self.ruled_out.get(file)
+    }
+
     /// The function each call of `file` reaches by the compiler's rows,
     /// keyed by the call's `(span_start, span_end)`. A call the rows do not
     /// answer (no rows, or read from the call graph) has no entry.
@@ -11639,7 +11710,7 @@ impl Composer<'_> {
                 // were while an element read as nothing (carrick#1949).
                 Some((_, callee)) if call.jsx => {
                     for effect in callee.effects.iter().filter(|effect| effect.has_params()) {
-                        let sent = effect.at_call(call, file);
+                        let sent = effect.at_call(call, file).on_path(&call.path_guards);
                         if !sent.ruled_out {
                             summary.state(
                                 ir.settle_forward(sent),
@@ -11653,8 +11724,10 @@ impl Composer<'_> {
                     summary.hands_out |= callee.hands_out;
                     for effect in &callee.effects {
                         // A way this call's text rules out is never sent
-                        // from here (carrick#3679).
-                        let sent = effect.at_call(call, file);
+                        // from here (carrick#3679). Nor is one a test on the
+                        // path to the call already took the other way
+                        // (carrick#4093).
+                        let sent = effect.at_call(call, file).on_path(&call.path_guards);
                         if !sent.ruled_out {
                             summary.state(
                                 ir.settle_forward(sent),
@@ -11669,10 +11742,11 @@ impl Composer<'_> {
                                 summary.complete &= callback.complete;
                                 summary.hands_out |= callback.hands_out;
                                 for effect in &callback.effects {
-                                    summary.state(
-                                        effect.detached().lifted(),
-                                        callback.through_of(effect),
-                                    );
+                                    let sent =
+                                        effect.detached().lifted().on_path(&call.path_guards);
+                                    if !sent.ruled_out {
+                                        summary.state(sent, callback.through_of(effect));
+                                    }
                                 }
                             }
                             Value::Callback(nested) => {
@@ -11696,6 +11770,12 @@ impl Composer<'_> {
                         for effect in
                             Effect::from_shape(&request, file, call.site, &ir.key_defaults)
                         {
+                            // The tests on the path to the send, for the
+                            // callers to decide (carrick#4093).
+                            let effect = effect.on_path(&call.path_guards);
+                            if effect.ruled_out {
+                                continue;
+                            }
                             summary.state(
                                 ir.settle_forward(effect),
                                 BTreeSet::from([(file.to_path_buf(), call.site.line)]),
@@ -12197,6 +12277,10 @@ fn emit(
                     .target(file, call)
                     .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
                 let mut open_verbs = OpenVerbs::default();
+                // The requests this call's text rules out, and those it
+                // sends (carrick#4093).
+                let mut ruled_out: BTreeSet<(PathBuf, u32)> = BTreeSet::new();
+                let mut sent: BTreeSet<(PathBuf, u32)> = BTreeSet::new();
                 for effect in &callee.effects {
                     // A JSX element states only what its props fill in
                     // (carrick#1949).
@@ -12207,9 +12291,12 @@ fn emit(
                         effect.instantiate_omitting(&call.args, &call.spread_args, &|index| {
                             call.omits(index)
                         });
+                    let request = (effect.site.file.clone(), effect.site.span_start);
                     if instantiated.ruled_out {
+                        ruled_out.insert(request);
                         continue;
                     }
+                    sent.insert(request);
                     // What this call writes for a method that is a parameter
                     // (carrick#2049).
                     if matches!(effect.method, MethodValue::Param(_)) {
@@ -12342,6 +12429,14 @@ fn emit(
                             }
                         }
                     }
+                }
+                let ruled_out: BTreeSet<_> = ruled_out.difference(&sent).cloned().collect();
+                if !ruled_out.is_empty() {
+                    index
+                        .ruled_out
+                        .entry(file.to_path_buf())
+                        .or_default()
+                        .insert(call.site.span_start, ruled_out);
                 }
                 if let Some(method) = open_verbs.verb() {
                     index
@@ -13117,6 +13212,7 @@ mod tests {
             semantics: BTreeSet::new(),
             key_defaults: BTreeMap::new(),
             guards: Vec::new(),
+            path_guards: Vec::new(),
             ruled_out: false,
         }
     }

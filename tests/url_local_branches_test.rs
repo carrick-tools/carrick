@@ -224,6 +224,68 @@ fn a_test_in_the_same_block_decides_its_way() {
     assert_eq!(rows_in(EXITS, 44), ["POST /api/items.list"]);
 }
 
+/// Callers of requests behind tests on their path (carrick#4093).
+const PATH_GUARDS: &str = "src/use-path-guards.ts";
+
+#[test]
+fn a_caller_that_takes_the_exit_before_a_send_is_not_given_its_row() {
+    // `if (verb === "GET") return null;` before `fetch(base + path)`.
+    assert_eq!(rows_in(PATH_GUARDS, 13), Vec::<String>::new());
+    // A caller that passes the test keeps its row.
+    assert_eq!(rows_in(PATH_GUARDS, 14), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_test_the_caller_does_not_decide_keeps_the_row() {
+    // `verb` is the caller's own parameter, and nothing calls the caller.
+    assert_eq!(rows_in(PATH_GUARDS, 15), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_branch_the_caller_picks_states_only_its_own_request() {
+    // `if (kind === "PUSH") return this.post("/sync/push");` then
+    // `this.post("/sync/pull")`.
+    assert_eq!(rows_in(PATH_GUARDS, 16), ["POST /api/sync/push"]);
+    assert_eq!(rows_in(PATH_GUARDS, 17), ["POST /api/sync/pull"]);
+    // Each call inside the helper states its own request, as before.
+    assert_eq!(
+        rows_in("src/clients/path-guards.ts", 24),
+        ["POST /api/sync/push"]
+    );
+    assert_eq!(
+        rows_in("src/clients/path-guards.ts", 26),
+        ["POST /api/sync/pull"]
+    );
+}
+
+#[test]
+fn a_prefix_test_of_an_options_key_that_throws_is_decided_by_the_caller() {
+    assert_eq!(rows_in(PATH_GUARDS, 18), Vec::<String>::new());
+    assert_eq!(rows_in(PATH_GUARDS, 19), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_literal_url_after_an_exit_is_stated_only_for_callers_that_pass() {
+    assert_eq!(rows_in(PATH_GUARDS, 20), Vec::<String>::new());
+    assert_eq!(rows_in(PATH_GUARDS, 21), ["PUT /api/literal"]);
+}
+
+#[test]
+fn a_hop_that_hands_the_tested_parameter_on_leaves_it_to_its_callers() {
+    // `relay(path, verb)` passes `verb` to `send`, whose path exits on
+    // `"GET"`: the hop's callers decide it.
+    let clients = "src/clients/path-guards.ts";
+    assert_eq!(rows_in(clients, 58), Vec::<String>::new());
+    assert_eq!(rows_in(clients, 59), ["POST /api/relayed"]);
+}
+
+#[test]
+fn a_caller_in_the_senders_own_file_that_takes_the_exit_has_no_row() {
+    let clients = "src/clients/path-guards.ts";
+    assert_eq!(rows_in(clients, 60), Vec::<String>::new());
+    assert_eq!(rows_in(clients, 61), Vec::<String>::new());
+}
+
 #[test]
 fn a_query_written_under_a_truthiness_test_states_one_row() {
     // carrick#3984's snippet: both ways key one route, one row. The URL
