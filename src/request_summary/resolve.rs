@@ -132,20 +132,23 @@ pub(super) struct ModuleBinding {
 impl ModuleBinding {
     /// Whether the value readers (discovery's callee walk, the receiver
     /// walk) read this entry: an enum holds no value, and a text-only local
-    /// is held by its scope. No reader opens a [`Self::scoped_entry`] yet.
+    /// is held by its scope. A [`Self::scoped_entry`] is read here
+    /// (carrick#3794 T3): a nested function's own top-level local stays
+    /// `text_only` (D2), and the procedures walk still refuses the class at its
+    /// own choke point.
     pub(super) fn values_read(&self) -> bool {
         !matches!(
             self.kind,
             BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter
         ) && !self.text_only
-            && !self.scoped_entry()
     }
 
     /// An entry of the carrick#3794 class: a declaration in a block, in a
     /// function written inside a body, or a function declared in a body.
-    /// The table holds them, and every reader refuses them at its choke
-    /// point ([`Self::values_read`], the procedures walk's `binding`) until
-    /// its own step opens them; the text reader reads them (T2).
+    /// The table holds them, and a reader that has not opened them refuses
+    /// them at its choke point (the procedures walk's `binding`) until its
+    /// own step does. The text reader (T2) and the value readers
+    /// ([`Self::values_read`], T3) read them.
     pub(super) fn scoped_entry(&self) -> bool {
         !matches!(self.declared, Declared::Module | Declared::Body(_))
             || self.kind == BindingKind::Function
@@ -1099,7 +1102,9 @@ pub(super) fn module_bindings(
                 entries_handed: census.entries_handed(&local.key, false),
                 handed: census.handed.get(&local.key).cloned().unwrap_or_default(),
                 exported: false,
-                text_only: !local.block && !local.reassigned,
+                // The scope holds a body's own locals, not a function declared
+                // in it: the value readers read that one here (carrick#3794).
+                text_only: !local.block && !local.reassigned && local.kind != BindingKind::Function,
                 object_kept: false,
                 plain: local.plain,
                 reads: flow_checked(local, &census),
@@ -3982,6 +3987,12 @@ impl<'a> Resolver<'a> {
             (other, _) => out.extend(self.read_value(follow, file, other, invoke, false)),
         };
         for value in &binding.init {
+            // A parameter in a nested function's own local is that
+            // function's: no caller index keys it, what runs it fills it.
+            if binding.declared == Declared::Nested && matches!(value, ValueAt::Param { .. }) {
+                out.push(Held::Stop(Stop::CallbackParameter));
+                continue;
+            }
             written(&mut out, value, binding.declared.function());
         }
         for at in &binding.writes {
@@ -4924,6 +4935,135 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             .collect();
         assert_eq!(found.len(), 1, "{function:?} {name}: {found:?}");
         found.remove(0)
+    }
+
+    /// What the module binding the call at `file:line` names as its callee
+    /// holds, as discovery's `binding_callee` reads it: the compiler's call
+    /// row names the declaration, and the resolver reads the table entry.
+    /// `None` where the row names no binding of the run.
+    fn named_callee<'a>(
+        resolver: &Resolver<'a>,
+        inputs: &'a RequestSummaryInputs,
+        file: &str,
+        line: u32,
+    ) -> Option<Vec<Got>> {
+        let (path, ir) = inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with(file))
+            .unwrap_or_else(|| panic!("{file} is read"));
+        let found: Vec<&CallIr> = super::row_calls::every_call(&inputs.files)
+            .into_iter()
+            .filter(|(at, call, _)| *at == path.as_path() && call.site.line == line)
+            .map(|(_, call, _)| call)
+            .collect();
+        let [call] = found.as_slice() else {
+            panic!("one call at {file}:{line}: {}", found.len());
+        };
+        let row = inputs
+            .positions
+            .as_ref()?
+            .lookup(
+                path,
+                ir.swc_start(call.site.lo),
+                ir.swc_start(call.site.hi),
+                Kind::Call,
+            )
+            .ok()?;
+        let (declared, decl_line, symbol) = resolver.declared_binding(row)?;
+        let invoke = Invoke {
+            file: path,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        resolver
+            .binding_values(&mut Ends, declared, decl_line, &symbol, invoke)
+            .map(got)
+    }
+
+    /// carrick#3794 T3: a client held in a local of a block is reached
+    /// through its name, as one held in the body is.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_client_built_in_a_block_is_reached_through_its_name() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "scoped.ts", 16),
+            Some(vec![definition("sendBlock")])
+        );
+    }
+
+    /// carrick#3794 T3: a function declared in a body is reached through its
+    /// name, and a call of it reads what it returns.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_function_declared_in_a_body_is_reached_through_its_name() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "scoped.ts", 32),
+            Some(vec![written(29)])
+        );
+        // A call of such a function is not read yet: its returned value is
+        // the factory reader's, which keys definitions only. Pinned so a
+        // later step names the move.
+        assert_eq!(
+            callee(&resolver, &on.inputs, "scoped.ts", 25),
+            [Got::Stop(Stop::UnreadExpression)]
+        );
+    }
+
+    /// carrick#3794 T3: a local of a block inside a callback that holds the
+    /// callback's own parameter reads `callback_parameter`: no caller index
+    /// keys that parameter.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_nested_local_holding_its_function_s_parameter_reads_callback_parameter() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "scoped.ts", 39),
+            Some(vec![Got::Stop(Stop::CallbackParameter)])
+        );
+    }
+
+    /// carrick#3794 T3, pin: every entry of the class is outside module
+    /// scope and holds no object the object reader would take
+    /// (`object_kept`), so `objects_of`, `const_call` and the receiver walk's
+    /// module binding, which filter on those, keep refusing them.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn the_readers_that_stay_closed_still_refuse_a_scoped_entry() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let path = on.path("services/web/src/scoped.ts");
+        let scoped: Vec<_> = on.inputs.files[&path]
+            .module_bindings
+            .values()
+            .filter(|binding| binding.scoped_entry())
+            .collect();
+        assert!(scoped.len() >= 3, "{scoped:?}");
+        for binding in scoped {
+            assert!(!binding.declared.module_scope(), "{binding:?}");
+            assert!(!binding.object_kept, "{binding:?}");
+        }
     }
 
     /// carrick#3504 B10-1a: each parameter has an entry of its own, by line
