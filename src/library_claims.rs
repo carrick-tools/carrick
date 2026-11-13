@@ -1160,22 +1160,18 @@ pub fn read(
             .filter_map(|(site, _)| site.origin.as_ref())
             .map(|origin| (&origin.file, origin.span_start))
             .collect();
-        let mut unstated: Vec<LibraryLead> = Vec::new();
         for (site, read) in of_export.iter().zip(&read_sites) {
             // A library call read and dropped (carrick#3947, carrick#3946):
             // no row here or at a caller, and no lead.
-            if let Some(lead) = &read.unstated {
-                if read.rows.is_empty()
-                    && read.leads.is_empty()
-                    && !filled.contains(&(&site.file, site.span_start))
-                {
-                    unstated.push(lead.clone());
-                }
-            }
-        }
-        for lead in unstated {
-            if !leads.contains(&lead) {
-                leads.push(lead);
+            let Some(lead) = &read.unstated else {
+                continue;
+            };
+            if read.rows.is_empty()
+                && read.leads.is_empty()
+                && !filled.contains(&(&site.file, site.span_start))
+                && !leads.contains(lead)
+            {
+                leads.push(lead.clone());
             }
         }
         for (site, read) in of_export.iter().zip(read_sites) {
