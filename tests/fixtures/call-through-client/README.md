@@ -83,15 +83,29 @@ Rows that stay as the model stated them:
 
 | Site | Why |
 |---|---|
-| `commands.ts:57` | the helper called reaches two operations |
+| `commands.ts:57` | the helper called reaches two operations; it is in the same file |
 | `commands.ts:70` | nothing resolves the receiver |
-| `commands.ts:76` | the function called writes its URL from its parameters, so no row states its request |
 | `commands.ts:82` | the site writes the route |
 | `commands.ts:88` | the site also writes a request of its own |
-| `commands.ts:94` | only the model states the request the function called makes |
 | `commands.ts:127` | the site makes a request itself, inside a call that reaches another |
-| `commands.ts:139` | the function called asks for a token and returns a `fetch` only the model reads |
+| `commands.ts:139` | the function called asks for a token and returns a `fetch` only the model reads; it is in the same file |
+
+Rows withdrawn, each site saved unread with `own_function` (carrick#4206): the
+call goes to a function of another file of the repository, and the walk from it
+settles no one request.
+
+| Site | Why the walk settles nothing |
+|---|---|
+| `commands.ts:76` | `send` writes its URL from its parameters, so no row states its request |
+| `commands.ts:94` | only the model states the request `ping` makes |
 | `hooks.ts:24` | two callbacks, and one calls what nothing resolves |
+
+`packages/cli/src/unsettled.ts` (carrick#4206):
+
+| Site | Outcome |
+|---|---|
+| `unsettled.ts:6` (`client.close(path)`) | withdrawn; the walk below the call already saved the site unread (`value_never_bound`), and it gains `own_function` beside that: the method is in `job-client.ts` and writes nothing of the path, its request is `send` with a path it is given, so the walk reaches no request row, and the model's `POST /v1/jobs/close` is read off the method's name |
+| `unsettled.ts:13`, `:20` | as stated: the same callee is handed a URL the file builds (`const url = `${base}/api/v1/accounts``, and `url.toString()` of a `new URL`) |
 
 `commands.ts:113` writes its route into a function of the same file; the
 scanner reads that row off the source and this pass never touches it.
@@ -200,7 +214,10 @@ same with and without the compiler's rows:
 | `chained.ts:21` | `GET /api/v1/status`: the same through `.then` |
 | `chained.ts:27` | as stated: `run` is a member of an interface, and `openSession` (`session.ts`) requests `POST /api/v1/audit` and then returns an object of its own |
 
-`hooks.ts:24` stays as stated for the reason `chained.ts:14` does:
-`vendor.send` resolves to nothing.
+`hooks.ts:24` is not stated as the model stated it (carrick#4206): its
+call is `retry` (`spinner.ts`), a function of another file whose walk settles
+no one request, since `vendor.send` resolves to nothing. The model's row goes,
+the site is saved unread, and the call into the client in the other callback
+states `POST /api/v1/audit`.
 
 Driven by `tests/call_through_rows_test.rs`.

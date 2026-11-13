@@ -640,6 +640,9 @@ fn a_token_handed_to_the_returned_request_is_not_the_request_reached() {
 /// The function called asks for a token, a request a fact states, and then
 /// makes a `fetch` only the model reads. The token is not the one operation
 /// the call reaches, so the row stays as the model stated it, and is counted.
+/// The function is in the call's own file, so the row is not withdrawn
+/// (carrick#4206 withdraws `commands.ts:94`, the other such row, whose function
+/// is in another file).
 #[test]
 fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_it() {
     assert_eq!(
@@ -647,7 +650,7 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
         as_stated("GET", "/tokened", "/tokened")
     );
     assert!(
-        settled_line().contains("2 reach a request only the model states"),
+        settled_line().contains("1 reach a request only the model states"),
         "{}",
         settled_line()
     );
@@ -803,9 +806,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             70,
             as_stated("GET", "/api/v1/injected/${id}", "/api/v1/injected/:id"),
         ),
-        // The function called writes its URL from its parameters alone, so
-        // no row states its request.
-        ("cli", COMMANDS, 76, as_stated("GET", "/reply", "/reply")),
         // The site writes the route itself.
         ("cli", COMMANDS, 82, as_stated("GET", "/orders", "/orders")),
         // The site also writes a request of its own.
@@ -814,13 +814,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             COMMANDS,
             88,
             as_stated("GET", "/api/v1/notified/${id}", "/api/v1/notified/:id"),
-        ),
-        // Only the model states the request the function called makes.
-        (
-            "cli",
-            COMMANDS,
-            94,
-            as_stated("GET", "/api/v1/pings", "/api/v1/pings"),
         ),
         // The site writes the route, and the function it calls reaches one
         // request of its own (a token). The row is the one the scanner reads
@@ -846,14 +839,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             127,
             as_stated("POST", "/api/v1/audited", "/api/v1/audited"),
         ),
-        // Two callbacks: one through a client nothing resolves, one that
-        // reaches a request.
-        (
-            "web",
-            HOOKS,
-            24,
-            as_stated("POST", "/vendor/send", "/vendor/send"),
-        ),
     ] {
         let row = row_at(service, file, line);
         if row != stated {
@@ -864,6 +849,108 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         changed.is_empty(),
         "each of these must stay as the model stated it: {changed:#?}"
     );
+}
+
+/// carrick#4206: the rows above that called a function of another file of the
+/// repository, whose walk settled no one request, lose the model's key and
+/// are saved unread. `commands.ts:76` (`send(base, path)` writes its URL from
+/// its parameters) and `:94` (`ping()` makes a `fetch` only the model reads,
+/// and the model's `/api/v1/pings` is not its `/api/v1/ping`) hold no row.
+/// `hooks.ts:24` hands two callbacks to `retry` (`spinner.ts`): the model's
+/// `POST /vendor/send` goes, and the call into the client inside the other
+/// callback, which the model's row held, states its request.
+#[test]
+fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
+    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+        assert_eq!(rows_in(blobs(), service, file, line), [], "{file}:{line}");
+    }
+    assert_eq!(
+        row_at("web", HOOKS, 24),
+        Row {
+            method: "POST".to_string(),
+            target: "/api/v1/audit".to_string(),
+            path: "/api/v1/audit".to_string(),
+            source: "request_summary".to_string(),
+            role: Some("wrapper_call".to_string()),
+            reaches: Some(format!("{REQUESTS}:17")),
+        }
+    );
+    // `hooks.ts:24` holds the leaf row, so it is not saved unread.
+    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+        let named = blobs()[service]["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == file && site["line"] == line)
+            .any(|site| reasons(site).contains(&"own_function".to_string()));
+        assert!(named, "{file}:{line} is saved unread as withdrawn");
+    }
+}
+
+const UNSETTLED: &str = "packages/cli/src/unsettled.ts";
+
+/// The unread site the blob of `service` lists at `file:line`.
+fn unread_at(service: &str, file: &str, line: u32) -> Option<&'static serde_json::Value> {
+    blobs()[service]["unread_sites"]
+        .as_array()?
+        .iter()
+        .find(|site| site["file"] == file && site["line"] == line)
+}
+
+/// carrick#4206: a client method whose request sits in another file, and
+/// whose walk reaches no request row. The model read its path off the
+/// method's name (`POST /v1/jobs/close`), which nothing in the code states,
+/// so the row goes and the call is saved unread: it goes to a function of the
+/// repository, and what that function requests is not read.
+#[test]
+fn a_call_into_a_function_in_another_file_that_settles_no_request_is_saved_unread() {
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 6), []);
+    let site = unread_at("cli", UNSETTLED, 6).unwrap_or_else(|| {
+        panic!(
+            "the call is saved unread: {:#}",
+            blobs()["cli"]["unread_sites"]
+        )
+    });
+    // The walk below the call already saved it (nothing binds the client's
+    // `send`), so the site keeps that reason and names the withdrawal beside
+    // it; a site no walk saved takes `own_function` as its reason (unit test
+    // in `src/unread_sites.rs`).
+    assert_eq!(text(&site["callee"]).as_deref(), Some("client.close"));
+    assert!(
+        reasons(site).contains(&"own_function".to_string()),
+        "{site:#}"
+    );
+}
+
+/// A site's reason and the reasons `also` names beside it.
+fn reasons(site: &serde_json::Value) -> Vec<String> {
+    std::iter::once(&site["reason"])
+        .chain(site["also"].as_array().into_iter().flatten())
+        .filter_map(text)
+        .collect()
+}
+
+/// carrick#4206's control: the same call into another file's function, handed
+/// a URL the calling code builds, keeps the model's row. The path is read off
+/// the call's own file, not off a name.
+#[test]
+fn a_call_handed_a_url_its_own_file_builds_keeps_the_models_row() {
+    for (line, target, path) in [
+        (13, "${base}/api/v1/accounts", "/api/v1/accounts"),
+        (20, "${base}/api/v1/accounts/${id}", "/api/v1/accounts/:id"),
+    ] {
+        assert_eq!(
+            row_at("cli", UNSETTLED, line),
+            as_stated("GET", target, path)
+        );
+        // The walk below the call saves it unread (`missed_inside`); no row
+        // was withdrawn there.
+        assert!(
+            unread_at("cli", UNSETTLED, line)
+                .is_none_or(|site| !reasons(site).contains(&"own_function".to_string())),
+            "{UNSETTLED}:{line} holds its row and is not saved as withdrawn"
+        );
+    }
 }
 
 #[test]
@@ -980,8 +1067,10 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Eleven rows in `commands.ts` the model alone states and the one at
-    // `nested.ts:7`. The three in `inline-commands.ts` (lines 9, 13, 22) are
+    // Nine rows in `commands.ts` the model alone states, the one at
+    // `nested.ts:7` and the two at `unsettled.ts` lines 13 and 20.
+    // `commands.ts` lines 76 and 94 and `unsettled.ts:6` are withdrawn
+    // (carrick#4206). The three in `inline-commands.ts` (lines 9, 13, 22) are
     // corrected, not the model's alone: every scan now walks with the
     // compiler's rows (`position_rows::destination` has no switch), which
     // follow them (carrick#2822), as `a_method_called_on_a_factorys_value_…`
