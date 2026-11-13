@@ -7,5 +7,8 @@
     "@fixture/broker": "1.0.0",
     "@fixture/jobs": "1.0.0",
     "@fixture/streams": "1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
   }
 }

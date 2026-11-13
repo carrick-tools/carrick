@@ -9,8 +9,12 @@ a pub/sub operation, the way the file-analyzer does when it reads only the
 caller's file. The scan decides from the wrapper's own body which rows stay.
 Framework detection (`__llm__/framework-detect`) lists `@fixture/broker` as
 the one messaging client; `@fixture/streams` and `@fixture/jobs` are declared
-dependencies it does not list. No package is installed: the scan only needs
-`package.json` to say they are dependencies.
+dependencies it does not list. The three packages and `@types/node` are
+installed as stubs (`node_modules/*/index.d.ts`, force-added), with a lockfile
+and a recorded store answer (`__llm__/library-claims/default.json`): a call is
+a candidate only when the store labels what it reaches. `@fixture/broker` and
+`@fixture/jobs` are brokers, `@fixture/streams` and `node:events` are
+in-process buses.
 
 ## Withdrawn (in-process, nothing on the other side of the topic)
 
