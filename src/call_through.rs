@@ -260,13 +260,21 @@ impl LeafCall {
 impl CallThroughSites {
     /// The leaf calls whose type is asked before capture (carrick#4113): a
     /// call into another service's function, or into one of the service's
-    /// own whose return is one call's value read one way. A row stated at
-    /// any other leaf call never carries its type ([`ReachGraph::hands_back_body`]
-    /// reads the callee's return shape first), so nothing is asked there.
+    /// own whose return is one call's value read one way, on a line where
+    /// the fold took a model row ([`Self::folded`]). Only there did the fold
+    /// drop a model type the leaf row would otherwise lose; at any other line
+    /// the row never had one, and a row stated there never carries it
+    /// ([`ReachGraph::hands_back_body`] reads the callee's return shape
+    /// first), so nothing is asked.
     pub fn typed_leaves(&self) -> impl Iterator<Item = &LeafCall> {
-        self.leaves.iter().filter(|leaf| match &leaf.callee {
-            LeafCallee::Own(callee) => self.return_shapes.contains_key(callee),
-            LeafCallee::Sibling { .. } => true,
+        self.leaves.iter().filter(|leaf| {
+            self.folded
+                .iter()
+                .any(|(file, line)| *file == leaf.file && *line == leaf.line)
+                && match &leaf.callee {
+                    LeafCallee::Own(callee) => self.return_shapes.contains_key(callee),
+                    LeafCallee::Sibling { .. } => true,
+                }
         })
     }
 
