@@ -1,8 +1,6 @@
-//! A request wrapper whose options run through a helper that returns
-//! `{ ...init, key: value }` (carrick#1561 C11, the `new_url_target` rule's
-//! deletion): the request summaries read the method its callers write
-//! through that spread, so a `new URL('/path', origin)` handed to the
-//! wrapper states its path at each caller, host-free. Runs the real scanner
+//! A model row at a call whose URL the site pass stopped on states no base
+//! (carrick#4171): the model's bare path does not make the call
+//! same-origin when the code read its base as a runtime value. Runs the real scanner
 //! binary on `.` over a committed copy of
 //! `tests/fixtures/model-row-runtime-base`, offline, and reads the stored
 //! blob.
@@ -130,8 +128,9 @@ fn graph_row(blob: &serde_json::Value, line: u64) -> serde_json::Value {
 fn a_model_row_over_an_unread_base_is_not_relative() {
     let blob = scan();
     let unread = graph_row(&blob, 6);
+    let stops = &blob["unread_sites"];
     assert_eq!(unread["target_url"], "/things/list", "{unread:#}");
-    assert!(unread["base"].is_null(), "{unread:#}");
+    assert!(unread["base"].is_null(), "{unread:#}\n{stops:#}");
     let twin = graph_row(&blob, 11);
     assert_eq!(twin["base"]["kind"], "injected", "{twin:#}");
     let relative = graph_row(&blob, 16);

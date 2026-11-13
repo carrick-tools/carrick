@@ -1388,7 +1388,10 @@ pub fn fold(
     // pass reads them (`call_through::settle`), and would read the folded
     // row as a call of its own (carrick#2704).
     if let Some(graph) = data.mount_graph.as_mut() {
-        unstate_relative_where_path_unread(graph, &site.unread, root);
+        // The fold's unread sites, not the site pass's: a stop the site
+        // pass raised as a lead becomes an unread site only here, beside a
+        // row the code did not decide (carrick#4171).
+        unstate_relative_where_path_unread(graph, &fold.unread, root);
         // A fact site row replaces the reader's row in the graph as it does
         // in the calls, and the facts join the graph beside the rows the
         // reader stated (carrick#2795): the cross-service pass and the cloud
