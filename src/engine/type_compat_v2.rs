@@ -667,6 +667,22 @@ pub(crate) fn derive_capture_anchors(
             anchors.extend(mode_anchors(alias, request));
             continue;
         }
+        // The call's result label went unanswered when the compiler engine
+        // died (carrick#4154): the type read without it is the library's
+        // envelope, not the body, so the alias is published unread.
+        if request.result_unanswered {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: "unknown".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+                absent_body_tolerated: false,
+                unread_cause: Some("site_unreadable"),
+            });
+            continue;
+        }
         // Kind-aware v1 inference result wins over a raw locator re-run.
         if let Some(text) = inferred_text.get(alias) {
             let names = printed_names
@@ -6773,6 +6789,47 @@ mod tests {
             ],
             "sorted, so the surface order follows the manifest and not a hash walk"
         );
+    }
+
+    /// carrick#4154: a call whose result label went unanswered is published
+    /// `unknown` with `site_unreadable`, even beside an inference for its
+    /// alias (the envelope read without the label), and is never retyped.
+    #[test]
+    fn an_unanswered_result_label_publishes_the_call_unread() {
+        let mut call = response_body_infer("Endpoint_call_Response");
+        call.infer_kind = InferKind::CallResult;
+        call.result_unanswered = true;
+        let envelope = inferred(
+            "Endpoint_call_Response",
+            "{ data: { id: string; }; status: number; }",
+            None,
+            None,
+        );
+
+        let anchors = derive_capture_anchors(
+            &[],
+            std::slice::from_ref(&call),
+            &[],
+            &[envelope],
+            &[],
+            "/repo",
+        );
+
+        assert_eq!(anchors.len(), 1, "{anchors:#?}");
+        let CaptureAnchor::Literal {
+            alias,
+            type_text,
+            unread_cause,
+            ..
+        } = &anchors[0]
+        else {
+            panic!("expected an unread literal, got {:?}", anchors[0]);
+        };
+        assert_eq!(
+            (alias.as_str(), type_text.as_str(), *unread_cause),
+            ("Endpoint_call_Response", "unknown", Some("site_unreadable"))
+        );
+        assert!(consumer_call_locators(&[call]).is_empty());
     }
 
     /// carrick#1836: the sidecar's printer writes some names bare, and only the

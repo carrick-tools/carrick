@@ -707,9 +707,60 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            marked, changed,
-            "with the answer: {with_answer:#?}\nwithout it: {without_answer:#?}"
+        let asked: BTreeSet<&str> = ends
+            .values()
+            .zip(&aliases)
+            .filter(|(end, _)| ask.ends.iter().any(|asked| asked.names(end)))
+            .map(|(_, alias)| alias.as_str())
+            .collect();
+        let shown = format!("with the answer: {with_answer:#?}\nwithout it: {without_answer:#?}");
+        // Every call whose type the answer would have moved is marked: none
+        // ships the envelope as its body.
+        assert!(
+            changed.is_subset(&marked),
+            "{marked:?} {changed:?}\n{shown}"
         );
+        // Only calls a check was asked for are marked. Which of them the
+        // answer would have left alone (a refused label, a label whose part
+        // reads as the bare call does) only the dead answer knew, so those are
+        // marked too: unknown, never a wrong type.
+        assert_eq!(marked, asked, "{shown}");
+        // Calls the label did not reach, every other type, are as before.
+        for request in sent.iter().filter(|request| !request.result_unanswered) {
+            let alias = request.alias.as_deref().unwrap();
+            assert_eq!(with_answer.get(alias), without_answer.get(alias), "{shown}");
+        }
+    }
+
+    /// carrick#4154: a dead ask holds as unanswered exactly the discovered
+    /// calls a check was asked for, keyed as a verified result is (by span,
+    /// and by line only where one end sits on it). An answered ask, or no
+    /// ask, holds none.
+    #[test]
+    fn a_dead_ask_holds_only_its_asked_calls_unanswered() {
+        let get = end(Some("get"), Some(LibraryOp::Request), 4, (10, 30));
+        let send = end(Some("send"), Some(LibraryOp::Request), 4, (40, 60));
+        let alone = end(Some("get"), Some(LibraryOp::Request), 9, (90, 99));
+        let unlabelled = end(Some("unlabelled"), Some(LibraryOp::Request), 12, (120, 130));
+        let discovery = discovery_of_ends(vec![get, send, alone, unlabelled]);
+        let exports = exports();
+        let ask = result_checks(&exports, &discovery);
+        let dead = ResultIndex::answered(&ask, Err("process died"), &discovery);
+        assert!(dead.is_empty());
+        assert_eq!(dead.checks, ask.checks.len());
+        let file = "src/client.ts";
+        assert!(dead.unanswered_at(file, Some((10, 30)), 4));
+        assert!(dead.unanswered_at(file, Some((40, 60)), 4));
+        assert!(dead.unanswered_at(file, Some((90, 99)), 9));
+        assert!(dead.unanswered_at(file, None, 9));
+        // The line holds two ends: it names neither.
+        assert!(!dead.unanswered_at(file, None, 4));
+        // No check was asked for this call.
+        assert!(!dead.unanswered_at(file, Some((120, 130)), 12));
+        assert!(!dead.unanswered_at(file, Some((1, 2)), 4));
+        let answered = ResultIndex::answered::<&str>(&ask, Ok(&verified(&ask)), &discovery);
+        assert!(!answered.unanswered_at(file, Some((10, 30)), 4));
+        let refused = ResultIndex::answered::<&str>(&ask, Ok(&[]), &discovery);
+        assert!(!refused.unanswered_at(file, Some((10, 30)), 4));
     }
 }
