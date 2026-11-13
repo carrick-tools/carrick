@@ -761,11 +761,9 @@ fn a_hook_with_two_callbacks_and_a_promise_chain_take_the_request_they_reach() {
             // model's path was invented (carrick#4078 R7).
             (14, corrected("PUT", "/api/v1/runs/:id", 11)),
             // The factory the method is read off requests something, then
-            // returns an object of its own.
-            (
-                27,
-                as_stated("POST", "/api/v1/session/run", "/api/v1/session/run"),
-            ),
+            // returns an object of its own: `.run()` is no request, and the
+            // call into the factory states the one it makes (carrick#4078).
+            (27, corrected("POST", "/api/v1/audit", 17)),
         ] {
             assert_eq!(
                 rows_in(blobs, "web", CHAINED, line),
