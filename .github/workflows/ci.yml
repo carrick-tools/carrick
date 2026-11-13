@@ -480,6 +480,11 @@ jobs:
       - name: Same-key commits inherit the release-check verdict
         run: bash scripts/release-check-inherit.test.sh
 
+      # The cut's write steps (scripts/release-cut.sh, release.yml `cut`), gh
+      # stubbed: in order, skip-if-done, relabel last.
+      - name: The release cut writes tag, Release and labels, relabel last
+        run: bash scripts/release-cut.test.sh
+
       # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
       # against stubbed objdump output: it must fail a binary above the floor.
       - name: The glibc floor check fails a binary above the floor
