@@ -280,4 +280,9 @@ fn the_json_output_carries_the_blobs_unread_site_keys() {
         assert!(!blob[key].is_null(), "the blob carries {key}");
         assert_eq!(out[key], blob[key], "{key} differs from the blob's");
     }
+    // Present only when the cap cut rows; the JSON output carries it too.
+    assert_eq!(
+        out["unread_sites_not_listed"], blob["unread_sites_not_listed"],
+        "unread_sites_not_listed differs from the blob's"
+    );
 }
