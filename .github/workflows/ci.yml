@@ -146,7 +146,7 @@ jobs:
           - shard: scan-4
             runner: cargo
             targets: >-
-              --test integration_test --test inline_handler_response_test --test xrepo_harness_test --test sibling_declared_host_test --test env_var_whole_url_test --test exclude_patterns_test --test stated_generic_body_anchor_test --test site_payloads_test --test llm_cassette_hard_gate_test --test response_init_bag_test --test one_row_per_request_test
+              --test integration_test --test inline_handler_response_test --test xrepo_harness_test --test sibling_declared_host_test --test env_var_whole_url_test --test exclude_patterns_test --test stated_generic_body_anchor_test --test site_payloads_test --test llm_cassette_hard_gate_test --test response_init_bag_test --test one_row_per_request_test --test deno_npm_specifier_test
           - shard: steps
             runner: steps
             targets: >-
