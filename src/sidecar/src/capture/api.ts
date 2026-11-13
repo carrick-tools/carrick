@@ -221,8 +221,8 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  * honest value is `not_recorded` — never a guess.
  *
  *  - `declared`: the captured declaration states `any`/`unknown` at this
- *    position, and the producer's own program had a type there too: an author
- *    annotation, not a failed resolution.
+ *    position, and the producer's own program had a type there too: stated by
+ *    the code or a library it uses, not a failed resolution.
  *  - `unresolved_import`: the position is `any` in the emitted text because the
  *    producer's program could not resolve the type there — an import of a
  *    dependency that is not installed, or of a generated module that was never
