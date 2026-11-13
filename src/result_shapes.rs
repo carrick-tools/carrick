@@ -641,6 +641,7 @@ mod tests {
                 result: index.at(&end.file, span, end.line).cloned(),
                 route_path: None,
                 result_unanswered: index.unanswered_at(&end.file, span, end.line),
+                through_call: None,
             }
         };
         let aliases: Vec<String> = (0..ends.len()).map(|i| format!("Call{i}")).collect();

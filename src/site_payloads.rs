@@ -34,8 +34,8 @@ use std::path::Path;
 
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind, TypeManifestEntry};
 use crate::operation::OperationKey;
-use crate::request_summary::site_record::{PayloadAt, PayloadSlots, SiteRecord};
-use crate::services::type_sidecar::{InferKind, InferRequestItem};
+use crate::request_summary::site_record::{AnchorAt, PayloadAt, PayloadSlots, SiteRecord};
+use crate::services::type_sidecar::{InferKind, InferRequestItem, ThroughCall};
 
 /// Which side of an operation a site is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +49,8 @@ enum Side {
 struct Site {
     http: bool,
     side: Side,
+    /// The site's own call.
+    call: AnchorAt,
     slots: PayloadSlots,
 }
 
@@ -83,6 +85,7 @@ impl SitePayloads {
                 .push(Site {
                     http,
                     side,
+                    call: record.anchors.call.clone(),
                     slots: record.payloads.clone(),
                 });
         }
@@ -138,14 +141,29 @@ impl SitePayloads {
             if matches!(slot, PayloadAt::Unwritten { .. }) && !http {
                 continue;
             }
+            // A call whose verb sends no body is not asked the object its
+            // wrapper builds (carrick#4128): the same verbs a producer is
+            // never asked a request body for (carrick#4159).
+            if entry.type_kind == ManifestTypeKind::Request
+                && matches!(slot, PayloadAt::Value(at) if outside(at, &site.call))
+                && entry.key.as_http().is_some_and(|(method, _)| {
+                    !crate::type_manifest::producer_reads_request_body(method)
+                })
+            {
+                continue;
+            }
             if !seen.insert(entry.type_alias.clone()) {
                 continue;
             }
             let at = slot.at();
-            let source = sources
-                .entry(at.file.clone())
-                .or_insert_with(|| std::fs::read_to_string(root.join(&at.file)).ok());
-            let Some(source) = source.as_deref() else {
+            let Some((span_start, span_end)) =
+                source_of(root, &at.file, &mut sources).map(|source| {
+                    (
+                        crate::utils::sidecar_position(source, at.span_start),
+                        crate::utils::sidecar_position(source, at.span_end),
+                    )
+                })
+            else {
                 continue;
             };
             let (infer_kind, param_name, member) = match slot {
@@ -173,11 +191,20 @@ impl SitePayloads {
                 PayloadAt::Result(at) => results.unanswered_at_anchor(at, repo_path),
                 _ => false,
             };
+            // A value read outside the site's own call (the body a wrapper
+            // builds, carrick#4128) names the call: a type parameter of the
+            // wrapper is read as that call instantiates it.
+            let through_call = match slot {
+                PayloadAt::Value(_) if outside(at, &site.call) => {
+                    through(root, &site.call, &mut sources)
+                }
+                _ => None,
+            };
             requests.push(InferRequestItem {
                 file_path: root.join(&at.file).to_string_lossy().into_owned(),
                 line_number: at.line,
-                span_start: Some(crate::utils::sidecar_position(source, at.span_start)),
-                span_end: Some(crate::utils::sidecar_position(source, at.span_end)),
+                span_start: Some(span_start),
+                span_end: Some(span_end),
                 expression_text: None,
                 expression_line: None,
                 infer_kind,
@@ -187,10 +214,42 @@ impl SitePayloads {
                 result,
                 route_path: None,
                 result_unanswered,
+                through_call,
             });
         }
         requests
     }
+}
+
+/// `file`'s text under `root`, read once into `sources`.
+fn source_of<'a>(
+    root: &Path,
+    file: &str,
+    sources: &'a mut BTreeMap<String, Option<String>>,
+) -> Option<&'a str> {
+    sources
+        .entry(file.to_string())
+        .or_insert_with(|| std::fs::read_to_string(root.join(file)).ok())
+        .as_deref()
+}
+
+/// `at` lies outside `call`: in another file, or not within its span.
+fn outside(at: &AnchorAt, call: &AnchorAt) -> bool {
+    at.file != call.file || at.span_start < call.span_start || at.span_end > call.span_end
+}
+
+/// `call` as the sidecar numbers it; `None` where its file cannot be read.
+fn through(
+    root: &Path,
+    call: &AnchorAt,
+    sources: &mut BTreeMap<String, Option<String>>,
+) -> Option<ThroughCall> {
+    let source = source_of(root, &call.file, sources)?;
+    Some(ThroughCall {
+        file_path: root.join(&call.file).to_string_lossy().into_owned(),
+        span_start: crate::utils::sidecar_position(source, call.span_start),
+        span_end: crate::utils::sidecar_position(source, call.span_end),
+    })
 }
 
 /// The aliases `slotted` types: the manifest entries whose payload the

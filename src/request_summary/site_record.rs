@@ -259,9 +259,11 @@ pub struct HandlerAnchor {
 /// capture prints its type there. A call's request is its body argument and
 /// its response is its own result; a handler's request is the parameter it
 /// is run with. A slot is filled only where the site's own call or handler
-/// states it, in the same function: a payload a call below builds, a value
-/// a caller hands in, and a route handler's body read and response value
-/// (which need the label fields carrick#2474 lists) are left empty.
+/// states it, in the same function, or where the wrapper it calls builds it
+/// ([`PayloadBinding::BuiltInside`], carrick#4128: the value the building
+/// call is given, read in the wrapper's file). A value a caller hands in, and
+/// a route handler's body read and response value (which need the label
+/// fields carrick#2474 lists) are left empty.
 ///
 /// Scanner-side only, like the anchors, and outside [`SiteState`], so no
 /// site's sha and no cache key moves.
@@ -1911,6 +1913,40 @@ fn roles_by_file(decided: &Decided) -> BTreeMap<String, BTreeSet<String>> {
     roles
 }
 
+/// The value a call below builds as a site's payload
+/// ([`PayloadBinding::BuiltInside`]): the building call's argument `arg`
+/// (one option key of it when `key` is set), in the file that call is in.
+/// `None` where the call is not found or its argument has no such value.
+fn built_payload(payload: &Option<PayloadBinding>, sources: &mut Sources<'_>) -> Option<PayloadAt> {
+    let Some(PayloadBinding::BuiltInside {
+        built_inside,
+        span_start,
+        span_end,
+        arg,
+        key,
+    }) = payload
+    else {
+        return None;
+    };
+    let (file, _) = built_inside.rsplit_once(':')?;
+    let parsed = sources.get(file)?;
+    let mut finder = CallFinder {
+        parsed,
+        target: (*span_start, *span_end),
+        handing: Vec::new(),
+        found: None,
+    };
+    parsed.module.visit_with(&mut finder);
+    let expr = finder.found?.arg_exprs.get(*arg)?.clone();
+    let span = payload_expr(&expr, key.as_deref())?;
+    Some(PayloadAt::Value(AnchorAt {
+        file: file.to_string(),
+        line: parsed.line(span.lo.0),
+        span_start: span.lo.0,
+        span_end: span.hi.0,
+    }))
+}
+
 /// A record for every decided site, read with the store's `labels`. Files
 /// are named relative to `root`, the scanned repo's root; the compiler's
 /// rows are `inputs.positions`, when the run walked them.
@@ -2505,10 +2541,18 @@ fn record(
         handler,
         key: site.key.clone(),
     };
+    // A payload a call below builds (carrick#4128): the body the wrapper
+    // makes, read where it makes it. It stands behind the carried option key
+    // and the locator's own argument.
+    let built = if anchors.payload_at.is_none() {
+        built_payload(&site.payload, sources)
+    } else {
+        None
+    };
     let payloads = payload_slots(
         &anchors.call,
         anchors.payload_at.as_ref(),
-        carried,
+        carried.or(built),
         anchors.handler.as_ref(),
     );
     Some(SiteRecord {
@@ -3461,6 +3505,80 @@ mod tests {
         assert!(!whole.to_string().contains("Unwritten"), "{whole}");
     }
 
+    /// carrick#4128: a socket emit whose wrapper builds the payload itself
+    /// (the call below states it, the caller decides the name) fills the
+    /// request slot with the value the wrapper builds, read where the
+    /// wrapper builds it.
+    #[test]
+    fn a_request_slot_is_the_body_a_call_below_builds() {
+        let fixture = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&fixture);
+        let session = std::fs::read_to_string(fixture.join("src/realtime/session.ts")).unwrap();
+        let call = "wire.emit(name, { at: Date.now() })";
+        let start = session.find(call).unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+        let end = super::super::decided_sites::LabelledEnd {
+            package: "@fixture/wire".into(),
+            export: "connect".into(),
+            member: Some("emit".into()),
+            role: "socket".into(),
+            op: Some("send".into()),
+            file: "src/realtime/session.ts".into(),
+            line: 7,
+            span_start: start,
+            new: false,
+            scope: None,
+            procedure: None,
+            span_end: start + call.len() as u32,
+        };
+        let site = super::super::decided_sites::DiscoverySite {
+            file: end.file.clone(),
+            line: end.line,
+            span_start: end.span_start,
+            span_end: end.span_end,
+            callee: "wire.emit".into(),
+            end: Some(end),
+            chain: Vec::new(),
+            stop: None,
+            receiver: None,
+            reached: None,
+            bound: Vec::new(),
+        };
+        let answer: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        )
+        .unwrap();
+        let labels = SiteLabel::from_store_answer(&answer);
+        let decided = decided_sites(&inputs, &fixture, &[site], &labels);
+        let records = site_records(&inputs, &[], &fixture, &decided, &labels);
+        let record = records
+            .iter()
+            .find(|record| record.state.point.at == "src/realtime/rooms.ts:4")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:#?}",
+                    records
+                        .iter()
+                        .map(|r| &r.state.point.at)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(record.anchors.payload_at, None);
+        let (span_start, span_end) = {
+            let body = "{ at: Date.now() }";
+            let lo = session.find(body).unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+            (lo, lo + body.len() as u32)
+        };
+        assert_eq!(
+            record.payloads.request,
+            Some(PayloadAt::Value(AnchorAt {
+                file: "src/realtime/session.ts".to_string(),
+                line: 7,
+                span_start,
+                span_end,
+            }))
+        );
+    }
+
     /// The records of `env.ts`: each call its own discovery site.
     fn env_records() -> (Vec<SiteRecord>, String) {
         let root = decided_fixture();
@@ -3878,7 +3996,7 @@ mod tests {
     /// (carrick#2519, carrick#2520).
     #[test]
     fn a_composed_path_forces_the_name_and_the_basis_is_recorded() {
-        use crate::request_summary::decided_sites::tests::{PATHS, paths_decided};
+        use super::super::decided_sites::tests::{PATHS, paths_decided};
         let root = decided_fixture();
         let inputs = crate::engine::discover_request_inputs(&root);
         let (decided, text) = paths_decided();
