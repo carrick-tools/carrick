@@ -1,0 +1,46 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/things/list",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL('things/list', apiBase()))",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:11",
+      "line_number": 11,
+      "target": "${apiBase()}/things/template",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`${apiBase()}/things/template`)",
+      "call_expression_line": 11,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "/health",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch('/health')",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

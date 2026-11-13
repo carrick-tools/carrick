@@ -1328,6 +1328,38 @@ pub fn relative(root: &Path, file: &str) -> String {
     crate::utils::repo_relative_source_path(file, &root.to_string_lossy()).replace('\\', "/")
 }
 
+/// The graph's model rows at a call whose URL the site pass stopped on
+/// (`slot` is `path`, carrick#4171) state no base. A bare path the model
+/// answered reads as `relative` ([`crate::call_base::stated_base`]), which
+/// claims the same origin, where the code read the base as a value it could
+/// not state (`fetch(new URL("a/b", apiBase()))`). A row the code decided
+/// keeps the base its own pass read.
+fn unstate_relative_where_path_unread(
+    graph: &mut crate::mount_graph::MountGraph,
+    unread: &[crate::unread_sites::UnreadSite],
+    root: &Path,
+) {
+    use crate::call_base::CallBaseKind;
+    for call in graph.data_calls.iter_mut().filter(|call| {
+        call.resolution_source == Some(ResolutionSource::Model)
+            && call
+                .base
+                .as_ref()
+                .is_some_and(|base| base.kind == CallBaseKind::Relative)
+    }) {
+        let Some((file, line)) = call.file_location.rsplit_once(':') else {
+            continue;
+        };
+        let (file, line) = (relative(root, file), line.parse::<u32>().ok());
+        if unread
+            .iter()
+            .any(|site| site.slot == "path" && site.file == file && Some(site.line) == line)
+        {
+            call.base = None;
+        }
+    }
+}
+
 /// A row's `file:line`, relative to `root`.
 fn place(root: &Path, row: &ApiEndpointDetails) -> Option<(String, u32)> {
     let text = row.file_path.to_string_lossy();
@@ -1356,6 +1388,7 @@ pub fn fold(
     // pass reads them (`call_through::settle`), and would read the folded
     // row as a call of its own (carrick#2704).
     if let Some(graph) = data.mount_graph.as_mut() {
+        unstate_relative_where_path_unread(graph, &site.unread, root);
         // A fact site row replaces the reader's row in the graph as it does
         // in the calls, and the facts join the graph beside the rows the
         // reader stated (carrick#2795): the cross-service pass and the cloud
