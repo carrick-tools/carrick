@@ -817,6 +817,7 @@ export async function getOrderCount(): Promise<number> {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        at_registration: false,
         result_unanswered: false,
         through_call: None,
     }];
@@ -1025,6 +1026,7 @@ notificationRouter.get('/status', async () => {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        at_registration: false,
         result_unanswered: false,
         through_call: None,
     }];
@@ -1206,6 +1208,7 @@ notificationRouter.get('/status', async () => {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        at_registration: false,
         result_unanswered: false,
         through_call: None,
     }];
@@ -1442,6 +1445,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         alias: Some(alias.to_string()),
         param_name: Some("evt".to_string()),
         route_path: None,
+        at_registration: false,
         result_unanswered: false,
         through_call: None,
     };

@@ -251,6 +251,16 @@ pub struct InferRequestItem {
     /// `site_unreadable`. Never sent to the sidecar.
     #[serde(skip)]
     pub result_unanswered: bool,
+    /// carrick#4204: a route's request body asked at its registration call
+    /// itself, so its span is the call and names no payload. The sidecar
+    /// follows the handler from there; where it gives no answer, the capture
+    /// must not re-read the span (it would publish the call's own type), and
+    /// the alias takes the placeholder ([`derive_capture_anchors`]). Never
+    /// sent to the sidecar.
+    ///
+    /// [`derive_capture_anchors`]: crate::engine::type_compat_v2::derive_capture_anchors
+    #[serde(skip)]
+    pub at_registration: bool,
     /// carrick#4128: the call that reaches the function this request's
     /// expression sits in, set where a site's payload is read in the wrapper
     /// that builds it. The sidecar reads a type parameter of that function as
@@ -6143,6 +6153,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -6408,6 +6419,7 @@ mod tests {
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
                         route_path: None,
+                        at_registration: false,
                         result_unanswered: false,
                         through_call: Some(ThroughCall {
                             file_path: "/repo/src/checkout.ts".into(),
@@ -6881,6 +6893,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -8767,6 +8780,7 @@ mod tests {
             alias: Some(alias.into()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -8995,6 +9009,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             })
@@ -9044,6 +9059,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
             through_call: None,
             member: None,
             result,
@@ -9185,6 +9201,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some("A".to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];

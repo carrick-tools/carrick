@@ -759,15 +759,27 @@ pub(crate) fn derive_capture_anchors(
         // the first expression on a registration line is the registration
         // call, and its own result (a route chain, `void`) would be served as
         // the reply (carrick#2727). It takes the placeholder, as a decided
-        // abstain does.
-        if matches!(
-            request.infer_kind,
-            InferKind::ResponseBody | InferKind::RequestBody
-        ) && request.span_start.is_none()
-            && request.span_end.is_none()
-            && request.expression_text.is_none()
-            && request.param_name.is_none()
-        {
+        // abstain does. A `FunctionReturn` with no span, text or param is the
+        // same (a declaration line or registration call names no response),
+        // and so is a `ResponseBody` with no text and no param whether or not
+        // it carries a span: a span at a registration call re-reads the call
+        // or the installed framework's instance type (carrick#4079). A
+        // `FunctionReturn` with a span (a GraphQL resolver) keeps its anchor.
+        // A `RequestBody` asked by span at the registration call is the
+        // request side of the same case (carrick#4204): unanswered there, the
+        // capture would publish the call's own type (the server's app). Its
+        // builder marks it, since a consumer's body argument is asked by span
+        // with no text too and keeps its anchor. A decided `no_request_body`
+        // took the branch above and keeps its reason.
+        let no_text_no_param = request.expression_text.is_none() && request.param_name.is_none();
+        let no_span = request.span_start.is_none() && request.span_end.is_none();
+        let names_no_payload = match request.infer_kind {
+            InferKind::RequestBody => no_text_no_param && (no_span || request.at_registration),
+            InferKind::FunctionReturn => no_span && no_text_no_param,
+            InferKind::ResponseBody => no_text_no_param,
+            _ => false,
+        };
+        if names_no_payload {
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
                 type_text: "unknown".to_string(),
@@ -5730,6 +5742,7 @@ mod tests {
             alias: Some("Endpoint_a_Response".to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -5825,6 +5838,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -5891,6 +5905,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -6412,6 +6427,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -6555,6 +6571,7 @@ mod tests {
                 alias: Some("Endpoint_a_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             },
@@ -6571,6 +6588,7 @@ mod tests {
                 alias: Some("Endpoint_b_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             },
@@ -6678,12 +6696,15 @@ mod tests {
             line_number: 7,
             span_start: Some(10),
             span_end: Some(20),
-            expression_text: None,
+            // A located send: the text names the payload (a span alone at a
+            // registration call does not, carrick#4079).
+            expression_text: Some("res.json(body)".to_string()),
             expression_line: None,
             infer_kind: InferKind::ResponseBody,
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }
@@ -7559,6 +7580,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];
@@ -7644,6 +7666,13 @@ mod tests {
             let mut request = response_body_infer(alias);
             request.span_start = None;
             request.span_end = None;
+            request.expression_text = None;
+            request.infer_kind = kind;
+            request
+        };
+        let span_only = |alias: &str, kind: InferKind| {
+            let mut request = response_body_infer(alias);
+            request.expression_text = None;
             request.infer_kind = kind;
             request
         };
@@ -7655,12 +7684,33 @@ mod tests {
             with_text,
             line_only("Endpoint_call_Response", InferKind::CallResult),
             line_only("Endpoint_return_Response", InferKind::FunctionReturn),
+            span_only("Endpoint_span_Response", InferKind::ResponseBody),
+            span_only("Endpoint_resolver_Response", InferKind::FunctionReturn),
+            span_only("Endpoint_span_Request", InferKind::RequestBody),
+            // carrick#4204: a request body asked at the registration call.
+            InferRequestItem {
+                at_registration: true,
+                ..span_only("Endpoint_registration_Request", InferKind::RequestBody)
+            },
         ];
 
         let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], "/repo");
 
-        assert_eq!(anchors.len(), 5, "{anchors:?}");
-        for anchor in &anchors[..2] {
+        assert_eq!(anchors.len(), 9, "{anchors:?}");
+        assert!(
+            matches!(
+                &anchors[8],
+                CaptureAnchor::Literal {
+                    unread_cause: Some("not_located"),
+                    ..
+                }
+            ),
+            "{:?}",
+            anchors[8]
+        );
+        let placeholders: Vec<&CaptureAnchor> =
+            [0, 1, 4, 5, 8].iter().map(|i| &anchors[*i]).collect();
+        for anchor in placeholders {
             match anchor {
                 CaptureAnchor::Literal {
                     type_text,
@@ -7677,10 +7727,11 @@ mod tests {
                 }
             }
         }
-        for anchor in &anchors[2..] {
+        for i in [2, 3, 6, 7] {
             assert!(
-                matches!(anchor, CaptureAnchor::Infer { .. }),
-                "a located or non-body request keeps its infer anchor, got {anchor:?}"
+                matches!(&anchors[i], CaptureAnchor::Infer { .. }),
+                "a located or non-body request keeps its infer anchor, got {:?}",
+                anchors[i]
             );
         }
     }
@@ -7765,6 +7816,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             through_call: None,
             result: None,
             result_unanswered: false,
@@ -7879,6 +7931,7 @@ mod tests {
         let mut line_only = response_body_infer("Endpoint_line_Response");
         line_only.span_start = None;
         line_only.span_end = None;
+        line_only.expression_text = None;
         let mut config = response_body_infer("Endpoint_spread_Request");
         config.infer_kind = InferKind::RequestConfig;
         config.member = Some("body".to_string());
@@ -8330,6 +8383,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -8425,6 +8479,7 @@ mod tests {
                 alias: Some(alias.to_string()),
                 param_name: param.map(str::to_string),
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             }
@@ -8494,6 +8549,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -11592,6 +11648,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };
@@ -11826,6 +11883,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(producer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];
@@ -11930,6 +11988,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];
@@ -12085,6 +12144,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];
@@ -12287,6 +12347,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         }];
@@ -12518,6 +12579,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(producer_alias(key)),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             })
@@ -12643,6 +12705,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(consumer_alias(key, *line)),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             })
@@ -12830,6 +12893,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: Some(param_name.to_string()),
             route_path: None,
+            at_registration: false,
             result_unanswered: false,
             through_call: None,
         };

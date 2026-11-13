@@ -13,8 +13,9 @@
  *    inlined to its member structure, recursively.
  *
  * An alias whose own type did not resolve produces neither: the tree is read
- * with nothing installed, so a reference that leaves it lands on TypeScript's
- * unresolved-reference placeholder, which the compiler prints as the reference
+ * as its self-check read it, so a reference that leaves it and that the
+ * self-check could not follow either lands on TypeScript's unresolved-reference
+ * placeholder, which the compiler prints as the reference
  * text rather than as `any` (see `isUnresolvedReference`). Both forms are then
  * the top type, which is what every downstream rule about an empty answer is
  * written to refuse.
@@ -26,17 +27,20 @@
  * inference path in `type-inferrer.ts`), which walks the resolved `Type` and
  * rebuilds the inlined text.
  *
- * Each resolve call builds its own throwaway project over the stub tree and
- * reads nothing else: not the service's project, and not whether the sidecar
- * was ever initialised. So the request costs what the stub costs, in a process
- * that has built nothing as in one that has (carrick#1927), and the sidecar's
- * long-lived project never sees stub files.
+ * Each resolve call builds its own throwaway project over the stub tree: not
+ * the service's project, and not whether the sidecar was ever initialised. So
+ * the request costs what the stub costs, in a process that has built nothing as
+ * in one that has (carrick#1927), and the sidecar's long-lived project never
+ * sees stub files. Its module specifiers resolve as the capture's self-check
+ * resolved them (`withStubResolution`), so a bare package import the
+ * self-check called clean reads the installed package's type here too
+ * (carrick#3995 T5).
  */
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Project, Node, type SourceFile, type Type } from 'ts-morph';
-import { sidecarCompilerOptions } from './capture/index.js';
+import { sidecarCompilerOptions, withStubResolution } from './capture/index.js';
 import { defaultLibraryOptions } from './default-library.js';
 import {
   expandTypeStructural,
@@ -72,39 +76,48 @@ export class DefinitionResolver {
     }
 
     try {
-      const stubProject = new Project({
-        ...defaultLibraryOptions(),
-        compilerOptions: sidecarCompilerOptions({
-          target: 99, // ESNext
-          module: 99, // ESNext
-          moduleResolution: 100, // Bundler
-          strict: true,
-          skipLibCheck: true,
-        }),
-        skipAddingFilesFromTsConfig: true,
-      });
-      for (const filePath of walkDtsFiles(typesDir)) {
-        stubProject.addSourceFileAtPath(filePath);
-      }
-      const surface = stubProject.getSourceFile(surfacePath);
-      if (!surface) {
-        this.logError(`Failed to load ${surfacePath}`);
-        return [];
-      }
-
-      const results: ResolvedDefinition[] = [];
-      for (const alias of aliases) {
-        const result = this.resolveAlias(surface, alias, {
-          program: stubProject.getProgram().compilerObject,
-          repoRoot: stubDir,
+      return withStubResolution(stubDir, (resolveModules) => {
+        if (!resolveModules) this.log(`${stubDir} was not captured in this process; reading it with nothing installed`);
+        const stubProject = new Project({
+          ...defaultLibraryOptions(),
+          compilerOptions: sidecarCompilerOptions({
+            target: 99, // ESNext
+            module: 99, // ESNext
+            moduleResolution: 100, // Bundler
+            strict: true,
+            skipLibCheck: true,
+          }),
+          skipAddingFilesFromTsConfig: true,
+          ...(resolveModules && {
+            resolutionHost: (_host, getOptions) => ({
+              resolveModuleNames: (moduleNames, containingFile) =>
+                resolveModules(moduleNames, containingFile, getOptions()),
+            }),
+          }),
         });
-        if (result) {
-          results.push(result);
-        } else {
-          this.log(`Could not resolve alias: ${alias}`);
+        for (const filePath of walkDtsFiles(typesDir)) {
+          stubProject.addSourceFileAtPath(filePath);
         }
-      }
-      return results;
+        const surface = stubProject.getSourceFile(surfacePath);
+        if (!surface) {
+          this.logError(`Failed to load ${surfacePath}`);
+          return [];
+        }
+
+        const results: ResolvedDefinition[] = [];
+        for (const alias of aliases) {
+          const result = this.resolveAlias(surface, alias, {
+            program: stubProject.getProgram().compilerObject,
+            repoRoot: stubDir,
+          });
+          if (result) {
+            results.push(result);
+          } else {
+            this.log(`Could not resolve alias: ${alias}`);
+          }
+        }
+        return results;
+      });
     } catch (err) {
       this.logError(
         `Resolution failed: ${err instanceof Error ? err.message : String(err)}`,

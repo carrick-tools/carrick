@@ -4675,7 +4675,41 @@ fn an_edited_handler_keeps_its_route_and_is_re_judged() {
 /// that state. Those rows have no usable type on the producer side before the
 /// edit and after it. The line numbers do not move: the import goes last.
 fn carry_workspace_without_types(all: bool) -> tempfile::TempDir {
+    carry_workspace_without_types_with(all, false)
+}
+
+/// A minimal install of the framework the fixture's routes register on: its
+/// declarations and a public lockfile entry, as a lockfile-carrying checkout
+/// holds them.
+fn install_framework_stand_in(root: &Path) {
+    let package = root.join("items-api/node_modules/fastify");
+    std::fs::create_dir_all(&package).expect("make the package folder");
+    std::fs::write(
+        package.join("package.json"),
+        "{ \"name\": \"fastify\", \"version\": \"4.28.1\", \"types\": \"index.d.ts\" }\n",
+    )
+    .expect("write the manifest");
+    std::fs::write(
+        package.join("index.d.ts"),
+        "export interface FastifyRequest { params: unknown; query: unknown; body: unknown; }\n\
+export interface FastifyReply { send(payload?: unknown): FastifyReply; }\n\
+export type RouteHandlerMethod = (request: FastifyRequest, reply: FastifyReply) => unknown | Promise<unknown>;\n\
+export interface FastifyInstance {\n  get(path: string, handler: RouteHandlerMethod): FastifyInstance;\n}\n\
+declare function fastify(): FastifyInstance;\nexport default fastify;\n",
+    )
+    .expect("write the declarations");
+    std::fs::write(
+        root.join("items-api/package-lock.json"),
+        "{\n  \"name\": \"items-api\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": { \"name\": \"items-api\", \"dependencies\": { \"fastify\": \"^4.0.0\" } },\n    \"node_modules/fastify\": { \"version\": \"4.28.1\", \"resolved\": \"https://registry.npmjs.org/fastify/-/fastify-4.28.1.tgz\" }\n  }\n}\n",
+    )
+    .expect("write the lockfile");
+}
+
+fn carry_workspace_without_types_with(all: bool, framework_installed: bool) -> tempfile::TempDir {
     carry_workspace_with(|root| {
+        if framework_installed {
+            install_framework_stand_in(root);
+        }
         let file = root.join(CARRY_ROUTES);
         edit(
             &file,
@@ -4739,6 +4773,37 @@ fn an_edit_to_a_pair_with_no_usable_type_is_named_not_passed() {
         "the other typed-through-import route is named too: {named:?}\n{changed:#}"
     );
     assert_eq!(changed["type_checked"], 0, "{changed:#}");
+    assert_eq!(changed["failing"], 0, "{changed:#}");
+}
+
+/// With the framework installed and no store answer, a refused reading of a
+/// route's reply must not fall to the registration call's own type: the capture
+/// would publish the framework's instance type as the reply and the edit would
+/// read as a failure. The rows are named unchecked instead (carrick#4079).
+#[test]
+#[serial]
+fn an_installed_framework_instance_type_is_not_published_as_a_route_reply() {
+    let workspace = carry_workspace_without_types_with(true, true);
+    let root = workspace.path();
+    edit(
+        &root.join(CARRY_ROUTES),
+        "connected: true, owner",
+        "connected: 1, owner",
+    );
+
+    let (code, changed) = carry_check_changed(root);
+    assert_eq!(
+        code,
+        Some(2),
+        "nothing was type-checked and nothing fails:\n{changed:#}"
+    );
+    let named = named_lines(&changed);
+    for line in [4, 9] {
+        assert!(
+            named.contains(&format!("\"{CARRY_ROUTES}\":{line}")),
+            "the route at line {line} is named: {named:?}\n{changed:#}"
+        );
+    }
     assert_eq!(changed["failing"], 0, "{changed:#}");
 }
 

@@ -132,6 +132,7 @@ fn scan() -> BTreeMap<String, Vec<Row>> {
         String::from_utf8_lossy(&output.stderr)
     );
     let mut services = BTreeMap::new();
+    let mut manifests = BTreeMap::new();
     for entry in std::fs::read_dir(&storage).expect("storage dir") {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "json") {
@@ -162,8 +163,17 @@ fn scan() -> BTreeMap<String, Vec<Row>> {
             }
         }
         rows.sort();
-        services.insert(blob["service_name"].as_str().unwrap().to_string(), rows);
+        let service = blob["service_name"].as_str().unwrap().to_string();
+        manifests.insert(
+            service.clone(),
+            blob["type_manifest"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        services.insert(service, rows);
     }
+    MANIFESTS.set(manifests).expect("one scan");
     assert_eq!(
         services.keys().map(String::as_str).collect::<Vec<_>>(),
         ["hub", "peer"],
@@ -175,6 +185,14 @@ fn scan() -> BTreeMap<String, Vec<Row>> {
 fn scanned() -> &'static BTreeMap<String, Vec<Row>> {
     static ROWS: OnceLock<BTreeMap<String, Vec<Row>>> = OnceLock::new();
     ROWS.get_or_init(scan)
+}
+
+/// The type manifest entries of each service of the same scan.
+static MANIFESTS: OnceLock<BTreeMap<String, Vec<serde_json::Value>>> = OnceLock::new();
+
+fn manifests() -> &'static BTreeMap<String, Vec<serde_json::Value>> {
+    scanned();
+    MANIFESTS.get().expect("the scan keeps its manifests")
 }
 
 /// Peers a hub hands to the function it runs are the server's end: written in
@@ -362,4 +380,23 @@ fn every_socket_row_is_a_library_claim() {
             );
         }
     }
+}
+
+/// The hub's handler is handed a `Peer`, and its type is the package's own
+/// `Peer`: the capture names it through the installed package, and the
+/// definition step reads it there as the capture's self-check did, so the
+/// entry publishes a definition rather than none (carrick#3995 T5).
+#[test]
+fn a_type_named_through_the_installed_package_publishes_its_definition() {
+    let peer = r#"import("@fixture/rt").Peer"#;
+    let entries: Vec<&serde_json::Value> = manifests()["hub"]
+        .iter()
+        .filter(|entry| {
+            entry["resolved_definition"]
+                .as_str()
+                .is_some_and(|definition| definition.contains(peer))
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "{:#?}", manifests()["hub"]);
+    assert_eq!(entries[0]["expanded_definition"].as_str(), Some("Peer"));
 }

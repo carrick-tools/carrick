@@ -98,6 +98,7 @@ fn ask(sidecar: &TypeSidecar, root: &Path, modules: &[(&str, &str)]) -> Vec<Stri
                 alias: Some(file.to_string()),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             };

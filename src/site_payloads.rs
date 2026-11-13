@@ -18,6 +18,10 @@
 //! - **Which slot.** HTTP: the request entry reads the request slot and the
 //!   response entry the response slot. Any other protocol states one payload,
 //!   under its response entry: the request slot.
+//! - **A route handler's parameter is not its body** (carrick#4197). An HTTP
+//!   handler is handed the server's request object, so its request entry is
+//!   read as the body at the route's registration call instead, where the
+//!   sidecar follows the handler to the member it reads off that object.
 //! - **Not moved.** A symbol the reader named still publishes its alias (the
 //!   capture takes symbol anchors first), unless the file's own imports and
 //!   declarations do not name it (below); a slot left empty leaves the
@@ -155,6 +159,22 @@ impl SitePayloads {
             if !seen.insert(entry.type_alias.clone()) {
                 continue;
             }
+            // carrick#4197: an HTTP route handler's parameter is the request
+            // object the server hands it (`req`, a context), never the body.
+            // The body is what the handler reads off it, and the request read
+            // at the registration call follows the handler to that read, or
+            // decides the route takes none. Another protocol's handler is run
+            // with its payload, so its parameter stays the slot.
+            // The request asked at the call is marked: where the sidecar
+            // gives it no answer, its span names no payload (carrick#4204).
+            let registration;
+            let (slot, at_registration) = match slot {
+                PayloadAt::Param { .. } if http => {
+                    registration = PayloadAt::Value(site.call.clone());
+                    (&registration, true)
+                }
+                _ => (slot, false),
+            };
             let at = slot.at();
             let Some((span_start, span_end)) =
                 source_of(root, &at.file, &mut sources).map(|source| {
@@ -213,6 +233,7 @@ impl SitePayloads {
                 member,
                 result,
                 route_path: None,
+                at_registration,
                 result_unanswered,
                 through_call,
             });

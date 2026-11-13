@@ -641,6 +641,7 @@ mod tests {
                 result: index.at(&end.file, span, end.line).cloned(),
                 route_path: None,
                 result_unanswered: index.unanswered_at(&end.file, span, end.line),
+                at_registration: false,
                 through_call: None,
             }
         };

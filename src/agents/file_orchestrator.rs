@@ -1751,6 +1751,7 @@ pub(crate) fn route_response_request(
         )),
         param_name: None,
         route_path: None,
+        at_registration: false,
         result_unanswered: false,
         through_call: None,
     }
@@ -5259,6 +5260,9 @@ impl FileOrchestrator {
             Span {
                 span_start: Option<u32>,
                 span_end: Option<u32>,
+                /// The span is a route's registration call, not a payload
+                /// (carrick#4204, [`InferRequestItem::at_registration`]).
+                at_registration: bool,
             },
             Text {
                 expression_text: Option<&'a str>,
@@ -5299,6 +5303,7 @@ impl FileOrchestrator {
                 InferLocator::Span {
                     span_start,
                     span_end,
+                    at_registration,
                 } => {
                     let (Some(start), Some(end)) = (span_start, span_end) else {
                         return false;
@@ -5350,6 +5355,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        at_registration,
                         result_unanswered,
                         through_call: None,
                     });
@@ -5379,6 +5385,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        at_registration: false,
                         result_unanswered,
                         through_call: None,
                     });
@@ -5407,6 +5414,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        at_registration: false,
                         result_unanswered,
                         through_call: None,
                     });
@@ -5810,6 +5818,7 @@ impl FileOrchestrator {
                             InferLocator::Span {
                                 span_start: endpoint.call_expression_span_start,
                                 span_end: endpoint.call_expression_span_end,
+                                at_registration: false,
                             },
                         );
                         if !response_inferred
@@ -5838,6 +5847,7 @@ impl FileOrchestrator {
                         InferLocator::Span {
                             span_start: endpoint.call_expression_span_start,
                             span_end: endpoint.call_expression_span_end,
+                            at_registration: true,
                         },
                     );
                 }
@@ -6005,6 +6015,7 @@ impl FileOrchestrator {
                         InferLocator::Span {
                             span_start: anchor.call_expression_span_start,
                             span_end: anchor.call_expression_span_end,
+                            at_registration: false,
                         },
                     );
                     *call_result.borrow_mut() = (None, false);
@@ -6039,6 +6050,7 @@ impl FileOrchestrator {
                                 InferLocator::Span {
                                     span_start: data_call.call_expression_span_start,
                                     span_end: data_call.call_expression_span_end,
+                                    at_registration: false,
                                 },
                             )
                         }
@@ -6060,6 +6072,7 @@ impl FileOrchestrator {
                             InferLocator::Span {
                                 span_start: Some(param.span_start),
                                 span_end: Some(param.span_end),
+                                at_registration: false,
                             },
                         ),
                         Some(CallBody::Built) => false,
@@ -6270,6 +6283,7 @@ impl FileOrchestrator {
                 member: None,
                 result: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             });
@@ -6646,6 +6660,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        at_registration: false,
                         result_unanswered: false,
                         through_call: None,
                     },
@@ -6669,6 +6684,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: Some(text.clone()),
                         route_path: None,
+                        at_registration: false,
                         result_unanswered: false,
                         through_call: None,
                     },
@@ -6926,6 +6942,7 @@ impl FileOrchestrator {
                 alias: Some(alias),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
                 result_unanswered: false,
                 through_call: None,
             });
@@ -7099,6 +7116,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     param_name: None,
                     route_path: None,
+                    at_registration: false,
                     result_unanswered: false,
                     through_call: None,
                 });

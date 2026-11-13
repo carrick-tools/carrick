@@ -48,6 +48,7 @@ import { installedVersions, lockfileVersions } from './lockfile.js';
 import { installedResolutionEdges, RESOLUTION_FILE } from './resolution-edges.js';
 import { rewriteEmittedSpecifiers } from './paths-rewrite.js';
 import { substituteMachinePathImports } from './machine-paths.js';
+import { forgetStubResolutions, rememberStubResolution } from './stub-resolution.js';
 import { installedPackageSpecifier, typesPackageOf, withInstalledPackages } from './installed-package.js';
 import { selfCheckStub, type SelfCheckArgs } from './self-check.js';
 import { backfillRerun, sharingHost, type BackfillPlan } from './backfill.js';
@@ -65,6 +66,7 @@ import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
+export { withStubResolution, type StubModuleResolver } from './stub-resolution.js';
 export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
 export { serviceConfigPath } from './project-references.js';
 export { referenceRedirectOf, workspaceSourceRedirectOf } from './reference-redirect.js';
@@ -252,6 +254,7 @@ function computeFidelity(records: CaptureAliasRecord[]): CaptureFidelity {
 }
 
 export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
+  forgetStubResolutions();
   const repoRoot = path.resolve(opts.repoRoot);
   const packageName = `@carrick/${sanitizeServiceName(opts.serviceName)}`;
   const stubDir = path.resolve(opts.outDir);
@@ -570,6 +573,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
     [aliases] = selfCheckStub(checkArgs(stub, hostFor(stub.installs)));
   } else {
     ({ first: aliases, second: secondAliases } = selfCheckBoth(stub, second, checkArgs, hostFor));
+  }
+  // The definition resolver reads each stub next, in this process, and must
+  // resolve it as its self-check did (carrick#3995 T5).
+  for (const written of second ? [stub, second] : [stub]) {
+    rememberStubResolution(checkArgs(written, hostFor(written.installs)));
   }
 
   const result = finishStub(stub, aliases, {
