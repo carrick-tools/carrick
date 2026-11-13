@@ -12,7 +12,9 @@
 //!   joins them to the possible calls the fold lists, and writes both
 //!   fields from that one list: `possible_calls` is the projection of the
 //!   listed rows ([`crate::possible_calls`]), byte for byte what it was
-//!   before this field, until its readers move to this one (U5).
+//!   before this field, until its readers move to this one (U5). The one
+//!   pass that runs after it, the call-through pass, adds the sites whose
+//!   model rows it withdraws through [`add`] (carrick#4206).
 //! - **Never an input.** Nothing here feeds findings, the type check, the
 //!   matcher or the PR result.
 //! - **Cap.** At most [`MAX_PER_SERVICE`] rows per service. The rows that
@@ -115,6 +117,37 @@ impl UnreadSite {
         UnreadSite {
             listed: false,
             ..Self::listed(call)
+        }
+    }
+
+    /// A call into a function of the repository whose model row the
+    /// call-through pass withdrew, its walk settling no one request
+    /// ([`crate::call_through::settle`], carrick#4206): the path the call
+    /// requests is that function's, and is not read. `stop_at` is the
+    /// function called, when it is one.
+    pub(crate) fn own_function_call(
+        file: &str,
+        line: u32,
+        (span_start, span_end): (u32, u32),
+        callee_text: &str,
+        stop_at: Option<String>,
+    ) -> Self {
+        UnreadSite {
+            file: file.to_string(),
+            line,
+            span_start,
+            span_end,
+            reason: Stop::OwnFunction,
+            also: Vec::new(),
+            slot: "path".to_string(),
+            callee: callee(callee_text),
+            stop_at,
+            depth: 1,
+            labelled_end: None,
+            kind: None,
+            role: None,
+            ends: Vec::new(),
+            listed: false,
         }
     }
 
@@ -707,6 +740,18 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
             keeps
         });
     }
+    sort_kept(&mut rows);
+    Capped {
+        rows,
+        total,
+        by_reason,
+        not_listed,
+    }
+}
+
+/// The order the blob lists kept rows in: labelled first, then by file, line
+/// and span.
+fn sort_kept(rows: &mut [UnreadSite]) {
     rows.sort_by(|a, b| {
         (
             a.labelled_end.is_none(),
@@ -723,12 +768,54 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
                 b.span_end,
             ))
     });
-    Capped {
-        rows,
-        total,
-        by_reason,
-        not_listed,
+}
+
+/// Add sites a later pass leaves unread to a blob [`attach`] already wrote
+/// (the call-through pass, carrick#4206, which runs once every service is in
+/// hand). A site the list already holds at its span keeps its one reason and
+/// gains the new one in `also` ([`UnreadSite::also`]); it is not counted
+/// again. Each new site counts in `unread_sites_total` and
+/// `unread_sites_by_reason`, and is listed while the list is under
+/// [`MAX_PER_SERVICE`]; past it, it counts under its file in
+/// `unread_sites_not_listed`.
+pub fn add(data: &mut CloudRepoData, sites: Vec<UnreadSite>) {
+    if sites.is_empty() {
+        return;
     }
+    let mut rows = data.unread_sites.take().unwrap_or_default();
+    let mut total = data.unread_sites_total.unwrap_or_default();
+    let mut by_reason = data.unread_sites_by_reason.take().unwrap_or_default();
+    let mut not_listed = data.unread_sites_not_listed.take().unwrap_or_default();
+    // Each site by its span, with its index in `rows` when it is listed.
+    let mut seen: BTreeMap<(String, u32, u32), Option<usize>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| ((row.file.clone(), row.span_start, row.span_end), Some(i)))
+        .collect();
+    for site in sites {
+        let at = (site.file.clone(), site.span_start, site.span_end);
+        match seen.get(&at) {
+            Some(Some(i)) => {
+                rows[*i].also(site.reason);
+                continue;
+            }
+            Some(None) => continue,
+            None => {}
+        }
+        seen.insert(at, (rows.len() < MAX_PER_SERVICE).then_some(rows.len()));
+        total += 1;
+        *by_reason.entry(site.reason).or_default() += 1;
+        if rows.len() < MAX_PER_SERVICE {
+            rows.push(site);
+        } else {
+            *not_listed.entry(site.file).or_default() += 1;
+        }
+    }
+    sort_kept(&mut rows);
+    data.unread_sites = Some(rows);
+    data.unread_sites_total = (total > 0).then_some(total);
+    data.unread_sites_by_reason = (!by_reason.is_empty()).then_some(by_reason);
+    data.unread_sites_not_listed = (!not_listed.is_empty()).then_some(not_listed);
 }
 
 /// Write a service's unread sites on its blob: the possible calls the fold
@@ -1610,5 +1697,48 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::MissedInside);
         assert_eq!(rows[0].also, vec![Stop::Uncorroborated]);
+    }
+
+    /// carrick#4206: the call-through pass adds the sites it withdraws a model
+    /// row at, after `attach` wrote the blob. A new site is listed and
+    /// counted; a site already held at its span keeps its reason, gains the
+    /// new one in `also`, and is not counted twice.
+    #[test]
+    fn a_site_added_after_attach_is_counted_once_and_a_held_one_gains_the_reason() {
+        let mut data = blob();
+        attach(
+            &mut data,
+            vec![stop("src/a.ts", 1, Stop::MissedInside)],
+            &[],
+            &BTreeSet::new(),
+        );
+        let withdrawn = |line: u32| {
+            UnreadSite::own_function_call(
+                "src/a.ts",
+                line,
+                (line * 10, line * 10 + 5),
+                "client.failed",
+                None,
+            )
+        };
+        add(&mut data, vec![withdrawn(1), withdrawn(2), withdrawn(2)]);
+        let rows = data.unread_sites.as_ref().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.line, row.reason, row.also.clone(), row.slot.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (1, Stop::MissedInside, vec![Stop::OwnFunction], "callee"),
+                (2, Stop::OwnFunction, vec![], "path"),
+            ]
+        );
+        assert_eq!(data.unread_sites_total, Some(2));
+        assert_eq!(
+            data.unread_sites_by_reason,
+            Some(BTreeMap::from([
+                (Stop::MissedInside, 1),
+                (Stop::OwnFunction, 1)
+            ]))
+        );
     }
 }

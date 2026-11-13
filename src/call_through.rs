@@ -41,16 +41,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use swc_common::{
-    BytePos, FileName, SourceMap, Span, Spanned,
+    BytePos, FileName, SourceMap, SourceMapper, Span, Spanned,
     errors::{ColorConfig, Handler},
     sync::Lrc,
 };
-use swc_ecma_ast::{CallExpr, Callee, Expr, ExprOrSpread, OptCall, Prop, PropOrSpread, Str, Tpl};
+use swc_ecma_ast::{
+    CallExpr, Callee, Expr, ExprOrSpread, Ident, OptCall, Pat, Prop, PropOrSpread, Str, Tpl,
+    VarDeclarator,
+};
 use swc_ecma_visit::{Visit, VisitWith};
 use tracing::debug;
 
 use crate::agents::file_analyzer_agent::{DataCallResult, FileAnalysisResult, ResolutionSource};
 use crate::agents::file_orchestrator::FileOrchestrator;
+use crate::binding_scope::{BindingKey, ident_key};
 use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind};
 use crate::graphql_document_sites::unwrap_expression;
 use crate::mount_graph::{ConsumerRole, DataFetchingCall};
@@ -155,6 +159,27 @@ pub struct CallThroughSites {
     /// run that analyses the service, so never stored, like
     /// [`Self::written`].
     pub direct: HashSet<(String, u32)>,
+    /// The call each row was placed at, by the row's repository-relative
+    /// file and line ([`RowCall`]): what [`settle`] saves as an unread site
+    /// where it withdraws the row (carrick#4206). Read only in the run that
+    /// analyses the service, so never stored, like [`Self::direct`].
+    pub calls: HashMap<(String, u32), RowCall>,
+}
+
+/// The call a model row was placed at, as the file it is written in reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowCall {
+    /// The call's SWC span in the file parsed on its own.
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The callee as written.
+    pub callee: String,
+    /// An argument is a binding of the file whose value writes a route or a
+    /// URL (`const url = `${base}/accounts`; get(url)`, or `url.toString()`
+    /// of it): the calling code builds the URL the call is handed, so the
+    /// model's path is read off the call's own file, not off a method's
+    /// name.
+    pub passes_written_url: bool,
 }
 
 impl CallThroughSites {
@@ -285,6 +310,7 @@ impl StoredCallThrough {
             leaves: Vec::new(),
             written: HashMap::new(),
             direct: HashSet::new(),
+            calls: HashMap::new(),
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -369,6 +395,7 @@ pub fn read_sites(
             leaves,
             written,
             direct: HashSet::new(),
+            calls: HashMap::new(),
         };
     }
 
@@ -377,6 +404,7 @@ pub fn read_sites(
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
     let mut rows = Vec::new();
     let mut direct = HashSet::new();
+    let mut calls = HashMap::new();
     for key in keys {
         let absolute = if Path::new(key).is_absolute() {
             PathBuf::from(key)
@@ -452,7 +480,7 @@ pub fn read_sites(
             }
         }
         let relative = crate::engine::repo_relative(key, root);
-        let (read, lines) = read_file_sites(
+        let read = read_file_sites(
             &absolute,
             &relative,
             &file_results[key],
@@ -461,8 +489,13 @@ pub fn read_sites(
                 outside: &outside,
             },
         );
-        rows.extend(read);
-        direct.extend(lines.into_iter().map(|line| (relative.clone(), line)));
+        rows.extend(read.rows);
+        direct.extend(read.direct.into_iter().map(|line| (relative.clone(), line)));
+        calls.extend(
+            read.calls
+                .into_iter()
+                .map(|(line, call)| ((relative.clone(), line), call)),
+        );
     }
     CallThroughSites {
         rows,
@@ -471,6 +504,7 @@ pub fn read_sites(
         leaves,
         written,
         direct,
+        calls,
     }
 }
 
@@ -877,16 +911,26 @@ impl Resolution<'_> {
     }
 }
 
+/// One file's model rows as [`read_file_sites`] reads them.
+#[derive(Default)]
+struct FileSites {
+    rows: Vec<SiteRow>,
+    /// The lines of the rows whose call is a direct call of a binding.
+    direct: Vec<u32>,
+    /// The call each row was placed at, by its line.
+    calls: Vec<(u32, RowCall)>,
+}
+
 fn read_file_sites(
     absolute: &Path,
     relative: &str,
     result: &FileAnalysisResult,
     resolution: &Resolution<'_>,
-) -> (Vec<SiteRow>, Vec<u32>) {
+) -> FileSites {
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let Some(module) = parse_file(absolute, &cm, &handler) else {
-        return (Vec::new(), Vec::new());
+        return FileSites::default();
     };
     let positions = Positions { cm: &cm };
 
@@ -905,7 +949,7 @@ fn read_file_sites(
         .filter_map(|call| Some((call, place(&every.calls, call)?)))
         .collect();
     if placed.is_empty() {
-        return (Vec::new(), Vec::new());
+        return FileSites::default();
     }
     let mut direct_calls = DirectCalls {
         positions: &positions,
@@ -913,15 +957,20 @@ fn read_file_sites(
     };
     module.visit_with(&mut direct_calls);
 
+    let mut url_bindings = UrlBindings::default();
+    module.visit_with(&mut url_bindings);
+
     let mut reader = SiteReader {
         positions: &positions,
         wanted: placed.iter().map(|(_, extent)| extent.span()).collect(),
         read: HashMap::new(),
+        url_bindings: &url_bindings.bindings,
     };
     module.visit_with(&mut reader);
 
     let mut rows = Vec::new();
     let mut direct = Vec::new();
+    let mut calls = Vec::new();
     for (call, extent) in placed {
         let Some(site) = reader.read.get(&extent.span()) else {
             continue;
@@ -969,8 +1018,21 @@ fn read_file_sites(
         if direct_calls.spans.contains(&extent.span()) {
             direct.push(line);
         }
+        calls.push((
+            line,
+            RowCall {
+                span_start: extent.lo,
+                span_end: extent.hi,
+                callee: site.callee.clone(),
+                passes_written_url: site.passes_written_url,
+            },
+        ));
     }
-    (rows, direct)
+    FileSites {
+        rows,
+        direct,
+        calls,
+    }
 }
 
 /// The spans of every call whose callee is a bare name (`loadStats(id)`).
@@ -1228,12 +1290,20 @@ struct SiteReading {
     /// call's value (through `await`, parentheses and type assertions), then
     /// the call that one is made on, and so on: outermost first.
     receivers: Vec<(u32, u32)>,
+    /// The callee as written.
+    callee: String,
+    /// An argument is a binding whose value writes a route or a URL
+    /// ([`RowCall::passes_written_url`]).
+    passes_written_url: bool,
 }
 
 struct SiteReader<'a> {
     positions: &'a Positions<'a>,
     wanted: HashSet<(u32, u32)>,
     read: HashMap<(u32, u32), SiteReading>,
+    /// The bindings of the file whose value writes a route or a URL
+    /// ([`UrlBindings`]).
+    url_bindings: &'a HashSet<BindingKey>,
 }
 
 impl SiteReader<'_> {
@@ -1250,6 +1320,14 @@ impl SiteReader<'_> {
         }
         let mut writer = RequestWriter::default();
         node.visit_with(&mut writer);
+        let callee_text = callee
+            .and_then(|callee| self.positions.cm.span_to_snippet(callee.span()).ok())
+            .unwrap_or_default();
+        let passes_written_url = args
+            .iter()
+            .filter(|arg| arg.spread.is_none())
+            .filter_map(|arg| value_binding(&arg.expr))
+            .any(|ident| self.url_bindings.contains(&ident_key(ident)));
 
         let mut spread_calls = Vec::new();
         // The calls in the body of each function-valued argument.
@@ -1296,6 +1374,8 @@ impl SiteReader<'_> {
                 spread_calls,
                 callbacks,
                 receivers,
+                callee: callee_text,
+                passes_written_url,
             },
         );
     }
@@ -1369,6 +1449,52 @@ fn member_object_call(callee: &Expr) -> Option<&CallExpr> {
 #[derive(Default)]
 struct RequestWriter {
     found: bool,
+    /// Read the strings and templates alone, not the calls that state a
+    /// verb: whether a value is a route or a URL, not a request.
+    routes_only: bool,
+}
+
+/// The bindings of a module whose initializer writes a route or a URL
+/// ([`writes_a_route`]): `const url = `${base}/accounts``, or
+/// `const url = new URL(`${base}/accounts`)`. Keyed by the resolver's
+/// identity ([`BindingKey`]), so a name declared again in another scope is
+/// another binding.
+#[derive(Default)]
+struct UrlBindings {
+    bindings: HashSet<BindingKey>,
+}
+
+impl Visit for UrlBindings {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let (Pat::Ident(name), Some(init)) = (&node.name, &node.init) {
+            let mut writer = RequestWriter {
+                routes_only: true,
+                ..RequestWriter::default()
+            };
+            init.visit_with(&mut writer);
+            if writer.found {
+                self.bindings.insert(ident_key(&name.id));
+            }
+        }
+        node.visit_children_with(self);
+    }
+}
+
+/// The binding an argument hands on as its value: `url`, `url.href`, or
+/// `url.toString()`, through `await`, parentheses and type assertions.
+fn value_binding(expr: &Expr) -> Option<&Ident> {
+    match unwrap_expression(expr) {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Member(member) => value_binding(&member.obj),
+        Expr::Call(call) if call.args.is_empty() => match &call.callee {
+            Callee::Expr(callee) => match unwrap_expression(callee) {
+                Expr::Member(member) => value_binding(&member.obj),
+                _ => None,
+            },
+            Callee::Super(_) | Callee::Import(_) => None,
+        },
+        _ => None,
+    }
 }
 
 impl Visit for RequestWriter {
@@ -1388,7 +1514,9 @@ impl Visit for RequestWriter {
     }
 
     fn visit_call_expr(&mut self, node: &CallExpr) {
-        if let Callee::Expr(callee) = &node.callee {
+        if let Callee::Expr(callee) = &node.callee
+            && !self.routes_only
+        {
             let property = match unwrap_expression(callee) {
                 Expr::Member(member) => member.prop.as_ident().map(|ident| ident.sym.to_string()),
                 _ => None,
@@ -1488,6 +1616,13 @@ pub struct Settled {
     /// reaches writes the row's route and hands back a value of its own, not
     /// the request's parsed body ([`drop_copied_response`], carrick#1801).
     pub responses_dropped: usize,
+    /// Rows withdrawn at a call into a function of the repository written in
+    /// another file, where the walk settles no one request, the function
+    /// writes nothing of the row's path and the call is handed no URL its own
+    /// file writes ([`withdraw_unsettled`], carrick#4206): the model's path is
+    /// read off a function's name. Each
+    /// site is saved unread instead (`own_function`).
+    pub unsettled_withdrawn: usize,
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1498,7 +1633,8 @@ pub struct Settled {
 /// | One operation, the row's own | stays the model's and keeps its type anchors; gains `role: wrapper_call` and `reaches_request` |
 /// | One operation, another | takes the reached row's method, target, base and dispatch value; its source becomes `request_summary`; its response type entry is keyed to the reached operation where the call hands back the request's parsed body, and goes otherwise; its request type entry goes |
 /// | One row only the model states, at a call of a helper of the row's own service that writes that row's route and not the row's ([`helper_row`]) | withdrawn: the helper's row is the request |
-/// | None, several, or one beside a request no fact states | left as it is, and counted; where its own helper writes the row's route and does not hand back a parsed body, its response entry goes ([`drop_copied_response`]) |
+/// | None, several, or one beside a request no fact states, at a call into a function of the repository in another file that writes nothing of the row's path and is handed no URL its own file writes ([`withdraw_unsettled`]) | withdrawn, and the site saved unread (`own_function`): the model's path is read off a function's name |
+/// | None, several, or one beside a request no fact states, anywhere else | left as it is, and counted; where its own helper writes the row's route and does not hand back a parsed body, its response entry goes ([`drop_copied_response`]) |
 ///
 /// A corrected row keeps the RESPONSE type anchored at it only where the
 /// row's call is itself the call that reaches the request (its own callee
@@ -1541,6 +1677,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     {
         let mut corrected = 0;
         let mut withdrawn_at_helper = 0;
+        let mut unsettled = Vec::new();
         for row in &service.sites.rows {
             let left = |why: &str| {
                 debug!(
@@ -1556,7 +1693,25 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                 settled.replaced_by_site_row += 1;
                 continue;
             }
-            match decider.decide(row) {
+            let reach = decider.decide(row);
+            // A row the helper it calls states for it goes first (carrick#1794):
+            // that row is the request, so no site is left unread.
+            if matches!(reach, Reach::Unstated)
+                && let Some(request) =
+                    helper_row(&decider, row, &service.sites.direct, &owners, index)
+                && withdraw_at_helper_call(service.data, row, request)
+            {
+                withdrawn_at_helper += 1;
+                continue;
+            }
+            if !matches!(reach, Reach::One { .. })
+                && let Some(site) =
+                    withdraw_unsettled(service.data, row, service.sites, &owners, &graph)
+            {
+                unsettled.push(site);
+                continue;
+            }
+            match reach {
                 Reach::None => {
                     left("reaches no request row");
                     settled.reaches_none += 1;
@@ -1574,13 +1729,6 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     settled.reaches_several += 1;
                 }
                 Reach::Unstated => {
-                    if let Some(request) =
-                        helper_row(&decider, row, &service.sites.direct, &owners, index)
-                        && withdraw_at_helper_call(service.data, row, request)
-                    {
-                        withdrawn_at_helper += 1;
-                        continue;
-                    }
                     left("reaches a request only the model states");
                     settled.reaches_unstated += 1;
                     settled.responses_dropped += usize::from(drop_copied_response(
@@ -1626,8 +1774,16 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         }
         settled.corrected += corrected;
         settled.withdrawn_at_helper += withdrawn_at_helper;
-        let corrected = corrected + withdrawn_at_helper;
+        settled.unsettled_withdrawn += unsettled.len();
+        let corrected = corrected + withdrawn_at_helper + unsettled.len();
         let stated = state_leaves(service, index, &owners, &siblings, &graph, &mut decider);
+        // Saved once the leaf rows are stated: a site a leaf row now states
+        // is read, not unread.
+        let unsettled: Vec<_> = unsettled
+            .into_iter()
+            .filter(|site| !holds_a_row(service.data, &site.file, site.line))
+            .collect();
+        crate::unread_sites::add(service.data, unsettled);
         settled.leaf_rows += stated.own + stated.boundary;
         settled.boundary_rows += stated.boundary;
         settled.boundary_in_wrapper += stated.in_wrapper;
@@ -1670,7 +1826,104 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         "Call-through rows at a call of a helper of their own service: {} withdrawn, the helper writes and states one other route (carrick#1794); {} lost their response entry, the helper writes their route and hands back a value of its own (carrick#1801)",
         settled.withdrawn_at_helper, settled.responses_dropped
     );
+    debug!(
+        "Call-through rows withdrawn at a call into a function of the repository in another file, whose walk settles no one request and whose file hands it no URL it writes: {} (carrick#4206), each site saved unread",
+        settled.unsettled_withdrawn
+    );
     settled
+}
+
+/// Withdraw the model's row `row` names, and give back the site to save
+/// unread, where the walk settled no one request (none, several, or one only
+/// the model states) at a call into a function of the repository written in
+/// another file, the call is handed no URL its own file writes
+/// ([`RowCall::passes_written_url`], carrick#4206), and the function called
+/// does not write the row's last literal segment ([`CallThroughSites::written`],
+/// the test [`helper_row`] reads).
+///
+/// The call writes no request ([`read_sites`]), and the function called
+/// writes nothing of the row's path, so the model's path is read off its name. The site goes
+/// unread instead: `own_function`, slot `path`. A call whose callee nothing
+/// resolves, or resolves into the call's own file, keeps its row, as does a
+/// call handed a URL its own file builds (`get(url)` under
+/// `const url = `${base}/accounts``).
+fn withdraw_unsettled(
+    data: &mut CloudRepoData,
+    row: &SiteRow,
+    sites: &CallThroughSites,
+    owners: &HashMap<String, usize>,
+    graph: &ReachGraph,
+) -> Option<crate::unread_sites::UnreadSite> {
+    let callee = row.steps.first().filter(|callee| !callee.is_empty())?;
+    if !callee
+        .iter()
+        .all(|definition| definition.file != row.file && owners.contains_key(&definition.file))
+    {
+        return None;
+    }
+    // The function called writes the row's route (#1794's test): the path is
+    // read off its body, not off its name.
+    let named = last_literal_segment(&row.target);
+    if callee.iter().any(|definition| {
+        named.as_ref().is_some_and(|named| {
+            graph
+                .written
+                .get(definition)
+                .is_some_and(|written| written.contains(named))
+        })
+    }) {
+        return None;
+    }
+    let call = sites
+        .calls
+        .get(&(row.file.clone(), row.line))
+        .filter(|call| !call.passes_written_url)?;
+    let location = format!("{}:{}", row.file, row.line);
+    let index = data
+        .mount_graph
+        .as_ref()?
+        .data_calls
+        .iter()
+        .position(|stated| {
+            stated.file_location == location
+                && stated.method == row.method
+                && stated.target_url == row.target
+                && stated.resolution_source == Some(ResolutionSource::Model)
+                && stated.reaches_request.is_none()
+        })?;
+    let withdrawn = withdraw_model_row(data, &row.file, row.line, index);
+    debug!(
+        "  - {location}: the model's {} {} withdrawn, its call into {} settles no one request; saved unread",
+        withdrawn.method,
+        withdrawn.target_url,
+        callee
+            .iter()
+            .map(|definition| format!("{}:{}", definition.file, definition.line))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let stop_at = match callee.as_slice() {
+        [one] => Some(format!("{}:{}", one.file, one.line)),
+        _ => None,
+    };
+    Some(crate::unread_sites::UnreadSite::own_function_call(
+        &row.file,
+        row.line,
+        (call.span_start, call.span_end),
+        &call.callee,
+        stop_at,
+    ))
+}
+
+/// Whether a row of the graph stands at `file`:`line`.
+fn holds_a_row(data: &CloudRepoData, file: &str, line: u32) -> bool {
+    let location = format!("{file}:{line}");
+    data.mount_graph.as_ref().is_some_and(|graph| {
+        graph
+            .data_calls
+            .iter()
+            .any(|call| call.file_location == location)
+    })
 }
 
 /// The one helper of `row`'s own service its own callee reaches, when the
@@ -3659,6 +3912,7 @@ mod tests {
                 leaves: Vec::new(),
                 written: HashMap::new(),
                 direct: HashSet::new(),
+                calls: HashMap::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3792,7 +4046,7 @@ mod tests {
                 outside: &outside(),
             },
         )
-        .0
+        .rows
     }
 
     /// [`read_rows`] as (line, steps).
