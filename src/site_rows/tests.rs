@@ -1138,7 +1138,12 @@ fn an_unanswered_lead_on_a_row_line_is_saved_unread_unless_the_code_states_the_r
     let key = || OperationKey::http("POST", "/a");
     let mut calls = vec![
         blob_row(key(), "src/model.ts", 4, Some(ResolutionSource::Model)),
-        blob_row(key(), "src/old.ts", 4, Some(ResolutionSource::NewUrl)),
+        blob_row(
+            key(),
+            "src/old.ts",
+            4,
+            Some(ResolutionSource::SameFileWrapper),
+        ),
         blob_row(
             key(),
             "src/fact.ts",
