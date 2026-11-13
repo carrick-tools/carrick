@@ -95,6 +95,7 @@ pub async fn fact_files_of_tree(
     let semantics_root = super::service_scan_root(&repo_path, &config);
     let (early, first) = tokio::sync::oneshot::channel();
     let (sender, facts) = tokio::sync::oneshot::channel();
+    let implementations = Default::default();
     tokio::join!(
         super::settled_library_answer(Some(&ask), early),
         super::fact_files_of(
@@ -103,7 +104,7 @@ pub async fn fact_files_of_tree(
             &inputs,
             &[],
             &repo,
-            &Default::default(),
+            &implementations,
             super::FirstTrace::Traced {
                 sidecar: Some(&sidecar),
                 from_dir: &semantics_root,
@@ -112,5 +113,5 @@ pub async fn fact_files_of_tree(
         ),
     );
     drop(sidecar);
-    facts.expect("the fact files are sent")
+    facts.await.expect("the fact files are sent")
 }
