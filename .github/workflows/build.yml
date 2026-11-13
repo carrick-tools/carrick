@@ -134,14 +134,25 @@ jobs:
         shell: bash
         run: cd src/sidecar && npm ci && npm run build
 
+      # The example's routes are labelled from the store's answer about the
+      # installed `express`, so the smoke scan installs the stand-in the tests
+      # use, with the public lockfile entry the store's ask needs, and reads
+      # the answer from the example's cassette (carrick#3711).
+      - name: Install the express stand-in
+        shell: bash
+        run: |
+          dir=examples/express-single/node_modules/express
+          mkdir -p "$dir"
+          cp tests/fixtures/real-packages/express/package.json tests/fixtures/real-packages/express/index.d.ts "$dir/"
+          v=$(node -p "require('./$dir/package.json').version")
+          printf '{"name":"express-single","lockfileVersion":3,"requires":true,"packages":{"":{"name":"express-single"},"node_modules/express":{"version":"%s","resolved":"https://registry.npmjs.org/express/-/express-%s.tgz"}}}\n' "$v" "$v" > examples/express-single/package-lock.json
+
       # Run the binary just built (carrick#2197), so a break only a release
       # build has is found here and not at the RC scan.
       - name: Smoke the binary (scan)
         shell: bash
         env:
           CARRICK_MOCK_ALL: "true"
-          # The example's installed `express` stand-in and the store's answer
-          # for it (carrick#3711).
           CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
           EXPECTED_ENDPOINTS: "4"
         run: |

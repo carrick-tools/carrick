@@ -145,9 +145,9 @@ fn test_basic_endpoint_detection() {
         );
     }
 
-    // The example carries the `express` stand-in and the store's answer for
-    // it, which is what labels its routes (carrick#3711); the release-binary
-    // smoke scan in build.yml reads the same answer.
+    // The example carries the store's answer for `express`, which labels its
+    // routes (carrick#3711); the test setup installs `express` in it, and the
+    // smoke scans in ci.yml and build.yml read the same answer.
     let cassettes = test_repo_path.join("__llm__");
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
