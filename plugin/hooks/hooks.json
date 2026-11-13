@@ -20,6 +20,26 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook post-bash",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "carrick hook post-search",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "SessionStart": [
