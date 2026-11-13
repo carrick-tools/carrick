@@ -713,13 +713,16 @@ fn a_file_that_shadows_a_resolution_is_an_input_when_added_or_deleted() {
     assert_analysed(&scan, &["api", "web"]);
 }
 
+/// A shared file's edit: its text before and after.
+type Edit = fn(String) -> String;
+
 /// Cases 7, 8 and 9: the shared tsconfig, the lockfile and carrick.json.
 #[test]
 fn shared_config_lockfile_and_carrick_json_analyse_every_service() {
     // The lockfile is read now that it lists installed packages: a trailing
     // newline moves no package, so its edit is one to its header, which the
     // rule reads as a move of the whole repo's installs.
-    let edits: [(&str, fn(String) -> String); 3] = [
+    let edits: [(&str, Edit); 3] = [
         ("tsconfig.base.json", |text| text + "\n"),
         ("package-lock.json", |text| {
             assert!(text.contains("\"requires\": true"));
