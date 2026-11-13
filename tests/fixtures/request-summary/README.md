@@ -56,7 +56,7 @@ one the source writes.
 | `server.ts:9` | `POST … {action=analysis-job-status}` (inside a lambda) |
 | `server.ts:12` | none: `invalidateCache` sends nothing, and the model's row is withdrawn |
 | `server.ts:13` | `POST … {action=get-cross-repo-data}` |
-| `server.ts:19` | the model's row, kept: `startPolling` constructs a `Poller`, whose constructor sends a request, so it is never proven to send nothing |
+| `server.ts:19` | no row, the site saved unread: `startPolling` constructs a `Poller`, whose constructor sends a request, so it is never proven to send nothing; nothing in the code writes the model's path, so the model's row is withdrawn (carrick#4206) |
 | `negatives.ts`, `tools/misc.ts` | none |
 
 ## Known gaps
