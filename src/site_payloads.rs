@@ -191,6 +191,11 @@ impl SitePayloads {
                 PayloadAt::Result(at) => results.at_anchor(at, repo_path),
                 _ => None,
             };
+            // The label's check died unanswered (carrick#4154).
+            let result_unanswered = match slot {
+                PayloadAt::Result(at) => results.unanswered_at_anchor(at, repo_path),
+                _ => false,
+            };
             requests.push(InferRequestItem {
                 file_path: root.join(&at.file).to_string_lossy().into_owned(),
                 line_number: at.line,
@@ -205,6 +210,7 @@ impl SitePayloads {
                 result,
                 route_path: None,
                 at_registration,
+                result_unanswered,
             });
         }
         requests

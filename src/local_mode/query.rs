@@ -467,6 +467,7 @@ fn not_run(reason: &str, indexed_at: &str) -> Recheck {
         deadline: false,
         scope: None,
         moved: Vec::new(),
+        engine_ready: None,
     }
 }
 
@@ -515,6 +516,7 @@ fn rechecked(
                     deadline: false,
                     scope: None,
                     moved: Vec::new(),
+                    engine_ready: None,
                 },
             );
         }
@@ -541,6 +543,7 @@ fn rechecked(
                 deadline: false,
                 scope: Some(fresh.scope),
                 moved: fresh.moved,
+                engine_ready: Some(fresh.engine_ready),
             },
         ),
         Err(degraded) => (
@@ -559,6 +562,7 @@ fn rechecked(
                 deadline: degraded.deadline,
                 scope: degraded.scope,
                 moved: Vec::new(),
+                engine_ready: None,
             },
         ),
     }

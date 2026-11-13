@@ -533,6 +533,7 @@ fn build_infer_requests(
                 param_name: None,
                 route_path: None,
                 at_registration: false,
+                result_unanswered: false,
             });
             targets.insert(
                 alias,
@@ -564,6 +565,7 @@ fn build_infer_requests(
                 param_name: Some(arg.name.trim_start_matches("...").to_string()),
                 route_path: None,
                 at_registration: false,
+                result_unanswered: false,
             });
             targets.insert(
                 alias,

@@ -19,6 +19,7 @@ import { deliverLate, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
+import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
@@ -150,6 +151,8 @@ export async function editFlow(
       continue;
     }
     const result = results[index] ?? null;
+    const engineReady = engineReadyOf(result);
+    if (input.timing && engineReady !== undefined) input.timing.engineReady = engineReady;
     if (!result) {
       // A probe with no answer queues every file; one unreadable file in a
       // patch of four is no reason to say nothing about the other three.

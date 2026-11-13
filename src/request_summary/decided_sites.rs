@@ -1049,6 +1049,16 @@ pub struct Decided {
     /// is composed through the site's line, by `file:line`. Counted in the
     /// run log.
     pub kept_beside_summaries: Vec<String>,
+    /// With the receiver trace on, the route sites, by file and span, served
+    /// under an instance handed to a member a `mounts` claim the trace's
+    /// ask got no answer for names (carrick#4155,
+    /// [`composed::reads_open`]): the answer could have placed the mount.
+    /// Their saved rows say `unanswered` beside their own reason
+    /// ([`crate::unread_sites::attach`]). The other sites a dead ask moves
+    /// are unread at discovery, saved `unanswered` there
+    /// ([`super::discovery::Discovery::declarations_unanswered`]); the
+    /// tests of carrick#4155 hold both halves to every move.
+    pub scopes_unanswered: BTreeSet<(String, u32, u32)>,
 }
 
 /// A discovered call whose request is decided lower down its chain
@@ -3597,11 +3607,18 @@ fn decide(
     } else {
         Calls::index_with(inputs, siblings, &entered_files)
     };
+    // A scope claim the trace's ask got no answer for is never read as a
+    // scope: only the walk index holds it, for the mounts it could have
+    // placed (carrick#4155, [`composed::reads_open`]).
+    let (open, verified): (Vec<ScopeLabel>, Vec<ScopeLabel>) =
+        scopes.iter().cloned().partition(|label| label.open);
+    let scopes: &[ScopeLabel] = &verified;
     let index = makers.map(|_| {
         instances::WalkIndex::of(
             &calls,
             inputs,
             scopes,
+            open,
             instances::HostLabel::of_discovered(root, discovered, labels),
         )
     });
@@ -3995,6 +4012,15 @@ fn decide(
                 site.composed = composed;
                 // A maker-bound name's walk may have set it already.
                 site.composed_trimmed |= trimmed;
+                // Served under a mount a `mounts` claim the ask got no
+                // answer for could have placed (carrick#4155).
+                if composed::reads_open(&site.instances, &mounts) {
+                    out.scopes_unanswered.insert((
+                        site.file.clone(),
+                        site.span_start,
+                        site.span_end,
+                    ));
+                }
             }
             procedures::Pass {
                 calls: &calls,

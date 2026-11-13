@@ -149,3 +149,22 @@ test("an empty emission is silent, and one with text is printed", async (t) => {
     ["silent", "printed"],
   );
 });
+
+test("a timing row carries engine_ready when the hook learned it, and omits it when not (carrick#3948)", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+  await timed("post-edit", async (timing) => {
+    timing.root = workspace.root;
+    timing.engineReady = false;
+  });
+  await timed("post-edit", async (timing) => {
+    timing.root = workspace.root;
+    timing.engineReady = true;
+  });
+  await timed("post-edit", async (timing) => void (timing.root = workspace.root));
+  assert.deepEqual(
+    readTimings(workspace.root).map((r) => r.engine_ready),
+    [false, true, undefined],
+  );
+  assert.equal("engine_ready" in readTimings(workspace.root)[2]!, false);
+});

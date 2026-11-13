@@ -572,14 +572,14 @@ fn census_repo(
             .collect();
         let declarations =
             super::fixture_walk::census_declarations(&script, &root, service, &inputs, &exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
-        census.scopes_verified += declarations.verified_scopes.len();
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        census.scopes_verified += declarations.scope_answers.len();
         // Traced: each site also names its instance (carrick#2474 R2a),
         // which only the routes section reads.
         let started = std::time::Instant::now();
         let procedures = super::decided_sites::ProcedureLabels::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let decided = decided_sites_traced(
             &inputs,

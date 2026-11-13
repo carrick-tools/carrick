@@ -343,6 +343,7 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         param_name: None,
         route_path: None,
         at_registration: false,
+        result_unanswered: false,
     }
 }
 

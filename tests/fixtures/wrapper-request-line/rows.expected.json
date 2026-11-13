@@ -24,6 +24,7 @@
   "unread_sites": [
     "src/daily.ts:4 unread_expression",
     "src/daily.ts:4 interface_member",
-    "src/forwarding.ts:5 name_never_bound"
+    "src/forwarding.ts:5 name_never_bound",
+    "src/net/relay.ts:4 name_never_bound"
   ]
 }

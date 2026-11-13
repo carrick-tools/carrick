@@ -52,6 +52,9 @@ pub const ALLOW_PARTIAL_ENV: &str = "CARRICK_ALLOW_PARTIAL_ANALYSIS";
 /// existing index is not thinned; a sidecar that never becomes ready aborts
 /// before the analysis, because nothing after that point can recover the
 /// types and the whole LLM spend would buy a typeless index (carrick#748).
+/// It also lands a service whose types the run lost at resolution in place
+/// of a stored index that has them, which the run otherwise keeps
+/// ([`crate::engine::durability::holds_back_for_types`], carrick#3992).
 pub const ALLOW_MISSING_TYPES_ENV: &str = "CARRICK_ALLOW_MISSING_TYPES";
 
 /// Set this (the cloud runner does) to stop the run at the first type-checker
@@ -1055,14 +1058,13 @@ pub fn type_memory_stop() -> Result<(), TypesOutOfMemory> {
     )
 }
 
-/// Whether `service` is to be analysed again, alone, at the run's cap: the
-/// run was told to stop on a memory death, and its checker died of memory
-/// in a way that does not stop the run (beside another service, or under a
-/// cap below the run's; carrick#3084).
+/// Whether `service` is to be analysed again, alone, at the run's cap: its
+/// checker died of memory in a way that does not stop a run told to stop on
+/// one (beside another service, or under a cap below the run's;
+/// carrick#3084). In every mode: without [`FAIL_ON_TYPE_MEMORY_ENV`] such a
+/// death would otherwise land the service typeless, keeping the low cap that
+/// killed it for the next scan (carrick#4180).
 pub fn to_analyse_again_alone(service: Option<&str>) -> bool {
-    if !fail_on_type_memory_from_env() {
-        return false;
-    }
     let run_cap = crate::services::type_sidecar::heap_cap_mb();
     registry()
         .lock()

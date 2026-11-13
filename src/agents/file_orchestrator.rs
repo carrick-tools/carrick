@@ -1752,6 +1752,7 @@ pub(crate) fn route_response_request(
         param_name: None,
         route_path: None,
         at_registration: false,
+        result_unanswered: false,
     }
 }
 
@@ -5283,16 +5284,19 @@ impl FileOrchestrator {
         // The verified result of the consumer call whose response requests
         // are being pushed (carrick#2819): set before them, cleared after, and
         // carried by `CallResult` items only.
-        let call_result: std::cell::RefCell<Option<crate::services::type_sidecar::ResultShape>> =
-            std::cell::RefCell::new(None);
+        // With it, whether that call's check died unanswered (carrick#4154).
+        let call_result: std::cell::RefCell<(
+            Option<crate::services::type_sidecar::ResultShape>,
+            bool,
+        )> = std::cell::RefCell::new((None, false));
         let mut push_infer = |file_path: &str,
                               line_number: u32,
                               infer_kind: InferKind,
                               alias: String,
                               locator: InferLocator<'_>| {
-            let result = match infer_kind {
+            let (result, result_unanswered) = match infer_kind {
                 InferKind::CallResult => call_result.borrow().clone(),
-                _ => None,
+                _ => (None, false),
             };
             match locator {
                 InferLocator::Span {
@@ -5351,6 +5355,7 @@ impl FileOrchestrator {
                         param_name: None,
                         route_path: None,
                         at_registration,
+                        result_unanswered,
                     });
                     true
                 }
@@ -5379,6 +5384,7 @@ impl FileOrchestrator {
                         param_name: None,
                         route_path: None,
                         at_registration: false,
+                        result_unanswered,
                     });
                     true
                 }
@@ -5406,6 +5412,7 @@ impl FileOrchestrator {
                         param_name: None,
                         route_path: None,
                         at_registration: false,
+                        result_unanswered,
                     });
                     true
                 }
@@ -5976,16 +5983,17 @@ impl FileOrchestrator {
                         );
                     }
 
-                    *call_result.borrow_mut() = self
-                        .result_index
-                        .at(
-                            crate::utils::repo_relative_source_path(anchor_file, repo_path),
-                            anchor
-                                .call_expression_span_start
-                                .zip(anchor.call_expression_span_end),
-                            anchor_line,
-                        )
-                        .cloned();
+                    let call_file = crate::utils::repo_relative_source_path(anchor_file, repo_path);
+                    let call_span = anchor
+                        .call_expression_span_start
+                        .zip(anchor.call_expression_span_end);
+                    *call_result.borrow_mut() = (
+                        self.result_index
+                            .at(call_file, call_span, anchor_line)
+                            .cloned(),
+                        self.result_index
+                            .unanswered_at(call_file, call_span, anchor_line),
+                    );
                     let call_inferred = push_infer(
                         &anchor_absolute,
                         anchor_line,
@@ -6006,7 +6014,7 @@ impl FileOrchestrator {
                             at_registration: false,
                         },
                     );
-                    *call_result.borrow_mut() = None;
+                    *call_result.borrow_mut() = (None, false);
                     if !call_inferred && let Some(symbol) = anchor.primary_type_symbol.as_ref() {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
@@ -6272,6 +6280,7 @@ impl FileOrchestrator {
                 result: None,
                 route_path: None,
                 at_registration: false,
+                result_unanswered: false,
             });
         }
         debug!(
@@ -6647,6 +6656,7 @@ impl FileOrchestrator {
                         param_name: None,
                         route_path: None,
                         at_registration: false,
+                        result_unanswered: false,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6669,6 +6679,7 @@ impl FileOrchestrator {
                         param_name: Some(text.clone()),
                         route_path: None,
                         at_registration: false,
+                        result_unanswered: false,
                     },
                 };
                 requests.push(request);
@@ -6925,6 +6936,7 @@ impl FileOrchestrator {
                 param_name: None,
                 route_path: None,
                 at_registration: false,
+                result_unanswered: false,
             });
         }
         debug!(
@@ -7097,6 +7109,7 @@ impl FileOrchestrator {
                     param_name: None,
                     route_path: None,
                     at_registration: false,
+                    result_unanswered: false,
                 });
             }
         }
@@ -11608,8 +11621,15 @@ impl FileOrchestrator {
         // phase line's `types` covers this round trip plus the scanner-side
         // request collection (carrick#767).
         let round_trip = std::time::Instant::now();
+        // A call whose result label went unanswered is not inferred: read
+        // without the label, its type is the envelope (carrick#4154).
+        let asked: Vec<InferRequestItem> = infer
+            .iter()
+            .filter(|request| !request.result_unanswered)
+            .cloned()
+            .collect();
         let mut result = sidecar
-            .resolve_all_types(&explicit, &infer, extraction_config, server_claims)
+            .resolve_all_types(&explicit, &asked, extraction_config, server_claims)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         // Every request as sent, for the type-reach record (carrick#3101).
         result.note_request_files(&explicit, &infer);

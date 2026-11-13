@@ -58,9 +58,10 @@ fn sidecar_built() -> bool {
     true
 }
 
-/// Each call row of the scan's one blob as `file:line METHOD path`.
-fn rows() -> Option<&'static Vec<String>> {
-    static ROWS: OnceLock<Option<Vec<String>>> = OnceLock::new();
+/// Each call row of the scan's one blob as `file:line METHOD path`, and each
+/// unread site as `file:line reason slot`.
+fn scan() -> Option<&'static (Vec<String>, Vec<String>)> {
+    static ROWS: OnceLock<Option<(Vec<String>, Vec<String>)>> = OnceLock::new();
     ROWS.get_or_init(|| {
         if !sidecar_built() {
             return None;
@@ -124,6 +125,7 @@ fn rows() -> Option<&'static Vec<String>> {
             String::from_utf8_lossy(&output.stderr)
         );
         let mut rows: Vec<String> = Vec::new();
+        let mut unread: Vec<String> = Vec::new();
         for entry in fs::read_dir(&store).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|ext| ext != "json") {
@@ -142,11 +144,25 @@ fn rows() -> Option<&'static Vec<String>> {
                     call["key"]["path"].as_str().unwrap_or_default(),
                 ));
             }
+            for site in blob["unread_sites"].as_array().into_iter().flatten() {
+                unread.push(format!(
+                    "{}:{} {} {}",
+                    site["file"].as_str().unwrap_or_default(),
+                    site["line"].as_u64().unwrap_or_default(),
+                    site["reason"].as_str().unwrap_or_default(),
+                    site["slot"].as_str().unwrap_or_default(),
+                ));
+            }
         }
         rows.sort();
-        Some(rows)
+        unread.sort();
+        Some((rows, unread))
     })
     .as_ref()
+}
+
+fn rows() -> Option<&'static Vec<String>> {
+    scan().map(|(rows, _)| rows)
 }
 
 /// The row at `file:line`, or `None` when the scan states none there.
@@ -236,5 +252,32 @@ fn a_relative_input_replaces_the_last_segment_of_a_literal_base() {
     assert_row(
         "src/resolve-urls.ts:16",
         "GET https://api.example.test/things/list",
+    );
+}
+
+// carrick#4153: the model's row at `new URL(rel, opaqueBase)` stays, and the
+// site is saved as unread (a row the code did not decide stands there).
+
+#[test]
+fn a_model_row_at_a_new_url_on_a_runtime_base_keeps_its_row_and_saves_the_site() {
+    assert_row("src/resolve-urls.ts:21", "GET /things/list");
+    let Some((rows, unread)) = scan() else { return };
+    assert!(
+        unread
+            .iter()
+            .any(|site| site == "src/resolve-urls.ts:21 unread_expression path"),
+        "{unread:#?}\n{rows:#?}"
+    );
+}
+
+#[test]
+fn the_template_twin_is_a_code_row_with_no_unread_path_site() {
+    assert_row("src/resolve-urls.ts:26", "GET /things/list");
+    let Some((_, unread)) = scan() else { return };
+    assert!(
+        !unread
+            .iter()
+            .any(|site| site.starts_with("src/resolve-urls.ts:26 ") && site.ends_with(" path")),
+        "{unread:#?}"
     );
 }

@@ -15,7 +15,7 @@
 //! their verdicts do not depend on it, and a refused result never fails the
 //! claim it sits on. Protocol-blind: any op or maker the store labels.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::library_claims::ExportClaims;
 use crate::request_summary::discovery::{Discovery, SiteEnd, claim_receivers};
@@ -130,6 +130,12 @@ pub struct ResultIndex {
     /// Keyed by file and line, only where the line holds exactly one
     /// discovered end.
     by_line: BTreeMap<(String, u32), ResultShape>,
+    /// carrick#4154: the labelled calls whose `result` check was asked and
+    /// never answered (the engine died), by file and SWC span.
+    unanswered_by_span: BTreeSet<(String, u32, u32)>,
+    /// The same calls by file and line, only where the line holds exactly
+    /// one discovered end, as `by_line` keys them.
+    unanswered_by_line: BTreeSet<(String, u32)>,
     /// The checks asked.
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
@@ -197,6 +203,80 @@ impl ResultIndex {
             }
         }
         index
+    }
+
+    /// The index of `answer` to `ask`: [`Self::of`] its verdicts, or, when
+    /// the ask failed, [`Self::unanswered`].
+    pub fn answered<E>(
+        ask: &ResultAsk,
+        answer: Result<&[SemanticsResult], E>,
+        discovery: &Discovery,
+    ) -> Self {
+        match answer {
+            Ok(verdicts) => Self::of(ask, verdicts, discovery),
+            Err(_) => Self::unanswered(ask, discovery),
+        }
+    }
+
+    /// The index of an ask the compiler engine never answered
+    /// (carrick#4154): no result is verified, and every discovered end a
+    /// check was asked for is held as unanswered, keyed as [`Self::of`] keys
+    /// a verified one, so a type request at it can say it was read without
+    /// the answer instead of reading the library's envelope as the body.
+    pub fn unanswered(ask: &ResultAsk, discovery: &Discovery) -> Self {
+        let mut index = ResultIndex {
+            checks: ask.checks.len(),
+            ..ResultIndex::default()
+        };
+        let mut ends: BTreeMap<(&str, u32, u32), &SiteEnd> = BTreeMap::new();
+        for end in discovery.sites.iter().filter_map(|site| site.end.as_ref()) {
+            ends.entry((end.file.as_str(), end.span_start, end.span_end))
+                .or_insert(end);
+        }
+        let mut on_line: BTreeMap<(&str, u32), usize> = BTreeMap::new();
+        for end in ends.values() {
+            *on_line.entry((end.file.as_str(), end.line)).or_default() += 1;
+        }
+        for end in ends.values() {
+            if !ask.ends.iter().any(|asked| asked.names(end)) {
+                continue;
+            }
+            index
+                .unanswered_by_span
+                .insert((end.file.clone(), end.span_start, end.span_end));
+            if on_line[&(end.file.as_str(), end.line)] == 1 {
+                index
+                    .unanswered_by_line
+                    .insert((end.file.clone(), end.line));
+            }
+        }
+        index
+    }
+
+    /// Whether the labelled call at `file` with SWC span `span` (with no
+    /// span, the one end on `line`) had its `result` check asked and never
+    /// answered, keyed as [`Self::at`] reads a verified one.
+    pub fn unanswered_at(&self, file: &str, span: Option<(u32, u32)>, line: u32) -> bool {
+        match span {
+            Some((start, end)) => self
+                .unanswered_by_span
+                .contains(&(file.to_string(), start, end)),
+            None => self.unanswered_by_line.contains(&(file.to_string(), line)),
+        }
+    }
+
+    /// [`Self::unanswered_at`] for the call a site record anchors at
+    /// `anchor`, keyed as [`Self::at_anchor`] reads it.
+    pub fn unanswered_at_anchor(
+        &self,
+        anchor: &crate::request_summary::site_record::AnchorAt,
+        repo_path: &str,
+    ) -> bool {
+        self.unanswered_at(
+            crate::utils::repo_relative_source_path(&anchor.file, repo_path),
+            Some((anchor.span_start, anchor.span_end)),
+            anchor.line,
+        )
     }
 
     /// The verified result of the labelled call at `file` with SWC span
@@ -505,5 +585,183 @@ mod tests {
             );
         }
         assert_eq!(index.at("src/client.ts", None, 25), None);
+    }
+
+    /// carrick#4154, end to end on the fixture with the real sidecar: the
+    /// result ask answered, and the same ask dead (`Err("process died")`).
+    /// Each labelled call's response is inferred with the answer, and as the
+    /// dead run reads it, without one. Exactly the calls whose type moves
+    /// between the two are published unread with `site_unreadable`; every
+    /// other call keeps the type it is read with.
+    #[test]
+    fn a_dead_result_ask_marks_only_the_calls_its_answer_would_retype() {
+        use crate::services::type_sidecar::{CaptureAnchor, InferKind, InferRequestItem};
+        let Some(on) = fixture_walk::walked("result-shape-client", ".", "web", &[], true) else {
+            return;
+        };
+        let script = fixture_walk::sidecar().expect("the built sidecar");
+        let exports = exports();
+        let labels = Labels::of(&exports);
+        let discovery = discover_with(&on.inputs, &[], &labels, &on.repo);
+        let ask = result_checks(&exports, &discovery);
+        let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
+        sidecar.set_scan_root(&on.repo);
+        sidecar.start_init(&on.repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(300))
+            .expect("the sidecar is ready");
+        let verdicts = sidecar
+            .verify_library_claims(&on.repo, &ask.checks)
+            .expect("the verify request answers")
+            .verdicts;
+        let answered = ResultIndex::answered::<&str>(&ask, Ok(&verdicts), &discovery);
+        let dead = ResultIndex::answered(&ask, Err("process died"), &discovery);
+        assert!(dead.is_empty(), "a dead ask verifies nothing");
+        // Every discovered end once, as the type request at its call.
+        let mut ends: BTreeMap<(String, u32, u32), &SiteEnd> = BTreeMap::new();
+        for end in discovery.sites.iter().filter_map(|site| site.end.as_ref()) {
+            ends.entry((end.file.clone(), end.span_start, end.span_end))
+                .or_insert(end);
+        }
+        assert!(ends.len() >= 5, "{ends:#?}");
+        let request = |alias: &str, end: &SiteEnd, index: &ResultIndex| {
+            let source = std::fs::read_to_string(on.repo.join(&end.file)).expect("source");
+            let span = Some((end.span_start, end.span_end));
+            InferRequestItem {
+                file_path: on.repo.join(&end.file).to_string_lossy().into_owned(),
+                line_number: end.line,
+                span_start: Some(crate::utils::sidecar_position(&source, end.span_start)),
+                span_end: Some(crate::utils::sidecar_position(&source, end.span_end)),
+                expression_text: None,
+                expression_line: None,
+                infer_kind: InferKind::CallResult,
+                alias: Some(alias.to_string()),
+                param_name: None,
+                member: None,
+                result: index.at(&end.file, span, end.line).cloned(),
+                route_path: None,
+                result_unanswered: index.unanswered_at(&end.file, span, end.line),
+                at_registration: false,
+            }
+        };
+        let aliases: Vec<String> = (0..ends.len()).map(|i| format!("Call{i}")).collect();
+        let build = |index: &ResultIndex| -> Vec<InferRequestItem> {
+            ends.values()
+                .zip(&aliases)
+                .map(|(end, alias)| request(alias, end, index))
+                .collect()
+        };
+        let typed = |requests: &[InferRequestItem]| -> BTreeMap<String, String> {
+            sidecar
+                .infer_types(requests, None)
+                .expect("infer")
+                .inferred_types
+                .unwrap_or_default()
+                .into_iter()
+                .map(|inferred| (inferred.alias, inferred.type_string))
+                .collect()
+        };
+        // With the answer, and as the dead ask leaves each call: no result.
+        let with_answer = typed(&build(&answered));
+        let mut bare = build(&dead);
+        for request in &mut bare {
+            request.result_unanswered = false;
+        }
+        let without_answer = typed(&bare);
+        let changed: BTreeSet<&str> = aliases
+            .iter()
+            .filter(|alias| with_answer.get(*alias) != without_answer.get(*alias))
+            .map(String::as_str)
+            .collect();
+        assert!(!changed.is_empty(), "{with_answer:#?} {without_answer:#?}");
+        // The dead run as the scan publishes it: unmarked requests inferred,
+        // marked ones not.
+        let sent = build(&dead);
+        let asked: Vec<InferRequestItem> = sent
+            .iter()
+            .filter(|request| !request.result_unanswered)
+            .cloned()
+            .collect();
+        let inferred = sidecar
+            .infer_types(&asked, None)
+            .expect("infer")
+            .inferred_types
+            .unwrap_or_default();
+        let root = on.repo.to_string_lossy();
+        let anchors = crate::engine::type_compat_v2::derive_capture_anchors(
+            &[],
+            &sent,
+            &[],
+            &inferred,
+            &aliases,
+            &root,
+        );
+        let marked: BTreeSet<&str> = anchors
+            .iter()
+            .filter_map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    type_text,
+                    unread_cause: Some("site_unreadable"),
+                    ..
+                } if type_text == "unknown" => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect();
+        let asked: BTreeSet<&str> = ends
+            .values()
+            .zip(&aliases)
+            .filter(|(end, _)| ask.ends.iter().any(|asked| asked.names(end)))
+            .map(|(_, alias)| alias.as_str())
+            .collect();
+        let shown = format!("with the answer: {with_answer:#?}\nwithout it: {without_answer:#?}");
+        // Every call whose type the answer would have moved is marked: none
+        // ships the envelope as its body.
+        assert!(
+            changed.is_subset(&marked),
+            "{marked:?} {changed:?}\n{shown}"
+        );
+        // Only calls a check was asked for are marked. Which of them the
+        // answer would have left alone (a refused label, a label whose part
+        // reads as the bare call does) only the dead answer knew, so those are
+        // marked too: unknown, never a wrong type.
+        assert_eq!(marked, asked, "{shown}");
+        // Calls the label did not reach, every other type, are as before.
+        for request in sent.iter().filter(|request| !request.result_unanswered) {
+            let alias = request.alias.as_deref().unwrap();
+            assert_eq!(with_answer.get(alias), without_answer.get(alias), "{shown}");
+        }
+    }
+
+    /// carrick#4154: a dead ask holds as unanswered exactly the discovered
+    /// calls a check was asked for, keyed as a verified result is (by span,
+    /// and by line only where one end sits on it). An answered ask, or no
+    /// ask, holds none.
+    #[test]
+    fn a_dead_ask_holds_only_its_asked_calls_unanswered() {
+        let get = end(Some("get"), Some(LibraryOp::Request), 4, (10, 30));
+        let send = end(Some("send"), Some(LibraryOp::Request), 4, (40, 60));
+        let alone = end(Some("get"), Some(LibraryOp::Request), 9, (90, 99));
+        let unlabelled = end(Some("unlabelled"), Some(LibraryOp::Request), 12, (120, 130));
+        let discovery = discovery_of_ends(vec![get, send, alone, unlabelled]);
+        let exports = exports();
+        let ask = result_checks(&exports, &discovery);
+        let dead = ResultIndex::answered(&ask, Err("process died"), &discovery);
+        assert!(dead.is_empty());
+        assert_eq!(dead.checks, ask.checks.len());
+        let file = "src/client.ts";
+        assert!(dead.unanswered_at(file, Some((10, 30)), 4));
+        assert!(dead.unanswered_at(file, Some((40, 60)), 4));
+        assert!(dead.unanswered_at(file, Some((90, 99)), 9));
+        assert!(dead.unanswered_at(file, None, 9));
+        // The line holds two ends: it names neither.
+        assert!(!dead.unanswered_at(file, None, 4));
+        // No check was asked for this call.
+        assert!(!dead.unanswered_at(file, Some((120, 130)), 12));
+        assert!(!dead.unanswered_at(file, Some((1, 2)), 4));
+        let answered = ResultIndex::answered::<&str>(&ask, Ok(&verified(&ask)), &discovery);
+        assert!(!answered.unanswered_at(file, Some((10, 30)), 4));
+        let refused = ResultIndex::answered::<&str>(&ask, Ok(&[]), &discovery);
+        assert!(!refused.unanswered_at(file, Some((10, 30)), 4));
     }
 }
