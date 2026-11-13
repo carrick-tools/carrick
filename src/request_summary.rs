@@ -10966,7 +10966,7 @@ struct CallerLedger {
     /// The direct calls made where a module is loaded, per function they
     /// reach, as `(file, line, span start)` (carrick#4121). This pass states
     /// no row for them; the fact layer may.
-    module_calls: HashMap<(PathBuf, String), BTreeSet<(PathBuf, u32, u32)>>,
+    module_calls: HashMap<(PathBuf, String), ModuleCalls>,
     /// The requests, by file and span start, whose every caller this pass
     /// read and stated ([`RequestSummaryIndex::answered_at_callers`]).
     closed: HashSet<(PathBuf, u32)>,
@@ -10985,8 +10985,12 @@ pub struct HeldAtModule {
     /// The request's own line.
     pub line: u32,
     /// The module-level calls, as `(file, line, span start)`.
-    pub module_calls: BTreeSet<(PathBuf, u32, u32)>,
+    pub module_calls: ModuleCalls,
 }
+
+/// Direct calls made where a module is loaded, as `(file, line, span
+/// start)` ([`HeldAtModule::module_calls`]).
+pub type ModuleCalls = BTreeSet<(PathBuf, u32, u32)>;
 
 /// The calls the summaries' rows and stops were composed through (C11 T1,
 /// [`Summary::through`]).

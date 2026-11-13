@@ -535,6 +535,11 @@ fn modules_named_by_candidates(file: &PartedFile<'_>) -> Option<Vec<BTreeSet<usi
     )
 }
 
+/// Per request line held at its module-level calls, by file and span start:
+/// the summary callers stating it ([`HeldRequestLine::stating`],
+/// carrick#4121).
+type HeldStating = HashMap<(String, u32), Vec<(String, u32, bool)>>;
+
 /// Complete result of file-centric analysis
 #[derive(Debug)]
 pub struct FileCentricAnalysisResult {
@@ -4651,7 +4656,7 @@ impl FileOrchestrator {
         // known only at the site fold. Its summary callers pass the same
         // test as above now, so the fold need only ask about the facts.
         let mut held_open: Vec<(String, u32, crate::request_summary::HeldAtModule)> = Vec::new();
-        let mut held_stating: HashMap<(String, u32), Vec<(String, u32, bool)>> = HashMap::new();
+        let mut held_stating: HeldStating = HashMap::new();
         for (pf, _) in &analyzed {
             let file = PathBuf::from(&pf.path_str);
             for (start, held) in summaries.held_at_module(&file) {
@@ -9062,7 +9067,7 @@ impl FileOrchestrator {
     /// out.
     fn held_request_lines(
         held_open: Vec<(String, u32, crate::request_summary::HeldAtModule)>,
-        mut stating: HashMap<(String, u32), Vec<(String, u32, bool)>>,
+        mut stating: HeldStating,
         file_results: &HashMap<String, FileAnalysisResult>,
     ) -> Vec<HeldRequestLine> {
         let mut lines = Vec::new();
