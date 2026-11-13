@@ -489,6 +489,8 @@ function checkedRecord(
   // placeholder out because the check heals a pinned external; what the index
   // publishes is this tree, so the record says where it does not resolve.
   let unresolvedPaths: string[] = [];
+  // The alias's own type is a genuine `any`/`unknown` (carrick#4046).
+  let rootStatesTopType = false;
   const seeds: string[] = [];
   let statementText: string | undefined;
 
@@ -509,6 +511,10 @@ function checkedRecord(
         unresolvedPaths = findUnresolvedPlaceholders(type, ctx.program, ctx.checker, stmt.name);
       } else if (isErrorPlaceholder(type)) {
         unresolvedPaths = [''];
+      } else if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) {
+        // A genuine root `any`/`unknown`, not TypeScript's unresolved-reference
+        // placeholder and not `never` (carrick#4046).
+        rootStatesTopType = true;
       }
       // Seed the closure with the alias's own import-type targets.
       const visit = (node: ts.Node) => {
@@ -578,6 +584,9 @@ function checkedRecord(
   // phase must pre-gate exactly these: its probe gates are whole-type only and
   // cannot see a member-level any.
   let unexplainedDeep: DeepTopType[] = [];
+  // Located, and the type is itself a bare `any`/`unknown` nothing explains
+  // away: the declaration states it (carrick#4046).
+  let declaredTop = false;
   const deep = deepFindings[0];
   if (internalFailure) {
     outcome = 'decayed_internal';
@@ -611,6 +620,7 @@ function checkedRecord(
       }
     } else {
       // Root top type with no external explanation.
+      declaredTop = rootStatesTopType;
       outcome = 'decayed_internal';
       detail = 'alias resolved to a top type with no allowlisted external failure';
     }
@@ -662,6 +672,15 @@ function checkedRecord(
         }
       : {}),
     ...literalMarks(anchor.request),
+    // An abstain keeps its own reason (stated, or none): its `unknown` is
+    // this layer's wording, not a type the source declares. So does a literal
+    // whose text is the driver's `unknown` placeholder.
+    ...(declaredTop &&
+    !anchor.abstainReason &&
+    !(anchor.request.kind === 'literal' && anchor.request.type_text.trim() === 'unknown') &&
+    !unreadCause(anchor).unread_cause
+      ? { unread_cause: 'declared' as const }
+      : {}),
     ...unreadCause(anchor),
   };
   return statementText === undefined

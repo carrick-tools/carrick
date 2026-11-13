@@ -13284,15 +13284,13 @@ fn stamp_capture_provenance(
         if entry.type_state != ManifestTypeState::Unknown || !entry.any_provenance.is_empty() {
             continue;
         }
+        let cause = record.unread_cause.as_deref().unwrap_or("not_recorded");
         let (kind, reason) = match entry.v1_before_demotion {
             Some(v1) => (
                 if v1.holds_any { "any" } else { "unknown" },
-                "unplaced_top_type",
+                if v1.bare { cause } else { "unplaced_top_type" },
             ),
-            None => (
-                "unknown",
-                record.unread_cause.as_deref().unwrap_or("not_recorded"),
-            ),
+            None => ("unknown", cause),
         };
         entry
             .any_provenance
@@ -14150,15 +14148,27 @@ fn enrich_manifest_with_type_resolution(
                 // about it beside the demotion: whether the source wrote that
                 // top type is the capture record's to say, and when it did,
                 // the entry returns to this state (carrick#1752).
-                entry.v1_before_demotion =
-                    (!placeholder).then_some(crate::cloud_storage::V1Demotion {
+                //
+                // A bare top type is recorded too, as `bare`, so the entry's
+                // root finding says the kind the bundle printed
+                // (carrick#4046).
+                entry.v1_before_demotion = Some(if placeholder {
+                    crate::cloud_storage::V1Demotion {
+                        state: ManifestTypeState::Implicit,
+                        holds_any: type_string.trim().trim_end_matches(';').trim() == "any",
+                        bare: true,
+                    }
+                } else {
+                    crate::cloud_storage::V1Demotion {
                         state: if *is_explicit {
                             ManifestTypeState::Explicit
                         } else {
                             ManifestTypeState::Implicit
                         },
                         holds_any: type_compat_v2::text_uses_any_as_type(type_string),
-                    });
+                        bare: false,
+                    }
+                });
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
                 entry.evidence.is_explicit = false;
@@ -26864,6 +26874,35 @@ unfollowed_member_calls_total: 0,
             vec![("unknown", "not_recorded", None)]
         );
         assert!(manifest[1].any_provenance.is_empty());
+    }
+
+    /// carrick#4046: a type v1 printed as a bare top type keeps the kind the
+    /// bundle says (`any` stays `any`), with the record's cause as the reason.
+    /// With no cause it still says `not_recorded`.
+    #[test]
+    fn a_bare_top_type_keeps_the_kind_the_bundle_printed() {
+        for (printed, kind) in [("any", "any"), ("any;", "any"), ("unknown", "unknown")] {
+            for (cause, reason) in [(Some("declared"), "declared"), (None, "not_recorded")] {
+                let mut manifest = enriched_explicit(printed);
+                assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+                let mut extra = serde_json::json!({
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": true
+                });
+                if let Some(cause) = cause {
+                    extra["unread_cause"] = serde_json::json!(cause);
+                }
+                let records = records_from(serde_json::json!([record_json("OrderView", extra)]));
+
+                join_capture_answers(&mut manifest, Vec::new(), &records);
+
+                assert_eq!(
+                    root_findings(&manifest[0]),
+                    vec![(kind, reason, None)],
+                    "v1 printed {printed}, cause {cause:?}"
+                );
+            }
+        }
     }
 
     /// A shape v1 printed with a top type nothing places reads

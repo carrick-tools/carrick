@@ -202,10 +202,10 @@ describe('capture: an untyped alias carries the cause the capture decided (carri
     assert.strictEqual(r.unread_cause, 'not_located');
   });
 
-  it('a decided abstain (a status table with no success body) carries no cause', () => {
+  it('a decided abstain (a status table with no success body) says no_success_payload (carrick#4046)', () => {
     const r = record(records, 'Status_Table_Response');
     assert.match(r.self_check_detail ?? '', /no success row/);
-    assert.strictEqual(r.unread_cause, undefined);
+    assert.strictEqual(r.unread_cause, 'no_success_payload');
   });
 
   it('a typed alias carries no cause', () => {
