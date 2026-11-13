@@ -46,8 +46,10 @@ export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = p
   // Four fixed variables, set after both spreads so neither the process env
   // nor the caller's can override them (R42.1): no replace ref answering for
   // another tree, no lazy fetch of a missing object, no transport of any kind,
-  // and no credential prompt. A hook never uses the network.
-  return git(dir, args, factsGitBudgetMs(env), {
+  // and no credential prompt. A hook never uses the network. An explicit
+  // `core.useReplaceRefs=true` (repo, global or env config) outranks
+  // GIT_NO_REPLACE_OBJECTS, so the command line, read last, turns it off (R42.2).
+  return git(dir, ["-c", "core.useReplaceRefs=false", ...args], factsGitBudgetMs(env), {
     ...process.env,
     ...env,
     GIT_NO_REPLACE_OBJECTS: "1",

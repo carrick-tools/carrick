@@ -1460,3 +1460,35 @@ test("R42.1: a caller's env cannot unset what keeps the facts git local and exac
   assert.ok(calls.some((line) => line.includes("ls-tree")), calls.join("\n"));
   for (const line of calls) assert.match(line, /^replace=1 protocol=none lazy=1 prompt=0 /);
 });
+
+const REPLACE_REFS_ON: Array<{ name: string; setup: (t: { after: (fn: () => void) => void }, web: string) => NodeJS.ProcessEnv }> = [
+  { name: "repo config", setup: (_t, web) => (gitIn(web, "config", "core.useReplaceRefs", "true"), {}) },
+  {
+    name: "global config (GIT_CONFIG_GLOBAL)",
+    setup: (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-global-config-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const file = path.join(dir, "gitconfig");
+      fs.writeFileSync(file, "[core]\n\tuseReplaceRefs = true\n");
+      return { GIT_CONFIG_GLOBAL: file };
+    },
+  },
+  { name: "env config (GIT_CONFIG_COUNT)", setup: () => ({ GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.useReplaceRefs", GIT_CONFIG_VALUE_0: "true" }) },
+];
+
+for (const arm of REPLACE_REFS_ON) {
+  test(`R42.2: core.useReplaceRefs=true in ${arm.name} does not let a replace ref answer for the index commit`, async (t) => {
+    const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [OP_PEER, FN_PEER]);
+    const web = ws.at("web");
+    const env = { ...process.env, CARRICK_FACT_LINES: "1", ...arm.setup(t, web) };
+    // Control: with the config set and no replace ref, the peer line prints.
+    assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined, { env })).lines, [OP_PEER.text, LOAD_LINE]);
+    // The call moves down a line on disk; a replace ref makes the index commit read as the moved tree.
+    const indexCommit = gitIn(web, "rev-parse", "HEAD").trim();
+    fs.writeFileSync(path.join(web, "src/page.ts"), `// moved down\n${PAGE}`);
+    gitIn(web, "commit", "-q", "-am", "moved");
+    gitIn(web, "replace", indexCommit, gitIn(web, "rev-parse", "HEAD").trim());
+    // The stored line (":3") is now wrong; the only right answer is silence.
+    assert.deepEqual((await factLines(ws.root, [inLoadOrder(ws)], undefined, { env })).lines, []);
+  });
+}
