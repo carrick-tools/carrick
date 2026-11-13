@@ -22,6 +22,7 @@
 
 import { readStdin } from "./stdin.ts";
 import { sessionKey } from "./session-key.ts";
+import { factsEnabled } from "../facts/enabled.ts";
 import path from "node:path";
 import fs from "node:fs";
 import { bashTargets, MENTIONS_FACT_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
@@ -122,7 +123,9 @@ async function main(): Promise<void> {
     // A shell write names no changed lines: the file's diff against HEAD does
     // (`facts/diff.ts`); a file the session never saw, untracked, counts whole.
     const changes = new Map<string, { lines?: number[]; removed?: number[]; whole?: boolean }>();
-    if (channel.channel === "hook") {
+    // With the fact lines off, no changed lines are computed and git is never
+    // asked (R36.5); the files still take the flow they took before.
+    if (channel.channel === "hook" && factsEnabled()) {
       const { changesAgainstHead } = await import("../facts/diff.ts");
       for (const file of capped) {
         const found = changesAgainstHead(file, unseen.has(file));

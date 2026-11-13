@@ -21,6 +21,9 @@ import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
 import type { Timing } from "./timings.ts";
 import { factLines } from "../facts/lines.ts";
+import type { FactEdit } from "../facts/lines.ts";
+import { isManifest } from "../facts/rules/packages.ts";
+import { factsEnabled } from "../facts/enabled.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -42,7 +45,7 @@ export async function editFlow(
      * file, a shell write, a patch hunk that cannot be placed) gets no fact
      * lines: which lines changed is not known.
      */
-    changes?: ReadonlyMap<string, { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean }>;
+    changes?: ReadonlyMap<string, Omit<FactEdit, "file">>;
     /**
      * The files came from a shell command's write shapes, not from an edit
      * tool, so who wrote them is not proven: a file in another linked
@@ -50,8 +53,9 @@ export async function editFlow(
      */
     shell?: boolean;
     /**
-     * Files the fact path reads that the probe does not (JavaScript, `FACT_FILE`):
-     * they get fact lines and nothing else, so `edited` may be empty.
+     * Files the fact path reads that the probe does not (JavaScript,
+     * `FACT_FILE`; a `package.json`): they get fact lines and nothing else,
+     * are never probed, queued or recorded as an edit, so `edited` may be empty.
      */
     factOnly?: string[];
   },
@@ -90,6 +94,22 @@ export async function editFlow(
   // file is queued for the background runner (carrick#3198).
   const answers = edited.length > 0 ? await probeEdits(relatives, choice.root) : { results: [], failure: null, ms: 0 };
   if (input.timing) input.timing.waitedMs = answers.ms;
+  // Where each operation the edited code serves or calls sits in other
+  // files, and who calls the edited functions, from the fact file
+  // (`facts/lines.ts`): read locally, beside the probe's answer, never
+  // instead of it. Read before the probe's answer is rendered: a file the
+  // fact file covers gets its callers from there, not the uses-count line.
+  const facts =
+    channel.channel === "hook"
+      ? await factLines(
+          choice.root,
+          [...edited, ...(input.factOnly ?? [])]
+            .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
+            .map((file) => ({ file, ...input.changes?.get(file) })),
+          session,
+        )
+      : null;
+  const covered = new Set(facts?.callersRead ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
@@ -111,8 +131,15 @@ export async function editFlow(
       continue;
     }
     const key = toldKey(result, relative);
-    const show = !session || !wasTold(session, key);
-    if (show && result.uses_lines?.length) told.push(key);
+    // With a fact file for this file's repo, its callers are fact lines
+    // (v1-agent's Q2 ruling); the uses-count line is the fallback without one.
+    const show = !covered.has(edited[index]!) && (!session || !wasTold(session, key));
+    if (show && result.uses_lines?.length) {
+      told.push(key);
+      // Counted only where the line is delivered (the hook channel) and the
+      // fact lines could have stood in for it (the switch is on).
+      if (input.timing && facts !== null && factsEnabled()) input.timing.usesFallback = true;
+    }
     const context = renderPostToolUse(result, relative, { uses: show });
     log(`check ${relative} -> ${context ? "context" : "nothing to say"} in ${answers.ms}ms`);
     if (context) rendered.set(index, context);
@@ -120,7 +147,9 @@ export async function editFlow(
 
   const queued = new Set<string>();
   if (toQueue.length > 0 && session) {
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt);
+    // A file whose callers the fact lines answered keeps its late answer free
+    // of the uses-count line too, as this answer would have been.
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     // A queued file says nothing now: its answer is delivered with the next
@@ -163,20 +192,10 @@ export async function editFlow(
     }
   }
 
-  if (channel.channel !== "hook") {
+  if (facts === null) {
     log(`the ${channel.channel} channel owns delivery in this install; printing nothing`);
     return;
   }
-  // Where each operation the edited code serves or calls sits in other
-  // files, from the fact file (`facts/lines.ts`): read locally, beside the
-  // probe's answer, never instead of it.
-  const facts = await factLines(
-    choice.root,
-    [...edited, ...(input.factOnly ?? [])]
-      .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
-      .map((file) => ({ file, ...input.changes?.get(file) })),
-    session,
-  );
   if (input.timing) input.timing.factsMs = facts.ms;
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.
@@ -186,7 +205,10 @@ export async function editFlow(
   // possible moment, so the once-a-day stamp is spent only on a line that is
   // actually delivered, and inside `additionalContext` rather than on a bare
   // stdout line, which this host reads as a malformed hook response.
-  const mismatch = throttledVersionMismatch(choice.root, currentVersion());
+  // A call that touched only `package.json` files says only its fact lines and
+  // owed late answers, as before fact files: no version notice.
+  const sourceTouched = edited.length > 0 || (input.factOnly ?? []).some((file) => !isManifest(file));
+  const mismatch = sourceTouched ? throttledVersionMismatch(choice.root, currentVersion()) : null;
   if (mismatch) contexts.push(mismatch);
   if (told.length > 0 && session) markTold(session, told);
   if (led.length > 0 && session) markLed(session, led);

@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
+import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
 import { scanSource } from "../src/facts/match.ts";
@@ -42,10 +43,13 @@ async function factsWorkspace(
     const slug = (JSON.parse(ndjson.slice(0, ndjson.indexOf("\n"))) as { project_slug: string }).project_slug;
     fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
     fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: slug }] } }));
+    // Each fixture repo committed, and the header naming its commit. A repo
+    // the fixture has no folder for is not checked out here, so not mapped.
+    const local = REPOS.filter((repo) => fs.existsSync(path.join(root, repo)));
     await buildFacts(
-      ndjson,
+      commitRepos(root, ndjson, local),
       factsPath(root),
-      REPOS.map((repo) => ({ repo, path: path.join(root, repo) })),
+      local.map((repo) => ({ repo, path: path.join(root, repo) })),
       options.fetchedAt ?? new Date().toISOString(),
     );
   }
@@ -93,12 +97,55 @@ const header = (repos: string[]) =>
   });
 
 const row = (fields: Record<string, unknown>) =>
-  JSON.stringify({ k: "op", service: fields["repo"], others: [], total: 0, source: "handler", ...fields });
+  // A peer in the row's own repo, a committed fixture checkout (`commitRepos`
+  // writes the file): ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"], others: [{ service: fields["repo"], repo: fields["repo"], file: "src/peer.ts", line: 1 }], total: 0, source: "handler", ...fields });
 
 test("the wire fixture is the pinned one", () => {
   const pinned = fs.readFileSync(path.join(testDir, "facts-fixture.sha256"), "utf8").split(/\s+/)[0];
   const actual = crypto.createHash("sha256").update(fs.readFileSync(WIRE)).digest("hex");
   assert.equal(actual, pinned);
+});
+
+test("every row of the pinned fixture is ingested", async (t) => {
+  const ws = await factsWorkspace(t);
+  const wire = fs.readFileSync(WIRE, "utf8").split("\n").filter(Boolean).slice(1).map((line) => (JSON.parse(line) as { k: string }).k);
+  const tables: Record<string, string> = { op: "rows", fn: "fns", name: "names", pkg: "pkgs" };
+  const sqlite = (await loadSqlite())!;
+  const db = new sqlite.DatabaseSync(factsPath(ws.root), { readOnly: true });
+  for (const [kind, table] of Object.entries(tables)) {
+    const stored = Number(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!["n"]);
+    assert.equal(stored, wire.filter((k) => k === kind).length, kind);
+  }
+  db.close();
+});
+
+// The pinned fixture's fn, name and pkg rows (writer 2), on the workspace's own files.
+
+test("the pinned fixture's fn row: an edit in formatPrice names its callers", async (t) => {
+  const ws = await factsWorkspace(t);
+  assert.deepEqual(await linesFor(ws, "web-app/src/lib/format.ts", "const whole = Math.floor(cents / 100);"), [
+    "formatPrice is called from web-app/src/cart/total.ts:4, web-app/src/checkout/summary.ts:14",
+  ]);
+});
+
+test("the pinned fixture's name rows: a new file declaring slugify names the first other declaration", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("gateway/src/slug.ts");
+  fs.writeFileSync(file, "export function slugify(text: string): string {\n  return text;\n}\n");
+  assert.deepEqual((await factLines(ws.root, [{ file, whole: true }], undefined)).lines, [
+    "a function named slugify is declared at orders-api/src/util/slug.ts:1",
+  ]);
+});
+
+test("the pinned fixture's pkg row: a service bumping its own spec is told only the others'", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/package.json");
+  const before = fs.readFileSync(file, "utf8").split("\n");
+  const at = before.findIndex((line) => line.includes("@demo/http-kit")) + 1;
+  fs.writeFileSync(file, before.map((line, i) => (i === at - 1 ? line.replace("^4.18.2", "^4.20.0") : line)).join("\n"));
+  const lines = (await factLines(ws.root, [{ file, lines: [at], removed: [at], removedText: [before[at - 1]!] }], undefined)).lines;
+  assert.deepEqual(lines, ["@demo/http-kit is ^4.19.0 in web-app"]);
 });
 
 // Naming rule 3 first: the dotted path of keys from a const-bound object.
@@ -121,9 +168,11 @@ test("naming rule 1: a declared function and a const-bound arrow are found by na
 
 test("naming rule 2: a class method and a class field holding an arrow are Class.member", async (t) => {
   const ws = await factsWorkspace(t);
-  assert.deepEqual(await linesFor(ws, "web-app/src/billing/client.ts", "await this.http.post("), [
-    "POST /events {type=refund} is served at billing-api/src/routes/events.ts:7",
-  ]);
+  // The producer sits in billing-api, which this workspace does not check out:
+  // silent (R40.2). The method is still named Class.member.
+  assert.deepEqual(await linesFor(ws, "web-app/src/billing/client.ts", "await this.http.post("), []);
+  const billing = scanSource(fs.readFileSync(ws.at("web-app/src/billing/client.ts"), "utf8"));
+  assert.ok(billing.spans.some((span) => span.name === "BillingClient.refund"));
   assert.deepEqual(await linesFor(ws, "web-app/src/chat/client.ts", 'this.socket.emit("chat:send", { text });'), [
     "CLIENT->SERVER chat:send is handled at gateway/src/chat.ts:4",
   ]);
@@ -444,19 +493,45 @@ test("an Edit's patch hunks place the change by line, deletions included", async
   const file = ws.at("orders-api/src/routes/orders.ts");
   const lineOf = (needle: string) => fs.readFileSync(file, "utf8").split("\n").findIndex((line) => line.includes(needle)) + 1;
   const at = lineOf("res.status(201).json(created);");
+  const text = fs.readFileSync(file, "utf8").split("\n");
+  // A deletion just above the line: the new text is empty, so only the hunk
+  // places it. Its context lines are the file's lines around the gap.
+  const hunk = { oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [` ${text[at - 2]}`, "-  // gone", ` ${text[at - 1]}`] };
+  const removal = (session: string) =>
+    runHook("post-edit.ts", {
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        session_id: session,
+        cwd: ws.root,
+        tool_input: { file_path: file, old_string: "  // gone\n", new_string: "" },
+        tool_response: { structuredPatch: [hunk] },
+      },
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+    });
+  assert.equal(context((await removal("patch")).stdout), "POST /orders is called at web-app/src/boot.ts:4");
+});
+
+test("a removal-only hunk that went stale is unplaced", async (t) => {
+  const ws = await factsWorkspace(t);
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const text = fs.readFileSync(file, "utf8").split("\n");
+  const at = text.findIndex((line) => line.includes("res.status(201).json(created);")) + 1;
+  const hunk = { oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [` ${text[at - 2]}`, "-  // gone", ` ${text[at - 1]}`] };
+  // Ten lines were put on top after the Edit: the hunk's gap now sits inside getOrder.
+  fs.writeFileSync(file, `${"// added\n".repeat(10)}${text.join("\n")}`);
   const run = await runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",
       tool_name: "Edit",
-      session_id: "patch",
+      session_id: "stale",
       cwd: ws.root,
-      // A deletion just above the line: the new text is empty, so only the hunk places it.
       tool_input: { file_path: file, old_string: "  // gone\n", new_string: "" },
-      tool_response: { structuredPatch: [{ oldStart: at - 1, oldLines: 3, newStart: at - 1, newLines: 2, lines: [" ctx", "-  // gone", " ctx"] }] },
+      tool_response: { structuredPatch: [hunk] },
     },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
   });
-  assert.equal(context(run.stdout), "POST /orders is called at web-app/src/boot.ts:4");
+  assert.equal(context(run.stdout), "");
 });
 
 /** Run the post-edit hook for an Edit of `file` whose result carries `hunks`. */
@@ -567,14 +642,7 @@ function payloadEdit(ws: FactsWorkspace, payload: Record<string, unknown>, sessi
 
 /** Make `repo` in the workspace a git repository with its files committed. */
 function gitRepo(ws: FactsWorkspace, repo: string): void {
-  const dir = ws.at(repo);
-  const git = (...args: string[]) => {
-    const run = spawnSync("git", ["-C", dir, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { encoding: "utf8" });
-    assert.equal(run.status, 0, run.stderr);
-  };
-  git("init", "-q");
-  git("add", ".");
-  git("commit", "-q", "-m", "init");
+  commitAll(ws.at(repo));
 }
 
 test("a Write over an existing file, whose changed lines are unknown, prints nothing", async (t) => {
@@ -607,7 +675,9 @@ test("a file this Write created, untracked in git, counts every named thing in i
   const text = fs.readFileSync(ws.at("orders-api/src/routes/orders.ts"), "utf8");
   fs.writeFileSync(file, text);
   const payload = { tool_name: "Write", tool_input: { file_path: file, content: text }, tool_response: { type: "create", filePath: file } };
-  // Its rows are another file's, still on disk: nothing, by the named-row rule.
+  // Its op rows are another file's, still on disk: none print, by the named-row
+  // rule. The name kind's line for getOrder would state orders.ts:12, but this
+  // fixture copy declares getOrder at line 11: unproven on disk, so silent (R33.3).
   assert.equal(context((await payloadEdit(ws, payload)).stdout), "");
   // A tracked file is never "created by this call".
   fs.rmSync(file);
@@ -632,7 +702,9 @@ test("Codex apply_patch: its hunks place the change; a hunk that cannot be place
     tool_input: { command: patch(["@@ export async function getOrder", "   if (!order) {", '-    res.status(404).json({ error: "not found" });', '+    res.status(410).json({ error: "not found" });'] ) },
   });
   assert.equal(context(placed.stdout), GET_ORDER_LINE);
-  // The hunk's new text is nowhere in the file: nothing.
+  // The hunk's new text is nowhere in the file, and the file reads as HEAD
+  // (the diff fallback has nothing either): nothing.
+  gitRepo(ws, "orders-api");
   const lost = await payloadEdit(ws, { tool_name: "apply_patch", tool_input: { command: patch(["@@", "-  res.status(201).json(created);", "+  res.status(299).json(created);"]) } }, "lost");
   assert.equal(context(lost.stdout), "");
   // `*** Add File` of a file git does not track: every thing in it counts.
@@ -979,8 +1051,10 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
   fs.writeFileSync(path.join(ws.root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo-shop" }] } }));
   fs.writeFileSync(
     path.join(ws.root, ".carrick", "index.json"),
-    JSON.stringify({ repos: REPOS.map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }),
+    JSON.stringify({ repos: REPOS.filter((repo) => fs.existsSync(ws.at(repo))).map((repo) => ({ name: repo, path: ws.at(repo), services: [] })) }),
   );
+  // The fixture repos committed; the served file's header names those commits.
+  const wire = commitRepos(ws.root, fs.readFileSync(WIRE, "utf8"), REPOS.filter((repo) => fs.existsSync(ws.at(repo))));
   const { gzipSync } = await import("node:zlib");
   const calls: Array<{ url: string; auth: string | null }> = [];
   const request = (async (url: string, init?: RequestInit) => {
@@ -991,7 +1065,7 @@ test("a fresh digest is fetched, unzipped and built; an unchanged one is one rea
       if (body.known_digest) return new Response(JSON.stringify({ unchanged: true }));
       return new Response(JSON.stringify({ staged_url: "https://facts.s3.eu-west-1.amazonaws.com/x?sig=1", digest: "d", schema: 1, writer: 1, bytes: 1 }));
     }
-    return new Response(gzipSync(fs.readFileSync(WIRE)));
+    return new Response(gzipSync(wire));
   }) as typeof fetch;
   const env = { ...process.env, CARRICK_TOKEN: "t" };
   assert.equal(await refreshFacts(ws.root, { request, env }), "written");

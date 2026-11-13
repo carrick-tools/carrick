@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 /** The nearest directory at or above `start` holding a `.git`, and whether it is a linked worktree (`.git` is a file). */
-function checkoutOf(start: string): { top: string; linked: boolean } | null {
+export function checkoutOf(start: string): { top: string; linked: boolean } | null {
   let dir = start;
   for (;;) {
     try {
@@ -19,6 +19,29 @@ function checkoutOf(start: string): { top: string; linked: boolean } | null {
     const parent = path.dirname(dir);
     if (parent === dir) return null;
     dir = parent;
+  }
+}
+
+/**
+ * The git directory every worktree of the checkout at `top` shares: `top/.git`
+ * itself, or for a linked worktree the one its `.git` file and `commondir`
+ * point at. Read from the files, no git run. Null when there is none.
+ */
+export function commonGitDir(top: string): string | null {
+  try {
+    const dotGit = path.join(top, ".git");
+    if (fs.statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!pointer) return null;
+    const gitdir = path.resolve(top, pointer);
+    try {
+      return path.resolve(gitdir, fs.readFileSync(path.join(gitdir, "commondir"), "utf8").trim());
+    } catch {
+      const at = gitdir.lastIndexOf(`${path.sep}worktrees${path.sep}`);
+      return at >= 0 ? gitdir.slice(0, at) : null;
+    }
+  } catch {
+    return null;
   }
 }
 

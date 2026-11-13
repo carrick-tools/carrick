@@ -24,11 +24,14 @@ import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import fs from "node:fs";
 import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
-import { MAX_FACT_FILE_BYTES } from "../facts/lines.ts";
+import { MAX_FACT_FILE_BYTES } from "../facts/files.ts";
+import type { FactEdit } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
 import { sessionKey } from "./session-key.ts";
+import { isManifest } from "../facts/rules/packages.ts";
+import { factsEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
 import { timed, type Timing } from "./timings.ts";
 
@@ -78,6 +81,8 @@ type Payload = {
 export function filesFromPayload(payload: Payload): string[] {
   const input = payload.tool_input ?? {};
   const named = input.file_path ?? input.filePath ?? input.edits?.[0]?.file_path ?? null;
+  // A payload naming its file with a non-string (`file_path: 123`) names none of ours.
+  if (named !== null && typeof named !== "string") return [];
   if (named) return [named];
   return typeof input.command === "string" ? patchedFiles(input.command) : [];
 }
@@ -107,7 +112,14 @@ async function main(timing: Timing): Promise<void> {
   const absolute = (file: string) => (path.isAbsolute(file) ? file : path.resolve(cwd ?? process.cwd(), file));
   const named = filesFromPayload(payload);
   const edited = named.filter((file) => CHECKED.test(file)).map(absolute);
-  const factOnly = named.filter((file) => FACT_ONLY.test(file)).map(absolute);
+  // JavaScript (`FACT_FILE`) and a `package.json` (`facts/rules/packages.ts`)
+  // reach the fact lines only: the probe and re-check never run on them.
+  // With the fact lines off, no fact work at all: no manifest, no changed
+  // lines computed, no git (R36.5). JavaScript still takes the edit flow it
+  // took before fact lines (owed late answers, the version notice), so the
+  // output is the same as without this package's fact kinds.
+  const factsOn = factsEnabled();
+  const factOnly = named.filter((file) => FACT_ONLY.test(file) || (factsOn && isManifest(file))).map(absolute);
   const session = sessionKey(payload);
   if (edited.length === 0 && factOnly.length === 0) {
     // Nothing of ours to check in this edit, but a finished background answer
@@ -120,21 +132,20 @@ async function main(timing: Timing): Promise<void> {
   }
 
   timing.file = (edited[0] ?? factOnly[0])!;
-  const changes = await changesFromPayload(payload, [...edited, ...factOnly], cwd);
+  const changes = factsOn ? await changesFromPayload(payload, [...edited, ...factOnly], cwd) : undefined;
   await editFlow({ cwd, session, channel: channel.channel, timing, changes, factOnly }, edited);
 }
 
-type Change = { lines?: number[]; removed?: number[]; snippets?: string[]; whole?: boolean };
+type Change = Omit<FactEdit, "file">;
 
 /**
- * Whether git, asked in the file's folder, says it does not track `file`;
- * false when git cannot say. Loaded only on this path, which a created file
- * alone takes.
+ * Whether git, asked in the file's folder through the facts git runner, says
+ * it does not track `file`; false when git cannot say. Loaded only on this
+ * path, which a created file alone takes.
  */
 async function untracked(file: string): Promise<boolean> {
-  const { trackedPaths } = await import("../init/repo-copies.ts");
-  const tracked = trackedPaths(path.dirname(file), [path.basename(file)]);
-  return tracked !== null && tracked.size === 0;
+  const { untrackedFile } = await import("../facts/diff.ts");
+  return untrackedFile(file);
 }
 
 /** The file's changed lines against HEAD (`facts/diff.ts`), or null when not known. */
@@ -195,8 +206,12 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
     // A removed line is not a line of the file now: it is the gap just above
     // the line that now sits where it was (`facts/match.ts` `gapsOfLines`).
     const removed: number[] = [];
-    // Each added line's text must be the file's line at that number now; a
-    // formatter that ran after the tool moves them, and then the hunks are unplaced.
+    const removedText: string[] = [];
+    // Each added and each context line's text must be the file's line at that
+    // number now; a formatter that ran after the tool moves them, and then the
+    // hunks are unplaced (a removal-only hunk is checked by its context alone).
+    // Placed hunks carry the removed text, from which the file before the
+    // edit is rebuilt (`facts/rules/same-name.ts`).
     let now: string[];
     try {
       if (fs.statSync(edited[0]!).size > MAX_FACT_FILE_BYTES) return new Map();
@@ -209,18 +224,22 @@ async function changesFromPayload(payload: Payload, edited: string[], cwd: strin
       let at = hunk.newStart;
       for (const text of hunk.lines) {
         if (typeof text !== "string" || text.startsWith("\\")) continue;
-        if (text.startsWith("+")) {
-          if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) {
-            // Unplaced: the file's diff against HEAD, as for a Codex patch.
-            const found = await againstHead(edited[0]!, false);
-            return found ? new Map([[edited[0]!, found]]) : new Map();
-          }
-          lines.push(at++);
-        } else if (text.startsWith("-")) removed.push(at);
-        else at += 1;
+        if (text.startsWith("-")) {
+          removed.push(at);
+          removedText.push(text.slice(1));
+          continue;
+        }
+        if (now[at - 1]?.replace(/\r$/, "") !== text.slice(1).replace(/\r$/, "")) {
+          // Unplaced: the file's diff against HEAD, as for a Codex patch (no
+          // removed text: that diff rebuilds HEAD, not the file before this call).
+          const found = await againstHead(edited[0]!, false);
+          return found ? new Map([[edited[0]!, found]]) : new Map();
+        }
+        if (text.startsWith("+")) lines.push(at);
+        at += 1;
       }
     }
-    return new Map([[edited[0]!, { lines, removed }]]);
+    return new Map([[edited[0]!, { lines, removed, removedText }]]);
   }
   const texts = [
     changedMiddle(input.old_string, input.new_string),

@@ -17,6 +17,11 @@ import {
 // Tests that exercise them import this file, so it turns the switch on for the
 // test process and, through `fakeEnv`, for every hook child. The off test unsets it.
 process.env["CARRICK_FACT_LINES"] = "1";
+// A test that expects a fact line must not lose it to a slow git call (the
+// diff against HEAD, the peer proof) on a busy machine: in this process and,
+// through `fakeEnv`, in every hook child. A test of the budget itself passes
+// its own value.
+process.env["CARRICK_FACTS_DIFF_BUDGET_MS"] = "5000";
 
 export const testDir =path.dirname(fileURLToPath(import.meta.url));
 export const pluginDir = path.dirname(testDir);
@@ -162,8 +167,6 @@ export function fakeEnv(overrides: Record<string, string> = {}): NodeJS.ProcessE
     // The fixtures speak in absolute paths under /workspace; an integration
     // test's workspace is a fresh temp directory, so the fake CLI rebases them.
     CARRICK_FAKE_REBASE: "1",
-    // A test that expects a fact line must not lose it to a slow `git diff` on a busy machine.
-    CARRICK_FACTS_DIFF_BUDGET_MS: "5000",
     ...overrides,
   };
 }

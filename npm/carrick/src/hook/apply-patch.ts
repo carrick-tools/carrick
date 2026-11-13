@@ -150,11 +150,16 @@ export function patchEdits(text: string): Map<string, { added: true } | { hunks:
  * the 1-based lines they added, and the lines they removed lines just above.
  * Each hunk's new text (its context and `+` lines) must be found exactly once
  * in the file; otherwise null, and nothing is said about the file.
+ * `removedText` is each removed line's text, in the order of `removed`.
  */
-export function placeHunks(text: string, hunks: readonly string[][]): { lines: number[]; removed: number[] } | null {
+export function placeHunks(
+  text: string,
+  hunks: readonly string[][],
+): { lines: number[]; removed: number[]; removedText: string[] } | null {
   const fileLines = text.split("\n");
   const lines: number[] = [];
   const removed: number[] = [];
+  const removedText: string[] = [];
   for (const hunk of hunks) {
     const after = hunk.filter((line) => !line.startsWith("-")).map((line) => line.slice(1));
     if (after.length === 0) return null;
@@ -169,9 +174,11 @@ export function placeHunks(text: string, hunks: readonly string[][]): { lines: n
     let at = found + 1;
     for (const line of hunk) {
       if (line.startsWith("+")) lines.push(at++);
-      else if (line.startsWith("-")) removed.push(at);
-      else at += 1;
+      else if (line.startsWith("-")) {
+        removed.push(at);
+        removedText.push(line.slice(1));
+      } else at += 1;
     }
   }
-  return { lines, removed };
+  return { lines, removed, removedText };
 }

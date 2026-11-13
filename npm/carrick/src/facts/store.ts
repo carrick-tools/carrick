@@ -2,9 +2,12 @@
 // (`fetch.ts`) from the cloud's NDJSON and opened read-only by the hooks.
 //
 // Wire contract: carrick-cloud `docs/internal/reference/edit-facts-wire.md`
-// (schema 1). The file lives at `<root>/.carrick/facts/edit-facts.s<schema>.sqlite`
+// (schema 1). The file lives at `<root>/.carrick/facts/edit-facts.s<schema>.l<LOCAL>.sqlite`
 // and is written under a temporary name and renamed, so a hook never opens a
-// half-built file. A `meta` table holds the project, digest, schema, writer,
+// half-built file. `LOCAL` is this package's table layout: a new row kind's
+// table bumps it, so a file built by an older package is never found (and
+// never read with a table missing); the refresh then fetches the whole file,
+// as it does when there is none. A `meta` table holds the project, digest, schema, writer,
 // built_at, fetched_at and each repo's commit; a file whose schema is not
 // `SCHEMA` is not read.
 //
@@ -16,6 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createLogger } from "../log.ts";
+import { isRecord } from "../fs-util.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 
 const log = createLogger("carrick-facts");
@@ -42,8 +46,33 @@ export type FactRow = {
   text: string;
 };
 
+/** A function's callers in other files (`k: "fn"`), as the wire states it. */
+export type FnRow = {
+  repo: string;
+  file: string;
+  line: number;
+  name: string;
+  others: Array<{ repo: string; file: string; line: number; name: string }>;
+  total: number;
+  text: string;
+};
+
+/** One declaration of a function name (`k: "name"`), as the wire states it. */
+export type NameRow = { name: string; repo: string; file: string; line: number; text: string };
+
+/** A package two or more services declare (`k: "pkg"`), as the wire states it. */
+export type PkgRow = {
+  package: string;
+  /** `others_text`: the row's sentence without this service (absent in a file an older cloud wrote). */
+  services: Array<{ repo: string; service: string; spec: string; manifest: string; others_text?: string }>;
+  text: string;
+};
+
+/** This package's table layout; bumped with every table a new row kind adds. */
+export const LOCAL_LAYOUT = 3;
+
 export function factsPath(root: string, schema: number = SCHEMA): string {
-  return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.sqlite`);
+  return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.l${LOCAL_LAYOUT}.sqlite`);
 }
 
 type Sqlite = typeof import("node:sqlite");
@@ -78,6 +107,14 @@ export type FactStore = {
   repos: LocalRepo[];
   byName: (repo: string, name: string) => FactRow[];
   unnamed: (repo: string, file: string) => FactRow[];
+  /** The `fn` rows of a function `name` in `repo`, in any file. */
+  callers: (repo: string, name: string) => FnRow[];
+  /** Every declaration of a function `name`, in any repo, ordered by (repo, file). */
+  declarations: (name: string) => NameRow[];
+  /** Which of `names` are declared in some file but not in `file` of `repo`, in one query. */
+  declaredOnlyElsewhere: (names: readonly string[], repo: string, file: string) => Set<string>;
+  /** The `pkg` row of a package, or null. */
+  packageRow: (name: string) => PkgRow | null;
   close: () => void;
 };
 
@@ -127,12 +164,43 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const repos = open.prepare("SELECT repo, path FROM repos").all().map((raw) => ({ repo: String(raw["repo"]), path: String(raw["path"]) }));
     const byName = open.prepare("SELECT * FROM rows WHERE repo = ? AND name = ? ORDER BY id");
     const unnamed = open.prepare("SELECT * FROM rows WHERE repo = ? AND file = ? AND name IS NULL ORDER BY id");
+    const callers = open.prepare("SELECT * FROM fns WHERE repo = ? AND name = ? ORDER BY id");
+    const declarations = open.prepare("SELECT * FROM names WHERE name = ? ORDER BY repo, file, line");
+    const declaredOnlyElsewhere = open.prepare(
+      "SELECT name FROM names WHERE name IN (SELECT value FROM json_each(?)) GROUP BY name HAVING SUM(repo = ? AND file = ?) = 0",
+    );
+    const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
     handed = true;
     return {
       meta,
       repos,
       byName: (repo, name) => byName.all(repo, name).map((raw) => toRow(raw as Record<string, unknown>)),
       unnamed: (repo, rel) => unnamed.all(repo, rel).map((raw) => toRow(raw as Record<string, unknown>)),
+      callers: (repo, name) =>
+        callers.all(repo, name).map((raw) => ({
+          repo: String(raw["repo"]),
+          file: String(raw["file"]),
+          line: Number(raw["line"]),
+          name: String(raw["name"]),
+          others: JSON.parse(String(raw["others"])) as FnRow["others"],
+          total: Number(raw["total"]),
+          text: String(raw["text"]),
+        })),
+      declaredOnlyElsewhere: (names, repo, rel) =>
+        new Set(declaredOnlyElsewhere.all(JSON.stringify(names), repo, rel).map((raw) => String(raw["name"]))),
+      declarations: (name) =>
+        declarations.all(name).map((raw) => ({
+          name: String(raw["name"]),
+          repo: String(raw["repo"]),
+          file: String(raw["file"]),
+          line: Number(raw["line"]),
+          text: String(raw["text"]),
+        })),
+      packageRow: (name) => {
+        const raw = packageRow.get(name);
+        if (!raw) return null;
+        return { package: String(raw["package"]), services: JSON.parse(String(raw["services"])) as PkgRow["services"], text: String(raw["text"]) };
+      },
       close: () => open.close(),
     };
   } catch (error) {
@@ -168,12 +236,7 @@ export type FactHeader = {
  * main checkout here. Returns the header, or null when the text is not a
  * schema this package reads (nothing is written then).
  */
-export async function buildFacts(
-  text: string,
-  dest: string,
-  local: LocalRepo[],
-  fetchedAt: string,
-): Promise<FactHeader | null> {
+export async function buildFacts(text: string, dest: string, local: LocalRepo[], fetchedAt: string): Promise<FactHeader | null> {
   const lines = text.split("\n").filter((line) => line.length > 0);
   if (lines.length === 0) return null;
   const header = JSON.parse(lines[0]!) as FactHeader;
@@ -197,6 +260,70 @@ export async function buildFacts(
   return header;
 }
 
+/** The row kinds this package reads. */
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg"]);
+
+const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
+const isNameOrNull = (value: unknown): boolean => value === null || typeof value === "string";
+const allOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
+  Array.isArray(value) && value.every((entry) => isRecord(entry) && each(entry));
+/** An op or fn row's `others`: whole entries, at least one (an empty list proves nothing; R36.6). */
+const someOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
+  Array.isArray(value) && value.length > 0 && allOf(value, each);
+
+/**
+ * Whether a wire row carries every field its kind requires, each of the
+ * wire's type (carrick-cloud `docs/internal/reference/edit-facts-wire.md`):
+ * a non-empty `text`, and every `others` or `services` entry whole. A row
+ * that does not is skipped at ingest, so no line prints from a half row.
+ */
+function wholeRow(raw: Record<string, unknown>): boolean {
+  if (!isText(raw["text"])) return false;
+  switch (raw["k"]) {
+    case "op":
+      return (
+        (raw["side"] === "producer" || raw["side"] === "consumer") &&
+        isText(raw["protocol"]) &&
+        isText(raw["label"]) &&
+        isText(raw["service"]) &&
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        isLine(raw["line"]) &&
+        isNameOrNull(raw["name"]) &&
+        (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
+        someOf(raw["others"], (other) => isText(other["service"]) && isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]))
+      );
+    // An fn or name row states a line, so it needs one (R33.7, F15).
+    case "fn":
+      return (
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        Number.isInteger(raw["line"]) &&
+        Number.isInteger(raw["total"]) &&
+        isText(raw["name"]) &&
+        someOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
+      );
+    case "name":
+      return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && Number.isInteger(raw["line"]);
+    case "pkg":
+      return (
+        isText(raw["package"]) &&
+        allOf(
+          raw["services"],
+          (entry) =>
+            isText(entry["repo"]) &&
+            isText(entry["service"]) &&
+            typeof entry["spec"] === "string" &&
+            isText(entry["manifest"]) &&
+            (entry["others_text"] === undefined || isText(entry["others_text"])),
+        )
+      );
+    default:
+      return false;
+  }
+}
+
 /** Write the fact database at `temp` from the header and NDJSON row lines. */
 function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string): void {
   const db = new sqlite.DatabaseSync(temp);
@@ -208,9 +335,21 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         id INTEGER PRIMARY KEY, side TEXT, protocol TEXT, label TEXT, service TEXT, repo TEXT,
         file TEXT, line INTEGER, name TEXT, site TEXT, others TEXT, text TEXT
       );
+      CREATE TABLE fns (
+        id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, others TEXT, total INTEGER, text TEXT
+      );
+      CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, repo TEXT, file TEXT, line INTEGER, text TEXT);
+      CREATE TABLE pkgs (id INTEGER PRIMARY KEY, package TEXT, services TEXT, text TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
-    const commits = Object.fromEntries((header.repos ?? []).map((repo) => [repo.repo, repo.commit]));
+    // Each repo's index commit, which the peer proof checks files against
+    // (`peers.ts`). A repo whose services name different commits has none,
+    // so its peers are never proven: which commit a peer's file was read at
+    // is not known. Kept that strict because both live fact files measured
+    // (2026-11-12) hold one commit per repo across all its services.
+    const named = new Map<string, Set<unknown>>();
+    for (const entry of header.repos ?? []) named.set(entry.repo, (named.get(entry.repo) ?? new Set()).add(entry.commit));
+    const commits = Object.fromEntries([...named].filter(([, seen]) => seen.size === 1).map(([repo, seen]) => [repo, [...seen][0]]));
     for (const [key, value] of Object.entries({
       project: header.project_slug,
       digest: header.digest,
@@ -227,11 +366,41 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const row = db.prepare(
       "INSERT INTO rows (side, protocol, label, service, repo, file, line, name, site, others, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
+    const fn = db.prepare("INSERT INTO fns (repo, file, line, name, others, total, text) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    const declared = db.prepare("INSERT INTO names (name, repo, file, line, text) VALUES (?, ?, ?, ?, ?)");
+    const pkg = db.prepare("INSERT INTO pkgs (package, services, text) VALUES (?, ?, ?)");
     db.exec("BEGIN");
+    let skipped = 0;
     for (const line of lines.slice(1)) {
-      const raw = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as unknown;
+      if (!isRecord(parsed)) continue;
+      const raw = parsed;
       // A row kind this package does not know is skipped (the wire adds kinds without a schema bump).
-      if (raw["k"] !== "op") continue;
+      if (!KNOWN_KINDS.has(String(raw["k"]))) continue;
+      if (!wholeRow(raw)) {
+        skipped += 1;
+        continue;
+      }
+      if (raw["k"] === "fn") {
+        fn.run(
+          String(raw["repo"]),
+          String(raw["file"]),
+          Number(raw["line"]),
+          String(raw["name"]),
+          JSON.stringify(raw["others"]),
+          Number(raw["total"]),
+          String(raw["text"]),
+        );
+        continue;
+      }
+      if (raw["k"] === "name") {
+        declared.run(String(raw["name"]), String(raw["repo"]), String(raw["file"]), Number(raw["line"]), String(raw["text"]));
+        continue;
+      }
+      if (raw["k"] === "pkg") {
+        pkg.run(String(raw["package"]), JSON.stringify(raw["services"]), String(raw["text"]));
+        continue;
+      }
       row.run(
         String(raw["side"]),
         String(raw["protocol"]),
@@ -242,12 +411,13 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         Number(raw["line"]),
         typeof raw["name"] === "string" ? raw["name"] : null,
         typeof raw["site"] === "string" ? raw["site"] : null,
-        JSON.stringify(Array.isArray(raw["others"]) ? raw["others"] : []),
+        JSON.stringify(raw["others"]),
         String(raw["text"]),
       );
     }
     db.exec("COMMIT");
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file);");
+    if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package);");
   } finally {
     closeQuietly(db);
   }

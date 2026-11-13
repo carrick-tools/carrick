@@ -92,7 +92,9 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
         continue;
       }
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
-      const uses = key === null || !wasTold(session, key);
+      // As the edit-time answer would have: no uses-count line where the fact
+      // lines answered the file's callers.
+      const uses = !answer.facts_callers && (key === null || !wasTold(session, key));
       const context = isChanged(answer) ? changedLine(session, answer) : lateContext(answer, uses);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);

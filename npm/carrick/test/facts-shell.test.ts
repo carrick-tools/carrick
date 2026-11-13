@@ -8,8 +8,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { fakeEnv, firstCall, fixturePath, runHook, testDir } from "./helpers.ts";
+import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
 import { changesAgainstHead, MAX_DIFF_LINES } from "../src/facts/diff.ts";
 
@@ -30,7 +30,9 @@ const header = JSON.stringify({
 });
 
 const row = (fields: Record<string, unknown>) =>
-  JSON.stringify({ k: "op", service: fields["repo"], others: [], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
+  // A peer in a mapped, committed fixture repo (`commitRepos` writes the
+  // file): ingest skips an op row with `others: []`.
+  JSON.stringify({ k: "op", service: fields["repo"] ?? "orders-api", others: [{ service: "web-app", repo: "web-app", file: "src/peer.ts", line: 1 }], total: 0, source: "handler", side: "consumer", protocol: "http", repo: "orders-api", ...fields });
 
 /** The fixture repos in a fresh workspace, the fact file built from the wire fixture plus `extra` rows. */
 async function workspace(t: { after: (fn: () => void) => void }, extra: string[] = [], files: Record<string, string> = {}): Promise<Ws> {
@@ -46,15 +48,14 @@ async function workspace(t: { after: (fn: () => void) => void }, extra: string[]
   fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "demo" }] } }));
   const wire = fs.readFileSync(WIRE, "utf8");
   const body = [header, ...wire.split("\n").slice(1).filter((line) => line.trim() !== ""), ...extra].join("\n");
-  await buildFacts(`${body}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
+  // The peer repos are committed checkouts at the index commit; the edited
+  // repo, `orders-api`, is left for each test to make a repository or not.
+  await buildFacts(`${commitRepos(root, body, REPOS.filter((repo) => repo !== "orders-api"))}\n`, factsPath(root), REPOS.map((repo) => ({ repo, path: path.join(root, repo) })), new Date().toISOString());
   return { root, home, at: (rel) => path.join(root, rel) };
 }
 
 function commit(dir: string): void {
-  for (const args of [["init", "-q"], ["add", "."], ["commit", "-q", "-m", "init"]]) {
-    const run = spawnSync("git", ["-C", dir, "-c", "user.email=t@example.com", "-c", "user.name=t", ...args], { encoding: "utf8" });
-    assert.equal(run.status, 0, run.stderr);
-  }
+  commitAll(dir);
 }
 
 const env = (ws: Ws, extra: Record<string, string> = {}) =>
