@@ -975,9 +975,8 @@ pub fn key_requests_canonically(
                 && earlier.procedure == row.procedure
                 && earlier.name_scope == row.name_scope
         });
-        if !repeat {
-            kept.push(row);
-        }
+        let _ = repeat;
+        kept.push(row);
     }
     rows.rows = kept;
 }
