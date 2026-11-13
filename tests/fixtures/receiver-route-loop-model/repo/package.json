@@ -1,0 +1,8 @@
+{
+  "name": "receiver-route-loop-model-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-plugin-server": "^1.0.0"
+  }
+}

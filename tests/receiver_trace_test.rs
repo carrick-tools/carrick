@@ -3231,3 +3231,222 @@ fn an_imported_handler_is_placed_in_its_declaring_file() {
         "{flat:#?}"
     );
 }
+
+/// What `receiver-route-loop` states at `src/server.ts`: every mount-graph
+/// row there, every possible call there with why its path is unread, and the
+/// producer manifest entries there (`file:line METHOD path kind alias`).
+struct LoopScan {
+    rows: Vec<String>,
+    unread: Vec<String>,
+    manifest: Vec<String>,
+}
+
+fn loop_scan(blobs: &Blobs) -> LoopScan {
+    let at = "src/server.ts:";
+    LoopScan {
+        rows: endpoint_rows(blobs)
+            .0
+            .into_iter()
+            .filter(|row| row.starts_with(at))
+            .collect(),
+        unread: unread_reasons(blobs)
+            .into_iter()
+            .filter(|(site, _)| site.starts_with(at))
+            .map(|(site, reason)| format!("{site} {reason}"))
+            .collect(),
+        manifest: producer_manifest(blobs)
+            .into_iter()
+            .filter(|entry| entry.starts_with(at))
+            .collect(),
+    }
+}
+
+/// The rows of `scan` at `line`.
+fn rows_at(scan: &LoopScan, line: u32) -> Vec<String> {
+    let at = format!("src/server.ts:{line} ");
+    scan.rows
+        .iter()
+        .filter(|row| row.starts_with(&at))
+        .cloned()
+        .collect()
+}
+
+/// carrick#2093: a route registered in a `for…of` over a list the code
+/// states (a module constant, an imported `as const` list, a nested pair of
+/// literal lists) is one route per element, served by the trace: the cassette
+/// states no endpoint in `src/server.ts`, so each row is the trace's. No row
+/// keeps the template's `${…}`.
+///
+/// Ship condition (the 2093 ruling): the producer manifest at the element
+/// rows says whether each gets its own element's response type or the union
+/// of all of them; the assertion pins what the scan states.
+#[test]
+fn a_route_in_a_loop_over_a_stated_list_is_one_row_per_element() {
+    let (blobs, fallbacks) = scan_fixture_reading("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!(
+        "rows {:#?}\nunread {:#?}\nmanifest {:#?}\ncounts {:#?}",
+        scan.rows,
+        scan.unread,
+        scan.manifest,
+        route_counts(&fallbacks)
+    );
+    assert_eq!(
+        rows_at(&scan, 20),
+        vec![
+            "src/server.ts:20 POST /widgets/sizes/large library_claim app",
+            "src/server.ts:20 POST /widgets/sizes/small library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 25),
+        vec![
+            "src/server.ts:25 POST /teams/:id/plan/apply library_claim app",
+            "src/server.ts:25 POST /teams/:id/plan/create library_claim app",
+            "src/server.ts:25 POST /teams/:id/plan/preview library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 34),
+        vec![
+            "src/server.ts:34 GET /v1/teams library_claim app",
+            "src/server.ts:34 GET /v1/users library_claim app",
+            "src/server.ts:34 GET /v2/teams library_claim app",
+            "src/server.ts:34 GET /v2/users library_claim app",
+        ],
+        "{picture}"
+    );
+    assert!(scan.rows.iter().all(|row| !row.contains("${")), "{picture}");
+    // The response type of each element row of (a) and (c).
+    let typed: Vec<&String> = scan
+        .manifest
+        .iter()
+        .filter(|entry| {
+            entry.starts_with("src/server.ts:20 ") || entry.starts_with("src/server.ts:29 ")
+        })
+        .collect();
+    assert_eq!(typed, Vec::<&String>::new(), "{picture}");
+}
+
+/// carrick#2093: a loop over a list of tuples reads both names of one
+/// element together: `[file, type]` over two pairs gives two routes, never
+/// the four that mixing elements would, and no `/:file` row.
+#[test]
+fn a_tuple_loop_reads_each_element_whole_and_together() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!("rows {:#?}\nunread {:#?}", scan.rows, scan.unread);
+    assert_eq!(
+        rows_at(&scan, 29),
+        vec![
+            "src/server.ts:29 GET /favicon.svg library_claim app",
+            "src/server.ts:29 GET /logo.png library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 32),
+        vec![
+            "src/server.ts:32 GET /pair/x/1 library_claim app",
+            "src/server.ts:32 GET /pair/y/2 library_claim app",
+        ],
+        "{picture}"
+    );
+}
+
+/// carrick#2093: a loop over a list the code does not state, or one the code
+/// may change (a call's result, a parameter's key, a spread, a `let`, a list
+/// a module pushes to, an imported list another module pushes to), states no
+/// row, and neither does a loop whose routes would number more than the cap
+/// or a `forEach` callback (carrick#4246). Each such site is saved unread
+/// with a true reason: the loop variable is declared in the file, so never
+/// `outside_service`.
+#[test]
+fn a_loop_over_a_list_the_code_does_not_state_keeps_todays_outcome() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!("rows {:#?}\nunread {:#?}", scan.rows, scan.unread);
+    for line in [37, 40, 43, 45, 47, 49, 51, 53] {
+        assert_eq!(
+            rows_at(&scan, line),
+            Vec::<String>::new(),
+            "{line}: {picture}"
+        );
+    }
+    let unread: Vec<&String> = scan
+        .unread
+        .iter()
+        .filter(|site| {
+            [37, 40, 43, 45, 47, 49, 51, 53]
+                .iter()
+                .any(|line| site.starts_with(&format!("src/server.ts:{line} ")))
+        })
+        .collect();
+    assert_eq!(
+        unread,
+        vec![
+            "src/server.ts:37 unread_expression",
+            "src/server.ts:40 unread_expression",
+            "src/server.ts:43 unread_expression",
+            "src/server.ts:45 reassigned",
+            "src/server.ts:47 reassigned",
+            "src/server.ts:49 reassigned",
+            "src/server.ts:51 fan_out_cap",
+            "src/server.ts:53 callback_parameter",
+        ],
+        "{picture}"
+    );
+}
+
+/// carrick#2093: a route at a literal parameter path, a route at a choice,
+/// and a request (not a route) in a loop over a stated list are as they
+/// were before loops were read.
+#[test]
+fn kept_sites_beside_a_loop_are_unchanged() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!(
+        "rows {:#?}\nunread {:#?}\ncalls {:#?}",
+        scan.rows,
+        scan.unread,
+        possible_calls(&blobs)
+    );
+    assert_eq!(
+        rows_at(&scan, 56),
+        vec!["src/server.ts:56 GET /:id library_claim app"],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 58),
+        vec![
+            "src/server.ts:58 GET /p library_claim app",
+            "src/server.ts:58 GET /q library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(rows_at(&scan, 60), Vec::<String>::new(), "{picture}");
+    assert!(
+        scan.unread
+            .iter()
+            .all(|site| !site.starts_with("src/server.ts:60 ")),
+        "{picture}"
+    );
+}
+
+/// carrick#2093: where the model states the loop's route as a parameter
+/// path (`POST /widgets/sizes/:size`), the trace replaces that row with one
+/// per element, and no `:size` row stands.
+#[test]
+fn a_model_row_over_a_loop_gives_way_to_one_row_per_element() {
+    let blobs = scan_fixture("receiver-route-loop-model");
+    let rows = endpoint_rows(&blobs).0;
+    assert_eq!(
+        rows,
+        vec![
+            "src/server.ts:8 POST /widgets/sizes/large library_claim app",
+            "src/server.ts:8 POST /widgets/sizes/small library_claim app",
+        ],
+    );
+}
