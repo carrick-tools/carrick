@@ -33,7 +33,7 @@
 //! The rules are in `docs/reference/client-semantics.md`, "Message roles".
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,8 @@ use crate::request_summary::decided_sites::reserved_on;
 use crate::request_summary::site_record::kind_and_role;
 use crate::request_summary::{
     CallerChain, LibrarySite, LibrarySites, MakerForm, MemberUse, MemberWire, NameFallback,
-    NamePlace, On, PlacedName, Selector, SiteMaker, SiteNames, SiteReceiver, SlotName, Stop,
+    NamePlace, On, PlacedName, Selector, SiteArg, SiteMaker, SiteNames, SiteReceiver, SlotName,
+    Stop,
 };
 use crate::services::type_sidecar::{
     BoundName, ClaimOn, ClaimProtocol, ClaimSlot, Collects, LibraryCheck, LibraryClaim, LibraryOp,
@@ -932,7 +933,12 @@ pub struct LibraryRows {
     /// (carrick#3504 B10-0). Log-only: no row reads it.
     pub names: LibraryNames,
     /// Each verified site whose name slot the text reader reads as no name,
-    /// with why (carrick#3504 B10-3): saved as an unread site
+    /// with why (carrick#3504 B10-3), and each library call read and then
+    /// dropped with no row and no other lead (carrick#3947, carrick#3946):
+    /// a claim answered `failed` (`uncorroborated`), a check the verifier's
+    /// time budget did not reach (`unanswered`), or a verified op whose name
+    /// slot reads no name (`caller_arg_missing`, `unread_expression`,
+    /// `unread`, `rows_missing`). Saved as unread sites
     /// ([`crate::unread_sites::from_scan`]), never a row.
     pub leads: Vec<LibraryLead>,
     /// The sites `read` would have read when verification returned no
@@ -1024,6 +1030,27 @@ pub fn read(
         })
         .map(|(check, _)| (check.claim_id.clone(), check.receiver.clone()))
         .collect();
+    // The word each check that did not verify saves a dropped call with
+    // (carrick#3947, carrick#3946), where the verdict at its position names
+    // it: `failed` is `uncorroborated`, a check the verifier's time budget
+    // did not reach `unanswered`. Any other `unchecked` saves nothing.
+    let unverified_words: HashMap<(String, String), Stop> = checks
+        .iter()
+        .zip(&verdicts)
+        .filter(|(check, verdict)| {
+            verdict.claim_id == check.claim_id && verdict.receiver == check.receiver
+        })
+        .filter_map(|(check, verdict)| {
+            let word = if verdict.verdict == SemanticsVerdict::Failed {
+                Stop::Uncorroborated
+            } else if verdict.not_reached_in_time() {
+                Stop::Unanswered
+            } else {
+                return None;
+            };
+            Some(((check.claim_id.clone(), check.receiver.clone()), word))
+        })
+        .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
     let mut outcomes = LibraryNames::default();
     let mut leads: Vec<LibraryLead> = Vec::new();
@@ -1044,6 +1071,8 @@ pub fn read(
             leads: RefCell::new(Vec::new()),
             led: RefCell::new(Vec::new()),
             sites: &sites.sites,
+            unverified: RefCell::new(Vec::new()),
+            unnamed: Cell::new(None),
         };
         // Library calls first: each states its rows at itself and at the
         // outermost call of each caller chain the text reader read the name
@@ -1077,10 +1106,14 @@ pub fn read(
             for chain in here.led.take() {
                 led.insert((call.0.clone(), call.1, chain));
             }
+            let unstated = here
+                .unstated(&unverified_words)
+                .map(|(reason, op)| here.lead_of(None, reason, op));
             read_sites[index] = SiteRead {
                 rows,
                 outcome: here.outcome.get(),
                 leads: site_leads,
+                unstated,
             };
         }
         // Then each site a caller fills. Where its library call states no
@@ -1099,6 +1132,7 @@ pub fn read(
                 rows: here.row().into_iter().collect(),
                 outcome: here.outcome.get(),
                 leads: here.leads.take(),
+                unstated: None,
             };
             let on_chain = (origin.file.clone(), origin.span_start, site.chain.clone());
             if read.rows.is_empty() && names.is_some() && !led.contains(&on_chain) {
@@ -1124,6 +1158,28 @@ pub fn read(
                 }
             }
             read_sites[index] = read;
+        }
+        // The library calls a caller they fill states a row at.
+        let filled: HashSet<(&PathBuf, u32)> = of_export
+            .iter()
+            .zip(&read_sites)
+            .filter(|(_, read)| !read.rows.is_empty())
+            .filter_map(|(site, _)| site.origin.as_ref())
+            .map(|origin| (&origin.file, origin.span_start))
+            .collect();
+        for (site, read) in of_export.iter().zip(&read_sites) {
+            // A library call read and dropped (carrick#3947, carrick#3946):
+            // no row here or at a caller, and no lead.
+            let Some(lead) = &read.unstated else {
+                continue;
+            };
+            if read.rows.is_empty()
+                && read.leads.is_empty()
+                && !filled.contains(&(&site.file, site.span_start))
+                && !leads.contains(lead)
+            {
+                leads.push(lead.clone());
+            }
         }
         for (site, read) in of_export.iter().zip(read_sites) {
             if let Some(outcome) = read.outcome {
@@ -1212,6 +1268,9 @@ struct SiteRead {
     rows: Vec<LibraryRow>,
     outcome: Option<NameOutcome>,
     leads: Vec<LibraryLead>,
+    /// At a library call: the site saved when the call states no row and
+    /// no lead, and no caller it fills states one (carrick#3947).
+    unstated: Option<LibraryLead>,
 }
 
 /// One site, read through its export's claims.
@@ -1241,6 +1300,13 @@ struct Reading<'a, 'n> {
     /// Every site of the service: the callers today's reading fills are
     /// sites of their own ([`LibrarySite::origin`]).
     sites: &'a [LibrarySite],
+    /// Each check of a claim that would state a message row here and did
+    /// not verify, with the claim's op (carrick#3947): why a call the
+    /// reader reads may state no row.
+    unverified: RefCell<Vec<(String, String, LibraryOp)>>,
+    /// The word for the first name slot a verified op read no name at,
+    /// saving no lead, with the op (carrick#3947).
+    unnamed: Cell<Option<(Stop, LibraryOp)>>,
 }
 
 impl Reading<'_, '_> {
@@ -1254,6 +1320,86 @@ impl Reading<'_, '_> {
         if self.outcome.get().is_none() {
             self.outcome.set(Some(outcome));
         }
+    }
+
+    /// Notes a check of the claim `id` on `receiver`, for `op`, that did not
+    /// verify.
+    fn unverified(&self, id: &str, receiver: &str, op: LibraryOp) {
+        self.unverified
+            .borrow_mut()
+            .push((id.to_string(), receiver.to_string(), op));
+    }
+
+    /// Notes the word for a name slot read as no name, unless one is noted.
+    fn unnamed(&self, reason: Stop, op: LibraryOp) {
+        if self.unnamed.get().is_none() {
+            self.unnamed.set(Some((reason, op)));
+        }
+    }
+
+    /// Why the call states no row, with the op the reason is for, when the
+    /// reader read it and dropped it (carrick#3947, carrick#3946): a name
+    /// slot a verified op read no name at, then a check the verifier's time
+    /// budget did not reach (`unanswered`), then a check answered `failed`
+    /// (`uncorroborated`), as `words` spells each check. `None` when no
+    /// claim that states a message row applied here, or none of its checks
+    /// has a word.
+    fn unstated(&self, words: &HashMap<(String, String), Stop>) -> Option<(Stop, LibraryOp)> {
+        if let Some(unnamed) = self.unnamed.get() {
+            return Some(unnamed);
+        }
+        let unverified = self.unverified.borrow();
+        let worded: Vec<(Stop, LibraryOp)> = unverified
+            .iter()
+            .filter_map(|(id, receiver, op)| {
+                words
+                    .get(&(id.clone(), receiver.clone()))
+                    .map(|word| (*word, *op))
+            })
+            .collect();
+        worded
+            .iter()
+            .find(|(word, _)| *word == Stop::Unanswered)
+            .or_else(|| worded.first())
+            .copied()
+    }
+
+    /// The op of the first claim on `through` that would state a message
+    /// row at this call: what a maker that did not verify keeps from it.
+    fn message_op(&self, through: Option<&SiteMaker>) -> Option<LibraryOp> {
+        let side = self.export.side.filter(|_| self.export.side_rule.is_none());
+        self.claims.iter().find_map(|(_, claim)| {
+            let LibraryClaim::Op {
+                op,
+                member,
+                path,
+                on,
+                of,
+                payload,
+                handler,
+                ack,
+                protocol,
+                method,
+                ..
+            } = claim
+            else {
+                return None;
+            };
+            let selected = selector(
+                *on,
+                of.as_deref(),
+                path,
+                member.as_deref(),
+                claim.op_site_form().unwrap_or(MakerForm::Call),
+            );
+            (self.site.selected_by(through, &selected)
+                && row_kind(self.export.role, *op, side, *protocol, method.as_deref()).is_some()
+                && [payload, handler, ack]
+                    .into_iter()
+                    .flatten()
+                    .all(|slot| self.site.supplies(slot_arg(slot), slot_key(slot))))
+            .then_some(*op)
+        })
     }
 
     /// The row the site states, if any: a definition, or an op read the same
@@ -1317,8 +1463,11 @@ impl Reading<'_, '_> {
                 } if *member == self.site.member => Some((id, name, handler, name_scope)),
                 _ => None,
             })?;
-        if !self.verified(id, "export") || !self.site.supplies(slot_arg(handler), slot_key(handler))
-        {
+        if !self.site.supplies(slot_arg(handler), slot_key(handler)) {
+            return None;
+        }
+        if !self.verified(id, "export") {
+            self.unverified(id, "export", LibraryOp::Receive);
             return None;
         }
         let name = self.name(slot_arg(name_slot), slot_key(name_slot), LibraryOp::Receive)?;
@@ -1345,6 +1494,9 @@ impl Reading<'_, '_> {
             Some(maker) => {
                 let (id, make) = ExportClaims::make_for(self.claims, maker)?;
                 if !self.verified(id, "export") {
+                    if let Some(op) = self.message_op(through) {
+                        self.unverified(id, "export", op);
+                    }
                     return None;
                 }
                 claim_ids.push(id.to_string());
@@ -1379,9 +1531,12 @@ impl Reading<'_, '_> {
                 member.as_deref(),
                 claim.op_site_form().unwrap_or(MakerForm::Call),
             );
-            if !self.site.selected_by(through, &selected) || !self.verified(id, &receiver) {
+            if !self.site.selected_by(through, &selected) {
                 continue;
             }
+            // A `by_origin` export has no side of its own (see `row_kind`).
+            let side = self.export.side.filter(|_| self.export.side_rule.is_none());
+            let kind = row_kind(self.export.role, *op, side, *protocol, method.as_deref());
             // Every other part the claim positions must be in the call: an
             // overload with fewer arguments can put the payload where the
             // name was claimed.
@@ -1389,14 +1544,20 @@ impl Reading<'_, '_> {
                 .into_iter()
                 .flatten()
                 .all(|slot| self.site.supplies(slot_arg(slot), slot_key(slot)));
+            if !self.verified(id, &receiver) {
+                // Only a claim that would state a message row here is a
+                // reason the call states none (carrick#3947).
+                if kind.is_some() && supplied {
+                    self.unverified(id, &receiver, *op);
+                }
+                continue;
+            }
             if !supplied {
                 return None;
             }
-            // A `by_origin` export has no side of its own (see `row_kind`).
             // Read before the name: an op that is no message row saves no
             // lead.
-            let side = self.export.side.filter(|_| self.export.side_rule.is_none());
-            let kind = row_kind(self.export.role, *op, side, *protocol, method.as_deref())?;
+            let kind = kind?;
             let (text, scope) = match name.as_deref()? {
                 OpName::Slot(slot) => (
                     self.name(slot_arg(slot), slot_key(slot), *op)?,
@@ -1428,10 +1589,11 @@ impl Reading<'_, '_> {
                         }
                         None => NameOutcome::StopUnread,
                     });
-                    (
-                        maker.literal(slot_arg(slot), slot_key(slot))?.to_string(),
-                        name_scope.clone(),
-                    )
+                    let Some(made) = maker.literal(slot_arg(slot), slot_key(slot)) else {
+                        self.unnamed(slot_stop(&maker.args, slot_arg(slot), slot_key(slot)), *op);
+                        return None;
+                    };
+                    (made.to_string(), name_scope.clone())
                 }
                 // The name of the member a decorator is applied to
                 // (amendment 8), stated at the library call only.
@@ -1446,7 +1608,12 @@ impl Reading<'_, '_> {
                         Some(_) => NameOutcome::Literal,
                         None => NameOutcome::StopUnread,
                     });
-                    (self.site.decorated.clone()?, None)
+                    // A computed key names nothing.
+                    let Some(decorated) = self.site.decorated.clone() else {
+                        self.unnamed(Stop::UnreadExpression, *op);
+                        return None;
+                    };
+                    (decorated, None)
                 }
                 // The first entry the call fills (amendment 8).
                 OpName::First(first) => (self.first(&first.first, *op)?, None),
@@ -1521,7 +1688,17 @@ impl Reading<'_, '_> {
                     Some(SlotName::Today(NameFallback::NoRows)) => NameOutcome::NoRows,
                     _ => site_outcome(self.site, arg, key),
                 });
-                return today();
+                let name = today();
+                if name.is_none() {
+                    self.unnamed(
+                        match today_read {
+                            Some(SlotName::Today(NameFallback::NoRows)) => Stop::RowsMissing,
+                            _ => slot_stop(&self.site.args, arg, key),
+                        },
+                        op,
+                    );
+                }
+                return name;
             }
         };
         if self.site.origin.is_some() {
@@ -1743,6 +1920,9 @@ impl Reading<'_, '_> {
                         Some(_) => NameOutcome::Literal,
                         None => NameOutcome::StopUnread,
                     });
+                    if self.site.decorated.is_none() {
+                        self.unnamed(Stop::UnreadExpression, op);
+                    }
                     return self.site.decorated.clone();
                 }
                 NameEntry::Slot(slot) => {
@@ -1755,6 +1935,7 @@ impl Reading<'_, '_> {
         }
         if self.at.is_none() {
             self.noted(NameOutcome::StopUnread);
+            self.unnamed(Stop::CallerArgMissing, op);
         }
         None
     }
@@ -1762,6 +1943,15 @@ impl Reading<'_, '_> {
     /// Saves a lead of `reason` at `place` (the library call when `None`),
     /// once.
     fn lead(&self, place: Option<NamePlace>, reason: Stop, op: LibraryOp) {
+        let lead = self.lead_of(place, reason, op);
+        let mut leads = self.leads.borrow_mut();
+        if !leads.contains(&lead) {
+            leads.push(lead);
+        }
+    }
+
+    /// The lead of `reason` at `place` (the library call when `None`).
+    fn lead_of(&self, place: Option<NamePlace>, reason: Stop, op: LibraryOp) -> LibraryLead {
         let (file, line, span_start, span_end) = match place {
             Some(place) => (place.file, place.line, place.span_start, place.span_end),
             None => self.place(),
@@ -1770,7 +1960,7 @@ impl Reading<'_, '_> {
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_default();
-        let lead = LibraryLead {
+        LibraryLead {
             file,
             line,
             span_start,
@@ -1781,10 +1971,6 @@ impl Reading<'_, '_> {
             member: self.site.member.clone(),
             kind: crate::possible_calls::kind_of(&role),
             role: crate::possible_calls::role_of(&role, Some(op_name(op))),
-        };
-        let mut leads = self.leads.borrow_mut();
-        if !leads.contains(&lead) {
-            leads.push(lead);
         }
     }
 
@@ -1835,7 +2021,23 @@ enum SlotRead {
 }
 
 fn read_slot(site: &LibrarySite, arg: usize, key: Option<&str>) -> SlotRead {
-    let Some(arg) = site.args.get(arg) else {
+    read_args(&site.args, arg, key)
+}
+
+/// The word a name slot that reads no name is saved with (carrick#3947): a
+/// slot the call fills with nothing that can be the name
+/// `caller_arg_missing`, a spread `unread_expression`, any other value
+/// `unread`.
+fn slot_stop(args: &[SiteArg], arg: usize, key: Option<&str>) -> Stop {
+    match read_args(args, arg, key) {
+        SlotRead::Next => Stop::CallerArgMissing,
+        _ if args.get(arg).is_some_and(|arg| arg.spread) => Stop::UnreadExpression,
+        _ => Stop::Unread,
+    }
+}
+
+fn read_args(args: &[SiteArg], arg: usize, key: Option<&str>) -> SlotRead {
+    let Some(arg) = args.get(arg) else {
         return SlotRead::Next;
     };
     // A spread moves every position after it, and may hold the key.
@@ -3086,6 +3288,146 @@ mod tests {
         assert!(
             swapped.rows.is_empty(),
             "verdicts out of order verify nothing"
+        );
+    }
+
+    /// The saved sites of a reading: line, reason, kind and role.
+    fn saved(rows: &LibraryRows) -> Vec<(u32, Stop, Option<&'static str>, Option<&'static str>)> {
+        let mut saved: Vec<_> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason, lead.kind, lead.role))
+            .collect();
+        saved.sort();
+        saved
+    }
+
+    /// carrick#3947, carrick#3946: a library call the reader reads and then
+    /// states no row and no lead at is saved, once, with a reason: a claim
+    /// the verifier answered `failed` is `uncorroborated`, one its time
+    /// budget did not reach (`unchecked`, `budget`) is `unanswered`. Several
+    /// calls ask one check, and the verdict decides before the name is read,
+    /// so a wildcard and a reserved name are saved too. A call missing the
+    /// payload the claim positions is no reading of the claim and saves
+    /// nothing. A fully verified reading of the same calls states its rows
+    /// and saves nothing.
+    #[test]
+    fn a_library_call_read_and_dropped_on_its_verdict_is_saved_with_a_reason() {
+        let source = "import { bus } from \"@fixture/bus\";\n\
+            export async function send() {\n\
+            \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+            \x20 await bus.publish(\"orders.shipped\", { id: 2 });\n\
+            \x20 bus.subscribe(\"orders.created\", (message) => {});\n\
+            \x20 await bus.publish(\"orders.*\", {});\n\
+            \x20 await bus.publish(\"orders.lonely\");\n\
+            \x20 bus.subscribe(\"$connected\", () => {});\n\
+            }\n";
+        let sites = sites_of(&[("src/orders.ts", source)]);
+        let verdict = |check: &LibraryCheck| {
+            if check.claim_id.contains(":send:") {
+                (SemanticsVerdict::Failed, Some("not the declared member"))
+            } else {
+                (SemanticsVerdict::Unchecked, Some("budget"))
+            }
+        };
+        let asked = std::cell::RefCell::new(0usize);
+        let rows = read(&sites, &[bus()], None, |checks| {
+            *asked.borrow_mut() = checks.len();
+            Ok(checks
+                .iter()
+                .map(|check| {
+                    let (verdict, reason) = verdict(check);
+                    SemanticsResult {
+                        claim_id: check.claim_id.clone(),
+                        receiver: check.receiver.clone(),
+                        verdict,
+                        reason: reason.map(str::to_string),
+                        declarations: Vec::new(),
+                    }
+                })
+                .collect())
+        });
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        assert_eq!(*asked.borrow(), 3, "fewer checks than sites");
+        assert_eq!(
+            saved(&rows),
+            vec![
+                (3, Stop::Uncorroborated, Some("pubsub"), Some("producer")),
+                (4, Stop::Uncorroborated, Some("pubsub"), Some("producer")),
+                (5, Stop::Unanswered, Some("pubsub"), Some("consumer")),
+                (6, Stop::Uncorroborated, Some("pubsub"), Some("producer")),
+                (8, Stop::Unanswered, Some("pubsub"), Some("consumer")),
+            ],
+            "{:?}",
+            rows.leads
+        );
+        // The verified reading of the same sites states rows at 3, 4, 5 and
+        // saves nothing: no row moves.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let verified = read(&sites, &[bus()], None, verifier(&asked, all));
+        let lines: Vec<u32> = verified.rows.iter().map(|row| row.line).collect();
+        assert_eq!(lines, vec![3, 4, 5], "{verified:#?}");
+        assert!(verified.leads.is_empty(), "{:?}", verified.leads);
+        // Any other `unchecked`, and a verdict that names another check,
+        // save nothing here.
+        let other = read(&sites, &[bus()], None, |checks| {
+            Ok(checks
+                .iter()
+                .map(|check| SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: SemanticsVerdict::Unchecked,
+                    reason: Some("member_untyped".to_string()),
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        assert!(other.leads.is_empty(), "{:?}", other.leads);
+        let swapped = read(&sites, &[bus()], None, |checks| {
+            Ok(checks
+                .iter()
+                .cycle()
+                .skip(1)
+                .take(checks.len())
+                .map(|check| SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: SemanticsVerdict::Failed,
+                    reason: None,
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        assert!(swapped.leads.is_empty(), "{:?}", swapped.leads);
+    }
+
+    /// carrick#3947: a verified op at a call whose name slot reads no name,
+    /// and saves no lead, is saved with the word for the slot: a spread is
+    /// `unread_expression`, another value `unread`, a slot the call does
+    /// not fill `caller_arg_missing`.
+    #[test]
+    fn a_verified_call_that_names_nothing_is_saved_with_a_reason() {
+        let source = "import { bus } from \"@fixture/bus\";\n\
+            export async function send(topic: string, rest: string[]) {\n\
+            \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+            \x20 await bus.publish(...rest, {});\n\
+            \x20 await bus.publish(topic, {});\n\
+            \x20 await bus.publish(7, {});\n\
+            }\n";
+        let sites = sites_of(&[("src/orders.ts", source)]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = read(&sites, &[bus()], None, verifier(&asked, all));
+        let lines: Vec<u32> = rows.rows.iter().map(|row| row.line).collect();
+        assert_eq!(lines, vec![3], "{rows:#?}");
+        assert_eq!(
+            saved(&rows),
+            vec![
+                (4, Stop::UnreadExpression, Some("pubsub"), Some("producer")),
+                (5, Stop::Unread, Some("pubsub"), Some("producer")),
+                (6, Stop::CallerArgMissing, Some("pubsub"), Some("producer")),
+            ],
+            "{:?}",
+            rows.leads
         );
     }
 

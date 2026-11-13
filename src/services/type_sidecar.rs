@@ -965,11 +965,17 @@ const NOT_REACHED_IN_TIME: &str = "budget";
 pub fn not_reached_in_time(results: &[SemanticsResult]) -> usize {
     results
         .iter()
-        .filter(|result| {
-            result.verdict == SemanticsVerdict::Unchecked
-                && result.reason.as_deref() == Some(NOT_REACHED_IN_TIME)
-        })
+        .filter(|result| result.not_reached_in_time())
         .count()
+}
+
+impl SemanticsResult {
+    /// The sidecar did not reach this check before the request's time limit
+    /// ran out.
+    pub fn not_reached_in_time(&self) -> bool {
+        self.verdict == SemanticsVerdict::Unchecked
+            && self.reason.as_deref() == Some(NOT_REACHED_IN_TIME)
+    }
 }
 
 /// How one package of a `verify_client_semantics` request resolved, for logs.

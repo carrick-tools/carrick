@@ -31351,6 +31351,10 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     /// its boundary carries the count when the run takes the boundaries for
     /// the index. The stand-in answers every check the way the verifier does
     /// once its time limit has passed.
+    ///
+    /// carrick#3946: each library site a check the time limit did not reach
+    /// dropped is saved, `unanswered`, through the library reader's leads:
+    /// two sites ask one check, and both are saved.
     #[test]
     fn library_checks_the_time_limit_did_not_reach_reach_the_boundary() {
         const SERVICE: &str = "library-2021";
@@ -31358,7 +31362,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(
             root.join("index.ts"),
-            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\nbus.publish(\"steady\", {});\n",
         )
         .expect("write");
         let script = root.join("out-of-time-sidecar.cjs");
@@ -31410,6 +31414,38 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             rows.rows.is_empty(),
             "nothing was verified, nothing is stated"
         );
+        assert_eq!(asked, 1, "one check for both sites");
+        let unread = crate::unread_sites::from_scan(
+            &crate::request_summary::discovery::Discovery::default(),
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &rows.leads,
+            &root,
+        );
+        let mut saved = service_data("monorepo", Some(SERVICE));
+        crate::unread_sites::attach(&mut saved, unread, &[]);
+        let lines: Vec<(u32, crate::request_summary::Stop)> = saved
+            .unread_sites
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|site| (site.line, site.reason))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (2, crate::request_summary::Stop::Unanswered),
+                (3, crate::request_summary::Stop::Unanswered),
+            ]
+        );
+        assert_eq!(
+            saved
+                .unread_sites_by_reason
+                .unwrap_or_default()
+                .get(&crate::request_summary::Stop::Unanswered)
+                .copied(),
+            Some(2)
+        );
 
         let mut data = service_data("monorepo", Some(SERVICE));
         data.boundary = Some(crate::boundary::ServiceBoundary::default());
@@ -31433,13 +31469,22 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         verifier: &str,
         saved: Vec<crate::unread_sites::UnreadSite>,
     ) -> Vec<(String, u32, Vec<crate::request_summary::Stop>, String)> {
+        library_unread_blob_of(
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+            verifier,
+            saved,
+        )
+    }
+
+    /// [`library_unread_blob`] over `source` as the service's `index.ts`.
+    fn library_unread_blob_of(
+        source: &str,
+        verifier: &str,
+        saved: Vec<crate::unread_sites::UnreadSite>,
+    ) -> Vec<(String, u32, Vec<crate::request_summary::Stop>, String)> {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().unwrap();
-        std::fs::write(
-            root.join("index.ts"),
-            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
-        )
-        .expect("write");
+        std::fs::write(root.join("index.ts"), source).expect("write");
         let script = root.join("stand-in-sidecar.cjs");
         let body = format!(
             r#"
@@ -31473,6 +31518,14 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         ];
         let library = read_library_rows(&inputs, &sites, &claims, Some(&sidecar), &root);
         assert!(library.rows.is_empty(), "no verified row either way");
+        let mut saved = saved;
+        saved.extend(crate::unread_sites::from_scan(
+            &crate::request_summary::discovery::Discovery::default(),
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &library.leads,
+            &root,
+        ));
         let unread = crate::unread_sites::with_unanswered(saved, &[], &library.unanswered, &root);
         let mut data = service_data("monorepo", None);
         crate::unread_sites::attach(&mut data, unread, &[]);
@@ -31582,6 +31635,39 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// carrick#3947: on the engine's path (the text reader over the
+    /// service's own inputs), a verified send whose name slot reads no name
+    /// is saved at its name with the slot's word: a spread is
+    /// `unread_expression`, a number `caller_arg_missing`.
+    #[test]
+    fn a_verified_send_that_names_nothing_is_saved_on_the_engine_path() {
+        let saved = library_unread_blob_of(
+            "import { bus } from \"@fixture/bus\";\n\
+             const parts: string[] = [];\n\
+             bus.publish(...parts, {});\n\
+             bus.publish(7, {});\n",
+            "return write({ request_id, status: 'success', verdicts: request.checks.map((check) => ({ claim_id: check.claim_id, receiver: check.receiver, verdict: 'verified' })) });",
+            Vec::new(),
+        );
+        assert_eq!(
+            saved,
+            vec![
+                (
+                    "index.ts".to_string(),
+                    3,
+                    vec![],
+                    "UnreadExpression/name/0".to_string()
+                ),
+                (
+                    "index.ts".to_string(),
+                    4,
+                    vec![],
+                    "CallerArgMissing/name/0".to_string()
+                ),
+            ]
+        );
+    }
+
     /// DS-V-2: a site the site pass already saved at the same span keeps
     /// one row and gains `unanswered` in `also`.
     #[test]
@@ -31613,15 +31699,24 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
-    /// DS-V-2: a verdict of `failed` is a verdict, not a missing one: nothing
-    /// is saved.
+    /// DS-V-2: a verdict of `failed` is a verdict, not a missing one: it is
+    /// not saved `unanswered`. carrick#3947: the site it drops is saved
+    /// `uncorroborated`, at its name, through the library reader's leads.
     #[test]
-    fn a_failed_verdict_saves_no_unanswered_site() {
+    fn a_failed_verdict_saves_its_site_uncorroborated() {
         let saved = library_unread_blob(
             "return write({ request_id, status: 'success', verdicts: request.checks.map((check) => ({ claim_id: check.claim_id, receiver: check.receiver, verdict: 'failed', reason: 'no' })) });",
             Vec::new(),
         );
-        assert!(saved.is_empty(), "{saved:?}");
+        assert_eq!(
+            saved,
+            vec![(
+                "index.ts".to_string(),
+                2,
+                vec![],
+                "Uncorroborated/name/0".to_string()
+            )]
+        );
     }
 
     /// carrick#2021, ruled 2026-10-07: a scan in which the sidecar goes

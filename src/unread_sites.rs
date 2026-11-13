@@ -149,14 +149,12 @@ impl UnreadSite {
         }
     }
 
-    /// `unanswered` beside the row's own reason, once, when the row has room
-    /// (#3952's merge, shared by every ask that died without an answer).
-    fn also_unanswered(&mut self) {
-        if self.reason != Stop::Unanswered
-            && !self.also.contains(&Stop::Unanswered)
-            && self.also.len() < 4
-        {
-            self.also.push(Stop::Unanswered);
+    /// `reason` beside the row's own, once, when the row has room: the one
+    /// rule for a site already saved at the span another saves at (#3952's
+    /// merge; carrick#3947's library leads).
+    fn also(&mut self, reason: Stop) {
+        if self.reason != reason && !self.also.contains(&reason) && self.also.len() < 4 {
+            self.also.push(reason);
         }
     }
 
@@ -349,12 +347,8 @@ pub fn from_scan(
             .unanswered_at
             .get(&at)
             .is_some_and(|keys| !keys.is_empty());
-        if unanswered
-            && row.reason != Stop::UnansweredPackage
-            && !row.also.contains(&Stop::UnansweredPackage)
-            && row.also.len() < 4
-        {
-            row.also.push(Stop::UnansweredPackage);
+        if unanswered {
+            row.also(Stop::UnansweredPackage);
         }
     }
     out.extend(decided.stops.iter().map(UnreadSite::of_decided));
@@ -376,9 +370,8 @@ pub fn from_scan(
     // The library reader's leads (carrick#3504 B10-3), at a call no other
     // row here names and the site pass decides no name at: the site pass's
     // own reading of a call stands.
-    // A second chain's lead at the same call, with another stop, joins the
-    // first lead's `also`.
-    let mut led_here: Vec<usize> = Vec::new();
+    // A lead at a call another unread site already holds (a second chain's
+    // lead, or a site another pass saved) joins that site's `also`.
     for lead in library {
         let site = UnreadSite::of_library(lead, root);
         let decided_here = decided
@@ -388,21 +381,9 @@ pub fn from_scan(
         if decided_here {
             continue;
         }
-        match out.iter().position(|held| held.at() == site.at()) {
-            None => {
-                led_here.push(out.len());
-                out.push(site);
-            }
-            Some(index) if led_here.contains(&index) => {
-                let held = &mut out[index];
-                if held.reason != site.reason
-                    && !held.also.contains(&site.reason)
-                    && held.also.len() < 4
-                {
-                    held.also.push(site.reason);
-                }
-            }
-            Some(_) => {}
+        match out.iter_mut().find(|held| held.at() == site.at()) {
+            None => out.push(site),
+            Some(held) => held.also(site.reason),
         }
     }
     out
@@ -428,7 +409,7 @@ pub fn with_unanswered(
             continue;
         }
         if let Some(held) = stops.iter_mut().find(|row| row.at() == at) {
-            held.also_unanswered();
+            held.also(Stop::Unanswered);
             continue;
         }
         let path: Vec<&str> = std::iter::once(site.export.as_str())
@@ -499,7 +480,7 @@ pub fn with_unanswered_implementations(
         for row in stops.iter_mut().filter(|row| {
             row.reason == Stop::InterfaceMember && row.at() == (file.as_str(), *lo, *hi)
         }) {
-            row.also_unanswered();
+            row.also(Stop::Unanswered);
         }
     }
     stops
@@ -1485,5 +1466,39 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].reason, Stop::UnreadExpression);
         assert_eq!(rows[0].also, vec![Stop::FanOutCap]);
+    }
+
+    /// carrick#3947, ruled on #4146: a library lead at a call another pass
+    /// already saved is not dropped. The held site keeps its reason and gains
+    /// the lead's word in `also`, by the same rule an unanswered ask joins.
+    #[test]
+    fn a_library_lead_at_a_site_already_saved_joins_its_also() {
+        let mut discovery = Discovery::default();
+        let at = ("src/use.ts".to_string(), 20, 30);
+        discovery.missed_inside.push(at.clone());
+        discovery
+            .missed_at
+            .insert(at, (2, "bus.publish(topic, {})".to_string()));
+        let rows = from_scan(
+            &discovery,
+            &Decided::default(),
+            &[],
+            &[LibraryLead {
+                file: "/repo/src/use.ts".into(),
+                line: 2,
+                span_start: 20,
+                span_end: 30,
+                reason: Stop::Uncorroborated,
+                package: "fixture-bus".to_string(),
+                export: "bus".to_string(),
+                member: Some("publish".to_string()),
+                kind: Some("pubsub"),
+                role: Some("producer"),
+            }],
+            Path::new("/repo"),
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].reason, Stop::MissedInside);
+        assert_eq!(rows[0].also, vec![Stop::Uncorroborated]);
     }
 }
