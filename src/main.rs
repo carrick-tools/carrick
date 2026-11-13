@@ -5,6 +5,7 @@
 
 use carrick::cloud_storage::{self, AwsStorage, LocalDirStorage, MockStorage};
 use carrick::engine::{self, run_analysis_engine_with_sidecar};
+use carrick::engine_stamp::{self, EngineOrigin, StampVerdict};
 use carrick::services::TypeSidecar;
 use carrick::services::type_sidecar;
 use carrick::{
@@ -668,7 +669,18 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let sp = logging::spinner("Starting compiler engine...");
     let mut sidecar_found = false;
     let sidecar = match discover_sidecar_path() {
-        Some(sidecar_path) => {
+        Some((sidecar_path, origin)) => {
+            // carrick#4133: log the engine's stamp, and refuse a stale
+            // engine found in a source checkout (src/sidecar/README.md, "Build stamp").
+            match engine_stamp::check(&sidecar_path, origin) {
+                StampVerdict::Ok { stamp } => info!("Compiler engine stamp: {stamp}"),
+                StampVerdict::Warn(message) => warn!("{message}"),
+                StampVerdict::Refuse(message) => {
+                    logging::finish_spinner_warn(&sp, "Compiler engine is stale");
+                    logging::annotate(logging::Annotation::Error, &message);
+                    return Err(message.into());
+                }
+            }
             sidecar_found = true;
             debug!("Found sidecar at: {}", sidecar_path.display());
             match spawn_sidecar(&sidecar_path, &args.repo_path, &initial_service) {
@@ -814,12 +826,12 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Discover the sidecar path by checking known locations
-fn discover_sidecar_path() -> Option<PathBuf> {
+fn discover_sidecar_path() -> Option<(PathBuf, EngineOrigin)> {
     // The sidecar entry point after building (TypeScript compiles to dist/src/)
     let sidecar_entry = "dist/src/index.js";
 
     // List of locations to check, in order of priority
-    let mut candidates: Vec<PathBuf> = vec![];
+    let mut candidates: Vec<(PathBuf, EngineOrigin)> = vec![];
 
     // 0. Told where it is. The npm package (carrick#710) is the case that
     //    needs this: the binary ships in a per-platform package and the
@@ -829,34 +841,43 @@ fn discover_sidecar_path() -> Option<PathBuf> {
     if let Ok(configured) = env::var("CARRICK_SIDECAR_DIR")
         && !configured.trim().is_empty()
     {
-        candidates.push(PathBuf::from(configured));
+        candidates.push((PathBuf::from(configured), EngineOrigin::EnvVar));
     }
 
-    candidates.extend([
-        // 1. Relative to executable (for packaged distribution)
-        get_executable_relative_path("sidecar"),
-        get_executable_relative_path("../sidecar"),
-        get_executable_relative_path("../lib/sidecar"),
-    ]);
+    candidates.extend(
+        [
+            // 1. Relative to executable (for packaged distribution)
+            get_executable_relative_path("sidecar"),
+            get_executable_relative_path("../sidecar"),
+            get_executable_relative_path("../lib/sidecar"),
+        ]
+        .map(|path| (path, EngineOrigin::NextToBinary)),
+    );
 
     // 2. For development builds, use CARGO_MANIFEST_DIR (set at compile time)
     //    This ensures we find the sidecar regardless of the current working directory
     if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        candidates.push(PathBuf::from(manifest_dir).join("src/sidecar"));
+        candidates.push((
+            PathBuf::from(manifest_dir).join("src/sidecar"),
+            EngineOrigin::SourceCheckout,
+        ));
     }
 
     // 3. Fallback to relative paths (in case running from project root)
-    candidates.extend([
-        PathBuf::from("src/sidecar"),
-        PathBuf::from("./src/sidecar"),
-        PathBuf::from("sidecar"),
-    ]);
+    candidates.extend(
+        [
+            PathBuf::from("src/sidecar"),
+            PathBuf::from("./src/sidecar"),
+            PathBuf::from("sidecar"),
+        ]
+        .map(|path| (path, EngineOrigin::SourceCheckout)),
+    );
 
-    for candidate in candidates {
+    for (candidate, origin) in candidates {
         let full_path = candidate.join(sidecar_entry);
         if full_path.exists() {
             debug!("Checking sidecar candidate: {:?}", full_path);
-            return Some(full_path);
+            return Some((full_path, origin));
         }
     }
 

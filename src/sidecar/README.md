@@ -40,6 +40,10 @@ npm test        # node --test over dist/test
 
 `npm test` runs the COMPILED tests, so a stale `dist/` makes the suite lie. The Rust integration tests spawn `dist/src/index.js` for the same reason; the pre-commit hook rebuilds it.
 
+### Build stamp
+
+`npm run build` also writes `dist/src/engine-stamp.json`: a sha256 over `package.json`, `package-lock.json`, `tsconfig*.json` and `src/**` (not `test/**`), by `scripts/write-engine-stamp.mjs`. The scanner (`src/engine_stamp.rs`) logs it on every spawn. An engine found in a source checkout (the compile-time `src/sidecar` folder or the relative `src/sidecar` fallback) is re-hashed and refused when the stamp is missing or differs. An engine from `CARRICK_SIDECAR_DIR` or next to the binary is never refused; a missing stamp is a warning. Both packagings copy `dist/src`, so the stamp ships with them. The two hashes must stay identical: `tests/engine_stamp_test.rs`.
+
 ### The surface lister artifact
 
 ```bash
