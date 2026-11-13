@@ -21,7 +21,8 @@ use crate::{
     agents::{
         file_analyzer_agent::{
             AnalysisPrompt, DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult,
-            FileAnalyzerAgent, MountResult, PubsubOperation, RequestLineAnchors, ResolutionSource,
+            FileAnalyzerAgent, HeldRequestLine, MountResult, PubsubOperation, RequestLineAnchors,
+            ResolutionSource,
         },
         framework_guidance_agent::ProtocolGuidance,
         source_parts::{Limits, ShownLines, SourceCut, SourcePart},
@@ -534,6 +535,11 @@ fn modules_named_by_candidates(file: &PartedFile<'_>) -> Option<Vec<BTreeSet<usi
     )
 }
 
+/// Per request line held at its module-level calls, by file and span start:
+/// the summary callers stating it ([`HeldRequestLine::stating`],
+/// carrick#4121).
+type HeldStating = HashMap<(String, u32), Vec<(String, u32, bool)>>;
+
 /// Complete result of file-centric analysis
 #[derive(Debug)]
 pub struct FileCentricAnalysisResult {
@@ -575,6 +581,9 @@ pub struct FileCentricAnalysisResult {
     /// unread site each ([`crate::unread_sites::of_decorator_path`]). The
     /// engine adds them to the site pass's unread sites.
     pub unread_decorator_paths: Vec<crate::unread_sites::UnreadSite>,
+    /// The request lines held at their module-level calls (carrick#4121),
+    /// keyed as `file_results` is. The site fold decides whether each goes.
+    pub held_at_module_calls: Vec<HeldRequestLine>,
     /// Bundled type definitions (if sidecar was used)
     pub bundled_types: Option<String>,
     /// Type resolution result from sidecar
@@ -4293,6 +4302,7 @@ impl FileOrchestrator {
                 stats,
                 unread_mount_prefixes: Vec::new(),
                 unread_decorator_paths: Vec::new(),
+                held_at_module_calls: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -4372,6 +4382,7 @@ impl FileOrchestrator {
                 stats,
                 unread_mount_prefixes: Vec::new(),
                 unread_decorator_paths: Vec::new(),
+                held_at_module_calls: Vec::new(),
                 bundled_types: None,
                 type_resolution: None,
             });
@@ -4658,6 +4669,46 @@ impl FileOrchestrator {
                 (pf.path_str.clone(), starts)
             })
             .collect();
+        // A request line whose other callers are read so, and which direct
+        // calls made where a module is loaded also reach (carrick#4121),
+        // keeps its model row here: whether those calls' fact rows stand is
+        // known only at the site fold. Its summary callers pass the same
+        // test as above now, so the fold need only ask about the facts.
+        let mut held_open: Vec<(String, u32, crate::request_summary::HeldAtFactCalls)> = Vec::new();
+        let mut held_stating: HeldStating = HashMap::new();
+        for (pf, _) in &analyzed {
+            let file = PathBuf::from(&pf.path_str);
+            for (start, held) in summaries.held_at_fact_calls(&file) {
+                let callers = summaries.stating_callers(&(file.clone(), start));
+                let mut stating = Vec::new();
+                let mut each_one_row = true;
+                for (caller_file, caller_start) in &callers {
+                    let row = summaries
+                        .rows(caller_file)
+                        .and_then(|sites| sites.get(caller_start))
+                        .and_then(|rows| match rows.as_slice() {
+                            [row] => Some(row),
+                            _ => None,
+                        });
+                    match row {
+                        Some(row)
+                            if summary_sites.contains(&(caller_file.clone(), *caller_start)) =>
+                        {
+                            stating.push((
+                                caller_file.to_string_lossy().into_owned(),
+                                *caller_start,
+                                row.returns_request_value,
+                            ));
+                        }
+                        _ => each_one_row = false,
+                    }
+                }
+                if each_one_row {
+                    held_stating.insert((pf.path_str.clone(), start), stating);
+                    held_open.push((pf.path_str.clone(), start, held));
+                }
+            }
+        }
         let mut withdrawn_at: HashMap<(PathBuf, u32), DataCallResult> = HashMap::new();
 
         // PHASE 3 (serial): emit the deterministic rows for each file, join
@@ -4821,6 +4872,7 @@ impl FileOrchestrator {
             }
         }
         Self::carry_request_line_anchors(&mut file_results, &withdrawn_at, &summaries, &mut stats);
+        let held_at_module_calls = Self::held_request_lines(held_open, held_stating, &file_results);
 
         // PHASE 4 (#580 part b): join each route table's paths to the
         // controller classes they bind. Cross-file, so it runs once every
@@ -5062,6 +5114,7 @@ impl FileOrchestrator {
             stats,
             unread_mount_prefixes: unread_prefixes,
             unread_decorator_paths,
+            held_at_module_calls,
             bundled_types: None,
             type_resolution: None,
         })
@@ -6002,16 +6055,20 @@ impl FileOrchestrator {
                     // The body the request line sends, where this row's own
                     // call states none (carrick#3961).
                     if !own_request
-                        && let Some((anchor, _, anchor_absolute, anchor_line)) = &request_line
+                        && let Some((_, _, anchor_absolute, _)) = &request_line
+                        && let Some(body) = data_call
+                            .request_line
+                            .as_deref()
+                            .and_then(RequestLineAnchors::request_body)
                     {
                         push_infer(
                             anchor_absolute,
-                            *anchor_line,
+                            body.line,
                             InferKind::RequestBody,
                             request_alias.clone(),
                             InferLocator::Text {
-                                expression_text: anchor.payload_expression_text.as_deref(),
-                                expression_line: anchor.payload_expression_line,
+                                expression_text: Some(body.text),
+                                expression_line: body.expression_line.map(|at| at as i32),
                             },
                         );
                     }
@@ -8995,6 +9052,44 @@ impl FileOrchestrator {
             }
         }
         stats.request_lines_carried_to_callers += carried.len();
+    }
+
+    /// The request lines held at their module-level calls (carrick#4121),
+    /// each with the model's row it kept: a line with no model-only row at
+    /// the request's span has nothing the fold could withdraw, and is left
+    /// out.
+    fn held_request_lines(
+        held_open: Vec<(String, u32, crate::request_summary::HeldAtFactCalls)>,
+        mut stating: HeldStating,
+        file_results: &HashMap<String, FileAnalysisResult>,
+    ) -> Vec<HeldRequestLine> {
+        let mut lines = Vec::new();
+        for (file, span_start, held) in held_open {
+            let Some(model) = file_results.get(&file).and_then(|result| {
+                result.data_calls.iter().find(|call| {
+                    call.call_expression_span_start == Some(span_start)
+                        && call.resolution_source == Some(ResolutionSource::Model)
+                })
+            }) else {
+                continue;
+            };
+            lines.push(HeldRequestLine {
+                stating: stating
+                    .remove(&(file.clone(), span_start))
+                    .unwrap_or_default(),
+                fact_calls: held
+                    .fact_calls
+                    .iter()
+                    .map(|(at, line, _)| (at.to_string_lossy().into_owned(), *line))
+                    .collect(),
+                model: model.clone(),
+                file,
+                span_start,
+                line: held.line,
+            });
+        }
+        lines.sort_by(|a, b| (&a.file, a.span_start).cmp(&(&b.file, b.span_start)));
+        lines
     }
 
     /// The value a call sends for the field its target dispatches on, where

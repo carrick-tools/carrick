@@ -1458,6 +1458,134 @@ fn off_the_fold_leaves_the_graph_untouched() {
 }
 
 // ---------------------------------------------------------------------------
+// A request line its module-level callers' facts state (carrick#4121).
+
+const MODULE_CALLER: &str = "src/forced-http.ts";
+const HELD_LINE: &str = "src/net/notify.ts";
+
+/// The forced HTTP fact row at `src/forced-http.ts:7`, standing for a
+/// module-level call of a wrapper whose request line is
+/// `src/net/notify.ts:7`.
+fn module_held() -> SiteRows {
+    let all = rows();
+    SiteRows {
+        enabled: true,
+        rows: all
+            .rows
+            .into_iter()
+            .filter(|row| row.file == MODULE_CALLER)
+            .collect(),
+        held_open: vec![HeldOpen {
+            file: HELD_LINE.to_string(),
+            line: LINE,
+            span_start: 40,
+            fact_calls: vec![(MODULE_CALLER.to_string(), LINE)],
+        }],
+        ..SiteRows::default()
+    }
+}
+
+fn reader_at_held_line() -> ApiEndpointDetails {
+    blob_row(
+        OperationKey::http("POST", "/v1/:endpoint"),
+        HELD_LINE,
+        LINE,
+        Some(ResolutionSource::Model),
+    )
+}
+
+/// Where the module-level call's fact row stands, the one reader row at the
+/// request line goes as a row a fact replaced, and the graph's copy with it.
+#[test]
+fn a_module_callers_fact_withdraws_the_reader_row_at_the_request_line() {
+    let mut data = blob_with_graph(
+        vec![reader_at_held_line()],
+        vec![graph_call(
+            "POST",
+            "/v1/:endpoint",
+            HELD_LINE,
+            ResolutionSource::Model,
+        )],
+    );
+    let fold = fold_into(&mut data, &module_held());
+    assert!(
+        at_site(&data.calls, HELD_LINE).is_empty(),
+        "{:?}",
+        data.calls
+    );
+    let key = OperationKey::http("POST", "/v1/:endpoint");
+    assert!(
+        fold.withdrawn
+            .contains(&(HELD_LINE.to_string(), LINE, key.clone(), RowSide::Call))
+    );
+    assert!(
+        fold.replaced_by_fact
+            .contains(&(HELD_LINE.to_string(), LINE, key))
+    );
+    assert_eq!(
+        fold.stated_at_fact_callers,
+        vec![(HELD_LINE.to_string(), 40)]
+    );
+    let graph = &data.mount_graph.as_ref().unwrap().data_calls;
+    assert!(
+        !graph
+            .iter()
+            .any(|call| call.file_location == format!("{HELD_LINE}:{LINE}")),
+        "{graph:?}"
+    );
+}
+
+/// A library row at the module-level call keeps the fact out: no fact
+/// stands there, so the request line keeps its row.
+#[test]
+fn a_module_caller_whose_fact_is_kept_out_keeps_the_request_line() {
+    let mut calls = vec![
+        reader_at_held_line(),
+        blob_row(
+            OperationKey::http("POST", "/v1/other"),
+            MODULE_CALLER,
+            LINE,
+            Some(ResolutionSource::LibraryClaim),
+        ),
+    ];
+    let fold = fold_rows(
+        &mut calls,
+        &mut Vec::new(),
+        &module_held(),
+        Path::new("."),
+        "",
+        make,
+    );
+    assert_eq!(at_site(&calls, HELD_LINE).len(), 1);
+    assert!(fold.stated_at_fact_callers.is_empty());
+}
+
+/// Two reader rows at the request line: no one of them is the request's,
+/// so neither goes.
+#[test]
+fn two_reader_rows_at_the_request_line_keep_it() {
+    let mut calls = vec![
+        reader_at_held_line(),
+        blob_row(
+            OperationKey::http("GET", "/v1/:endpoint"),
+            HELD_LINE,
+            LINE,
+            Some(ResolutionSource::Model),
+        ),
+    ];
+    let fold = fold_rows(
+        &mut calls,
+        &mut Vec::new(),
+        &module_held(),
+        Path::new("."),
+        "",
+        make,
+    );
+    assert_eq!(at_site(&calls, HELD_LINE).len(), 2);
+    assert!(fold.stated_at_fact_callers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // The wire.
 
 /// `inference` rides the wire on the rows that carry it, round-trips, and

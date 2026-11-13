@@ -11056,14 +11056,39 @@ struct CallerLedger {
     open: HashSet<(PathBuf, u32)>,
     /// The functions some call this pass composed reaches.
     seen: HashSet<(PathBuf, String)>,
-    /// The functions some call this pass did not compose reaches: a call
-    /// made where a module is loaded, in a constructor, an optional call, or
+    /// The functions some call this pass did not compose reaches and that
+    /// has no call site of its own to check: a call through a parameter, or
     /// one whose callee only the call graph names.
     unseen: HashSet<(PathBuf, String)>,
+    /// The calls this pass states no row for (a call made where a module is
+    /// loaded, an optional call, a construction, a call in a constructor or
+    /// in a callback), per function they reach, as `(file, line, span
+    /// start)` (carrick#4121, carrick#4127). The fact layer may state a row
+    /// at each.
+    fact_calls: HashMap<(PathBuf, String), FactCalls>,
     /// The requests, by file and span start, whose every caller this pass
     /// read and stated ([`RequestSummaryIndex::answered_at_callers`]).
     closed: HashSet<(PathBuf, u32)>,
+    /// The requests, by file and span start, whose every caller this pass
+    /// read or is a call it states no row for, with at least one such call
+    /// ([`RequestSummaryIndex::held_at_fact_calls`]).
+    held: HashMap<(PathBuf, u32), HeldAtFactCalls>,
 }
+
+/// A request whose own line leaves the path open, and whose callers this
+/// pass read save the calls it states no row for (carrick#4121,
+/// carrick#4127): the fact layer may state those calls as rows of their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAtFactCalls {
+    /// The request's own line.
+    pub line: u32,
+    /// The calls the fact layer may state, as `(file, line, span start)`.
+    pub fact_calls: FactCalls,
+}
+
+/// Calls this pass states no row for, as `(file, line, span start)`
+/// ([`HeldAtFactCalls::fact_calls`]).
+pub type FactCalls = BTreeSet<(PathBuf, u32, u32)>;
 
 /// The calls the summaries' rows and stops were composed through (C11 T1,
 /// [`Summary::through`]).
@@ -11256,6 +11281,28 @@ impl RequestSummaryIndex {
                     .any(|row| row.request_at == **at && row.reaches_request.is_none())
             })
             .map(|(_, start)| *start)
+            .collect()
+    }
+
+    /// The requests written in `file`, by span start, that leave their path
+    /// open and whose every caller this pass read and stated, save direct
+    /// calls this pass states no row for, of which there is at least one
+    /// (carrick#4121, carrick#4127). Whether the request line's row goes is
+    /// the site fold's to decide, once it knows whether a fact row stands at
+    /// each call. A row stated at the request's own line by any other source
+    /// keeps it out, as in [`Self::answered_at_callers`].
+    pub fn held_at_fact_calls(&self, file: &Path) -> BTreeMap<u32, HeldAtFactCalls> {
+        self.ledger
+            .held
+            .iter()
+            .filter(|((at_file, _), _)| at_file == file)
+            .filter(|((at_file, start), _)| {
+                !self
+                    .rows
+                    .get(at_file)
+                    .is_some_and(|sites| sites.contains_key(start))
+            })
+            .map(|((_, start), held)| (*start, held.clone()))
             .collect()
     }
 
@@ -11789,6 +11836,11 @@ pub fn summarize(
 /// function a key names, some call this pass composed reaches it, and no
 /// call this pass did not compose does; no caller closed it without a row;
 /// and the request is written in a function a key names, holding it open.
+/// A request whose other callers are read so but which a call this pass
+/// states no row for also reaches (made where a module is loaded, in a
+/// constructor or a callback, or optional) is not closed: it goes to
+/// `ledger.held` (carrick#4121, carrick#4127). A call through a parameter
+/// has no call site to check and keeps the request unread.
 fn closed_at_callers(
     composer: &mut Composer<'_>,
     paths: &[&PathBuf],
@@ -11797,19 +11849,42 @@ fn closed_at_callers(
     let files = composer.files;
     for path in paths {
         let file = &files[*path];
-        reached_from(composer, path, &file.module_level, &mut ledger.unseen);
+        // A call this pass states no row for is one the fact layer may
+        // state a row for (carrick#4121, carrick#4127): it is named with its
+        // call site, not unseen. Only a call through a parameter, which has
+        // no call site of its own, stays unseen.
+        let module_level = &file.module_level;
+        for call in &module_level.calls {
+            note_call(composer, path, call, ledger);
+        }
+        for call in module_level
+            .optional_calls
+            .iter()
+            .chain(&module_level.constructions)
+        {
+            note_call(composer, path, call, ledger);
+        }
+        for inner in module_level
+            .nested
+            .iter()
+            .chain(&module_level.detached)
+            .chain(&module_level.param_functions)
+        {
+            note_calls_from(composer, path, inner, ledger);
+        }
         for ir in &file.constructor_defaults {
-            reached_from(composer, path, ir, &mut ledger.unseen);
+            note_calls_from(composer, path, ir, ledger);
         }
         for ir in file.functions.values() {
             if ir.constructor {
-                reached_from(composer, path, ir, &mut ledger.unseen);
+                note_calls_from(composer, path, ir, ledger);
             } else {
-                reached_unread(composer, path, ir, &mut ledger.unseen);
+                note_calls_unread(composer, path, ir, ledger);
             }
         }
     }
     let mut holders: HashMap<(PathBuf, u32), Vec<(PathBuf, String)>> = HashMap::new();
+    let mut lines: HashMap<(PathBuf, u32), u32> = HashMap::new();
     let mut written_in: HashSet<(PathBuf, u32)> = HashSet::new();
     for path in paths {
         let mut keys: Vec<&String> = files[*path].functions.keys().collect();
@@ -11832,6 +11907,7 @@ fn closed_at_callers(
                 {
                     written_in.insert(at.clone());
                 }
+                lines.insert(at.clone(), effect.site.line);
                 holders
                     .entry(at)
                     .or_default()
@@ -11839,36 +11915,74 @@ fn closed_at_callers(
             }
         }
     }
-    holders
-        .into_iter()
-        .filter(|(at, held)| {
-            written_in.contains(at)
-                && !ledger.stops.contains(at)
-                && !ledger.open.contains(at)
-                && held
-                    .iter()
-                    .all(|holder| ledger.seen.contains(holder) && !ledger.unseen.contains(holder))
-        })
-        .map(|(at, _)| at)
-        .collect()
+    // A request no caller closed without a row, held open only by functions
+    // whose every call is one this pass composed, or a call it states no row
+    // for (carrick#4121, carrick#4127).
+    let readable = |at: &(PathBuf, u32), held: &[(PathBuf, String)]| {
+        written_in.contains(at)
+            && !ledger.stops.contains(at)
+            && !ledger.open.contains(at)
+            && held.iter().all(|holder| {
+                (ledger.seen.contains(holder) || ledger.fact_calls.contains_key(holder))
+                    && !ledger.unseen.contains(holder)
+            })
+    };
+    let mut closed = HashSet::new();
+    let mut held_at_fact_calls = HashMap::new();
+    for (at, held) in &holders {
+        if !readable(at, held) {
+            continue;
+        }
+        let fact_calls: FactCalls = held
+            .iter()
+            .filter_map(|holder| ledger.fact_calls.get(holder))
+            .flatten()
+            .cloned()
+            .collect();
+        if fact_calls.is_empty() {
+            closed.insert(at.clone());
+        } else {
+            held_at_fact_calls.insert(
+                at.clone(),
+                HeldAtFactCalls {
+                    line: lines.get(at).copied().unwrap_or_default(),
+                    fact_calls,
+                },
+            );
+        }
+    }
+    ledger.held = held_at_fact_calls;
+    closed
 }
 
-/// Every function a call in `ir`, or in a function written in it, reaches.
-fn reached_from(
-    composer: &Composer<'_>,
-    file: &Path,
-    ir: &FnIr,
-    reached: &mut HashSet<(PathBuf, String)>,
-) {
+/// Names `call`, which this pass states no row for, in the ledger: with its
+/// call site for the fact check, or as unseen when it goes through a
+/// parameter and has none (carrick#4127).
+fn note_call(composer: &Composer<'_>, file: &Path, call: &CallIr, ledger: &mut CallerLedger) {
+    let Some(target) = composer.target(file, call) else {
+        return;
+    };
+    if call.invokes_param.is_some() {
+        ledger.unseen.insert(target);
+    } else {
+        ledger.fact_calls.entry(target).or_default().insert((
+            file.to_path_buf(),
+            call.site.line,
+            call.site.span_start,
+        ));
+    }
+}
+
+/// Every call in `ir`, or in a function written in it, named by
+/// [`note_call`].
+fn note_calls_from(composer: &Composer<'_>, file: &Path, ir: &FnIr, ledger: &mut CallerLedger) {
     for call in ir
         .calls
         .iter()
         .chain(&ir.optional_calls)
         .chain(&ir.constructions)
     {
-        if let Some(target) = composer.target(file, call) {
-            reached.insert(target);
-        }
+        note_call(composer, file, call, ledger);
     }
     for inner in ir
         .nested
@@ -11876,29 +11990,22 @@ fn reached_from(
         .chain(&ir.detached)
         .chain(&ir.param_functions)
     {
-        reached_from(composer, file, inner, reached);
+        note_calls_from(composer, file, inner, ledger);
     }
 }
 
-/// Every function a call in `ir` reaches that [`emit`] does not read: an
-/// optional call, a construction, and any call in a function written as a
-/// parameter's default.
-fn reached_unread(
-    composer: &Composer<'_>,
-    file: &Path,
-    ir: &FnIr,
-    reached: &mut HashSet<(PathBuf, String)>,
-) {
+/// Every call in `ir` that [`emit`] does not read, named by [`note_call`]:
+/// an optional call, a construction, and any call in a function written as
+/// a parameter's default.
+fn note_calls_unread(composer: &Composer<'_>, file: &Path, ir: &FnIr, ledger: &mut CallerLedger) {
     for call in ir.optional_calls.iter().chain(&ir.constructions) {
-        if let Some(target) = composer.target(file, call) {
-            reached.insert(target);
-        }
+        note_call(composer, file, call, ledger);
     }
     for inner in &ir.param_functions {
-        reached_from(composer, file, inner, reached);
+        note_calls_from(composer, file, inner, ledger);
     }
     for inner in ir.nested.iter().chain(&ir.detached) {
-        reached_unread(composer, file, inner, reached);
+        note_calls_unread(composer, file, inner, ledger);
     }
 }
 
@@ -15005,5 +15112,117 @@ function build() { return {}; }
         for base in ["config.apiUrl", "readBase()", "API_BASE"] {
             assert_eq!(in_another_file(base), (false, true), "{base}");
         }
+    }
+
+    /// The summaries of a service written from `files` (path, source).
+    fn summarized(files: &[(&str, &str)]) -> (tempfile::TempDir, RequestSummaryIndex) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        std::fs::write(dir.path().join("package.json"), "{\"name\":\"held\"}")
+            .expect("the manifest is writable");
+        for (path, source) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("the tree");
+            std::fs::write(path, source).expect("the source is writable");
+        }
+        let inputs = crate::engine::discover_request_inputs(dir.path());
+        let index = summarize(&inputs, &LibrarySemantics::default());
+        (dir, index)
+    }
+
+    /// The key the summaries hold `file` (repo-relative) under.
+    fn key_of(index: &RequestSummaryIndex, file: &str) -> PathBuf {
+        index
+            .ledger
+            .seen
+            .iter()
+            .chain(index.ledger.fact_calls.keys())
+            .map(|(path, _)| path.clone())
+            .chain(index.ledger.held.keys().map(|(path, _)| path.clone()))
+            .find(|path| path.ends_with(file))
+            .unwrap_or_else(|| panic!("{file} is read"))
+    }
+
+    const NOTIFY: &str = "export function notify(endpoint: string) {\n\
+                          \x20 return fetch(`/v1${endpoint}`, { method: 'POST' });\n\
+                          }\n";
+
+    /// carrick#4121: a wrapper called inside a function and directly where a
+    /// module loads is held at the module-level call, by the request's span,
+    /// and not answered at its callers: the fold decides once it knows
+    /// whether the call's fact row stands.
+    #[test]
+    fn a_request_a_module_level_call_reaches_is_held_at_that_call() {
+        let (_dir, index) = summarized(&[
+            ("src/net/notify.ts", NOTIFY),
+            (
+                "src/alerts.ts",
+                "import { notify } from './net/notify';\n\
+                 export const fire = () => notify('/fire');\n\
+                 export const eager = notify('/eager');\n",
+            ),
+        ]);
+        let notify = key_of(&index, "src/net/notify.ts");
+        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
+        let held = index.held_at_fact_calls(&notify);
+        assert_eq!(held.len(), 1, "{held:?}");
+        let (_, at) = held.iter().next().unwrap();
+        assert_eq!(at.line, 2);
+        let calls: Vec<(String, u32)> = at
+            .fact_calls
+            .iter()
+            .map(|(file, line, _)| (file.to_string_lossy().into_owned(), *line))
+            .collect();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            calls[0].0.ends_with("src/alerts.ts") && calls[0].1 == 3,
+            "{calls:?}"
+        );
+    }
+
+    /// carrick#4127: a call written inside a callback has a call site of its
+    /// own, which the fact layer may state: the request is held at it, with
+    /// the module-level call, and not answered.
+    #[test]
+    fn a_module_level_call_inside_a_callback_is_held_at_that_call() {
+        let (_dir, index) = summarized(&[
+            ("src/net/notify.ts", NOTIFY),
+            (
+                "src/alerts.ts",
+                "import { notify } from './net/notify';\n\
+                 export const fire = () => notify('/fire');\n\
+                 export const eager = notify('/eager');\n\
+                 setTimeout(() => notify('/tick'));\n",
+            ),
+        ]);
+        let notify = key_of(&index, "src/net/notify.ts");
+        let held = index.held_at_fact_calls(&notify);
+        let (_, at) = held.iter().next().unwrap();
+        let lines: Vec<u32> = at.fact_calls.iter().map(|(_, line, _)| *line).collect();
+        assert_eq!(lines, vec![3, 4], "{held:?}");
+        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
+    }
+
+    /// A call through a parameter, written in a constructor, has no call
+    /// site of its own to check: a request it may reach is neither held nor
+    /// answered (carrick#4127).
+    #[test]
+    fn a_call_through_a_parameter_is_not_held() {
+        let (_dir, index) = summarized(&[
+            ("src/net/notify.ts", NOTIFY),
+            (
+                "src/alerts.ts",
+                "import { notify } from './net/notify';\n\
+                 export const fire = () => notify('/fire');\n\
+                 export const eager = notify('/eager');\n\
+                 export class Pager {\n\
+                 \x20 constructor(notify: (endpoint: string) => void) {\n\
+                 \x20   notify('/page');\n\
+                 \x20 }\n\
+                 }\n",
+            ),
+        ]);
+        let notify = key_of(&index, "src/net/notify.ts");
+        assert_eq!(index.held_at_fact_calls(&notify), BTreeMap::new());
+        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
     }
 }

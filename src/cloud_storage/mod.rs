@@ -2243,6 +2243,7 @@ mod tests {
             raw_model_results: HashMap::new(),
             builds_graphql_schema_in_code: false,
             unread_decorator_paths: Vec::new(),
+            held_at_module_calls: Vec::new(),
             stats: Default::default(),
         };
 
