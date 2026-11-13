@@ -53,5 +53,6 @@
   "parameter_unread": "the value comes from a parameter this function's callers fill, and this reader does not read through callers",
   "env_value": "the name is built from an environment variable, so it is only known when the program runs",
   "procedure_unmounted": "the procedure's adapter has no path prefix and no call mounts it, so Carrick can't tell where it is served",
-  "procedure_no_adapter": "no adapter in this repository is handed this procedure's router, so Carrick can't find a path for it"
+  "procedure_no_adapter": "no adapter in this repository is handed this procedure's router, so Carrick can't find a path for it",
+  "procedure_subscription_not_http": "it is a subscription, and the library's labels state no request method for it"
 }

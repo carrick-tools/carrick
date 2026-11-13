@@ -107,3 +107,18 @@ app.post('/h', async (req, res) => {
   }
   res.end();
 });
+
+// S
+app.get('/s', async (req, reply) => {
+  reply.send(ok());
+});
+
+// J
+app.get('/j', async (req, res) => {
+  const { failure, doc } = await load();
+  if (failure) {
+    res.status(500).json(failure);
+    return;
+  }
+  res.json(doc);
+});

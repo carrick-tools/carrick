@@ -120,10 +120,22 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/glibc-floor.sh "$BIN"
 
+      # The type sidecar is not tracked (carrick#4066): the smoke scan below
+      # runs against a build of this commit's sidecar source, as the `cli` job
+      # packs one.
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: src/sidecar/package-lock.json
+
+      - name: Build sidecar
+        shell: bash
+        run: cd src/sidecar && npm ci && npm run build
+
       # Run the binary just built (carrick#2197), so a break only a release
-      # build has is found here and not at the RC scan. express-single needs no
-      # `node_modules` or sidecar build to be indexed: types degrade, the count
-      # does not.
+      # build has is found here and not at the RC scan.
       - name: Smoke the binary (scan)
         shell: bash
         env:

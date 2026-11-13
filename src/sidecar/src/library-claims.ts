@@ -118,6 +118,22 @@ const ROLE_PROTOCOLS: Readonly<Record<LibraryRole, ReadonlySet<string>>> = {
   none: new Set(),
 };
 
+/**
+ * A maker's `protocol` (amendment 11): only `graphql` is a make protocol, on
+ * `server_framework` only (any other role is `protocol_role`), and it takes
+ * `runs`, with `prefix` optional, and no `name`, `base`, `handler` or
+ * `key_labels`. Undefined when the check has no make protocol or it is well
+ * formed; the make is then judged as any other.
+ */
+function makeProtocolRefusal(check: LibraryCheck): 'claim_invalid' | 'protocol_role' | undefined {
+  const claim = check.claim;
+  if (claim.kind !== 'make' || claim.protocol === undefined) return undefined;
+  if (claim.protocol !== 'graphql') return 'claim_invalid';
+  if (check.role !== 'server_framework') return 'protocol_role';
+  const stray = claim.name !== undefined || claim.base !== undefined || claim.handler !== undefined || claim.key_labels !== undefined;
+  return claim.runs === undefined || stray ? 'claim_invalid' : undefined;
+}
+
 /** The type names a `document` name slot accepts; a string is accepted too. */
 const DOCUMENT_TYPES: ReadonlySet<string> = new Set([
   'DocumentNode',
@@ -964,6 +980,8 @@ export class LibraryClaimsVerifier {
 
       const judgeCheck = (index: number): Judged => {
         const check = checks[index];
+        const makeProtocol = makeProtocolRefusal(check);
+        if (makeProtocol !== undefined) return { outcome: unchecked(makeProtocol) };
         const rules = rulesFor(check);
         if (!rules) return { outcome: unchecked('role_unsupported') };
         // An export given two roles is classified two ways; neither is a fact.
@@ -2703,8 +2721,18 @@ class DeclarationReader {
     const holding: ts.Signature[] = [];
     let best: RankedFailure | undefined;
     for (const signature of callee.signatures) {
-      let result = this.messageSignatureOutcome(signature, layout.value, labels);
-      if (result.outcome.verdict !== 'verified' && result.outcome.reason.startsWith('runs_') && collections !== undefined) {
+      let result = this.messageSignatureOutcome(
+        signature,
+        layout.value,
+        labels,
+        claim.protocol === 'graphql' ? declared => this.graphqlRunsFailure(declared) : undefined
+      );
+      if (
+        claim.protocol !== 'graphql' &&
+        result.outcome.verdict !== 'verified' &&
+        result.outcome.reason.startsWith('runs_') &&
+        collections !== undefined
+      ) {
         const collected = collections();
         if (collected !== undefined) {
           result = this.messageSignatureOutcome(signature, layout.value, labels, declared =>
@@ -3748,6 +3776,26 @@ class DeclarationReader {
       best = furthest(best, 3, failure);
     }
     return best?.outcome ?? failed('param_missing');
+  }
+
+  /**
+   * A `runs` slot on a `protocol: "graphql"` make (ruling G9): what the maker
+   * is given to run is a schema, which is an object, or a factory, which is a
+   * function. `any`, `unknown` and an unconstrained type parameter say
+   * nothing (`runs_untyped`); anything that is not an object type, a
+   * primitive for one, fails `runs_not_schema`. Names no library type.
+   */
+  private graphqlRunsFailure(declared: Slot | undefined): Outcome | undefined {
+    if (declared === undefined) return failed('param_missing');
+    const slot = this.throughConditional(this.throughConstraint(declared));
+    if (slot === VARIADIC) return unchecked('runs_untyped');
+    const parts = this.parts(slot);
+    if (parts.length === 0) return failed('runs_not_schema');
+    for (const part of parts) {
+      if (this.isOpenTop(part) || this.isUnconstrained(part)) return unchecked('runs_untyped');
+      if (!this.isObjectLike(part)) return failed('runs_not_schema');
+    }
+    return undefined;
   }
 
   /** A `runs` slot: a function with a declared signature, as a handler is, under its own reasons. */

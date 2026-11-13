@@ -74,6 +74,7 @@ pub(crate) fn spec_hash(pair: &BuiltPair) -> String {
         consumer_service: &pair.consumer_service,
         pre_verdict: pair.pre_verdict.as_ref().map(|pre| match pre {
             PreVerdict::NotCompared { reason } => format!("not_compared:{reason}"),
+            PreVerdict::NoSurface { reason } => format!("no_surface:{reason}"),
             PreVerdict::NoBodyEitherSide => "no_body_either_side".to_string(),
         }),
         pre_verdict_side: pair.pre_verdict_side,

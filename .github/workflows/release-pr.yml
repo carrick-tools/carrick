@@ -1,0 +1,39 @@
+name: Release PR
+
+# Opens and updates the version PR on main. It never tags and never publishes:
+# `skip-github-release` leaves the merged version PR labelled
+# `autorelease: pending`, and release-please opens no next PR while it is.
+# The release itself is cut by moving the `release` branch to a commit main's
+# check passed; release.yml tags that commit, publishes it, and relabels the
+# version PR `autorelease: tagged` (scripts/release-cut.sh).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Its own group, not release.yml's: a newer pending run cancels an older
+# pending one in a group, and that must never drop a push-to-`release` run.
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # With the default GITHUB_TOKEN the release PR is authored by
+      # `app/github-actions`, which has no merged commit of its own, so GitHub's
+      # first-time-contributor approval parks every workflow run on the release
+      # branch at `action_required` until a maintainer approves it by hand
+      # (carrick#1270; it bit 0.3.74 through 0.3.78). A token owned by a
+      # contributor makes the PR theirs and the runs start on their own. Falls
+      # back to GITHUB_TOKEN when the secret is absent, so nothing breaks
+      # before it exists.
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          skip-github-release: true

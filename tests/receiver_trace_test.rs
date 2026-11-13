@@ -2275,6 +2275,64 @@ fn procedure_rows_state_their_router_and_key_path() {
     assert!(flat.iter().all(|row| !row.ends_with("=> -")), "{flat:?}");
 }
 
+/// A server label that states its method as the kind word (`QUERY`,
+/// `MUTATION`, on `protocol: "rpc"`) writes the same rows the HTTP words do:
+/// the server's procedure sites state their wire method through
+/// `procedure_wire_label`, as the client's do (cloud#2743 item 5, S1).
+/// Subscriptions are left out (carrick#4048): `stream` keeps no method.
+#[test]
+fn a_server_procedure_label_stating_the_kind_word_writes_its_wire_method() {
+    let name = "procedure-router";
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let storage = tmp.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let home = tmp.path().join("home");
+    let mut cmd = scan_cmd(name, tmp.path(), &repo, &storage, &home);
+    // The same claims, the two key-named ops stating the kind word.
+    let claims = tmp.path().join("cassettes/library-claims/default.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claims).unwrap()).unwrap();
+    let mut rewritten = 0;
+    for package in doc["library_claims"].as_array_mut().unwrap() {
+        for export in package["exports"].as_array_mut().unwrap() {
+            for op in export["ops"].as_array_mut().unwrap() {
+                let word = match op["member"].as_str() {
+                    Some("query") => "QUERY",
+                    Some("mutation") => "MUTATION",
+                    _ => continue,
+                };
+                if op["name"]["bound"] == "key" {
+                    op["method"] = word.into();
+                    op["protocol"] = "rpc".into();
+                    rewritten += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(rewritten, 2, "the fixture's key-named query and mutation");
+    std::fs::write(&claims, serde_json::to_string(&doc).unwrap()).unwrap();
+    cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env_remove("CARRICK_PROGRESS");
+    let (on, _) = run_scan(&mut cmd, &storage);
+    let (graph, flat) = procedure_rows(&on);
+    let (stated, _) = {
+        let (base, _) = scan_fixture_reading(name);
+        procedure_rows(&base)
+    };
+    // Byte-identical to the rows the HTTP words write.
+    assert_eq!(graph, stated);
+    assert!(
+        graph.iter().any(|row| row.contains(" POST ")),
+        "the mutation writes POST: {graph:?}"
+    );
+    assert!(flat.iter().all(|row| !row.ends_with("=> -")), "{flat:?}");
+}
+
 /// The router a procedure row names is the innermost declaration holding the
 /// property of the first key: the binding the router call is assigned to, a
 /// table another binding hands it, and two routers in one file that share a
@@ -2658,6 +2716,7 @@ fn procedure_client_rows() -> Vec<String> {
         format!("src/web/hooks.ts:7 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/hooks.ts:8 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/hooks.ts:16 GET \"\" {router} count request_summary"),
+        format!("src/web/subscribe.ts:13 GET \"\" {router} shelf.list request_summary"),
         format!("src/web/vanilla.ts:11 POST \"\" {router} shelf.add request_summary"),
         format!("src/web/vanilla.ts:15 GET \"\" {router} shelf.inner.get request_summary"),
         format!("src/web/vanilla.ts:16 GET \"\" {router} count request_summary"),
@@ -2689,6 +2748,7 @@ fn a_client_procedure_call_pairs_only_its_own_router() {
             format!("http|GET|/api/rpc/count <- {call}"),
             format!("http|GET|/api/rpc/count <- {call}"),
             format!("http|GET|/api/rpc/shelf.inner.get <- {call}"),
+            format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
@@ -2734,6 +2794,30 @@ fn a_client_typed_by_a_router_outside_the_repo_is_saved_unread() {
             .get("src/web/remote.ts:7")
             .map(String::as_str),
         Some("procedure_router_outside_repo")
+    );
+}
+
+/// carrick#4048: a subscription call whose label states no HTTP method
+/// (`SUBSCRIBE`) states no wire method: no row, and the call is saved unread
+/// with its reason. The same call whose label states `GET` (an SSE adapter)
+/// keeps its GET row (`procedure_client_rows`).
+#[test]
+fn a_subscription_call_with_no_method_word_is_saved_unread() {
+    let blobs = scan_fixture("procedure-client");
+    let (flat, graph) = client_rows(&blobs);
+    for rows in [&flat, &graph] {
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.starts_with("src/web/subscribe.ts:9")),
+            "{rows:?}"
+        );
+    }
+    assert_eq!(
+        unread_reasons(&blobs)
+            .get("src/web/subscribe.ts:9")
+            .map(String::as_str),
+        Some("procedure_subscription_not_http")
     );
 }
 
@@ -2806,7 +2890,7 @@ fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
     assert_eq!(vanilla(&graph).len(), 4, "{graph:?}");
     // One edge per call: `count` is called at `vanilla.ts:16` and
     // `hooks.ts:16`, `shelf.list` at `vanilla.ts:7`, `vanilla.ts:16` and
-    // `hooks.ts:7`.
+    // `hooks.ts:7`, and `subscribe.ts:13` (a `GET` subscription label).
     let edges = matched_producers("procedure-client");
     let calls_of = |producer: &str| {
         edges
@@ -2820,7 +2904,7 @@ fn two_procedure_queries_in_one_file_and_on_one_line_are_two_rows() {
             calls_of("shelf.inner.get"),
             calls_of("shelf.list")
         ],
-        [2, 1, 3],
+        [2, 1, 4],
         "{edges:?}"
     );
 }
@@ -2956,6 +3040,53 @@ fn a_client_call_through_an_expanded_alias_pairs_its_procedure() {
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
             format!("http|GET|/api/rpc/shelf.list <- {call}"),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
+        ]
+    );
+}
+
+/// The rows `procedure-client-hooks-module` states: a hooks proxy made in
+/// its own module (`client.ts`) and imported into a `.tsx` file, three calls
+/// through a sub-router (`shelf.drawer.items` is two routers deep) and calls
+/// that span several lines. Pins the shape of carrick#3847 / carrick#3931
+/// beyond their one-module `.ts` fixture.
+fn hooks_module_client_rows() -> Vec<String> {
+    let router = "workspace:src/router.ts#appRouter";
+    vec![
+        format!("src/web/poll.tsx:4 POST \"\" {router} shelf.add request_summary"),
+        format!("src/web/poll.tsx:5 GET \"\" {router} shelf.drawer.items request_summary"),
+        format!("src/web/poll.tsx:9 POST \"\" {router} shelf.add request_summary"),
+    ]
+}
+
+/// Leads in `poll.tsx` saved unread: none, each call is a row.
+fn unread_in_hooks_module(blobs: &Blobs) -> Vec<String> {
+    unread_reasons(blobs)
+        .into_iter()
+        .filter(|(at, _)| at.starts_with("src/web/poll.tsx:"))
+        .map(|(at, reason)| format!("{at} {reason}"))
+        .collect()
+}
+
+#[test]
+fn a_hooks_proxy_imported_into_tsx_states_each_procedure() {
+    let blobs = scan_fixture("procedure-client-hooks-module");
+    let (flat, graph) = client_rows(&blobs);
+    assert_eq!(flat, hooks_module_client_rows());
+    assert_eq!(graph, hooks_module_client_rows());
+    assert_eq!(unread_in_hooks_module(&blobs), Vec::<String>::new());
+}
+
+/// Each of those calls pairs with the server's procedure row.
+#[test]
+fn a_hooks_proxy_imported_into_tsx_pairs_each_procedure() {
+    let blobs = scan_fixture("procedure-client-hooks-module");
+    assert_eq!(unread_in_hooks_module(&blobs), Vec::<String>::new());
+    assert_eq!(
+        matched_producers("procedure-client-hooks-module"),
+        vec![
+            "http|GET|/api/rpc/shelf.drawer.items <- http|GET|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
             "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
         ]
     );

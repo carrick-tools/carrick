@@ -373,6 +373,12 @@ pub enum Link {
     Named(library_sites::NamedRef),
     /// A field of a class the file declares (carrick#2452).
     Field(FieldLink),
+    /// The parameters the arguments of a call the text reader cannot read
+    /// hand it (`signed(`${ROOT}${path}`)`, carrick#4022): the hole is still
+    /// one a caller chooses, so the request is open until a caller fills
+    /// them ([`Piece::refilled`]), and closed it is the plain hole again.
+    /// Nothing resolves it to text.
+    Through(Vec<Piece>),
 }
 
 impl Piece {
@@ -384,6 +390,47 @@ impl Piece {
             self,
             Piece::Param(..) | Piece::ParamKey(..) | Piece::ParamKeyOr(..) | Piece::Outer(..)
         )
+    }
+
+    /// Whether a caller still chooses what the piece holds, for a name or a
+    /// URL: a parameter, or a hole of an unread call open on one
+    /// ([`Link::Through`], carrick#4022). Only the readers of a request's
+    /// name ask this; a receiver handed such a hole is no parameter.
+    fn waits_on_caller(&self) -> bool {
+        self.is_parameter()
+            || self
+                .through()
+                .is_some_and(|inner| inner.iter().any(Piece::waits_on_caller))
+    }
+
+    /// The parameters a hole made of an unread call holds ([`Link::Through`]).
+    fn through(&self) -> Option<&[Piece]> {
+        match self {
+            Piece::Opaque {
+                link: Some(link), ..
+            } => match &**link {
+                Link::Through(inner) => Some(inner),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A hole made of an unread call ([`Link::Through`]) with its parameters
+    /// replaced by `fill(inner)`: still open while one is left, else the
+    /// plain hole with its own text and end. `None` for any other piece.
+    fn refilled(&self, fill: &dyn Fn(&[Piece]) -> Vec<Piece>) -> Option<Piece> {
+        let inner = self.through()?;
+        let Piece::Opaque { text, end, .. } = self else {
+            return None;
+        };
+        let inner = fill(inner);
+        let open = inner.iter().any(Piece::waits_on_caller);
+        Some(Piece::Opaque {
+            text: text.clone(),
+            end: end.clone(),
+            link: open.then(|| Box::new(Link::Through(inner))),
+        })
     }
 
     /// The text a parameter is read by where it is written.
@@ -405,7 +452,9 @@ impl Piece {
                 Piece::Outer(1, Box::new(self.clone()))
             }
             Piece::Outer(depth, inner) => Piece::Outer(depth.saturating_add(1), inner.clone()),
-            other => other.clone(),
+            other => other
+                .refilled(&|inner| inner.iter().map(Piece::enclosed).collect())
+                .unwrap_or_else(|| other.clone()),
         }
     }
 
@@ -415,9 +464,26 @@ impl Piece {
         match self {
             Piece::Outer(1, inner) => (**inner).clone(),
             Piece::Outer(depth, inner) => Piece::Outer(depth - 1, inner.clone()),
-            other => other.clone(),
+            other => other
+                .refilled(&|inner| inner.iter().map(Piece::lifted).collect())
+                .unwrap_or_else(|| other.clone()),
         }
     }
+}
+
+/// `pieces` with each parameter piece `param` answers replaced by its
+/// answer, and the holes of unread calls in them refilled the same way
+/// ([`Piece::refilled`], carrick#4022).
+fn substituted(pieces: &[Piece], param: &dyn Fn(&Piece) -> Option<Vec<Piece>>) -> Vec<Piece> {
+    concat(pieces.iter().map(|piece| {
+        param(piece).unwrap_or_else(|| {
+            vec![
+                piece
+                    .refilled(&|inner| substituted(inner, param))
+                    .unwrap_or_else(|| piece.clone()),
+            ]
+        })
+    }))
 }
 
 /// Where a value renamed into one opaque piece comes from (carrick#2406): a
@@ -3386,7 +3452,8 @@ fn held_by(values: &[Value]) -> Option<Held> {
     let linked = |value: &Value| {
         matches!(value, Value::Str(pieces) if pieces
             .iter()
-            .any(|piece| matches!(piece, Piece::Opaque { link: Some(_), .. })))
+            .any(|piece| piece.through().is_none()
+                && matches!(piece, Piece::Opaque { link: Some(_), .. })))
     };
     if !values.iter().any(linked)
         && let Some(tail) = shared_written_tail(values)
@@ -7017,7 +7084,7 @@ impl Reader<'_> {
                     return Value::Str(vec![Piece::Query]);
                 }
                 if let Some(value) = built {
-                    return value;
+                    return self.through(value, call, scope);
                 }
                 // `url.toString()` is the URL.
                 if let Some(object) = to_string_object(call) {
@@ -7037,7 +7104,9 @@ impl Reader<'_> {
                         },
                     ),
                     None => {
-                        self.linked(Value::hole(text, HoleReason::UnreadExpression), expr, scope)
+                        let hole = Value::hole(text, HoleReason::UnreadExpression);
+                        let hole = self.linked(hole, expr, scope);
+                        self.through(hole, call, scope)
                     }
                 }
             }
@@ -7153,6 +7222,60 @@ impl Reader<'_> {
             && let [Piece::Opaque { link, .. }] = inner.as_mut_slice()
         {
             *link = Some(Box::new(Link::Named((**named).clone())));
+        }
+        value
+    }
+
+    /// `value`, the hole a call reads as (a body the builder rule cannot
+    /// read, or returns that state no one path), keeping the parameters its
+    /// arguments read (carrick#4022): a caller still chooses the path, so the
+    /// request stays open until one fills them ([`Link::Through`]). A
+    /// parameter that is a whole path segment of its argument is a path
+    /// parameter, chosen by no caller, and is not kept. Only a call of a
+    /// function by its name: a method's arguments act on its receiver
+    /// (`'/items/:id'.replace(':id', id)` is the receiver's route). A hole
+    /// that already links elsewhere, and any other value, is `value` as it
+    /// is.
+    fn through(&self, mut value: Value, call: &CallExpr, scope: &Scope<'_>) -> Value {
+        let by_name = matches!(&call.callee, Callee::Expr(callee)
+            if matches!(crate::graphql_document_sites::unwrap_expression(callee), Expr::Ident(_)));
+        let Value::Str(pieces) = &mut value else {
+            return value;
+        };
+        if !by_name {
+            return value;
+        }
+        let [
+            Piece::Opaque {
+                end: Root::Hole(_),
+                link: link @ None,
+                ..
+            },
+        ] = pieces.as_mut_slice()
+        else {
+            return value;
+        };
+        if call.args.iter().any(|arg| arg.spread.is_some()) {
+            return value;
+        }
+        let kept: Vec<Piece> = self.unrecorded(|| {
+            call.args
+                .iter()
+                .flat_map(|arg| {
+                    let pieces = self.eval(&arg.expr, scope).pieces();
+                    pieces
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, piece)| {
+                            piece.waits_on_caller() && !is_whole_segment(&pieces, *position)
+                        })
+                        .map(|(_, piece)| piece.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        });
+        if !kept.is_empty() {
+            *link = Some(Box::new(Link::Through(kept)));
         }
         value
     }
@@ -9606,12 +9729,14 @@ impl Effect {
         matches!(
             self.method,
             MethodValue::Param(_) | MethodValue::ParamKey(..)
-        ) || self
-            .url
-            .iter()
-            .enumerate()
-            .any(|(position, piece)| piece.is_parameter() && !is_whole_segment(&self.url, position))
-            || self.base.iter().any(Piece::is_parameter)
+        ) || self.url.iter().enumerate().any(|(position, piece)| {
+            piece.waits_on_caller()
+                && !is_whole_segment(&self.url, position)
+                // A hole of an unread call (carrick#4022) in a URL that
+                // states a route all the same is no caller's to choose, as
+                // the site walk reads it (`decided_sites::decides`).
+                && (piece.through().is_none() || render_target(&self.url).is_none())
+        }) || self.base.iter().any(Piece::is_parameter)
     }
 
     /// This effect as seen from a call passing `args`, which `spread_args`
@@ -9635,10 +9760,14 @@ impl Effect {
         // it is the base, and the caller's own expression is what says where
         // the request goes.
         let written = |arg: &[Piece], position: usize, name: &str| match arg {
-            [Piece::Opaque { end, .. }] if position > 0 => vec![Piece::Opaque {
+            // A hole of an unread call keeps the parameters it is open on
+            // (carrick#4022).
+            [piece @ Piece::Opaque { end, .. }] if position > 0 => vec![Piece::Opaque {
                 text: name.to_string(),
                 end: end.clone(),
-                link: None,
+                link: piece
+                    .through()
+                    .map(|inner| Box::new(Link::Through(inner.to_vec()))),
             }],
             _ => arg.to_vec(),
         };
@@ -9663,6 +9792,26 @@ impl Effect {
                     _ => hole,
                 },
                 _ => hole,
+            }
+        };
+        // What the caller writes for one parameter piece, as plain text: the
+        // parameters a hole of an unread call holds (carrick#4022).
+        let param_fill = |piece: &Piece| -> Option<Vec<Piece>> {
+            match piece {
+                Piece::Param(index, _) => {
+                    Some(args.get(*index).map_or(vec![Piece::Unknown], Value::pieces))
+                }
+                Piece::ParamKey(index, key, name) => {
+                    Some(match self.read_key(args, omitted, *index, key) {
+                        KeyRead::Written(value) => value.pieces(),
+                        KeyRead::Fallback(fallback) => fallback,
+                        KeyRead::Passed(outer, _) => {
+                            vec![Piece::ParamKey(outer, key.clone(), name.clone())]
+                        }
+                        KeyRead::Missing | KeyRead::Unread => vec![Piece::Unknown],
+                    })
+                }
+                _ => None,
             }
         };
         let fill = |pieces: &[Piece]| -> Vec<Piece> {
@@ -9706,7 +9855,13 @@ impl Effect {
                                 _ => vec![Piece::Unknown],
                             }
                         }
-                        other => vec![other.clone()],
+                        // A hole of an unread call (carrick#4022): its
+                        // parameters take what the caller writes, as text.
+                        other => vec![
+                            other
+                                .refilled(&|inner| substituted(inner, &param_fill))
+                                .unwrap_or_else(|| other.clone()),
+                        ],
                     }),
             )
         };

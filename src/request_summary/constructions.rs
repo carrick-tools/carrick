@@ -657,7 +657,7 @@ impl RequestSummaryInputs {
                         Link::Field(field) => table
                             .get(&(scope.to_path_buf(), field.class, field.field.clone()))
                             .map(Value::pieces),
-                        Link::Named(_) => None,
+                        Link::Named(_) | Link::Through(_) => None,
                     },
                     _ => None,
                 };

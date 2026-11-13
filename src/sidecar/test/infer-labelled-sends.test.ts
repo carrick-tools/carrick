@@ -96,12 +96,16 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
     return source.slice(0, at).split('\n').length;
   };
 
-  /** The response row of handler `label`, located at `located` on the line holding `at`. */
+  /**
+   * The response row of handler `label`, located at `located` on the line
+   * holding `at`; with no `located`, the line-only request the scanner sends
+   * for a route with no located payload (carrick#4081).
+   */
   const infer = async (
     label: string,
-    located: string,
+    located: string | undefined,
     labels: boolean,
-    at: string = located
+    at: string | undefined = located
   ): Promise<Inferred | undefined> => {
     const alias = `${label}_${labels}_${id}`;
     const response = await client.send<{ inferred_types?: Inferred[] }>(
@@ -114,8 +118,9 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
             line_number: lineOf(label, 'app.'),
             infer_kind: 'response_body',
             alias,
-            expression_text: located,
-            expression_line: lineOf(label, at),
+            ...(located !== undefined && at !== undefined
+              ? { expression_text: located, expression_line: lineOf(label, at) }
+              : {}),
           },
         ],
         ...(labels ? { server_claims: { from_dir: root, checks: LABELS, type_packages: {} } } : {}),
@@ -183,5 +188,37 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
       const inferred = await infer('H', "{ error: 'bad', code: 3 }", labels);
       assert.strictEqual(reason(inferred), 'no_success_payload', `labels=${labels}`);
     }
+  });
+
+  // carrick#4081: a line-only row at a registration whose handler returns
+  // nothing reads the success bodies the handler sends through labelled
+  // sends, through the same walk a located send takes.
+  describe('carrick#4081: a line-only row reads the labelled sends of a handler that returns nothing', () => {
+    it('S: a lone labelled `reply.send(x)` is the body; without labels nothing is read', async () => {
+      const got = collapse((await infer('S', undefined, true))?.type_string);
+      assert.match(got, /total: number/, got);
+      assert.strictEqual(await infer('S', undefined, false), undefined, 'an unlabelled send stays unread');
+    });
+
+    it('J: the labelled `res.json(x)` after an error guard is the body, the error send is dropped', async () => {
+      const got = collapse((await infer('J', undefined, true))?.type_string);
+      assert.match(got, /title: string/, got);
+      assert.doesNotMatch(got, /error/, got);
+      assert.strictEqual(await infer('J', undefined, false), undefined, 'an unlabelled send stays unread');
+    });
+
+    it('A, D: the labelled success send is the body; a setter joins nothing', async () => {
+      const a = collapse((await infer('A', undefined, true))?.type_string);
+      assert.match(a, /total: number/, a);
+      assert.doesNotMatch(a, /error/, a);
+      const d = collapse((await infer('D', undefined, true))?.type_string);
+      assert.match(d, /total: number/, d);
+      assert.doesNotMatch(d, /\|/, `the cookie value joins no union: ${d}`);
+    });
+
+    it('E, H: sends no label names, and a labelled send with no payload, are not read', async () => {
+      assert.strictEqual(await infer('E', undefined, true), undefined, 'the repo’s own reply type has no label');
+      assert.strictEqual(await infer('H', undefined, true), undefined, 'a send with no payload carries no body');
+    });
   });
 });

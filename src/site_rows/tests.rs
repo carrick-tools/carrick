@@ -2560,3 +2560,104 @@ fn the_name_census_counts_each_reader_s_outcome() {
     );
     assert_eq!(parity.line(), "absent=1 agrees=1 disagrees=1");
 }
+
+/// The rows a record with `names` states for `file`, keyed canonically as
+/// the engine keys them.
+fn canonical_rows(file: &str, names: &[&str]) -> SiteRows {
+    let http = site(file, "http_client", "request", "get");
+    let mut http_record = record(
+        &http,
+        &[
+            (Slot::Kind, "http"),
+            (Slot::Role, "sends"),
+            (Slot::Method, "GET"),
+        ],
+        &[],
+    );
+    http_record.names = names.iter().map(|name| name.to_string()).collect();
+    http_record.basis.insert(Slot::Name, Basis::Code);
+    let decided = Decided {
+        sites: vec![http],
+        ..Decided::default()
+    };
+    let mut rows = of(&decided, &[http_record], &labels(), &cassette());
+    key_requests_canonically(
+        &mut rows,
+        &crate::url_normalizer::UrlNormalizer::new(&crate::config::Config::default()),
+    );
+    rows
+}
+
+/// carrick#3984: two names that key alike once the query is stripped are
+/// one operation at the call, so one row, and the fold states one call.
+#[test]
+fn names_that_key_alike_after_canonical_keying_are_one_row() {
+    let file = "src/dup.ts";
+    let rows = canonical_rows(file, &["/api/c4", "/api/c4?query=1"]);
+    let keys: Vec<OperationKey> = rows.rows.iter().map(|row| row.key.clone()).collect();
+    assert_eq!(keys, vec![OperationKey::http("GET", "/api/c4")]);
+
+    let mut calls = Vec::new();
+    fold_rows(&mut calls, &mut Vec::new(), &rows, Path::new("."), "", make);
+    assert_eq!(at_site(&calls, file).len(), 1, "{calls:?}");
+
+    // A summary row already at the line with the same key (what the send
+    // side writes on a written `let`) is kept out, not a third row.
+    let mut calls = vec![blob_row(
+        OperationKey::http("GET", "/api/c4"),
+        file,
+        LINE,
+        Some(ResolutionSource::RequestSummary),
+    )];
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &rows, Path::new("."), "", make);
+    assert_eq!(at_site(&calls, file).len(), 1, "{calls:?}");
+    assert_eq!(
+        fold.kept_out,
+        BTreeMap::from([("request_summary".to_string(), 1)])
+    );
+}
+
+/// carrick#3984, what must not change: names that key apart stay rows, as
+/// do two procedure calls whose keys are alike and two rows that differ in
+/// a name scope.
+#[test]
+fn rows_that_key_apart_stay_rows() {
+    let rows = canonical_rows("src/apart.ts", &["/v1/a", "/v1/b?x=1"]);
+    let keys: Vec<OperationKey> = rows.rows.iter().map(|row| row.key.clone()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            OperationKey::http("GET", "/v1/a"),
+            OperationKey::http("GET", "/v1/b")
+        ]
+    );
+
+    let mut one = canonical_rows("src/apart.ts", &["/v1/a"]).rows.remove(0);
+    let at_proc = |binding: &str| crate::request_summary::discovery::ProcedureAt {
+        path: "users.list".to_string(),
+        file: "src/router.ts".to_string(),
+        binding: binding.to_string(),
+    };
+    one.key = OperationKey::http("GET", String::new());
+    let mut first = one.clone();
+    first.procedure = Some(at_proc("a"));
+    let mut second = one.clone();
+    second.procedure = Some(at_proc("b"));
+    let mut scoped = one.clone();
+    scoped.name_scope = Some(carrick_match::NameScope {
+        scope: "svc".to_string(),
+        namespace: None,
+    });
+    let mut rows = SiteRows {
+        enabled: true,
+        rows: vec![first.clone(), second, first, one.clone(), scoped, one],
+        ..SiteRows::default()
+    };
+    key_requests_canonically(
+        &mut rows,
+        &crate::url_normalizer::UrlNormalizer::new(&crate::config::Config::default()),
+    );
+    // Equal rows fold: the repeated procedure row and the repeated plain
+    // row; the second procedure and the scoped row stand.
+    assert_eq!(rows.rows.len(), 4, "{:?}", rows.rows);
+}

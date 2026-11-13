@@ -426,6 +426,20 @@ function literalMarks(
   };
 }
 
+/**
+ * Why an untyped alias is untyped (carrick#3995), which only the index reads:
+ * never a verdict input, never in `surface_hash`. The driver's cause on a
+ * literal it sent as a placeholder wins: it knows no value was located, which
+ * a demotion of that placeholder does not undo. Otherwise the cause the
+ * capture decided at the anchor, of any kind.
+ */
+function unreadCause(anchor: ResolvedAnchor): Pick<CaptureAliasRecord, 'unread_cause'> {
+  const cause =
+    (anchor.request.kind === 'literal' ? anchor.request.unread_cause : undefined) ??
+    anchor.unreadCause;
+  return cause ? { unread_cause: cause } : {};
+}
+
 /** An alias that never reached a capture-native tier: the failure reason was
  * recorded at demotion time; the surface line is `unknown` by construction. */
 function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
@@ -447,6 +461,7 @@ function demotedRecord(anchor: ResolvedAnchor): CaptureAliasRecord {
       ? { unresolved_in_tree: [unemittedModuleProvenance()] }
       : {}),
     ...literalMarks(anchor.request),
+    ...unreadCause(anchor),
   };
 }
 
@@ -647,6 +662,7 @@ function checkedRecord(
         }
       : {}),
     ...literalMarks(anchor.request),
+    ...unreadCause(anchor),
   };
   return statementText === undefined
     ? record
