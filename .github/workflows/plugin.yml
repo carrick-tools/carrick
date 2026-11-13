@@ -1,7 +1,7 @@
 name: Plugin
 
 # The hook, the language server and the VS Code wrapper. Separate from ci.yml so
-# the path filter can apply: this job is about the npm package and the host
+# the path test can apply (the `changes` job): this job is about the npm package and the host
 # manifests that point at it, and nothing in them touches Rust, so a Rust-only
 # pull request should not wait on it and a package-only one should not wait on
 # the Rust suite.
@@ -22,24 +22,72 @@ on:
       # the `vsix` job below runs, and nothing else proves that command still
       # works before a tag is cut.
       - ".github/workflows/release.yml"
+  # No `paths` on these two: a required check that a path filter keeps from
+  # running stays pending forever, and a `merge_group` event takes no filter at
+  # all. The `changes` job below decides instead, so this workflow reports on
+  # every pull request and every queue run (carrick#4136).
   pull_request:
     branches: [main, develop]
-    paths:
-      - "npm/**"
-      - "plugin/**"
-      - "src/sidecar/**"
-      - ".github/workflows/plugin.yml"
-      # release.yml packages and publishes the extension with the same command
-      # the `vsix` job below runs, and nothing else proves that command still
-      # works before a tag is cut.
-      - ".github/workflows/release.yml"
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
 jobs:
+  # Whether this run has anything to test. The queue's own run is the only one
+  # that sees two package PRs together (carrick#4136: each was green alone, and
+  # their combination turned main red). On a pull request it diffs the PR
+  # against the base it merges into; in the queue, `base_sha..head_sha` is the
+  # whole group. A push already passed the filter above, so it always runs.
+  # The jobs behind it are skipped, not absent, when nothing matches: a skipped
+  # job reports as passing, so `Plugin tests` can be a required check.
+  changes:
+    name: Plugin changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.diff.outputs.run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # A pull request checks out its merge commit, whose first parent is
+          # the base; one more commit is enough to diff against it.
+          fetch-depth: 2
+
+      - name: Does the diff touch the package?
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            merge_group)
+              git fetch --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+              FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+              ;;
+            pull_request)
+              FILES=$(git diff --name-only HEAD^1 HEAD)
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          echo "$FILES"
+          # The same paths the push trigger filters on.
+          if echo "$FILES" | grep -Eq '^(npm/|plugin/|src/sidecar/|\.github/workflows/(plugin|release)\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing under npm/, plugin/ or src/sidecar/ changed; the package jobs are skipped."
+          fi
+
   plugin:
     name: Plugin tests
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -144,6 +192,8 @@ jobs:
   # Keep the `vsce package` command the same as the one in release.yml.
   vsix:
     name: Extension package
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -201,6 +251,8 @@ jobs:
   # ask a different question on each runner.
   pack:
     name: Pack the tarball
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
