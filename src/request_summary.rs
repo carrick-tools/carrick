@@ -11144,6 +11144,9 @@ fn declared_client(
 /// Each file's calls by span, and what each reaches.
 type ReachedByFile = HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>;
 
+/// [`RequestSummaryIndex::ruled_out`]: per file, by a call's span start.
+type RuledOutByFile = HashMap<PathBuf, BTreeMap<u32, BTreeSet<(PathBuf, u32)>>>;
+
 /// The function a call reaches by the compiler's rows, and the requests that
 /// function sends (carrick#4120). Paths are as walked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11166,7 +11169,7 @@ pub struct RequestSummaryIndex {
     /// each is written in and the span start of its call, as
     /// [`ReachedCallee::requests`] names them. Read by the imported-member
     /// join, which drops a member whose request is one of them.
-    ruled_out: HashMap<PathBuf, BTreeMap<u32, BTreeSet<(PathBuf, u32)>>>,
+    ruled_out: Box<RuledOutByFile>,
     /// The function each call of the service's files reaches by the
     /// compiler's rows, keyed by the call's span. Read by the imported-member
     /// join, which drops a member the compiler says the call does not reach
