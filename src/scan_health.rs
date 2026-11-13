@@ -132,6 +132,10 @@ struct Registry {
     /// their per-position rows are missing from the index. Its own count: a
     /// walk death never stops a run, as `type_memory_deaths` can.
     walk_rows_lost: std::collections::BTreeSet<Scope>,
+    /// The declaration texts of each service the unheld-name sweep could not
+    /// parse, one sentence each naming the text and where it stopped. The
+    /// text stays as capture wrote it, unswept.
+    declarations_unswept: BTreeMap<Scope, Vec<String>>,
     /// The source files each service's analysis could not read, by path as
     /// the walk named them, and why (carrick#3233). Not a loss of the model's
     /// answer and never a reason to hold a service back: no scan of those
@@ -381,6 +385,7 @@ impl Registry {
         self.library_pending.remove(scope);
         self.library_ask_failed.remove(scope);
         self.unread_sources.remove(scope);
+        self.declarations_unswept.remove(scope);
     }
 
     /// Records that `limit` ran out while `scope` was analysed, at a cost of
@@ -571,6 +576,29 @@ impl Registry {
             });
         }
         lines
+    }
+
+    /// One line naming the services whose declarations went unswept, or `None`.
+    fn declarations_unswept_line(&self) -> Option<String> {
+        if self.declarations_unswept.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = self
+            .declarations_unswept
+            .iter()
+            .map(|(scope, why)| {
+                format!(
+                    "{} ({})",
+                    scope.as_deref().unwrap_or("(root)"),
+                    why.join("; ")
+                )
+            })
+            .collect();
+        Some(format!(
+            "{} service(s) keep type declarations nothing holds, their declaration text did not parse: {}.",
+            names.len(),
+            names.join(", ")
+        ))
     }
 
     /// One line naming the services whose walk rows were lost, or `None`.
@@ -929,6 +957,37 @@ pub fn record_walk_rows_lost(service: Option<&str>) {
         .expect("scan health lock")
         .walk_rows_lost
         .insert(service.map(str::to_string));
+}
+
+/// Records that `service`'s declaration text did not parse, so the sweep of
+/// the type names nothing holds left it as it was (`what` names the text).
+pub fn record_declarations_unswept(service: Option<&str>, what: &str, why: &str) {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .declarations_unswept
+        .entry(service.map(str::to_string))
+        .or_default()
+        .push(format!("{what}: {why}"));
+}
+
+/// What went unswept for `service`, one sentence per declaration text.
+pub fn declarations_unswept_for(service: Option<&str>) -> Vec<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .declarations_unswept
+        .get(&service.map(str::to_string))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One line naming the services whose declarations went unswept, or `None`.
+pub fn declarations_unswept_line() -> Option<String> {
+    registry()
+        .lock()
+        .expect("scan health lock")
+        .declarations_unswept_line()
 }
 
 /// One line naming the services whose walk rows were lost, or `None`.

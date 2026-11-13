@@ -16410,6 +16410,32 @@ mod tests {
         );
     }
 
+    /// A bundle whose declarations do not parse (an unquoted hyphenated key)
+    /// stays as it was, and the scan's health says so, naming the service and
+    /// where the parser stopped.
+    #[test]
+    fn a_bundle_that_does_not_parse_is_recorded_in_the_scan_health() {
+        let mut held = consumer_entry("Endpoint_aaaa_Response");
+        held.key = OperationKey::http("GET", "/orders/:id");
+        let mut data = bare_blob();
+        data.service_name = Some("sweep-unparsed-svc".to_string());
+        data.type_manifest = Some(vec![held]);
+        let dts = "export type Endpoint_aaaa_Response = { id: string };\n\
+                   export type Endpoint_bbbb_Response = { a-b: number };\n";
+        data.bundled_types = Some(dts.to_string());
+        let mut reach = None;
+
+        drop_unheld_type_names(&mut data, &mut reach);
+
+        assert_eq!(data.bundled_types.as_deref(), Some(dts));
+        let recorded = crate::scan_health::declarations_unswept_for(Some("sweep-unparsed-svc"));
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(
+            recorded[0].starts_with("bundle: ") && recorded[0].contains("line 2"),
+            "{recorded:?}"
+        );
+    }
+
     /// A second answer beside `bare_blob`'s, for the file the tests edit.
     fn blob_with_an_edited_file() -> CloudRepoData {
         let mut blob = bare_blob();
