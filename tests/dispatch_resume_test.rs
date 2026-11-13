@@ -39,6 +39,8 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llm-mocked-api")
 }
 
+#[path = "support/fact_files.rs"]
+mod fact_files;
 /// Guidance with an id, which is what a dispatch requires: without one the
 /// cloud keys the whole message and the block this bundle carries once would
 /// be paid for once per file.
@@ -86,7 +88,11 @@ fn files(root: &Path) -> Vec<PathBuf> {
 }
 
 async fn analyze(root: &Path) -> carrick::agents::file_orchestrator::FileCentricAnalysisResult {
+    // The fact layer's files, as a scan with `express` installed and
+    // answered hands them over (carrick#3711).
+    let facts = fact_files::walked_copy(root, &["express"], &["express", "lib-dom-fetch"]);
     FileOrchestrator::new(AgentService::new())
+        .with_fact_files(fact_files::source(&facts))
         .analyze_files(
             &files(root),
             &std::collections::HashMap::new(),
