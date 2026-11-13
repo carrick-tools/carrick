@@ -8316,7 +8316,8 @@ async fn dispatch_rows_of(
 /// `sites` read through `claims`, each verified by the sidecar against the
 /// package's own declarations, from `from_dir` (the service root, as for the
 /// client semantics). Verification runs on every scan and is never cached.
-/// No claims, or no sidecar, read nothing. A name slot is read through the
+/// No claims read nothing. No sidecar states no row and saves each site the
+/// claims would have read, `unanswered` (carrick#3948). A name slot is read through the
 /// text reader over `inputs` (carrick#3504 B10-3).
 fn read_library_rows(
     inputs: &crate::request_summary::RequestSummaryInputs,
@@ -8325,9 +8326,21 @@ fn read_library_rows(
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
 ) -> crate::library_claims::LibraryRows {
-    let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
-        return crate::library_claims::LibraryRows::default();
+    let Some(sidecar) = sidecar else {
+        // No run mode skips the engine by design: it was not found, did not
+        // start or did not get ready. Say so once, and save each site the
+        // claims would have read through the no-verdict save (carrick#3948).
+        warn!(
+            "library reader skipped: no compiler engine, so no library row is stated and each \
+             library site is saved unread"
+        );
+        return crate::library_claims::read(sites, claims, None, |_| {
+            Err("no compiler engine".to_string())
+        });
     };
+    if claims.is_empty() {
+        return crate::library_claims::LibraryRows::default();
+    }
     let names = crate::request_summary::SiteNames::of(inputs);
     crate::library_claims::read(sites, claims, Some(&names), |checks| {
         sidecar
