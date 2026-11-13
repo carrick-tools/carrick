@@ -10872,6 +10872,7 @@ fn site_infer_requests(
             param_name,
             route_path: None,
             result_unanswered: false,
+            through_call: None,
         }
     };
     let mut requests = Vec::new();
@@ -32256,6 +32257,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 param_name: None,
                 route_path: None,
                 result_unanswered: false,
+                through_call: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));

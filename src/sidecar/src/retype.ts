@@ -43,6 +43,7 @@ import { deferredResultNeedsUndefined } from './retype-deferred.js';
 import { resolvedDeclaration, typeArgumentOnlySelects } from './retype-selector.js';
 import { fileDiagnostics, type FileDiagnostic } from './unwidened.js';
 import { JSON_READ } from './platform-body-read.js';
+import { enclosingTypeParameterIn } from './type-parameters.js';
 import type {
   InferRequestItem,
   RetypeDiagnostic,
@@ -672,69 +673,6 @@ function bodyReadUnboundReason(read: CallExpression): string | undefined {
   return expected
     ? unboundReason(checker, 'the type the body read flows into', expected, read.compilerNode)
     : undefined;
-}
-
-/** How deep {@link enclosingTypeParameterIn} reads into a type. */
-const TYPE_PARAMETER_DEPTH = 4;
-
-/**
- * The name of a type parameter in `type` that a declaration enclosing `at`
- * declares (a function, a method, a class), or `undefined`. Reads union and
- * intersection members, type arguments, indexed accesses, conditional
- * branches and the properties of an anonymous object type, to a fixed depth.
- * A polymorphic `this` is not one: a call can hold it without passing a
- * response through.
- */
-function enclosingTypeParameterIn(
-  checker: ts.TypeChecker,
-  type: ts.Type,
-  at: ts.Node
-): string | undefined {
-  const seen = new Set<ts.Type>();
-  const encloses = (declaring: ts.Node): boolean => {
-    for (let node: ts.Node | undefined = at.parent; node; node = node.parent) {
-      if (node === declaring) return true;
-    }
-    return false;
-  };
-  const visit = (current: ts.Type, depth: number): string | undefined => {
-    if (depth > TYPE_PARAMETER_DEPTH || seen.has(current)) return undefined;
-    seen.add(current);
-    if (current.flags & ts.TypeFlags.TypeParameter) {
-      if ((current as ts.TypeParameter & { isThisType?: boolean }).isThisType) return undefined;
-      const declared = current.symbol?.declarations?.some(
-        (decl) => ts.isTypeParameterDeclaration(decl) && encloses(decl.parent)
-      );
-      if (declared) return current.symbol.getName();
-    }
-    const parts: ts.Type[] = [...(current.aliasTypeArguments ?? [])];
-    if (current.isUnionOrIntersection()) parts.push(...current.types);
-    if (current.flags & ts.TypeFlags.IndexedAccess) {
-      const access = current as ts.IndexedAccessType;
-      parts.push(access.objectType, access.indexType);
-    }
-    if (current.flags & ts.TypeFlags.Conditional) {
-      const conditional = current as ts.ConditionalType;
-      parts.push(conditional.checkType, conditional.extendsType);
-    }
-    if (current.flags & ts.TypeFlags.Object) {
-      const flags = (current as ts.ObjectType).objectFlags;
-      if (flags & ts.ObjectFlags.Reference) {
-        parts.push(...checker.getTypeArguments(current as ts.TypeReference));
-      }
-      if (flags & ts.ObjectFlags.Anonymous) {
-        for (const property of current.getProperties()) {
-          parts.push(checker.getTypeOfSymbolAtLocation(property, at));
-        }
-      }
-    }
-    for (const part of parts) {
-      const found = visit(part, depth + 1);
-      if (found !== undefined) return found;
-    }
-    return undefined;
-  };
-  return visit(type, 0);
 }
 
 function asLocator(item: RetypeLocatorItem): InferRequestItem {

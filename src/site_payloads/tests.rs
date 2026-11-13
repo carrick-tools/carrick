@@ -192,6 +192,63 @@ fn an_http_calls_entries_read_its_body_and_its_result() {
             .all(|request| request.file_path == dir.path().join(FILE).to_string_lossy()),
         "{requests:?}"
     );
+    // Both are read in the site's own call: no call is named beside them.
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.through_call.is_none()),
+        "{requests:?}"
+    );
+}
+
+/// carrick#4128: a body the wrapper builds is read in the wrapper's file,
+/// and the request names the site's own call beside it, in the sidecar's
+/// numbering, so a type parameter of the wrapper is read as that call
+/// instantiates it.
+#[test]
+fn a_body_built_in_the_wrapper_names_the_call_that_reaches_it() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str =
+        "export const place = <T>(item: T) => http.post(\"/orders\", { body: item });\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let built = "{ body: item }";
+    let start = WRAPPER_SOURCE.find(built).unwrap() as u32;
+    let slots = PayloadSlots {
+        request: Some(PayloadAt::Value(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + built.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        })),
+        response: None,
+    };
+    let payloads = SitePayloads::of(&[record("http_client", false, slots)]);
+    let requests = payloads.requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &dir.path().to_string_lossy(),
+        &ResultIndex::default(),
+    );
+    let [request] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    assert_eq!(
+        request.file_path,
+        dir.path().join(WRAPPER).to_string_lossy()
+    );
+    assert_eq!(
+        (request.span_start, request.span_end),
+        (Some(start), Some(start + built.len() as u32))
+    );
+    let (call_start, call_end) = sidecar_span("http.post(\"/orders\", order)");
+    assert_eq!(
+        request.through_call,
+        Some(ThroughCall {
+            file_path: dir.path().join(FILE).to_string_lossy().into_owned(),
+            span_start: call_start.unwrap(),
+            span_end: call_end.unwrap(),
+        })
+    );
 }
 
 /// carrick#2910: the response entry's request carries the store's label for
@@ -343,6 +400,7 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         param_name: None,
         route_path: None,
         result_unanswered: false,
+        through_call: None,
     }
 }
 

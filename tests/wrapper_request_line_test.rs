@@ -865,8 +865,10 @@ fn request_verdicts_in(file: &str, line: u32) -> Vec<(String, String, String)> {
 /// A wrapper that sends `JSON.stringify(data)` forwards its parameter whole:
 /// the caller's own argument is still the body. One that builds `{ body }`
 /// from a loosely typed parameter reads the declared inner type, the right
-/// shape; the caller's argument (a string) was the wrong one. A generic
-/// parameter must never print as a bare type parameter.
+/// shape; the caller's argument (a string) was the wrong one. One that builds
+/// it from a generic parameter reads it as the caller instantiates the
+/// wrapper (`gen.ts:2`); a caller that leaves the parameter open (`gen.ts:3`,
+/// which passes its own) publishes no type naming it.
 #[test]
 fn a_body_built_from_a_loose_parameter_reads_the_declared_type() {
     if !sidecar_available() {
@@ -881,9 +883,35 @@ fn a_body_built_from_a_loose_parameter_reads_the_declared_type() {
         request_type_at(SHOP, 4).as_deref(),
         Some("{ body: unknown; }")
     );
-    let generic = request_type_at(GEN, 2);
-    assert!(
-        generic.is_some() && generic.as_deref() != Some("{ body: T; }"),
-        "a generic parameter leaked through: {generic:?}"
+    assert_eq!(
+        request_type_at(GEN, 2).as_deref(),
+        Some("{ body: string; }"),
+        "{:#?}",
+        consumer_entries(GEN)
+    );
+    assert_eq!(
+        request_verdicts_in(GEN, 2),
+        [(
+            "http|POST|/v1/orders".to_string(),
+            "request".to_string(),
+            "compatible".to_string()
+        )]
+    );
+    // The relay's entry is a decided unknown, with the reason it is one.
+    let relay = web()["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["role"] == "consumer"
+                && entry["type_kind"] == "request"
+                && entry["file_path"] == GEN
+                && entry["line_number"] == 3
+        })
+        .unwrap_or_else(|| panic!("{:#?}", consumer_entries(GEN)));
+    assert_eq!(relay["type_state"], "unknown", "{relay:#}");
+    assert_eq!(
+        relay["any_provenance"][0]["reason"], "body_built_by_callee",
+        "{relay:#}"
     );
 }
