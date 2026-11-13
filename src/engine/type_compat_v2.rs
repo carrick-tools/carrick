@@ -1748,7 +1748,11 @@ fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_
 ///   (carrick#1945): a call to a route of its own service is a consumer of
 ///   that route (carrick#1926). A winner where the call has a placeholder
 ///   over the route's literal (carrick#2004) is not compared: which route
-///   the call reaches is a guess. A call that reaches a dispatching route
+///   the call reaches is a guess. A winner that is a catch-all route
+///   (`/*`, `/**`, `/(.*)`) whose wildcard covers a literal segment of the
+///   call is not compared either: the route says nothing about that segment,
+///   so its handler's type is not the path's contract (carrick#4186); a
+///   route wildcard over a call placeholder is still compared. A call that reaches a dispatching route
 ///   without stating its case (`RouteCaseUnknown`, carrick#2059) gets one
 ///   half per kind, stored unverifiable without a probe; a call stating a
 ///   value no case answers gets none.
@@ -1918,6 +1922,9 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         // Routes the call could only be paired with by guessing its
         // placeholder's value (carrick#2004).
         let mut guessed: Vec<&str> = Vec::new();
+        // Catch-all routes whose wildcard covers a literal segment of the
+        // call: the edge stays, the type is not theirs to answer (carrick#4186).
+        let mut absorbed: Vec<&str> = Vec::new();
         for case in cases {
             let pairing = http_pool.pair(&carrick_match::Call {
                 service: consumer.service_id.to_string(),
@@ -1937,6 +1944,11 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             for winner in &pairing.winners {
                 if winner.call_param_over_route_literal == Some(true) {
                     guessed.push(routes[winner.producer].full_path.as_str());
+                } else if carrick_match::catch_all_covers_call_literal(
+                    &routes[winner.producer].full_path,
+                    path.as_str(),
+                ) {
+                    absorbed.push(routes[winner.producer].full_path.as_str());
                 } else {
                     reached.push(winner.producer);
                 }
@@ -1979,6 +1991,18 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 pair.pre_verdict_side = None;
                 pairs.push(pair);
             }
+        }
+        if pairs.len() == before && !absorbed.is_empty() {
+            absorbed.sort_unstable();
+            absorbed.dedup();
+            debug!(
+                "v2 check: {} {} at {}:{} is not compared: a catch-all route covers its literal segment(s) ({}) (carrick#4186)",
+                method,
+                path,
+                consumer.entry.file_path,
+                consumer.entry.line_number,
+                absorbed.join(", ")
+            );
         }
         if pairs.len() == before && !guessed.is_empty() {
             guessed.sort_unstable();
