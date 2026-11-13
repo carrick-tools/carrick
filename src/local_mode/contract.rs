@@ -661,6 +661,13 @@ pub struct Recheck {
     /// (`changed.rs`, `judge`). Absent when the edit moved nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub moved: Vec<MovedRow>,
+    /// Whether the compiler engine was ready for this re-check's re-scan
+    /// (carrick#3948). `false` when it was not found or missed its ready
+    /// budget: every library call the re-scan could not check is then saved
+    /// `unanswered`, and the human answer says so once instead of listing
+    /// them. Absent when no re-scan ran, so nothing is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_ready: Option<bool>,
 }
 
 /// One row outside the edited file that the edit moved
@@ -1563,6 +1570,7 @@ mod tests {
             deadline: false,
             scope: None,
             moved: Vec::new(),
+            engine_ready: None,
         });
         let text = fresh.render();
         assert!(
@@ -1571,6 +1579,102 @@ mod tests {
         );
         // The sentence that sends a reader to re-index would be false here.
         assert!(!text.contains("unresolved since your edit"), "{text}");
+    }
+
+    /// carrick#3948: unread sites for one reason, `unanswered`, and one for
+    /// another.
+    fn unread_with(unanswered: u32) -> Vec<UnreadItem> {
+        let mut items: Vec<UnreadItem> = (0..unanswered)
+            .map(|n| UnreadItem {
+                file: "src/a.ts".to_string(),
+                line: 10 + n,
+                reason: "unanswered".to_string(),
+                phrase: "this call couldn't be checked on this scan".to_string(),
+                edited: false,
+            })
+            .collect();
+        items.push(UnreadItem {
+            file: "src/a.ts".to_string(),
+            line: 90,
+            reason: "dynamic_target".to_string(),
+            phrase: "the target is built at run time".to_string(),
+            edited: false,
+        });
+        items
+    }
+
+    fn rechecked_with(engine_ready: Option<bool>) -> CheckOutput {
+        let mut answer = output();
+        answer.unread = unread_with(10);
+        answer.recheck = Some(Recheck {
+            ran: "extraction".to_string(),
+            elapsed_ms: 900,
+            stale_since: None,
+            reason: None,
+            new_functions: Vec::new(),
+            known_miss: false,
+            deferred: false,
+            deadline: false,
+            scope: None,
+            moved: Vec::new(),
+            engine_ready,
+        });
+        answer
+    }
+
+    const ENGINE_NOT_READY_LINE: &str = "Library calls in this file were not checked on this edit: the compiler engine was not ready.";
+
+    /// carrick#3948: a re-check whose engine was not ready prints one line for
+    /// the library sites it saved `unanswered`, not one line each. Other
+    /// reasons print as before.
+    #[test]
+    fn a_re_check_with_no_ready_engine_collapses_its_unanswered_sites_to_one_line() {
+        let text = rechecked_with(Some(false)).render();
+        assert_eq!(text.matches(ENGINE_NOT_READY_LINE).count(), 1, "{text}");
+        assert!(
+            !text.contains("couldn't be checked on this scan"),
+            "no per-site unanswered line: {text}"
+        );
+        assert!(
+            text.contains("Carrick could not read the call at src/a.ts:90"),
+            "another reason still prints: {text}"
+        );
+        assert!(
+            !text.contains("more calls Carrick could not read"),
+            "the collapsed sites are not counted in the cap: {text}"
+        );
+    }
+
+    /// An engine that was ready, an answer from the index, and a re-check that
+    /// did not run all print every site as before, capped at the same count.
+    #[test]
+    fn unanswered_sites_print_per_site_when_the_engine_was_ready_or_nothing_re_ran() {
+        for engine_ready in [Some(true), None] {
+            let text = rechecked_with(engine_ready).render();
+            assert!(!text.contains(ENGINE_NOT_READY_LINE), "{text}");
+            assert_eq!(
+                text.matches("couldn't be checked on this scan").count(),
+                8,
+                "{text}"
+            );
+            assert!(
+                text.contains("and 3 more calls Carrick could not read"),
+                "{text}"
+            );
+        }
+        let mut not_run = rechecked_with(Some(false));
+        not_run.recheck.as_mut().unwrap().ran = "none".to_string();
+        let text = not_run.render();
+        assert!(!text.contains(ENGINE_NOT_READY_LINE), "{text}");
+    }
+
+    /// `engine_ready` rides the `recheck` block only when a re-scan stated it.
+    #[test]
+    fn engine_ready_is_in_the_recheck_block_only_when_stated() {
+        let stated = serde_json::to_value(rechecked_with(Some(false))).unwrap();
+        assert_eq!(stated["recheck"]["engine_ready"], false);
+        let unstated = serde_json::to_value(rechecked_with(None)).unwrap();
+        assert!(unstated["recheck"].get("engine_ready").is_none());
     }
 
     #[test]
@@ -1587,6 +1691,7 @@ mod tests {
             deadline: false,
             scope: None,
             moved: Vec::new(),
+            engine_ready: None,
         });
         let text = degraded.render();
         assert!(text.contains("computed at 2026-09-13T22:26:26Z"), "{text}");
@@ -1609,6 +1714,7 @@ mod tests {
             deadline: true,
             scope: None,
             moved: Vec::new(),
+            engine_ready: None,
         });
         let text = stopped.render();
         let line = format!(
@@ -1642,6 +1748,7 @@ mod tests {
             deadline: false,
             scope: None,
             moved: Vec::new(),
+            engine_ready: None,
         };
         assert_eq!(
             recheck.line("1a2b3c4d5e6f"),
@@ -1669,6 +1776,7 @@ mod tests {
             deadline: false,
             scope: None,
             moved: Vec::new(),
+            engine_ready: None,
         });
         let text = unchanged.render();
         assert!(

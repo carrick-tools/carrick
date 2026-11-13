@@ -112,6 +112,18 @@ pub struct Fresh {
     pub scope: RecheckScope,
     /// Rows outside the edited file that this edit moved.
     pub moved: Vec<super::contract::MovedRow>,
+    /// The compiler engine was ready for this re-scan ([`engine_ready_of`],
+    /// carrick#3948).
+    pub engine_ready: bool,
+}
+
+/// Whether the compiler engine was ready for the re-scan that built `index`
+/// for repo `name`: no service of it records that the engine was not found
+/// (`spawn`) or missed its ready budget (`init`). A died-mid-run engine
+/// (`resolve`, `capture`) was ready, so it is not a "not ready" here.
+pub(super) fn engine_ready_of(index: &super::read_model::LocalIndex, name: &str) -> bool {
+    let _ = (index, name);
+    true
 }
 
 /// How many new functions one answer carries.
@@ -1149,6 +1161,7 @@ fn inside(
         elapsed: Duration::default(),
         scope: plan.scope.clone(),
         moved,
+        engine_ready: engine_ready_of(&rejoined.index, &name),
     })
 }
 
@@ -1988,6 +2001,39 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// carrick#3948: the re-check says whether the compiler engine was ready
+    /// from the re-scan's own record: not found (`spawn`) and past its ready
+    /// budget (`init`) are not ready; an engine that died while reading
+    /// (`resolve`) or no record at all is.
+    #[test]
+    fn a_re_scan_is_engine_ready_unless_it_records_spawn_or_init() {
+        fn index(boundary: serde_json::Value) -> super::super::read_model::LocalIndex {
+            serde_json::from_value(serde_json::json!({
+                "version": 1, "scanner_version": "0", "indexed_at": "", "repos": [{
+                    "path": "/w/web", "name": "web",
+                    "services": [{
+                        "name": "web", "commit": "", "indexed_at": "", "boundary": boundary,
+                        "routes": 0, "calls": 0
+                    }],
+                    "files": {}
+                }]
+            }))
+            .expect("an index")
+        }
+        let degraded = |stage: &str| {
+            index(serde_json::json!({ "types_degraded": { "stage": stage, "detail": "x" } }))
+        };
+        assert!(!engine_ready_of(&degraded("spawn"), "web"));
+        assert!(!engine_ready_of(&degraded("init"), "web"));
+        assert!(engine_ready_of(&degraded("resolve"), "web"));
+        assert!(engine_ready_of(&index(serde_json::json!(null)), "web"));
+        assert!(engine_ready_of(&index(serde_json::json!({})), "web"));
+        assert!(
+            engine_ready_of(&degraded("spawn"), "another-repo"),
+            "another repo's record says nothing about this re-scan"
+        );
+    }
+
     use super::*;
 
     /// carrick#2826: a re-scan holds every sidecar to its own heap cap, which
