@@ -148,7 +148,8 @@ describe('carrick#1841: a status-keyed response table is not a body', () => {
  * names one payload and every other branch holds that payload as a member,
  * the payload is published; where the branches disagree, the site states no
  * contract. The conditional is never published as written. A conditional none
- * of whose branches is a carrier is left exactly as it was.
+ * of whose branches is a carrier still holds the enclosing function's type
+ * parameter, so it is the decided `bound_by_callers` abstain (carrick#4201).
  */
 describe('carrick#1841: a call result deferred on a type parameter is read through its branches', () => {
   let client: SidecarClient;
@@ -265,8 +266,12 @@ describe('carrick#1841: a call result deferred on a type parameter is read throu
     decidedAbstain(await infer('Deferred_Differ', 'export const eitherBody', 'loadEither(legacy)'));
   });
 
-  it('control: a conditional over plain data, no branch a carrier, is left as it is', async () => {
+  it('control: a conditional over plain data, no branch a carrier, is not read as one; it holds the open parameter (carrick#4201)', async () => {
     const inferred = await infer('Deferred_Plain', 'export const plainConditional', 'pick(value)');
-    assert.match(collapse(inferred.type_string), /^T extends string \? /);
+    assert.strictEqual(inferred.type_string.trim(), 'unknown', inferred.type_string);
+    assert.deepStrictEqual(
+      (inferred.any_provenance ?? []).map((p) => [p.path, p.reason]),
+      [['', 'bound_by_callers']]
+    );
   });
 });
