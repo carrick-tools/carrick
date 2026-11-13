@@ -2960,3 +2960,50 @@ fn a_client_call_through_an_expanded_alias_pairs_its_procedure() {
         ]
     );
 }
+
+/// The rows `procedure-client-hooks-module` states: a hooks proxy made in
+/// its own module (`client.ts`) and imported into a `.tsx` file, three calls
+/// through a sub-router (`shelf.drawer.items` is two routers deep) and calls
+/// that span several lines. Pins the shape of carrick#3847 / carrick#3931
+/// beyond their one-module `.ts` fixture.
+fn hooks_module_client_rows() -> Vec<String> {
+    let router = "workspace:src/router.ts#appRouter";
+    vec![
+        format!("src/web/poll.tsx:4 POST \"\" {router} shelf.add request_summary"),
+        format!("src/web/poll.tsx:5 GET \"\" {router} shelf.drawer.items request_summary"),
+        format!("src/web/poll.tsx:9 POST \"\" {router} shelf.add request_summary"),
+    ]
+}
+
+/// Leads in `poll.tsx` saved unread: none, each call is a row.
+fn unread_in_hooks_module(blobs: &Blobs) -> Vec<String> {
+    unread_reasons(blobs)
+        .into_iter()
+        .filter(|(at, _)| at.starts_with("src/web/poll.tsx:"))
+        .map(|(at, reason)| format!("{at} {reason}"))
+        .collect()
+}
+
+#[test]
+fn a_hooks_proxy_imported_into_tsx_states_each_procedure() {
+    let blobs = scan_fixture("procedure-client-hooks-module");
+    let (flat, graph) = client_rows(&blobs);
+    assert_eq!(flat, hooks_module_client_rows());
+    assert_eq!(graph, hooks_module_client_rows());
+    assert_eq!(unread_in_hooks_module(&blobs), Vec::<String>::new());
+}
+
+/// Each of those calls pairs with the server's procedure row.
+#[test]
+fn a_hooks_proxy_imported_into_tsx_pairs_each_procedure() {
+    let blobs = scan_fixture("procedure-client-hooks-module");
+    assert_eq!(unread_in_hooks_module(&blobs), Vec::<String>::new());
+    assert_eq!(
+        matched_producers("procedure-client-hooks-module"),
+        vec![
+            "http|GET|/api/rpc/shelf.drawer.items <- http|GET|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
+            "http|POST|/api/rpc/shelf.add <- http|POST|".to_string(),
+        ]
+    );
+}
