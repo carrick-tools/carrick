@@ -1761,7 +1761,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             walk_memories,
             run_cap_mb,
             ended,
-            walk_slots,
+            std::sync::Arc::clone(&walk_slots),
             reaches_of,
             std::sync::Arc::new(move |repo: &str, service: Option<&str>| {
                 crate::position_rows::destination(should_upload, repo, service)
@@ -2239,6 +2239,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             );
         }
     }
+    // Each walk's rows land in the local store now that the holds are
+    // decided, so a held service keeps the rows and walk record of the
+    // generation it is held on, not this run's (carrick#4183).
+    walk_slots.land(|service| {
+        runs.iter()
+            .any(|run| run.held_back && run.data.service_name.as_deref() == service)
+    });
     // 4d. A model row at a call through the repository's own code takes the
     // request that call reaches (carrick#1146). Here, because the request is
     // usually written in another service: this is the first point at which
