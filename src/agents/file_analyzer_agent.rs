@@ -646,6 +646,63 @@ pub struct RequestLineAnchors {
     pub response: bool,
 }
 
+/// Where the model read the body a request line sends: its line, the
+/// payload's text, and the line that text is written on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLineBody<'a> {
+    pub line: u32,
+    pub text: &'a str,
+    pub expression_line: Option<u32>,
+}
+
+impl RequestLineAnchors {
+    /// The body the request line sends, as the model read it there
+    /// (carrick#3961, carrick#4121): the one place a caller's row that
+    /// states no body of its own asks its request type. `None` where the
+    /// model read no payload text. A payload line not above zero is the
+    /// request line's own.
+    pub fn request_body(&self) -> Option<RequestLineBody<'_>> {
+        let line = u32::try_from(self.call.line_number.max(1)).unwrap_or(1);
+        let text = self
+            .call
+            .payload_expression_text
+            .as_deref()
+            .filter(|text| !text.is_empty())?;
+        let expression_line = self
+            .call
+            .payload_expression_line
+            .map(|at| u32::try_from(at).ok().filter(|at| *at > 0).unwrap_or(line));
+        Some(RequestLineBody {
+            line,
+            text,
+            expression_line,
+        })
+    }
+}
+
+/// A request line whose every caller is read, save direct calls made where a
+/// module is loaded (carrick#4121,
+/// [`crate::request_summary::RequestSummaryIndex::held_at_module`]). The
+/// model's row there stays through the analysis: whether it goes is decided
+/// by the site fold, once it knows whether each module-level call's fact row
+/// stands. Files are spelled as the analysis keys its results until the
+/// engine normalises them, once.
+#[derive(Debug, Clone)]
+pub struct HeldRequestLine {
+    /// The request line's file.
+    pub file: String,
+    pub span_start: u32,
+    pub line: u32,
+    /// The model's row at the request line.
+    pub model: DataCallResult,
+    /// The calls whose summary rows state the request, by file and span
+    /// start, each with whether its function hands back the request's own
+    /// value ([`RequestLineAnchors::response`]).
+    pub stating: Vec<(String, u32, bool)>,
+    /// The direct calls made where a module is loaded, by file and line.
+    pub module_calls: Vec<(String, u32)>,
+}
+
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
 /// the resolver function's declared return type (resolved downstream into the
 /// producer-side response contract). Mirrors the `graphql_operations` array in

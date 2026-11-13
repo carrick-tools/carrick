@@ -231,6 +231,24 @@ pub struct SiteRows {
     /// The resolver's pieces read of each labelled call's name slot beside
     /// the site path's own (carrick#3504 B10-2a2). Log-only: no row reads it.
     pub dry_run_names: crate::name_census::DryRunNames,
+    /// The request lines whose callers the summaries read, save direct calls
+    /// made where a module is loaded, each of which the site pass decided to
+    /// that request (carrick#4121). The fold withdraws the request line's
+    /// reader row where a fact row stands at every one of those calls.
+    pub held_open: Vec<HeldOpen>,
+}
+
+/// A request line held open by functions called directly where a module is
+/// loaded (carrick#4121, [`SiteRows::held_open`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldOpen {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    pub span_start: u32,
+    /// The module-level calls, by repo-relative file and line: each holds
+    /// exactly one decided HTTP site, which ends at this request.
+    pub module_calls: Vec<(String, u32)>,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -1002,6 +1020,7 @@ pub fn of(
         boundaries: Default::default(),
         names: site_names(decided, records),
         dry_run_names: decided.dry_run_names.clone(),
+        held_open: Vec::new(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
@@ -1238,10 +1257,17 @@ pub struct SiteFold {
     /// `withdrawn` as well.
     pub through_folded: Vec<(String, u32, OperationKey)>,
     /// Of `withdrawn`, the call-side reader rows a FACT site row replaced,
-    /// as `(file, line, key)`: the mount graph's copy of each goes too
-    /// (carrick#2795). A row an in-band candidate replaced is not here: the
-    /// graph keeps the reader's row beside the candidate.
+    /// at its own line or at a request line its module-level callers' facts
+    /// state (carrick#4121), as `(file, line, key)`: the mount graph's copy
+    /// of each goes too (carrick#2795). A row an in-band candidate replaced
+    /// is not here: the graph keeps the reader's row beside the candidate.
     pub replaced_by_fact: Vec<(String, u32, OperationKey)>,
+    /// The request lines ([`SiteRows::held_open`]) whose reader row went
+    /// because a fact row stands at each of their module-level calls
+    /// (carrick#4121), as `(file, span start)`. The engine drops the model's
+    /// row there from the file results and moves its request type to the
+    /// callers.
+    pub stated_at_module_callers: Vec<(String, u32)>,
     /// Fact site rows kept out of their site by a row already there, by the
     /// resolution source of the row that kept it (`socket_call`,
     /// `event_bus`, `library_claim`, ...). The measure of how much a frozen
@@ -1684,6 +1710,52 @@ pub fn fold_rows(
                 index += 1;
             }
         }
+    }
+    // A request line held open by functions called directly where a module
+    // is loaded (carrick#4121): where each of those calls holds exactly one
+    // row and that row is a fact this fold stated, the calls state the
+    // request, and the one reader row at the request line is the same
+    // request stated again. It goes as a row a fact replaced. Any call
+    // without its fact row (a lead, a row kept out, a second row there)
+    // keeps it. Decided over every line first, then removed.
+    let mut stated_at_module: Vec<(usize, &HeldOpen)> = Vec::new();
+    for held in &site.held_open {
+        let facts_stand = !held.module_calls.is_empty()
+            && held.module_calls.iter().all(|(file, line)| {
+                let here: Vec<&ApiEndpointDetails> =
+                    calls.iter().filter(|row| at(row, file, *line)).collect();
+                matches!(here.as_slice(), [row] if is_fact(row)
+                && out.stated.iter().any(|stated| {
+                    stated.side == RowSide::Call
+                        && stated.fact()
+                        && stated.file == *file
+                        && stated.line == *line
+                        && stated.key == row.key
+                }))
+            });
+        if !facts_stand {
+            continue;
+        }
+        let readers: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| is_reader(row) && at(row, &held.file, held.line))
+            .map(|(index, _)| index)
+            .collect();
+        if let [index] = readers.as_slice() {
+            stated_at_module.push((*index, held));
+        }
+    }
+    stated_at_module.sort_by(|a, b| b.0.cmp(&a.0));
+    stated_at_module.dedup_by_key(|(index, _)| *index);
+    for (index, held) in stated_at_module {
+        let gone = calls.remove(index);
+        out.replaced_by_fact
+            .push((held.file.clone(), held.line, gone.key.clone()));
+        out.withdrawn
+            .push((held.file.clone(), held.line, gone.key, RowSide::Call));
+        out.stated_at_module_callers
+            .push((held.file.clone(), held.span_start));
     }
     // An unread site at a line a row stands at once the fold is done, of
     // either side, is that row's call (a class-only GraphQL call is its
