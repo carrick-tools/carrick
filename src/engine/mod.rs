@@ -11136,14 +11136,13 @@ fn resolve_types_if_available(
         // The reason the run recorded at spawn, not a list of everything that
         // could have gone wrong: this string is what the boundary line reads
         // out to whoever is looking at a service with no types.
-        let detail =
-            match crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN) {
-                Some(reason) => format!("sidecar unavailable: {}", reason),
-                None => "sidecar unavailable (not found, failed to start, or failed to \
-                     initialize)"
-                    .to_string(),
-            };
-        cloud_data.type_extraction_status = Some(format!("type extraction skipped: {}", detail));
+        if let Some(reason) =
+            crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN)
+        {
+            debug!("The compiler engine was unavailable: {}", reason);
+        }
+        let detail = "the compiler engine was not found or could not be started".to_string();
+        cloud_data.type_extraction_status = Some(detail.clone());
         cloud_data.types_degraded = Some(TypeDegradation {
             stage: "spawn".to_string(),
             detail,
@@ -11258,11 +11257,22 @@ fn resolve_types_if_available(
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
-                    cloud_data.type_extraction_status =
-                        Some(format!("type resolution failed: {}", e));
+                    // A death of memory the run recorded for this service is the
+                    // cause; the client's error only says the process died.
+                    let detail = match crate::scan_health::first_type_memory_death_of(
+                        crate::current_service::name().as_deref(),
+                    ) {
+                        Some(death) => type_compat_v2::resolution_memory_death(&death),
+                        None => format!(
+                            "the compiler engine could not read types because {}",
+                            e.downcast_ref::<crate::services::type_sidecar::SidecarError>()
+                                .map_or("it reported an error", |e| e.customer_cause())
+                        ),
+                    };
+                    cloud_data.type_extraction_status = Some(detail.clone());
                     cloud_data.types_degraded = Some(TypeDegradation {
                         stage: "resolve".to_string(),
-                        detail: e.to_string(),
+                        detail,
                     });
                     TypesOutcome::default()
                 }
@@ -11271,11 +11281,14 @@ fn resolve_types_if_available(
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
-            cloud_data.type_extraction_status =
-                Some(format!("type extraction skipped: sidecar not ready: {}", e));
+            let detail = format!(
+                "the compiler engine was not ready to read types because {}",
+                e.customer_cause()
+            );
+            cloud_data.type_extraction_status = Some(detail.clone());
             cloud_data.types_degraded = Some(TypeDegradation {
                 stage: "init".to_string(),
-                detail: e.to_string(),
+                detail,
             });
             crate::scan_health::record_types_unavailable(
                 config.service_name.as_deref().unwrap_or("(root)"),
@@ -16337,8 +16350,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(run.data.capture_stub.is_none());
         assert!(
             run.status().starts_with("type capture failed: ")
-                && run.status().contains("process ended during the capture")
-                && run.status().contains("retried in a fresh process"),
+                && run
+                    .status()
+                    .contains("compiler engine ended during the capture")
+                && run.status().contains("on the retry in a fresh process"),
             "the status does not say the sidecar died: {}",
             run.status()
         );
@@ -30630,6 +30645,77 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 )
             })
             .collect()
+    }
+
+    /// LED-2: a type resolution whose process died of memory says so in the
+    /// service's `types_degraded` detail, as the capture words it, not only
+    /// that the process died.
+    #[test]
+    fn a_memory_death_in_resolution_is_named_in_the_detail() {
+        use crate::services::type_sidecar::SymbolRequest;
+        const SERVICE: &str = "led2-resolve-death";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("types.ts"),
+            "export interface Order { id: string }",
+        )
+        .unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return fs.writeSync(1, JSON.stringify({ request_id, status: 'ready' }) + '\n');
+  fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+  process.exit(134);
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &Config::default());
+        let mut data = service_data("fixture", Some(SERVICE));
+        let outcome = crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
+            resolve_types_if_available(
+                Some(&sidecar),
+                &FileOrchestrator::new(crate::agent_service::AgentService::new()),
+                &HashMap::new(),
+                root.to_str().unwrap(),
+                None,
+                &MountGraph::default(),
+                &Config::default(),
+                &service_module_index(root.to_str().unwrap(), &Config::default()),
+                &[SymbolRequest {
+                    symbol_name: "Order".into(),
+                    source_file: "types.ts".into(),
+                    alias: Some("Order".into()),
+                    array_depth: None,
+                    payload_borrow_witness: false,
+                    consumer_response: false,
+                }],
+                &[],
+                &[],
+                None,
+                &mut data,
+            )
+        });
+        crate::scan_health::forget_type_memory_loss(Some(SERVICE));
+        assert!(outcome.stub_dir.is_none());
+        let degraded = data.types_degraded.as_ref().expect("types_degraded");
+        assert_eq!(degraded.stage, "resolve");
+        assert!(
+            degraded
+                .detail
+                .starts_with("the compiler engine ran out of memory while reading types, with ")
+                && degraded.detail.contains("memory limit"),
+            "the detail does not name the memory death: {}",
+            degraded.detail
+        );
     }
 
     /// DS-V-2: a scan whose verification died answers no check, so each
