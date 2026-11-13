@@ -9289,12 +9289,13 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     }
 
     /// Routes the pairing pool says a call reaches are paired: a prefixed
-    /// catch-all, an optional placeholder the call leaves out, and a
+    /// catch-all over a placeholder tail (a literal tail is not compared,
+    /// carrick#4186), an optional placeholder the call leaves out, and a
     /// placeholder spelled `<id>` (carrick#3496 slice 3).
     #[test]
     fn build_pairs_pair_the_routes_the_pool_reaches() {
         for (route, call) in [
-            ("/api/*", "/api/users/7"),
+            ("/api/*", "/api/:userId"),
             ("/users/:id?", "/users"),
             ("/orders/<id>", "/orders/9"),
         ] {
