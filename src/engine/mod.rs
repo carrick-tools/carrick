@@ -5243,7 +5243,18 @@ fn normalize_file_results_keys(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
 ) -> HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
-    let normalize = |key: &str| -> String { normalized_result_key(key, repo_path) };
+    let repo_prefix = if repo_path.ends_with('/') {
+        repo_path.to_string()
+    } else {
+        format!("{}/", repo_path)
+    };
+
+    let normalize = |key: &str| -> String {
+        key.strip_prefix(&repo_prefix)
+            .or_else(|| key.strip_prefix("./"))
+            .unwrap_or(key)
+            .to_string()
+    };
     file_results
         .iter()
         .map(|(key, value)| {
@@ -5261,29 +5272,17 @@ fn normalize_file_results_keys(
         .collect()
 }
 
-/// A file results key relative to the repo root: the one spelling every
-/// join over the results reads ([`normalize_file_results_keys`]).
-fn normalized_result_key(key: &str, repo_path: &str) -> String {
-    let repo_prefix = if repo_path.ends_with('/') {
-        repo_path.to_string()
-    } else {
-        format!("{}/", repo_path)
-    };
-    key.strip_prefix(&repo_prefix)
-        .or_else(|| key.strip_prefix("./"))
-        .unwrap_or(key)
-        .to_string()
-}
-
 /// The request lines held at their module-level calls (carrick#4121), every
-/// file in the spelling [`normalize_file_results_keys`] gives the results:
-/// normalised once, here, and read in that spelling by the site pass, the
-/// fold and the removal after it.
+/// file repo-relative and `/`-separated as the decided sites spell theirs
+/// ([`crate::site_rows::relative`]): normalised once, here, and read in that
+/// spelling by the site pass, the fold and the removal after it. The
+/// analysis keys a file with the root and a `./` in between
+/// (`<root>/./src/a.ts`), which a prefix strip alone leaves as `./src/a.ts`.
 fn normalize_held_request_lines(
     held: &[crate::agents::file_analyzer_agent::HeldRequestLine],
     repo_path: &str,
 ) -> Vec<crate::agents::file_analyzer_agent::HeldRequestLine> {
-    let normalize = |file: &str| normalized_result_key(file, repo_path);
+    let normalize = |file: &str| crate::site_rows::relative(Path::new(repo_path), file);
     held.iter()
         .map(|line| crate::agents::file_analyzer_agent::HeldRequestLine {
             file: normalize(&line.file),
@@ -5328,7 +5327,7 @@ fn settle_request_lines_stated_at_module_callers(
             continue;
         };
         for (key, result) in file_results.iter_mut() {
-            let key = normalized_result_key(key, repo_path);
+            let key = crate::site_rows::relative(Path::new(repo_path), key);
             if key == line.file {
                 result.data_calls.retain(|call| {
                     !(call.call_expression_span_start == Some(line.span_start)
@@ -7659,6 +7658,11 @@ async fn site_rows_of(
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
     rows.held_open = held_open_at_decided_sites(context.held_at_module, &decided);
+    debug!(
+        held = context.held_at_module.len(),
+        decided_at_each_call = rows.held_open.len(),
+        "site questions: request lines held at module-level calls (carrick#4121)"
+    );
     // The requests the service builds and returns for a caller to send
     // (carrick#3470): candidate rows, folded as every site row is.
     rows.rows
