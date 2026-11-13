@@ -187,3 +187,81 @@ fn a_side_with_one_declared_any_member_is_served_as_its_shape() {
         "the resolved shape is served, with `meta` open: {shape}"
     );
 }
+
+/// carrick#3995 T4: a service whose compiler engine never started says so on
+/// every untyped entry. `PATH` names an empty directory, so `node` cannot be
+/// found, the engine cannot spawn and no service has a capture stub.
+#[test]
+fn a_service_that_lost_its_types_says_so_on_every_unknown_entry() {
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let empty_path = tempfile::tempdir().expect("empty PATH dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
+    cmd.arg(fixture_dir())
+        .env("PATH", empty_path.path())
+        .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
+        .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+        .env("CARRICK_CACHE_DIR", cache.path())
+        .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_ALLOW_MISSING_TYPES", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/__llm__/", fixture_dir().display()),
+        )
+        .env("CARRICK_SKIP_INTENTS", "1");
+    for var in [
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_SHA",
+        "GITHUB_RUN_ID",
+        "GITHUB_ACTIONS",
+        "GITHUB_WORKSPACE",
+        "CI",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "CARRICK_OUTPUT_JSON",
+    ] {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("failed to spawn carrick");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "scan exited non-zero:\n{stderr}");
+
+    let blobs: Vec<serde_json::Value> = std::fs::read_dir(storage.path())
+        .expect("storage dir")
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(entry.path()).ok()?).ok()
+        })
+        .filter(|blob| blob["type_manifest"].is_array())
+        .collect();
+    assert_eq!(blobs.len(), 2, "api and web blobs: {stderr}");
+    let mut unknown = 0;
+    for blob in &blobs {
+        // Premise guard: the engine never started, so the loss is real.
+        assert_eq!(
+            blob["types_degraded"]["stage"], "spawn",
+            "the engine must have failed to spawn: {}",
+            blob["types_degraded"]
+        );
+        for entry in blob["type_manifest"].as_array().unwrap() {
+            if entry["type_state"] != "unknown" {
+                continue;
+            }
+            unknown += 1;
+            let findings = entry["any_provenance"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f["path"] == "" && f["reason"] == "site_unreadable"),
+                "an unknown entry with no reason: {entry:#}"
+            );
+        }
+    }
+    assert!(unknown > 0, "the fixture has untyped entries");
+}
