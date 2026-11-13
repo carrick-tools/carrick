@@ -116,13 +116,13 @@ pub fn check(entry: &Path, origin: EngineOrigin) -> StampVerdict {
         return match stamp {
             Some(stamp) => StampVerdict::Ok { stamp },
             None => StampVerdict::Warn(format!(
-                "The compiler engine at {shown} has no build stamp, so its version cannot be checked."
+                "The compiler engine at {shown} has no build stamp, so Carrick cannot check which build it is."
             )),
         };
     }
     let Some(stamp) = stamp else {
         return StampVerdict::Refuse(format!(
-            "The compiler engine at {shown} has no build stamp, so it may be older than its sources. {REBUILD}"
+            "The compiler engine at {shown} has no build stamp, so Carrick cannot tell whether it matches the sources beside it. {REBUILD}"
         ));
     };
     // No sources beside the build (a packaged layout reached by a relative
@@ -138,7 +138,7 @@ pub fn check(entry: &Path, origin: EngineOrigin) -> StampVerdict {
         StampVerdict::Ok { stamp }
     } else {
         StampVerdict::Refuse(format!(
-            "The compiler engine at {shown} was built from different sources than the ones beside it (built {}, sources now {}). {REBUILD}",
+            "The compiler engine at {shown} does not match the sources beside it (built {}, sources now {}). {REBUILD}",
             &stamp[..stamp.len().min(12)],
             &now[..12]
         ))
