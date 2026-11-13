@@ -1,0 +1,9 @@
+{
+  "name": "graphql-mount-gql",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-gql-server": "^1.0.0",
+    "fixture-web": "^1.0.0"
+  }
+}

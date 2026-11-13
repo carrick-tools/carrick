@@ -103,6 +103,7 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
         member: Some("job".into()),
         base: None,
         prefix: None,
+        protocol: None,
         name: Some(keyed("id")),
         handler: Some(keyed("run")),
         runs: None,

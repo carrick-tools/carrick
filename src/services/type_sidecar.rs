@@ -1360,6 +1360,13 @@ pub enum LibraryClaim {
         base: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prefix: Option<ClaimSlot>,
+        /// Contract amendment 11 (cloud#2743 item 5): `graphql` says the
+        /// maker serves GraphQL operations over HTTP, with `runs` where the
+        /// schema it executes is and `prefix` where its endpoint path is.
+        /// Absent is a make as before. Read by the GraphQL mount half of
+        /// the procedure pass (`decided_sites/procedures.rs`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol: Option<ClaimProtocol>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<ClaimSlot>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6551,6 +6558,7 @@ mod tests {
                         member: Some("task".into()),
                         base: Some(slot()),
                         prefix: Some(slot()),
+                        protocol: Some(ClaimProtocol::Graphql),
                         name: Some(slot()),
                         handler: Some(slot()),
                         runs: Some(slot()),
@@ -7230,6 +7238,7 @@ mod tests {
                         member: Some("task".into()),
                         base: None,
                         prefix: None,
+                        protocol: None,
                         name: Some(slot(0, Some("id"))),
                         handler: Some(slot(0, Some("run"))),
                         runs: None,
@@ -7357,6 +7366,7 @@ mod tests {
                         member: None,
                         base: None,
                         prefix: None,
+                        protocol: None,
                         name: Some(slot(0, None)),
                         handler: Some(slot(1, None)),
                         runs: None,
@@ -7496,6 +7506,7 @@ mod tests {
                 member: None,
                 base: None,
                 prefix: None,
+                protocol: None,
                 name: None,
                 handler: None,
                 runs: None,
@@ -9053,6 +9064,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 member: None,
                 base: None,
                 prefix: None,
+                protocol: None,
                 name: None,
                 handler: None,
                 runs: None,

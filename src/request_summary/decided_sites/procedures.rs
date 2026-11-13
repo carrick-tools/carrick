@@ -39,6 +39,14 @@
 //!   paths. A catch-all segment at the end of either is dropped
 //!   ([`carrick_match::is_catch_all_path`]). Anything else is unread.
 //!
+//! - **A GraphQL server** (a make the store labels `protocol: "graphql"`,
+//!   contract amendment 11) is read by the same mount reader and never
+//!   walked: its `runs` slot holds a schema, not a collection. Each one is
+//!   written to [`super::Decided::graphql_mounts`] with every path its mount
+//!   states; a mount with no path the code writes (a library default, a
+//!   host with no verified mount, a mount call with no path) is still a
+//!   mount, saved with `graphql_mount_path_unread`.
+//!
 //! A procedure's full path is the mount, `/`, and its key path, one per
 //! mount and per key path that reach it (#2474 Q2). The served paths ride
 //! on the site ([`super::DecidedSite::procedure`]) and never on its record's
@@ -91,7 +99,9 @@ struct MergesLabel {
 }
 
 /// A maker that may serve a collection: the export, the member and form,
-/// the `runs` slot and the `prefix` slot.
+/// the `runs` slot and the `prefix` slot. With `graphql`, a GraphQL server
+/// (contract amendment 11): its `runs` slot holds a schema, never a
+/// collection, so only its mount is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AdapterLabel {
     package: String,
@@ -100,6 +110,23 @@ struct AdapterLabel {
     new: bool,
     runs: (usize, Option<String>),
     prefix: Option<(usize, Option<String>)>,
+    graphql: bool,
+}
+
+/// Where a GraphQL server a store make labels (`protocol: "graphql"`,
+/// contract amendment 11) is mounted: its make's call, and every path the
+/// mount reader states for it. A mount whose path is unread is still a
+/// mount, saved with [`Stop::GraphqlMountPathUnread`]. In-run only: nothing
+/// reads it yet (carrick#1213 S2b-2 is its reader).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GraphqlMount {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub line: u32,
+    /// Sorted, without repeats.
+    pub paths: Vec<String>,
+    /// Set where any way the mount reader followed named no path.
+    pub stop: Option<Stop>,
 }
 
 /// The member declarations the request's verdicts name for the claim
@@ -131,7 +158,9 @@ impl ProcedureLabels {
         exports: &[crate::library_claims::ExportClaims],
         verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
     ) -> Self {
-        use crate::services::type_sidecar::{BoundName, LibraryClaim, MakeForm, OpName};
+        use crate::services::type_sidecar::{
+            BoundName, ClaimProtocol, LibraryClaim, MakeForm, OpName,
+        };
         let mut labels = ProcedureLabels::default();
         for export in exports {
             for (claim_id, claim) in export.claims_with_scopes_by_id() {
@@ -203,6 +232,7 @@ impl ProcedureLabels {
                     member,
                     runs: Some(runs),
                     prefix,
+                    protocol,
                     ..
                 } = claim
                 {
@@ -215,6 +245,7 @@ impl ProcedureLabels {
                         prefix: prefix
                             .as_ref()
                             .map(|prefix| (prefix.arg as usize, prefix.key.clone())),
+                        graphql: *protocol == Some(ClaimProtocol::Graphql),
                     };
                     if !labels.adapters.contains(&label) {
                         labels.adapters.push(label);
@@ -234,9 +265,12 @@ impl ProcedureLabels {
         })
     }
 
-    fn adapter(&self, end: &LabelledEnd) -> Option<&AdapterLabel> {
+    /// The maker label of the call `end`: a procedure adapter, or with
+    /// `graphql` a GraphQL server's.
+    fn adapter(&self, end: &LabelledEnd, graphql: bool) -> Option<&AdapterLabel> {
         self.adapters.iter().find(|adapter| {
-            adapter.package == end.package
+            adapter.graphql == graphql
+                && adapter.package == end.package
                 && adapter.export == end.export
                 && adapter.member == end.member
                 && adapter.new == end.new
@@ -366,6 +400,7 @@ impl Pass<'_, '_> {
     /// Name every procedure route site of `out` (carrick#2474 R6c), read
     /// from the adapter calls among `discovered`.
     pub(super) fn run(&self, out: &mut Decided, discovered: &[super::DiscoverySite]) {
+        self.graphql_mounts(out, discovered);
         let leaves: HashSet<(String, u32, u32)> = out
             .sites
             .iter()
@@ -390,7 +425,7 @@ impl Pass<'_, '_> {
             let (Some(end), None) = (&site.end, &site.stop) else {
                 continue;
             };
-            let Some(adapter) = self.labels.adapter(end) else {
+            let Some(adapter) = self.labels.adapter(end, false) else {
                 continue;
             };
             if !adapters.insert((end.file.clone(), end.span_start, end.span_end)) {
@@ -493,6 +528,66 @@ impl Pass<'_, '_> {
             procedure.at.dedup();
             site.procedure = Some(procedure);
         }
+    }
+
+    /// Write where each GraphQL server the store labels is mounted
+    /// (`protocol: "graphql"` makes, contract amendment 11), read by the
+    /// adapter's own mount reader ([`Pass::mounts_of`]). Its `runs` slot is
+    /// never walked: it holds a schema, not a procedure collection.
+    fn graphql_mounts(&self, out: &mut Decided, discovered: &[super::DiscoverySite]) {
+        let mut seen: BTreeSet<(String, u32, u32)> = BTreeSet::new();
+        for site in discovered {
+            let (Some(end), None) = (&site.end, &site.stop) else {
+                continue;
+            };
+            let Some(server) = self.labels.adapter(end, true) else {
+                continue;
+            };
+            if !seen.insert((end.file.clone(), end.span_start, end.span_end)) {
+                continue;
+            }
+            let file = self.root.join(&end.file);
+            let mut mount = GraphqlMount {
+                file: end.file.clone(),
+                line: end.line,
+                paths: Vec::new(),
+                stop: None,
+            };
+            for path in self.mounts_of(&file, end, server, &out.sites) {
+                match path {
+                    Ok(path) => mount.paths.push(path),
+                    Err(_) => mount.stop = Some(Stop::GraphqlMountPathUnread),
+                }
+            }
+            mount.paths.sort();
+            mount.paths.dedup();
+            out.graphql_mounts.push(mount);
+        }
+        out.graphql_mounts.sort();
+        out.graphql_mounts.dedup();
+        if out.graphql_mounts.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            graphql_mounts = %out
+                .graphql_mounts
+                .iter()
+                .map(|mount| format!(
+                    "{}:{} {}",
+                    mount.file,
+                    mount.line,
+                    mount
+                        .paths
+                        .iter()
+                        .map(String::as_str)
+                        .chain(mount.stop.map(Stop::as_str))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .collect::<Vec<_>>()
+                .join(";"),
+            "receiver trace: graphql mounts"
+        );
     }
 
     /// The declaration the compiler's row of `kind` at `span` in `file`
@@ -1008,6 +1103,13 @@ impl Pass<'_, '_> {
                 }
                 let values = match walk().prefix_of(&host, &label.name, None) {
                     Prefix::Stated { values } => values,
+                    // A GraphQL server mounted with no path serves at an
+                    // endpoint of its own, which may be a library default
+                    // the code never writes: the path is unread.
+                    Prefix::Unstated if adapter.graphql => {
+                        out.push(Err(MOUNT_UNREAD));
+                        continue;
+                    }
                     Prefix::Unstated => vec!["/".to_string()],
                     Prefix::Unread { .. } => {
                         out.push(Err(MOUNT_UNREAD));
