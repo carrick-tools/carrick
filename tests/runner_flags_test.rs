@@ -428,6 +428,20 @@ fn sidecar_stand_in(home: &Path, died: &Path, alpha_waits: bool, beta_dies: Beta
         format!(
             r#"const fs = require("fs");
 const pause = new Int32Array(new SharedArrayBuffer(4));
+// A rows file with one line per file and no rows, each file's hash taken
+// from its bytes, so the file changes when the source does (carrick#4183).
+const walk_rows = (request) => {{
+  const lines = request.files.map((file) => JSON.stringify({{
+    f: require("path").relative(request.scan_root, file).split(require("path").sep).join("/"),
+    h: require("crypto").createHash("sha256").update(fs.readFileSync(file)).digest("hex"),
+    r: [],
+  }}));
+  const header = JSON.stringify({{ v: {rows_version}, typescript: "stand-in", service: request.service, files: lines.length }});
+  const bytes = require("zlib").gzipSync([header, ...lines].join("\n") + "\n");
+  fs.mkdirSync(require("path").dirname(request.out_path), {{ recursive: true }});
+  fs.writeFileSync(request.out_path, bytes);
+  return {{ files: lines.length, rows: 0, resolved: 0, any: 0, error_type: 0, jsx: 0, bytes: bytes.length, load_ms: 0, walk_ms: 0 }};
+}};
 const dies = {always} || !fs.existsSync({died:?});
 let waited = false;
 let root = "";
@@ -474,6 +488,13 @@ process.stdin.on("data", (chunk) => {{
       process.abort();
     }}
     switch (request.action) {{
+      case "position_rows":
+        if (!{at_resolution}) {{
+          answer({{ status: "error", errors: ["the stand-in answers nothing else"] }});
+          break;
+        }}
+        answer({{ status: "success", result: walk_rows(request) }});
+        break;
       case "bundle":
         answer({{ status: "success", dts_content: "", manifest: [], symbol_failures: [] }});
         break;
@@ -503,6 +524,7 @@ process.stdin.resume();
             at_resolution = matches!(beta_dies, BetaDies::AtResolution),
             die = home.join("die").to_string_lossy(),
             argv = home.join("argv").to_string_lossy(),
+            rows_version = carrick::position_rows::FORMAT_VERSION,
         ),
     )
     .unwrap();
@@ -1105,6 +1127,94 @@ fn a_crash_that_is_not_memory_holds_it_too() {
         "beta's typed index was replaced"
     );
     assert_eq!(landed["alpha"]["commit_hash"], head.as_str());
+}
+
+/// Every file in the store's `positions/` directory, by name, with its bytes.
+fn positions_of(store: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(store.join("positions"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The commit the walk record of `service`'s rows in `store` names.
+fn walked_commit(store: &Path, service: &str) -> Option<String> {
+    let record = positions_of(store)
+        .into_iter()
+        .find(|(name, _)| name.ends_with(&format!("{service}.jsonl.gz.at")))?
+        .1;
+    String::from_utf8(record)
+        .ok()?
+        .lines()
+        .nth(1)
+        .map(str::to_string)
+}
+
+/// carrick#4183: a service held for its types keeps the stored generation's
+/// per-position rows and their walk record, byte for byte, rather than rows
+/// of this run beside the old blob.
+#[test]
+fn a_held_service_keeps_its_stored_position_rows() {
+    let fixture = LateTypeLoss::of(&["beta"]);
+    typed_first_index(&fixture);
+    let seed = positions_of(&fixture.store);
+    for wanted in ["beta.jsonl.gz", "beta.jsonl.gz.at"] {
+        assert!(
+            seed.keys().any(|name| name.ends_with(wanted)),
+            "the seed run left no {wanted}: {:?}",
+            seed.keys()
+        );
+    }
+    fixture.change_both();
+
+    let run = fixture.scan(Some("heap"), false, &[]);
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
+    assert!(run.stderr.contains(KEPT_ALL_FOR_TYPES), "{}", run.stderr);
+    let landed = positions_of(&fixture.store);
+    assert_eq!(
+        landed.keys().collect::<Vec<_>>(),
+        seed.keys().collect::<Vec<_>>(),
+        "positions/ holds other files than the seed's"
+    );
+    assert!(
+        landed == seed,
+        "beta's rows or their record are not the seed's"
+    );
+}
+
+/// carrick#4183: in the same held run the service that uploads lands its
+/// rows at this run's commit, and a held service let through with
+/// `CARRICK_ALLOW_MISSING_TYPES` does too.
+#[test]
+fn a_service_that_uploads_lands_its_position_rows() {
+    let fixture = LateTypeLoss::new();
+    typed_first_index(&fixture);
+    let seeded = walked_commit(&fixture.store, "beta");
+    let head = fixture.change_both();
+
+    let run = fixture.scan(Some("heap"), false, &[]);
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
+    assert_eq!(walked_commit(&fixture.store, "alpha"), Some(head.clone()));
+    assert_eq!(walked_commit(&fixture.store, "beta"), seeded);
+
+    let let_through = fixture.scan(Some("heap"), false, &[("CARRICK_ALLOW_MISSING_TYPES", "1")]);
+    assert_eq!(
+        let_through.code,
+        Some(0),
+        "{}\n{}",
+        let_through.stderr,
+        let_through.log
+    );
+    assert_eq!(walked_commit(&fixture.store, "beta"), Some(head));
 }
 
 /// carrick#3992: `CARRICK_ALLOW_MISSING_TYPES` uploads the service without
