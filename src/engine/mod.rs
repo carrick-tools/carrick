@@ -5961,13 +5961,14 @@ async fn analyze_current_repo_incremental(
                 &protocol_extractions.site.traced.guessed,
                 repo_path,
             );
+            let (applied, traced_asks) = apply_traced_routes(
+                &mut mount_graph,
+                &protocol_extractions.site.traced.routes,
+                repo_path,
+            );
             let traced = TracedApplied {
                 guessed_withdrawn,
-                ..apply_traced_routes(
-                    &mut mount_graph,
-                    &protocol_extractions.site.traced.routes,
-                    repo_path,
-                )
+                ..applied
             };
             let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
@@ -6169,6 +6170,9 @@ async fn analyze_current_repo_incremental(
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
             protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
+            // A route the trace wrote has no model row to ask for its
+            // response (carrick#4071).
+            protocol_infer.extend(traced_asks);
             // A declared operation's case is read at its handler (carrick#2076).
             protocol_infer.extend(crate::dispatch::declared_infer_requests(
                 &mount_graph,
@@ -8123,12 +8127,21 @@ impl TracedApplied {
 /// ([`FileOrchestrator::fold_documented_operations`]).
 ///
 /// `repo_path` places the graph's files as the withdraw does.
+///
+/// Also returns the type requests of the rows written (carrick#4071): no
+/// model row stands behind them, so no file's model answer asks for their
+/// response. Each is the line-only `response_body` request of a route with
+/// no located payload, under the alias the manifest gives the row.
 fn apply_traced_routes(
     mount_graph: &mut MountGraph,
     traced: &[crate::site_rows::TracedRoute],
     repo_path: &str,
-) -> TracedApplied {
+) -> (
+    TracedApplied,
+    Vec<crate::services::type_sidecar::InferRequestItem>,
+) {
     let mut write = write_traced_routes(mount_graph, traced, repo_path);
+    let asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
     if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
@@ -8145,7 +8158,32 @@ fn apply_traced_routes(
         twin = write.applied.twin,
         "receiver trace: routes written into the mount graph"
     );
-    write.applied
+    (write.applied, asks)
+}
+
+/// The response request of each route row the trace wrote, keyed and sited
+/// as [`build_type_manifest_entries`] keys the row, so the answer joins the
+/// manifest entry (carrick#4071).
+fn traced_route_requests(
+    rows: &[crate::mount_graph::ResolvedEndpoint],
+    repo_path: &str,
+) -> Vec<crate::services::type_sidecar::InferRequestItem> {
+    let root = Path::new(repo_path);
+    rows.iter()
+        .filter_map(|row| {
+            let method = normalize_manifest_method(&row.method);
+            if !is_producer_method(&method) || !row.full_path.starts_with('/') {
+                return None;
+            }
+            let (file, line) = parse_file_location(&row.file_location);
+            let key = OperationKey::http(&method, row.full_path.clone());
+            let site_id = build_site_id(&file, line, &key, repo_path);
+            let file_abs = root.join(&file).to_string_lossy().into_owned();
+            Some(crate::agents::file_orchestrator::route_response_request(
+                &file_abs, line, &key, &site_id,
+            ))
+        })
+        .collect()
 }
 
 /// What [`write_traced_routes`] did, by the graph rows it touched: their
@@ -14403,13 +14441,14 @@ async fn analyze_current_repo(
         &protocol_extractions.site.traced.guessed,
         repo_path,
     );
+    let (applied, traced_asks) = apply_traced_routes(
+        &mut analysis_result.mount_graph,
+        &protocol_extractions.site.traced.routes,
+        repo_path,
+    );
     let traced = TracedApplied {
         guessed_withdrawn,
-        ..apply_traced_routes(
-            &mut analysis_result.mount_graph,
-            &protocol_extractions.site.traced.routes,
-            repo_path,
-        )
+        ..applied
     };
     let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
@@ -14566,6 +14605,9 @@ async fn analyze_current_repo(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
     protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
+    // A route the trace wrote has no model row to ask for its response
+    // (carrick#4071).
+    protocol_infer.extend(traced_asks);
     // A declared operation's case is read at its handler (carrick#2076).
     protocol_infer.extend(crate::dispatch::declared_infer_requests(
         &analysis_result.mount_graph,
@@ -29430,7 +29472,7 @@ unfollowed_member_calls_total: 0,
             "/health",
             ResolutionSource::Model,
         )];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"]),
@@ -29481,6 +29523,49 @@ unfollowed_member_calls_total: 0,
         assert_eq!(walked.endpoints[1].file_location, "./src/users.ts:8");
     }
 
+    /// carrick#4071: each row the trace writes asks for its response, as a
+    /// line-only `response_body` at its registration line under the alias
+    /// the manifest gives the row; a relabelled row asks nothing here.
+    #[test]
+    fn a_row_the_trace_writes_asks_for_its_response_at_its_line() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
+        use crate::services::type_sidecar::InferKind;
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = vec![traced_row(
+            "src/kept.ts:3",
+            "GET",
+            "/kept",
+            "/kept",
+            ResolutionSource::Model,
+        )];
+        let (applied, asks) = apply_traced_routes(
+            &mut graph,
+            &[
+                traced_route("src/kept.ts", 3, "GET", "/kept", &["/kept"]),
+                traced_route("src/users.ts", 8, "GET", "/", &["/v1/users"]),
+            ],
+            "/repo",
+        );
+        assert_eq!(applied.relabelled, 1);
+        assert_eq!(applied.added, 1);
+        assert_eq!(asks.len(), 1);
+        let key = crate::operation::OperationKey::http("GET", "/v1/users".to_string());
+        let site_id = crate::type_manifest::build_site_id("src/users.ts", 8, &key, "/repo");
+        let alias = crate::type_manifest::build_manifest_type_alias_with_site_id(
+            &key,
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            Some(&site_id),
+        );
+        assert_eq!(asks[0].infer_kind, InferKind::ResponseBody);
+        assert_eq!(asks[0].file_path, "/repo/src/users.ts");
+        assert_eq!(asks[0].line_number, 8);
+        assert_eq!(asks[0].alias.as_deref(), Some(alias.as_str()));
+        assert!(asks[0].span_start.is_none() && asks[0].expression_text.is_none());
+        assert!(asks[0].route_path.is_none());
+    }
+
     /// carrick#2474 R3 S1: rows at a traced route's line that state its
     /// method and one of its paths keep them and take `library_claim`; a
     /// traced path none holds is written as a copy of a row there. Two rows
@@ -29513,7 +29598,7 @@ unfollowed_member_calls_total: 0,
                 ResolutionSource::Model,
             ),
         ];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/shared.ts", 8, "GET", "/ping", &["/a/ping", "/b/ping"]),
@@ -29570,7 +29655,7 @@ unfollowed_member_calls_total: 0,
             ),
         ];
         let before = traced_rows(&graph);
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 crate::site_rows::TracedRoute {
@@ -29632,7 +29717,7 @@ unfollowed_member_calls_total: 0,
             ),
         ];
         let before = traced_rows(&graph);
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/items.ts", 8, "GET", "/leaf", &["/api/deep/leaf"]),
@@ -29718,7 +29803,7 @@ unfollowed_member_calls_total: 0,
                 ResolutionSource::Model,
             ),
         ];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/app.ts", 5, "GET", "/api/health", &["/api/health"]),
@@ -29875,7 +29960,7 @@ unfollowed_member_calls_total: 0,
         };
         let mut graph = crate::mount_graph::MountGraph::new();
         graph.endpoints = vec![declared("first"), declared("second")];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[traced_route(
                 "src/shared.ts",
@@ -29961,7 +30046,7 @@ unfollowed_member_calls_total: 0,
                 ResolutionSource::Model,
             ),
         ];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 with(
@@ -30019,7 +30104,7 @@ unfollowed_member_calls_total: 0,
             "/api/items",
             ResolutionSource::Model,
         )];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/items.ts", 5, "GET", "/items", &["/api/items"]),
@@ -30051,7 +30136,7 @@ unfollowed_member_calls_total: 0,
     #[test]
     fn a_traced_route_with_no_owner_is_counted_not_written() {
         let mut graph = crate::mount_graph::MountGraph::new();
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[crate::site_rows::TracedRoute {
                 owner: None,
@@ -30097,7 +30182,7 @@ unfollowed_member_calls_total: 0,
                 ResolutionSource::Model,
             ),
         ];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[traced_route(
                 "src/orders.ts",
@@ -30154,7 +30239,7 @@ unfollowed_member_calls_total: 0,
                 )
             },
         ];
-        let applied = apply_traced_routes(
+        let (applied, _) = apply_traced_routes(
             &mut graph,
             &[
                 traced_route("src/health.ts", 5, "GET", "/health", &["/health"]),
