@@ -881,7 +881,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          # A dry run reads the dispatched ref, so it can prove a branch; a
+          # real run always starts from main, where the PR must be based.
+          ref: ${{ inputs.dry_run && github.sha || 'main' }}
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Refresh the platform entries
