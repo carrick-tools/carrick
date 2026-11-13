@@ -9,6 +9,7 @@ import { sidecarCompilerOptions } from './compiler-options.js';
 import { rewriteSpecifiers } from './specifiers.js';
 import { WriteGuard } from './guarded-fs.js';
 import { toolEnv } from './tool-env.js';
+import { realOf, sidecarInstallDir, untrustedTree, type ReadBound } from './checkout.js';
 
 interface Config {
   workspace?: string[];
@@ -118,6 +119,31 @@ function runDeno(args: string[], cwd: string): string {
   }
 }
 
+/**
+ * The npm package directories an untrusted scan may read (carrick#4076): the
+ * real path of each package's `localPath`, kept only when strictly beneath the
+ * real npm cache. No cache, no roots; a package that resolves anywhere else
+ * (the cache itself, a link out of it) is dropped.
+ */
+export function npmReadRoots(packages: Record<string, { localPath?: string }>, npmCache: string | undefined): string[] {
+  if (!npmCache) return [];
+  const cache = realOf(npmCache);
+  const prefix = cache.endsWith(path.sep) ? cache : cache + path.sep;
+  const roots = Object.values(packages).flatMap(pkg => pkg.localPath ? [realOf(pkg.localPath)] : []);
+  return [...new Set(roots.filter(root => root.startsWith(prefix) && root !== cache))];
+}
+
+/** The npm cache Deno itself uses, asked from the engine's install directory
+ * with no configuration, so nothing in the scanned tree can move it. */
+function denoNpmCache(): string | undefined {
+  try {
+    const info = JSON.parse(runDeno(['info', '--json', '--no-config'], sidecarInstallDir())) as { npmCache?: unknown };
+    return typeof info.npmCache === 'string' && info.npmCache !== '' ? info.npmCache : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** One request's immutable graph, shared by analysis, emit and relocation. */
 export class DenoProject {
   readonly cacheDir: string;
@@ -132,6 +158,10 @@ export class DenoProject {
   private readonly redirects: Record<string, string>;
   private readonly npmPackages: Record<string, NpmPackage>;
   private readonly externalNames = new Map<string, string>();
+  /** Under CARRICK_UNTRUSTED_TREE, the npm package directories this graph
+   * resolved (`npmReadRoots`); empty otherwise. */
+  readonly readRoots: string[];
+  private bound: ReadBound | undefined;
 
   constructor(readonly config: DenoConfig, readonly repoRoot: string) {
     // Named from where the service sits in its workspace, never from the
@@ -202,6 +232,7 @@ export class DenoProject {
         throw new Error(`Deno npm graph lacks localPath for ${id}. Use Deno 2.9.4 and run deno install --frozen --node-modules-dir=none before scanning.`);
       }
     }
+    this.readRoots = untrustedTree() ? npmReadRoots(this.npmPackages, denoNpmCache()) : [];
     for (const module of graph.modules) {
       this.modules.set(module.specifier, module);
       if (module.error) this.diagnostics.push(`${module.specifier}: ${module.error}`);
@@ -265,7 +296,25 @@ export class DenoProject {
     return this.localPaths.get(spec) ?? (spec.startsWith('file:') ? fileURLToPath(spec) : undefined);
   }
 
+  /** The read bound of whoever owns the compiler this graph resolves for (the
+   * loader's, or a capture's with its stub dirs), so `resolve` never hands it
+   * a file it would refuse (carrick#4076). */
+  bindReadBound(bound: ReadBound | undefined): void {
+    this.bound = bound;
+  }
+
+  get readBound(): ReadBound | undefined {
+    return this.bound;
+  }
+
+  /** A file the bound refuses resolves to nothing, so the import reads as
+   * missing (`any`) instead of failing the whole program. */
   resolve(spec: string, from: string, options: ts.CompilerOptions, host: ts.ModuleResolutionHost = ts.sys): ts.ResolvedModule | undefined {
+    const resolved = this.resolveUnbounded(spec, from, options, host);
+    return resolved && this.bound && !this.bound.allows(resolved.resolvedFileName) ? undefined : resolved;
+  }
+
+  private resolveUnbounded(spec: string, from: string, options: ts.CompilerOptions, host: ts.ModuleResolutionHost): ts.ResolvedModule | undefined {
     const edge = this.edges.get(path.resolve(from))?.get(spec);
     if (edge) {
       const target = this.targetPath(edge, from);

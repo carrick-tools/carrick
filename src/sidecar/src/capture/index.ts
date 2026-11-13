@@ -254,12 +254,12 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const stubDir = path.resolve(opts.outDir);
   const errors: string[] = [];
   // Under CARRICK_UNTRUSTED_TREE every compiler read below is held to the
-  // checkout, the sidecar's own install and this stub; otherwise undefined
-  // and nothing here changes (carrick#2230).
+  // checkout, the sidecar's own install, these stub dirs and a Deno graph's
+  // npm packages (`bound`, built once the Deno graph exists); otherwise
+  // undefined and nothing here changes (carrick#2230).
   // The backfilled stub (carrick#2041) is written beside the first.
   const backfillDir = plannedBackfill(opts) ? path.resolve(opts.backfillOutDir!) : undefined;
   const stubDirs = backfillDir ? [stubDir, backfillDir] : [stubDir];
-  const bound = untrustedReadBound(repoRoot, stubDirs);
 
   // The named config, else the one the init'd project reads too
   // (carrick#1776). A service with neither is typed under defaults below.
@@ -297,6 +297,11 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   } catch (err) {
     return fail(stubDir, packageName, [err instanceof Error ? err.message : String(err)]);
   }
+  // The bound also admits the npm packages a Deno graph resolved, and the
+  // Deno resolver is held to this same bound, stub dirs included, so it never
+  // hands the compiler a file the bound refuses (carrick#4076).
+  const bound = untrustedReadBound(repoRoot, [...stubDirs, ...(deno?.readRoots ?? [])]);
+  deno?.bindReadBound(bound);
   if (deno) {
     parsed = deno.parsed;
     errors.push(...deno.diagnostics);
