@@ -157,6 +157,7 @@ fn an_http_calls_entries_read_its_body_and_its_result() {
         &entries,
         &dir.path().to_string_lossy(),
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     // The body argument: `order` before the call's closing parenthesis.
     let body = {
@@ -228,6 +229,7 @@ fn a_body_built_in_the_wrapper_names_the_call_that_reaches_it() {
         &[entry(http(), "consumer", "request", "Req", 2)],
         &dir.path().to_string_lossy(),
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     let [request] = requests.as_slice() else {
         panic!("{requests:?}");
@@ -282,6 +284,7 @@ fn a_get_through_a_wrapper_that_builds_an_object_is_not_asked_a_request_body() {
             &[entry(key, "consumer", "request", "Req", 2)],
             &root,
             &ResultIndex::default(),
+            &HashSet::new(),
         )
     };
     let get = asked("GET");
@@ -306,8 +309,8 @@ fn a_calls_result_request_takes_the_label_at_its_call() {
     let member = ResultShape::Member(["data".to_string()]);
     let (start, end) = span_of("http.post(\"/orders\", order)");
     let index = ResultIndex::labelled(FILE, (start, end), member.clone());
-    let labelled = payloads.requests(&entries, &root, &index);
-    let bare = payloads.requests(&entries, &root, &ResultIndex::default());
+    let labelled = payloads.requests(&entries, &root, &index, &HashSet::new());
+    let bare = payloads.requests(&entries, &root, &ResultIndex::default(), &HashSet::new());
     assert_eq!(labelled.len(), 2, "{labelled:?}");
     let by_alias = |requests: &[InferRequestItem], alias: &str| {
         requests
@@ -329,7 +332,7 @@ fn a_calls_result_request_takes_the_label_at_its_call() {
     let elsewhere = ResultIndex::labelled("src/other.ts", (start, end), ResultShape::Whole(true));
     assert!(
         payloads
-            .requests(&entries, &root, &elsewhere)
+            .requests(&entries, &root, &elsewhere, &HashSet::new())
             .iter()
             .all(|request| request.result.is_none())
     );
@@ -348,7 +351,8 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
             .requests(
                 &[entry(http(), "consumer", "response", "Res", 3)],
                 &root,
-                &ResultIndex::default()
+                &ResultIndex::default(),
+                &HashSet::new()
             )
             .is_empty()
     );
@@ -358,7 +362,12 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
     let socket_entry = entry(socket, "consumer", "response", "Sock", 2);
     assert!(
         http_call
-            .requests(&[socket_entry], &root, &ResultIndex::default())
+            .requests(
+                &[socket_entry],
+                &root,
+                &ResultIndex::default(),
+                &HashSet::new()
+            )
             .is_empty()
     );
     // Another side: a route at the line of a client's call.
@@ -367,7 +376,8 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
             .requests(
                 &[entry(http(), "producer", "request", "Route", 2)],
                 &root,
-                &ResultIndex::default()
+                &ResultIndex::default(),
+                &HashSet::new()
             )
             .is_empty()
     );
@@ -380,7 +390,8 @@ fn an_entry_joins_one_site_of_its_line_protocol_and_side() {
         two.requests(
             &[entry(http(), "consumer", "response", "Res", 2)],
             &root,
-            &ResultIndex::default()
+            &ResultIndex::default(),
+            &HashSet::new()
         )
         .is_empty()
     );
@@ -406,6 +417,7 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
         &[entry(socket.clone(), "producer", "response", "Sub", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].infer_kind, InferKind::FunctionParam);
@@ -417,7 +429,8 @@ fn a_handlers_payload_is_its_parameter_and_an_empty_slot_asks_nothing() {
             .requests(
                 &[entry(http(), "consumer", "request", "Req", 2)],
                 &root,
-                &ResultIndex::default()
+                &ResultIndex::default(),
+                &HashSet::new()
             )
             .is_empty()
     );
@@ -584,6 +597,7 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
         &[entry(http(), "consumer", "request", "Req", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].infer_kind, InferKind::RequestConfig);
@@ -597,6 +611,7 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
         &[entry(http(), "consumer", "request", "Req", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert_eq!(value[0].infer_kind, InferKind::RequestBody);
     assert_eq!(value[0].member, None);
@@ -629,6 +644,7 @@ fn an_unwritten_slot_is_not_asked_of_another_protocol() {
         &[entry(socket, "producer", "response", "Sub", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert!(requests.is_empty(), "{requests:?}");
 }

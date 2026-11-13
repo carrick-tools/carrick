@@ -6359,6 +6359,7 @@ async fn analyze_current_repo_incremental(
                 cloud_data.type_manifest.as_deref().unwrap_or_default(),
                 repo_path,
                 &results,
+                &awaiting_body(&merged_results),
             );
             protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
                 &pubsub_results,
@@ -14115,20 +14116,16 @@ fn stamp_stated_values(
     }
 }
 
-/// A row at a caller whose response no request line reads (carrick#1601,
-/// carrick#3961) holds the value its function returns, which is no wire
-/// response, unless the function hands back the transport response beside
-/// the body it read (carrick#4196). Its own call is asked; the consumer
-/// response entry stays only where `kept`, the aliases whose answer named
-/// that body member, holds it. Every other such entry goes, as it does for
-/// a call with no internal producer.
-fn withhold_unread_hand_backs(
-    manifest: &mut Vec<TypeManifestEntry>,
+/// The caller rows whose response no request line reads, as `(file, line,
+/// method)`: the rows [`withhold_unread_hand_backs`] holds to the answer for
+/// their own call, and for which the site-payload request builder asks no
+/// response slot (carrick#4213 T0), so the engine's own ask is the only
+/// route that types one.
+pub(crate) fn awaiting_body(
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    kept: &BTreeSet<String>,
-) {
+) -> HashSet<(&str, u32, String)> {
     let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
-    let asked: HashSet<(&str, u32, String)> = file_results
+    file_results
         .iter()
         .flat_map(|(file_path, result)| {
             result
@@ -14149,7 +14146,22 @@ fn withhold_unread_hand_backs(
                     )
                 })
         })
-        .collect();
+        .collect()
+}
+
+/// A row at a caller whose response no request line reads (carrick#1601,
+/// carrick#3961) holds the value its function returns, which is no wire
+/// response, unless the function hands back the transport response beside
+/// the body it read (carrick#4196). Its own call is asked; the consumer
+/// response entry stays only where `kept`, the aliases whose answer named
+/// that body member, holds it. Every other such entry goes, as it does for
+/// a call with no internal producer.
+fn withhold_unread_hand_backs(
+    manifest: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    kept: &BTreeSet<String>,
+) {
+    let asked = awaiting_body(file_results);
     if asked.is_empty() {
         return;
     }
@@ -15387,6 +15399,7 @@ async fn analyze_current_repo(
         cloud_data.type_manifest.as_deref().unwrap_or_default(),
         repo_path,
         &results,
+        &awaiting_body(&analysis_result.file_results),
     );
     protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
         &pubsub_results,

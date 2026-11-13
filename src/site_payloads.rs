@@ -33,7 +33,7 @@
 //!   demoted to inference) asks nothing, so the slot decides. An alias no slot
 //!   types keeps the guard.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind, TypeManifestEntry};
@@ -103,12 +103,15 @@ impl SitePayloads {
     /// The infer request each of `entries` takes from its site's slot, in
     /// the entries' order. Files are joined relative to `repo_path`; a file
     /// that cannot be read gives no request, since its span cannot be put in
-    /// the sidecar's numbering.
+    /// the sidecar's numbering. A consumer response entry at a caller row in
+    /// `awaiting_body` takes no request: the answer for its own call decides
+    /// whether it stays (carrick#4213 T0).
     pub fn requests(
         &self,
         entries: &[TypeManifestEntry],
         repo_path: &str,
         results: &crate::result_shapes::ResultIndex,
+        awaiting_body: &HashSet<(&str, u32, String)>,
     ) -> Vec<InferRequestItem> {
         let root = Path::new(repo_path);
         let mut sources: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -121,6 +124,18 @@ impl SitePayloads {
                 ManifestRole::Consumer => Side::Call,
                 ManifestRole::Producer => Side::Handler,
             };
+            if entry.role == ManifestRole::Consumer
+                && entry.type_kind == ManifestTypeKind::Response
+                && entry.key.as_http().is_some_and(|(method, _)| {
+                    awaiting_body.contains(&(
+                        entry.file_path.as_str(),
+                        entry.line_number,
+                        method.to_string(),
+                    ))
+                })
+            {
+                continue;
+            }
             let Some(sites) = self.by_line.get(&(file.clone(), entry.line_number)) else {
                 continue;
             };
