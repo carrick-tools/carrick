@@ -1328,6 +1328,38 @@ pub fn relative(root: &Path, file: &str) -> String {
     crate::utils::repo_relative_source_path(file, &root.to_string_lossy()).replace('\\', "/")
 }
 
+/// The graph's model rows at a call whose URL the site pass stopped on
+/// (`slot` is `path`, carrick#4171) state no base. A bare path the model
+/// answered reads as `relative` ([`crate::call_base::stated_base`]), which
+/// claims the same origin, where the code read the base as a value it could
+/// not state (`fetch(new URL("a/b", apiBase()))`). A row the code decided
+/// keeps the base its own pass read.
+fn unstate_relative_where_path_unread(
+    graph: &mut crate::mount_graph::MountGraph,
+    unread: &[crate::unread_sites::UnreadSite],
+    root: &Path,
+) {
+    use crate::call_base::CallBaseKind;
+    for call in graph.data_calls.iter_mut().filter(|call| {
+        call.resolution_source == Some(ResolutionSource::Model)
+            && call
+                .base
+                .as_ref()
+                .is_some_and(|base| base.kind == CallBaseKind::Relative)
+    }) {
+        let Some((file, line)) = call.file_location.rsplit_once(':') else {
+            continue;
+        };
+        let (file, line) = (relative(root, file), line.parse::<u32>().ok());
+        if unread
+            .iter()
+            .any(|site| site.slot == "path" && site.file == file && Some(site.line) == line)
+        {
+            call.base = None;
+        }
+    }
+}
+
 /// A row's `file:line`, relative to `root`.
 fn place(root: &Path, row: &ApiEndpointDetails) -> Option<(String, u32)> {
     let text = row.file_path.to_string_lossy();
@@ -1356,6 +1388,10 @@ pub fn fold(
     // pass reads them (`call_through::settle`), and would read the folded
     // row as a call of its own (carrick#2704).
     if let Some(graph) = data.mount_graph.as_mut() {
+        // The fold's unread sites, not the site pass's: a stop the site
+        // pass raised as a lead becomes an unread site only here, beside a
+        // row the code did not decide (carrick#4171).
+        unstate_relative_where_path_unread(graph, &fold.unread, root);
         // A fact site row replaces the reader's row in the graph as it does
         // in the calls, and the facts join the graph beside the rows the
         // reader stated (carrick#2795): the cross-service pass and the cloud
@@ -1825,11 +1861,13 @@ pub fn fold_rows(
     out
 }
 
-/// A row a fact states: the scan's own, or a site row every slot of which
-/// the code decided. A site answer is the model's, a candidate.
+/// A row a fact states: its source is no candidate
+/// ([`ResolutionSource::is_candidate`], the one answer; carrick#4170). The
+/// model's row, an inline literal's and a request descriptor's are
+/// candidates; a row with no source is neither.
 fn is_fact(row: &ApiEndpointDetails) -> bool {
     row.resolution_source
-        .is_some_and(|source| source != ResolutionSource::Model)
+        .is_some_and(|source| !source.is_candidate())
 }
 
 /// A row the code decided: its source is no candidate (the model's, an
@@ -1840,8 +1878,7 @@ fn is_fact(row: &ApiEndpointDetails) -> bool {
 /// whole row from a literal name only. The one test for both drops in
 /// [`fold_rows`] (carrick#4151, carrick#4153).
 fn code_decided(row: &ApiEndpointDetails) -> bool {
-    row.resolution_source
-        .is_some_and(|source| !source.is_candidate() && !is_old_path_source(source))
+    is_fact(row) && !is_old_path(row)
 }
 
 /// A row the file reader stated, which no site answer has touched.
