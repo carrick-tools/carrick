@@ -1189,6 +1189,36 @@ fn an_unanswered_lead_on_a_row_line_is_saved_unread_unless_the_code_states_the_r
     );
 }
 
+/// The site fold asks [`ResolutionSource::is_candidate`] whether a row is a
+/// fact (carrick#4170): an inline literal's and a request descriptor's rows
+/// are candidates beside the model's, and a row the code decided is a fact no
+/// old-path pass wrote.
+#[test]
+fn the_site_fold_reads_the_one_candidate_answer() {
+    use ResolutionSource as S;
+    for source in [
+        S::Model,
+        S::InlineLiteral,
+        S::RequestDescriptor,
+        S::ImportedMember,
+        S::SameFileWrapper,
+        S::RequestSummary,
+        S::LibraryClaim,
+        S::EventBus,
+        S::SocketCall,
+    ] {
+        let row = blob_row(OperationKey::http("GET", "/a"), "src/a.ts", 4, Some(source));
+        assert_eq!(is_fact(&row), !source.is_candidate(), "{source:?}");
+        assert_eq!(
+            code_decided(&row),
+            is_fact(&row) && !is_old_path_source(source),
+            "{source:?}"
+        );
+    }
+    let none = blob_row(OperationKey::http("GET", "/a"), "src/a.ts", 4, None);
+    assert!(!is_fact(&none) && !code_decided(&none));
+}
+
 /// A stop on a row's line, of any reason, is dropped from the possible calls
 /// and saved as an unread site unless a row the code decided stands on that
 /// line: the model's, an old-path pass's, a candidate's or a row with no
