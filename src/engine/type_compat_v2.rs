@@ -10532,6 +10532,62 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert_eq!(pre_verdict_of(&pairs), None);
     }
 
+    /// A `GET /notes` call (consumer request) against a route registered for
+    /// every verb (producer request), each side with its text and root reason.
+    fn get_call_against_all_route(
+        producer: (Option<&str>, Option<&str>),
+        consumer: (Option<&str>, Option<&str>),
+    ) -> Vec<BuiltPair> {
+        let side =
+            |role: ManifestRole, method: &str, (text, reason): (Option<&str>, Option<&str>)| {
+                let mut e = body_entry(role, ManifestTypeKind::Request, text, reason);
+                e.key = OperationKey::http(method, "/notes");
+                e
+            };
+        let mut api = repo(
+            "api",
+            None,
+            vec![side(ManifestRole::Producer, "ALL", producer)],
+            Some(fake_artifact()),
+        );
+        api.endpoints = vec![dispatch_row("ALL", "/notes", "src/routes.ts:3", None)];
+        let web = repo(
+            "web",
+            None,
+            vec![side(ManifestRole::Consumer, "GET", consumer)],
+            Some(fake_artifact()),
+        );
+        build_check_pairs(&[api, web])
+    }
+
+    /// The one pair the stamp moves: a GET call against an every-verb route
+    /// whose handler is itself decided to read no body now says so on both
+    /// sides, which is the compatible both-sides verdict. Before, the call's
+    /// side read `not_located` and the pair was probed.
+    #[test]
+    fn a_get_call_stating_no_body_against_a_route_reading_none_is_compatible() {
+        let before =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), None));
+        let after =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), DECIDED));
+        assert_eq!(pre_verdict_of(&before), None);
+        assert_eq!(pre_verdict_of(&after), Some(PreVerdict::NoBodyEitherSide));
+    }
+
+    /// carrick#4159: a GET call states `no_request_body` (nothing was left
+    /// unlocated). Against a route whose request type expects a body, or one
+    /// no scan read, the pair is judged exactly as it was before the call said
+    /// so: there is no both-sides verdict.
+    #[test]
+    fn a_get_call_stating_no_body_against_a_route_expecting_one_is_still_probed() {
+        for producer in [Some("{ name: string; }"), Some("unknown"), None] {
+            let before = get_call_against_all_route((producer, None), (Some("unknown"), None));
+            let after = get_call_against_all_route((producer, None), (Some("unknown"), DECIDED));
+            assert_eq!(pre_verdict_of(&before), None, "producer {producer:?}");
+            assert_eq!(pre_verdict_of(&after), None, "producer {producer:?}");
+        }
+    }
+
     #[test]
     fn a_side_with_no_surface_keeps_its_not_compared_verdict() {
         let mut api = repo(

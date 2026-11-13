@@ -13737,7 +13737,8 @@ fn read_capture_records(
 ///  - otherwise the record's `unread_cause`, or `not_recorded` when the record
 ///    has none.
 ///
-/// No verdict reads any of these words, and the finding carries no detail.
+/// Only `no_request_body` is a verdict input (carrick#2674), and it is stamped only on a consumer
+/// request whose verb carries no body (carrick#4159). The finding carries no detail.
 fn stamp_capture_provenance(
     manifest: &mut [TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
@@ -13758,6 +13759,13 @@ fn stamp_capture_provenance(
             continue;
         }
         let cause = record.unread_cause.as_deref().unwrap_or("not_recorded");
+        // carrick#4159: a call whose verb carries no body sends none, so a
+        // request no scan located is decided, not unlocated.
+        let cause = if cause == "not_located" && consumer_call_sends_no_body(entry) {
+            "no_request_body"
+        } else {
+            cause
+        };
         let (kind, reason) = match entry.v1_before_demotion {
             Some(v1) => (
                 if v1.holds_any { "any" } else { "unknown" },
@@ -13807,6 +13815,18 @@ fn stamp_service_type_loss(cloud_data: &mut CloudRepoData) {
                 });
         }
     }
+}
+
+/// Whether `entry` is a consumer's request type for an HTTP call whose verb
+/// carries no body (the verbs a producer is never asked a request body for,
+/// [`crate::type_manifest::producer_reads_request_body`]).
+fn consumer_call_sends_no_body(entry: &TypeManifestEntry) -> bool {
+    entry.role == ManifestRole::Consumer
+        && entry.type_kind == ManifestTypeKind::Request
+        && entry
+            .key
+            .as_http()
+            .is_some_and(|(method, _)| !crate::type_manifest::producer_reads_request_body(method))
 }
 
 fn build_type_manifest_entries(
@@ -27491,6 +27511,75 @@ unfollowed_member_calls_total: 0,
             vec![("unknown", "not_recorded", None)]
         );
         assert!(manifest[1].any_provenance.is_empty());
+    }
+
+    /// A consumer request entry of the given HTTP verb, with the placeholder
+    /// record the driver sends for an alias no request located a value for.
+    fn request_entry_stamped(
+        method: &str,
+        role: ManifestRole,
+        kind: ManifestTypeKind,
+    ) -> TypeManifestEntry {
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].key = OperationKey::http(method, "/orders/:id");
+        manifest[0].role = role;
+        manifest[0].type_kind = kind;
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "anchor_kind": "literal",
+                "anchor_origin": "manifest-placeholder",
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unread_cause": "not_located"
+            }),
+        )]));
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "unknown")],
+            &records,
+        );
+        manifest.remove(0)
+    }
+
+    /// carrick#4159: a call whose verb carries no body (GET, HEAD, OPTIONS)
+    /// sends none, so its request type reads the decided `no_request_body`,
+    /// not `not_located`: nothing was left unlocated.
+    #[test]
+    fn a_bodyless_verb_consumer_request_states_no_request_body() {
+        for method in ["GET", "HEAD", "OPTIONS"] {
+            let entry =
+                request_entry_stamped(method, ManifestRole::Consumer, ManifestTypeKind::Request);
+            assert_eq!(entry.type_state, ManifestTypeState::Unknown, "{method}");
+            assert_eq!(
+                root_findings(&entry),
+                vec![("unknown", "no_request_body", None)],
+                "{method}"
+            );
+        }
+    }
+
+    /// carrick#4159: only the request side of a consumer call whose verb
+    /// carries no body says so. A body verb whose call located no value
+    /// (the scan cannot tell a call that passes none from one it could not
+    /// read), a consumer's response and a producer's request keep
+    /// `not_located`.
+    #[test]
+    fn only_a_bodyless_verb_consumer_request_states_no_request_body() {
+        for (method, role, kind) in [
+            ("POST", ManifestRole::Consumer, ManifestTypeKind::Request),
+            ("DELETE", ManifestRole::Consumer, ManifestTypeKind::Request),
+            ("GET", ManifestRole::Consumer, ManifestTypeKind::Response),
+            ("ALL", ManifestRole::Producer, ManifestTypeKind::Request),
+        ] {
+            let entry = request_entry_stamped(method, role, kind);
+            assert_eq!(
+                root_findings(&entry),
+                vec![("unknown", "not_located", None)],
+                "{method} {role:?} {kind:?}"
+            );
+        }
     }
 
     /// carrick#4046: a type v1 printed as a bare top type keeps the kind the
