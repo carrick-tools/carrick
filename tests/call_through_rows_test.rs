@@ -1774,9 +1774,9 @@ fn leaf_types_are_asked_only_where_the_fold_took_a_model_row() {
         asked.contains(&format!("{TYPED_COMMANDS}:15")),
         "the leaf at a folded line is asked: {asked:#?}"
     );
-    // The fixture asked 72 leaf calls before the gate, 67 of them off a
-    // folded line.
-    assert_eq!(asked.len(), 5, "{asked:#?}");
+    // The fixture asked 72 leaf calls before the gate, 67 distinct lines of
+    // them off a folded line; the one fold-taken leaf is all that is asked.
+    assert_eq!(asked.len(), 1, "{asked:#?}");
     let elsewhere: Vec<&String> = asked.difference(&folded).collect();
     assert!(
         elsewhere.is_empty(),
