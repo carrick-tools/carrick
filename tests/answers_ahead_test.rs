@@ -886,6 +886,22 @@ async fn main_then_change(tmp: &Path, ahead: bool) -> Rescanned {
     let repo = tmp.join("workspace");
     let _ = std::fs::remove_dir_all(&repo);
     copy_dir(&fixture, &repo);
+    // The fixture carries an installed `express` and the store's answer for it
+    // for the tests that scan it as it is. A store answer makes the scan state
+    // the routes itself, and this test is about the files the lane asks the
+    // model, so its copy has no install (carrick#3711).
+    for stand_in in [
+        "node_modules",
+        "package-lock.json",
+        "__llm__/library-claims",
+    ] {
+        let path = repo.join(stand_in);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else if path.is_file() {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
     run_git(&repo, &["init", "-q"]);
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "main"]);
