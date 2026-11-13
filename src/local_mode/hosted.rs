@@ -1655,9 +1655,17 @@ impl HostedInput {
 /// there is no previous generation at all and every laptop rescan is a cold,
 /// paid one.
 pub(super) const PREVIOUS_ENV: &str = "CARRICK_LOCAL_HOSTED_PREVIOUS";
+
+/// Whether the local indexer drives this scan: local storage, and a
+/// facts-only pass or a laptop scan. Such a run is the laptop's, whatever
+/// its storage answers about the index, so it ends as a laptop run does
+/// (carrick#3992).
+pub(crate) fn driven_by_the_indexer() -> bool {
+    (super::no_model() || crate::cloud_storage::laptop_scan_requested())
+        && std::env::var_os(crate::cloud_storage::CACHE_DIR_ENV).is_some()
+}
 pub(crate) fn previous_data() -> Result<Option<Vec<CloudRepoData>>, Box<dyn std::error::Error>> {
-    let driven_by_the_indexer = super::no_model() || crate::cloud_storage::laptop_scan_requested();
-    if !driven_by_the_indexer || std::env::var_os(crate::cloud_storage::CACHE_DIR_ENV).is_none() {
+    if !driven_by_the_indexer() {
         return Ok(None);
     }
     let Some(path) = std::env::var_os(PREVIOUS_ENV) else {

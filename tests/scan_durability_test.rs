@@ -924,22 +924,21 @@ process.stdin.resume();
     entry
 }
 
-/// carrick#3992 on the laptop path: a rescan whose compiler engine dies at
-/// beta's type resolution, where beta's stored index has its types, keeps
-/// that index and its served generation, lands the other two, and exits 0.
-/// Nothing is owed to the model, so no fail marker closes the scan.
-#[tokio::test]
-#[serial]
-async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation() {
-    offline_env();
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = three_service_repo(tmp.path());
-    let die = tmp.path().join("die");
-    let died = tmp.path().join("died");
-    let entry = engine_that_dies_at_beta_resolution(&tmp.path().join("engine"), &die, &died);
+/// A laptop first index of `repo` (its services `indexed`) in which beta's
+/// types land, then a rescan in which the compiler engine dies at beta's
+/// type resolution; the rescan exits 0. Returns the rescan's storage and how
+/// many uploads the first index made.
+async fn laptop_rescan_that_loses_beta_types(
+    tmp: &Path,
+    repo: &Path,
+    indexed: &[&str],
+) -> (StubStorage, usize) {
+    let die = tmp.join("die");
+    let died = tmp.join("died");
+    let entry = engine_that_dies_at_beta_resolution(&tmp.join("engine"), &die, &died);
     let sidecar =
         carrick::services::type_sidecar::TypeSidecar::spawn(&entry).expect("the stand-in spawns");
-    sidecar.start_init(&repo, None);
+    sidecar.start_init(repo, None);
     sidecar
         .wait_ready(std::time::Duration::from_secs(60))
         .expect("the stand-in is ready");
@@ -957,7 +956,7 @@ async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation()
     );
 
     let rescan = StubStorage {
-        indexed: Some(vec!["alpha".into(), "beta".into(), "gamma".into()]),
+        indexed: Some(indexed.iter().map(|s| s.to_string()).collect()),
         ..first.clone()
     };
     std::fs::write(&die, "plain").unwrap();
@@ -968,6 +967,21 @@ async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation()
         died.exists(),
         "the stand-in never died at beta's resolution"
     );
+    (rescan, landed)
+}
+
+/// carrick#3992 on the laptop path: a rescan whose compiler engine dies at
+/// beta's type resolution, where beta's stored index has its types, keeps
+/// that index and its served generation, lands the other two, and exits 0.
+/// The last write closes the scan, so no fail marker is written.
+#[tokio::test]
+#[serial]
+async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let (rescan, landed) =
+        laptop_rescan_that_loses_beta_types(tmp.path(), &repo, &["alpha", "beta", "gamma"]).await;
 
     let mut fresh: Vec<String> = rescan.uploads()[landed..]
         .iter()
@@ -978,6 +992,50 @@ async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation()
     assert_eq!(*rescan.kept.lock().unwrap(), ["beta"]);
     let markers = rescan.scan_failed.lock().unwrap().clone();
     assert!(markers.is_empty(), "{markers:?}");
+}
+
+/// carrick#4157: a laptop rescan of a single-service repo whose only
+/// service is kept for its types writes nothing, so no write closes the
+/// scan: the fail marker does, naming the service.
+#[tokio::test]
+#[serial]
+async fn on_a_laptop_a_run_that_keeps_every_service_closes_with_the_marker() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("monorepo");
+    write(
+        &repo,
+        "carrick.json",
+        r#"{ "services": [ { "name": "beta", "directory": "services/beta" } ] }"#,
+    );
+    write(
+        &repo,
+        "package.json",
+        r#"{ "name": "monorepo", "private": true }"#,
+    );
+    write(
+        &repo,
+        "services/beta/package.json",
+        r#"{ "name": "beta", "dependencies": { "express": "4.18.2" } }"#,
+    );
+    write(
+        &repo,
+        "services/beta/src/server.ts",
+        "import express from \"express\";\n\nconst app = express();\n\n\
+         app.get(\"/beta/status\", async (_req, res) => {\n  \
+         const upstream = await fetch(\"http://localhost:9000/api/health\");\n  \
+         res.json({ ok: upstream.ok });\n});\n\napp.listen(3000);\n",
+    );
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let (rescan, landed) = laptop_rescan_that_loses_beta_types(tmp.path(), &repo, &["beta"]).await;
+    assert_eq!(rescan.uploads().len(), landed, "beta's typed index is kept");
+    assert_eq!(*rescan.kept.lock().unwrap(), ["beta"]);
+    let markers = rescan.scan_failed.lock().unwrap().clone();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].1.contains("beta"), "{markers:?}");
 }
 
 /// A spent run-wide retry budget skips the in-run retry (carrick#1126): one

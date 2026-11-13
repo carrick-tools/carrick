@@ -3215,17 +3215,40 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     }
     // A service kept at its stored index for its types (step 4c,
     // carrick#3992). As with pending work, CI's exit code is the only place
-    // it shows; the laptop said it in the run and keeps its served
-    // generation, so it exits 0.
+    // it shows. The laptop, and the local indexer that drives a laptop's
+    // scans, said it in the run and keep the served generation, so they exit
+    // 0.
     let types_held: Vec<&str> = runs
         .iter()
         .filter(|run| run.types_held)
         .map(|run| run.label.as_str())
         .collect();
-    if !laptop && !allow_missing_types && !types_held.is_empty() {
+    // A run that wrote no final write (every analysed service held) and owes
+    // no model work closes its scan with the same marker the pending path
+    // above writes, so the slot is released and a runner does not read the
+    // run as one that never landed (carrick#4157).
+    if !types_held.is_empty() && !closed_by_final_write && !incomplete {
+        let reason = format!(
+            "types lost at resolution, stored index kept: {}",
+            types_held.join(", ")
+        );
+        storage
+            .report_scan_failed(
+                crate::scan_stage::current().as_str(),
+                &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
+            )
+            .await;
+    }
+    let laptop_run = laptop || crate::local_mode::hosted::driven_by_the_indexer();
+    if !laptop_run && !allow_missing_types && !types_held.is_empty() {
+        let others = if runs.iter().any(|run| !run.held_back && !run.carried) {
+            "The other services were uploaded."
+        } else {
+            "Nothing was uploaded."
+        };
         return Err(format!(
-            "Kept the stored index of {}: this run lost their types. The other services were \
-             uploaded. Set {}=1 to upload without types.",
+            "Kept the stored index of {}: this run lost their types. {others} Set {}=1 to \
+             upload without types.",
             types_held.join(", "),
             crate::scan_health::ALLOW_MISSING_TYPES_ENV
         )

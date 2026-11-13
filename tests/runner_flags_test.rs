@@ -946,10 +946,18 @@ fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
 }
 
 /// What a run says when it keeps a service's stored index because it lost
-/// that service's types (carrick#3992).
+/// that service's types, and uploads the others (carrick#3992).
 const KEPT_FOR_TYPES: &str = "Kept the stored index of beta: this run lost their types. The other \
                               services were uploaded. Set CARRICK_ALLOW_MISSING_TYPES=1 to upload \
                               without types.";
+
+/// The same, when every service the run analysed was kept.
+const KEPT_ALL_FOR_TYPES: &str = "Kept the stored index of beta: this run lost their types. \
+                                  Nothing was uploaded. Set CARRICK_ALLOW_MISSING_TYPES=1 to \
+                                  upload without types.";
+
+/// The warning line of a service kept for its types.
+const NOT_UPLOADING_BETA: &str = "Not uploading beta: this run lost its types (";
 
 /// carrick#3992: the two-service repo, scanned into one local store by a
 /// stand-in whose `beta` process dies at type resolution while `home/die`
@@ -964,8 +972,13 @@ struct LateTypeLoss {
 
 impl LateTypeLoss {
     fn new() -> Self {
+        Self::of(&["alpha", "beta"])
+    }
+
+    /// The fixture over a repo of `services`.
+    fn of(services: &[&str]) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let repo = two_service_repo(tmp.path());
+        let repo = service_repo(tmp.path(), services);
         let home = tmp.path().join("home");
         let died = tmp.path().join("died");
         let store = tmp.path().join("store");
@@ -1004,10 +1017,13 @@ impl LateTypeLoss {
         )
     }
 
-    /// A commit that changes both services' source.
+    /// A commit that changes every service's source.
     fn change_both(&self) -> String {
         for service in ["alpha", "beta"] {
             let path = self.repo.join(format!("services/{service}/src/server.ts"));
+            if !path.exists() {
+                continue;
+            }
             let mut source = std::fs::read_to_string(&path).unwrap();
             source.push_str("\n// changed\n");
             std::fs::write(&path, source).unwrap();
@@ -1055,6 +1071,7 @@ fn a_late_type_loss_keeps_the_stored_typed_index() {
     assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
     assert!(run.stderr.contains(KEPT_FOR_TYPES), "{}", run.stderr);
     assert!(run.log.contains("Type resolution failed"), "{}", run.log);
+    assert!(run.log.contains(NOT_UPLOADING_BETA), "{}", run.log);
     let landed = stored_blobs(&fixture.store);
     assert_eq!(
         serde_json::to_string_pretty(&landed["beta"]).unwrap(),
@@ -1130,4 +1147,66 @@ fn a_stored_index_without_types_is_replaced() {
     let beta = fixture.blob("beta");
     assert_eq!(beta["commit_hash"], head.as_str(), "{beta}");
     assert_eq!(degraded_stage(&beta).as_deref(), Some("resolve"), "{beta}");
+}
+
+/// carrick#3992: when every service the run analysed is kept, the CI error
+/// says nothing was uploaded rather than that the others were.
+#[test]
+fn a_run_that_keeps_every_service_says_nothing_was_uploaded() {
+    let fixture = LateTypeLoss::of(&["beta"]);
+    typed_first_index(&fixture);
+    let stored = stored_blobs(&fixture.store);
+    fixture.change_both();
+
+    let run = fixture.scan(Some("heap"), false, &[]);
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
+    assert!(run.stderr.contains(KEPT_ALL_FOR_TYPES), "{}", run.stderr);
+    assert!(!run.stderr.contains("other services"), "{}", run.stderr);
+    assert_eq!(
+        serde_json::to_string_pretty(&stored_blobs(&fixture.store)["beta"]).unwrap(),
+        serde_json::to_string_pretty(&stored["beta"]).unwrap(),
+        "beta's typed index was replaced"
+    );
+}
+
+/// carrick#3992: the local indexer's facts-only pass (`CARRICK_NO_MODEL`,
+/// with the hosted previous generation handed in) is a laptop run: it keeps
+/// the typed service, says so in its log and exits 0.
+#[test]
+fn the_local_indexer_keeps_the_typed_service_and_exits_0() {
+    let fixture = LateTypeLoss::new();
+    typed_first_index(&fixture);
+    let stored = stored_blobs(&fixture.store);
+    let previous: Vec<serde_json::Value> = std::fs::read_dir(&fixture.store)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok())
+        .collect();
+    let previous_file = fixture.home.join("previous.json");
+    std::fs::write(&previous_file, serde_json::to_vec(&previous).unwrap()).unwrap();
+    fixture.change_both();
+
+    let previous_path = previous_file.to_string_lossy().to_string();
+    let run = fixture.scan(
+        Some("heap"),
+        false,
+        &[
+            ("CARRICK_NO_MODEL", "1"),
+            ("CARRICK_LOCAL_HOSTED_PREVIOUS", previous_path.as_str()),
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    assert!(run.log.contains(NOT_UPLOADING_BETA), "{}", run.log);
+    assert!(
+        !run.stderr.contains("Kept the stored index"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(
+        serde_json::to_string_pretty(&stored_blobs(&fixture.store)["beta"]).unwrap(),
+        serde_json::to_string_pretty(&stored["beta"]).unwrap(),
+        "beta's typed index was replaced"
+    );
 }
