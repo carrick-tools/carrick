@@ -2485,22 +2485,6 @@ fn record(
         _ => None,
     };
     let carried = site.payload_slot.as_ref().and_then(|binding| {
-        let (arg, key) = match binding {
-            SlotBinding::Written { arg, key } | SlotBinding::Unwritten { arg, key } => (*arg, key),
-            // No call writes the payload argument (carrick#4165): the call
-            // itself is the place.
-            SlotBinding::Absent => {
-                return Some(PayloadAt::Absent {
-                    at: AnchorAt {
-                        file: file.to_string(),
-                        line: call_line,
-                        span_start: site.span_start,
-                        span_end: site.span_end,
-                    },
-                });
-            }
-        };
-        let expr = parts.arg_exprs.get(arg)?;
         let parsed = sources.get(file)?;
         let at = |span: Span| AnchorAt {
             file: file.to_string(),
@@ -2509,16 +2493,27 @@ fn record(
             span_end: span.hi.0,
         };
         match binding {
-            SlotBinding::Written { .. } => {
-                payload_expr(expr, Some(key)).map(|span| PayloadAt::Value(at(span)))
+            SlotBinding::Written { arg, key } => {
+                payload_expr(parts.arg_exprs.get(*arg)?, Some(key))
+                    .map(|span| PayloadAt::Value(at(span)))
             }
-            SlotBinding::Unwritten { .. } => match expr {
-                Expr::Object(_) => Some(PayloadAt::Unwritten {
+            SlotBinding::Unwritten { arg, key } => match parts.arg_exprs.get(*arg)? {
+                expr @ Expr::Object(_) => Some(PayloadAt::Unwritten {
                     at: at(expr.span()),
                     key: key.clone(),
                 }),
                 _ => None,
             },
+            // No call writes the payload argument (carrick#4165): the call
+            // itself is the place.
+            SlotBinding::Absent => Some(PayloadAt::Absent {
+                at: AnchorAt {
+                    file: file.to_string(),
+                    line: call_line,
+                    span_start: site.span_start,
+                    span_end: site.span_end,
+                },
+            }),
         }
     });
     let handler = site.handler.clone().map(
