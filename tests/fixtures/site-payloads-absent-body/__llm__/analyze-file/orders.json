@@ -1,0 +1,123 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "target": "/orders/ping",
+      "method": "POST",
+      "pattern_matched": "http.post(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:10",
+      "line_number": 10,
+      "target": "/orders/1/bump",
+      "method": "POST",
+      "pattern_matched": "bump(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:13",
+      "line_number": 13,
+      "target": "/orders/defaulted",
+      "method": "POST",
+      "pattern_matched": "send(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "/orders/spread",
+      "method": "POST",
+      "pattern_matched": "http.post(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:17",
+      "line_number": 17,
+      "target": "/orders/1",
+      "method": "DELETE",
+      "pattern_matched": "http.remove(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "/orders/2",
+      "method": "DELETE",
+      "pattern_matched": "http.remove(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/orders/3",
+      "method": "DELETE",
+      "pattern_matched": "http.purge(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:23",
+      "line_number": 23,
+      "target": "/orders/null",
+      "method": "POST",
+      "pattern_matched": "http.post(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:25",
+      "line_number": 25,
+      "target": "/orders",
+      "method": "POST",
+      "pattern_matched": "http.post(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

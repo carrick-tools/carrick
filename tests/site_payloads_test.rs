@@ -219,6 +219,68 @@ fn a_caller_that_writes_no_body_through_a_wrapper_is_decided_no_body() {
     assert!(note_type.contains("text: string"), "request: {note_type}");
 }
 
+/// The root reasons the consumer request entry at `file:line` states.
+fn root_reasons(blob: &serde_json::Value, file: &str, line: u64) -> Vec<String> {
+    entry_at(blob, "request", file, line)["any_provenance"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["path"] == "")
+                .filter_map(|row| row["reason"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// carrick#4165: `tests/fixtures/site-payloads-absent-body/`. A call that
+/// writes nothing at the label's body argument, no call up to the row's
+/// writing one either, is decided "no body" by that fact, whatever its verb.
+/// The store labels `@fixture/http`'s `post` with body argument 1, `remove`
+/// with argument 1's `data` key, and `purge` with no body slot.
+///
+/// | line | call | the request |
+/// |---|---|---|
+/// | 7 | `http.post("/orders/ping")` | `no_request_body` |
+/// | 10 | `bump("1")`, whose `http.post` writes no body | `no_request_body` |
+/// | 13 | `send(...)`, whose body parameter has a default | not decided |
+/// | 15 | `http.post(..., ...rest)` | not decided |
+/// | 17 | `http.remove("/orders/1")` | `no_request_body` |
+/// | 19 | `http.remove(..., { headers: {} })` | `no_request_body` (the literal) |
+/// | 21 | `http.purge(...)`, no body slot | `not_located` |
+/// | 23 | `http.post(..., null)` | typed `null` |
+/// | 25 | `http.post("/orders", order)` | typed `Order` |
+#[test]
+fn a_call_that_writes_no_body_argument_is_decided_no_body() {
+    const FILE: &str = "src/orders.ts";
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-absent-body");
+    let on = scan(&repo, &[]);
+    let decided = vec!["no_request_body".to_string()];
+    for line in [7, 10, 17, 19] {
+        assert_eq!(root_reasons(&on, FILE, line), decided, "{FILE}:{line}");
+        let alias = alias_at(&on, "request", FILE, line);
+        let text = captured(&on, &alias);
+        assert_eq!(
+            text.trim_end_matches(';'),
+            "unknown",
+            "{FILE}:{line} {text}"
+        );
+    }
+    for line in [13, 15] {
+        let reasons = root_reasons(&on, FILE, line);
+        assert!(!reasons.contains(&decided[0]), "{FILE}:{line} {reasons:?}");
+    }
+    assert_eq!(
+        root_reasons(&on, FILE, 21),
+        vec!["not_located".to_string()],
+        "{FILE}:21"
+    );
+    let null = captured(&on, &alias_at(&on, "request", FILE, 23));
+    assert_eq!(null.trim_end_matches(';'), "null", "{null}");
+    let order = captured_block(&on, &alias_at(&on, "request", FILE, 25));
+    assert!(order.contains("sku: string"), "{order}");
+}
+
 /// carrick#2472 C3: a pub/sub payload a slot types is read there, not at the
 /// symbol the reader named.
 ///
