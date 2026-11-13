@@ -1479,7 +1479,7 @@ fn module_held() -> SiteRows {
             file: HELD_LINE.to_string(),
             line: LINE,
             span_start: 40,
-            module_calls: vec![(MODULE_CALLER.to_string(), LINE)],
+            fact_calls: vec![(MODULE_CALLER.to_string(), LINE)],
         }],
         ..SiteRows::default()
     }
@@ -1523,7 +1523,7 @@ fn a_module_callers_fact_withdraws_the_reader_row_at_the_request_line() {
             .contains(&(HELD_LINE.to_string(), LINE, key))
     );
     assert_eq!(
-        fold.stated_at_module_callers,
+        fold.stated_at_fact_callers,
         vec![(HELD_LINE.to_string(), 40)]
     );
     let graph = &data.mount_graph.as_ref().unwrap().data_calls;
@@ -1557,7 +1557,7 @@ fn a_module_caller_whose_fact_is_kept_out_keeps_the_request_line() {
         make,
     );
     assert_eq!(at_site(&calls, HELD_LINE).len(), 1);
-    assert!(fold.stated_at_module_callers.is_empty());
+    assert!(fold.stated_at_fact_callers.is_empty());
 }
 
 /// Two reader rows at the request line: no one of them is the request's,
@@ -1582,7 +1582,7 @@ fn two_reader_rows_at_the_request_line_keep_it() {
         make,
     );
     assert_eq!(at_site(&calls, HELD_LINE).len(), 2);
-    assert!(fold.stated_at_module_callers.is_empty());
+    assert!(fold.stated_at_fact_callers.is_empty());
 }
 
 // ---------------------------------------------------------------------------

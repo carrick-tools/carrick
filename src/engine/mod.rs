@@ -5291,8 +5291,8 @@ fn normalize_held_request_lines(
                 .iter()
                 .map(|(file, start, response)| (normalize(file), *start, *response))
                 .collect(),
-            module_calls: line
-                .module_calls
+            fact_calls: line
+                .fact_calls
                 .iter()
                 .map(|(file, at)| (normalize(file), *at))
                 .collect(),
@@ -5319,7 +5319,7 @@ fn settle_request_lines_stated_at_module_callers(
 ) -> HashMap<(String, u32), crate::agents::file_analyzer_agent::RequestLineAnchors> {
     use crate::agents::file_analyzer_agent::{RequestLineAnchors, ResolutionSource};
     let mut moved = HashMap::new();
-    for (file, span_start) in &fold.stated_at_module_callers {
+    for (file, span_start) in &fold.stated_at_fact_callers {
         let Some(line) = held
             .iter()
             .find(|line| line.file == *file && line.span_start == *span_start)
@@ -5351,7 +5351,7 @@ fn settle_request_lines_stated_at_module_callers(
                 }
             }
         }
-        for (caller_file, caller_line) in &line.module_calls {
+        for (caller_file, caller_line) in &line.fact_calls {
             moved.insert(
                 (caller_file.clone(), *caller_line),
                 RequestLineAnchors {
@@ -7768,8 +7768,8 @@ fn held_open_at_decided_sites(
 ) -> Vec<crate::site_rows::HeldOpen> {
     held.iter()
         .filter(|line| {
-            !line.module_calls.is_empty()
-                && line.module_calls.iter().all(|(file, at)| {
+            !line.fact_calls.is_empty()
+                && line.fact_calls.iter().all(|(file, at)| {
                     let here: Vec<&crate::request_summary::decided_sites::DecidedSite> = decided
                         .sites
                         .iter()
@@ -7785,7 +7785,7 @@ fn held_open_at_decided_sites(
             file: line.file.clone(),
             line: line.line,
             span_start: line.span_start,
-            module_calls: line.module_calls.clone(),
+            fact_calls: line.fact_calls.clone(),
         })
         .collect()
 }
@@ -9412,7 +9412,7 @@ fn append_deterministic_protocol_operations(
             withdrawn = site.withdrawn.len(),
             through = extractions.site.through.len(),
             through_folded = site.through_folded.len(),
-            stated_at_module_callers = site.stated_at_module_callers.len(),
+            stated_at_fact_callers = site.stated_at_fact_callers.len(),
             kept_out = ?site.kept_out,
             socket_disagrees = site.socket_disagrees,
             "site questions: fold"

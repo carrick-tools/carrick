@@ -680,11 +680,11 @@ impl RequestLineAnchors {
     }
 }
 
-/// A request line whose every caller is read, save direct calls made where a
-/// module is loaded (carrick#4121,
-/// [`crate::request_summary::RequestSummaryIndex::held_at_module`]). The
+/// A request line whose every caller is read, save calls the summaries state
+/// no row for (carrick#4121, carrick#4127,
+/// [`crate::request_summary::RequestSummaryIndex::held_at_fact_calls`]). The
 /// model's row there stays through the analysis: whether it goes is decided
-/// by the site fold, once it knows whether each module-level call's fact row
+/// by the site fold, once it knows whether each such call's fact row
 /// stands. Files are spelled as the analysis keys its results until the
 /// engine normalises them, once.
 #[derive(Debug, Clone)]
@@ -699,8 +699,8 @@ pub struct HeldRequestLine {
     /// start, each with whether its function hands back the request's own
     /// value ([`RequestLineAnchors::response`]).
     pub stating: Vec<(String, u32, bool)>,
-    /// The direct calls made where a module is loaded, by file and line.
-    pub module_calls: Vec<(String, u32)>,
+    /// The calls the summaries state no row for, by file and line.
+    pub fact_calls: Vec<(String, u32)>,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and

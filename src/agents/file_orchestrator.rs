@@ -4674,11 +4674,11 @@ impl FileOrchestrator {
         // keeps its model row here: whether those calls' fact rows stand is
         // known only at the site fold. Its summary callers pass the same
         // test as above now, so the fold need only ask about the facts.
-        let mut held_open: Vec<(String, u32, crate::request_summary::HeldAtModule)> = Vec::new();
+        let mut held_open: Vec<(String, u32, crate::request_summary::HeldAtFactCalls)> = Vec::new();
         let mut held_stating: HeldStating = HashMap::new();
         for (pf, _) in &analyzed {
             let file = PathBuf::from(&pf.path_str);
-            for (start, held) in summaries.held_at_module(&file) {
+            for (start, held) in summaries.held_at_fact_calls(&file) {
                 let callers = summaries.stating_callers(&(file.clone(), start));
                 let mut stating = Vec::new();
                 let mut each_one_row = true;
@@ -9059,7 +9059,7 @@ impl FileOrchestrator {
     /// the request's span has nothing the fold could withdraw, and is left
     /// out.
     fn held_request_lines(
-        held_open: Vec<(String, u32, crate::request_summary::HeldAtModule)>,
+        held_open: Vec<(String, u32, crate::request_summary::HeldAtFactCalls)>,
         mut stating: HeldStating,
         file_results: &HashMap<String, FileAnalysisResult>,
     ) -> Vec<HeldRequestLine> {
@@ -9077,8 +9077,8 @@ impl FileOrchestrator {
                 stating: stating
                     .remove(&(file.clone(), span_start))
                     .unwrap_or_default(),
-                module_calls: held
-                    .module_calls
+                fact_calls: held
+                    .fact_calls
                     .iter()
                     .map(|(at, line, _)| (at.to_string_lossy().into_owned(), *line))
                     .collect(),

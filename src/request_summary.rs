@@ -11059,39 +11059,39 @@ struct CallerLedger {
     open: HashSet<(PathBuf, u32)>,
     /// The functions some call this pass composed reaches.
     seen: HashSet<(PathBuf, String)>,
-    /// The functions some call this pass did not compose reaches: a call
-    /// in a constructor, an optional call, a call written inside a function
-    /// where a module is loaded, or one whose callee only the call graph
-    /// names.
+    /// The functions some call this pass did not compose reaches and that
+    /// has no call site of its own to check: a call through a parameter, or
+    /// one whose callee only the call graph names.
     unseen: HashSet<(PathBuf, String)>,
-    /// The direct calls made where a module is loaded, per function they
-    /// reach, as `(file, line, span start)` (carrick#4121). This pass states
-    /// no row for them; the fact layer may.
-    module_calls: HashMap<(PathBuf, String), ModuleCalls>,
+    /// The calls this pass states no row for (a call made where a module is
+    /// loaded, an optional call, a construction, a call in a constructor or
+    /// in a callback), per function they reach, as `(file, line, span
+    /// start)` (carrick#4121, carrick#4127). The fact layer may state a row
+    /// at each.
+    fact_calls: HashMap<(PathBuf, String), FactCalls>,
     /// The requests, by file and span start, whose every caller this pass
     /// read and stated ([`RequestSummaryIndex::answered_at_callers`]).
     closed: HashSet<(PathBuf, u32)>,
     /// The requests, by file and span start, whose every caller this pass
-    /// read or is a direct call made where a module is loaded, with at least
-    /// one such call ([`RequestSummaryIndex::held_at_module`]).
-    held: HashMap<(PathBuf, u32), HeldAtModule>,
+    /// read or is a call it states no row for, with at least one such call
+    /// ([`RequestSummaryIndex::held_at_fact_calls`]).
+    held: HashMap<(PathBuf, u32), HeldAtFactCalls>,
 }
 
 /// A request whose own line leaves the path open, and whose callers this
-/// pass read save the direct calls made where a module is loaded
-/// (carrick#4121): the fact layer may state those calls as rows of their
-/// own.
+/// pass read save the calls it states no row for (carrick#4121,
+/// carrick#4127): the fact layer may state those calls as rows of their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeldAtModule {
+pub struct HeldAtFactCalls {
     /// The request's own line.
     pub line: u32,
-    /// The module-level calls, as `(file, line, span start)`.
-    pub module_calls: ModuleCalls,
+    /// The calls the fact layer may state, as `(file, line, span start)`.
+    pub fact_calls: FactCalls,
 }
 
-/// Direct calls made where a module is loaded, as `(file, line, span
-/// start)` ([`HeldAtModule::module_calls`]).
-pub type ModuleCalls = BTreeSet<(PathBuf, u32, u32)>;
+/// Calls this pass states no row for, as `(file, line, span start)`
+/// ([`HeldAtFactCalls::fact_calls`]).
+pub type FactCalls = BTreeSet<(PathBuf, u32, u32)>;
 
 /// The calls the summaries' rows and stops were composed through (C11 T1,
 /// [`Summary::through`]).
@@ -11289,13 +11289,12 @@ impl RequestSummaryIndex {
 
     /// The requests written in `file`, by span start, that leave their path
     /// open and whose every caller this pass read and stated, save direct
-    /// calls made where a module is loaded, of which there is at least one
-    /// (carrick#4121). This pass states no row for those calls: whether the
-    /// request line's row goes is the site fold's to decide, once it knows
-    /// whether a fact row stands at each. A row stated at the request's own
-    /// line by any other source keeps it out, as in
-    /// [`Self::answered_at_callers`].
-    pub fn held_at_module(&self, file: &Path) -> BTreeMap<u32, HeldAtModule> {
+    /// calls this pass states no row for, of which there is at least one
+    /// (carrick#4121, carrick#4127). Whether the request line's row goes is
+    /// the site fold's to decide, once it knows whether a fact row stands at
+    /// each call. A row stated at the request's own line by any other source
+    /// keeps it out, as in [`Self::answered_at_callers`].
+    pub fn held_at_fact_calls(&self, file: &Path) -> BTreeMap<u32, HeldAtFactCalls> {
         self.ledger
             .held
             .iter()
@@ -11851,9 +11850,10 @@ fn closed_at_callers(
     let files = composer.files;
     for path in paths {
         let file = &files[*path];
-        // A direct call made where the module is loaded is one the fact
-        // layer may state a row for (carrick#4121): it is named, not unseen.
-        // Everything else written there stays out of this pass's sight.
+        // A call this pass states no row for is one the fact layer may
+        // state a row for (carrick#4121, carrick#4127): it is named with its
+        // call site, not unseen. Only a call through a parameter, which has
+        // no call site of its own, stays unseen.
         let module_level = &file.module_level;
         for call in &module_level.calls {
             let Some(target) = composer.target(path, call) else {
@@ -11862,7 +11862,7 @@ fn closed_at_callers(
             if call.invokes_param.is_some() {
                 ledger.unseen.insert(target);
             } else {
-                ledger.module_calls.entry(target).or_default().insert((
+                ledger.fact_calls.entry(target).or_default().insert((
                     (*path).clone(),
                     call.site.line,
                     call.site.span_start,
@@ -11930,42 +11930,42 @@ fn closed_at_callers(
         }
     }
     // A request no caller closed without a row, held open only by functions
-    // whose every call is one this pass composed, or a direct call made where
-    // a module is loaded (carrick#4121).
+    // whose every call is one this pass composed, or a call it states no row
+    // for (carrick#4121, carrick#4127).
     let readable = |at: &(PathBuf, u32), held: &[(PathBuf, String)]| {
         written_in.contains(at)
             && !ledger.stops.contains(at)
             && !ledger.open.contains(at)
             && held.iter().all(|holder| {
-                (ledger.seen.contains(holder) || ledger.module_calls.contains_key(holder))
+                (ledger.seen.contains(holder) || ledger.fact_calls.contains_key(holder))
                     && !ledger.unseen.contains(holder)
             })
     };
     let mut closed = HashSet::new();
-    let mut held_at_module = HashMap::new();
+    let mut held_at_fact_calls = HashMap::new();
     for (at, held) in &holders {
         if !readable(at, held) {
             continue;
         }
-        let module_calls: BTreeSet<(PathBuf, u32, u32)> = held
+        let fact_calls: FactCalls = held
             .iter()
-            .filter_map(|holder| ledger.module_calls.get(holder))
+            .filter_map(|holder| ledger.fact_calls.get(holder))
             .flatten()
             .cloned()
             .collect();
-        if module_calls.is_empty() {
+        if fact_calls.is_empty() {
             closed.insert(at.clone());
         } else {
-            held_at_module.insert(
+            held_at_fact_calls.insert(
                 at.clone(),
-                HeldAtModule {
+                HeldAtFactCalls {
                     line: lines.get(at).copied().unwrap_or_default(),
-                    module_calls,
+                    fact_calls,
                 },
             );
         }
     }
-    ledger.held = held_at_module;
+    ledger.held = held_at_fact_calls;
     closed
 }
 
@@ -15144,7 +15144,7 @@ function build() { return {}; }
             .ledger
             .seen
             .iter()
-            .chain(index.ledger.module_calls.keys())
+            .chain(index.ledger.fact_calls.keys())
             .map(|(path, _)| path.clone())
             .chain(index.ledger.held.keys().map(|(path, _)| path.clone()))
             .find(|path| path.ends_with(file))
@@ -15172,12 +15172,12 @@ function build() { return {}; }
         ]);
         let notify = key_of(&index, "src/net/notify.ts");
         assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
-        let held = index.held_at_module(&notify);
+        let held = index.held_at_fact_calls(&notify);
         assert_eq!(held.len(), 1, "{held:?}");
         let (_, at) = held.iter().next().unwrap();
         assert_eq!(at.line, 2);
         let calls: Vec<(String, u32)> = at
-            .module_calls
+            .fact_calls
             .iter()
             .map(|(file, line, _)| (file.to_string_lossy().into_owned(), *line))
             .collect();
@@ -15203,7 +15203,7 @@ function build() { return {}; }
             ),
         ]);
         let notify = key_of(&index, "src/net/notify.ts");
-        assert_eq!(index.held_at_module(&notify), BTreeMap::new());
+        assert_eq!(index.held_at_fact_calls(&notify), BTreeMap::new());
         assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
     }
 }

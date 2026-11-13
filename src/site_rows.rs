@@ -246,9 +246,10 @@ pub struct HeldOpen {
     pub file: String,
     pub line: u32,
     pub span_start: u32,
-    /// The module-level calls, by repo-relative file and line: each holds
-    /// exactly one decided HTTP site, which ends at this request.
-    pub module_calls: Vec<(String, u32)>,
+    /// The calls the summaries state no row for, by repo-relative file and
+    /// line: each holds exactly one decided HTTP site, which ends at this
+    /// request.
+    pub fact_calls: Vec<(String, u32)>,
 }
 
 /// A route the receiver trace serves at a full path it composed from the
@@ -1263,11 +1264,11 @@ pub struct SiteFold {
     /// is not here: the graph keeps the reader's row beside the candidate.
     pub replaced_by_fact: Vec<(String, u32, OperationKey)>,
     /// The request lines ([`SiteRows::held_open`]) whose reader row went
-    /// because a fact row stands at each of their module-level calls
-    /// (carrick#4121), as `(file, span start)`. The engine drops the model's
-    /// row there from the file results and moves its request type to the
-    /// callers.
-    pub stated_at_module_callers: Vec<(String, u32)>,
+    /// because a fact row stands at each of their calls the summaries state
+    /// no row for (carrick#4121, carrick#4127), as `(file, span start)`. The
+    /// engine drops the model's row there from the file results and moves
+    /// its request type to the callers.
+    pub stated_at_fact_callers: Vec<(String, u32)>,
     /// Fact site rows kept out of their site by a row already there, by the
     /// resolution source of the row that kept it (`socket_call`,
     /// `event_bus`, `library_claim`, ...). The measure of how much a frozen
@@ -1720,8 +1721,8 @@ pub fn fold_rows(
     // keeps it. Decided over every line first, then removed.
     let mut stated_at_module: Vec<(usize, &HeldOpen)> = Vec::new();
     for held in &site.held_open {
-        let facts_stand = !held.module_calls.is_empty()
-            && held.module_calls.iter().all(|(file, line)| {
+        let facts_stand = !held.fact_calls.is_empty()
+            && held.fact_calls.iter().all(|(file, line)| {
                 let here: Vec<&ApiEndpointDetails> =
                     calls.iter().filter(|row| at(row, file, *line)).collect();
                 matches!(here.as_slice(), [row] if is_fact(row)
@@ -1754,7 +1755,7 @@ pub fn fold_rows(
             .push((held.file.clone(), held.line, gone.key.clone()));
         out.withdrawn
             .push((held.file.clone(), held.line, gone.key, RowSide::Call));
-        out.stated_at_module_callers
+        out.stated_at_fact_callers
             .push((held.file.clone(), held.span_start));
     }
     // An unread site at a line a row stands at once the fold is done, of
