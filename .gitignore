@@ -57,6 +57,11 @@ target/
 !tests/fixtures/library-store/node_modules/fixture-private-bus/
 !tests/fixtures/library-store/node_modules/fixture-private-bus/package.json
 !tests/fixtures/library-store/node_modules/fixture-private-bus/index.d.ts
+!tests/fixtures/nonhttp-source-labels/node_modules/
+!tests/fixtures/nonhttp-source-labels/node_modules/@fixture/
+!tests/fixtures/nonhttp-source-labels/node_modules/@fixture/broker/
+!tests/fixtures/nonhttp-source-labels/node_modules/@fixture/broker/package.json
+!tests/fixtures/nonhttp-source-labels/node_modules/@fixture/broker/index.d.ts
 !tests/fixtures/decided-sites/node_modules/
 !tests/fixtures/decided-sites/node_modules/@fixture/
 !tests/fixtures/decided-sites/node_modules/@fixture/wire/

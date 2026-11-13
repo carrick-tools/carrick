@@ -503,7 +503,7 @@ function listItems() {
 
     fn id_at(text: &str, line: usize) -> String {
         SwcScanner::new()
-            .scan_content(Path::new("routes.ts"), text, &[], &[])
+            .scan_content(Path::new("routes.ts"), text, &[])
             .candidates
             .iter()
             .find(|c| c.line_number == line)
@@ -786,22 +786,17 @@ export async function run() {
 }
 ";
 
-    /// A model row on an import-gated messaging subscribe is carried with no
-    /// detection list: the carry places the row by the calls in the file, not
-    /// by re-running the scanner behind the lists (N24).
+    /// A model row on a messaging subscribe is carried with no detection
+    /// list: the carry places the row by the calls in the file, not by
+    /// re-running the scanner behind the lists (N24).
     #[test]
     fn a_messaging_subscribe_row_is_carried_without_detection_lists() {
         let id = SwcScanner::new()
-            .scan_content(
-                Path::new("consumer.ts"),
-                SUBSCRIBE,
-                &[],
-                &["kafkajs".to_string()],
-            )
+            .scan_every_call(Path::new("consumer.ts"), SUBSCRIBE)
             .candidates
             .iter()
             .find(|c| c.callee_property.as_deref() == Some("subscribe"))
-            .expect("the gated scan raises the subscribe")
+            .expect("every call is a candidate, the subscribe among them")
             .candidate_id
             .clone();
         let answer: FileAnalysisResult = serde_json::from_value(json!({

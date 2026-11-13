@@ -46,7 +46,7 @@ fn line_of(file: &str, needle: &str) -> usize {
 /// The id the scanner gives the call that starts on `line`, as the model
 /// would echo it.
 fn candidate_at(file: &str, line: usize) -> String {
-    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[], &[]);
+    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[]);
     scanned
         .candidates
         .iter()
@@ -687,7 +687,7 @@ type Case<'a> = (&'a str, &'a str, &'a str);
 /// case)`.
 fn reports(rows: &[(&str, usize, &str, &str, Option<Case>)]) -> (String, FileAnalysisResult) {
     let file = "src/reports.ts";
-    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[], &[]);
+    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[]);
     let endpoints: Vec<serde_json::Value> = rows
         .iter()
         .map(|(needle, nth, method, path, case)| {

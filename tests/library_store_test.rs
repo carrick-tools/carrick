@@ -306,12 +306,12 @@ fn rows_with_claims() -> (Vec<Row>, Vec<Row>) {
 }
 
 /// What the scan states with no claims: the socket pass's rows, each of
-/// unknown direction, and the subscriber the model reported and the scanner backfilled (no source), which the
-/// library row folds when there is one.
+/// unknown direction. The bus subscriber in `src/emails.ts` states nothing
+/// without a store answer: no detection list raises it, so only the library
+/// row states it (carrick blueprint row N1).
 fn rows_without_claims() -> (Vec<Row>, Vec<Row>) {
     (
         vec![
-            row("pubsub|orders.created", "src/emails.ts:3", None, &[]),
             row("socket|UNKNOWN|chat", "src/live.ts:5", SOCKET_CALL, &[]),
             row(
                 "socket|UNKNOWN|presence",
