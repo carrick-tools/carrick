@@ -1022,6 +1022,11 @@ pub struct ClaimSlot {
     pub document: Option<ClaimDocument>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub reference: Option<ClaimRef>,
+    /// On a scope's `mounts` only (carrick#2434, K1): the slot takes a
+    /// handler (a middleware), which the verifier judges by the handler
+    /// rule rather than the instance rule. `false` is no flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handle: bool,
 }
 
 impl ClaimSlot {
@@ -1389,8 +1394,10 @@ pub enum LibraryClaim {
     },
     /// `member(name)` (after `path`) returns a receiver bound to that name.
     /// A procedure router's member (`collects`, #2474 R6a) has no name: a
-    /// scope carries exactly one of `name`, `collects` and `merges`, and the
-    /// store reader drops one with none.
+    /// scope carries exactly one of `name`, `collects`, `merges` and
+    /// `passes`, or none of them when it binds (`mounts`, or `runs` with
+    /// `yields`: served at its parent's address, K1); the store reader
+    /// drops one that does neither.
     Scope {
         member: String,
         /// Amendment 7: absent is `call`.
@@ -1431,6 +1438,13 @@ pub enum LibraryClaim {
         /// exactly one of `name`, `collects` and `merges`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         merges: Option<ClaimSlot>,
+        /// A pass-through (carrick#2434, K1): the call's value is the
+        /// receiver itself, served at the receiver's own address
+        /// (`router.routes()`). It stands alone: no `name`, `collects`,
+        /// `merges`, `runs`, `yields` or `mounts` beside it. `false` is no
+        /// flag.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        passes: bool,
     },
     /// A member that acts on the wire; `member: None` is the object `path`
     /// reaches (the receiver itself when `path` is empty).
@@ -6587,6 +6601,7 @@ mod tests {
                         mounts: Some(slot()),
                         collects: None,
                         merges: None,
+                        passes: false,
                     }),
                     // Procedure routers (#2474 R6a): a router member with no
                     // name, and an op named by its key.
@@ -6609,6 +6624,7 @@ mod tests {
                             join: ".".into(),
                         }),
                         merges: None,
+                        passes: false,
                     }),
                     library(LibraryClaim::Op {
                         form: None,
@@ -7342,6 +7358,7 @@ mod tests {
                         mounts: None,
                         collects: None,
                         merges: None,
+                        passes: false,
                     },
                 ),
                 check(

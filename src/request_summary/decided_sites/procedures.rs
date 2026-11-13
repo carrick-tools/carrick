@@ -1071,8 +1071,8 @@ impl Pass<'_, '_> {
         let Some(placed) = self.calls.at_span(file, end.span_start, end.span_end) else {
             return vec![Err(MOUNT_UNREAD)];
         };
-        if let Some(prefix) = &adapter.prefix {
-            match walk().prefix_of(&placed, prefix, None) {
+        if adapter.prefix.is_some() {
+            match walk().prefix_of(&placed, &adapter.prefix, None) {
                 Prefix::Stated { values } => return values.into_iter().map(Ok).collect(),
                 Prefix::Unread { .. } => return vec![Err(MOUNT_UNREAD)],
                 Prefix::Unstated => {}
@@ -1084,15 +1084,20 @@ impl Pass<'_, '_> {
         let Some(host) = self.calls.at_span(file, host_lo, host_hi) else {
             return vec![Err(MOUNT_UNREAD)];
         };
-        // A verified mount member, at the slot it mounts.
-        let mount_labels: Vec<&ScopeLabel> = self
-            .scopes
-            .iter()
-            .filter(|label| {
-                label.member == host.call.callee
-                    && matches!(&label.binds, ScopeBinds::Mounts { arg: at, key: None } if *at == arg)
-            })
-            .collect();
+        // A verified mount member, at the slot it mounts: an instance mount
+        // or a handle mount (K1), one label per slot where both twins are
+        // stored.
+        let mut mount_labels: Vec<&ScopeLabel> = Vec::new();
+        for label in self.scopes.iter().filter(|label| {
+            label.member == host.call.callee
+                && matches!(&label.binds, ScopeBinds::Mounts { arg: at, key: None, .. } if *at == arg)
+        }) {
+            if !mount_labels.iter().any(|known| known.twin_of(label))
+                && (label.name.is_some() || walk().name_less_stands(host))
+            {
+                mount_labels.push(label);
+            }
+        }
         if !mount_labels.is_empty() && walk().library_call(file, host.call) {
             let receivers = walk().of(&[host]);
             let mut out: Vec<Result<String, Unmounted>> = Vec::new();

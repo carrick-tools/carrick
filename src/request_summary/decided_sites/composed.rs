@@ -21,7 +21,8 @@ use super::super::RequestSummaryInputs;
 use super::super::stop::Stop;
 use super::boundaries::{Above, Boundary, End, Part};
 use super::instances::{
-    InstanceAt, InstanceEnd, InstanceWalk, MakerLabel, Prefix, ScopeBinds, ScopeLabel, WalkIndex,
+    InstanceAt, InstanceEnd, InstanceWalk, MakerCall, MakerLabel, Prefix, ScopeBinds, ScopeLabel,
+    WalkIndex,
 };
 use super::{Calls, Placed, relative};
 use crate::address;
@@ -112,12 +113,33 @@ fn part(kind: address::PartKind, at: &str, member: &str, value: &address::Value)
     }
 }
 
+/// A labelled maker call: its file, line and span start. Two instances
+/// made on one line are two (carrick#3955): keyed by line alone, an app
+/// mounting a router made beside it would mount itself.
+type MakerAt = (String, u32, u32);
+
+/// The maker call `end` ends at, where it is a root.
+fn maker_at(end: &InstanceAt) -> Option<MakerAt> {
+    match end {
+        InstanceAt::Root {
+            file, line, made, ..
+        } => Some(maker_key(file, *line, made.as_ref())),
+        _ => None,
+    }
+}
+
+/// The maker call at `file:line`, told apart from another on the line by
+/// its span where the walk read it.
+fn maker_key(file: &str, line: u32, made: Option<&MakerCall>) -> MakerAt {
+    (file.to_string(), line, made.map_or(0, |made| made.span.0))
+}
+
 /// An instance served under a prefix: a call of a member labelled with
 /// `mounts`, handed a labelled maker's result.
 #[derive(Debug, Clone)]
 pub(super) struct MountEdge {
-    /// The maker call of the instance handed in (`file`, `line`).
-    child: (String, u32),
+    /// The maker call of the instance handed in.
+    child: MakerAt,
     /// The mount call, `file:line`.
     at: String,
     member: String,
@@ -136,12 +158,12 @@ pub(super) struct MountEdge {
 pub(super) struct Mounts {
     /// Every verified mount edge.
     edges: Vec<MountEdge>,
-    /// The maker calls (`file`, `line`) whose result is handed to a member
+    /// The maker calls whose result is handed to a member
     /// call of an instance of the same package that no verified edge
     /// reads: a `mounts` claim that did not verify, a member no label
     /// names, or an argument the label does not name. Such an instance is
     /// served somewhere the trace cannot say, so it is not "the top".
-    unverified: Vec<(String, u32)>,
+    unverified: Vec<MakerAt>,
     /// The mount calls (`file:line`) the trace ignores because a file only
     /// tests import makes them (carrick#2775): a helper that builds its own
     /// app for the suite serves nothing in production. Each would have been
@@ -159,10 +181,23 @@ pub(super) fn mount_edges<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
 ) -> Mounts {
-    let (edges, mut test_only) = verified_edges(calls, inputs, root, makers, scopes, index);
-    let (unverified, ignored) =
+    let (edges, mut test_only, guarded) =
+        verified_edges(calls, inputs, root, makers, scopes, index);
+    let (mut unverified, ignored) =
         unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
     test_only.extend(ignored);
+    // What the path guard refused is a mount the trace cannot place, of
+    // whatever package (K1 ruling): never the top, never the parent's
+    // address. A test-only file's call counts only where nothing else
+    // serves the instance (carrick#2775).
+    for (at, child, in_test_only) in guarded {
+        let read = edges.iter().any(|edge| {
+            edge.child == child && (edge.at == at || in_test_only && !edge.in_test_only)
+        });
+        if !read && !unverified.contains(&child) {
+            unverified.push(child);
+        }
+    }
     test_only.sort();
     test_only.dedup();
     Mounts {
@@ -184,7 +219,7 @@ fn unverified_roots<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
     edges: &[MountEdge],
-) -> (Vec<(String, u32)>, Vec<String>) {
+) -> (Vec<MakerAt>, Vec<String>) {
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
         .values()
@@ -199,9 +234,9 @@ fn unverified_roots<'a>(
         ))
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
-    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut out: Vec<MakerAt> = Vec::new();
     let mut test_only: Vec<String> = Vec::new();
-    let mut held: Vec<(String, (String, u32))> = Vec::new();
+    let mut held: Vec<(String, MakerAt)> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
@@ -222,16 +257,11 @@ fn unverified_roots<'a>(
         let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
         for arg in 0..placed.call.args.len().max(placed.call.instance.args.len()) {
             for child in walk().of_arg(placed, arg, None) {
-                let InstanceAt::Root {
-                    file,
-                    line,
-                    package,
-                    ..
-                } = &child.end
+                let (InstanceAt::Root { package, .. }, Some(here)) =
+                    (&child.end, maker_at(&child.end))
                 else {
                     continue;
                 };
-                let here = (file.clone(), *line);
                 let read = edges.iter().any(|edge| edge.child == here && edge.at == at);
                 if !packages.contains(&package.as_str()) || read {
                     continue;
@@ -272,14 +302,15 @@ fn verified_edges<'a>(
     makers: &[MakerLabel],
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
-) -> (Vec<MountEdge>, Vec<String>) {
+) -> (Vec<MountEdge>, Vec<String>, Vec<Guarded>) {
     let mounts: Vec<&ScopeLabel> = scopes
         .iter()
         .filter(|label| matches!(label.binds, ScopeBinds::Mounts { .. }))
         .collect();
     if mounts.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
+    let mut guarded: Vec<Guarded> = Vec::new();
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
         .values()
@@ -298,34 +329,66 @@ fn verified_edges<'a>(
         ))
     });
     let walk = || InstanceWalk::new(calls, inputs, root, makers, scopes, index);
-    let mut edges = Vec::new();
+    let mut edges: Vec<MountEdge> = Vec::new();
     for placed in placed {
         if !walk().library_call(placed.file, placed.call) {
             continue;
         }
         let receivers = walk().of(&[placed]);
-        let here: Vec<&ScopeLabel> = mounts
+        // A handle claim first: where it and its instance-rule twin both
+        // verified, its reading stands (K1).
+        let mut here: Vec<&ScopeLabel> = mounts
             .iter()
             .copied()
             .filter(|label| label.member == placed.call.callee)
             .collect();
+        here.sort_by_key(|label| !matches!(label.binds, ScopeBinds::Mounts { handle: true, .. }));
         let applying = walk().applying(&placed, &here, &receivers);
+        let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
+        // One edge per (call, slot, instance) for a claim and its handle
+        // twin (K1): the twin's parents join the edge already made.
+        let mut made: Vec<(&ScopeLabel, usize)> = Vec::new();
         for (label, parents) in here.into_iter().zip(applying) {
-            let ScopeBinds::Mounts { arg, key } = &label.binds else {
+            let ScopeBinds::Mounts { arg, key, .. } = &label.binds else {
                 continue;
             };
             if parents.is_empty() {
                 continue;
             }
-            for child in walk().of_arg(placed, *arg, key.as_deref()) {
-                let InstanceAt::Root { file, line, .. } = &child.end else {
+            let roots = || {
+                walk()
+                    .of_arg(placed, *arg, key.as_deref())
+                    .into_iter()
+                    .filter_map(|child| maker_at(&child.end))
+            };
+            // A name-less mount past a value that could be a path never
+            // serves at the parent's address (K1 ruling): what it is handed
+            // is a mount the trace cannot place.
+            if label.name.is_none() && !walk().name_less_stands(placed) {
+                guarded.extend(
+                    roots()
+                        .map(|child| (at.clone(), child, inputs.test_only.contains(placed.file))),
+                );
+                continue;
+            }
+            for child in roots() {
+                let twin = made
+                    .iter()
+                    .find(|(known, index)| known.twin_of(label) && edges[*index].child == child);
+                if let Some((_, index)) = twin {
+                    let edge: &mut MountEdge = &mut edges[*index];
+                    for parent in &parents {
+                        if !edge.parents.contains(parent) {
+                            edge.parents.push(parent.clone());
+                        }
+                    }
                     continue;
-                };
-                let at = format!("{}:{}", relative(root, placed.file), placed.call.site.line);
+                }
+                made.push((label, edges.len()));
                 let prefix = walk().prefix_of(&placed, &label.name, None);
                 edges.push(MountEdge {
-                    child: (file.clone(), *line),
-                    at,
+                    child,
+                    at: at.clone(),
                     member: label.member.clone(),
                     value: walk().value_of(&placed, &label.name, &prefix),
                     prefix,
@@ -338,7 +401,7 @@ fn verified_edges<'a>(
     // A mount a test-only file makes is dropped when a file that is not
     // test-only also hands the same instance; an entry only a test imports
     // is its instance's only mount and stays.
-    let served: Vec<(String, u32)> = edges
+    let served: Vec<MakerAt> = edges
         .iter()
         .filter(|edge| !edge.in_test_only)
         .map(|edge| edge.child.clone())
@@ -351,8 +414,13 @@ fn verified_edges<'a>(
         }
         !drop
     });
-    (edges, test_only)
+    (edges, test_only, guarded)
 }
+
+/// A maker call handed to a name-less mount at a call
+/// (`file:line`) the path guard refused (K1 ruling), and whether a file
+/// only tests import makes the call.
+type Guarded = (String, MakerAt, bool);
 
 /// One walk from an instance end up to the top: the prefixes and edges
 /// from the top down, and where it ends.
@@ -416,7 +484,7 @@ impl Budget {
 fn chains(
     end: &InstanceEnd,
     mounts: &Mounts,
-    seen: &mut Vec<(String, u32)>,
+    seen: &mut Vec<MakerAt>,
     budget: &mut Budget,
 ) -> Vec<Chain> {
     if budget.left == 0 {
@@ -447,8 +515,10 @@ fn chains(
             boundary.clone(),
             budget,
         ),
-        InstanceAt::Root { file, line, .. } => {
-            let here = (file.clone(), *line);
+        InstanceAt::Root {
+            file, line, made, ..
+        } => {
+            let here = maker_key(file, *line, made.as_ref());
             if seen.contains(&here) {
                 return ended(Stop::Recursion.as_str().to_string(), None, budget);
             }
