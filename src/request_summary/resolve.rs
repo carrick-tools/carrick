@@ -3824,6 +3824,7 @@ impl<'a> Resolver<'a> {
                                         invoke,
                                         &mut Vec::new(),
                                         &mut unfilled,
+                                        &mut false,
                                     );
                                     note_unfilled(&mut unfilled, before, spread, &held);
                                     out.extend(held);
@@ -3954,13 +3955,18 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
     ) -> Vec<Held<F::Reached>> {
-        self.callers_pass_noting(follow, at, param, invoke, passing, &mut 0)
+        self.callers_pass_noting(follow, at, param, invoke, passing, &mut 0, &mut false)
     }
 
     /// [`Self::callers_pass`], counting in `unfilled` the callers' writes
     /// read through a spread of a parameter whose own callers held nothing
     /// ([`unread_where_spread_unfilled`]), for the caller that sees every
-    /// value the key may hold to decide.
+    /// value the key may hold to decide. `handed` is set where a definition
+    /// on the way has no caller and holds nothing there, but is handed on
+    /// as a value to a function of the service
+    /// ([`super::decided_sites::Calls::handed_inward`], carrick#4025): the
+    /// call that runs it may write the parameter.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn callers_pass_noting<F: Follow<'a>>(
         &self,
         follow: &mut F,
@@ -3969,6 +3975,7 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
         unfilled: &mut usize,
+        handed: &mut bool,
     ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let (file, key, depth) = at;
@@ -3993,7 +4000,9 @@ impl<'a> Resolver<'a> {
         let mut values = Vec::new();
         if callers.is_empty() {
             // Nothing calls it: what it holds is its default, if any.
-            values.extend(self.passed(follow, None, index, keys, callee, invoke));
+            let defaulted = self.passed(follow, None, index, keys, callee, invoke);
+            *handed |= defaulted.is_empty() && self.callers().handed_inward(file, key);
+            values.extend(defaulted);
         }
         for caller in callers {
             let at = Invoke {
@@ -4016,6 +4025,7 @@ impl<'a> Resolver<'a> {
                             invoke,
                             passing,
                             unfilled,
+                            handed,
                         );
                         note_unfilled(unfilled, before, spread, &held);
                         values.extend(held);

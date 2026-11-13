@@ -3438,6 +3438,7 @@ impl<'a> Walker<'a> {
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
             let mut unfilled = 0;
+            let mut handed = false;
             for (out, index, keys) in &open.refs {
                 let before = unfilled;
                 let held = resolver.callers_pass_noting(
@@ -3447,6 +3448,7 @@ impl<'a> Walker<'a> {
                     open.invoke,
                     &mut Vec::new(),
                     &mut unfilled,
+                    &mut handed,
                 );
                 note_unfilled(&mut unfilled, before, open.spread, &held);
                 values.extend(held);
@@ -3455,6 +3457,19 @@ impl<'a> Walker<'a> {
             // not fill, and nothing else held: each write keeps the reading
             // it had before ruling R-SP (carrick#4025).
             unread_where_spread_unfilled(&mut values, unfilled);
+            // Nothing held, and a function on the way is handed on as a
+            // value to a function of the service: the call that runs it is
+            // not read, and may bind the callee (carrick#4025). Nothing binds
+            // it is no answer. The callee's values decide it, so it is kept
+            // among the sites, as `value_never_bound` was.
+            if values.is_empty() && handed {
+                let stopped = Outcome {
+                    valued: true,
+                    ..Outcome::stopped(Stop::CallbackIntoOwnFunction)
+                };
+                outcome.absorb(stopped.below(&open.chain));
+                continue;
+            }
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
         }
@@ -4380,6 +4395,49 @@ mod tests {
             assert_eq!(
                 stops, twin,
                 "gates.ts:{line} keeps the twin's reason, not value_never_bound\n{all}"
+            );
+        }
+    }
+
+    /// carrick#4025: a callee read from a parameter of a function that is
+    /// run only through a value (`{ g: gate }` handed on, run as
+    /// `deps.g(args)`) is saved, and never as `value_never_bound`: the call
+    /// that runs the function writes the parameter, though no call names
+    /// the function. Same module and across modules. The answer key is
+    /// `tests/fixtures/value-run-param/README.md`.
+    #[test]
+    fn a_callee_read_from_a_parameter_of_a_function_run_only_through_a_value_is_never_value_never_bound()
+     {
+        let Some(on) = walked("value-run-param", "", "", &[], true) else {
+            return;
+        };
+        let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let all = format!("{:?} {:?}", discovery.sites, discovery.unfollowed);
+        for (file, line) in [("src/local.ts", 8), ("src/gates.ts", 7)] {
+            let stops: Vec<Option<Stop>> = discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| site.stop)
+                .collect();
+            assert!(
+                !stops.is_empty() && !stops.contains(&Some(Stop::ValueNeverBound)),
+                "{file}:{line} is saved with a reason other than value_never_bound: \
+                 {stops:?}\n{all}"
+            );
+            // Kept among the sites, as `value_never_bound` was, with the
+            // handoff as its reason.
+            let kept: Vec<Option<Stop>> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| site.stop)
+                .collect();
+            assert_eq!(
+                kept,
+                vec![Some(Stop::CallbackIntoOwnFunction)],
+                "{file}:{line} is a site stopped as callback_into_own_function\n{all}"
             );
         }
     }
