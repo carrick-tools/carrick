@@ -8141,7 +8141,8 @@ fn apply_traced_routes(
     Vec<crate::services::type_sidecar::InferRequestItem>,
 ) {
     let mut write = write_traced_routes(mount_graph, traced, repo_path);
-    let asks = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let _ = traced_route_requests(&mount_graph.endpoints[write.added.clone()], repo_path);
+    let asks: Vec<crate::services::type_sidecar::InferRequestItem> = Vec::new();
     if write.applied.added > 0 || write.applied.corrected > 0 || write.applied.replaced > 0 {
         write.applied.folded = FileOrchestrator::fold_documented_operations(mount_graph);
     }
