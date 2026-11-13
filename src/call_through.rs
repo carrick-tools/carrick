@@ -180,6 +180,9 @@ pub struct RowCall {
     /// model's path is read off the call's own file, not off a method's
     /// name.
     pub passes_written_url: bool,
+    /// The path segments the call's own string and template arguments write
+    /// (`swap("orders.swap", list)`: `orders.swap`).
+    pub argument_segments: HashSet<String>,
 }
 
 impl CallThroughSites {
@@ -811,12 +814,41 @@ struct WrittenSegments<'a> {
 impl WrittenSegments<'_> {
     fn add(&mut self, span: Span, text: &str) {
         let line = self.positions.extent(span).line;
-        self.at.extend(
-            text.split(|c: char| matches!(c, '/' | '?' | '#' | '&' | '=') || c.is_whitespace())
-                .filter(|segment| !segment.is_empty())
-                .map(|segment| (line, segment.to_ascii_lowercase())),
-        );
+        self.at
+            .extend(path_segments(text).map(|segment| (line, segment)));
     }
+}
+
+/// The path segments a string writes, lowercased: `/v1/shelves/stats?shelf=`
+/// writes `v1`, `shelves`, `stats` and `shelf`.
+fn path_segments(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| matches!(c, '/' | '?' | '#' | '&' | '=') || c.is_whitespace())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// The path segments the string and template arguments of a call write
+/// themselves (`swap("orders.swap", list)` writes `orders.swap`); a
+/// template's interpolations write nothing.
+fn argument_segments(args: &[ExprOrSpread]) -> HashSet<String> {
+    let mut segments = HashSet::new();
+    for arg in args.iter().filter(|arg| arg.spread.is_none()) {
+        match unwrap_expression(&arg.expr) {
+            Expr::Lit(swc_ecma_ast::Lit::Str(text)) => {
+                segments.extend(path_segments(&text.value.to_string_lossy()));
+            }
+            Expr::Tpl(template) => {
+                for quasi in &template.quasis {
+                    match &quasi.cooked {
+                        Some(cooked) => segments.extend(path_segments(&cooked.to_string_lossy())),
+                        None => segments.extend(path_segments(&quasi.raw)),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    segments
 }
 
 impl Visit for WrittenSegments<'_> {
@@ -1025,6 +1057,7 @@ fn read_file_sites(
                 span_end: extent.hi,
                 callee: site.callee.clone(),
                 passes_written_url: site.passes_written_url,
+                argument_segments: site.argument_segments.clone(),
             },
         ));
     }
@@ -1295,6 +1328,8 @@ struct SiteReading {
     /// An argument is a binding whose value writes a route or a URL
     /// ([`RowCall::passes_written_url`]).
     passes_written_url: bool,
+    /// [`RowCall::argument_segments`].
+    argument_segments: HashSet<String>,
 }
 
 struct SiteReader<'a> {
@@ -1328,6 +1363,7 @@ impl SiteReader<'_> {
             .filter(|arg| arg.spread.is_none())
             .filter_map(|arg| value_binding(&arg.expr))
             .any(|ident| self.url_bindings.contains(&ident_key(ident)));
+        let argument_segments = argument_segments(args);
 
         let mut spread_calls = Vec::new();
         // The calls in the body of each function-valued argument.
@@ -1376,6 +1412,7 @@ impl SiteReader<'_> {
                 receivers,
                 callee: callee_text,
                 passes_written_url,
+                argument_segments,
             },
         );
     }
@@ -1706,7 +1743,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
             }
             if !matches!(reach, Reach::One { .. })
                 && let Some(site) =
-                    withdraw_unsettled(service.data, row, service.sites, &owners, &graph)
+                    withdraw_unsettled(service.data, row, service.sites, &owners, &decider)
             {
                 unsettled.push(site);
                 continue;
@@ -1836,23 +1873,29 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
 /// Withdraw the model's row `row` names, and give back the site to save
 /// unread, where the walk settled no one request (none, several, or one only
 /// the model states) at a call into a function of the repository written in
-/// another file, the call is handed no URL its own file writes
-/// ([`RowCall::passes_written_url`], carrick#4206), and the function called
-/// does not write the row's last literal segment ([`CallThroughSites::written`],
-/// the test [`helper_row`] reads).
+/// another file, and nothing in the code writes the row's path (carrick#4206).
 ///
-/// The call writes no request ([`read_sites`]), and the function called
-/// writes nothing of the row's path, so the model's path is read off its name. The site goes
-/// unread instead: `own_function`, slot `path`. A call whose callee nothing
-/// resolves, or resolves into the call's own file, keeps its row, as does a
-/// call handed a URL its own file builds (`get(url)` under
-/// `const url = `${base}/accounts``).
+/// The call writes no request ([`read_sites`]), so the model's path is read
+/// off the function's name unless the code says otherwise. The site goes
+/// unread instead: `own_function`, slot `path`. The row stays where the code
+/// does say:
+///
+/// - nothing resolves the callee, or it is in the call's own file;
+/// - the function called writes the row's last literal segment
+///   ([`CallThroughSites::written`], the test [`helper_row`] reads);
+/// - a request the walk reaches ends in a hole the call fills
+///   ([`ends_in_hole`], as [`helper_row`] keeps it);
+/// - the call's own string arguments write that segment
+///   ([`RowCall::argument_segments`]: `swap("orders.swap", list)`);
+/// - the call is handed a URL its own file builds
+///   ([`RowCall::passes_written_url`]: `get(url)` under
+///   `const url = `${base}/accounts``).
 fn withdraw_unsettled(
     data: &mut CloudRepoData,
     row: &SiteRow,
     sites: &CallThroughSites,
     owners: &HashMap<String, usize>,
-    graph: &ReachGraph,
+    decider: &Decider<'_>,
 ) -> Option<crate::unread_sites::UnreadSite> {
     let callee = row.steps.first().filter(|callee| !callee.is_empty())?;
     if !callee
@@ -1861,23 +1904,31 @@ fn withdraw_unsettled(
     {
         return None;
     }
-    // The function called writes the row's route (#1794's test): the path is
-    // read off its body, not off its name.
-    let named = last_literal_segment(&row.target);
-    if callee.iter().any(|definition| {
-        named.as_ref().is_some_and(|named| {
-            graph
-                .written
-                .get(definition)
-                .is_some_and(|written| written.contains(named))
-        })
-    }) {
-        return None;
-    }
     let call = sites
         .calls
         .get(&(row.file.clone(), row.line))
         .filter(|call| !call.passes_written_url)?;
+    let named = last_literal_segment(&row.target);
+    let written_by_callee = callee.iter().any(|definition| {
+        named.as_ref().is_some_and(|named| {
+            decider
+                .graph
+                .written
+                .get(definition)
+                .is_some_and(|written| written.contains(named))
+        })
+    });
+    let written_at_call = named
+        .as_ref()
+        .is_some_and(|named| call.argument_segments.contains(named));
+    let (_, unstated) = decider.reached_by(row, callee);
+    let fills_a_hole = unstated
+        .values()
+        .flat_map(|(rows, _)| rows)
+        .any(|request| ends_in_hole(&request.target_url));
+    if written_by_callee || written_at_call || fills_a_hole {
+        return None;
+    }
     let location = format!("{}:{}", row.file, row.line);
     let index = data
         .mount_graph
