@@ -342,6 +342,7 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        result_unanswered: false,
     }
 }
 
