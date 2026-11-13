@@ -259,9 +259,11 @@ pub struct HandlerAnchor {
 /// capture prints its type there. A call's request is its body argument and
 /// its response is its own result; a handler's request is the parameter it
 /// is run with. A slot is filled only where the site's own call or handler
-/// states it, in the same function: a payload a call below builds, a value
-/// a caller hands in, and a route handler's body read and response value
-/// (which need the label fields carrick#2474 lists) are left empty.
+/// states it, in the same function, or where the wrapper it calls builds it
+/// ([`PayloadBinding::BuiltInside`], carrick#4128: the value the building
+/// call is given, read in the wrapper's file). A value a caller hands in, and
+/// a route handler's body read and response value (which need the label
+/// fields carrick#2474 lists) are left empty.
 ///
 /// Scanner-side only, like the anchors, and outside [`SiteState`], so no
 /// site's sha and no cache key moves.
@@ -1911,6 +1913,40 @@ fn roles_by_file(decided: &Decided) -> BTreeMap<String, BTreeSet<String>> {
     roles
 }
 
+/// The value a call below builds as a site's payload
+/// ([`PayloadBinding::BuiltInside`]): the building call's argument `arg`
+/// (one option key of it when `key` is set), in the file that call is in.
+/// `None` where the call is not found or its argument has no such value.
+fn built_payload(payload: &Option<PayloadBinding>, sources: &mut Sources<'_>) -> Option<PayloadAt> {
+    let Some(PayloadBinding::BuiltInside {
+        built_inside,
+        span_start,
+        span_end,
+        arg,
+        key,
+    }) = payload
+    else {
+        return None;
+    };
+    let (file, _) = built_inside.rsplit_once(':')?;
+    let parsed = sources.get(file)?;
+    let mut finder = CallFinder {
+        parsed,
+        target: (*span_start, *span_end),
+        handing: Vec::new(),
+        found: None,
+    };
+    parsed.module.visit_with(&mut finder);
+    let expr = finder.found?.arg_exprs.get(*arg)?.clone();
+    let span = payload_expr(&expr, key.as_deref())?;
+    Some(PayloadAt::Value(AnchorAt {
+        file: file.to_string(),
+        line: parsed.line(span.lo.0),
+        span_start: span.lo.0,
+        span_end: span.hi.0,
+    }))
+}
+
 /// A record for every decided site, read with the store's `labels`. Files
 /// are named relative to `root`, the scanned repo's root; the compiler's
 /// rows are `inputs.positions`, when the run walked them.
@@ -2505,10 +2541,18 @@ fn record(
         handler,
         key: site.key.clone(),
     };
+    // A payload a call below builds (carrick#4128): the body the wrapper
+    // makes, read where it makes it. It stands behind the carried option key
+    // and the locator's own argument.
+    let built = if anchors.payload_at.is_none() {
+        built_payload(&site.payload, sources)
+    } else {
+        None
+    };
     let payloads = payload_slots(
         &anchors.call,
         anchors.payload_at.as_ref(),
-        carried,
+        carried.or(built),
         anchors.handler.as_ref(),
     );
     Some(SiteRecord {
