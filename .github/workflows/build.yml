@@ -140,7 +140,10 @@ jobs:
         shell: bash
         env:
           CARRICK_MOCK_ALL: "true"
-          EXPECTED_ENDPOINTS: "3"
+          # The example's installed `express` stand-in and the store's answer
+          # for it (carrick#3711).
+          CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
+          EXPECTED_ENDPOINTS: "4"
         run: |
           out="$RUNNER_TEMP/express-single-release.txt"
           "./$BIN" ./examples/express-single/ > "$out" 2>&1

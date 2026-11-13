@@ -145,18 +145,18 @@ fn test_basic_endpoint_detection() {
         );
     }
 
-    // A copy, so the example stays a plain example: the copy gets the
-    // installed `express` stand-in and the store's answer for it, which is
-    // what labels its routes (carrick#3711).
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let copy = temp_dir.path().join("express-single");
-    copy_dir_recursive(&test_repo_path, &copy).expect("Failed to copy the example");
-    let cassettes = install_express(temp_dir.path(), &copy);
+    // The example carries the `express` stand-in and the store's answer for
+    // it, which is what labels its routes (carrick#3711); the release-binary
+    // smoke scan in build.yml reads the same answer.
+    let cassettes = test_repo_path.join("__llm__");
 
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
-        .arg(copy.to_str().unwrap())
+        .arg(test_repo_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
-        .env("CARRICK_MOCK_FIXTURE_DIR", &cassettes)
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
         .output()
         .expect("Failed to execute carrick");
 
@@ -184,10 +184,11 @@ fn test_basic_endpoint_detection() {
         stdout
     );
 
-    // express-single should have 3 endpoints (the 4th uses a variable reference which the mock doesn't detect)
+    // express-single has 4 endpoints: one path is a const the scan reads
+    // through (the model mock never did, so this pinned 3).
     assert_eq!(
-        test_output.endpoint_count, 3,
-        "Expected 3 endpoints in express-single, but found {}. Output: {}",
+        test_output.endpoint_count, 4,
+        "Expected 4 endpoints in express-single, but found {}. Output: {}",
         test_output.endpoint_count, stdout
     );
 }
