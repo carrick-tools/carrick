@@ -327,14 +327,6 @@ fn settle_on_off(
     (on, off)
 }
 
-fn assert_unread(shipped: &Observed, skipped: &Observed) {
-    assert_eq!(shipped.text, skipped.text, "the printed check");
-    assert_eq!(shipped.text_exit, skipped.text_exit, "the exit code");
-    assert_eq!(shipped.json, skipped.json, "the printed JSON");
-    assert_eq!(shipped.json_exit, skipped.json_exit, "the JSON exit code");
-    assert_eq!(shipped.stored, skipped.stored, "the stored verdicts");
-}
-
 /// The join's `join settle: S of N pairs taken ...` lines (carrick#3884).
 fn join_settled_counts(log: &str) -> Vec<(usize, usize)> {
     log.lines()
