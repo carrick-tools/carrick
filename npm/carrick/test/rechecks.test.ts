@@ -27,6 +27,7 @@ import { checkedSinceLastEdit } from "../src/hook/checked.ts";
 import { lateContext } from "../src/hook/late.ts";
 import { recordEdit } from "../src/hook/reuse.ts";
 import { sessionCoverage } from "../src/hook/stop-wait.ts";
+import { readTimings } from "../src/hook/timings.ts";
 import { parseChangedResult, parseCheckResult } from "../src/contract.ts";
 import { fakeBin, fakeEnv, fixturePath } from "./helpers.ts";
 
@@ -381,6 +382,32 @@ test("one new owed answer among 100 delivered entries reads only pending entries
     const pendingReads = read.mock.calls.map((c) => String(c.arguments[0])).filter((f) => f.endsWith(".pending.json"));
     assert.equal(pendingReads.length, 1, "only the owed entry's own pending file");
     assert.ok(pendingReads[0]!.includes(one!.seq));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a background re-check writes a timing row that says whether the engine was ready (carrick#3948)", async () => {
+  const s = scratch();
+  try {
+    const base = JSON.parse(fs.readFileSync(fixturePath("check-mismatch.json"), "utf8"));
+    const fixture = (engineReady: boolean) => {
+      const file = path.join(path.dirname(s.log), `recheck-${engineReady}.json`);
+      const recheck = { ran: "extraction", elapsed_ms: 5, engine_ready: engineReady };
+      fs.writeFileSync(file, JSON.stringify({ ...base, recheck }));
+      return file;
+    };
+    fs.mkdirSync(path.join(s.root, ".carrick"), { recursive: true });
+    for (const [name, ready] of [["a.ts", false], ["b.ts", true]] as const) {
+      enqueue(s.root, "s1", [s.file(name)], Date.now(), { home: s.home });
+      await runQueue(s.root, { env: env(s, { CARRICK_FAKE_FIXTURE: fixture(ready) }), home: s.home });
+    }
+    const rows = readTimings(s.root).filter((row) => row.hook === "recheck");
+    assert.deepEqual(
+      rows.map((row) => [row.file, row.engine_ready]),
+      [["a.ts", false], ["b.ts", true]],
+    );
+    assert.ok(rows.every((row) => row.waited_ms >= 0 && row.duration_ms >= 0));
   } finally {
     s.cleanup();
   }

@@ -258,6 +258,11 @@ export type Recheck = {
    * now reaches no route. Absent when the edit moved nothing.
    */
   moved?: MovedRow[];
+  /**
+   * Whether the compiler engine was ready for this re-check's re-scan
+   * (carrick#3948). Absent when no re-scan ran.
+   */
+  engine_ready?: boolean;
 };
 
 /** One row of `recheck.moved` (`docs/local-mode-output.md`, "`recheck.moved`"). */

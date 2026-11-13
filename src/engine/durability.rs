@@ -57,9 +57,9 @@
 use std::time::Duration;
 
 use crate::agents::framework_guidance_agent::ProtocolGuidance;
-use crate::cloud_storage::CloudRepoData;
+use crate::cloud_storage::{CloudRepoData, TypeDegradation};
 use crate::framework_detector::DetectionResult;
-use crate::scan_health::ServiceLosses;
+use crate::scan_health::{ServiceLosses, TypeMemoryDeath};
 
 /// What a service's model stages settled on before its files are analysed.
 pub struct ModelSetup {
@@ -331,6 +331,9 @@ impl OwedWork {
 ///
 /// `allow_partial` (`CARRICK_ALLOW_PARTIAL_ANALYSIS`) lands everything but a
 /// failed retry.
+///
+/// A service whose types the run lost, rather than model work, is decided by
+/// [`holds_back_for_types`].
 pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial: bool) -> bool {
     if owed.retry_error.is_some() {
         return true;
@@ -343,6 +346,49 @@ pub fn holds_back(owed: &OwedWork, has_index: bool, laptop: bool, allow_partial:
     }
     let mendable = owed.losses.files.saturating_sub(owed.losses.final_files);
     mendable > 0 && (has_index || !laptop)
+}
+
+/// Whether a service whose types this run lost is kept out of its upload, so
+/// its stored index keeps them (carrick#3992). The model-loss rule above,
+/// for the compiler engine: an index stale but typed, and true for its
+/// commit, stands rather than one current but typeless.
+///
+/// Held when every one of these holds:
+/// - `lost` is a loss at type resolution (`resolve`). The other stages are
+///   carrick#4145: a machine with no engine loses every service at `spawn`.
+/// - `memory_death` (the service's first, if it died of memory) is one that
+///   would stop a runner run ([`TypeMemoryDeath::stops_the_run`]). A death
+///   under a cap below the run's is not held: the cap came from the stored
+///   peak, so keeping that generation would start the next scan at the same
+///   cap (carrick#3084). A death of no recorded memory (a crash) is held.
+/// - `stored`, the generation the index serves, has types to keep:
+///   `types_degraded` none and a non-empty `type_manifest`. A first index,
+///   or one that already lost its types, lands.
+/// - `allow_missing_types` (`CARRICK_ALLOW_MISSING_TYPES`) is off.
+///
+/// The service owes no model work, so this never goes through [`OwedWork`]:
+/// a retry in the same run would die again, and the pending text would be
+/// false.
+pub fn holds_back_for_types(
+    lost: Option<&TypeDegradation>,
+    memory_death: Option<&TypeMemoryDeath>,
+    run_cap_mb: Option<u64>,
+    stored: Option<&CloudRepoData>,
+    allow_missing_types: bool,
+) -> bool {
+    if allow_missing_types || lost.is_none_or(|lost| lost.stage != "resolve") {
+        return false;
+    }
+    if memory_death.is_some_and(|death| !death.stops_the_run(run_cap_mb)) {
+        return false;
+    }
+    stored.is_some_and(|stored| {
+        stored.types_degraded.is_none()
+            && stored
+                .type_manifest
+                .as_ref()
+                .is_some_and(|manifest| !manifest.is_empty())
+    })
 }
 
 /// Set to a number of seconds to change how long a run waits before it
@@ -740,6 +786,99 @@ mod tests {
         // A missing intent never held an index back.
         assert!(!holds_back(&intents_only, true, false, false));
         assert!(!holds_back(&OwedWork::default(), true, false, false));
+    }
+
+    /// A stored generation, with a type manifest of `entries` rows and, when
+    /// `degraded`, types already lost at resolution.
+    fn stored(entries: usize, degraded: bool) -> CloudRepoData {
+        let row = serde_json::json!({
+            "protocol": "http", "method": "GET", "path": "/status",
+            "role": "producer", "type_kind": "response", "type_alias": "Status",
+            "file_path": "src/server.ts", "line_number": 5,
+            "is_explicit": false, "type_state": "implicit",
+            "evidence": {
+                "file_path": "src/server.ts", "line_number": 5, "infer_kind": "response_body",
+                "is_explicit": false, "type_state": "implicit"
+            }
+        });
+        let manifest = vec![row; entries];
+        let mut data: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "monorepo",
+            "service_name": "beta",
+            "endpoints": [], "calls": [], "mounts": [], "apps": {}, "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-11-13T00:00:00Z",
+            "commit_hash": "1d263e2",
+            "type_manifest": manifest,
+        }))
+        .expect("a stored service deserializes");
+        if degraded {
+            data.types_degraded = Some(lost_at("resolve"));
+        }
+        data
+    }
+
+    fn lost_at(stage: &str) -> TypeDegradation {
+        TypeDegradation {
+            stage: stage.to_string(),
+            detail: "the compiler engine could not read types".to_string(),
+        }
+    }
+
+    /// A memory death in beta's analysis, alone unless `beside`, under
+    /// `heap_cap_mb`.
+    fn memory_death(heap_cap_mb: Option<u64>, beside: bool) -> TypeMemoryDeath {
+        TypeMemoryDeath {
+            service: Some("beta".to_string()),
+            stage: crate::scan_stage::Stage::TypeCapture,
+            kind: crate::services::type_sidecar::MemoryDeath::HeapLimit,
+            heap_cap_mb,
+            in_analysis: true,
+            beside,
+        }
+    }
+
+    #[test]
+    fn a_service_is_held_for_its_types_only_when_a_stored_index_has_them() {
+        let typed = stored(1, false);
+        let resolve = lost_at("resolve");
+        fn held(
+            lost: Option<&TypeDegradation>,
+            death: Option<&TypeMemoryDeath>,
+            stored: Option<&CloudRepoData>,
+            allow: bool,
+        ) -> bool {
+            holds_back_for_types(lost, death, Some(4096), stored, allow)
+        }
+        // The case: types lost at resolution, a typed index stored.
+        assert!(held(Some(&resolve), None, Some(&typed), false));
+        // Nothing lost, or lost at another stage (carrick#4145): it lands.
+        assert!(!held(None, None, Some(&typed), false));
+        for stage in ["spawn", "init", "capture"] {
+            assert!(
+                !held(Some(&lost_at(stage)), None, Some(&typed), false),
+                "{stage}"
+            );
+        }
+        // Nothing to protect: a first index, an empty manifest, no manifest,
+        // a stored index that already lost its types.
+        assert!(!held(Some(&resolve), None, None, false));
+        assert!(!held(Some(&resolve), None, Some(&stored(0, false)), false));
+        let mut no_manifest = stored(1, false);
+        no_manifest.type_manifest = None;
+        assert!(!held(Some(&resolve), None, Some(&no_manifest), false));
+        assert!(!held(Some(&resolve), None, Some(&stored(1, true)), false));
+        // The opt-out.
+        assert!(!held(Some(&resolve), None, Some(&typed), true));
+        // A memory death that would stop a runner run: alone at the run's cap.
+        let at_run_cap = memory_death(Some(4096), false);
+        assert!(held(Some(&resolve), Some(&at_run_cap), Some(&typed), false));
+        // One that would not (carrick#3084): under a stored-peak cap below the
+        // run's, or beside another service.
+        let below = memory_death(Some(1024), false);
+        assert!(!held(Some(&resolve), Some(&below), Some(&typed), false));
+        let beside = memory_death(Some(4096), true);
+        assert!(!held(Some(&resolve), Some(&beside), Some(&typed), false));
     }
 
     #[test]

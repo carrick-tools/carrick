@@ -82,7 +82,7 @@ jobs:
             partitioned: --test local_mode_test
             partition: slice:2/2
             targets: >-
-              --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test
+              --test new_url_target_test --test unanswered_on_row_line_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test
           - shard: n3
             runner: nextest
             partitioned: --test local_mode_test

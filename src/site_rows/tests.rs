@@ -1120,6 +1120,74 @@ fn a_pubsub_producer_lead_on_a_publisher_row_is_dropped() {
     assert_eq!(fold.lead_on_row_line, 2);
 }
 
+/// A site question nobody answered, on a line where only rows the code did
+/// not decide stand (the model's, an old-path pass's), is still no possible
+/// call but is saved as an unread site with its reason and slot: those rows
+/// state the asked slot as an answer, not as something the code read
+/// (carrick#4123). A row the code decided on that line states it, and the
+/// site is not saved.
+#[test]
+fn an_unanswered_lead_on_a_row_line_is_saved_unread_unless_the_code_states_the_row() {
+    let unanswered = |file: &str, line: u32| PossibleCall {
+        unread: crate::possible_calls::Unread {
+            slot: "method".to_string(),
+            reason: Stop::Unanswered,
+        },
+        ..lead_at(file, line, Some("consumer"))
+    };
+    let key = || OperationKey::http("POST", "/a");
+    let mut calls = vec![
+        blob_row(key(), "src/model.ts", 4, Some(ResolutionSource::Model)),
+        blob_row(
+            key(),
+            "src/old.ts",
+            4,
+            Some(ResolutionSource::SameFileWrapper),
+        ),
+        blob_row(
+            key(),
+            "src/fact.ts",
+            4,
+            Some(ResolutionSource::RequestSummary),
+        ),
+        blob_row(key(), "src/other.ts", 4, Some(ResolutionSource::Model)),
+    ];
+    let site = SiteRows {
+        enabled: true,
+        rows: Vec::new(),
+        leads: vec![
+            unanswered("src/model.ts", 4),
+            unanswered("src/old.ts", 4),
+            unanswered("src/fact.ts", 4),
+            // Any other reason on a row line stays dropped (carrick#2539).
+            lead_at("src/other.ts", 4, Some("consumer")),
+        ],
+        ..SiteRows::default()
+    };
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
+    assert!(fold.leads.is_empty(), "{:#?}", fold.leads);
+    assert_eq!(fold.lead_on_row_line, 4);
+    let saved: Vec<(&str, u32, Stop, &str)> = fold
+        .unread
+        .iter()
+        .map(|site| {
+            (
+                site.file.as_str(),
+                site.line,
+                site.reason,
+                site.slot.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        saved,
+        vec![
+            ("src/model.ts", 4, Stop::Unanswered, "method"),
+            ("src/old.ts", 4, Stop::Unanswered, "method"),
+        ]
+    );
+}
+
 /// Off, nothing folds and nothing is written: the rows are byte for byte
 /// what they were.
 #[test]

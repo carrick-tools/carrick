@@ -243,6 +243,14 @@ pub struct InferRequestItem {
     /// other request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_path: Option<String>,
+    /// carrick#4154: the call's result is labelled and its `result` check was
+    /// asked, but the compiler engine died before it answered, so `result`
+    /// is empty where it would have named the body. Read without it, the
+    /// call's type would be the library's envelope, not the body: such a
+    /// request is never inferred, and its alias is published `unknown` with
+    /// `site_unreadable`. Never sent to the sidecar.
+    #[serde(skip)]
+    pub result_unanswered: bool,
 }
 
 // ============================================================================
@@ -6113,6 +6121,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            result_unanswered: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -6373,6 +6382,7 @@ mod tests {
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
                         route_path: None,
+                        result_unanswered: false,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6839,6 +6849,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            result_unanswered: false,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8723,6 +8734,7 @@ mod tests {
             alias: Some(alias.into()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8949,6 +8961,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -8998,6 +9011,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             route_path: None,
             member: None,
             result,
+            result_unanswered: false,
         };
         let json = |r| serde_json::to_string(&item(r)).unwrap();
         assert!(!json(None).contains(r#""result":"#), "{}", json(None));
@@ -9134,6 +9148,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some("A".to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
         }];
         assert!(
             sidecar.infer_types(&infer, None).is_err(),

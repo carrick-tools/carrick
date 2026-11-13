@@ -532,6 +532,7 @@ fn build_infer_requests(
                 alias: Some(alias.clone()),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
             });
             targets.insert(
                 alias,
@@ -562,6 +563,7 @@ fn build_infer_requests(
                 // ts-morph matches by getName(), which drops the rest `...`.
                 param_name: Some(arg.name.trim_start_matches("...").to_string()),
                 route_path: None,
+                result_unanswered: false,
             });
             targets.insert(
                 alias,

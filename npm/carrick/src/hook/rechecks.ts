@@ -29,6 +29,7 @@ import { createLogger } from "../log.ts";
 import { scriptBeside, startDetached } from "./refresh.ts";
 import { sessionsDir, writeAtomic } from "./reuse.ts";
 import { safeId } from "./session-key.ts";
+import { appendTiming, engineReadyOf } from "./timings.ts";
 
 const log = createLogger("carrick-recheck");
 
@@ -652,6 +653,19 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         bin,
       });
       const finishedAt = clock();
+      // One timing row per re-check, with whether the compiler engine was
+      // ready for its re-scan, so the miss rate can be read later (carrick#3948).
+      // Not in the hooks' p50/p90: the agent does not wait on this runner.
+      const engineReady = engineReadyOf(outcome.result);
+      appendTiming(root, {
+        hook: "recheck",
+        start: new Date(startedAt).toISOString(),
+        duration_ms: Math.max(0, finishedAt - startedAt),
+        waited_ms: Math.max(0, finishedAt - startedAt),
+        outcome: outcome.result ? "silent" : "error",
+        file: entry.relative,
+        ...(engineReady === undefined ? {} : { engine_ready: engineReady }),
+      });
       if (outcome.result) {
         writeAnswer(entry, "answered", startedAt, finishedAt, { result: outcome.result }, options.home);
       } else {

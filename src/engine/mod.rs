@@ -2168,7 +2168,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //
     // `CARRICK_ALLOW_PARTIAL_ANALYSIS` still lands a held-back service; the
     // loss is reported either way.
+    //
+    // A service whose types this run lost at resolution, where its stored
+    // index has them, is held back the same way (carrick#3992): the index
+    // stays stale but typed, rather than current and typeless.
+    // `CARRICK_ALLOW_MISSING_TYPES` lands it.
     let allow_partial = crate::scan_health::allow_partial_from_env();
+    let allow_missing_types = crate::scan_health::allow_missing_types_from_env();
+    let run_cap_mb = crate::services::type_sidecar::heap_cap_mb();
     let laptop = run_start.is_laptop();
     let authorized_basename = run_context
         .repo_full_name
@@ -2190,8 +2197,37 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 repo.repo_name == repo_name && repo.service_name == run.data.service_name
             }),
         };
-        run.held_back = durability::holds_back(&run.owed, has_index, laptop, allow_partial);
-        if run.held_back {
+        run.types_held = should_upload && {
+            let stored = previous_generations.iter().find(|repo| {
+                repo.repo_name == repo_name && repo.service_name == run.data.service_name
+            });
+            let memory_death =
+                crate::scan_health::first_type_memory_death_of(run.data.service_name.as_deref());
+            durability::holds_back_for_types(
+                run.data.types_degraded.as_ref(),
+                memory_death.as_ref(),
+                run_cap_mb,
+                stored,
+                allow_missing_types,
+            )
+        };
+        let owes = durability::holds_back(&run.owed, has_index, laptop, allow_partial);
+        run.held_back = owes || run.types_held;
+        if run.types_held {
+            let line = format!(
+                "Not uploading {} because this run lost its types ({}). Its stored index has them \
+                 and stays. Set {}=1 to upload it without types.",
+                run.label,
+                run.data
+                    .types_degraded
+                    .as_ref()
+                    .map_or("", |lost| lost.detail.as_str()),
+                crate::scan_health::ALLOW_MISSING_TYPES_ENV
+            );
+            warn!("{line}");
+            logging::annotate(logging::Annotation::Warning, &line);
+        }
+        if owes {
             warn!(
                 "Not uploading {}: it already has an index and this run still owes it model \
                  work ({}), so uploading would replace that index with a thinner one. Set {} to \
@@ -3177,6 +3213,47 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .into());
         }
     }
+    // A service kept at its stored index for its types (step 4c,
+    // carrick#3992). As with pending work, CI's exit code is the only place
+    // it shows. The laptop, and the local indexer that drives a laptop's
+    // scans, said it in the run and keep the served generation, so they exit
+    // 0.
+    let types_held: Vec<&str> = runs
+        .iter()
+        .filter(|run| run.types_held)
+        .map(|run| run.label.as_str())
+        .collect();
+    // A run that wrote no final write (every analysed service held) and owes
+    // no model work closes its scan with the same marker the pending path
+    // above writes, so the slot is released and a runner does not read the
+    // run as one that never landed (carrick#4157).
+    if !types_held.is_empty() && !closed_by_final_write && !incomplete {
+        let reason = format!(
+            "types lost while reading, stored index kept: {}",
+            types_held.join(", ")
+        );
+        storage
+            .report_scan_failed(
+                crate::scan_stage::current().as_str(),
+                &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
+            )
+            .await;
+    }
+    let laptop_run = laptop || crate::local_mode::hosted::driven_by_the_indexer();
+    if !laptop_run && !allow_missing_types && !types_held.is_empty() {
+        let others = if runs.iter().any(|run| !run.held_back && !run.carried) {
+            "The other services were uploaded."
+        } else {
+            "Nothing was uploaded."
+        };
+        return Err(format!(
+            "Kept the stored index of {} because this run lost their types. {others} Set {}=1 \
+             to upload without types.",
+            types_held.join(", "),
+            crate::scan_health::ALLOW_MISSING_TYPES_ENV
+        )
+        .into());
+    }
 
     // The last word of a run whose index is not what it should be. Everything
     // above happened; this is what makes the exit code say so (carrick#1067).
@@ -3240,6 +3317,10 @@ struct ServiceRun {
     owed: durability::OwedWork,
     /// Decided once every service has been analysed (step 4c).
     held_back: bool,
+    /// Held back because this run lost its types and its stored index has
+    /// them ([`durability::holds_back_for_types`], carrick#3992). Decided in
+    /// step 4c, only on a run that uploads.
+    types_held: bool,
     /// Not analysed: `data` is its stored generation (`--changed-only`,
     /// carrick#2227).
     carried: bool,
@@ -3285,6 +3366,7 @@ impl ServiceRun {
             data: stored,
             owed: durability::OwedWork::default(),
             held_back: false,
+            types_held: false,
             carried: true,
             call_through,
             boundaries,
@@ -3863,6 +3945,7 @@ impl ServiceScan {
             data,
             owed,
             held_back: false,
+            types_held: false,
             carried: false,
             call_through: analysis.call_through,
             boundaries: analysis.route_boundaries,
@@ -7952,22 +8035,20 @@ fn member_declarations(
     let started = Instant::now();
     let ask = declaration_ask(inputs, claims);
     let mut failed = false;
-    let verdicts = match sidecar {
+    let declarations = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
             #[cfg(test)]
             DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
-            match sidecar.verify_library_claims(from_dir, &ask.checks) {
-                Ok(answer) => answer.verdicts,
-                Err(error) => {
-                    warn!(%error, "receiver trace: the declaration ask failed; none indexed");
-                    failed = true;
-                    Vec::new()
-                }
-            }
+            let answer = sidecar
+                .verify_library_claims(from_dir, &ask.checks)
+                .map(|answer| answer.verdicts);
+            failed = !answer
+                .as_ref()
+                .is_ok_and(|verdicts| verdicts.len() == ask.checks.len());
+            MemberDeclarations::answered(&ask, answer)
         }
-        _ => Vec::new(),
+        _ => MemberDeclarations::of(&ask, &[]),
     };
-    let declarations = MemberDeclarations::of(&ask, &verdicts);
     debug!(
         checks = declarations.checks,
         not_reached = declarations.not_reached,
@@ -8127,19 +8208,22 @@ fn result_index_of(
     }
     let discovery = discovery_of(inputs, root, claims, context);
     let ask = result_checks(claims, &discovery);
-    let verdicts = match sidecar {
+    let index = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
-            match sidecar.verify_library_claims(from_dir, &ask.checks) {
-                Ok(answer) => answer.verdicts,
-                Err(error) => {
-                    warn!(%error, "result shapes: the result ask failed; none indexed");
-                    Vec::new()
-                }
+            let answer = sidecar.verify_library_claims(from_dir, &ask.checks);
+            if let Err(error) = &answer {
+                // The asked calls are held unanswered, so their types say
+                // they were read without the answer (carrick#4154).
+                warn!(%error, "result shapes: the result ask failed; none verified");
             }
+            ResultIndex::answered(
+                &ask,
+                answer.as_ref().map(|answer| answer.verdicts.as_slice()),
+                &discovery,
+            )
         }
-        _ => Vec::new(),
+        _ => ResultIndex::of(&ask, &[], &discovery),
     };
-    let index = ResultIndex::of(&ask, &verdicts, &discovery);
     debug!(
         checks = index.checks,
         not_reached = index.not_reached,
@@ -8316,7 +8400,8 @@ async fn dispatch_rows_of(
 /// `sites` read through `claims`, each verified by the sidecar against the
 /// package's own declarations, from `from_dir` (the service root, as for the
 /// client semantics). Verification runs on every scan and is never cached.
-/// No claims, or no sidecar, read nothing. A name slot is read through the
+/// No claims read nothing. No sidecar states no row and saves each site the
+/// claims would have read, `unanswered` (carrick#3948). A name slot is read through the
 /// text reader over `inputs` (carrick#3504 B10-3).
 fn read_library_rows(
     inputs: &crate::request_summary::RequestSummaryInputs,
@@ -8325,9 +8410,21 @@ fn read_library_rows(
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
 ) -> crate::library_claims::LibraryRows {
-    let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
-        return crate::library_claims::LibraryRows::default();
+    let Some(sidecar) = sidecar else {
+        // No run mode skips the engine by design: it was not found, did not
+        // start or did not get ready. Say so once, and save each site the
+        // claims would have read through the no-verdict save (carrick#3948).
+        warn!(
+            "library reader skipped: no compiler engine, so no library row is stated and each \
+             library site is saved unread"
+        );
+        return crate::library_claims::read(sites, claims, None, |_| {
+            Err("no compiler engine".to_string())
+        });
     };
+    if claims.is_empty() {
+        return crate::library_claims::LibraryRows::default();
+    }
     let names = crate::request_summary::SiteNames::of(inputs);
     crate::library_claims::read(sites, claims, Some(&names), |checks| {
         sidecar
@@ -10800,6 +10897,7 @@ fn site_infer_requests(
             alias: Some(alias),
             param_name,
             route_path: None,
+            result_unanswered: false,
         }
     };
     let mut requests = Vec::new();
@@ -10842,6 +10940,7 @@ fn site_infer_requests(
                         alias: Some(alias(ManifestTypeKind::Request)),
                         param_name: None,
                         route_path: None,
+                        result_unanswered: false,
                     });
                 }
                 // A built request's anchor is its object literal, not a
@@ -10859,6 +10958,8 @@ fn site_infer_requests(
                 );
                 // The store's label for the call's result (carrick#2910).
                 call_result.result = results.at_anchor(&anchors.call, repo_path);
+                call_result.result_unanswered =
+                    results.unanswered_at_anchor(&anchors.call, repo_path);
                 requests.push(call_result);
             }
             (OperationKey::Http { .. }, _) => {}
@@ -31519,8 +31620,9 @@ unfollowed_member_calls_total: 0,
         );
     }
 
-    /// carrick#1662: with no claims, or no sidecar to verify them, nothing
-    /// is read.
+    /// carrick#1662: with no claims, or no sidecar to verify them, no row is
+    /// read. With no sidecar the sites the claims would have read are saved
+    /// `unanswered` (carrick#3948, `no_sidecar_saves_each_library_site_unanswered`).
     #[test]
     fn no_claims_or_no_sidecar_read_no_library_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -31550,6 +31652,76 @@ unfollowed_member_calls_total: 0,
                 .rows
                 .is_empty()
         );
+    }
+
+    /// carrick#3948: a run with no compiler engine states no library row, and
+    /// says so. Each site the claims would have read is saved `unanswered`
+    /// (the no-verdict save), and one log line names the skip and why. Claims
+    /// empty means nothing was asked: no site is saved.
+    #[test]
+    fn no_sidecar_saves_each_library_site_unanswered() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let inputs = discover_request_inputs(&root);
+        let sites = crate::request_summary::library_sites(&inputs);
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let (library, none_asked) = tracing::subscriber::with_default(subscriber, || {
+            (
+                read_library_rows(&inputs, &sites, &claims, None, &root),
+                read_library_rows(&inputs, &sites, &[], None, &root),
+            )
+        });
+        assert!(library.rows.is_empty());
+        let saved =
+            crate::unread_sites::with_unanswered(Vec::new(), &[], &library.unanswered, &root);
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].reason, crate::request_summary::Stop::Unanswered);
+        assert_eq!(saved[0].slot, "name");
+        assert_eq!(saved[0].line, 2);
+        assert!(none_asked.unanswered.is_empty(), "no claims: nothing asked");
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("library reader skipped").count(),
+            2,
+            "one line per run of the reader, claims or none: {log}"
+        );
+        assert!(log.contains("no compiler engine"), "{log}");
     }
 
     /// A sidecar whose process died before the library verification is
@@ -32038,6 +32210,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
