@@ -649,6 +649,27 @@ impl Filled {
     }
 }
 
+/// The slot an unanswered site left open: the name slot (`name_slot`, the
+/// role's word for it) when the question asked the name, else the first slot
+/// it asked. The code stated every slot it did not ask, so naming the name
+/// slot for a question that asked only the method names the wrong hole
+/// (carrick#4123).
+fn asked_slot(asked: &[Slot], name_slot: &str) -> String {
+    if asked.contains(&Slot::Name) {
+        return name_slot.to_string();
+    }
+    match asked.first() {
+        None | Some(Slot::Name) => name_slot,
+        Some(Slot::Kind) => "kind",
+        Some(Slot::Role) => "role",
+        Some(Slot::NameArgument) => "name_argument",
+        Some(Slot::PayloadArgument) => "payload_argument",
+        Some(Slot::Method) => "method",
+        Some(Slot::Namespace) => "namespace",
+    }
+    .to_string()
+}
+
 fn filled(record: &SiteRecord, answered: Option<&Answered>, slot: Slot) -> Option<Filled> {
     if let Some(text) = record.state.forced.get(&slot) {
         return Some(Filled::stated(text.clone()));
@@ -1037,7 +1058,9 @@ pub fn of(
         }
         let answered = answers.answered.get(&site_id(&record.anchors));
         if record.bucket == Bucket::Asked && answered.is_none() {
-            out.leads.push(lead(Stop::Unanswered));
+            let mut unanswered = lead(Stop::Unanswered);
+            unanswered.unread.slot = asked_slot(&record.state.asked, &unanswered.unread.slot);
+            out.leads.push(unanswered);
             continue;
         }
         let slot = |slot| filled(record, answered, slot);
@@ -1248,7 +1271,9 @@ pub struct SiteFold {
     /// Leads dropped because the blob already holds a row at their line
     /// (carrick#2539): the index states that site, so it is no possible call.
     pub lead_on_row_line: usize,
-    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at.
+    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at,
+    /// and the unanswered leads of `lead_on_row_line` no row the code
+    /// decided stands beside (carrick#4123).
     pub unread: Vec<crate::unread_sites::UnreadSite>,
     /// The unread sites dropped because the blob already holds a row at
     /// their line: the index states that call.
@@ -1451,20 +1476,35 @@ pub fn fold_rows(
     // and a lead with no role either. A message's producer is the other way
     // round: a publish is a call row and a subscriber an endpoint row, so a
     // pub/sub producer lead matches a call row (carrick#3439 T1).
-    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
-        rows.iter()
-            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    //
+    // An unanswered question there still left a slot open, unless a row the
+    // code decided (a fact no old-path pass wrote) stands on the line: the
+    // model's row, or an old-path pass's, states that slot as an answer, not
+    // as something the code read. That site is saved as unread with its
+    // reason, and stays out of the possible calls (carrick#4123).
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32, code_only: bool| {
+        rows.iter().any(|existing| {
+            (!code_only || (is_fact(existing) && !is_old_path(existing)))
+                && place(root, existing).is_some_and(|(f, l)| f == file && l == line)
+        })
     };
     for lead in &site.leads {
-        let on_call = held_at(calls, &lead.file_path, lead.line_number);
-        let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
-        let held = match crate::message_key::lead_side(lead.kind.as_deref(), lead.role.as_deref()) {
-            Some(RowSide::Call) => on_call,
-            Some(RowSide::Endpoint) => on_endpoint,
-            None => on_call || on_endpoint,
+        let side = crate::message_key::lead_side(lead.kind.as_deref(), lead.role.as_deref());
+        let held = |code_only| {
+            let on_call = held_at(calls, &lead.file_path, lead.line_number, code_only);
+            let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number, code_only);
+            match side {
+                Some(RowSide::Call) => on_call,
+                Some(RowSide::Endpoint) => on_endpoint,
+                None => on_call || on_endpoint,
+            }
         };
-        if held {
+        if held(false) {
             out.lead_on_row_line += 1;
+            if lead.unread.reason == Stop::Unanswered && !held(true) {
+                out.unread
+                    .push(crate::unread_sites::UnreadSite::unread_lead(lead));
+            }
         } else {
             out.leads.push(lead.clone());
         }

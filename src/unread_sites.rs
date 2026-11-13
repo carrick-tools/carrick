@@ -109,6 +109,15 @@ impl UnreadSite {
         (&self.file, self.span_start, self.span_end)
     }
 
+    /// A lead that is no possible call (a row stands on its line) but whose
+    /// site the code still did not read (carrick#4123), as an unread site.
+    pub(crate) fn unread_lead(call: &PossibleCall) -> Self {
+        UnreadSite {
+            listed: false,
+            ..Self::listed(call)
+        }
+    }
+
     /// The possible call `call` is, as an unread site.
     fn listed(call: &PossibleCall) -> Self {
         UnreadSite {
