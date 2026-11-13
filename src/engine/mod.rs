@@ -8287,11 +8287,11 @@ fn site_records_of(
             &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
             &crate::request_summary::decided_sites::ScopeLabel::from_exports(
                 claims,
-                &declarations.verified_scopes,
+                &declarations.scope_answers,
             ),
             &crate::request_summary::decided_sites::ProcedureLabels::from_exports(
                 claims,
-                &declarations.verified_scopes,
+                &declarations.scope_answers,
             ),
         ),
         None => crate::request_summary::decided_sites::decided_sites_with(
@@ -9498,7 +9498,12 @@ fn append_deterministic_protocol_operations(
             &extractions.implementations_unanswered,
             Path::new(repo_path),
         );
-        crate::unread_sites::attach(cloud_data, unread, &site.leads);
+        crate::unread_sites::attach(
+            cloud_data,
+            unread,
+            &site.leads,
+            &extractions.site.scopes_unanswered,
+        );
         debug!(
             unread_sites = cloud_data.unread_sites_total.unwrap_or_default(),
             unread_on_row_line = site.unread_on_row_line,
@@ -31954,7 +31959,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &root,
         );
         let mut saved = service_data("monorepo", Some(SERVICE));
-        crate::unread_sites::attach(&mut saved, unread, &[]);
+        crate::unread_sites::attach(&mut saved, unread, &[], &BTreeSet::new());
         let lines: Vec<(u32, crate::request_summary::Stop)> = saved
             .unread_sites
             .clone()
@@ -32059,7 +32064,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         ));
         let unread = crate::unread_sites::with_unanswered(saved, &[], &library.unanswered, &root);
         let mut data = service_data("monorepo", None);
-        crate::unread_sites::attach(&mut data, unread, &[]);
+        crate::unread_sites::attach(&mut data, unread, &[], &BTreeSet::new());
         let by_reason = data.unread_sites_by_reason.clone().unwrap_or_default();
         let unanswered = by_reason
             .get(&crate::request_summary::Stop::Unanswered)

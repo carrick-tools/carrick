@@ -773,6 +773,31 @@ pub struct AskedScope {
     pub receiver: String,
 }
 
+/// What the declaration ask returned for one scope check (carrick#4155).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeAnswer {
+    /// Verified, with the member declarations (`decl_file`, `decl_line`)
+    /// the verdict names (carrick#2636): a call whose row resolves to one
+    /// of them is a call of that scope member, whatever holds its receiver.
+    Verified(Vec<(String, u32)>),
+    /// Asked, and the ask got no answer ([`MemberDeclarations::answered`]):
+    /// a call of the member is one the answer would have decided, so the
+    /// decided pass saves the sites it leaves open `unanswered`
+    /// ([`super::decided_sites::Decided::scopes_unanswered`]).
+    Unanswered,
+}
+
+impl ScopeAnswer {
+    /// The member declarations a verified check names; `None` for a check
+    /// with no answer.
+    pub fn verified(&self) -> Option<&[(String, u32)]> {
+        match self {
+            ScopeAnswer::Verified(declarations) => Some(declarations),
+            ScopeAnswer::Unanswered => None,
+        }
+    }
+}
+
 /// The receiver id the instances a maker claim builds are read through, as
 /// [`LibrarySite::receiver_ids`] names a site's.
 fn make_receiver(form: MakeForm, member: Option<&str>) -> String {
@@ -907,12 +932,10 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
 #[derive(Debug, Default, Clone)]
 pub struct MemberDeclarations {
     by_declaration: HashMap<(String, u32), Vec<DeclaredOp>>,
-    /// The scope claims verified, each by claim id on the receiver id it
-    /// was asked on, with the member declarations (`decl_file`,
-    /// `decl_line`) the verdict names (carrick#2474 R2b, carrick#2636):
-    /// a call whose row resolves to one of them is a call of that scope
-    /// member, whatever holds its receiver.
-    pub verified_scopes: HashMap<AskedScope, Vec<(String, u32)>>,
+    /// The scope claims the ask verified or got no answer for, each by
+    /// claim id on the receiver id it was asked on (carrick#2474 R2b,
+    /// carrick#4155). A claim the verifier refuted is not here.
+    pub scope_answers: HashMap<AskedScope, ScopeAnswer>,
     /// The checks asked.
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
@@ -929,7 +952,8 @@ pub struct MemberDeclarations {
 impl MemberDeclarations {
     /// The declarations the verifier's `answer` to `ask` names. An `Err`,
     /// or an answer with a verdict count other than the checks', indexes
-    /// nothing and keeps the op checks it left open (carrick#3991).
+    /// nothing and keeps the op checks (carrick#3991) and the scope checks
+    /// (carrick#4155) it left open.
     pub fn answered<E: std::fmt::Display>(
         ask: &DeclarationAsk,
         answer: Result<Vec<SemanticsResult>, E>,
@@ -957,6 +981,13 @@ impl MemberDeclarations {
                 .iter()
                 .flatten()
                 .map(|op| (op.package.clone(), op.member.clone()))
+                .collect(),
+            // The scope checks it left open (carrick#4155).
+            scope_answers: ask
+                .scopes
+                .iter()
+                .flatten()
+                .map(|scope| (scope.clone(), ScopeAnswer::Unanswered))
                 .collect(),
             ..MemberDeclarations::of(ask, &verdicts)
         }
@@ -1007,7 +1038,8 @@ impl MemberDeclarations {
                     .collect();
                 declarations.sort();
                 declarations.dedup();
-                out.verified_scopes.insert(scope.clone(), declarations);
+                out.scope_answers
+                    .insert(scope.clone(), ScopeAnswer::Verified(declarations));
             }
             let Some(op) = op else {
                 continue;
@@ -4385,8 +4417,8 @@ mod tests {
             &discovered,
             &labels,
             &MakerLabel::from_exports(exports),
-            &ScopeLabel::from_exports(exports, &declarations.verified_scopes),
-            &ProcedureLabels::from_exports(exports, &declarations.verified_scopes),
+            &ScopeLabel::from_exports(exports, &declarations.scope_answers),
+            &ProcedureLabels::from_exports(exports, &declarations.scope_answers),
         );
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -4403,7 +4435,7 @@ mod tests {
             .unwrap();
         let listed: Vec<crate::possible_calls::PossibleCall> =
             rows.leads.iter().chain(&rows.routes).cloned().collect();
-        crate::unread_sites::attach(&mut data, unread, &listed);
+        crate::unread_sites::attach(&mut data, unread, &listed, &rows.scopes_unanswered);
         let mut sites: BTreeMap<(String, u32, u32), Vec<String>> = BTreeMap::new();
         for site in &decided.sites {
             let composed: Vec<String> = site
@@ -6320,7 +6352,7 @@ mod tests {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let name_at = |file: &str, line: u32| -> Vec<String> {
@@ -6373,7 +6405,7 @@ mod tests {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let name_at = |file: &str, line: u32| -> Vec<String> {
@@ -7904,7 +7936,7 @@ export function listen(): void {
             scopes,
             &super::super::decided_sites::ProcedureLabels::from_exports(
                 exports,
-                &declarations.verified_scopes,
+                &declarations.scope_answers,
             ),
         );
         (discovery, decided)
@@ -7923,7 +7955,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::ScopeLabel;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         let want = texts(&["src/index.ts:20 <- /tree", "src/index.ts:8 <- /health"]);
@@ -7977,7 +8009,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::ScopeLabel;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         let want = texts(&[
@@ -8006,7 +8038,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let mut verified: Vec<&str> = scopes.iter().map(|scope| scope.member.as_str()).collect();
         verified.sort();
         assert_eq!(verified, vec!["basePath", "register", "route"]);
@@ -8145,7 +8177,7 @@ export function listen(): void {
     )> {
         use super::super::decided_sites::ScopeLabel;
         let (on, exports, declarations) = traced_fixture_named("receiver-mount-pathless")?;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         Some((decided, scopes))
     }
@@ -8322,7 +8354,7 @@ export function listen(): void {
         else {
             return;
         };
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         assert!(
             scopes.iter().any(|label| {
                 label.package == "fixture-mw-router"
@@ -8397,7 +8429,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let served = |decided: &super::super::decided_sites::Decided| {
             let records = super::super::site_record::site_records(
                 &on.inputs,
@@ -8466,7 +8498,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8533,7 +8565,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8587,7 +8619,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8630,7 +8662,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8717,7 +8749,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8774,7 +8806,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8831,7 +8863,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8872,7 +8904,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8981,8 +9013,8 @@ export function listen(): void {
             &discovered,
             &labels,
             &MakerLabel::from_exports(&exports),
-            &ScopeLabel::from_exports(&exports, &declarations.verified_scopes),
-            &ProcedureLabels::from_exports(&exports, &declarations.verified_scopes),
+            &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
+            &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
         );
         let records =
             super::super::site_record::site_records(own, &siblings, &on.repo, &decided, &labels);
@@ -9045,7 +9077,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -9089,7 +9121,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         // The scope's path is the route's own path, served under the
@@ -9210,7 +9242,7 @@ export function listen(): void {
         assert_eq!(only, vec!["src/edge.ts", "src/harness.ts", "src/worker.ts"]);
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         assert_eq!(
@@ -9234,7 +9266,7 @@ export function listen(): void {
         let (on, exports, declarations) = traced_fixture_in(name, dir, service)?;
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         Some(composed_lines(&decided, true))
@@ -9256,7 +9288,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = without_files(
@@ -9321,7 +9353,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), MODULE_ALIAS_FILES);
@@ -9351,7 +9383,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = instance_ends(&decided);
@@ -9378,7 +9410,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), GETTER_FILES);
@@ -9403,7 +9435,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), CALL_RESULT_FILES);
@@ -9434,7 +9466,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         assert_eq!(discovery.counts.get("declaration_ambiguous"), None);
@@ -9514,7 +9546,7 @@ export function listen(): void {
         ) else {
             return;
         };
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let lines = boundary_lines(&decided.boundaries);
         let call_ins: Vec<&String> = lines
@@ -9773,7 +9805,7 @@ export function listen(): void {
             ) else {
                 return;
             };
-            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
             let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
             facts.push((service, decided.boundaries));
         }
@@ -9839,7 +9871,7 @@ export function listen(): void {
             ) else {
                 return;
             };
-            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
             let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
             facts.push((service, decided.boundaries));
         }
@@ -10009,7 +10041,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let mut got: Vec<String> = ends_in_order(&decided)
@@ -10058,13 +10090,13 @@ export function listen(): void {
             scope.package == "fixture-split-server" && scope.receiver == "instance:()"
         };
         assert!(
-            declarations.verified_scopes.keys().any(hub),
+            declarations.scope_answers.keys().any(hub),
             "{:#?}",
-            declarations.verified_scopes
+            declarations.scope_answers
         );
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let ends = ends_in_order(&decided);
@@ -10087,7 +10119,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let first = ends_in_order(&decided_traced(&on, &exports, &declarations, &scopes).1);
         assert!(

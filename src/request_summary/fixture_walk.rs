@@ -77,7 +77,7 @@ pub(crate) fn census_declarations(
         declarations.checks,
         declarations.not_reached,
         declarations.len(),
-        declarations.verified_scopes.len()
+        declarations.scope_answers.len()
     );
     declarations
 }
