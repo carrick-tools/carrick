@@ -50,6 +50,7 @@ import {
 import { repairDanglingImports, type RepairedFile } from './repair-dangling.js';
 import { RESOLUTION_FILE } from './resolution-edges.js';
 import type { WriteGuard } from './guarded-fs.js';
+import { linkInstalledPackages, stubResolutionHost } from './stub-resolution.js';
 import {
   findDisqualifyingTopTypes,
   findUnresolvedPlaceholders,
@@ -114,13 +115,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
   walk(typesDir);
 
   // Point resolution at the producer repo's installed deps when present.
-  const repoNodeModules = path.join(args.repoRoot, 'node_modules');
-  const linkPath = path.join(args.stubDir, 'node_modules');
-  let linked = false;
-  if (!args.bareCheckout && fs.existsSync(repoNodeModules) && !fs.existsSync(linkPath)) {
-    args.guard.symlink(repoNodeModules, linkPath, 'dir');
-    linked = true;
-  }
+  const unlink = linkInstalledPackages(args);
 
   try {
     const first = runSelfCheck(args, treeFiles);
@@ -135,9 +130,7 @@ export function selfCheckStub(args: SelfCheckArgs): CaptureAliasRecord[][] {
     if (repaired.size === 0) return first.records;
     return runSelfCheck(args, treeFiles, repaired).records;
   } finally {
-    // unlinkSync, not rmSync: the link target is a directory and rmSync
-    // refuses symlinks-to-directories with EISDIR.
-    if (linked) args.guard.unlink(linkPath);
+    unlink();
   }
 }
 
@@ -180,30 +173,12 @@ export const SELF_CHECK_OPTIONS: Readonly<ts.CompilerOptions> = sidecarCompilerO
   types: [],
 });
 
-/** The host of a self-check program, with outside declarations resolving from their source. */
-function selfCheckHost(args: SelfCheckArgs): ts.CompilerHost | undefined {
-  const outside = args.outsideSources;
-  if (!outside || Object.keys(outside).length === 0) return args.compilerHost?.(SELF_CHECK_OPTIONS);
-  const host = args.compilerHost?.(SELF_CHECK_OPTIONS) ?? ts.createCompilerHost(SELF_CHECK_OPTIONS);
-  const fallback = host.resolveModuleNames?.bind(host);
-  host.resolveModuleNames = (names, containingFile, reused, redirected, options, containingSourceFile) =>
-    names.map((name, index) => {
-      const resolved = fallback
-        ? fallback([name], containingFile, reused?.slice(index, index + 1), redirected, options, containingSourceFile)[0]
-        : ts.resolveModuleName(name, containingFile, options, host).resolvedModule;
-      const source = outside[path.resolve(containingFile)];
-      if (resolved || !source || name.startsWith('.') || path.isAbsolute(name)) return resolved;
-      return ts.resolveModuleName(name, source, options, host).resolvedModule;
-    });
-  return host;
-}
-
 function runSelfCheck(
   args: SelfCheckArgs,
   treeFiles: string[],
   repaired?: Map<string, RepairedFile>
 ): SelfCheckPass {
-  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, selfCheckHost(args));
+  const program = ts.createProgram(treeFiles, SELF_CHECK_OPTIONS, stubResolutionHost(args, SELF_CHECK_OPTIONS));
   const checker = program.getTypeChecker();
   const diagnostics = ts.getPreEmitDiagnostics(program);
 
