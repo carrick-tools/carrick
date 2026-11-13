@@ -3089,6 +3089,112 @@ mod tests {
         );
     }
 
+    /// The saved sites of a reading: line, reason, kind and role.
+    fn saved(rows: &LibraryRows) -> Vec<(u32, Stop, Option<&'static str>, Option<&'static str>)> {
+        let mut saved: Vec<_> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason, lead.kind, lead.role))
+            .collect();
+        saved.sort();
+        saved
+    }
+
+    /// carrick#3947, carrick#3946: a library call the reader reads and then
+    /// states no row and no lead at is saved, once, with a reason: a claim
+    /// the verifier answered `failed` is `uncorroborated`, one its time
+    /// budget did not reach (`unchecked`, `budget`) is `unanswered`. Two
+    /// calls ask one check. Sites that state no row on purpose (a wildcard,
+    /// a reserved name, an empty name, a call missing the payload) save
+    /// nothing, and the rows are the ones a fully verified reading states
+    /// less the dropped ones.
+    #[test]
+    fn a_library_call_read_and_dropped_on_its_verdict_is_saved_with_a_reason() {
+        let source = "import { bus } from \"@fixture/bus\";\n\
+            export async function send() {\n\
+            \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+            \x20 await bus.publish(\"orders.shipped\", { id: 2 });\n\
+            \x20 bus.subscribe(\"orders.created\", (message) => {});\n\
+            \x20 await bus.publish(\"orders.*\", {});\n\
+            \x20 await bus.publish(\"orders.lonely\");\n\
+            \x20 bus.subscribe(\"$connected\", () => {});\n\
+            }\n";
+        let sites = sites_of(&[("src/orders.ts", source)]);
+        let verdict = |check: &LibraryCheck| {
+            if check.claim_id.contains(":send:") {
+                (SemanticsVerdict::Failed, Some("not the declared member"))
+            } else {
+                (SemanticsVerdict::Unchecked, Some("budget"))
+            }
+        };
+        let asked = std::cell::RefCell::new(0usize);
+        let rows = read(&sites, &[bus()], None, |checks| {
+            *asked.borrow_mut() = checks.len();
+            Ok(checks
+                .iter()
+                .map(|check| {
+                    let (verdict, reason) = verdict(check);
+                    SemanticsResult {
+                        claim_id: check.claim_id.clone(),
+                        receiver: check.receiver.clone(),
+                        verdict,
+                        reason: reason.map(str::to_string),
+                        declarations: Vec::new(),
+                    }
+                })
+                .collect())
+        });
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        assert_eq!(*asked.borrow(), 3, "fewer checks than sites");
+        assert_eq!(
+            saved(&rows),
+            vec![
+                (3, Stop::Uncorroborated, Some("pubsub"), Some("producer")),
+                (4, Stop::Uncorroborated, Some("pubsub"), Some("producer")),
+                (5, Stop::Unanswered, Some("pubsub"), Some("consumer")),
+            ],
+            "{:?}",
+            rows.leads
+        );
+        // The verified reading of the same sites states rows at 3, 4, 5 and
+        // saves nothing: no row moves.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let verified = read(&sites, &[bus()], None, verifier(&asked, all));
+        let lines: Vec<u32> = verified.rows.iter().map(|row| row.line).collect();
+        assert_eq!(lines, vec![3, 4, 5], "{verified:#?}");
+        assert!(verified.leads.is_empty(), "{:?}", verified.leads);
+    }
+
+    /// carrick#3947: a verified op at a call whose name slot reads no name,
+    /// and saves no lead, is saved with the word for the slot: a spread is
+    /// `unread_expression`, another value `unread`, a slot the call does
+    /// not fill `caller_arg_missing`.
+    #[test]
+    fn a_verified_call_that_names_nothing_is_saved_with_a_reason() {
+        let source = "import { bus } from \"@fixture/bus\";\n\
+            export async function send(topic: string, rest: string[]) {\n\
+            \x20 await bus.publish(\"orders.created\", { id: 1 });\n\
+            \x20 await bus.publish(...rest, {});\n\
+            \x20 await bus.publish(topic, {});\n\
+            \x20 await bus.publish(7, {});\n\
+            }\n";
+        let sites = sites_of(&[("src/orders.ts", source)]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let rows = read(&sites, &[bus()], None, verifier(&asked, all));
+        let lines: Vec<u32> = rows.rows.iter().map(|row| row.line).collect();
+        assert_eq!(lines, vec![3], "{rows:#?}");
+        assert_eq!(
+            saved(&rows),
+            vec![
+                (4, Stop::UnreadExpression, Some("pubsub"), Some("producer")),
+                (5, Stop::Unread, Some("pubsub"), Some("producer")),
+                (6, Stop::CallerArgMissing, Some("pubsub"), Some("producer")),
+            ],
+            "{:?}",
+            rows.leads
+        );
+    }
+
     /// A call the claims list as off the wire contests nothing; a mutator,
     /// and a member no list names, contest the receiver.
     #[test]
