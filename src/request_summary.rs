@@ -10915,11 +10915,28 @@ fn declared_client(
     Declared::Unfollowable
 }
 
+/// The function a call reaches by the compiler's rows, and the requests that
+/// function sends (carrick#4120). Paths are as walked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachedCallee {
+    /// The file that declares the function.
+    pub file: PathBuf,
+    /// Each request the function sends, directly or through what it calls:
+    /// the file it is written in and the span start of its call, in the same
+    /// numbering as `RequestMember::request_start`.
+    pub requests: BTreeSet<(PathBuf, u32)>,
+}
+
 /// Everything the pass states, per file (keyed by the file as walked).
 #[derive(Debug, Default)]
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
+    /// The function each call of the service's files reaches by the
+    /// compiler's rows, keyed by the call's span. Read by the imported-member
+    /// join, which drops a member the compiler says the call does not reach
+    /// (carrick#4120).
+    reached: HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
     /// The callers among them whose request is closed and does not render
@@ -11184,6 +11201,38 @@ impl RequestSummaryIndex {
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {
         self.silent.get(file)
+    }
+
+    /// The function each call of `file` reaches by the compiler's rows,
+    /// keyed by the call's `(span_start, span_end)`. A call the rows do not
+    /// answer (no rows, or read from the call graph) has no entry.
+    pub fn reached(&self, file: &Path) -> Option<&BTreeMap<(u32, u32), ReachedCallee>> {
+        self.reached.get(file)
+    }
+
+    /// Record what the call reaches, when the rows say it.
+    fn record_reach(
+        &mut self,
+        inputs: &RequestSummaryInputs,
+        file: &Path,
+        call: &CallIr,
+        callee_file: &Path,
+        callee: &Summary,
+    ) {
+        if call.jsx || !inputs.rows_answer(file, call.site.lo, call.site.hi) {
+            return;
+        }
+        self.reached.entry(file.to_path_buf()).or_default().insert(
+            (call.site.span_start, call.site.span_end),
+            ReachedCallee {
+                file: callee_file.to_path_buf(),
+                requests: callee
+                    .effects
+                    .iter()
+                    .map(|effect| (effect.site.file.clone(), effect.site.span_start))
+                    .collect(),
+            },
+        );
     }
 
     /// The verbs the calls of `file` settle for requests whose URL they
@@ -11608,14 +11657,15 @@ pub fn summarize(
             if call.invokes_param.is_some() {
                 continue;
             }
-            if let Some((_, callee)) = composer.callee(path, call)
-                && is_silent(&mut composer, path, module_level, call, &callee)
-            {
-                index
-                    .silent
-                    .entry(path.to_path_buf())
-                    .or_default()
-                    .insert(call.site.span_start);
+            if let Some((callee_file, callee)) = composer.callee(path, call) {
+                index.record_reach(inputs, path, call, &callee_file, &callee);
+                if is_silent(&mut composer, path, module_level, call, &callee) {
+                    index
+                        .silent
+                        .entry(path.to_path_buf())
+                        .or_default()
+                        .insert(call.site.span_start);
+                }
             }
         }
     }
@@ -11851,6 +11901,7 @@ fn emit(
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
+                index.record_reach(composer.inputs, file, call, &callee_file, &callee);
                 if let Some(target) = composer.target(file, call) {
                     index.ledger.seen.insert(target);
                 }
