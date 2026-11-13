@@ -243,6 +243,16 @@ pub struct InferRequestItem {
     /// other request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_path: Option<String>,
+    /// carrick#4204: the request is asked at a route's registration call
+    /// itself, so its span is the call and names no payload. The sidecar
+    /// follows the handler from there; where it gives no answer, the capture
+    /// must not re-read the span (it would publish the call's own type), and
+    /// the alias takes the placeholder ([`derive_capture_anchors`]). Never
+    /// read by the sidecar, which finds the registration at the node it locates.
+    ///
+    /// [`derive_capture_anchors`]: crate::engine::type_compat_v2::derive_capture_anchors
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_registration: bool,
 }
 
 // ============================================================================
@@ -6113,6 +6123,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -6373,6 +6384,7 @@ mod tests {
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
                         route_path: None,
+                        at_registration: false,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6839,6 +6851,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8723,6 +8736,7 @@ mod tests {
             alias: Some(alias.into()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8949,6 +8963,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -8996,6 +9011,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             alias: None,
             param_name: None,
             route_path: None,
+            at_registration: false,
             member: None,
             result,
         };
@@ -9134,6 +9150,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some("A".to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         assert!(
             sidecar.infer_types(&infer, None).is_err(),

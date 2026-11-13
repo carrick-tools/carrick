@@ -342,6 +342,7 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        at_registration: false,
     }
 }
 
@@ -409,6 +410,9 @@ fn an_http_route_handlers_parameter_is_not_its_request_body() {
         (requests[0].span_start, requests[0].span_end),
         sidecar_span("http.post(\"/orders\", order)")
     );
+    // carrick#4204: marked as asked at the registration call, so an
+    // unanswered read takes the placeholder, not the call's own type.
+    assert!(requests[0].at_registration);
 
     // Socket, pub/sub and queue handlers are run with their payload: their
     // parameter read stands.
@@ -499,6 +503,8 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
     );
     assert_eq!(value[0].infer_kind, InferKind::RequestBody);
     assert_eq!(value[0].member, None);
+    // A consumer's body argument is a payload: never marked (carrick#4204).
+    assert!(!value[0].at_registration);
     assert!(
         serde_json::to_value(&value[0])
             .unwrap()

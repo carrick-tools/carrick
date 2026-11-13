@@ -743,10 +743,17 @@ pub(crate) fn derive_capture_anchors(
         // it carries a span: a span at a registration call re-reads the call
         // or the installed framework's instance type (carrick#4079). A
         // `FunctionReturn` with a span (a GraphQL resolver) keeps its anchor.
+        // A `RequestBody` asked by span at the registration call is the
+        // request side of the same case (carrick#4204): unanswered there, the
+        // capture would publish the call's own type (the server's app). Its
+        // builder marks it, since a consumer's body argument is asked by span
+        // with no text too and keeps its anchor. A decided `no_request_body`
+        // took the branch above and keeps its reason.
         let no_text_no_param = request.expression_text.is_none() && request.param_name.is_none();
         let no_span = request.span_start.is_none() && request.span_end.is_none();
         let names_no_payload = match request.infer_kind {
-            InferKind::RequestBody | InferKind::FunctionReturn => no_span && no_text_no_param,
+            InferKind::RequestBody => no_text_no_param && (no_span || request.at_registration),
+            InferKind::FunctionReturn => no_span && no_text_no_param,
             InferKind::ResponseBody => no_text_no_param,
             _ => false,
         };
@@ -5686,6 +5693,7 @@ mod tests {
             alias: Some("Endpoint_a_Response".to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let with = |unwidened: Option<&str>| {
             let mut inf = inferred("Endpoint_a_Response", "{ scope: string; }", None, None);
@@ -5779,6 +5787,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let mut text_read = inferred("Endpoint_a_Response_Call1", "string", None, None);
         text_read.infer_kind = InferKind::CallResult;
@@ -5843,6 +5852,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
         tolerant.infer_kind = InferKind::RequestBody;
@@ -6362,6 +6372,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let calls = consumer_call_locators(&[
             item(InferKind::RequestBody, "Req", 3),
@@ -6503,6 +6514,7 @@ mod tests {
                 alias: Some("Endpoint_a_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             },
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
@@ -6517,6 +6529,7 @@ mod tests {
                 alias: Some("Endpoint_b_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             },
         ];
         let inline = vec![
@@ -6630,6 +6643,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }
     }
 
@@ -7462,6 +7476,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         let text = "{ members: { id: string; name: string; email: string; }[]; }";
         let mut inf = inferred(alias, text, None, None);
@@ -7566,12 +7581,29 @@ mod tests {
             span_only("Endpoint_span_Response", InferKind::ResponseBody),
             span_only("Endpoint_resolver_Response", InferKind::FunctionReturn),
             span_only("Endpoint_span_Request", InferKind::RequestBody),
+            // carrick#4204: a request body asked at the registration call.
+            InferRequestItem {
+                at_registration: true,
+                ..span_only("Endpoint_registration_Request", InferKind::RequestBody)
+            },
         ];
 
         let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], "/repo");
 
-        assert_eq!(anchors.len(), 8, "{anchors:?}");
-        let placeholders: Vec<&CaptureAnchor> = [0, 1, 4, 5].iter().map(|i| &anchors[*i]).collect();
+        assert_eq!(anchors.len(), 9, "{anchors:?}");
+        assert!(
+            matches!(
+                &anchors[8],
+                CaptureAnchor::Literal {
+                    unread_cause: Some("not_located"),
+                    ..
+                }
+            ),
+            "{:?}",
+            anchors[8]
+        );
+        let placeholders: Vec<&CaptureAnchor> =
+            [0, 1, 4, 5, 8].iter().map(|i| &anchors[*i]).collect();
         for anchor in placeholders {
             match anchor {
                 CaptureAnchor::Literal {
@@ -7678,6 +7710,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
             result: None,
         };
         let items = vec![
@@ -8216,6 +8249,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             alias: alias.to_string(),
@@ -8309,6 +8343,7 @@ mod tests {
                 alias: Some(alias.to_string()),
                 param_name: param.map(str::to_string),
                 route_path: None,
+                at_registration: false,
             }
         };
 
@@ -8359,6 +8394,7 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             alias: alias.to_string(),
@@ -11398,6 +11434,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         };
         let infer = vec![
             call(6, "api.post<{ x: number }>(\"/checkout\")", &typed_alias),
@@ -11630,6 +11667,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(producer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         let inferred = sidecar
             .infer_types(&producer_infer, None)
@@ -11732,6 +11770,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         let consumer_inferred = sidecar
             .infer_types(&consumer_infer, None)
@@ -11885,6 +11924,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12085,6 +12125,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            at_registration: false,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12314,6 +12355,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(producer_alias(key)),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             })
             .collect();
         let api_inferred = api_sidecar
@@ -12437,6 +12479,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(consumer_alias(key, *line)),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             })
             .collect();
         let web_inferred = web_sidecar
@@ -12622,6 +12665,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: Some(param_name.to_string()),
             route_path: None,
+            at_registration: false,
         };
         let infer = vec![request(named, "message"), request(unnamed, "message.data")];
         let anchors = derive_capture_anchors(

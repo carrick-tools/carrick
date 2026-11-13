@@ -10800,6 +10800,7 @@ fn site_infer_requests(
             alias: Some(alias),
             param_name,
             route_path: None,
+            at_registration: false,
         }
     };
     let mut requests = Vec::new();
@@ -10842,6 +10843,7 @@ fn site_infer_requests(
                         alias: Some(alias(ManifestTypeKind::Request)),
                         param_name: None,
                         route_path: None,
+                        at_registration: false,
                     });
                 }
                 // A built request's anchor is its object literal, not a
@@ -32038,6 +32040,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                at_registration: false,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));

@@ -154,13 +154,15 @@ impl SitePayloads {
             // at the registration call follows the handler to that read, or
             // decides the route takes none. Another protocol's handler is run
             // with its payload, so its parameter stays the slot.
+            // The request asked at the call is marked: where the sidecar
+            // gives it no answer, its span names no payload (carrick#4204).
             let registration;
-            let slot = match slot {
+            let (slot, at_registration) = match slot {
                 PayloadAt::Param { .. } if http => {
                     registration = PayloadAt::Value(site.call.clone());
-                    &registration
+                    (&registration, true)
                 }
-                _ => slot,
+                _ => (slot, false),
             };
             let at = slot.at();
             let source = sources
@@ -202,6 +204,7 @@ impl SitePayloads {
                 member,
                 result,
                 route_path: None,
+                at_registration,
             });
         }
         requests
