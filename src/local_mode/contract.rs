@@ -342,15 +342,6 @@ impl UnreadItem {
 /// Unread calls a human answer lists before it counts the rest.
 const MAX_UNREAD_LINES: usize = 8;
 
-/// The [`crate::request_summary::Stop`] word of a site the scan asked about and
-/// got no answer for.
-const UNANSWERED_REASON: &str = "unanswered";
-
-/// What a re-check with no ready compiler engine says in place of one line per
-/// unanswered library site (carrick#3948).
-const ENGINE_NOT_READY_LINE: &str =
-    "Library calls in this file were not checked on this edit: the compiler engine was not ready.";
-
 /// What the type check did, as a check answer states it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TypeCheckState {
@@ -890,17 +881,6 @@ impl CheckOutput {
             .is_some_and(|recheck| recheck.ran != "none")
     }
 
-    /// This answer came from a re-check whose compiler engine was not ready
-    /// (`recheck.engine_ready`), so its `unanswered` sites are that re-check's
-    /// own gap.
-    fn engine_not_ready_on_recheck(&self) -> bool {
-        self.rechecked()
-            && self
-                .recheck
-                .as_ref()
-                .is_some_and(|recheck| recheck.engine_ready == Some(false))
-    }
-
     /// The human form: the same content in the same order, for a model reading
     /// a terminal.
     pub fn render(&self) -> String {
@@ -979,30 +959,17 @@ impl CheckOutput {
             out.push('\n');
         }
 
-        // A re-check with no ready engine saved every library site it asked
-        // about `unanswered`; one line says so, and the sites stay saved in
-        // the blob (carrick#3948). Other reasons list as before.
-        let (collapsed, unread): (Vec<&UnreadItem>, Vec<&UnreadItem>) =
-            self.unread.iter().partition(|item| {
-                self.engine_not_ready_on_recheck() && item.reason == UNANSWERED_REASON
-            });
-        if !collapsed.is_empty() {
-            out.push_str(ENGINE_NOT_READY_LINE);
-            out.push('\n');
-        }
-        if !unread.is_empty() {
-            for item in unread.iter().take(MAX_UNREAD_LINES) {
+        if !self.unread.is_empty() {
+            for item in self.unread.iter().take(MAX_UNREAD_LINES) {
                 out.push_str(&item.line());
                 out.push('\n');
             }
-            if unread.len() > MAX_UNREAD_LINES {
+            if self.unread.len() > MAX_UNREAD_LINES {
                 out.push_str(&format!(
                     "and {} more calls Carrick could not read in this file.\n",
-                    unread.len() - MAX_UNREAD_LINES
+                    self.unread.len() - MAX_UNREAD_LINES
                 ));
             }
-        }
-        if !self.unread.is_empty() {
             out.push('\n');
         }
 
@@ -1653,53 +1620,6 @@ mod tests {
             engine_ready,
         });
         answer
-    }
-
-    /// The sentence, written out so a change to the one in the code shows here.
-    const ENGINE_NOT_READY_LINE: &str = "Library calls in this file were not checked on this edit: the compiler engine was not ready.";
-
-    /// carrick#3948: a re-check whose engine was not ready prints one line for
-    /// the library sites it saved `unanswered`, not one line each. Other
-    /// reasons print as before.
-    #[test]
-    fn a_re_check_with_no_ready_engine_collapses_its_unanswered_sites_to_one_line() {
-        let text = rechecked_with(Some(false)).render();
-        assert_eq!(text.matches(ENGINE_NOT_READY_LINE).count(), 1, "{text}");
-        assert!(
-            !text.contains("couldn't be checked on this scan"),
-            "no per-site unanswered line: {text}"
-        );
-        assert!(
-            text.contains("Carrick could not read the call at src/a.ts:90"),
-            "another reason still prints: {text}"
-        );
-        assert!(
-            !text.contains("more calls Carrick could not read"),
-            "the collapsed sites are not counted in the cap: {text}"
-        );
-    }
-
-    /// An engine that was ready, an answer from the index, and a re-check that
-    /// did not run all print every site as before, capped at the same count.
-    #[test]
-    fn unanswered_sites_print_per_site_when_the_engine_was_ready_or_nothing_re_ran() {
-        for engine_ready in [Some(true), None] {
-            let text = rechecked_with(engine_ready).render();
-            assert!(!text.contains(ENGINE_NOT_READY_LINE), "{text}");
-            assert_eq!(
-                text.matches("couldn't be checked on this scan").count(),
-                8,
-                "{text}"
-            );
-            assert!(
-                text.contains("and 3 more calls Carrick could not read"),
-                "{text}"
-            );
-        }
-        let mut not_run = rechecked_with(Some(false));
-        not_run.recheck.as_mut().unwrap().ran = "none".to_string();
-        let text = not_run.render();
-        assert!(!text.contains(ENGINE_NOT_READY_LINE), "{text}");
     }
 
     /// `engine_ready` rides the `recheck` block only when a re-scan stated it.
