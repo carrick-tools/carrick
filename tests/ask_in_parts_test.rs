@@ -109,8 +109,10 @@ fn table_source(tag: &str) -> String {
     for n in 0..HANDLER_MODULES {
         writeln!(out, "import {{ h{n} }} from \"./handlers/h{n}\";").unwrap();
     }
-    out.push_str("import type { Table } from \"fixture-table\";\n");
-    out.push_str("declare const table: Table;\n");
+    // Two lines, as the window constants count them; no import, so the
+    // table's own import table names only the handler modules.
+    out.push_str("// The routes register on an installed package's table.\n");
+    out.push_str("declare const table: import(\"fixture-table\").Table;\n");
     out.push_str("const local = (req: any, res: any) => {};\n");
     for i in 0..LOCAL_SINGLES {
         single(&mut out, tag, i, "local");
@@ -188,9 +190,11 @@ impl Fixture {
         cached: &HashMap<String, FileAnalysisResult>,
         consumer: &GraphqlConsumerHints,
     ) -> FileCentricAnalysisResult {
-        let facts = fact_files::walked(&self.root).await;
+        // A tree that calls no installed package asks the store nothing, as
+        // the route-array shape: a scan then hands the orchestrator no files.
+        let facts = fact_files::walked_if_asked(&self.root).await;
         FileOrchestrator::new(AgentService::new())
-            .with_fact_files(fact_files::source(&facts))
+            .with_fact_files(fact_files::source_of(facts))
             .analyze_files(
                 &self.files,
                 cached,
@@ -1305,9 +1309,12 @@ async fn a_file_with_no_candidates_is_cut_by_size_alone_and_halved_by_items() {
         )
         .unwrap();
     }
+    // The module's call is one only the name rule raises (C3): a request on an
+    // installed client would make each use a site. Left for #3702 to name.
+    let module = "export function h0(req: any, res: any) {\n  res.send({ handled: 0 });\n}\n";
     let fx = Fixture::of(
         &[
-            ("src/handlers/h0.ts".to_string(), handler_source(0)),
+            ("src/handlers/h0.ts".to_string(), module.to_string()),
             ("src/nocandidates_uses.ts".to_string(), source.clone()),
         ],
         "src/nocandidates_uses.ts",
