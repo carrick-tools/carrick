@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 const CALLERS: &str = "src/use-branches.ts";
+const EXITS: &str = "src/use-exits.ts";
 
 fn calls() -> &'static [serde_json::Value] {
     static CALLS: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
@@ -45,13 +46,17 @@ fn calls() -> &'static [serde_json::Value] {
     })
 }
 
-/// Every `method target` stated at the caller on `line`, sorted.
+/// Every `method target` stated at the caller on `line` of `use-branches.ts`,
+/// sorted.
 fn rows_at(line: i64) -> Vec<String> {
+    rows_in(CALLERS, line)
+}
+
+/// Every `method target` stated at the caller on `line` of `file`, sorted.
+fn rows_in(file: &str, line: i64) -> Vec<String> {
     let mut rows: Vec<String> = calls()
         .iter()
-        .filter(|call| {
-            call["file"].as_str() == Some(CALLERS) && call["line"].as_i64() == Some(line)
-        })
+        .filter(|call| call["file"].as_str() == Some(file) && call["line"].as_i64() == Some(line))
         .map(|row| {
             assert_eq!(
                 row["resolution_source"].as_str(),
@@ -115,11 +120,11 @@ fn the_branching_client_states_one_row_at_its_caller() {
 }
 
 #[test]
-fn a_local_written_from_another_the_same_statement_writes_stays_unread() {
-    // `target` is set from `query` in the branch that sets `query` too:
-    // nothing says what `query` holds there, so `target` states nothing,
-    // whichever order the two locals are read in.
-    assert_eq!(rows_at(26), Vec::<String>::new());
+fn a_local_written_from_another_in_one_branch_is_read_per_way() {
+    // `target` is set from `query` in the branch that sets `query` just
+    // before: the read of `query` there sees that write, and both ways of
+    // `target` key the one route.
+    assert_eq!(rows_at(26), ["POST /api/items.list"]);
 }
 
 #[test]
@@ -132,4 +137,96 @@ fn a_test_of_a_key_the_caller_leaves_to_a_hops_default_is_decided_by_it() {
     assert_eq!(rows_at(28), ["POST /api/items.list"]);
     // A caller that writes the key decides the test with it.
     assert_eq!(rows_at(29), ["POST /api/v2/items.list"]);
+}
+
+/// Each row at `line` of `file` keys `route` (the query, when one is
+/// written, keys the same route), and there is exactly one.
+fn one_row_keying(file: &str, line: i64, route: &str) {
+    let rows = rows_in(file, line);
+    assert_eq!(rows.len(), 1, "one row at line {line}: {rows:?}");
+    let row = &rows[0];
+    assert!(
+        row == route
+            || row
+                .strip_prefix(route)
+                .is_some_and(|rest| rest.starts_with('?')),
+        "line {line} keys {route}: {rows:?}"
+    );
+}
+
+#[test]
+fn a_branch_that_returns_sends_nothing_after_it() {
+    assert_eq!(rows_in(EXITS, 32), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_branch_a_caller_takes_and_that_returns_sends_nothing() {
+    // `verb === "GET"` holds for this caller, and that branch returns.
+    assert_eq!(rows_in(EXITS, 33), Vec::<String>::new());
+}
+
+#[test]
+fn an_empty_initialiser_falls_through_or() {
+    assert_eq!(rows_in(EXITS, 34), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_null_initialiser_falls_through_or() {
+    assert_eq!(rows_in(EXITS, 35), ["POST /api/items.list"]);
+}
+
+#[test]
+fn an_empty_initialiser_does_not_fall_through_nullish() {
+    // `"" ?? path` is `""`: the base alone is sent.
+    assert_eq!(rows_in(EXITS, 36), ["POST /api"]);
+}
+
+#[test]
+fn a_write_after_the_send_is_not_sent() {
+    assert_eq!(rows_in(EXITS, 37), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_local_written_in_a_loop_stays_unread() {
+    // Guard: passes on main.
+    assert_eq!(rows_in(EXITS, 38), Vec::<String>::new());
+}
+
+#[test]
+fn a_closure_reading_a_written_local_stays_unread() {
+    // Guard: passes on main.
+    assert_eq!(rows_in(EXITS, 39), Vec::<String>::new());
+}
+
+#[test]
+fn a_branch_that_throws_sends_nothing_after_it() {
+    assert_eq!(rows_in(EXITS, 40), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_local_unwritten_on_the_callers_way_states_nothing() {
+    // Guard: passes on main.
+    assert_eq!(rows_in(EXITS, 41), Vec::<String>::new());
+}
+
+#[test]
+fn a_url_local_extended_from_itself_is_read_per_way() {
+    // carrick#3986: `target = target + "?q=1"` reads `target` as the ways
+    // before the write. `post` fills `verb` with `"POST"`: the GET way is
+    // ruled out.
+    assert_eq!(rows_in(EXITS, 42), ["POST /api/items.list"]);
+    // A direct `"GET"` keeps only the extended way.
+    one_row_keying(EXITS, 43, "GET /api/items.list");
+}
+
+#[test]
+fn a_test_in_the_same_block_decides_its_way() {
+    assert_eq!(rows_in(EXITS, 44), ["POST /api/items.list"]);
+}
+
+#[test]
+fn a_query_written_under_a_truthiness_test_states_one_row() {
+    // carrick#3984's snippet: both ways key one route, one row. The URL
+    // waits on no caller, so the row is stated at the send itself.
+    one_row_keying("src/clients/exits.ts", 170, "GET /api/c4");
 }
