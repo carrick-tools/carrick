@@ -57,7 +57,7 @@
           "specifier": "socket.io",
           "export": "Namespace",
           "role": "socket",
-          "side": "client",
+          "side": "server",
           "classifier": "fixture-classifier",
           "makes": [],
           "scopes": [],

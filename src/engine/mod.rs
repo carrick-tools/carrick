@@ -32664,8 +32664,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
 
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("live.ts");
-        let source = r#"import { Server } from "socket.io";
-const io = new Server();
+        let source = r#"import { Hub } from "wire-transport";
+const io = new Hub();
 const shipped: Shipped = load();
 io.emit("inline:out", { id: 1 });
 io.emit("named:out", shipped);
@@ -32674,7 +32674,10 @@ io.on("named:in", (event: Named) => {});
 io.on("bare:in", (event) => {});
 "#;
         std::fs::write(&file, source).unwrap();
-        let sockets = crate::socket_io::scan_files(std::slice::from_ref(&file), &[]);
+        let sockets = crate::socket_io::scan_files(
+            std::slice::from_ref(&file),
+            &["wire-transport".to_string()],
+        );
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
         let requests =
@@ -32706,7 +32709,7 @@ io.on("bare:in", (event) => {});
                 alias(
                     "inline:out",
                     ManifestRole::Consumer,
-                    crate::operation::SocketDirection::ServerToClient
+                    crate::operation::SocketDirection::Unknown
                 )
                 .as_str()
             )
@@ -32723,7 +32726,7 @@ io.on("bare:in", (event) => {});
                 alias(
                     "inline:in",
                     ManifestRole::Producer,
-                    crate::operation::SocketDirection::ClientToServer
+                    crate::operation::SocketDirection::Unknown
                 )
                 .as_str()
             )

@@ -55,6 +55,66 @@
           ]
         }
       ]
+    },
+    {
+      "package": "socket.io-client",
+      "version": "4.7.5",
+      "status": "answered",
+      "surface_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "exports": [
+        {
+          "specifier": "socket.io-client",
+          "export": "io",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "emit",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "on",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
     }
   ]
 }

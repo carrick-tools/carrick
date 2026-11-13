@@ -82,7 +82,7 @@ jobs:
             partitioned: --test local_mode_test
             partition: slice:2/2
             targets: >-
-              --test socket_namespace_test --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test
+              --test new_url_target_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test
           - shard: n3
             runner: nextest
             partitioned: --test local_mode_test
@@ -100,7 +100,7 @@ jobs:
             partitioned: --test call_through_rows_test
             partition: slice:3/3
             targets: >-
-              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test composed_strings_test --test incremental_raw_cache_test --test socket_class_field_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test socket_extraction_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test url_to_string_choices_test --test wrapper_sibling_callers_test
+              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test composed_strings_test --test incremental_raw_cache_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test url_to_string_choices_test --test wrapper_sibling_callers_test
           - shard: n6
             runner: nextest
             partitioned: --test call_through_rows_test
@@ -114,7 +114,7 @@ jobs:
           - shard: n8
             runner: nextest
             targets: >-
-              --test retype_consumer_test --test unwidened_budget_test --test socket_type_alias_test --test socket_bus_yield_test --test socket_claims_parity_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test graphql_held_documents_test --test alias_import_callers_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test graphql_object_documents_test --test graphql_document_arguments_test --test graphql_document_files_test --test graphql_nested_walk_test --test workspace_package_client_test --test graphql_undeclared_selection_test --test governing_config_callers_test --test nestjs_uri_versioning_test
+              --test retype_consumer_test --test unwidened_budget_test --test socket_bus_yield_test --test socket_claims_parity_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test graphql_held_documents_test --test alias_import_callers_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test graphql_object_documents_test --test graphql_document_arguments_test --test graphql_document_files_test --test graphql_nested_walk_test --test workspace_package_client_test --test graphql_undeclared_selection_test --test governing_config_callers_test --test nestjs_uri_versioning_test
           - shard: n9
             runner: nextest
             targets: >-

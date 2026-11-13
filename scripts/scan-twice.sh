@@ -100,10 +100,10 @@ fixture_targets=(
   scenario-3-cross-repo-success/repo-a
   scenario-3-cross-repo-success/repo-b
   scenario-3-cross-repo-success/repo-c
-  socket-class-field-monorepo
-  socket-namespace-monorepo
+  socket-class-field-claims
+  socket-namespace-claims
   socket-service
-  socket-type-alias-monorepo
+  socket-type-alias-claims
   spread-options-verb
   workspace-package-client
   xrepo-corpus-3

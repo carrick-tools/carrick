@@ -1,0 +1,114 @@
+{
+  "library_claims": [
+    {
+      "package": "socket.io",
+      "version": "4.7.5",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "socket.io",
+          "export": "Server",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [
+            {
+              "form": "new",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "on",
+              "on": "instance",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "socket.io",
+          "export": "Socket",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "emit",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "receive",
+              "member": "on",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "socket.io",
+          "export": "Namespace",
+          "role": "socket",
+          "side": "server",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "emit",
+              "on": "instance",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

@@ -77,6 +77,32 @@ fn workspace_prepared(fixture: &str, repos: &[&str], prepare: impl Fn(&Path)) ->
     dir
 }
 
+/// A mock fixture dir holding the store's answer for `socket.io` and
+/// `socket.io-client` as the parity test's cassettes give it for
+/// `xrepo-corpus-1`'s two socket repos.
+fn socket_claims_cassette() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut claims = Vec::new();
+    for repo in ["payments-svc", "web-frontend"] {
+        let path = repo_root()
+            .join("tests/fixtures/socket-claims-xrepo/corpus-1")
+            .join(repo)
+            .join("__llm__/library-claims/default.json");
+        let answer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read cassette"))
+                .expect("parse cassette");
+        claims.extend(answer["library_claims"].as_array().expect("claims").clone());
+    }
+    let target = dir.path().join("library-claims");
+    std::fs::create_dir_all(&target).expect("create cassette dir");
+    std::fs::write(
+        target.join("default.json"),
+        serde_json::to_string(&serde_json::json!({ "library_claims": claims })).unwrap(),
+    )
+    .expect("write cassette");
+    dir
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).expect("create the destination");
     for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display()))
@@ -1783,7 +1809,18 @@ fn local_mode_answers_over_a_real_corpus() {
         &["orders-monorepo", "payments-svc", "web-frontend"],
     );
     let root = workspace.path();
-    index(root);
+    // No installed model runs here, but the store's answer for the two socket
+    // packages is read as a signed-in machine reads it: the socket rows are the
+    // fact layer's. The answers are the parity test's cassettes for these repos.
+    let claims = socket_claims_cassette();
+    run_with_env(
+        root,
+        &["refresh", "--workspace", "."],
+        &[(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            claims.path().to_str().expect("utf-8 path"),
+        )],
+    );
 
     // A GraphQL producer names its consumer in another repo.
     // A file with no indexed rows still answers, and it answers for the

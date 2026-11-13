@@ -1,6 +1,0 @@
-{
-  "services": [
-    { "name": "supervisor", "directory": "services/supervisor" },
-    { "name": "gateway", "directory": "services/gateway" }
-  ]
-}

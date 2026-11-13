@@ -185,7 +185,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "commit": "e2dbd6a1bf9044289e12abdfd03980bf3cccbf46",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -212,23 +212,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -277,6 +260,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -412,7 +416,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "f794efac84915cc7613a8cd6d46d4b8c73fcd2cd",
+        "commit": "e2dbd6a1bf9044289e12abdfd03980bf3cccbf46",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -428,14 +432,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
@@ -697,7 +701,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "commit": "d60c61e4740756fe89c61ed00f837e8022e189d9",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -724,23 +728,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -789,6 +776,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -924,7 +932,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "c4da5177cb02f2d813c29644de3313da316f3bd6",
+        "commit": "d60c61e4740756fe89c61ed00f837e8022e189d9",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -940,14 +948,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
@@ -1209,7 +1217,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "commit": "3ccb9ca5017a245320f890737dff1c61cbce6b17",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -1236,23 +1244,6 @@
     "srv": {
       "call_through": null,
       "calls": [
-        {
-          "file_path": "services/srv/src/server.ts:23",
-          "handler_name": null,
-          "key": {
-            "direction": "server_to_client",
-            "event": "chat.notice",
-            "protocol": "socket"
-          },
-          "owner": null,
-          "params": [],
-          "provenance": "route",
-          "request_body": null,
-          "request_type": null,
-          "resolution_source": "socket_call",
-          "response_body": null,
-          "response_type": null
-        },
         {
           "file_path": "services/srv/src/server.ts:9",
           "handler_name": null,
@@ -1301,6 +1292,27 @@
           "key": {
             "direction": "server_to_client",
             "event": "chat.fan",
+            "protocol": "socket"
+          },
+          "name_scope": {
+            "namespace": null,
+            "scope": "global"
+          },
+          "owner": null,
+          "params": [],
+          "provenance": "route",
+          "request_body": null,
+          "request_type": null,
+          "resolution_source": "library_claim",
+          "response_body": null,
+          "response_type": null
+        },
+        {
+          "file_path": "services/srv/src/server.ts:23",
+          "handler_name": null,
+          "key": {
+            "direction": "server_to_client",
+            "event": "chat.notice",
             "protocol": "socket"
           },
           "name_scope": {
@@ -1436,7 +1448,7 @@
       ],
       "mounts": [],
       "pair_outcomes": {
-        "commit": "e9f6023b487c629150fea2f048a8b1c37207a5ba",
+        "commit": "3ccb9ca5017a245320f890737dff1c61cbce6b17",
         "outcomes": [
           {
             "bucket": "unverifiable",
@@ -1452,14 +1464,14 @@
           },
           {
             "bucket": "unverifiable",
-            "consumer_surface_hash": "0cbf0a9b733f03e48f44cb56c51e894719fe311416d796d554ac894457869858",
+            "consumer_surface_hash": "92f649a24c858f330a2f2f007c2412eb081448356aaa2797fce78c590250a60b",
             "diagnostic": "the producer type resolved to 'unknown' at check time; compatibility cannot be verified.",
             "gate": "producer:unknown",
             "judged": true,
-            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response",
+            "pair_key": "cli/Endpoint_2fef651e9ddc7bbe_Response~srv/Endpoint_bb767a7349f12448_Response_Call8ca0fc9c582e568a",
             "producer_surface_hash": "77a9f26cf4ee94ba4cf3313ed55a228ad23ba235dd762b4968a281a2cf2d2428",
             "resolved": false,
-            "spec_hash": "9a658acaf3171e59478f5b2cfd3bb6ecd6649421b6d23e006d656b72fbe9d7ad",
+            "spec_hash": "536a305990470403c051e5bcf79be9afeef7d0f8429e09f01d28889b1e431566",
             "unresolved_reason": "the producer type is 'unknown'"
           },
           {
