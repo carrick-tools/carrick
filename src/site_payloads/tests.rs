@@ -377,6 +377,61 @@ fn a_slot_takes_over_its_alias_and_nothing_else() {
     );
     assert!(slotted_aliases(&[]).is_empty());
 }
+/// carrick#4197: an HTTP route handler's parameter is the request object the
+/// server hands it (`req`, a context), never the route's body. The route's
+/// request entry asks the body read at the registration call, where the
+/// sidecar follows the handler to the member it reads; it is never asked as
+/// the parameter. Another protocol's handler parameter is its payload, and
+/// stays a parameter read.
+#[test]
+fn an_http_route_handlers_parameter_is_not_its_request_body() {
+    let dir = repo();
+    let root = dir.path().to_string_lossy().into_owned();
+    let param = || PayloadSlots {
+        request: Some(PayloadAt::Param {
+            at: at("http.post(\"/orders\", order)"),
+            name: "order".to_string(),
+        }),
+        response: None,
+    };
+    let route = SitePayloads::of(&[record("server_framework", true, param())]);
+    let requests = route.requests(
+        &[entry(http(), "producer", "request", "Route", 2)],
+        &root,
+        &ResultIndex::default(),
+    );
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].infer_kind, InferKind::RequestBody);
+    assert_eq!(requests[0].param_name, None);
+    assert_eq!(
+        (requests[0].span_start, requests[0].span_end),
+        sidecar_span("http.post(\"/orders\", order)")
+    );
+
+    // Socket, pub/sub and queue handlers are run with their payload: their
+    // parameter read stands.
+    for (role, key) in [
+        (
+            "socket",
+            json!({ "protocol": "socket", "event": "orders", "direction": "client_to_server" }),
+        ),
+        ("pubsub", json!({ "protocol": "pubsub", "topic": "orders" })),
+        (
+            "queue",
+            json!({ "protocol": "pubsub", "topic": "orders-queue" }),
+        ),
+    ] {
+        let handler = SitePayloads::of(&[record(role, true, param())]);
+        let requests = handler.requests(
+            &[entry(key, "producer", "response", "Sub", 2)],
+            &root,
+            &ResultIndex::default(),
+        );
+        assert_eq!(requests.len(), 1, "{role}: {requests:?}");
+        assert_eq!(requests[0].infer_kind, InferKind::FunctionParam, "{role}");
+        assert_eq!(requests[0].param_name.as_deref(), Some("order"), "{role}");
+    }
+}
 
 /// The seam: every infer kind this module sends is a kind the sidecar's
 /// request type declares, spelled as the scanner writes it.
