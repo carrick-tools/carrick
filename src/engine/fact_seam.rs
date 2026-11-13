@@ -100,5 +100,6 @@ pub async fn fact_files_of_tree(
         &[],
         &repo,
         &Default::default(),
+        None,
     ))
 }
