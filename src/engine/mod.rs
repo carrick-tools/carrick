@@ -8317,7 +8317,8 @@ async fn dispatch_rows_of(
 /// `sites` read through `claims`, each verified by the sidecar against the
 /// package's own declarations, from `from_dir` (the service root, as for the
 /// client semantics). Verification runs on every scan and is never cached.
-/// No claims, or no sidecar, read nothing. A name slot is read through the
+/// No claims read nothing. No sidecar states no row and saves each site the
+/// claims would have read, `unanswered` (carrick#3948). A name slot is read through the
 /// text reader over `inputs` (carrick#3504 B10-3).
 fn read_library_rows(
     inputs: &crate::request_summary::RequestSummaryInputs,
@@ -8326,9 +8327,21 @@ fn read_library_rows(
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
 ) -> crate::library_claims::LibraryRows {
-    let Some(sidecar) = sidecar.filter(|_| !claims.is_empty()) else {
-        return crate::library_claims::LibraryRows::default();
+    let Some(sidecar) = sidecar else {
+        // No run mode skips the engine by design: it was not found, did not
+        // start or did not get ready. Say so once, and save each site the
+        // claims would have read through the no-verdict save (carrick#3948).
+        warn!(
+            "library reader skipped: no compiler engine, so no library row is stated and each \
+             library site is saved unread"
+        );
+        return crate::library_claims::read(sites, claims, None, |_| {
+            Err("no compiler engine".to_string())
+        });
     };
+    if claims.is_empty() {
+        return crate::library_claims::LibraryRows::default();
+    }
     let names = crate::request_summary::SiteNames::of(inputs);
     crate::library_claims::read(sites, claims, Some(&names), |checks| {
         sidecar
@@ -31524,8 +31537,9 @@ unfollowed_member_calls_total: 0,
         );
     }
 
-    /// carrick#1662: with no claims, or no sidecar to verify them, nothing
-    /// is read.
+    /// carrick#1662: with no claims, or no sidecar to verify them, no row is
+    /// read. With no sidecar the sites the claims would have read are saved
+    /// `unanswered` (carrick#3948, `no_sidecar_saves_each_library_site_unanswered`).
     #[test]
     fn no_claims_or_no_sidecar_read_no_library_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -31555,6 +31569,76 @@ unfollowed_member_calls_total: 0,
                 .rows
                 .is_empty()
         );
+    }
+
+    /// carrick#3948: a run with no compiler engine states no library row, and
+    /// says so. Each site the claims would have read is saved `unanswered`
+    /// (the no-verdict save), and one log line names the skip and why. Claims
+    /// empty means nothing was asked: no site is saved.
+    #[test]
+    fn no_sidecar_saves_each_library_site_unanswered() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("index.ts"),
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+        )
+        .expect("write");
+        let inputs = discover_request_inputs(&root);
+        let sites = crate::request_summary::library_sites(&inputs);
+        let claims: Vec<crate::library_claims::ExportClaims> = vec![
+            serde_json::from_value(serde_json::json!({
+                "package": "@fixture/bus", "version": "1.0.0", "specifier": "@fixture/bus",
+                "export": "bus", "role": "broker",
+                "claims": [{ "kind": "op", "op": "send", "member": "publish", "on": "export",
+                             "name": { "arg": 0 }, "payload": { "arg": 1 } }]
+            }))
+            .expect("claims"),
+        ];
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let (library, none_asked) = tracing::subscriber::with_default(subscriber, || {
+            (
+                read_library_rows(&inputs, &sites, &claims, None, &root),
+                read_library_rows(&inputs, &sites, &[], None, &root),
+            )
+        });
+        assert!(library.rows.is_empty());
+        let saved =
+            crate::unread_sites::with_unanswered(Vec::new(), &[], &library.unanswered, &root);
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        assert_eq!(saved[0].reason, crate::request_summary::Stop::Unanswered);
+        assert_eq!(saved[0].slot, "name");
+        assert_eq!(saved[0].line, 2);
+        assert!(none_asked.unanswered.is_empty(), "no claims: nothing asked");
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("library reader skipped").count(),
+            2,
+            "one line per run of the reader, claims or none: {log}"
+        );
+        assert!(log.contains("no compiler engine"), "{log}");
     }
 
     /// A sidecar whose process died before the library verification is
