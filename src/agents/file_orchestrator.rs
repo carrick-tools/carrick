@@ -5221,6 +5221,36 @@ impl FileOrchestrator {
         Vec<InferRequestItem>,
         Vec<(String, String)>,
     ) {
+        let (explicit, infer, inline, _) = self.collect_type_requests_and_body_asks(
+            file_results,
+            repo_path,
+            mount_graph,
+            config,
+            modules,
+        );
+        (explicit, infer, inline)
+    }
+
+    /// [`Self::collect_type_requests`], with the asks a caller row's
+    /// response waits on (carrick#4196): a row at a caller whose response no
+    /// request line reads is asked at its own call. Its answer is the
+    /// wrapper's own value unless the compiler engine names the body member
+    /// it read ([`crate::services::type_sidecar::hand_back_bodies`]); only
+    /// then does the ask join the requests, so it is returned apart from
+    /// them.
+    pub fn collect_type_requests_and_body_asks(
+        &self,
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_path: &str,
+        mount_graph: &MountGraph,
+        config: &Config,
+        modules: &WorkspaceIndex,
+    ) -> (
+        Vec<SymbolRequest>,
+        Vec<InferRequestItem>,
+        Vec<(String, String)>,
+        Vec<InferRequestItem>,
+    ) {
         // Convert repo_path to absolute for path resolution
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
@@ -5240,6 +5270,10 @@ impl FileOrchestrator {
         let mut endpoint_lookup: EndpointLookup = HashMap::new();
         let mut data_call_lookup: DataCallLookup = HashMap::new();
         let mut inline_aliases: Vec<(String, String)> = Vec::new();
+        // The asks a caller row's response waits on (carrick#4196): pushed
+        // here, not with the requests, while `body_ask` is set.
+        let mut body_asks: Vec<InferRequestItem> = Vec::new();
+        let body_ask = std::cell::Cell::new(false);
         let should_infer_request_body = crate::type_manifest::producer_reads_request_body;
         // `consumer_response` marks a symbol named for what a consumer call
         // receives (carrick#1841): the sidecar reads a response table keyed
@@ -5315,6 +5349,11 @@ impl FileOrchestrator {
             let (result, result_unanswered) = match infer_kind {
                 InferKind::CallResult => call_result.borrow().clone(),
                 _ => (None, false),
+            };
+            let infer_requests = if body_ask.get() {
+                &mut body_asks
+            } else {
+                &mut infer_requests
             };
             match locator {
                 InferLocator::Span {
@@ -5939,7 +5978,9 @@ impl FileOrchestrator {
                 // symbol: the value there is what the function returns, not
                 // the response body. Such a row states no consumer response
                 // type from any of them, so it gets no response verdict and
-                // leaves the check-time retype no locator to rewrite.
+                // leaves the check-time retype no locator to rewrite, unless
+                // the compiler engine reads a body member out of that value
+                // (below).
                 //
                 // A row that states a request whose own line states no row,
                 // its callers' rows stating it (carrick#3961), carries the
@@ -5957,23 +5998,35 @@ impl FileOrchestrator {
                         u32::try_from(moved.call.line_number.max(1)).unwrap_or(1),
                     )
                 });
-                let response_from = if data_call.at_caller {
-                    request_line.clone().filter(|_| {
-                        data_call
-                            .request_line
-                            .as_deref()
-                            .is_some_and(|moved| moved.response)
-                    })
-                } else {
-                    Some((
+                //
+                // A row at a caller whose response no request line reads is
+                // asked at its own call (carrick#4196). The wrapper's own
+                // value is no wire response, unless the wrapper hands back the
+                // transport response beside the body it read: the compiler
+                // engine's answer then names that member, and only such an
+                // answer is kept. The model's symbol there names the
+                // wrapper's value, so it anchors nothing.
+                let moved_response = request_line.clone().filter(|_| {
+                    data_call
+                        .request_line
+                        .as_deref()
+                        .is_some_and(|moved| moved.response)
+                });
+                let asked_for_body = data_call.at_caller && moved_response.is_none();
+                let response_from = match moved_response {
+                    Some(moved) if data_call.at_caller => moved,
+                    _ => (
                         data_call,
                         file_path.as_str(),
                         file_path_absolute.clone(),
                         line_number,
-                    ))
+                    ),
                 };
-                if let Some((anchor, anchor_file, anchor_absolute, anchor_line)) = response_from {
-                    if let (Some(symbol), Some(import_source)) =
+                {
+                    let (anchor, anchor_file, anchor_absolute, anchor_line) = response_from;
+                    if asked_for_body {
+                        // Typed from the answer alone.
+                    } else if let (Some(symbol), Some(import_source)) =
                         (&anchor.primary_type_symbol, &anchor.type_import_source)
                     {
                         // Explicit type with import source - bundle it
@@ -6015,6 +6068,7 @@ impl FileOrchestrator {
                         self.result_index
                             .unanswered_at(call_file, call_span, anchor_line),
                     );
+                    body_ask.set(asked_for_body);
                     let call_inferred = push_infer(
                         &anchor_absolute,
                         anchor_line,
@@ -6035,8 +6089,12 @@ impl FileOrchestrator {
                             at_registration: false,
                         },
                     );
+                    body_ask.set(false);
                     *call_result.borrow_mut() = (None, false);
-                    if !call_inferred && let Some(symbol) = anchor.primary_type_symbol.as_ref() {
+                    if !call_inferred
+                        && !asked_for_body
+                        && let Some(symbol) = anchor.primary_type_symbol.as_ref()
+                    {
                         inline_aliases.push((response_alias.clone(), symbol.clone()));
                     }
                 }
@@ -6127,7 +6185,7 @@ impl FileOrchestrator {
             inline_aliases.len()
         );
 
-        (explicit_requests, infer_requests, inline_aliases)
+        (explicit_requests, infer_requests, inline_aliases, body_asks)
     }
 
     /// Build `SymbolRequest`s for Socket.IO payload anchors (#245 Phase 1).
@@ -11611,8 +11669,44 @@ impl FileOrchestrator {
         payload_infer: &[InferRequestItem],
         server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (mut explicit, mut infer, inline_aliases) =
-            self.collect_type_requests(file_results, repo_path, mount_graph, config, modules);
+        let (mut explicit, mut infer, inline_aliases, body_asks) = self
+            .collect_type_requests_and_body_asks(
+                file_results,
+                repo_path,
+                mount_graph,
+                config,
+                modules,
+            );
+        // A caller row's own call is asked first, and joins the requests
+        // only where the answer names the body member it read (carrick#4196).
+        let hand_back_bodies = if body_asks.is_empty() {
+            Default::default()
+        } else {
+            match sidecar.infer_types(&body_asks, extraction_config) {
+                Ok(response) => crate::services::type_sidecar::hand_back_bodies(
+                    &body_asks,
+                    response.inferred_types.as_deref().unwrap_or_default(),
+                ),
+                Err(e) => {
+                    warn!(
+                        "[FileOrchestrator] The {} caller row(s) asked at their own call got no answer; they keep no response type: {}",
+                        body_asks.len(),
+                        e
+                    );
+                    Default::default()
+                }
+            }
+        };
+        debug!(
+            "[FileOrchestrator] {} of {} caller row(s) asked at their own call read a body member",
+            hand_back_bodies.len(),
+            body_asks.len()
+        );
+        infer.extend(body_asks.into_iter().filter(|ask| {
+            ask.alias
+                .as_ref()
+                .is_some_and(|alias| hand_back_bodies.contains(alias))
+        }));
 
         // Deterministically-collected explicit requests for non-HTTP protocols
         // (today: Socket.IO payload anchors, #245). They use the same
@@ -11659,6 +11753,7 @@ impl FileOrchestrator {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         // Every request as sent, for the type-reach record (carrick#3101).
         result.note_request_files(&explicit, &infer);
+        result.hand_back_bodies = hand_back_bodies;
         debug!(
             "[FileOrchestrator] Sidecar type resolution round trip: {:.1}s",
             round_trip.elapsed().as_secs_f64()
@@ -13195,6 +13290,7 @@ mod tests {
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         };
         let result = FileOrchestrator::append_inline_aliases(
             result,
@@ -13225,6 +13321,7 @@ mod tests {
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         };
         let result = FileOrchestrator::append_inline_aliases(
             result,

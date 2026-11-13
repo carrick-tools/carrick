@@ -2159,6 +2159,14 @@ pub struct InferredType {
     /// whole answer to why an endpoint reports `any`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any_provenance: Vec<TypeProvenance>,
+    /// carrick#4196: the member of the call's value this answer read as the
+    /// response body, set by the sidecar only where the call's function
+    /// hands back an object holding the transport response beside the body
+    /// it read (carrick#4185). A caller row the request summaries own keeps
+    /// its answer only when the answer carries this
+    /// ([`hand_back_bodies`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_member: Option<String>,
     /// declares the resolved type, when that file sits under a `node_modules`
     /// tree. `None` for a type the workspace declares itself AND for a type
     /// that did not resolve — absence is never evidence of locality, which is
@@ -2584,6 +2592,29 @@ pub struct TypeResolutionResult {
     /// that carried it, as the requests named them (carrick#3101). Filled by
     /// the caller that built the requests; the type-reach record reads it.
     pub request_files: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The aliases of the caller rows asked at their own call whose answer
+    /// named the body member it read (carrick#4196, [`hand_back_bodies`]).
+    /// Every other such row was never inferred and keeps no response entry.
+    pub hand_back_bodies: std::collections::BTreeSet<String>,
+}
+
+/// carrick#4196: which of `asks`, each a caller row's own call that the
+/// request summaries own and whose response no request line reads, the
+/// compiler engine answered by naming the body member it read: a wrapper
+/// that hands back the transport response beside the body. Every other
+/// answer (the wrapper's own value, an abstain, no answer) is the wrapper's,
+/// not the wire response, and its row keeps no response type. One question,
+/// one answerer: the member comes from the reader a model-owned row reads.
+pub fn hand_back_bodies(
+    asks: &[InferRequestItem],
+    answers: &[InferredType],
+) -> std::collections::BTreeSet<String> {
+    let asked: HashSet<&str> = asks.iter().filter_map(|ask| ask.alias.as_deref()).collect();
+    answers
+        .iter()
+        .filter(|answer| answer.body_member.is_some() && asked.contains(answer.alias.as_str()))
+        .map(|answer| answer.alias.clone())
+        .collect()
 }
 
 impl TypeResolutionResult {
@@ -4700,6 +4731,7 @@ impl TypeSidecar {
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         };
 
         // Infer implicit types FIRST: a successful inference is the compiler's
@@ -7830,6 +7862,7 @@ mod tests {
 
     fn inferred(alias: &str, symbol: Option<&str>, array_depth: Option<u32>) -> InferredType {
         InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: "{ at: string; }[]".to_string(),
             is_explicit: false,

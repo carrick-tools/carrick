@@ -3462,7 +3462,14 @@ export class TypeInferrer {
             `Call result at ${where} is a hand-back object around the response; ` +
               `its body is the member '${member}' the called function fills from the body read`
           );
-          return this.labelledCallResult(request, callExpr, { member: [member] });
+          const read = this.labelledCallResult(request, callExpr, { member: [member] });
+          // carrick#4196: the answer names the member it read, so a caller
+          // row whose owner never asked for a body reads this answer and no
+          // other reading of the call.
+          const decided = !(read.any_provenance ?? []).some(
+            (finding) => finding.path === '' && finding.reason === 'result_member_missing'
+          );
+          return decided ? { ...read, body_member: member } : read;
         }
         this.log(
           `Call result at ${where} holds transport machinery as a member and no member of ` +
