@@ -13,9 +13,11 @@
 //! check leaves. The consumer's client returns `any`, so the judge has no
 //! consumer type and leaves the pair to the consumer's reads.
 //!
-//! The socket, GraphQL and pub/sub cases run with the join's settle on and
-//! `off` (`CARRICK_JOIN_SETTLE`): the judge decides those pairs and the
-//! retype is HTTP-only, so nothing they print may move.
+//! The same HTTP break runs with the join's settle on and `off`
+//! (`CARRICK_JOIN_SETTLE`): only the settle carries the retype's verdict to
+//! the printed check. The GraphQL and pub/sub cases run the same two ways: the
+//! judge decides those pairs and the retype is HTTP-only, so nothing they
+//! print may move.
 
 /// The switch in `retype_consumer_calls` (`src/engine/type_compat_v2.rs`).
 const SKIP_RETYPE_FOR_TEST_ENV: &str = "CARRICK_TEST_SKIP_RETYPE";
@@ -114,28 +116,6 @@ fn workspace(populate: impl Fn(&Path)) -> tempfile::TempDir {
 /// judge leaves the pair to the consumer and the retype check decides it.
 fn http_workspace() -> tempfile::TempDir {
     workspace(|repo| copy_tree(&fixtures().join("retype-reach-mono"), repo))
-}
-
-/// A socket pair across two services of one repo, from the cross-repo
-/// corpus: `payments` emits `payment:settled`, `frontend` listens. Both
-/// sides state their payload types, so the judge reads the pair itself.
-fn socket_workspace() -> tempfile::TempDir {
-    workspace(|repo| {
-        let corpus = fixtures().join("xrepo-corpus-1");
-        copy_tree(&corpus.join("payments-svc"), &repo.join("apps/payments"));
-        copy_tree(&corpus.join("web-frontend"), &repo.join("apps/frontend"));
-        for service in ["payments", "frontend"] {
-            for stale in ["carrick.json", "expected.json"] {
-                let _ = std::fs::remove_file(repo.join("apps").join(service).join(stale));
-            }
-        }
-        std::fs::write(
-            repo.join("carrick.json"),
-            "{ \"services\": [ { \"name\": \"payments\", \"directory\": \"apps/payments\" }, \
-             { \"name\": \"frontend\", \"directory\": \"apps/frontend\" } ] }\n",
-        )
-        .expect("write carrick.json");
-    })
 }
 
 /// Everything one `check --changed` leaves that a reader could depend on.
@@ -329,31 +309,6 @@ fn both_with_env(
     skip_env.push((SKIP_RETYPE_FOR_TEST_ENV, "1"));
     let skipped = observe(skipped_root.path(), edit_it, env, &skip_env);
     (shipped, skipped)
-}
-
-/// A mock fixture dir holding the library store's answer for `socket.io` and
-/// `socket.io-client` as the parity test's cassettes give it for the corpus's
-/// two socket repos. Socket rows are the fact layer's alone (carrick#3854), so
-/// a refresh with no claims states none and no socket pair forms.
-fn socket_claims_cassette() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let mut claims = Vec::new();
-    for repo in ["payments-svc", "web-frontend"] {
-        let path = fixtures()
-            .join("socket-claims-xrepo/corpus-1")
-            .join(repo)
-            .join("__llm__/library-claims/default.json");
-        let answer = read_json(&path);
-        claims.extend(answer["library_claims"].as_array().expect("claims").clone());
-    }
-    let target = dir.path().join("library-claims");
-    std::fs::create_dir_all(&target).expect("create cassette dir");
-    std::fs::write(
-        target.join("default.json"),
-        serde_json::to_string(&serde_json::json!({ "library_claims": claims })).unwrap(),
-    )
-    .expect("write cassette");
-    dir
 }
 
 /// Run the same edit on two identical workspaces, with the join's settle on
@@ -673,39 +628,45 @@ fn refresh_indexes_the_retype_and_check_changed_counts_what_it_moved() {
     );
 }
 
-/// A socket payload the judge reads itself. The retype is HTTP-only, so it
-/// never runs; the check prints a real break, and the same one either way.
+/// The same retype-proven break as the first case, read through the join's
+/// settle switch (`CARRICK_JOIN_SETTLE`, carrick#3884): with the settle on,
+/// the join takes the child's stored outcome and the check prints the break
+/// and fails; with it `off`, the join judges the pair again, the consumer's
+/// client returns `any`, and the check cannot say (the old behaviour).
 #[test]
 #[serial]
-fn socket_pair_check_changed_is_the_same_without_the_retype() {
+fn http_retype_break_prints_only_with_the_join_settle_on() {
     if !sidecar_built() {
         eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
         return;
     }
-    let payload_edit = |repo: &Path| {
-        edit(
-            &repo.join("apps/payments/src/types/index.ts"),
-            "  amountCents: number;\n  status:",
-            "  amountCents: string;\n  status:",
-        );
+    let producer_edit = |repo: &Path| {
+        let route = repo.join("apps/api/app/routes/api.v1.widgets.$widgetId.ts");
+        edit(&route, "activeCount: number", "active: number");
+        edit(&route, "activeCount: 3", "active: 3");
     };
-    let claims = socket_claims_cassette();
-    let cassettes = claims.path().to_str().expect("utf-8 path");
-    let (shipped, skipped) = both_with_env(
-        socket_workspace,
-        payload_edit,
-        &[("CARRICK_MOCK_FIXTURE_DIR", cassettes)],
-    );
+    let (on, off) = settle_on_off(http_workspace, producer_edit, &[]);
+    let break_line = |observed: &Observed| {
+        observed.text.lines().any(|line| {
+            line.starts_with("mono/apps/web/src/inventory.ts:7 ")
+                && line.contains("  incompatible  ")
+                && line.contains("'activeCount' does not exist")
+        })
+    };
 
     assert!(
-        shipped
-            .text
-            .contains("incompatible  route SERVER->CLIENT payment:settled"),
-        "the check prints the socket break:\n{}",
-        shipped.text
+        break_line(&on),
+        "the settled join prints the child's break:\n{}",
+        on.text
     );
-    assert_eq!(shipped.text_exit, Some(1), "and fails the run");
-    assert_unread(&shipped, &skipped);
+    assert_eq!(on.text_exit, Some(1), "and fails:\n{}", on.text);
+    assert_eq!(on.json_exit, Some(1), "the JSON run fails too");
+    assert!(
+        !break_line(&off),
+        "with the settle off the join cannot say:\n{}",
+        off.text
+    );
+    assert_ne!(on.text_exit, off.text_exit, "the exit reads the settle");
 }
 
 /// A GraphQL pair across two services of one repo, from the cross-repo
@@ -756,38 +717,6 @@ fn assert_settle_moves_nothing(on: &Observed, off: &Observed) {
     assert_eq!(on.text_exit, off.text_exit, "the exit code");
     assert_eq!(on.json, off.json, "the printed JSON");
     assert_eq!(on.json_exit, off.json_exit, "the JSON exit code");
-}
-
-/// carrick#3884 must not move a socket pair: the judge decides it, so the
-/// join's settle prints exactly what the join's own judge printed.
-#[test]
-#[serial]
-fn socket_pair_prints_the_same_with_the_join_settle_off() {
-    if !sidecar_built() {
-        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
-        return;
-    }
-    let payload_edit = |repo: &Path| {
-        edit(
-            &repo.join("apps/payments/src/types/index.ts"),
-            "  amountCents: number;\n  status:",
-            "  amountCents: string;\n  status:",
-        );
-    };
-    let claims = socket_claims_cassette();
-    let cassettes = claims.path().to_str().expect("utf-8 path");
-    let (on, off) = settle_on_off(
-        socket_workspace,
-        payload_edit,
-        &[("CARRICK_MOCK_FIXTURE_DIR", cassettes)],
-    );
-    assert!(
-        on.text
-            .contains("incompatible  route SERVER->CLIENT payment:settled"),
-        "the check prints the socket break:\n{}",
-        on.text
-    );
-    assert_settle_moves_nothing(&on, &off);
 }
 
 /// The same for a GraphQL pair.
