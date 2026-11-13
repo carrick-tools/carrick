@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "api", "directory": "api" },
+    { "serviceName": "web", "directory": "web", "tsconfig": "tsconfig.json" }
+  ]
+}

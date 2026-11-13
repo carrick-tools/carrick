@@ -788,3 +788,82 @@ fn a_withdrawn_request_line_keeps_its_request_type_at_each_caller() {
         );
     }
 }
+
+// `tests/fixtures/hand-back-object` (carrick#4185): `web` calls `api` through
+// wrappers that hand back the transport response beside the parsed body. A
+// caller's value is that object, never the body: the body is the member the
+// wrapper fills from the body read, and where no one member is decided the
+// site states no response contract.
+
+const HAND_BACK_APP: &str = "web/src/app.ts";
+
+fn hand_back_blobs() -> &'static BTreeMap<String, serde_json::Value> {
+    static BLOBS: OnceLock<BTreeMap<String, serde_json::Value>> = OnceLock::new();
+    BLOBS.get_or_init(|| {
+        scan_typed_fixture(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hand-back-object"),
+        )
+    })
+}
+
+/// The `(side, verdict)` pairs stored for the call at `site`.
+fn hand_back_verdicts(site: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = hand_back_blobs()
+        .values()
+        .flat_map(|blob| {
+            blob["compat_verdicts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .flat_map(|pair| {
+            pair["sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|at| at["consumer_location"] == site)
+                .flat_map(|at| {
+                    ["request", "response"]
+                        .into_iter()
+                        .filter_map(|side| {
+                            at[side]["verdict"]
+                                .as_str()
+                                .map(|verdict| (side.to_string(), verdict.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// `call` fills `json` from the body read in its one return: the caller is
+/// judged on that member, not on `{ res, json }`.
+#[test]
+fn a_hand_back_object_is_judged_on_its_body_member() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:4")),
+        [("response".to_string(), "compatible".to_string())]
+    );
+}
+
+/// `callEither` fills a different member in each return: no member is the
+/// body, so the pair is unverifiable rather than judged on the object.
+#[test]
+fn a_hand_back_object_with_no_decided_body_member_is_unverifiable() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:9")),
+        [("response".to_string(), "unverifiable".to_string())]
+    );
+}
