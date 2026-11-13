@@ -163,12 +163,20 @@ pub struct CallThroughSites {
     /// run that analyses the service, so never stored, like
     /// [`Self::written`].
     pub direct: HashSet<(String, u32)>,
+    /// The fact through-rows read off no call: their file was not walked, no
+    /// one call places them, or their call writes a request of its own. They
+    /// stay as the fact stated them, and [`settle`] counts them as left.
+    /// Never stored, like [`Self::written`].
+    pub facts_unread: usize,
 }
 
 impl CallThroughSites {
-    /// Whether there is nothing to store. The leaf calls are never stored.
+    /// Whether there is nothing to store. The leaf calls and the fact
+    /// through-rows are never stored.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.return_shapes.is_empty() && self.side_calls.is_empty()
+        self.rows.iter().all(|row| row.fact)
+            && self.return_shapes.is_empty()
+            && self.side_calls.is_empty()
     }
 }
 
@@ -293,6 +301,7 @@ impl StoredCallThrough {
             leaves: Vec::new(),
             written: HashMap::new(),
             direct: HashSet::new(),
+            facts_unread: 0,
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -403,6 +412,7 @@ pub fn read_sites(
             leaves,
             written,
             direct: HashSet::new(),
+            facts_unread: 0,
         };
     }
 
@@ -411,6 +421,7 @@ pub fn read_sites(
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
     let mut rows = Vec::new();
     let mut direct = HashSet::new();
+    let mut facts_unread = 0;
     for (relative, result) in keys {
         let absolute = Path::new(root).join(&relative);
         let discovered = match inputs.files.get_key_value(&absolute) {
@@ -437,6 +448,7 @@ pub fn read_sites(
                     "  - {relative}: {} fact through-row(s) in a file discovery did not walk",
                     facts.len()
                 );
+                facts_unread += facts.len();
             }
             continue;
         };
@@ -509,6 +521,8 @@ pub fn read_sites(
                 outside: &outside,
             },
         );
+        facts_unread += wanted.iter().filter(|row| row.fact).count()
+            - read.iter().filter(|row| row.fact).count();
         rows.extend(read);
         direct.extend(lines.into_iter().map(|line| (relative.clone(), line)));
     }
@@ -519,6 +533,7 @@ pub fn read_sites(
         leaves,
         written,
         direct,
+        facts_unread,
     }
 }
 
@@ -1689,6 +1704,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         let mut corrected = 0;
         let mut withdrawn_at_helper = 0;
         let mut fact_settled = 0;
+        settled.fact_through_left += service.sites.facts_unread;
         for row in &service.sites.rows {
             if row.fact {
                 // A fact through-row: the same walk decides it, and only one
@@ -1698,7 +1714,15 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     Reach::One { request, step } => {
                         let carries = carries_response(&graph, row, request, step);
                         let change = apply(service.data, row, request, carries);
-                        fact_settled += usize::from(change.is_some());
+                        if change.is_some() {
+                            fact_settled += 1;
+                        } else {
+                            debug!(
+                                "  - {}:{} {} {}: left as the fact stated it, the graph holds no such row",
+                                row.file, row.line, row.method, row.target
+                            );
+                            settled.fact_through_left += 1;
+                        }
                         settled.count(change);
                     }
                     reach => {
@@ -3877,6 +3901,7 @@ mod tests {
                 leaves: Vec::new(),
                 written: HashMap::new(),
                 direct: HashSet::new(),
+                facts_unread: 0,
             }
         };
         let sites = facts(&[0, 1]);
@@ -3898,6 +3923,16 @@ mod tests {
             ..CallThroughSites::default()
         };
         assert!(StoredCallThrough::of(&only_shapes).is_some());
+        // Fact through-rows are read only in the run that analyses the
+        // service: a service with nothing else stores nothing.
+        let only_facts = CallThroughSites {
+            rows: vec![SiteRow {
+                fact: true,
+                ..sites.rows[0].clone()
+            }],
+            ..CallThroughSites::default()
+        };
+        assert_eq!(StoredCallThrough::of(&only_facts), None);
     }
 
     /// A blob written before the return shapes carries the list of definitions
