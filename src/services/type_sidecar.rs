@@ -7929,6 +7929,7 @@ mod tests {
             route_path: None,
             result_unanswered: false,
             through_call: None,
+            at_registration: false,
         };
         let finding = |reason: &str| TypeProvenance {
             path: String::new(),

@@ -512,6 +512,7 @@ fn an_http_route_handlers_parameter_is_not_its_request_body() {
         &[entry(http(), "producer", "request", "Route", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].infer_kind, InferKind::RequestBody);
@@ -542,6 +543,7 @@ fn an_http_route_handlers_parameter_is_not_its_request_body() {
             &[entry(key, "producer", "response", "Sub", 2)],
             &root,
             &ResultIndex::default(),
+            &HashSet::new(),
         );
         assert_eq!(requests.len(), 1, "{role}: {requests:?}");
         assert_eq!(requests[0].infer_kind, InferKind::FunctionParam, "{role}");
