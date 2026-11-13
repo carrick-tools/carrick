@@ -38,6 +38,7 @@ import {
   type RawDiagnostic,
 } from './check-classify.js';
 import { scrubPaths, type ScrubContext } from './check-scrub.js';
+import { toolEnv } from './tool-env.js';
 import {
   assembleWorkspace,
   writeProbes,
@@ -512,7 +513,7 @@ export async function runCheck(
     pnpmPath,
     ['install'],
     ws.workspaceDir,
-    undefined,
+    toolEnv(),
     installLimits
   );
   if (install.code !== 0 || install.timedOut) {

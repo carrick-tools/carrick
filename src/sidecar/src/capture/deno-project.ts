@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { sidecarCompilerOptions } from './compiler-options.js';
 import { rewriteSpecifiers } from './specifiers.js';
 import { WriteGuard } from './guarded-fs.js';
+import { toolEnv } from './tool-env.js';
 
 interface Config {
   workspace?: string[];
@@ -109,7 +110,7 @@ function runDeno(args: string[], cwd: string): string {
   try {
     return execFileSync('deno', args, {
       cwd, encoding: 'utf8', timeout: 120_000, maxBuffer: 64 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, DENO_NO_UPDATE_CHECK: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'], env: toolEnv({ DENO_NO_UPDATE_CHECK: '1' }),
     });
   } catch (err) {
     const detail = err as { stderr?: string; message?: string };
