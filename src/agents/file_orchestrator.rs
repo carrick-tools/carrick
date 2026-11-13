@@ -1606,8 +1606,8 @@ struct Resolved {
     source: ResolutionSource,
     /// Whether this statement is a ROW when the model returns nothing at
     /// its span. False for a statement that can only qualify a row the
-    /// model returns: the path a `new URL` gives a call whose verb is
-    /// unreadable has no verb to be indexed under.
+    /// model returns: a bare `{ method, url }` object, which can equally be a
+    /// producer's route descriptor.
     emits: bool,
     row: ResolvedRow,
 }
@@ -1625,7 +1625,7 @@ impl ResolutionSource {
     /// is logged, never merged. The order is the one the pass sequence had
     /// before this consolidation: the whole-URL correction ran last and
     /// overwrote, the imported member ran before the request spec, and the
-    /// request spec overruled the `new URL` path.
+    /// request spec overruled the (since deleted) `new URL` path.
     fn precedence(self) -> u8 {
         match self {
             Self::WholeUrlEnv => 8,
@@ -8706,39 +8706,10 @@ impl FileOrchestrator {
                 });
             }
 
-            // The path a `new URL(path, base)` states for the target
-            // (carrick#610). The base stays opaque, so the call matches by
-            // route path like every other host-free call. A site whose verb is
-            // not readable off its own options bag states no row — the same
-            // rule the whole-URL source above applies — but it still overrules
-            // the path of the row the model returns.
-            if let Some(path) = candidate.new_url_path.as_deref() {
-                let method = match &candidate.request_shape {
-                    RequestShapeSignal::Known(shape) => Some(shape.method.clone()),
-                    _ => None,
-                };
-                claim(Resolved {
-                    method: method.clone(),
-                    url: path.to_string(),
-                    span,
-                    line,
-                    source: ResolutionSource::NewUrl,
-                    emits: method.is_some(),
-                    row: ResolvedRow::Call(Box::new(Self::deterministic_call(
-                        candidate,
-                        line,
-                        path.to_string(),
-                        method,
-                        ResolutionSource::NewUrl,
-                        None,
-                    ))),
-                });
-            }
-
             // The verb the call is spelled with, on its own (carrick-cloud#1365).
             // Every source above that states a verb also states a target, and
             // needs one it can read: a whole-URL binding, a base binding, a
-            // member, a request spec, a `new URL`, a plain string literal. A
+            // member, a request spec, a plain string literal. A
             // verb-named call on a template literal (`client.post(`/x/${id}`)`)
             // matches none of them, so the model's row was the only statement
             // of the site, and a row whose method the model left out was
@@ -9269,7 +9240,7 @@ impl FileOrchestrator {
     /// cross-file controller join runs against results that already hold the
     /// model's rows.
     /// Returns the statements that are NOT rows of their own — a config-object
-    /// request spec, a `new URL` path at a site whose verb is unreadable —
+    /// request spec at a site whose verb is unreadable —
     /// which the join applies to whatever the model returns at their span.
     fn emit_resolved_rows(
         result: &mut FileAnalysisResult,
@@ -19861,7 +19832,6 @@ export { routes };
             path_snippet: Some(format!("\"{path}\"")),
             code_snippet: format!("{receiver}.get(\"{path}\", arg)"),
             request_spec: None,
-            new_url_path: None,
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::Known(
                 WrapperRequestShape {
                     method: "GET".to_string(),
@@ -20050,7 +20020,6 @@ export { routes };
             path_snippet: snippet.map(|s| s.to_string()),
             code_snippet: "router.get(...)".to_string(),
             request_spec: None,
-            new_url_path: None,
             request_shape: crate::wrapper_request_shape::RequestShapeSignal::NotARequest,
             receiver_ident: Some("router".to_string()),
             base_path_target: None,

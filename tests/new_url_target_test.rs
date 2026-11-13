@@ -129,9 +129,9 @@ fn the_decoy_call_is_left_exactly_as_it_was_written() {
 /// that opaque argument, not a reading of the source. Keeping it keys the row
 /// on a base no route lookup can reach.
 ///
-/// The one prefix the model can only have READ is a literal absolute origin,
-/// which is also the one that classifies the call as external. That one is
-/// kept; everything else is discarded and the stated path wins.
+/// Every prefix the model reports is discarded and the stated path wins,
+/// including a literal absolute origin: the source's base is opaque, so the
+/// row is host-free.
 #[test]
 fn a_new_url_row_is_keyed_on_the_path_its_source_states_not_the_models_prefix() {
     let calls = calls();
@@ -172,12 +172,40 @@ fn a_new_url_row_is_keyed_on_the_path_its_source_states_not_the_models_prefix() 
         "http|POST|/api/v1/runs/:runFriendlyId/snapshots/:snapshotFriendlyId/continue"
     );
 
-    // A literal absolute origin is the carve-out: the model read a host the
-    // source does not state, and the origin is the classification.
+    // The recorded model answer named a literal origin, but the source's base
+    // is the opaque `this.opts.apiUrl`. The row is host-free: the source
+    // states the path and nothing else, whatever origin the model reported.
     let complete = call_at(&calls, file, 46);
     assert_eq!(complete["method"], "POST");
     assert_eq!(
         complete["target_url"],
-        "https://api.example.test/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete"
+        "/api/v1/runs/${runFriendlyId}/attempts/${attemptFriendlyId}/complete"
     );
+    assert_eq!(
+        complete["key"],
+        "http|POST|/api/v1/runs/:runFriendlyId/attempts/:attemptFriendlyId/complete"
+    );
+    assert_eq!(complete["base"]["kind"], "relative");
+}
+
+/// C11: the `new URL` rule is deleted, so the request summaries state every
+/// site it stated. Each row the tests above assert is a `request_summary` row
+/// with the same key, not the model's and not a retired pass's.
+#[test]
+fn every_new_url_site_is_stated_by_the_request_summaries() {
+    let calls = calls();
+    for (file, line) in [
+        ("src/catalogue.ts", 18),
+        ("src/catalogue.ts", 27),
+        ("src/catalogue.ts", 33),
+        ("src/checkpoints.ts", 15),
+        ("src/checkpoints.ts", 30),
+        ("src/checkpoints.ts", 46),
+    ] {
+        let call = call_at(&calls, file, line);
+        assert_eq!(
+            call["resolution_source"], "request_summary",
+            "{file}:{line} is stated by the request summaries: {call:#?}"
+        );
+    }
 }

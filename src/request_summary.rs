@@ -3495,6 +3495,66 @@ fn writes_a_path_segment(value: &Value) -> bool {
     false
 }
 
+/// A builder's returns that are each the caller's own parameter `index`,
+/// whole (`init ?? {}`) or spread first into an object (`{ ...init, keepalive:
+/// true }`, [`ObjValue::under_param`] with nothing written before it): the
+/// caller's options, with each key any return writes after the spread
+/// unread. Such a key is held before the spread, as an unknown, and
+/// unsettled, so the option-key readers (a decided site's method and payload
+/// slot, [`Effect::read_key`]) refuse it, and every other key is
+/// the one the caller's caller writes (carrick#1561 C11). `None`
+/// where the returns are all one value (that value is the answer), and
+/// unless at least one return spreads the parameter and every return is one
+/// of those two forms of the same parameter.
+fn passed_options(values: &[Value]) -> Option<Value> {
+    if values.iter().all(|value| *value == values[0]) {
+        return None;
+    }
+    let mut index: Option<usize> = None;
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    let mut spread = false;
+    for value in values {
+        let position = match value {
+            Value::Str(pieces) => match pieces.as_slice() {
+                [Piece::Param(position, _)] => *position,
+                _ => return None,
+            },
+            Value::Obj(object) => match &object.under_param {
+                Some((position, before))
+                    if before.is_empty()
+                        && object.under_rest.is_none()
+                        && object.functions.is_empty() =>
+                {
+                    spread = true;
+                    written.extend(object.fields.keys().cloned());
+                    written.extend(object.unsettled.iter().cloned());
+                    *position
+                }
+                _ => return None,
+            },
+            Value::Callback(_) => return None,
+        };
+        if index.is_some_and(|index| index != position) {
+            return None;
+        }
+        index = Some(position);
+    }
+    let index = index.filter(|_| spread)?;
+    let before = written
+        .iter()
+        .map(|key| (key.clone(), Value::Str(vec![Piece::Unknown])))
+        .collect();
+    Some(Value::Obj(ObjValue {
+        fields: BTreeMap::new(),
+        open: true,
+        under_param: Some((index, before)),
+        under_rest: None,
+        unsettled: written,
+        functions: BTreeSet::new(),
+        wide: true,
+    }))
+}
+
 /// A value that is one of `values`: a builder's returns, a conditional's
 /// branches (carrick#2536, carrick#2541).
 ///
@@ -5239,6 +5299,13 @@ struct Scope<'a> {
     /// assigns again, nor one whose name the file writes through, nor one the
     /// function hands to `Object.assign` as its target (carrick#2674).
     key_objects: HashSet<BindingKey>,
+    /// A builder's parameters the call hands one of the caller's
+    /// [`Self::key_objects`] whole (`withDefaults(init)`), by the caller's
+    /// position ([`Reader::builder_call`]): a spread of one in the builder's
+    /// return is a spread of the caller's parameter ([`Reader::own_param`]),
+    /// so the keys the caller's caller writes there stay read. Empty in
+    /// every scope but a builder's.
+    passed_params: HashMap<BindingKey, usize>,
     /// [`Captured::objects`]: an enclosing function's parameter whose keys
     /// this body reads (`props.endpoint` in a closure), read as
     /// [`Piece::Outer`] keys (carrick#1949).
@@ -5315,6 +5382,7 @@ impl<'a> Scope<'a> {
             defaults: HashMap::new(),
             rest_of: HashMap::new(),
             key_objects: HashSet::new(),
+            passed_params: HashMap::new(),
             outer_objects: HashMap::new(),
             locals: HashMap::new(),
             texts: HashMap::new(),
@@ -6410,6 +6478,7 @@ impl Reader<'_> {
             defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
+            passed_params: HashMap::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
@@ -6514,6 +6583,7 @@ impl Reader<'_> {
             defaults: HashMap::new(),
             rest_of: captured.rests.clone(),
             key_objects: HashSet::new(),
+            passed_params: HashMap::new(),
             outer_objects: captured.objects.clone(),
             locals: captured.values.clone(),
             texts: captured.texts.clone(),
@@ -7351,7 +7421,15 @@ impl Reader<'_> {
                 continue;
             };
             let value = match call.args.get(index) {
-                Some(arg) => self.eval(&arg.expr, scope),
+                Some(arg) => {
+                    // `withDefaults(init)`: the caller's own options, whole.
+                    // A spread of the parameter in the return keeps the keys
+                    // the caller's caller writes there (carrick#1561 C11).
+                    if let Some(passed) = self.own_param(&arg.expr, scope) {
+                        inner.passed_params.insert(param.clone(), passed);
+                    }
+                    self.eval(&arg.expr, scope)
+                }
                 None => Value::Str(vec![Piece::Unknown]),
             };
             inner.locals.insert(param.clone(), value);
@@ -7365,7 +7443,7 @@ impl Reader<'_> {
                 .collect()
         });
         self.builder_depth.set(depth);
-        several_values(values, self.text(call.span))
+        passed_options(&values).or_else(|| several_values(values, self.text(call.span)))
     }
 
     /// `new URL(path, base)`: the base is opaque and leads, the path follows.
@@ -7530,12 +7608,15 @@ impl Reader<'_> {
     }
 
     /// The position of the function's own parameter `expr` names, when its
-    /// keys are the ones the caller wrote ([`Scope::key_objects`]).
+    /// keys are the ones the caller wrote ([`Scope::key_objects`]); in a
+    /// builder, the caller's parameter one of its own holds whole
+    /// ([`Scope::passed_params`]).
     fn own_param(&self, expr: &Expr, scope: &Scope<'_>) -> Option<usize> {
         match crate::graphql_document_sites::unwrap_expression(expr) {
             Expr::Ident(ident) if scope.key_objects.contains(&ident_key(ident)) => {
                 scope.param_index(ident)
             }
+            Expr::Ident(ident) => scope.passed_params.get(&ident_key(ident)).copied(),
             _ => None,
         }
     }

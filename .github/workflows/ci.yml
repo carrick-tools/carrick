@@ -100,7 +100,7 @@ jobs:
             partitioned: --test call_through_rows_test
             partition: slice:3/3
             targets: >-
-              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test composed_strings_test --test incremental_raw_cache_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test url_to_string_choices_test --test wrapper_sibling_callers_test
+              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test composed_strings_test --test incremental_raw_cache_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test new_url_through_wrapper_test --test url_to_string_choices_test --test wrapper_sibling_callers_test
           - shard: n6
             runner: nextest
             partitioned: --test call_through_rows_test

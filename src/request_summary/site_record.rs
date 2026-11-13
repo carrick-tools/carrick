@@ -3431,7 +3431,23 @@ mod tests {
             direct.anchors.payload_at.clone().map(PayloadAt::Value)
         );
         assert!(direct.payloads.request.is_some());
-        for needle in ["call(\"/x\"", "wrapped(\"/wrapped\"", "direct/spread`"] {
+        // A module helper that spreads the options it is handed: the
+        // caller's literal writes no body (carrick#1561 C11).
+        let wrapped = record("wrapped(\"/wrapped\"");
+        let call = anchor("wrapped(\"/wrapped\", { method: \"POST\" })");
+        let literal = call.span_start + "wrapped(\"/wrapped\", ".len() as u32;
+        assert_eq!(
+            wrapped.payloads.request,
+            Some(PayloadAt::Unwritten {
+                at: AnchorAt {
+                    span_start: literal,
+                    span_end: literal + "{ method: \"POST\" }".len() as u32,
+                    ..call
+                },
+                key: "body".to_string(),
+            })
+        );
+        for needle in ["call(\"/x\"", "direct/spread`"] {
             assert_eq!(record(needle).payloads.request, None, "{needle}");
         }
         // Nothing else moves.

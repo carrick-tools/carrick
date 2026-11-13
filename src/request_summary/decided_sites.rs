@@ -6617,8 +6617,9 @@ pub(crate) mod tests {
     /// through a wrapper's spread of its own parameter and the rest of a
     /// destructured one, at any closure depth for the rest, and read at the
     /// deciding call: written there, or stated absent by a literal that holds
-    /// no spread. A wrapper that takes the key out, hands the options through
-    /// a call, or a literal that spreads another object, is not read. The
+    /// no spread, or through a module helper that spreads them (carrick#1561
+    /// C11). A wrapper that takes the key out, or a literal that spreads
+    /// another object, is not read. The
     /// payload binding itself stays as it was.
     #[test]
     fn a_payload_key_is_carried_through_a_spread_and_a_rest_to_the_deciding_call() {
@@ -6659,10 +6660,12 @@ pub(crate) mod tests {
         // A direct call that writes a closed literal.
         assert_eq!(slot_at("direct/ping`"), unwritten(1));
         assert_eq!(slot_at("direct/body`"), written(1));
+        // A module helper that spreads the options it is handed
+        // (`withDefaults(init)`, carrick#1561 C11): the caller's options.
+        assert_eq!(slot_at("wrapped(\"/wrapped\""), unwritten(1));
         // Controls: nothing is read.
         assert_eq!(slot_at("call(\"/x\""), None);
         assert_eq!(slot_at("sendStripped({ path"), None);
-        assert_eq!(slot_at("wrapped(\"/wrapped\""), None);
         assert_eq!(slot_at("direct/spread`"), None);
         // The payload binding is what it was: built inside the wrapper.
         for needle in ["send({ path: \"/ping\"", "post(\"/logout\", {})"] {
