@@ -409,8 +409,9 @@ enum BetaDies {
     /// one that finds no `died` file. Its second process lives.
     WalkOnce,
     /// Only at type resolution (`infer` or `bundle`), and only while
-    /// `home/die` exists: `plain` in it is a plain `exit(1)`, anything else a
-    /// full heap. Every `beta` request writes `died`, so a run whose `beta`
+    /// `home/die` exists: `plain` in it is a plain `exit(1)`, `under <N>` a
+    /// full heap in a process started with a heap cap below `N` MB only
+    /// (carrick#4180), anything else a full heap. Every `beta` request writes `died`, so a run whose `beta`
     /// lives still shows it was asked (carrick#3992).
     AtResolution,
 }
@@ -457,8 +458,11 @@ process.stdin.on("data", (chunk) => {{
     }}
     if ({at_resolution} && root.endsWith("beta")) {{
       fs.writeFileSync({died:?}, request.action);
-      if ((request.action === "infer" || request.action === "bundle") && fs.existsSync({die:?})) {{
-        if (fs.readFileSync({die:?}, "utf8").trim() === "plain") process.exit(1);
+      const how = fs.existsSync({die:?}) ? fs.readFileSync({die:?}, "utf8").trim() : "";
+      const under = /^under (\d+)$/.exec(how);
+      const cap = Number((/--max-old-space-size=(\d+)/.exec(process.execArgv.join(" ")) || [])[1] || 0);
+      if ((request.action === "infer" || request.action === "bundle") && how && (!under || cap < Number(under[1]))) {{
+        if (how === "plain") process.exit(1);
         fs.writeSync(2, "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n");
         process.abort();
       }}
@@ -1204,6 +1208,76 @@ fn the_local_indexer_keeps_the_typed_service_and_exits_0() {
         "{}",
         run.stderr
     );
+    assert_eq!(
+        serde_json::to_string_pretty(&stored_blobs(&fixture.store)["beta"]).unwrap(),
+        serde_json::to_string_pretty(&stored["beta"]).unwrap(),
+        "beta's typed index was replaced"
+    );
+}
+
+/// The run cap of the carrick#4180 tests: beta's stored peak of 1,000 MB
+/// starts its process at 2,048 MB, below it. One service at a time, so its
+/// death is never beside alpha's analysis.
+const RUN_CAP_4096: [(&str, &str); 2] = [
+    ("CARRICK_SIDECAR_MAX_OLD_SPACE_MB", "4096"),
+    ("CARRICK_SERVICE_CONCURRENCY", "1"),
+];
+
+const AGAIN_AT_THE_RUN_CAP: &str = "Service beta died of memory under its heap cap of 2048 MB; analysing it again alone at 4096 MB";
+
+/// carrick#4180: a first scan under a run cap of 4,096 MB in which nothing
+/// dies, so nothing is analysed again; then beta's stored analysis peak is
+/// set to 1,000 MB and both services change. Returns the new head.
+fn typed_index_with_a_stored_peak(fixture: &LateTypeLoss) -> String {
+    let first = fixture.scan(None, false, &RUN_CAP_4096);
+    assert_eq!(first.code, Some(0), "{}\n{}", first.stderr, first.log);
+    assert!(
+        !first.log.contains("analysing it again alone"),
+        "a run in which nothing died analysed a service again:\n{}",
+        first.log
+    );
+    assert_eq!(
+        first.log.matches("Analyzing service beta").count(),
+        1,
+        "{}",
+        first.log
+    );
+    let (path, mut blob) = stored_blob_file(&fixture.store, "beta");
+    assert!(blob["types_degraded"].is_null(), "{blob}");
+    blob["memory_peaks"] = serde_json::json!({ "analysis_mb": 1000 });
+    std::fs::write(&path, serde_json::to_string_pretty(&blob).unwrap()).unwrap();
+    fixture.change_both()
+}
+
+/// carrick#4180: without `CARRICK_FAIL_ON_TYPE_MEMORY` (the Action, the CLI),
+/// a service whose checker dies of memory under its own cap, one below the
+/// run's, is analysed again alone at the run's cap. It lives there, so it
+/// lands typed at this run's commit, and the run exits 0.
+#[test]
+fn a_memory_death_under_the_service_s_cap_is_analysed_again_at_the_run_s_cap() {
+    let fixture = LateTypeLoss::new();
+    let head = typed_index_with_a_stored_peak(&fixture);
+
+    let run = fixture.scan(Some("under 4096"), false, &RUN_CAP_4096);
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
+    assert!(run.log.contains(AGAIN_AT_THE_RUN_CAP), "{}", run.log);
+    let beta = fixture.blob("beta");
+    assert_eq!(beta["commit_hash"], head.as_str(), "{beta}");
+    assert!(beta["types_degraded"].is_null(), "{beta}");
+}
+
+/// carrick#4180: the same death, again at the run's cap, is the real loss:
+/// alone at the run's cap, so the stored typed index is kept (carrick#3992).
+#[test]
+fn a_memory_death_under_the_service_s_cap_and_at_the_run_s_keeps_the_typed_index() {
+    let fixture = LateTypeLoss::new();
+    typed_index_with_a_stored_peak(&fixture);
+    let stored = stored_blobs(&fixture.store);
+
+    let run = fixture.scan(Some("heap"), false, &RUN_CAP_4096);
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
+    assert!(run.log.contains(AGAIN_AT_THE_RUN_CAP), "{}", run.log);
+    assert!(run.stderr.contains(KEPT_FOR_TYPES), "{}", run.stderr);
     assert_eq!(
         serde_json::to_string_pretty(&stored_blobs(&fixture.store)["beta"]).unwrap(),
         serde_json::to_string_pretty(&stored["beta"]).unwrap(),
