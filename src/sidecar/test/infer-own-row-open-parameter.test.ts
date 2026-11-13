@@ -34,6 +34,9 @@ export async function fetchGeneric<T>(endpoint: string) {
   return page;
 }
 
+export const readArrow = <A>(endpoint: string): Promise<A> =>
+  send(endpoint, { arrow: true }) as Promise<A>;
+
 export class Repo<E> {
   load(endpoint: string): Promise<E> {
     return get<E>(endpoint);
@@ -171,6 +174,10 @@ describe('carrick#4201: a generic function’s own row publishes no open type pa
 
   it('function_return: a method returning its class parameter', async () => {
     assertBound(await infer('function_return', 'load(endpoint: string): Promise<E>', {}, true), 'method');
+  });
+
+  it('function_return: a generic arrow function a const holds', async () => {
+    assertBound(await infer('function_return', 'export const readArrow', {}, true), 'arrow');
   });
 
   it('call_result: a call whose result holds the parameter inside an object', async () => {
