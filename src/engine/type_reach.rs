@@ -328,6 +328,26 @@ pub(crate) fn base_alias(alias: &str) -> &str {
     alias
 }
 
+/// The stored record without the synthetic `Endpoint_` aliases `held` does
+/// not hold, re-encoded; `None` when none goes, so the stored bytes stay as
+/// they are. `held` reads each key as written. Everything but `aliases` is
+/// carried over unchanged.
+pub(crate) fn retain_held_aliases(
+    object: &crate::cloud_storage::TypeReachObject,
+    held: &dyn Fn(&str) -> bool,
+) -> Option<crate::cloud_storage::TypeReachObject> {
+    let mut record = crate::cloud_storage::decode_type_reach(object.gz(), object.reference())?;
+    let before = record.aliases.len();
+    record.aliases.retain(|alias, _| {
+        !alias.starts_with(crate::type_manifest::ENDPOINT_ALIAS_PREFIX) || held(alias)
+    });
+    if record.aliases.len() == before {
+        return None;
+    }
+    let value = serde_json::to_value(&record).ok()?;
+    crate::cloud_storage::TypeReachObject::encode(&value).ok()
+}
+
 /// A manifest entry's row key: protocol, method and path (or the other
 /// protocols' identity), role, type kind, evidence file and line.
 fn row_key(entry: &TypeManifestEntry, repo_path: &str) -> String {
@@ -1590,6 +1610,29 @@ mod tests {
             reached_of(&new_alias.decide(&Fake::reaching(&[]))),
             vec!["C"]
         );
+    }
+
+    #[test]
+    fn retain_held_aliases_drops_only_unheld_endpoint_keys() {
+        let mut full = record();
+        full.aliases.insert(
+            "Endpoint_x_Response".to_string(),
+            vec!["src/a.ts".to_string()],
+        );
+        let object =
+            crate::cloud_storage::TypeReachObject::encode(&serde_json::to_value(&full).unwrap())
+                .unwrap();
+        let held = |name: &str| name != "Endpoint_x_Response";
+
+        // Nothing to drop: no new object.
+        assert!(retain_held_aliases(&object, &|_| true).is_none());
+
+        let trimmed = retain_held_aliases(&object, &held).expect("one key goes");
+        let back =
+            crate::cloud_storage::decode_type_reach(trimmed.gz(), trimmed.reference()).unwrap();
+        let mut expected = full;
+        expected.aliases.remove("Endpoint_x_Response");
+        assert_eq!(back, expected);
     }
 
     #[test]

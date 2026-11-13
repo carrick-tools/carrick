@@ -1845,6 +1845,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             // finished service held are decided on the votes heard, and one
             // the stopped service walks stays `Served` (carrick#3888).
             settle_held_graphql_documents(&scan.graphql_schemas, &mut runs);
+            // Call-through never settled on this path, so the entries still
+            // under their provisional key go with the names nothing holds.
+            for run in runs
+                .iter_mut()
+                .filter(|run| run.owed.is_empty() && !run.carried)
+            {
+                drop_unheld_type_names(&mut run.data, &mut run.type_reach);
+            }
             let finished: Vec<&CloudRepoData> = runs
                 .iter()
                 // A carried service's data is its stored blob, which has
@@ -2307,6 +2315,13 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 );
             }
         }
+    }
+
+    // Every pass that drops entries after capture has run: the declarations
+    // no entry holds any more are not stored. A carried or held-back service
+    // keeps the blob its generation holds.
+    for run in runs.iter_mut().filter(|run| !run.carried && !run.held_back) {
+        drop_unheld_type_names(&mut run.data, &mut run.type_reach);
     }
 
     // Whether this run leaves a service short of a complete index. A missing
@@ -4206,6 +4221,88 @@ type TypeReachObjects = HashMap<(String, Option<String>), crate::cloud_storage::
 
 /// The records the run's analysed services read. A carried service has none:
 /// its stored generation stands in for it and nothing typed it this run.
+/// Drop the synthetic type names no manifest entry holds, once every pass
+/// that drops entries after capture has run: call-through, route boundaries,
+/// GraphQL documents. Capture wrote a declaration for every name asked; the
+/// ones whose entry was dropped since would be stored with nothing naming
+/// them. A name is held when its base alias ([`type_reach::base_alias`]) is a
+/// manifest `type_alias`. Trims the bundle, the stub's `surface.d.ts` and
+/// manifest `aliases[]`, and the type-reach record's `aliases`; the
+/// manifest's `fidelity` stays as capture wrote it. Entries still under the
+/// provisional leaf key go first: on a run that never settled them none may
+/// be stored (carrick#4113).
+fn drop_unheld_type_names(
+    data: &mut CloudRepoData,
+    reach: &mut Option<crate::cloud_storage::TypeReachObject>,
+) {
+    let provisional = crate::call_through::drop_unstated_leaf_entries(data);
+    let held_aliases: HashSet<String> = data
+        .type_manifest
+        .iter()
+        .flatten()
+        .map(|entry| entry.type_alias.clone())
+        .collect();
+    let held = |name: &str| held_aliases.contains(type_reach::base_alias(name));
+    let mut bundle = 0;
+    if let Some(text) = data.bundled_types.as_mut() {
+        let (kept, dropped) = crate::type_manifest::drop_alias_declarations(text, &held);
+        if dropped > 0 {
+            *text = kept;
+            bundle = dropped;
+        }
+    }
+    let (mut stub, mut records) = (0, 0);
+    if let Some(artifact) = data.capture_stub.as_mut() {
+        if let Some(text) = artifact.files.get_mut("types/surface.d.ts") {
+            let (kept, dropped) = crate::type_manifest::drop_alias_declarations(text, &held);
+            if dropped > 0 {
+                *text = kept;
+                stub = dropped;
+            }
+        }
+        if let Some(text) = artifact.files.get_mut("carrick-manifest.json")
+            && let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(list) = manifest
+                .get_mut("aliases")
+                .and_then(serde_json::Value::as_array_mut)
+        {
+            let before = list.len();
+            list.retain(|record| {
+                record
+                    .get("alias")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|alias| {
+                        !alias.starts_with(crate::type_manifest::ENDPOINT_ALIAS_PREFIX)
+                            || held(alias)
+                    })
+            });
+            records = before - list.len();
+            if records > 0
+                && let Ok(rewritten) = serde_json::to_string_pretty(&manifest)
+            {
+                *text = rewritten;
+            }
+        }
+    }
+    let mut reached = 0;
+    if let Some(object) = reach.as_ref()
+        && let Some(trimmed) = type_reach::retain_held_aliases(object, &held)
+    {
+        let count = |object: &crate::cloud_storage::TypeReachObject| {
+            crate::cloud_storage::decode_type_reach(object.gz(), object.reference())
+                .map_or(0, |record| record.aliases.len())
+        };
+        reached = count(object).saturating_sub(count(&trimmed));
+        *reach = Some(trimmed);
+    }
+    debug!(
+        "Type names no manifest entry holds, dropped after the row passes ({}): {bundle} bundle, \
+         {stub} stub, {records} stub records, {reached} reach aliases, {provisional} provisional \
+         leaf entries",
+        data.service_name.as_deref().unwrap_or(&data.repo_name)
+    );
+}
+
 fn type_reach_objects(runs: &[ServiceRun]) -> TypeReachObjects {
     runs.iter()
         .filter(|run| !run.carried)
@@ -16285,6 +16382,33 @@ mod tests {
             crate::agents::file_analyzer_agent::FileAnalysisResult::default(),
         )]));
         blob
+    }
+
+    #[test]
+    fn unheld_type_names_go_and_a_provisional_leaf_entry_goes_with_its_declaration() {
+        let mut held = consumer_entry("Endpoint_aaaa_Response");
+        held.key = OperationKey::http("GET", "/orders/:id");
+        let mut leaf = consumer_entry("Endpoint_bbbb_Response_Callx");
+        leaf.key = OperationKey::http("LEAF", "leaf:1-2");
+        let mut data = bare_blob();
+        data.type_manifest = Some(vec![held, leaf]);
+        let dts = "export type Endpoint_aaaa_Response = {\n  id: string;\n};\n\
+                   export type Endpoint_aaaa_Response_Unwidened = { id: string };\n\
+                   export type Endpoint_bbbb_Response_Callx = string;\n\
+                   export type Endpoint_cccc_Response = number;\n";
+        data.bundled_types = Some(dts.to_string());
+        let mut reach = None;
+
+        drop_unheld_type_names(&mut data, &mut reach);
+
+        assert_eq!(data.type_manifest.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            data.bundled_types.as_deref(),
+            Some(
+                "export type Endpoint_aaaa_Response = {\n  id: string;\n};\n\
+                 export type Endpoint_aaaa_Response_Unwidened = { id: string };\n"
+            )
+        );
     }
 
     /// A second answer beside `bare_blob`'s, for the file the tests edit.
