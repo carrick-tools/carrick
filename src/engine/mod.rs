@@ -6348,6 +6348,13 @@ async fn analyze_current_repo_incremental(
                 repo_path,
             );
             apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
+            stamp_fact_through_symbols(
+                &mut manifest_entries,
+                &site_fold,
+                &merged_results,
+                repo_path,
+                &service_modules,
+            );
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
             }
@@ -11041,7 +11048,9 @@ fn site_row_site_id(row: &crate::site_rows::SiteRow, repo_path: &str) -> Option<
 /// replaced leaves no entry, and every site row stated is anchored where its
 /// record says, so the type check reads it like any row (carrick#2472 C3).
 /// An HTTP row whose path is not a bare route gets none, as a reader's
-/// would not.
+/// would not, except a fact through-row: the call-through pass re-keys it
+/// to the request its call reaches and carries its entry there, and drops
+/// the entry of one it leaves unlinked (carrick#4078).
 fn apply_site_fold_to_manifest(
     entries: &mut Vec<TypeManifestEntry>,
     fold: &crate::site_rows::SiteFold,
@@ -11061,7 +11070,7 @@ fn apply_site_fold_to_manifest(
         let site_id = site_row_site_id(row, repo_path);
         match &row.key {
             OperationKey::Http { path, .. } => {
-                if path.starts_with('/') {
+                if path.starts_with('/') || row.is_fact_through_call() {
                     add_manifest_pair(
                         entries,
                         row.key.clone(),
@@ -11153,7 +11162,9 @@ fn site_infer_requests(
         };
         let anchors = &row.anchors;
         match (&row.key, row.side) {
-            (OperationKey::Http { path, .. }, RowSide::Call) if path.starts_with('/') => {
+            (OperationKey::Http { path, .. }, RowSide::Call)
+                if path.starts_with('/') || row.is_fact_through_call() =>
+            {
                 // Asked as a request body, as the payload slot asks it
                 // (`site_payloads`): the sidecar reads `JSON.stringify(x)` as
                 // `x`, where an expression reads the serialised `string`
@@ -14608,6 +14619,64 @@ fn drop_call_through_entries(
 /// (`parse_file_location`): a non-positive/missing line collapses to `1`. Keying
 /// a line-0 anchor at `0` would never join a manifest entry (always `>= 1`), so
 /// the anchor would silently fall back to the hashed `type_alias`.
+/// [`stamp_manifest_anchor_symbols`] for the entries the fold wrote at a fact
+/// through-row (carrick#4078), which the first stamping ran before. Their
+/// type is the compiler's, asked at the row's own call; only the symbol the
+/// first stamping gives any entry at that call is added, never a type.
+fn stamp_fact_through_symbols(
+    manifest: &mut [TypeManifestEntry],
+    fold: &crate::site_rows::SiteFold,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
+) {
+    let root = Path::new(repo_path);
+    let places: HashSet<(&str, u32)> = fold
+        .stated
+        .iter()
+        .filter(|row| row.is_fact_through_call())
+        .map(|row| (row.file.as_str(), row.line))
+        .collect();
+    let picked: Vec<usize> = manifest
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.role == ManifestRole::Consumer
+                && entry.primary_type_symbol.is_none()
+                && places.contains(&(
+                    crate::site_rows::relative(root, &entry.file_path).as_str(),
+                    entry.line_number,
+                ))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+    // The stamping joins on the file as `file_results` keys it, which a site
+    // row's repo-relative file need not spell the same way.
+    let keyed: HashMap<String, &String> = file_results
+        .keys()
+        .map(|key| (crate::site_rows::relative(root, key), key))
+        .collect();
+    let mut subset: Vec<TypeManifestEntry> = picked
+        .iter()
+        .map(|&index| {
+            let mut entry = manifest[index].clone();
+            let relative = crate::site_rows::relative(root, &entry.file_path);
+            if let Some(key) = keyed.get(&relative) {
+                entry.file_path = (*key).clone();
+            }
+            entry
+        })
+        .collect();
+    stamp_manifest_anchor_symbols(&mut subset, file_results, repo_path, modules);
+    for (index, mut entry) in picked.into_iter().zip(subset) {
+        entry.file_path = manifest[index].file_path.clone();
+        manifest[index] = entry;
+    }
+}
+
 fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
@@ -15528,6 +15597,13 @@ async fn analyze_current_repo(
         repo_path,
     );
     apply_site_fold_to_manifest(&mut manifest_entries, &site_fold, repo_path);
+    stamp_fact_through_symbols(
+        &mut manifest_entries,
+        &site_fold,
+        &analysis_result.file_results,
+        repo_path,
+        &service_modules,
+    );
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);
     }
