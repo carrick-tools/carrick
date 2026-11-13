@@ -41,6 +41,10 @@ export function placeLoose(endpoint: string, body: unknown) {
 export function placeKind<T>(endpoint: string, item: T) {
   return send(endpoint, { kind: 'order', item });
 }
+
+export function placeBounded<T extends Book>(endpoint: string, item: T) {
+  return send(endpoint, { data: item });
+}
 `;
 
 const CALLER_TS = `import { placeGeneric, placeKind, placeMany, placeLoose, type Book } from './net';
@@ -212,6 +216,42 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
   it('reads a type the caller declares and the wrapper cannot see', async () => {
     const { text } = await infer('Sized', '{ body: item }', "placeGeneric('/orders', size)");
     assert.strictEqual(text, '{ body: { size: "large" | "small"; }; }');
+  });
+
+  // carrick#4164: the wrapper's own row names no caller. Its body still
+  // holds the wrapper's type parameter, which only its callers bind, so no
+  // type naming it is published: a decided unknown, whether or not the
+  // parameter has a constraint (the constraint is a bound, not the body).
+  it('answers a decided unknown for a wrapper body read with no caller', async () => {
+    const { text, provenance } = await infer('Own', '{ body: item }', undefined);
+    assert.strictEqual(text, 'unknown');
+    assert.deepStrictEqual(
+      provenance.map((p) => p.reason),
+      ['body_built_by_callee']
+    );
+  });
+
+  it('answers a decided unknown for another protocol payload with no caller', async () => {
+    const { text, provenance } = await infer('OwnPayload', '{ body: item }', undefined, 'expression');
+    assert.strictEqual(text, 'unknown');
+    assert.deepStrictEqual(
+      provenance.map((p) => p.reason),
+      ['body_built_by_callee']
+    );
+  });
+
+  it('answers a decided unknown for a constrained parameter with no caller', async () => {
+    const { text, provenance } = await infer('OwnBounded', '{ data: item }', undefined);
+    assert.strictEqual(text, 'unknown');
+    assert.deepStrictEqual(
+      provenance.map((p) => p.reason),
+      ['body_built_by_callee']
+    );
+  });
+
+  it('leaves a body with no type parameter as it reads with no caller', async () => {
+    const { text } = await infer('OwnLoose', '{ body }', undefined);
+    assert.strictEqual(text, '{ body: unknown; }');
   });
 
   it('instantiates another protocol payload the same way', async () => {

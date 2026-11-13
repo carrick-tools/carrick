@@ -4016,7 +4016,9 @@ export class TypeInferrer {
    * instantiates that wrapper: `{ body: item }` in `place<T>(item: T)` reads
    * `{ body: Book }` at `place(book)`. A type parameter the call leaves open
    * is never published: the answer is a decided `unknown`. A request with no
-   * `through_call` reads the type at `node` as it stands.
+   * `through_call` (the wrapper's own row) names no call to bind one, so a
+   * type parameter its read holds stays open and is never published either
+   * (carrick#4164); a read that holds none is the type at `node` as it stands.
    */
   private typeAtThroughCall(
     node: Node,
@@ -4026,12 +4028,30 @@ export class TypeInferrer {
     | { kind: 'open'; abstain: InferredType } {
     const read = node.getType();
     const through = request.through_call;
-    if (!through) return { kind: 'as_read', type: read };
+    const checker = this.project.getTypeChecker();
+    if (!through) {
+      const open = openAt(checker.compilerObject, read.compilerType, node.compilerNode);
+      if (open.kind === 'as_read') return { kind: 'as_read', type: read };
+      this.log(
+        `Payload at ${request.file_path}:${request.line_number} holds the type parameter '${open.name}' ` +
+          'and names no call that binds it; leaving it unknown'
+      );
+      return {
+        kind: 'open',
+        abstain: this.decidedAbstain(request, this.getNodeLocation(node), {
+          path: '',
+          kind: 'unknown',
+          reason: 'body_built_by_callee',
+          detail:
+            `the body is built inside a generic function from its type parameter '${open.name}', ` +
+            `which only that function's callers bind, so this site states no body type`,
+        }),
+      };
+    }
     const callerFile = this.getSourceFile(through.file_path);
     const call = callerFile
       ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
       : undefined;
-    const checker = this.project.getTypeChecker();
     // A call the span does not find reaches nothing: whatever the read holds
     // open stays open.
     const outcome = call
