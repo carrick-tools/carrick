@@ -152,8 +152,15 @@ fn settled_line() -> &'static str {
     &scan().1
 }
 
-fn scan() -> &'static (Blobs, String) {
-    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+/// The alias names each service's stored type-reach object holds.
+type ReachAliases = BTreeMap<String, Vec<String>>;
+
+fn reach_aliases() -> &'static ReachAliases {
+    &scan().2
+}
+
+fn scan() -> &'static (Blobs, String, ReachAliases) {
+    static SCAN: OnceLock<(Blobs, String, ReachAliases)> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -186,7 +193,22 @@ fn scan() -> &'static (Blobs, String) {
             SERVICES,
             "every service uploads one blob"
         );
-        (blobs, settled)
+        let reach: ReachAliases = SERVICES
+            .iter()
+            .filter_map(|service| {
+                use std::io::Read;
+                let object =
+                    std::fs::read(storage.join(format!("{service}.type-reach.json.gz"))).ok()?;
+                let mut json = String::new();
+                flate2::read::GzDecoder::new(&object[..])
+                    .read_to_string(&mut json)
+                    .ok()?;
+                let record: serde_json::Value = serde_json::from_str(&json).ok()?;
+                let names = record["aliases"].as_object()?.keys().cloned().collect();
+                Some((service.to_string(), names))
+            })
+            .collect();
+        (blobs, settled, reach)
     })
 }
 
@@ -1624,4 +1646,94 @@ fn a_carried_blob_without_call_through_facts_reads_as_one_with_none() {
         carried.get("call_through").is_none(),
         "a carried blob states no facts it was not stored with"
     );
+}
+
+/// The alias a derived capture name goes with (`_Unwidened`, `_ModeOther`,
+/// `_Mode<16 hex>`).
+fn base_of(alias: &str) -> &str {
+    if let Some(base) = alias
+        .strip_suffix("_Unwidened")
+        .or_else(|| alias.strip_suffix("_ModeOther"))
+    {
+        return base;
+    }
+    match alias.rsplit_once("_Mode") {
+        Some((base, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            base
+        }
+        _ => alias,
+    }
+}
+
+/// Every type name a blob saves, in the bundle, the stub and its manifest
+/// records and the type-reach object, has a manifest entry behind it. The
+/// passes that drop entries after capture (call-through, route boundaries,
+/// GraphQL documents) must not leave their declarations stored.
+#[test]
+fn every_saved_type_name_has_a_manifest_entry() {
+    let declared = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|word| word.starts_with("Endpoint_"))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut checked = 0;
+    for (service, blob) in blobs() {
+        let held: Vec<&str> = blob["type_manifest"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e["type_alias"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut saved: Vec<(&str, String)> = Vec::new();
+        if let Some(bundle) = blob["bundled_types"].as_str() {
+            // Declarations only: a declaration starts a line after
+            // `type`/`interface`.
+            for line in bundle.lines() {
+                let line = line.trim_start().trim_start_matches("export ");
+                if let Some(rest) = line
+                    .strip_prefix("type ")
+                    .or_else(|| line.strip_prefix("interface "))
+                {
+                    saved.extend(declared(rest).into_iter().take(1).map(|n| ("bundle", n)));
+                }
+            }
+        }
+        let files = &blob["capture_stub"]["files"];
+        if let Some(stub) = files["types/surface.d.ts"].as_str() {
+            for line in stub.lines() {
+                let line = line.trim_start().trim_start_matches("export ");
+                if let Some(rest) = line
+                    .strip_prefix("type ")
+                    .or_else(|| line.strip_prefix("interface "))
+                {
+                    saved.extend(declared(rest).into_iter().take(1).map(|n| ("stub", n)));
+                }
+            }
+        }
+        if let Some(manifest) = files["carrick-manifest.json"].as_str() {
+            let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+            for record in manifest["aliases"].as_array().into_iter().flatten() {
+                if let Some(alias) = record["alias"].as_str() {
+                    saved.push(("stub records", alias.to_string()));
+                }
+            }
+        }
+        for alias in reach_aliases().get(service).into_iter().flatten() {
+            saved.push(("reach", alias.clone()));
+        }
+        for (place, name) in &saved {
+            if name.starts_with("Endpoint_") {
+                checked += 1;
+                assert!(
+                    held.contains(&base_of(name)),
+                    "{service}: {name} saved in the {place} with no manifest entry"
+                );
+            }
+        }
+    }
+    assert!(checked > 0, "the scan saved no type names to check");
 }

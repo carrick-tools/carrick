@@ -2687,7 +2687,7 @@ fn type_leaf(
 /// Drop every entry asked at a leaf call under its provisional key that no
 /// leaf row took ([`type_leaf`]): the call states no row, so its entry
 /// would anchor an operation nothing holds.
-fn drop_unstated_leaf_entries(data: &mut CloudRepoData) -> usize {
+pub(crate) fn drop_unstated_leaf_entries(data: &mut CloudRepoData) -> usize {
     let Some(manifest) = data.type_manifest.as_mut() else {
         return 0;
     };
