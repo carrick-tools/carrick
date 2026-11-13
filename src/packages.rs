@@ -210,29 +210,10 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
 }
 
 fn deno_registry_identity(target: &str) -> Option<(String, String)> {
-    let specifier = target
-        .strip_prefix("npm:")
-        .or_else(|| target.strip_prefix("jsr:"))?;
-    let package_end = if specifier.starts_with('@') {
-        specifier
-            .find('/')
-            .and_then(|slash| {
-                specifier[slash + 1..]
-                    .find('/')
-                    .map(|tail| slash + 1 + tail)
-            })
-            .unwrap_or(specifier.len())
-    } else {
-        specifier.find('/').unwrap_or(specifier.len())
-    };
-    let package_and_version = &specifier[..package_end];
-    let version_at = package_and_version
-        .char_indices()
-        .filter_map(|(index, ch)| (index > 0 && ch == '@').then_some(index))
-        .next_back();
-    let (name, spec) = version_at.map_or((package_and_version, "*"), |at| {
-        (&package_and_version[..at], &package_and_version[at + 1..])
-    });
+    let crate::request_summary::RegistrySpecifier { name, range, .. } =
+        crate::request_summary::registry_specifier(target, "npm:")
+            .or_else(|| crate::request_summary::registry_specifier(target, "jsr:"))?;
+    let spec = range.unwrap_or("*");
     let valid_name = !name.is_empty()
         && name.is_ascii()
         && name.bytes().all(|byte| {

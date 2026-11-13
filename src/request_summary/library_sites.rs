@@ -780,8 +780,29 @@ impl LibrarySites {
 }
 
 /// The package a bare specifier names: `@scope/name` of `@scope/name/sub`,
-/// `name` of `name/sub`. A runtime module (`node:events`) is its own.
+/// `name` of `name/sub`. A Deno `npm:` specifier names its package without
+/// the protocol and the range: `hono` of `npm:hono@4/jsx` (carrick#4070). A
+/// runtime module (`node:events`) and a `jsr:` specifier are their own.
 pub fn package_name(specifier: &str) -> &str {
+    match registry_specifier(specifier, "npm:") {
+        Some(npm) if !npm.name.is_empty() => npm.name,
+        _ => package_spelled(specifier),
+    }
+}
+
+/// The text of `specifier` that spells its package: `hono` of `hono/jsx`,
+/// `npm:hono@4` of `npm:hono@4/jsx`. Always a prefix of `specifier`, so
+/// what follows it is the subpath.
+pub fn package_spelling(specifier: &str) -> &str {
+    match registry_specifier(specifier, "npm:") {
+        Some(npm) if !npm.name.is_empty() => npm.spelling,
+        _ => package_spelled(specifier),
+    }
+}
+
+/// The package part of a bare specifier: up to the slash after the name
+/// (the second one for a scoped name).
+fn package_spelled(specifier: &str) -> &str {
     let mut ends = specifier.match_indices('/').map(|(index, _)| index);
     let end = if specifier.starts_with('@') {
         ends.nth(1)
@@ -789,6 +810,44 @@ pub fn package_name(specifier: &str) -> &str {
         ends.next()
     };
     end.map_or(specifier, |end| &specifier[..end])
+}
+
+/// A Deno registry specifier (`npm:` or `jsr:`), read as Deno reads one:
+/// `<protocol>[/]<name>[@<range>][/<subpath>]`, the name scoped or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrySpecifier<'a> {
+    /// The package name: `@scope/name` or `name`. Empty for a specifier
+    /// that names none (`npm:`).
+    pub name: &'a str,
+    /// The range after the name's `@`, when one is written (it may be
+    /// empty: `npm:hono@`).
+    pub range: Option<&'a str>,
+    /// The prefix of the specifier that spells the package, protocol and
+    /// range included: `npm:hono@4` of `npm:hono@4/jsx`.
+    pub spelling: &'a str,
+}
+
+/// `specifier` read as a Deno registry specifier of `protocol` (`npm:`,
+/// `jsr:`); `None` when it does not start with the protocol. Total: any
+/// text after the protocol reads, and a caller checks the name.
+pub fn registry_specifier<'a>(specifier: &'a str, protocol: &str) -> Option<RegistrySpecifier<'a>> {
+    let rest = specifier.strip_prefix(protocol)?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let start = specifier.len() - rest.len();
+    let spelled = package_spelled(rest);
+    let spelling = &specifier[..start + spelled.len()];
+    let at = spelled
+        .char_indices()
+        .filter_map(|(index, ch)| (index > 0 && ch == '@').then_some(index))
+        .next_back();
+    let (name, range) = at.map_or((spelled, None), |at| {
+        (&spelled[..at], Some(&spelled[at + 1..]))
+    });
+    Some(RegistrySpecifier {
+        name,
+        range,
+        spelling,
+    })
 }
 
 /// How many own factory calls an instance is followed through, and how many
@@ -4456,6 +4515,36 @@ mod tests {
         assert_eq!(package_name("fixture-bus"), "fixture-bus");
         assert_eq!(package_name("node:events"), "node:events");
         assert_eq!(package_name("@fixture/jobs/v3/ai"), "@fixture/jobs");
+    }
+
+    /// carrick#4070: a Deno `npm:` specifier names its package without the
+    /// protocol and the range, and spells it with both; a `jsr:` specifier
+    /// and one that names no package are their own.
+    #[test]
+    fn a_deno_npm_specifier_names_its_package() {
+        for (specifier, name, spelling) in [
+            ("npm:hono@4/jsx", "hono", "npm:hono@4"),
+            ("npm:@s/x@1/y", "@s/x", "npm:@s/x@1"),
+            ("npm:/hono@4", "hono", "npm:/hono@4"),
+            ("npm:hono", "hono", "npm:hono"),
+            ("npm:@s/x", "@s/x", "npm:@s/x"),
+            ("hono/jsx", "hono", "hono"),
+            ("jsr:@std/path", "jsr:@std", "jsr:@std"),
+            ("npm:", "npm:", "npm:"),
+        ] {
+            assert_eq!(package_name(specifier), name, "{specifier}");
+            assert_eq!(package_spelling(specifier), spelling, "{specifier}");
+            assert!(specifier.starts_with(package_spelling(specifier)));
+        }
+        assert_eq!(
+            registry_specifier("npm:@s/x@^1.2/y", "npm:"),
+            Some(RegistrySpecifier {
+                name: "@s/x",
+                range: Some("^1.2"),
+                spelling: "npm:@s/x@^1.2",
+            })
+        );
+        assert_eq!(registry_specifier("hono", "npm:"), None);
     }
 
     /// A name is the binding the identifier resolves to: a module constant
