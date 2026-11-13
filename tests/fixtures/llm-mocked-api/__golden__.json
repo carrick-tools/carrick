@@ -132,5 +132,135 @@
       ],
       "severity": "critical"
     }
-  ]
+  ],
+  "unread_sites": [
+    {
+      "callee": "express",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 4,
+      "reason": "value_callee",
+      "slot": "callee",
+      "span_end": 96,
+      "span_start": 87
+    },
+    {
+      "callee": "app.use",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 5,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "span_end": 121,
+      "span_start": 98
+    },
+    {
+      "callee": "express.json",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 5,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "span_end": 120,
+      "span_start": 106
+    },
+    {
+      "callee": "app.use",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 6,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "span_end": 157,
+      "span_start": 123
+    },
+    {
+      "callee": "res.json",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 9,
+      "reason": "untyped_receiver",
+      "slot": "callee",
+      "span_end": 224,
+      "span_start": 198
+    },
+    {
+      "callee": "app.listen",
+      "depth": 0,
+      "file": "src/index.ts",
+      "line": 12,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "span_end": 247,
+      "span_start": 231
+    },
+    {
+      "callee": "Router",
+      "depth": 0,
+      "file": "src/reports.ts",
+      "line": 3,
+      "reason": "value_callee",
+      "slot": "callee",
+      "span_end": 59,
+      "span_start": 51
+    },
+    {
+      "callee": "renderReport",
+      "depth": 1,
+      "file": "src/reports.ts",
+      "line": 10,
+      "reason": "injected_callee",
+      "slot": "callee",
+      "span_end": 232,
+      "span_start": 215,
+      "stop_at": "src/reports.ts:17"
+    },
+    {
+      "callee": "res.sendStatus",
+      "depth": 0,
+      "file": "src/reports.ts",
+      "line": 18,
+      "reason": "injected_callee",
+      "slot": "callee",
+      "span_end": 402,
+      "span_start": 383
+    },
+    {
+      "callee": "Router",
+      "depth": 0,
+      "file": "src/routes/users.ts",
+      "line": 4,
+      "reason": "value_callee",
+      "slot": "callee",
+      "span_end": 92,
+      "span_start": 84
+    },
+    {
+      "callee": "res.json",
+      "depth": 0,
+      "file": "src/routes/users.ts",
+      "line": 8,
+      "reason": "untyped_receiver",
+      "slot": "callee",
+      "span_end": 194,
+      "span_start": 179
+    },
+    {
+      "callee": "res.json",
+      "depth": 0,
+      "file": "src/routes/users.ts",
+      "line": 14,
+      "reason": "untyped_receiver",
+      "slot": "callee",
+      "span_end": 373,
+      "span_start": 356
+    }
+  ],
+  "unread_sites_by_reason": {
+    "injected_callee": 2,
+    "unresolved_name": 4,
+    "untyped_receiver": 3,
+    "value_callee": 3
+  },
+  "unread_sites_total": 12
 }

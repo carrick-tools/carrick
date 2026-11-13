@@ -764,6 +764,82 @@ pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[Possib
     data.unread_sites_not_listed = (!not_listed.is_empty()).then_some(not_listed);
 }
 
+/// One row of the `CARRICK_OUTPUT_JSON` output's `unread_sites`: the blob's row,
+/// and over several services the service it came from, since `file` is
+/// service-relative (carrick#3958).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnreadSiteRow {
+    #[serde(flatten)]
+    pub site: UnreadSite,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+/// The unread-site keys [`attach`] writes on a blob, read back off the blobs
+/// of one scan for the `CARRICK_OUTPUT_JSON` output (carrick#3958). It reads
+/// what `attach` wrote and produces no list of its own. Over one service the
+/// keys equal the blob's. Over several, the rows join in service order each
+/// carrying its `service`, the counts add, and `unread_sites_not_listed` keys
+/// are `<service>/<file>`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UnreadSiteKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites: Option<Vec<UnreadSiteRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_by_reason: Option<BTreeMap<Stop, u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_not_listed: Option<BTreeMap<String, u32>>,
+}
+
+impl UnreadSiteKeys {
+    pub fn of_blobs<'a>(blobs: impl IntoIterator<Item = &'a CloudRepoData>) -> Self {
+        let blobs: Vec<&CloudRepoData> = blobs.into_iter().collect();
+        let several = blobs.len() > 1;
+        let mut keys = Self::default();
+        for blob in blobs {
+            let service = blob
+                .service_name
+                .clone()
+                .unwrap_or_else(|| blob.repo_name.clone());
+            if let Some(rows) = &blob.unread_sites {
+                keys.unread_sites
+                    .get_or_insert_with(Vec::new)
+                    .extend(rows.iter().map(|site| UnreadSiteRow {
+                        site: site.clone(),
+                        service: several.then(|| service.clone()),
+                    }));
+            }
+            if let Some(total) = blob.unread_sites_total {
+                *keys.unread_sites_total.get_or_insert(0) += total;
+            }
+            if let Some(by_reason) = &blob.unread_sites_by_reason {
+                let into = keys
+                    .unread_sites_by_reason
+                    .get_or_insert_with(BTreeMap::new);
+                for (reason, count) in by_reason {
+                    *into.entry(*reason).or_insert(0) += count;
+                }
+            }
+            if let Some(not_listed) = &blob.unread_sites_not_listed {
+                let into = keys
+                    .unread_sites_not_listed
+                    .get_or_insert_with(BTreeMap::new);
+                for (file, count) in not_listed {
+                    let key = if several {
+                        format!("{service}/{file}")
+                    } else {
+                        file.clone()
+                    };
+                    *into.entry(key).or_insert(0) += count;
+                }
+            }
+        }
+        keys
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +854,42 @@ mod tests {
             "last_updated": "2026-11-09T00:00:00Z", "commit_hash": "abc"
         }))
         .unwrap()
+    }
+
+    /// carrick#3958: over several services each JSON row names its service and
+    /// the not-listed counts stay per service; over one the keys are the blob's.
+    #[test]
+    fn the_json_keys_name_the_service_over_several_and_carry_not_listed() {
+        let row = serde_json::json!({
+            "file": "src/a.ts", "line": 1, "span_start": 1, "span_end": 2,
+            "reason": "value_callee", "slot": "callee", "depth": 0,
+        });
+        let mut first = blob();
+        first.service_name = Some("one".into());
+        first.unread_sites = Some(vec![serde_json::from_value(row.clone()).unwrap()]);
+        first.unread_sites_total = Some(3);
+        first.unread_sites_not_listed = Some(BTreeMap::from([("src/a.ts".to_string(), 2)]));
+        let mut second = blob();
+        second.service_name = Some("two".into());
+        second.unread_sites = Some(vec![serde_json::from_value(row).unwrap()]);
+        second.unread_sites_total = Some(1);
+        second.unread_sites_not_listed = Some(BTreeMap::from([("src/a.ts".to_string(), 5)]));
+
+        let one = serde_json::to_value(UnreadSiteKeys::of_blobs([&first])).unwrap();
+        assert!(one["unread_sites"][0].get("service").is_none());
+        assert_eq!(
+            one["unread_sites_not_listed"],
+            serde_json::json!({"src/a.ts": 2})
+        );
+
+        let both = serde_json::to_value(UnreadSiteKeys::of_blobs([&first, &second])).unwrap();
+        assert_eq!(both["unread_sites"][0]["service"], "one");
+        assert_eq!(both["unread_sites"][1]["service"], "two");
+        assert_eq!(both["unread_sites_total"], 4);
+        assert_eq!(
+            both["unread_sites_not_listed"],
+            serde_json::json!({"one/src/a.ts": 2, "two/src/a.ts": 5})
+        );
     }
 
     /// carrick#3989 S0: a word a later release added reads, and a reader
