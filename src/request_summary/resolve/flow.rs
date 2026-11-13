@@ -506,11 +506,14 @@ mod tests {
     use swc_ecma_transforms_base::resolver;
     use swc_ecma_visit::VisitMutWith;
 
+    /// A way as `(source, tests)`, spelled from the source text.
+    type Spelled = (String, Vec<String>);
+
     /// The ways at each read of `p` in the body of the first function of
     /// `source`, as `(source, tests)` by read order: a source is `init`,
     /// `unwritten` or the write's text; a test is its text, `!` before it
     /// when it fails.
-    fn ways(source: &str) -> Option<Vec<Vec<(String, Vec<String>)>>> {
+    fn ways(source: &str) -> Option<Vec<Vec<Spelled>>> {
         let map: Lrc<SourceMap> = Default::default();
         let file = map.new_source_file(
             Lrc::new(FileName::Custom("t.ts".into())),
@@ -582,7 +585,7 @@ mod tests {
         )
     }
 
-    fn way(from: &str, tests: &[&str]) -> (String, Vec<String>) {
+    fn way(from: &str, tests: &[&str]) -> Spelled {
         (
             from.to_string(),
             tests.iter().map(|test| test.to_string()).collect(),
