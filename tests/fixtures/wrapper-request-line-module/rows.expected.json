@@ -1,0 +1,15 @@
+{
+  "caller_rows": {
+    "src/load.ts:8": "POST /v1/warm"
+  },
+  "stated_at_callers": [
+    "src/net/warm.ts:4"
+  ],
+  "kept": {
+    "src/net/arg.ts:4": "POST /v1/:endpoint",
+    "src/net/boot.ts:4": "POST /v1/:endpoint",
+    "src/net/timer.ts:4": "POST /v1/:endpoint",
+    "src/net/left.ts:4": "POST /v1/:endpoint",
+    "src/net/right.ts:4": "POST /v1/:endpoint"
+  }
+}

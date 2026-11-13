@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "wrapper-request-line-module", "directory": ".", "tsconfig": "tsconfig.json" }]
+}
