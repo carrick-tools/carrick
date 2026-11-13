@@ -13506,8 +13506,7 @@ fn stamp_capture_provenance(
 /// An entry a stage already explained is left alone, and so is a service
 /// with a stub. No detail: a failure text holds paths and customer text.
 fn stamp_service_type_loss(cloud_data: &mut CloudRepoData) {
-    // Red commit: the stamper is not wired yet.
-    if true || cloud_data.capture_stub.is_some() {
+    if cloud_data.capture_stub.is_some() {
         return;
     }
     let Some(manifest) = cloud_data.type_manifest.as_mut() else {
