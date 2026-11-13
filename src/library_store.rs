@@ -170,10 +170,14 @@ pub struct Asked {
     /// the service imports it by (`events`, `node:events`): the store answers
     /// its exports under the `node:` form only.
     spellings: BTreeMap<String, BTreeSet<String>>,
-    /// Every npm alias the service imports (`socket.io-client-v4`, installed
-    /// as `npm:socket.io-client@4.x`), by the specifier the store is asked
-    /// under (`socket.io-client`, `socket.io-client/dist/x`): the spellings
-    /// the service imports it by. The store knows the real package only.
+    /// Every specifier asked about a package (runtime modules apart), by the
+    /// specifier the store is asked under (`socket.io-client`,
+    /// `socket.io-client/dist/x`): the spellings the service imports it by,
+    /// the package's own name among them when it imports it bare. An npm
+    /// alias (`socket.io-client-v4`, installed as
+    /// `npm:socket.io-client@4.x`) and a Deno `npm:` specifier
+    /// (`npm:hono@4`, carrick#4070) are spellings of the real package. The
+    /// store knows the real package only.
     aliases: BTreeMap<String, BTreeSet<String>>,
     /// The real packages asked on an alias's account: their exports are kept
     /// only under a specifier in `aliases`.
@@ -424,31 +428,37 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
             continue;
         };
         let wire = if asked.runtime {
-            spellings
-                .entry(asked.package.clone())
-                .or_default()
-                .insert(specifier.clone());
             asked.package.clone()
         } else if let Some(imported) = &asked.imported_as {
-            // An npm alias: the store is asked under the real package, and
-            // the answer read back onto the spelling imported.
-            let wire = format!("{}{}", asked.package, &specifier[imported.len()..]);
-            aliases
-                .entry(wire.clone())
-                .or_default()
-                .insert(specifier.clone());
-            aliased.insert(asked.package.clone());
-            wire
+            // An npm alias or a Deno `npm:` specifier: the store is asked
+            // under the real package, and the answer read back onto the
+            // spelling imported.
+            format!("{}{}", asked.package, &specifier[imported.len()..])
         } else {
             specifier.clone()
         };
         // One entry per package at one version: an alias installed at another
-        // version than the package itself is left unasked (fail closed).
+        // version than the package itself is left unasked (fail closed), and
+        // no answer is read back onto it.
         if by_package
             .get(&asked.package)
             .is_some_and(|(version, _)| *version != asked.version)
         {
             continue;
+        }
+        if asked.runtime {
+            spellings
+                .entry(asked.package.clone())
+                .or_default()
+                .insert(specifier.clone());
+        } else {
+            aliases
+                .entry(wire.clone())
+                .or_default()
+                .insert(specifier.clone());
+            if asked.imported_as.is_some() {
+                aliased.insert(asked.package.clone());
+            }
         }
         by_package
             .entry(asked.package)
@@ -583,6 +593,9 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
     let runtime = installed(RUNTIME_TYPES, install);
     let mut installed_names: BTreeMap<String, Installed> = BTreeMap::new();
     let mut sent: BTreeSet<String> = BTreeSet::new();
+    // Where a Deno `npm:` specifier's install record is looked for: read
+    // even when it resolves nothing, so a lock that does not read is named.
+    let mut deno_lock_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for specifier in specifiers {
         if specifier.starts_with("node:") {
             continue;
@@ -593,20 +606,24 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
             }
             sent.insert(asked.package);
         }
-        let name = crate::request_summary::package_name(specifier);
-        if let Some(package) = installed(name, install) {
-            installed_names.insert(name.to_string(), package);
+        if npm_specifier(specifier).is_some() {
+            deno_lock_dirs.extend(lock_dir(install.service_root, install.repo_root));
+        }
+        if let Some(package) = located(specifier, install) {
+            installed_names.insert(
+                crate::request_summary::package_name(specifier).to_string(),
+                package,
+            );
         }
     }
+    let lock_dirs: BTreeSet<PathBuf> = installed_names
+        .values()
+        .filter_map(|package| lock_dir(&package.install_root, install.repo_root))
+        .chain(deno_lock_dirs)
+        .collect();
     let mut unreadable_lockfiles = BTreeSet::new();
-    for package in installed_names.values() {
-        let Some(lock_dir) = roots(&package.install_root, install.repo_root)
-            .into_iter()
-            .find(|dir| LOCKFILES.iter().any(|lock| dir.join(lock).is_file()))
-        else {
-            continue;
-        };
-        unreadable_lockfiles.extend(unreadable_in(&lock_dir));
+    for lock_dir in &lock_dirs {
+        unreadable_lockfiles.extend(unreadable_in(lock_dir));
     }
     AskHealth {
         installed: installed_names.len(),
@@ -642,6 +659,16 @@ fn unreadable_in(lock_dir: &Path) -> Vec<PathBuf> {
         if binary.is_file() {
             out.push(binary);
         }
+    }
+    // A `deno.lock` that does not parse, or of a format this scanner does
+    // not read (format 1, with no `version`, holds no npm package and is
+    // read as such).
+    let deno = lock_dir.join("deno.lock");
+    if deno.is_file()
+        && read_json(&deno)
+            .is_none_or(|lock| lock.get("version").is_some() && deno_lock_sections(&lock).is_none())
+    {
+        out.push(deno);
     }
     let pnpm = lock_dir.join("pnpm-lock.yaml");
     if pnpm.is_file() {
@@ -698,16 +725,52 @@ fn asked_as(
         return Some(asked);
     }
     let name = crate::request_summary::package_name(specifier);
-    let package = installed(name, install)?;
+    let package = located(specifier, install)?;
+    let spelling = crate::request_summary::package_spelling(specifier);
     from_public_registry(name, &package, install).then(|| AskedAs {
         // An npm alias (`npm:<real>@<range>`) is asked under the real name its
-        // installed manifest states, never the alias (the store serves only
+        // installed manifest states, and a Deno `npm:` specifier under the
+        // name its lock resolves, never the spelling (the store serves only
         // names npm does).
-        imported_as: (package.name != name).then(|| name.to_string()),
+        imported_as: (package.name != spelling).then(|| spelling.to_string()),
         package: package.name,
         version: package.version,
         runtime: false,
     })
+}
+
+/// A Deno `npm:` specifier (`npm:hono@4/jsx`), when `specifier` is one that
+/// names a package.
+fn npm_specifier(specifier: &str) -> Option<crate::request_summary::RegistrySpecifier<'_>> {
+    crate::request_summary::registry_specifier(specifier, "npm:").filter(|npm| !npm.name.is_empty())
+}
+
+/// The installed package `specifier` resolves to. A Deno `npm:` specifier
+/// resolves through the `deno.lock` of the nearest directory holding a
+/// lockfile, from the service root up to the repo root (carrick#4070,
+/// carrick#1722): what Deno's install recorded for that request, whether or
+/// not it wrote a `node_modules`. Any other specifier resolves to its
+/// installed copy ([`installed`]).
+fn located(specifier: &str, install: &Install<'_>) -> Option<Installed> {
+    let Some(npm) = npm_specifier(specifier) else {
+        return installed(crate::request_summary::package_name(specifier), install);
+    };
+    let dir = lock_dir(install.service_root, install.repo_root)?;
+    let (name, version) = deno_lock_resolve(&dir.join("deno.lock"), &npm)?;
+    Some(Installed {
+        dir: dir.clone(),
+        name,
+        version,
+        install_root: dir,
+    })
+}
+
+/// The nearest directory holding a lockfile, from `from` up to the repo
+/// root: where an install there recorded what it installed.
+fn lock_dir(from: &Path, repo_root: &Path) -> Option<PathBuf> {
+    roots(from, repo_root)
+        .into_iter()
+        .find(|dir| LOCKFILES.iter().any(|lock| dir.join(lock).is_file()))
 }
 
 /// A package's installed copy: its directory and the version its manifest
@@ -828,10 +891,7 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
     {
         return false;
     }
-    let Some(lock_dir) = roots(&package.install_root, install.repo_root)
-        .into_iter()
-        .find(|dir| LOCKFILES.iter().any(|lock| dir.join(lock).is_file()))
-    else {
+    let Some(lock_dir) = lock_dir(&package.install_root, install.repo_root) else {
         return false;
     };
     let answers: Vec<bool> = [
@@ -1388,24 +1448,16 @@ fn deno_lock(
     if !install.npm_registry_env.is_none_or(is_public_url) {
         return Some(false);
     }
-    let Some(lock) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    else {
+    let Some(lock) = read_json(&path) else {
         return Some(false);
     };
-    let (npm, jsr) = match lock.get("version").and_then(Value::as_str) {
-        Some("2") => (lock.pointer("/npm/packages"), None),
-        Some("3") => (lock.pointer("/packages/npm"), lock.pointer("/packages/jsr")),
-        Some("4" | "5") => (lock.get("npm"), lock.get("jsr")),
-        version => {
-            debug!(
-                ?version,
-                path = %path.display(),
-                "library store: a deno.lock format this scanner does not read; nothing sent from it"
-            );
-            return Some(false);
-        }
+    let Some(DenoLockSections { npm, jsr, .. }) = deno_lock_sections(&lock) else {
+        debug!(
+            version = ?lock.get("version"),
+            path = %path.display(),
+            "library store: a deno.lock format this scanner does not read; nothing sent from it"
+        );
+        return Some(false);
     };
     // A link is keyed with its protocol: `npm:name@1.2.3`.
     let linked = ["/workspace/links", "/workspace/patches"]
@@ -1441,6 +1493,91 @@ fn deno_lock(
                         .is_none_or(|tarball| tarball.as_str().is_some_and(is_public_url))
             }),
     )
+}
+
+/// A JSON file, parsed; `None` when it does not read or parse.
+fn read_json(path: &Path) -> Option<Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+}
+
+/// The format of a `deno.lock` this scanner reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenoLockFormat {
+    /// Format 2: `npm.specifiers` keys `name@range` to `name@version`.
+    V2,
+    /// Format 3: `packages.specifiers` keys `npm:name@range` to
+    /// `npm:name@version`.
+    V3,
+    /// Formats 4 and 5: `specifiers` keys `npm:name@range` to `version`.
+    V4,
+}
+
+/// The sections of a `deno.lock` this scanner reads, wherever its format
+/// keeps them.
+struct DenoLockSections<'a> {
+    format: DenoLockFormat,
+    /// What each request resolved to.
+    specifiers: Option<&'a Value>,
+    /// The npm packages installed, keyed `name@version[_peers]`.
+    npm: Option<&'a Value>,
+    /// The JSR packages installed.
+    jsr: Option<&'a Value>,
+}
+
+/// The sections of `lock`, read as Deno's own `deno_lockfile` crate
+/// (0.61.0) states each format. `None` for a format this scanner does not
+/// read, format 1 (no npm package) among them.
+fn deno_lock_sections(lock: &Value) -> Option<DenoLockSections<'_>> {
+    Some(match lock.get("version").and_then(Value::as_str)? {
+        "2" => DenoLockSections {
+            format: DenoLockFormat::V2,
+            specifiers: lock.pointer("/npm/specifiers"),
+            npm: lock.pointer("/npm/packages"),
+            jsr: None,
+        },
+        "3" => DenoLockSections {
+            format: DenoLockFormat::V3,
+            specifiers: lock.pointer("/packages/specifiers"),
+            npm: lock.pointer("/packages/npm"),
+            jsr: lock.pointer("/packages/jsr"),
+        },
+        "4" | "5" => DenoLockSections {
+            format: DenoLockFormat::V4,
+            specifiers: lock.get("specifiers"),
+            npm: lock.get("npm"),
+            jsr: lock.get("jsr"),
+        },
+        _ => return None,
+    })
+}
+
+/// The package and version the `deno.lock` at `path` resolved the Deno
+/// `npm:` request `npm` to (carrick#4070): its `specifiers` entry for the
+/// name and range (`*` when none is written, as Deno records it). `None`
+/// when the lock does not read, is of a format this scanner does not read,
+/// or resolved no such request.
+fn deno_lock_resolve(
+    path: &Path,
+    npm: &crate::request_summary::RegistrySpecifier<'_>,
+) -> Option<(String, String)> {
+    let lock = read_json(path)?;
+    let sections = deno_lock_sections(&lock)?;
+    let specifiers = sections.specifiers?.as_object()?;
+    let range = npm.range.filter(|range| !range.is_empty()).unwrap_or("*");
+    let request = format!("{}@{range}", npm.name);
+    let key = match sections.format {
+        DenoLockFormat::V2 => request,
+        DenoLockFormat::V3 | DenoLockFormat::V4 => format!("npm:{request}"),
+    };
+    let resolved = specifiers.get(&key)?.as_str()?;
+    let (name, version) = match sections.format {
+        DenoLockFormat::V2 => deno_lock_key(resolved)?,
+        DenoLockFormat::V3 => deno_lock_key(resolved.strip_prefix("npm:")?)?,
+        DenoLockFormat::V4 => (npm.name, resolved.split('_').next()?),
+    };
+    (!name.is_empty() && !version.is_empty()).then(|| (name.to_string(), version.to_string()))
 }
 
 /// The package name a `deno.lock` package key names: `@scope/name` of
@@ -3249,6 +3386,229 @@ mod tests {
             asked(request(&specifiers(&["chalk"]), &install_at(dir.path()))),
             vec![]
         );
+    }
+
+    /// What a service importing `imports` asks, with `lock` as its
+    /// `deno.lock` and no `node_modules` (Deno's default install, and the
+    /// Action's: carrick#1722).
+    fn deno_lock_only_asked(lock: &str, imports: &[&str]) -> Vec<(String, String, Vec<String>)> {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("deno.lock"), lock);
+        asked(request(&specifiers(imports), &install_at(dir.path())))
+    }
+
+    /// A format 5 `deno.lock` resolving each `(request, version)` of the
+    /// package `name` from the default registry.
+    fn deno_v5_lock(name: &str, resolved: &[(&str, &str)]) -> String {
+        let specifiers: serde_json::Map<String, Value> = resolved
+            .iter()
+            .map(|(request, version)| (format!("npm:{name}@{request}"), Value::from(*version)))
+            .collect();
+        let npm: serde_json::Map<String, Value> = resolved
+            .iter()
+            .map(|(_, version)| {
+                (
+                    format!("{name}@{version}"),
+                    serde_json::json!({"integrity": "sha512-x"}),
+                )
+            })
+            .collect();
+        serde_json::json!({"version": "5", "specifiers": specifiers, "npm": npm}).to_string()
+    }
+
+    /// The specifiers `asked` reads the store's exports of `package` at
+    /// `version` back onto (one export per specifier asked).
+    fn read_back(asked: &Asked, package: &str, version: &str) -> Vec<String> {
+        let exports: Vec<Value> = asked
+            .request
+            .packages
+            .iter()
+            .filter(|asked| asked.package == package)
+            .flat_map(|asked| asked.specifiers.iter())
+            .map(|specifier| {
+                serde_json::json!({"specifier": specifier, "export": "App",
+                    "role": "server_framework", "side": null, "ops": []})
+            })
+            .collect();
+        let answered = parse_answer(
+            &serde_json::json!({"library_claims": [{"package": package, "version": version,
+                "status": "answered", "exports": exports}]})
+            .to_string(),
+        );
+        let mut spellings: Vec<String> = asked
+            .claims(answered.exports)
+            .into_iter()
+            .map(|export| export.specifier)
+            .collect();
+        spellings.sort();
+        spellings
+    }
+
+    /// carrick#4070: a Deno `npm:` specifier is asked under the package its
+    /// `deno.lock` resolved it to, in every format, with no `node_modules`.
+    #[test]
+    fn a_deno_npm_specifier_without_node_modules_is_asked_under_its_real_name() {
+        for (format, lock) in [
+            ("2", DENO_V2),
+            ("3", DENO_V3),
+            ("4", DENO_V4),
+            ("5", DENO_V5),
+        ] {
+            assert_eq!(
+                deno_lock_only_asked(lock, &["npm:chalk@5.3.0", "npm:chalk@5.3.0/sub"]),
+                one("chalk", "5.3.0", &["chalk", "chalk/sub"]),
+                "format {format}"
+            );
+        }
+        // Deno reads `npm:/<name>` as `npm:<name>`, and records a request
+        // with no range as `@*`.
+        assert_eq!(
+            deno_lock_only_asked(&deno_v5_lock("hono", &[("*", "4.6.0")]), &["npm:/hono"]),
+            one("hono", "4.6.0", &["hono"])
+        );
+        assert_eq!(
+            deno_lock_only_asked(
+                &deno_v5_lock("@fixture/kit", &[("^1", "1.2.0_peer@2.0.0")]),
+                &["npm:@fixture/kit@^1/server"]
+            ),
+            one("@fixture/kit", "1.2.0", &["@fixture/kit/server"])
+        );
+    }
+
+    /// carrick#4070: the store's answer for the real package reaches every
+    /// spelling the service imports it by, the bare name too, whichever
+    /// sorts first.
+    #[test]
+    fn a_deno_npm_specifier_reads_the_answer_back_onto_its_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("deno.lock"), DENO_V5);
+        let asked = request(
+            &specifiers(&["npm:chalk@5.3.0", "npm:chalk@5.3.0/sub"]),
+            &install_at(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_back(&asked, "chalk", "5.3.0"),
+            vec!["npm:chalk@5.3.0", "npm:chalk@5.3.0/sub"]
+        );
+        // A bare import beside it (`nodeModulesDir: auto`): `chalk` sorts
+        // before `npm:`, `zod` after.
+        for (name, request_range, version) in [("chalk", "5.3.0", "5.3.0"), ("zod", "4", "4.0.0")] {
+            let dir = tempfile::tempdir().unwrap();
+            install_package(dir.path(), name, version);
+            write(
+                &dir.path().join("deno.lock"),
+                &deno_v5_lock(name, &[(request_range, version)]),
+            );
+            let spelled = format!("npm:{name}@{request_range}");
+            let asked = self::request(
+                &specifiers(&[name, spelled.as_str()]),
+                &install_at(dir.path()),
+            )
+            .unwrap();
+            assert_eq!(
+                self::asked(Some(asked.clone())),
+                one(name, version, &[name])
+            );
+            let mut want = vec![name.to_string(), spelled.clone()];
+            want.sort();
+            assert_eq!(read_back(&asked, name, version), want, "{name}");
+        }
+    }
+
+    /// carrick#4070: two requests the lock resolves to two versions ask one
+    /// (fail closed), and the answer for it is never read back onto the
+    /// other's spelling.
+    #[test]
+    fn a_deno_npm_specifier_at_another_version_gets_no_answer_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("deno.lock"),
+            &deno_v5_lock("zod", &[("3", "3.25.0"), ("4", "4.0.0")]),
+        );
+        let asked = request(
+            &specifiers(&["npm:zod@3", "npm:zod@4"]),
+            &install_at(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            self::asked(Some(asked.clone())),
+            one("zod", "3.25.0", &["zod"])
+        );
+        assert_eq!(read_back(&asked, "zod", "3.25.0"), vec!["npm:zod@3"]);
+    }
+
+    /// carrick#4070: a request the lock does not resolve, a package fetched
+    /// from another registry, a service with no `deno.lock`, and a `jsr:`
+    /// import are not asked.
+    #[test]
+    fn a_deno_npm_specifier_the_lock_does_not_resolve_is_not_asked() {
+        assert_eq!(deno_lock_only_asked(DENO_V5, &["npm:chalk@4"]), vec![]);
+        assert_eq!(deno_lock_only_asked(DENO_V5, &["npm:other@5.3.0"]), vec![]);
+        assert_eq!(
+            deno_lock_only_asked(DENO_V5_OTHER_REGISTRY, &["npm:chalk@5.3.0"]),
+            vec![]
+        );
+        assert_eq!(deno_lock_only_asked(DENO_V5, &["jsr:@std/path@1"]), vec![]);
+        // No `deno.lock`: another install's lockfile resolves no `npm:`
+        // request, and with none at all there is nothing to read.
+        let dir = tempfile::tempdir().unwrap();
+        npm_lockfile(dir.path(), &[("chalk", PUBLIC_TGZ)]);
+        assert_eq!(
+            asked(request(
+                &specifiers(&["npm:chalk@5.3.0"]),
+                &install_at(dir.path())
+            )),
+            vec![]
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            asked(request(
+                &specifiers(&["npm:chalk@5.3.0"]),
+                &install_at(empty.path())
+            )),
+            vec![]
+        );
+    }
+
+    /// carrick#4070: the ask's health counts a Deno `npm:` specifier the way
+    /// the ask reads it, and names a `deno.lock` that does not read.
+    #[test]
+    fn ask_health_counts_a_deno_npm_specifier_and_names_an_unreadable_deno_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("deno.lock"), DENO_V5);
+        let health = ask_health(&specifiers(&["npm:chalk@5.3.0"]), &install_at(dir.path()));
+        assert_eq!((health.installed, health.sent), (1, 1));
+        assert!(!health.is_blind(), "{health:?}");
+        // Installed but from another registry: counted, not sent.
+        let other = tempfile::tempdir().unwrap();
+        write(&other.path().join("deno.lock"), DENO_V5_OTHER_REGISTRY);
+        let health = ask_health(&specifiers(&["npm:chalk@5.3.0"]), &install_at(other.path()));
+        assert_eq!((health.installed, health.sent), (1, 0));
+        assert!(health.is_blind(), "{health:?}");
+        // A lock that does not parse, or of a format this scanner does not
+        // read, is named; format 1 holds no npm package and is not.
+        let format_6 = DENO_V5.replace(r#""version": "5""#, r#""version": "6""#);
+        let format_1 = r#"{"https://deno.land/std@0.71.0/textproto/mod.ts":"3118"}"#;
+        for (case, lock, named) in [
+            ("not JSON", "{\"version\": \"5\",", true),
+            ("format 6", format_6.as_str(), true),
+            ("format 1", format_1, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("deno.lock"), lock);
+            let health = ask_health(&specifiers(&["npm:chalk@5.3.0"]), &install_at(dir.path()));
+            assert_eq!((health.installed, health.sent), (0, 0), "{case}");
+            assert_eq!(
+                health.unreadable_lockfiles,
+                if named {
+                    BTreeSet::from([dir.path().join("deno.lock")])
+                } else {
+                    BTreeSet::new()
+                },
+                "{case}"
+            );
+        }
     }
 
     #[test]

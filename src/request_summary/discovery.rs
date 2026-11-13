@@ -565,14 +565,15 @@ fn is_language_key(package: &str) -> bool {
 /// The store's keys for the package a specifier imports: the runtime's
 /// module (`node:<module>`) for a `node:` specifier, and for a bare one both
 /// the runtime's module of that name and the package, as the store asks a
-/// specifier ([`crate::library_store::request`]).
+/// specifier ([`crate::library_store::request`]). A Deno `npm:` specifier
+/// is only its package (carrick#4070).
 fn specifier_keys(specifier: &str) -> Vec<String> {
     if specifier.starts_with("node:") {
         return vec![specifier.to_string()];
     }
     let package = super::library_sites::package_name(specifier);
     let mut keys = vec![package.to_string()];
-    if !specifier.starts_with('.') && !specifier.contains('/') {
+    if !specifier.starts_with('.') && !specifier.starts_with("npm:") && !specifier.contains('/') {
         keys.push(format!("node:{specifier}"));
     }
     keys
@@ -6464,7 +6465,23 @@ export function listen(): void {
         Vec<ExportClaims>,
         MemberDeclarations,
     )> {
-        let on = walked(name, dir, service, &[], true)?;
+        traced_fixture_files(name, dir, service, &[], edit)
+    }
+
+    /// [`traced_fixture_edited`] with `files` written into the service
+    /// before it is walked.
+    fn traced_fixture_files(
+        name: &str,
+        dir: &str,
+        service: &str,
+        files: &[(&str, &str)],
+        edit: impl FnOnce(&mut Vec<ExportClaims>),
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
+        let on = walked(name, dir, service, files, true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("tests/fixtures/{name}/library-claims.json")),
@@ -6906,6 +6923,53 @@ export function listen(): void {
                     .collect::<Vec<_>>()
             )
             .unwrap()
+        );
+    }
+
+    /// carrick#4070: an instance made by a maker imported through a Deno
+    /// `npm:` specifier (`npm:fixture-server@1`) is that labelled maker's,
+    /// as one imported bare is: the store keys the package by its name. The
+    /// compiler resolves the specifier here through a `paths` entry, as
+    /// Deno resolves it to the package it installed.
+    #[test]
+    fn an_instance_made_through_a_deno_npm_specifier_is_its_labelled_maker_s() {
+        let files = [
+            (
+                "tsconfig.json",
+                r#"{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": [],
+    "paths": { "npm:fixture-server@1": ["./node_modules/fixture-server"] }
+  },
+  "include": ["src/**/*"]
+}
+"#,
+            ),
+            (
+                "src/deno-spelled.ts",
+                "import make from \"npm:fixture-server@1\";\n\nexport const denoApp = make();\ndenoApp.get(\"/from-npm-spec\", () => undefined);\n",
+            ),
+        ];
+        let Some((on, exports, declarations)) =
+            traced_fixture_files("receiver-trace", ".", "web", &files, |_| {})
+        else {
+            return;
+        };
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &[]);
+        let got: Vec<String> = instance_ends(&decided)
+            .into_iter()
+            .filter(|end| end.starts_with("src/deno-spelled.ts"))
+            .collect();
+        assert_eq!(
+            got,
+            texts(&["src/deno-spelled.ts:4 <- src/deno-spelled.ts:4 root src/deno-spelled.ts:3"]),
+            "{:#?}",
+            instance_ends(&decided)
         );
     }
 
