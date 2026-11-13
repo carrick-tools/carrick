@@ -1,0 +1,14 @@
+{
+  "mounts": [
+    {
+      "line_number": 5,
+      "parent_node": "server",
+      "child_node": "itemRoutes",
+      "mount_path": "/api/v1",
+      "import_source": "./routes",
+      "pattern_matched": "server.register("
+    }
+  ],
+  "endpoints": [],
+  "data_calls": []
+}
