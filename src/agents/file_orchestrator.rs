@@ -22380,7 +22380,7 @@ export { routes };
         let mut stats = ProcessingStats::default();
         FileOrchestrator::settle_dispatch_values(
             &mut file_results,
-            &witnesses(&[("consumer.ts", vec![])]),
+            &witnesses(&[("consumer.ts", &[])]),
             &mut stats,
         );
 
@@ -22721,10 +22721,10 @@ export { routes };
             result,
             &candidate_map,
             &resolved,
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/consumer.ts",
             false,
         );
@@ -22765,10 +22765,10 @@ export { routes };
                 FileAnalysisResult::default(),
                 &candidate_map,
                 &resolved,
-                vec![],
+                &[],
                 &EnvAliasMap::new(),
                 &WholeUrlFallbackMap::new(),
-                vec![],
+                &[],
                 "src/consumer.ts",
                 false,
             );
@@ -22806,10 +22806,10 @@ export { routes };
             result,
             &candidate_map,
             &resolved,
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/consumer.ts",
             false,
         );
@@ -22844,10 +22844,10 @@ export { routes };
             result,
             &candidate_map,
             &resolved,
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/routes.ts",
             false,
         );
@@ -22873,10 +22873,10 @@ export { routes };
             result,
             &candidate_map,
             &resolved,
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/events.ts",
             false,
         );
@@ -22931,10 +22931,10 @@ export { routes };
             FileAnalysisResult::default(),
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -22958,10 +22958,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23013,10 +23013,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23055,10 +23055,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23102,10 +23102,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23144,10 +23144,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23184,10 +23184,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23216,10 +23216,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23249,10 +23249,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -23287,10 +23287,10 @@ export { routes };
             result,
             &candidate_map,
             &HashMap::new(),
-            vec![],
+            &[],
             &aliases,
             &paths,
-            vec![],
+            &[],
             "src/support.ts",
             false,
         );
@@ -24652,7 +24652,7 @@ export async function POST(request: Request): Promise<Response> {
             source,
             &[RoutingConvention::nextjs_app()],
         );
-        let scan = scanner.scan_content(rel, source, vec![], vec![]);
+        let scan = scanner.scan_content(rel, source, &[], &[]);
         let candidates = scan
             .candidates
             .into_iter()
@@ -24717,7 +24717,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -24762,7 +24762,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -24807,7 +24807,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -24835,7 +24835,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -24877,7 +24877,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -24918,7 +24918,7 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -25031,7 +25031,7 @@ export async function GET(): Promise<Response> {
             },
             candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             route_endpoints,
@@ -25227,7 +25227,7 @@ export async function GET(): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
             &route_endpoints,
@@ -25258,7 +25258,7 @@ export async function POST(request: Request): Promise<Response> {
     /// derived for it: the module sits outside every routing convention.
     fn unstated_route_candidates(source: &str) -> HashMap<String, CandidateTarget> {
         SwcScanner::new()
-            .scan_content(Path::new("src/handlers/things.ts"), source, vec![], vec![])
+            .scan_content(Path::new("src/handlers/things.ts"), source, &[], &[])
             .candidates
             .into_iter()
             .filter(|candidate| candidate.protocol == Protocol::Http)
@@ -25286,10 +25286,10 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/handlers/things.ts",
             false,
         );
@@ -25337,10 +25337,10 @@ export async function POST(request: Request): Promise<Response> {
             },
             &candidates,
             &HashMap::new(),
-            vec![],
+            &[],
             &EnvAliasMap::new(),
             &WholeUrlFallbackMap::new(),
-            vec![],
+            &[],
             "src/handlers/things.ts",
             false,
         );
@@ -25536,7 +25536,7 @@ export async function POST(request: Request): Promise<Response> {
             vec![answered((1, 4), &first), answered((5, 9), &second)],
             vec![answered((5, 9), &second), answered((1, 4), &first)],
         ] {
-            let merged = merge_part_answers(vec![], answers);
+            let merged = merge_part_answers(&[], answers);
             let mounts: Vec<(i32, &str)> = merged
                 .mounts
                 .iter()
@@ -25573,7 +25573,7 @@ export async function POST(request: Request): Promise<Response> {
             "data_calls": [],
             "pubsub_operations": [{ "topic": "far", "role": "subscriber", "line_number": 900 }],
         }));
-        let merged = merge_part_answers(vec![], vec![answered((1, 4), &only)]);
+        let merged = merge_part_answers(&[], vec![answered((1, 4), &only)]);
         assert_eq!(
             (
                 merged.mounts.len(),
@@ -25646,7 +25646,7 @@ export async function POST(request: Request): Promise<Response> {
                 answered((1, 4), &first),
             ],
         ] {
-            let merged = merge_part_answers(vec![], answers);
+            let merged = merge_part_answers(&[], answers);
             let [row] = merged.graphql_operations.as_slice() else {
                 panic!("one row a field: {:?}", merged.graphql_operations);
             };
@@ -25654,7 +25654,7 @@ export async function POST(request: Request): Promise<Response> {
         }
         // With no window holding the resolver, the first part that names one.
         let merged = merge_part_answers(
-            vec![],
+            &[],
             vec![answered((1, 4), &first), answered((10, 12), &third)],
         );
         assert_eq!(
@@ -25690,12 +25690,12 @@ export async function POST(request: Request): Promise<Response> {
             prompt_path: "src/table.ts",
             content,
             listed,
-            candidate_hints: vec![],
-            candidate_contexts: vec![],
+            candidate_hints: &[],
+            candidate_contexts: &[],
             imported_symbols: no_symbols,
-            graphql_producer_hints: vec![],
-            graphql_consumer_hints: vec![],
-            wrapper_context: vec![],
+            graphql_producer_hints: &[],
+            graphql_consumer_hints: &[],
+            wrapper_context: &[],
             wrapper_imports,
         }
     }
