@@ -716,13 +716,20 @@ fn a_file_that_shadows_a_resolution_is_an_input_when_added_or_deleted() {
 /// Cases 7, 8 and 9: the shared tsconfig, the lockfile and carrick.json.
 #[test]
 fn shared_config_lockfile_and_carrick_json_analyse_every_service() {
-    for (path, append) in [
-        ("tsconfig.base.json", "\n"),
-        ("package-lock.json", "\n"),
-        ("carrick.json", "\n"),
-    ] {
+    // The lockfile is read now that it lists installed packages: a trailing
+    // newline moves no package, so its edit is one to its header, which the
+    // rule reads as a move of the whole repo's installs.
+    let edits: [(&str, fn(String) -> String); 3] = [
+        ("tsconfig.base.json", |text| text + "\n"),
+        ("package-lock.json", |text| {
+            assert!(text.contains("\"requires\": true"));
+            text.replacen("\"requires\": true", "\"requires\": false", 1)
+        }),
+        ("carrick.json", |text| text + "\n"),
+    ];
+    for (path, edit) in edits {
         let (_, scan, _, _) = changed_only_after(|ws| {
-            let contents = ws.read(path) + append;
+            let contents = edit(ws.read(path));
             ws.edit(path, &contents);
         });
         assert_analysed(&scan, &["api", "web", "worker"]);

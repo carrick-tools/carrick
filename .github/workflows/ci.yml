@@ -249,14 +249,17 @@ jobs:
         if: matrix.shard == 'steps'
         env:
           CARRICK_MOCK_ALL: "true"
+          # The example's installed `express` stand-in and the store's answer
+          # for it (carrick#3711).
+          CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
         run: |
           mkdir -p examples/express-single/output
           ./target/debug/carrick ./examples/express-single/ > examples/express-single/output/test_output.txt 2>&1
           echo "=== express-single output ==="
           cat examples/express-single/output/test_output.txt
-          # Check that we find the expected 3 endpoints
-          if ! grep -q "Indexed \*\*3 endpoints\*\*" examples/express-single/output/test_output.txt; then
-            echo "ERROR: Expected to find 3 endpoints in examples/express-single"
+          # Check that we find the expected 4 endpoints
+          if ! grep -q "Indexed \*\*4 endpoints\*\*" examples/express-single/output/test_output.txt; then
+            echo "ERROR: Expected to find 4 endpoints in examples/express-single"
             exit 1
           fi
           echo "✅ Basic endpoint detection working correctly"

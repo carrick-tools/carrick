@@ -174,6 +174,8 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/package.json
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/index.d.ts
+!examples/express-single/node_modules/
+!examples/express-single/package-lock.json
 !tests/fixtures/alias-shaped-type-imports/node_modules/
 !tests/fixtures/parallel-services/node_modules/
 !tests/fixtures/graphql-document-call-sites/apps/api/node_modules/
