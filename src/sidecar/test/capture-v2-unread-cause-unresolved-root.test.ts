@@ -7,7 +7,8 @@
  * now records the root as well.
  *
  * - `await pkg.get(...)` on an uninstalled package says `unresolved_import`,
- *   and so does a `.then` chained on it.
+ *   and so do a `.then` chained on it, a `const` bound to it, and a value
+ *   whose own type names a type the missing package declares.
  * - A wrapper in the repo that states `Promise<unknown>` still says
  *   `declared`, even when its body calls the uninstalled package.
  * - An `any` a library declares (`JSON.parse`, `Response.json()`) still says
@@ -41,7 +42,7 @@ const TSCONFIG = {
 };
 
 // Line numbers matter: the anchors below name them.
-const CLIENT_TS = `import pkg from 'fixture-absent-http';
+const CLIENT_TS = `import pkg, { type Payload } from 'fixture-absent-http';
 
 export async function viaWrapper(): Promise<unknown> {
   return pkg.get('/wrapped');
@@ -54,6 +55,15 @@ export async function loadAll(raw: string, res: Response) {
   const parsed = JSON.parse(raw);
   const body = await res.json();
   return { item, chained, wrapped, parsed, body };
+}
+
+export async function loadOne() {
+  const one = await pkg.get('/z');
+  return one;
+}
+
+export function readBody(req: { body: Payload }) {
+  return req.body;
 }
 `;
 
@@ -86,6 +96,8 @@ describe('capture: a root top type from an unresolved import says unresolved_imp
     at('Wrapped_Response', 10, 'viaWrapper()'),
     at('Parsed_Response', 11, 'JSON.parse(raw)'),
     at('Body_Response', 12, 'res.json()'),
+    at('Bound_Response', 18, 'one'),
+    at('Placeholder_Request', 22, 'req.body'),
   ]);
   const record = (alias: string): CaptureAliasRecord => {
     const found = records.get(alias);
@@ -105,6 +117,17 @@ describe('capture: a root top type from an unresolved import says unresolved_imp
     assert.strictEqual(r.unread_cause, 'unresolved_import');
   });
 
+  it('a binding initialised from that call says unresolved_import', () => {
+    const r = record('Bound_Response');
+    assert.strictEqual(r.top_type_at_self_check, true);
+    assert.strictEqual(r.unread_cause, 'unresolved_import');
+  });
+
+  it('a value typed from a missing type says unresolved_import', () => {
+    const r = record('Placeholder_Request');
+    assert.strictEqual(r.unread_cause, 'unresolved_import', JSON.stringify(r));
+  });
+
   it('a repo wrapper that states Promise<unknown> still says declared', () => {
     const r = record('Wrapped_Response');
     assert.strictEqual(r.top_type_at_self_check, true);
@@ -120,7 +143,7 @@ describe('capture: a root top type from an unresolved import says unresolved_imp
   });
 
   it('the root cause is not a member finding: any_provenance stays empty', () => {
-    for (const alias of ['Item_Response', 'Chained_Response']) {
+    for (const alias of ['Item_Response', 'Chained_Response', 'Bound_Response']) {
       assert.strictEqual(record(alias).any_provenance, undefined, alias);
     }
   });
