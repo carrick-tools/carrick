@@ -1045,6 +1045,13 @@ export interface SymbolRequest {
   consumer_response?: boolean;
 }
 
+/** A call's place in its file: where a request's {@link InferRequestItem.through_call} is. */
+export interface ThroughCall {
+  file_path: string;
+  span_start: number;
+  span_end: number;
+}
+
 /**
  * Request for type inference at a specific location
  */
@@ -1082,6 +1089,13 @@ export interface InferRequestItem {
    * element this path names (`loop-element.ts`).
    */
   route_path?: string;
+  /**
+   * carrick#4128: the call that reaches the function this request's
+   * expression sits in, where the scanner reads a caller's payload in the
+   * wrapper that builds it. A type parameter of that function is read as
+   * this call instantiates it; one it leaves open is never published.
+   */
+  through_call?: ThroughCall;
 }
 
 // ============================================================================

@@ -1753,6 +1753,7 @@ pub(crate) fn route_response_request(
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }
 }
 
@@ -5356,6 +5357,7 @@ impl FileOrchestrator {
                         route_path: None,
                         at_registration,
                         result_unanswered,
+                        through_call: None,
                     });
                     true
                 }
@@ -5385,6 +5387,7 @@ impl FileOrchestrator {
                         route_path: None,
                         at_registration: false,
                         result_unanswered,
+                        through_call: None,
                     });
                     true
                 }
@@ -5413,6 +5416,7 @@ impl FileOrchestrator {
                         route_path: None,
                         at_registration: false,
                         result_unanswered,
+                        through_call: None,
                     });
                     true
                 }
@@ -6281,6 +6285,7 @@ impl FileOrchestrator {
                 route_path: None,
                 at_registration: false,
                 result_unanswered: false,
+                through_call: None,
             });
         }
         debug!(
@@ -6657,6 +6662,7 @@ impl FileOrchestrator {
                         route_path: None,
                         at_registration: false,
                         result_unanswered: false,
+                        through_call: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6680,6 +6686,7 @@ impl FileOrchestrator {
                         route_path: None,
                         at_registration: false,
                         result_unanswered: false,
+                        through_call: None,
                     },
                 };
                 requests.push(request);
@@ -6937,6 +6944,7 @@ impl FileOrchestrator {
                 route_path: None,
                 at_registration: false,
                 result_unanswered: false,
+                through_call: None,
             });
         }
         debug!(
@@ -7110,6 +7118,7 @@ impl FileOrchestrator {
                     route_path: None,
                     at_registration: false,
                     result_unanswered: false,
+                    through_call: None,
                 });
             }
         }

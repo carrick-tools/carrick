@@ -78,6 +78,7 @@ fn variable_item(file: &str, declaration: &str, alias: &str) -> InferRequestItem
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }
 }
 

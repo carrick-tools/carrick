@@ -100,6 +100,7 @@ fn ask(sidecar: &TypeSidecar, root: &Path, modules: &[(&str, &str)]) -> Vec<Stri
                 route_path: None,
                 at_registration: false,
                 result_unanswered: false,
+                through_call: None,
             };
             let response = sidecar.infer_types(&[item], None).expect("infer");
             response

@@ -261,6 +261,23 @@ pub struct InferRequestItem {
     /// [`derive_capture_anchors`]: crate::engine::type_compat_v2::derive_capture_anchors
     #[serde(skip)]
     pub at_registration: bool,
+    /// carrick#4128: the call that reaches the function this request's
+    /// expression sits in, set where a site's payload is read in the wrapper
+    /// that builds it. The sidecar reads a type parameter of that function as
+    /// this call instantiates it, and publishes none it leaves open. Absent
+    /// from every other request, so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_call: Option<ThroughCall>,
+}
+
+/// A call's place in its file, in the sidecar's numbering
+/// ([`InferRequestItem::through_call`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThroughCall {
+    /// The file the call is in, as `file_path` is given.
+    pub file_path: String,
+    pub span_start: u32,
+    pub span_end: u32,
 }
 
 // ============================================================================
@@ -6133,6 +6150,7 @@ mod tests {
             route_path: None,
             at_registration: false,
             result_unanswered: false,
+            through_call: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -6395,6 +6413,11 @@ mod tests {
                         route_path: None,
                         at_registration: false,
                         result_unanswered: false,
+                        through_call: Some(ThroughCall {
+                            file_path: "/repo/src/checkout.ts".into(),
+                            span_start: 30,
+                            span_end: 60,
+                        }),
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6863,6 +6886,7 @@ mod tests {
             route_path: None,
             at_registration: false,
             result_unanswered: false,
+            through_call: None,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8749,6 +8773,7 @@ mod tests {
             route_path: None,
             at_registration: false,
             result_unanswered: false,
+            through_call: None,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8977,6 +9002,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 route_path: None,
                 at_registration: false,
                 result_unanswered: false,
+                through_call: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -9025,6 +9051,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             param_name: None,
             route_path: None,
             at_registration: false,
+            through_call: None,
             member: None,
             result,
             result_unanswered: false,
@@ -9166,6 +9193,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             route_path: None,
             at_registration: false,
             result_unanswered: false,
+            through_call: None,
         }];
         assert!(
             sidecar.infer_types(&infer, None).is_err(),

@@ -5392,21 +5392,19 @@ fn normalize_held_request_lines(
 /// After the site fold (carrick#4121): each request line the fold found
 /// stated at its module-level callers' facts leaves the file results, as a
 /// model row withdrawn in the analysis does, and its type anchors move to
-/// its callers: the summary callers carry them as
-/// [`crate::agents::file_analyzer_agent::DataCallResult::request_line`], and
-/// the module-level fact rows' request is asked at the request line through
-/// the returned map, keyed by caller file and line ([`site_infer_requests`]).
+/// its summary callers, which carry them as
+/// [`crate::agents::file_analyzer_agent::DataCallResult::request_line`]. A
+/// module-level fact row's request is not asked here: its slot is the body
+/// the wrapper builds ([`crate::request_summary::site_record`], carrick#4128).
 /// Results are matched by their normalised key, whichever spelling they are
-/// held in. Only the request moves to the fact rows: each reads its response
-/// at its own call.
+/// held in.
 fn settle_request_lines_stated_at_module_callers(
     file_results: &mut HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     held: &[crate::agents::file_analyzer_agent::HeldRequestLine],
     fold: &crate::site_rows::SiteFold,
     repo_path: &str,
-) -> HashMap<(String, u32), crate::agents::file_analyzer_agent::RequestLineAnchors> {
+) {
     use crate::agents::file_analyzer_agent::{RequestLineAnchors, ResolutionSource};
-    let mut moved = HashMap::new();
     for (file, span_start) in &fold.stated_at_fact_callers {
         let Some(line) = held
             .iter()
@@ -5439,18 +5437,7 @@ fn settle_request_lines_stated_at_module_callers(
                 }
             }
         }
-        for (caller_file, caller_line) in &line.fact_calls {
-            moved.insert(
-                (caller_file.clone(), *caller_line),
-                RequestLineAnchors {
-                    file: line.file.clone(),
-                    call: line.model.clone(),
-                    response: false,
-                },
-            );
-        }
     }
-    moved
 }
 
 /// Which of this scan's files already hold a model answer, so the analyzer
@@ -6259,7 +6246,7 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 service,
             );
-            let moved_to_module_callers = settle_request_lines_stated_at_module_callers(
+            settle_request_lines_stated_at_module_callers(
                 &mut merged_results,
                 &held_at_module,
                 &site_fold,
@@ -6402,12 +6389,7 @@ async fn analyze_current_repo_incremental(
                 file_orchestrator
                     .collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
             );
-            protocol_infer.extend(site_infer_requests(
-                &site_fold,
-                repo_path,
-                &results,
-                &moved_to_module_callers,
-            ));
+            protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
             // A route the trace wrote has no model row to ask for its
             // response (carrick#4071).
             protocol_infer.extend(traced_asks);
@@ -10851,18 +10833,10 @@ fn apply_site_fold_to_manifest(
 /// row whose record has no such anchor asks nothing for that type; an HTTP
 /// route's handler is not asked (its request and response are read off the
 /// route, not the parameter).
-///
-/// `moved` holds, by caller file and line, the anchors of the request lines
-/// whose model row went because module-level fact rows state them
-/// (carrick#4121, [`settle_request_lines_stated_at_module_callers`]): an
-/// HTTP call row there with no payload of its own asks its request body at
-/// the request line, as a summary caller's row does
-/// ([`crate::agents::file_analyzer_agent::RequestLineAnchors::request_body`]).
 fn site_infer_requests(
     fold: &crate::site_rows::SiteFold,
     repo_path: &str,
     results: &crate::result_shapes::ResultIndex,
-    moved: &HashMap<(String, u32), crate::agents::file_analyzer_agent::RequestLineAnchors>,
 ) -> Vec<crate::services::type_sidecar::InferRequestItem> {
     use crate::services::type_sidecar::InferRequestItem;
     use crate::site_rows::RowSide;
@@ -10907,6 +10881,7 @@ fn site_infer_requests(
             route_path: None,
             at_registration: false,
             result_unanswered: false,
+            through_call: None,
         }
     };
     let mut requests = Vec::new();
@@ -10930,28 +10905,6 @@ fn site_infer_requests(
                         alias(ManifestTypeKind::Request),
                         None,
                     ));
-                } else if let Some(moved) = moved.get(&(row.file.clone(), row.line))
-                    && row.key.as_http().is_some_and(|(method, _)| {
-                        crate::type_manifest::producer_reads_request_body(method)
-                    })
-                    && let Some(body) = moved.request_body()
-                {
-                    requests.push(InferRequestItem {
-                        member: None,
-                        result: None,
-                        file_path: root.join(&moved.file).to_string_lossy().into_owned(),
-                        line_number: body.line,
-                        span_start: None,
-                        span_end: None,
-                        expression_text: Some(body.text.to_string()),
-                        expression_line: body.expression_line,
-                        infer_kind: InferKind::RequestBody,
-                        alias: Some(alias(ManifestTypeKind::Request)),
-                        param_name: None,
-                        route_path: None,
-                        at_registration: false,
-                        result_unanswered: false,
-                    });
                 }
                 // A built request's anchor is its object literal, not a
                 // call: nothing there is a response (carrick#3470).
@@ -12006,6 +11959,15 @@ fn run_capture_for_service(
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     crate::site_payloads::take_over(&mut infer, payload_infer);
+    debug!(
+        carrier_asks = infer
+            .iter()
+            .filter(|request| request.infer_kind == InferKind::RequestBody
+                && request.span_start.is_none()
+                && request.expression_text.is_some())
+            .count(),
+        "site payloads: request-line asks no slot took over"
+    );
     // Mirror resolve_all_types' post-processing exactly: the #413 two-anchor
     // arbitration re-aims witnessed-borrowed pub/sub anchors at the
     // tsc-witnessed payload root BEFORE depths apply, so v2 capture anchors
@@ -15212,7 +15174,7 @@ async fn analyze_current_repo(
         service,
     );
     let mut analysis_result = analysis_result;
-    let moved_to_module_callers = settle_request_lines_stated_at_module_callers(
+    settle_request_lines_stated_at_module_callers(
         &mut analysis_result.file_results,
         &held_at_module,
         &site_fold,
@@ -15319,12 +15281,7 @@ async fn analyze_current_repo(
     protocol_infer.extend(
         file_orchestrator.collect_graphql_consumer_infer_requests(&protocol_extractions.graphql),
     );
-    protocol_infer.extend(site_infer_requests(
-        &site_fold,
-        repo_path,
-        &results,
-        &moved_to_module_callers,
-    ));
+    protocol_infer.extend(site_infer_requests(&site_fold, repo_path, &results));
     // A route the trace wrote has no model row to ask for its response
     // (carrick#4071).
     protocol_infer.extend(traced_asks);
@@ -30157,7 +30114,6 @@ unfollowed_member_calls_total: 0,
             &fold,
             "/repo",
             &crate::result_shapes::ResultIndex::default(),
-            &HashMap::new(),
         );
         let aliases: HashSet<&str> = entries
             .iter()
@@ -30253,7 +30209,7 @@ unfollowed_member_calls_total: 0,
         );
         let fold = fold_of(vec![labelled, other_call, publish]);
         let index = ResultIndex::labelled("src/client.ts", (100, 130), member.clone());
-        let requests = site_infer_requests(&fold, "/repo", &index, &HashMap::new());
+        let requests = site_infer_requests(&fold, "/repo", &index);
         let carrying: Vec<(&str, InferKind)> = requests
             .iter()
             .filter(|request| request.result.is_some())
@@ -30273,12 +30229,12 @@ unfollowed_member_calls_total: 0,
         // The same span in another file names another call.
         let elsewhere = ResultIndex::labelled("src/else.ts", (100, 130), member);
         assert!(
-            site_infer_requests(&fold, "/repo", &elsewhere, &HashMap::new())
+            site_infer_requests(&fold, "/repo", &elsewhere)
                 .iter()
                 .all(|request| request.result.is_none())
         );
         // No labels: byte-identical to the requests with the label stripped.
-        let bare = site_infer_requests(&fold, "/repo", &ResultIndex::default(), &HashMap::new());
+        let bare = site_infer_requests(&fold, "/repo", &ResultIndex::default());
         let strip = |items: &[crate::services::type_sidecar::InferRequestItem]| {
             items
                 .iter()
@@ -32311,6 +32267,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 route_path: None,
                 at_registration: false,
                 result_unanswered: false,
+                through_call: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));

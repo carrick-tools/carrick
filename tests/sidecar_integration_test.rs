@@ -819,6 +819,7 @@ export async function getOrderCount(): Promise<number> {
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }];
     let config = ExtractionConfig {
         rules: vec![ExtractionRule {
@@ -1027,6 +1028,7 @@ notificationRouter.get('/status', async () => {
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }];
     let config = ExtractionConfig {
         rules: vec![ExtractionRule {
@@ -1208,6 +1210,7 @@ notificationRouter.get('/status', async () => {
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }];
     // Rules are present (the cloud generates them either way) but inert: they
     // cannot match a wrapper on an `any` call type, exactly as in CI.
@@ -1444,6 +1447,7 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     };
     let infer = vec![infer_item(demoted_alias), infer_item(kept_alias)];
 

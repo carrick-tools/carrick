@@ -126,6 +126,7 @@ fn handler_return(file: &str, alias: &str) -> InferRequestItem {
         route_path: None,
         at_registration: false,
         result_unanswered: false,
+        through_call: None,
     }
 }
 
