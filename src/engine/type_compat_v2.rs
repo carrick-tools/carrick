@@ -7790,6 +7790,7 @@ mod tests {
         let mut line_only = response_body_infer("Endpoint_line_Response");
         line_only.span_start = None;
         line_only.span_end = None;
+        line_only.expression_text = None;
         let mut config = response_body_infer("Endpoint_spread_Request");
         config.infer_kind = InferKind::RequestConfig;
         config.member = Some("body".to_string());
