@@ -13,6 +13,9 @@
 //! - A statement that is a whole `local = rhs` replaces every way that
 //!   reaches it; `local ??= rhs` and `local ||= rhs` add a way and keep the
 //!   rest. Reads in `rhs` see the ways before the write.
+//! - `local += rhs` where `rhs` is a string or template literal
+//!   ([`super::is_text_append`]) keeps every way that reaches it and extends
+//!   each by the write: the value is that way's value followed by `rhs`.
 //! - An `if` reads each branch under its test; a missing `else` is the state
 //!   under the test's negation. A way that comes through both branches
 //!   untouched is one way, without that test (dropping a test that holds on
@@ -21,7 +24,7 @@
 //!   reaches has no entry.
 //! - A write of the local in any other form or place (inside an `if` test, a
 //!   call argument, a loop, `try`, `switch`, a labelled statement, a function
-//!   written in the body, `++`, a compound operator, a destructuring) refuses
+//!   written in the body, `++`, any other compound operator, a destructuring) refuses
 //!   the whole local: [`reaching`] answers `None` and every reader keeps the
 //!   census's set. Any other statement passes the ways through.
 //! - A read inside a function written in the body has no entry.
@@ -33,7 +36,7 @@
 //! body to the point takes, with the branch taken. `fetch(u)` after
 //! `if (verb === "GET") return;` is reached only where the test fails.
 
-use super::MAX_VALUES;
+use super::{MAX_VALUES, is_text_append};
 use crate::binding_scope::{BindingKey, ident_key};
 use crate::graphql_document_sites::unwrap_expression;
 use std::collections::BTreeMap;
@@ -63,10 +66,16 @@ pub(in crate::request_summary) enum Source<'a> {
 pub(in crate::request_summary) struct Way<'a> {
     pub(in crate::request_summary) from: Source<'a>,
     pub(in crate::request_summary) tests: Vec<(&'a Expr, bool)>,
+    /// The `+=` writes that ran after `from`, in order: each one's right
+    /// side follows the value.
+    pub(in crate::request_summary) appends: Vec<&'a AssignExpr>,
 }
 
 impl Way<'_> {
-    /// The way as spans: what the binding table keeps.
+    /// The way as spans: what the binding table keeps. A local with a text
+    /// append is unplaceable for the readers of that table
+    /// ([`super::WriteCensus::is_unplaceable`]), so the table never holds
+    /// its appends.
     fn at(&self) -> WayAt {
         WayAt {
             from: match self.from {
@@ -227,7 +236,14 @@ fn same(a: &Way<'_>, b: &Way<'_>) -> bool {
         Source::Unwritten => (1, 0),
         Source::Write(assign) => (2, assign.span.lo.0),
     };
+    let appended = |way: &Way<'_>| {
+        way.appends
+            .iter()
+            .map(|at| at.span.lo.0)
+            .collect::<Vec<_>>()
+    };
     from(a) == from(b)
+        && appended(a) == appended(b)
         && a.tests.len() == b.tests.len()
         && a.tests
             .iter()
@@ -366,6 +382,7 @@ impl<'a> Flow<'_, 'a> {
                     state = State::Live(vec![Way {
                         from,
                         tests: path.to_vec(),
+                        appends: Vec::new(),
                     }]);
                 }
                 state
@@ -380,9 +397,17 @@ impl<'a> Flow<'_, 'a> {
                     let way = Way {
                         from: Source::Write(assign),
                         tests: path.to_vec(),
+                        appends: Vec::new(),
                     };
                     return match (assign.op, state) {
                         (_, State::Dead) => State::Dead,
+                        (AssignOp::AddAssign, State::Live(mut ways)) if is_text_append(assign) => {
+                            for way in &mut ways {
+                                way.appends.push(assign);
+                            }
+                            State::capped(ways)
+                        }
+                        (AssignOp::AddAssign, State::Over) if is_text_append(assign) => State::Over,
                         (AssignOp::Assign, _) => State::Live(vec![way]),
                         (AssignOp::NullishAssign | AssignOp::OrAssign, State::Live(mut ways)) => {
                             ways.push(way);
@@ -752,7 +777,8 @@ mod tests {
             "for (const x of xs) p = x;",
             "if ((p = \"/b\")) {}",
             "use((p = \"/b\"));",
-            "p += \"/b\";",
+            "p += suffix;",
+            "p -= \"/b\";",
             "p++;",
             "[p] = xs;",
             "const g = () => { p = \"/b\"; };",
