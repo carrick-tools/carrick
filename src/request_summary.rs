@@ -184,7 +184,7 @@ mod library_sites;
 // What a conditional leaves a URL or a method able to read as (carrick#2050,
 // carrick#2051).
 mod alternatives;
-use alternatives::{Alternation, Alternatives};
+use alternatives::{Alternation, Alternatives, Verdict, WayGuard};
 
 // The requests a function builds and returns for a caller to send
 // (carrick#3470): stated as candidate rows where nothing in the service
@@ -793,10 +793,11 @@ impl RequestShape {
         let path_first =
             |url: &[Piece]| matches!(url.first(), Some(Piece::Lit(text)) if text.starts_with('/'));
         match &self.alternation {
-            Alternation::Rows(rows) if rows.len() > 1 => {
-                rows.iter().all(|(_, url)| path_first(url))
-            }
-            Alternation::Rows(_) | Alternation::Single | Alternation::Nothing => {
+            // A way a caller's test decides is the caller's to state.
+            Alternation::Rows(rows, _) if rows.len() > 1 => rows
+                .iter()
+                .all(|(_, url, guards)| path_first(url) && guards.is_empty()),
+            Alternation::Rows(..) | Alternation::Single | Alternation::Nothing => {
                 !self.declared_methods.is_empty() && path_first(&self.url)
             }
         }
@@ -2654,6 +2655,20 @@ pub fn extract_file_ir(
             &file.module_bindings,
             &file.placed_writes,
         );
+        // A request read through a local written more than once keeps its
+        // ways only where the census places every write of it (carrick#3679).
+        let placed = &file.placed_writes;
+        for body in file
+            .functions
+            .values_mut()
+            .chain(std::iter::once(&mut file.module_level))
+        {
+            body.visit_calls(&mut |call| {
+                if let Some(request) = &mut call.request {
+                    request.alternation.census_checked(placed);
+                }
+            });
+        }
     }
     file.arg_pieces = reader.arg_pieces.take();
     file.held_inits = reader.held_inits.take();
@@ -6656,6 +6671,9 @@ impl Reader<'_> {
         let mut reassigned = Reassigned::default();
         let mut declared = Declarations::default();
         let mut written_through = HashSet::new();
+        // Each local declared once and written again whose ways are read,
+        // with where each write read so far starts (carrick#3679).
+        let mut written: HashMap<BindingKey, BTreeSet<u32>> = HashMap::new();
         for stmt in stmts {
             stmt.visit_with(&mut reassigned);
             stmt.visit_with(&mut declared);
@@ -6843,6 +6861,22 @@ impl Reader<'_> {
                             }
                         }
                     }
+                    // A `let` or `var` declared once and written again: every
+                    // write is a way the value resolver's census places
+                    // (carrick#3679), read as each statement after it writes
+                    // it ([`Self::written_ways`]). One with no initialiser
+                    // holds nothing until a write sets it.
+                    if let Pat::Ident(ident) = &declarator.name
+                        && var.kind != VarDeclKind::Const
+                        && reassigned.names.contains(ident.id.sym.as_ref())
+                        && reassigned.declared_once(&declared, ident.id.sym.as_ref())
+                    {
+                        let key = ident_key(&ident.id);
+                        written.insert(key.clone(), BTreeSet::new());
+                        if declarator.init.is_none() {
+                            scope.alts.insert(key.clone(), Alternatives::unwritten(key));
+                        }
+                    }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
                         let key = ident_key(&ident.id);
@@ -6871,12 +6905,19 @@ impl Reader<'_> {
                         }
                         // What a conditional in it leaves it able to read as
                         // (carrick#2050): a request built from it states
-                        // one row per branch.
-                        let alts = if unsettled {
-                            None
-                        } else {
+                        // one row per branch. One written again is its
+                        // initialiser until a write sets it (carrick#3679).
+                        let alts = if !unsettled {
                             self.alternatives(init, scope)
+                        } else if let Some(placed) = written.get(&key) {
+                            self.reading_of(init, scope)
+                                .map(|state| state.of_local(&key, placed))
+                        } else {
+                            None
                         };
+                        if alts.is_none() {
+                            written.remove(&key);
+                        }
                         scope.locals.insert(key.clone(), value);
                         match alts {
                             Some(alts) => {
@@ -6897,7 +6938,46 @@ impl Reader<'_> {
                 }
                 continue;
             }
+            // A local this statement writes reads as nothing inside it, and
+            // as each way the statement leaves it after it (carrick#3679).
+            // Every local's ways are read before any is put back, so one the
+            // statement writes from another reads it as nothing, whichever
+            // order the locals are taken in.
+            let mut keys: Vec<BindingKey> = written
+                .keys()
+                .filter(|key| alternatives::writes_local(stmt, key))
+                .cloned()
+                .collect();
+            keys.sort();
+            let before: Vec<(BindingKey, Alternatives)> = keys
+                .into_iter()
+                .filter_map(|key| {
+                    let state = scope.alts.remove(&key)?;
+                    Some((key, state))
+                })
+                .collect();
             self.walk(stmt, scope, ir);
+            let mut after = Vec::new();
+            for (key, state) in before {
+                let placed = written.get_mut(&key).expect("a written local");
+                let mut flow = alternatives::WriteFlow {
+                    local: &key,
+                    scope,
+                    guards: &ir.guards,
+                    path: Vec::new(),
+                    placed: &mut *placed,
+                };
+                match self.written_ways(stmt, state, &mut flow) {
+                    Some(state) => {
+                        let state = state.of_local(&key, placed);
+                        after.push((key, state));
+                    }
+                    None => {
+                        written.remove(&key);
+                    }
+                }
+            }
+            scope.alts.extend(after);
         }
     }
 
@@ -9558,6 +9638,14 @@ struct Effect {
     /// the key's default ([`FnIr::key_defaults`]), or, once a caller hands
     /// its own options on, the key it wrote before spreading them.
     key_defaults: BTreeMap<(usize, String), Vec<Piece>>,
+    /// The tests of parameters the request is sent this way under, each
+    /// decided at the call that fills its parameter with text
+    /// (carrick#3679): one decided the way's way is spent, one decided the
+    /// other way rules the effect out ([`Self::ruled_out`]).
+    guards: Vec<WayGuard>,
+    /// A guard was decided against this way: no call of the function sends
+    /// it.
+    ruled_out: bool,
 }
 
 /// What a caller's argument holds under one key of the callee's parameter
@@ -9646,19 +9734,16 @@ impl Effect {
             _ => None,
         };
         let readings = match &shape.alternation {
-            Alternation::Single => vec![(shape.method.clone(), shape.url.clone())],
-            Alternation::Rows(rows) => rows
-                .iter()
-                .map(|(method, url)| (method.clone(), url.clone()))
-                .collect(),
+            Alternation::Single => vec![(shape.method.clone(), shape.url.clone(), Vec::new())],
+            Alternation::Rows(rows, _) => rows.clone(),
             // The request goes out; which one is not stated. It is still a
             // request the function sends, so a call of the function is not
             // one that sends nothing.
-            Alternation::Nothing => vec![(MethodValue::Unknown, vec![Piece::Unknown])],
+            Alternation::Nothing => vec![(MethodValue::Unknown, vec![Piece::Unknown], Vec::new())],
         };
         readings
             .into_iter()
-            .map(|(method, url)| {
+            .map(|(method, url, guards)| {
                 let mut effect = Effect {
                     site: RequestSite {
                         file: file.to_path_buf(),
@@ -9675,6 +9760,8 @@ impl Effect {
                     base_scope: shape.base_scope.clone(),
                     semantics: shape.semantics.clone(),
                     key_defaults: key_defaults.clone(),
+                    guards,
+                    ruled_out: false,
                 };
                 effect.settle_keys();
                 effect.settle_outer();
@@ -9813,6 +9900,15 @@ impl Effect {
             semantics: self.semantics.clone(),
             // The closure's own defaults are no key of the enclosing one.
             key_defaults: BTreeMap::new(),
+            guards: self
+                .guards
+                .iter()
+                .map(|guard| WayGuard {
+                    subject: lift(&guard.subject),
+                    ..guard.clone()
+                })
+                .collect(),
+            ruled_out: self.ruled_out,
         }
     }
 
@@ -9833,6 +9929,8 @@ impl Effect {
                 // the site walk reads it (`decided_sites::decides`).
                 && (piece.through().is_none() || render_target(&self.url).is_none())
         }) || self.base.iter().any(Piece::is_parameter)
+            // A test a caller decides is the caller's (carrick#3679).
+            || self.guards.iter().any(WayGuard::is_open)
     }
 
     /// This effect as seen from a call passing `args`, which `spread_args`
@@ -9983,12 +10081,14 @@ impl Effect {
             },
             other => other.clone(),
         };
-        // What each key the caller's own parameter now holds falls back to.
+        // What each key the caller's own parameter now holds falls back to,
+        // a key a way's test reads among them.
         let mut key_defaults: BTreeMap<(usize, String), Vec<Piece>> = BTreeMap::new();
         let read_keys = self
             .url
             .iter()
             .chain(&self.base)
+            .chain(self.guards.iter().flat_map(|guard| &guard.subject))
             .filter_map(|piece| match piece {
                 Piece::ParamKey(index, key, _) => Some((*index, key.as_str())),
                 _ => None,
@@ -10071,7 +10171,42 @@ impl Effect {
             base_scope: self.base_scope.clone(),
             semantics: self.semantics.clone(),
             key_defaults,
+            guards: Vec::new(),
+            ruled_out: self.ruled_out,
         };
+        // Each test of a parameter against what the caller wrote there
+        // (carrick#3679): text decides it, the caller's own parameter leaves
+        // it to the caller's callers, and anything else leaves the way.
+        for guard in &self.guards {
+            let subject = concat(guard.subject.iter().map(|piece| match piece {
+                Piece::Param(index, _) => match args.get(*index) {
+                    Some(Value::Str(arg)) => arg.clone(),
+                    _ => vec![Piece::Unknown],
+                },
+                // The key as the URL and the method read it: a key the
+                // caller leaves out is the callee's default (carrick#3608).
+                Piece::ParamKey(index, key, name) => {
+                    match self.read_key(args, omitted, *index, key) {
+                        KeyRead::Written(Value::Str(arg)) => arg.clone(),
+                        KeyRead::Fallback(fallback) => fallback,
+                        KeyRead::Passed(outer, _) => {
+                            vec![Piece::ParamKey(outer, key.clone(), name.clone())]
+                        }
+                        _ => vec![Piece::Unknown],
+                    }
+                }
+                other => vec![other.clone()],
+            }));
+            let filled = WayGuard {
+                subject,
+                ..guard.clone()
+            };
+            match filled.verdict() {
+                Verdict::Open => instantiated.guards.push(filled),
+                Verdict::RuledOut => instantiated.ruled_out = true,
+                Verdict::Kept | Verdict::Undecided => {}
+            }
+        }
         // A key of the caller's own parameter may have arrived in what it
         // wrote (`get(`${options.base}/users`)`), and so may an enclosing
         // function's.
@@ -10600,8 +10735,8 @@ impl FnIr {
                 if let BodyValue::Fields(object) = &mut request.body {
                     visit_object_pieces(scope, object, visit);
                 }
-                if let Alternation::Rows(rows) = &mut request.alternation {
-                    for (_, url) in rows {
+                if let Alternation::Rows(rows, _) = &mut request.alternation {
+                    for (_, url, _) in rows {
                         visit(scope, url);
                     }
                 }
@@ -11547,20 +11682,28 @@ impl Composer<'_> {
                 // were while an element read as nothing (carrick#1949).
                 Some((_, callee)) if call.jsx => {
                     for effect in callee.effects.iter().filter(|effect| effect.has_params()) {
-                        summary.state(
-                            ir.settle_forward(effect.at_call(call, file)),
-                            callee.through_call(effect, file, call.site.line),
-                        );
+                        let sent = effect.at_call(call, file);
+                        if !sent.ruled_out {
+                            summary.state(
+                                ir.settle_forward(sent),
+                                callee.through_call(effect, file, call.site.line),
+                            );
+                        }
                     }
                 }
                 Some((_, callee)) => {
                     summary.complete &= callee.complete;
                     summary.hands_out |= callee.hands_out;
                     for effect in &callee.effects {
-                        summary.state(
-                            ir.settle_forward(effect.at_call(call, file)),
-                            callee.through_call(effect, file, call.site.line),
-                        );
+                        // A way this call's text rules out is never sent
+                        // from here (carrick#3679).
+                        let sent = effect.at_call(call, file);
+                        if !sent.ruled_out {
+                            summary.state(
+                                ir.settle_forward(sent),
+                                callee.through_call(effect, file, call.site.line),
+                            );
+                        }
                     }
                     for (index, arg) in call.args.iter().enumerate() {
                         match arg {
@@ -12107,6 +12250,9 @@ fn emit(
                         effect.instantiate_omitting(&call.args, &call.spread_args, &|index| {
                             call.omits(index)
                         });
+                    if instantiated.ruled_out {
+                        continue;
+                    }
                     // What this call writes for a method that is a parameter
                     // (carrick#2049).
                     if matches!(effect.method, MethodValue::Param(_)) {
@@ -13013,6 +13159,8 @@ mod tests {
             base_scope: None,
             semantics: BTreeSet::new(),
             key_defaults: BTreeMap::new(),
+            guards: Vec::new(),
+            ruled_out: false,
         }
     }
 

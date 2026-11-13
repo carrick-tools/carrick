@@ -20,3 +20,33 @@ it with a path; page components (`src/pages/entity-page.ts`) call the members.
 Each page caller keeps its row, and reads as its inline twin does. The test is
 `page_callers_of_a_url_local_wrapper_keep_their_rows` in
 `tests/url_local_base_test.rs`.
+
+## A URL local written more than once (`src/clients/branches.ts`)
+
+A wrapper that writes its URL local more than once (`src/clients/branches.ts`,
+callers in `src/use-branches.ts`, test `tests/url_local_branches_test.rs`)
+states one request per write at each caller. A write under a test of the
+wrapper's own parameter (`===` / `!==` against text, `startsWith`, an anchored
+literal pattern) is kept or dropped by the text the caller, or a hop between,
+fills it with; under any other test (`if (data)`) every write is kept.
+
+Answer key (the row at each call line in `use-branches.ts`):
+
+- 20, set in both branches of a prefix test, called with a path: `POST
+  /api/items.list` only.
+- 21, initialised then set again under a prefix test: `POST /api/items.list`.
+- 22, a query set under a truthiness test, or the path: every row keys `POST
+  /api/items.list`.
+- 23, line 20's client called with an absolute URL: only that URL is sent,
+  an outside host the scan states no call row for (as an inline `fetch` of
+  one), so no row; never a based `/api/https://…`.
+- 24, set again inside a callback: no row.
+- 25, the branching client (a method test filled one hop away, then an
+  anchored pattern on the path): `POST /api/items.list` only.
+- 26, the URL set from a query the same statement sets: no row.
+- 27 and 28, a test of an options key a hop writes before spreading its
+  caller's options (`{ mode: "plain", ...options }`), the options omitted or
+  written without the key: the hop's text decides the test, so `POST
+  /api/items.list` only.
+- 29, the same caller writing the key (`{ mode: "next" }`): `POST
+  /api/v2/items.list` only.
