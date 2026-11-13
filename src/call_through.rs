@@ -1814,6 +1814,7 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.wrapper_rows_withdrawn += stated.withdrawn;
         settled.enclosing_model_rows_withdrawn += stated.enclosing_withdrawn;
         settled.fact_through_settled += fact_settled;
+        drop_unlinked_fact_entries(service.data);
         // The boundary's model-only count falls by the model's rows alone; a
         // settled fact row still changes which call paths stay unknown.
         if (corrected > 0 || fact_settled > 0 || stated.own + stated.boundary > 0)
@@ -2086,6 +2087,46 @@ fn drop_copied_response(
         );
     }
     dropped
+}
+
+/// Drop the consumer entries of each fact through-row this pass left
+/// unlinked whose key is no bare route (`${process.env.ORIGIN}/runs/${id}`):
+/// the fold asked their type only so [`apply`] could carry it to the request
+/// the call reaches, and a row keyed so gets no entry otherwise, as a
+/// reader's would not (carrick#4078).
+fn drop_unlinked_fact_entries(data: &mut CloudRepoData) {
+    let unlinked: Vec<(String, u32, String, String)> = data
+        .mount_graph
+        .iter()
+        .flat_map(|graph| &graph.data_calls)
+        .filter(|call| {
+            call.role == Some(ConsumerRole::WrapperCall)
+                && call.reaches_request.is_none()
+                && call
+                    .resolution_source
+                    .is_some_and(|source| source != ResolutionSource::Model)
+                && !call.canonical_path.starts_with('/')
+        })
+        .filter_map(|call| {
+            let (file, line) = site_of(call)?;
+            Some((
+                file.to_string(),
+                line,
+                call.method.clone(),
+                call.canonical_path.clone(),
+            ))
+        })
+        .collect();
+    if unlinked.is_empty() {
+        return;
+    }
+    if let Some(manifest) = data.type_manifest.as_mut() {
+        manifest.retain(|entry| {
+            !unlinked
+                .iter()
+                .any(|(file, line, method, path)| anchored_at(entry, file, *line, method, path))
+        });
+    }
 }
 
 /// Whether `entry` is a consumer entry anchored at `file`:`line` under the
@@ -2591,6 +2632,23 @@ fn withdraw_wrapped(
                             call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                         })
                 }))
+        });
+    }
+    // Their consumer entries go too: they would anchor an operation no row
+    // at that call holds.
+    if let Some(manifest) = data.type_manifest.as_mut() {
+        manifest.retain(|entry| {
+            !gone.iter().any(|(place, key)| {
+                let (Some((file, line)), Some((method, path))) = (
+                    place
+                        .rsplit_once(':')
+                        .and_then(|(file, line)| Some((file, line.parse::<u32>().ok()?))),
+                    key.as_http(),
+                ) else {
+                    return false;
+                };
+                anchored_at(entry, file, line, method, path)
+            })
         });
     }
     withdrawn
