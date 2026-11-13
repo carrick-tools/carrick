@@ -4384,6 +4384,36 @@ mod tests {
         }
     }
 
+    /// carrick#4025: a callee read from a parameter of a function that is
+    /// run only through a value (`{ g: gate }` handed on, run as
+    /// `deps.g(args)`) is saved, and never as `value_never_bound`: the call
+    /// that runs the function writes the parameter, though no call names
+    /// the function. Same module and across modules. The answer key is
+    /// `tests/fixtures/value-run-param/README.md`.
+    #[test]
+    fn a_callee_read_from_a_parameter_of_a_function_run_only_through_a_value_is_never_value_never_bound()
+     {
+        let Some(on) = walked("value-run-param", "", "", &[], true) else {
+            return;
+        };
+        let discovery = discover(&on.inputs, &Labels::of(&[]), &on.repo);
+        let all = format!("{:?} {:?}", discovery.sites, discovery.unfollowed);
+        for (file, line) in [("src/local.ts", 8), ("src/gates.ts", 7)] {
+            let stops: Vec<Option<Stop>> = discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| site.stop)
+                .collect();
+            assert!(
+                !stops.is_empty() && !stops.contains(&Some(Stop::ValueNeverBound)),
+                "{file}:{line} is saved with a reason other than value_never_bound: \
+                 {stops:?}\n{all}"
+            );
+        }
+    }
+
     /// Ruling R-SP, must-stay (v1-agent on carrick#3856, #4025): where a
     /// spread source writes a key from a parameter whose callers the
     /// resolver does not find (a function run only through a value, a method
