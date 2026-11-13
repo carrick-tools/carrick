@@ -1825,11 +1825,13 @@ pub fn fold_rows(
     out
 }
 
-/// A row a fact states: the scan's own, or a site row every slot of which
-/// the code decided. A site answer is the model's, a candidate.
+/// A row a fact states: its source is no candidate
+/// ([`ResolutionSource::is_candidate`], the one answer; carrick#4170). The
+/// model's row, an inline literal's and a request descriptor's are
+/// candidates; a row with no source is neither.
 fn is_fact(row: &ApiEndpointDetails) -> bool {
     row.resolution_source
-        .is_some_and(|source| source != ResolutionSource::Model)
+        .is_some_and(|source| !source.is_candidate())
 }
 
 /// A row the code decided: its source is no candidate (the model's, an
@@ -1840,8 +1842,7 @@ fn is_fact(row: &ApiEndpointDetails) -> bool {
 /// whole row from a literal name only. The one test for both drops in
 /// [`fold_rows`] (carrick#4151, carrick#4153).
 fn code_decided(row: &ApiEndpointDetails) -> bool {
-    row.resolution_source
-        .is_some_and(|source| !source.is_candidate() && !is_old_path_source(source))
+    is_fact(row) && !is_old_path(row)
 }
 
 /// A row the file reader stated, which no site answer has touched.
