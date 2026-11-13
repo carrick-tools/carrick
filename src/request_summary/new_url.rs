@@ -42,6 +42,12 @@ pub(super) fn resolve_new_url(input: &[Piece], base: Option<&[Piece]>) -> Option
     if head.starts_with('/') || is_absolute_url(head) {
         return Some(input.to_vec());
     }
+    // `g:h`, `mailto:x`, `localhost:3000/x`: a scheme of its own makes the
+    // input a URL the subset does not read. A `\` is a `/` to the standard
+    // for some schemes only.
+    if has_scheme(head) || head.contains('\\') {
+        return None;
+    }
     let [Piece::Lit(base)] = base else {
         return None;
     };
@@ -55,6 +61,20 @@ pub(super) fn resolve_new_url(input: &[Piece], base: Option<&[Piece]>) -> Option
         return None;
     }
     Some(concat([vec![Piece::Lit(base.directory())], input.to_vec()]))
+}
+
+/// Whether `head` opens with a scheme and its `:` (`[A-Za-z][A-Za-z0-9+.-]*:`)
+/// before any `/`, `?` or `#`.
+fn has_scheme(head: &str) -> bool {
+    let Some(colon) = head.find(':') else {
+        return false;
+    };
+    let scheme = &head[..colon];
+    !scheme.contains(['/', '?', '#'])
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Whether a literal piece holds a `.` or `..` path segment.
@@ -283,6 +303,19 @@ mod tests {
         assert_eq!(
             resolve_new_url(&[lit("things")], Some(&[lit("//h.test/v2/")])),
             None
+        );
+        // A scheme of the input's own (RFC 3986 5.4.1's `g:h`), and a `\`.
+        for input in ["g:h", "things:batchGet", "localhost:3000/x", "a\\b"] {
+            assert_eq!(
+                resolve_new_url(&[lit(input)], Some(&[lit("https://h.test/v2/")])),
+                None,
+                "{input}"
+            );
+        }
+        // A `:` past the first segment is no scheme.
+        assert_eq!(
+            resolved("things/a:b", "https://h.test/v2/").as_deref(),
+            Some("https://h.test/v2/things/a:b")
         );
     }
 
