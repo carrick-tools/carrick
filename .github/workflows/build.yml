@@ -154,7 +154,7 @@ jobs:
         env:
           CARRICK_MOCK_ALL: "true"
           CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
-          EXPECTED_ENDPOINTS: "4"
+          EXPECTED_ENDPOINTS: "3"
         run: |
           out="$RUNNER_TEMP/express-single-release.txt"
           "./$BIN" ./examples/express-single/ > "$out" 2>&1

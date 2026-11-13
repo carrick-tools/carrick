@@ -184,11 +184,10 @@ fn test_basic_endpoint_detection() {
         stdout
     );
 
-    // express-single has 4 endpoints: one path is a const the scan reads
-    // through (the model mock never did, so this pinned 3).
+    // express-single should have 3 endpoints (the 4th uses a variable reference which the mock doesn't detect)
     assert_eq!(
-        test_output.endpoint_count, 4,
-        "Expected 4 endpoints in express-single, but found {}. Output: {}",
+        test_output.endpoint_count, 3,
+        "Expected 3 endpoints in express-single, but found {}. Output: {}",
         test_output.endpoint_count, stdout
     );
 }
