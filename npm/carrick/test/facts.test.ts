@@ -12,6 +12,7 @@ import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
 import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
+import { factsEnabled } from "../src/facts/enabled.ts";
 import { scanSource } from "../src/facts/match.ts";
 import { FACTS_MARKER, refreshFacts, startFactsRefresh } from "../src/facts/fetch.ts";
 import { readTimings } from "../src/hook/timings.ts";
@@ -937,10 +938,77 @@ test("the refresh starts once per cooldown, sooner after a building answer, and 
   assert.equal(started.length, 2);
 });
 
-test("with CARRICK_FACT_LINES unset, an edit that matches a row prints nothing and starts no refresh", async (t) => {
+test("factsEnabled is off only for exactly \"0\"", () => {
+  assert.equal(factsEnabled({}), true, "unset");
+  assert.equal(factsEnabled({ CARRICK_FACT_LINES: "" }), true, "empty");
+  assert.equal(factsEnabled({ CARRICK_FACT_LINES: "0" }), false, "0");
+  assert.equal(factsEnabled({ CARRICK_FACT_LINES: "1" }), true, "1");
+  assert.equal(factsEnabled({ CARRICK_FACT_LINES: "true" }), true, "true");
+});
+
+test("with CARRICK_FACT_LINES unset, an edit that matches a row prints the stored fact line", async (t) => {
   const ws = await factsWorkspace(t);
   const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") });
   delete env["CARRICK_FACT_LINES"];
+  const run = await runHook("post-edit.ts", {
+    payload: {
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "facts-default",
+      cwd: ws.root,
+      tool_input: { file_path: ws.at("orders-api/src/routes/orders.ts"), old_string: "x", new_string: 'const order = await db.orders.find(req.params["id"]);' },
+    },
+    env,
+  });
+  assert.equal(run.code, 0);
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
+});
+
+/** Every file under `dir` with its size, keyed by relative path. */
+function snapshot(dir: string): Map<string, string> {
+  const seen = new Map<string, string>();
+  const walk = (current: string) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else seen.set(path.relative(dir, full), crypto.createHash("sha256").update(fs.readFileSync(full)).digest("hex"));
+    }
+  };
+  walk(dir);
+  return seen;
+}
+
+test("with CARRICK_FACT_LINES=0 and a fact file, the hook's stdout, exit code and files written equal a run with no fact file", async (t) => {
+  const run = async (ndjson: string | null) => {
+    const ws = await factsWorkspace(t, { ndjson });
+    const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_FACT_LINES: "0" });
+    const before = [snapshot(ws.root), snapshot(ws.home)];
+    const result = await runHook("post-edit.ts", {
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        session_id: "facts-zero",
+        cwd: ws.root,
+        tool_input: { file_path: ws.at("orders-api/src/routes/orders.ts"), old_string: "x", new_string: 'const order = await db.orders.find(req.params["id"]);' },
+      },
+      env,
+    });
+    const after = [snapshot(ws.root), snapshot(ws.home)];
+    // A file written or changed by the hook, by relative path.
+    const written = after.flatMap((map, i) => [...map].filter(([rel, hash]) => before[i]!.get(rel) !== hash).map(([rel]) => `${i}:${rel.replace(/\.\d+-\d+-\d+\./, ".<id>.")}`));
+    return { code: result.code, stdout: result.stdout, written: written.sort() };
+  };
+  const withFile = await run(fs.readFileSync(WIRE, "utf8"));
+  const without = await run(null);
+  assert.equal(withFile.code, 0);
+  assert.equal(withFile.stdout, without.stdout);
+  assert.equal(context(withFile.stdout), "");
+  assert.deepEqual(withFile.written, without.written);
+});
+
+test("with CARRICK_FACT_LINES=0, an edit that matches a row prints nothing and starts no refresh", async (t) => {
+  const ws = await factsWorkspace(t);
+  const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_FACT_LINES: "0" });
   const run = await runHook("post-edit.ts", {
     payload: {
       hook_event_name: "PostToolUse",

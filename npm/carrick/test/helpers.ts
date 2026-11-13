@@ -13,9 +13,9 @@ import {
   type StatusResult,
 } from "../src/contract.ts";
 
-// The fact lines are off unless CARRICK_FACT_LINES is "1" (`src/facts/enabled.ts`).
-// Tests that exercise them import this file, so it turns the switch on for the
-// test process and, through `fakeEnv`, for every hook child. The off test unsets it.
+// The fact lines are on unless CARRICK_FACT_LINES is "0" (`src/facts/enabled.ts`).
+// This file pins the switch to "1" for the test process and, through `fakeEnv`,
+// for every hook child. An off test sets "0"; a default test deletes it.
 process.env["CARRICK_FACT_LINES"] = "1";
 // A test that expects a fact line must not lose it to a slow git call (the
 // diff against HEAD, the peer proof) on a busy machine: in this process and,
