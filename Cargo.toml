@@ -81,3 +81,9 @@ tokio = { version = "1", features = ["test-util"] }
 # dir by about a quarter (carrick#2155). CI sets no profile env of its own.
 [profile.dev]
 debug = "line-tables-only"
+
+# The engine stamp re-hashes the engine's sources on every spawn from a source
+# checkout (carrick#4133). Unoptimised sha2 takes hundreds of milliseconds for
+# them; optimised it takes a few.
+[profile.dev.package.sha2]
+opt-level = 3

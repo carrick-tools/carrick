@@ -145,4 +145,11 @@ pub fn check(entry: &Path, origin: EngineOrigin) -> StampVerdict {
     }
 }
 
+/// [`check`], computed at most once per process: the engine and its sources do
+/// not change under a running scan, and a scan may spawn several times.
+pub fn check_once(entry: &Path, origin: EngineOrigin) -> &'static StampVerdict {
+    static VERDICT: std::sync::OnceLock<StampVerdict> = std::sync::OnceLock::new();
+    VERDICT.get_or_init(|| check(entry, origin))
+}
+
 const REBUILD: &str = "Rebuild it with `cd src/sidecar && npm ci && npm run build`, or set CARRICK_SIDECAR_DIR to a current build.";

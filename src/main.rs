@@ -672,13 +672,17 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some((sidecar_path, origin)) => {
             // carrick#4133: log the engine's stamp, and refuse a stale
             // engine found in a source checkout (src/sidecar/README.md, "Build stamp").
-            match engine_stamp::check(&sidecar_path, origin) {
-                StampVerdict::Ok { stamp } => info!("Compiler engine stamp: {stamp}"),
+            let stamp_started = std::time::Instant::now();
+            match engine_stamp::check_once(&sidecar_path, origin) {
+                StampVerdict::Ok { stamp } => info!(
+                    "Compiler engine stamp: {stamp} (checked in {} ms)",
+                    stamp_started.elapsed().as_millis()
+                ),
                 StampVerdict::Warn(message) => warn!("{message}"),
                 StampVerdict::Refuse(message) => {
                     logging::finish_spinner_warn(&sp, "Compiler engine is stale");
-                    logging::annotate(logging::Annotation::Error, &message);
-                    return Err(message.into());
+                    logging::annotate(logging::Annotation::Error, message);
+                    return Err(message.clone().into());
                 }
             }
             sidecar_found = true;
