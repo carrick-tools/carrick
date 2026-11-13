@@ -251,6 +251,44 @@ fn a_body_built_in_the_wrapper_names_the_call_that_reaches_it() {
     );
 }
 
+/// carrick#4128, carrick#4159: a GET sends no body, so the object its wrapper
+/// builds (a query object) is not asked as the call's request body. The
+/// request entry is left to read `no_request_body`; the response entry is
+/// asked as before, and a POST through the same wrapper still asks its body.
+#[test]
+fn a_get_through_a_wrapper_that_builds_an_object_is_not_asked_a_request_body() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str =
+        "export const list = (page: number) => http.get(\"/orders\", { query: { page } });\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let built = "{ query: { page } }";
+    let start = WRAPPER_SOURCE.find(built).unwrap() as u32;
+    let slots = PayloadSlots {
+        request: Some(PayloadAt::Value(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + built.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        })),
+        response: None,
+    };
+    let payloads = SitePayloads::of(&[record("http_client", false, slots)]);
+    let root = dir.path().to_string_lossy().into_owned();
+    let asked = |method: &str| {
+        let mut key = http();
+        key["method"] = json!(method);
+        payloads.requests(
+            &[entry(key, "consumer", "request", "Req", 2)],
+            &root,
+            &ResultIndex::default(),
+        )
+    };
+    let get = asked("GET");
+    assert!(get.is_empty(), "a GET is asked no request body: {get:?}");
+    assert_eq!(asked("POST").len(), 1, "a POST is asked its body");
+}
+
 /// carrick#2910: the response entry's request carries the store's label for
 /// the call it reads, found by the call's span under the repo-relative file;
 /// the request entry and an index with no label at the call carry none, and
