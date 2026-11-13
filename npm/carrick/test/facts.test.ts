@@ -1181,7 +1181,7 @@ function probeCalls(argvLog: string): number {
 
 const waitForAnswer = (ws: FactsWorkspace, session: string) => waitForSessionAnswers(ws.home, session);
 
-test("with CARRICK_FACT_LINES unset and a fact file on disk, an Edit, a Write that creates a file and a shell write probe as before", async (t) => {
+test("with CARRICK_FACT_LINES=0 and a fact file on disk, an Edit, a Write that creates a file and a shell write probe as before", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const env = fakeEnv({
@@ -1189,8 +1189,8 @@ test("with CARRICK_FACT_LINES unset and a fact file on disk, an Edit, a Write th
     CLAUDE_PROJECT_DIR: ws.root,
     CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
     CARRICK_FAKE_ARGV_LOG: argvLog,
+    CARRICK_FACT_LINES: "0",
   });
-  delete env["CARRICK_FACT_LINES"];
   const hook = (script: string, payload: Record<string, unknown>) =>
     runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: "switch-off", cwd: ws.root, ...payload }, env });
   const said: Record<string, string> = {};
@@ -1358,14 +1358,19 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
       },
     }),
   );
-  assert.equal(await stop(ws, "lead"), "", "named once");
+  // The file is named once: this Stop does not name it again. On a slow
+  // machine the queued check can answer before this Stop runs in spite of the
+  // hold; Stop then states its clean line itself (carrick#4085), and that is
+  // the one time it is said.
+  const lead = "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.";
+  const clean = "Carrick checked orders-api/src/routes/orders.ts and found no contract problem.";
+  const second = context(await stop(ws, "lead"));
+  assert.ok(second === "" || second === clean, `named once: ${second}`);
   // The `check --changed` Stop queued has answered (the fake binary: clean).
   await waitForSessionAnswers(ws.home, "lead", 2);
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
-  assert.equal(
-    context(next.stdout),
-    "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.\n\nCarrick checked orders-api/src/routes/orders.ts and found no contract problem.",
-  );
+  // The lead always prints here; the clean line prints here unless the second Stop said it.
+  assert.equal(context(next.stdout), second === "" ? `${lead}\n\n${clean}` : lead);
 });
 
 // R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.
