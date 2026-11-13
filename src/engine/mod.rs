@@ -10214,7 +10214,7 @@ fn add_graphql_request_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        v1_state_before_demotion: None,
+        v1_before_demotion: None,
     });
 }
 
@@ -10481,7 +10481,7 @@ fn add_protocol_manifest_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        v1_state_before_demotion: None,
+        v1_before_demotion: None,
     });
 }
 
@@ -13105,8 +13105,8 @@ fn apply_resolved_definitions(
             });
         if v1_unanswered && settles {
             let state = entry
-                .v1_state_before_demotion
-                .unwrap_or(ManifestTypeState::Implicit);
+                .v1_before_demotion
+                .map_or(ManifestTypeState::Implicit, |v1| v1.state);
             let is_explicit = state == ManifestTypeState::Explicit;
             entry.is_explicit = is_explicit;
             entry.type_state = state;
@@ -13156,6 +13156,18 @@ fn read_capture_records(
 /// and the positions the emitted tree cannot resolve, which print as a name
 /// and read `any` (carrick#1446). An alias with no record leaves its entry as
 /// it was.
+///
+/// An entry still `Unknown` with no finding after the merge gets one root
+/// finding that says why (carrick#3995), so no untyped entry the capture saw
+/// reaches a reader without a reason:
+///
+///  - a shape v1 printed with a top type nothing placed reads
+///    `unplaced_top_type`, with the kind the shape holds. The record's cause
+///    describes the capture's own read, not v1's shape;
+///  - otherwise the record's `unread_cause`, or `not_recorded` when the record
+///    has none.
+///
+/// No verdict reads any of these words, and the finding carries no detail.
 fn stamp_capture_provenance(
     manifest: &mut [TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
@@ -13172,6 +13184,27 @@ fn stamp_capture_provenance(
                 .chain(&record.unresolved_in_tree)
                 .cloned(),
         );
+        if entry.type_state != ManifestTypeState::Unknown || !entry.any_provenance.is_empty() {
+            continue;
+        }
+        let (kind, reason) = match entry.v1_before_demotion {
+            Some(v1) => (
+                if v1.holds_any { "any" } else { "unknown" },
+                "unplaced_top_type",
+            ),
+            None => (
+                "unknown",
+                record.unread_cause.as_deref().unwrap_or("not_recorded"),
+            ),
+        };
+        entry
+            .any_provenance
+            .push(crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+                detail: None,
+            });
     }
 }
 
@@ -13893,7 +13926,7 @@ fn add_manifest_pair(
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         });
     }
 }
@@ -14020,11 +14053,15 @@ fn enrich_manifest_with_type_resolution(
                 // about it beside the demotion: whether the source wrote that
                 // top type is the capture record's to say, and when it did,
                 // the entry returns to this state (carrick#1752).
-                entry.v1_state_before_demotion = (!placeholder).then_some(if *is_explicit {
-                    ManifestTypeState::Explicit
-                } else {
-                    ManifestTypeState::Implicit
-                });
+                entry.v1_before_demotion =
+                    (!placeholder).then_some(crate::cloud_storage::V1Demotion {
+                        state: if *is_explicit {
+                            ManifestTypeState::Explicit
+                        } else {
+                            ManifestTypeState::Implicit
+                        },
+                        holds_any: type_compat_v2::text_uses_any_as_type(type_string),
+                    });
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
                 entry.evidence.is_explicit = false;
@@ -17992,7 +18029,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
-                v1_state_before_demotion: None,
+                v1_before_demotion: None,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -24542,7 +24579,7 @@ unfollowed_member_calls_total: 0,
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         }
     }
 
@@ -26666,6 +26703,178 @@ unfollowed_member_calls_total: 0,
             provenance_of(&manifest[0]),
             vec![("notes", "declared"), ("status", "unresolved_import")]
         );
+    }
+
+    // ---- carrick#3995: an untyped entry says why -------------------------
+
+    fn root_findings(entry: &TypeManifestEntry) -> Vec<(&str, &str, Option<&str>)> {
+        entry
+            .any_provenance
+            .iter()
+            .filter(|p| p.path.is_empty())
+            .map(|p| (p.kind.as_str(), p.reason.as_str(), p.detail.as_deref()))
+            .collect()
+    }
+
+    /// A placeholder the driver sent because no request located a value for
+    /// the alias says so on the entry: one root finding with the record's
+    /// cause, and no detail.
+    #[test]
+    fn a_placeholder_record_carrying_a_cause_stamps_it_at_the_root() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "anchor_kind": "literal",
+                "anchor_origin": "manifest-placeholder",
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unread_cause": "not_located"
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "unknown")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(
+            root_findings(&manifest[0]),
+            vec![("unknown", "not_located", None)]
+        );
+    }
+
+    /// A record with no cause still leaves no untyped entry with an empty
+    /// list: it says the scan recorded no cause. An entry with no record is
+    /// left alone.
+    #[test]
+    fn a_record_with_no_cause_stamps_not_recorded() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView"), consumer_entry("NoRecord")];
+
+        join_capture_answers(&mut manifest, vec![captured("OrderView", "any")], &records);
+
+        assert_eq!(
+            root_findings(&manifest[0]),
+            vec![("unknown", "not_recorded", None)]
+        );
+        assert!(manifest[1].any_provenance.is_empty());
+    }
+
+    /// A shape v1 printed with a top type nothing places reads
+    /// `unplaced_top_type`, whatever cause the record carries: the capture's
+    /// cause describes its own read, not v1's shape. The kind is what the
+    /// printed shape holds.
+    #[test]
+    fn a_demoted_shape_with_an_unplaced_top_type_says_so() {
+        for (shape, kind) in [
+            ("{ id: string; meta: any; }", "any"),
+            ("{ id: string; meta: unknown; }", "unknown"),
+        ] {
+            let mut manifest = enriched_explicit(shape);
+            assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+            let records = records_from(serde_json::json!([record_json(
+                "OrderView",
+                serde_json::json!({
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": true,
+                    "unread_cause": "not_located"
+                }),
+            )]));
+
+            join_capture_answers(&mut manifest, Vec::new(), &records);
+
+            assert_eq!(
+                root_findings(&manifest[0]),
+                vec![(kind, "unplaced_top_type", None)],
+                "v1 printed {shape}"
+            );
+        }
+    }
+
+    /// An entry that already says why (the inferrer's own reason) is not
+    /// stamped again.
+    #[test]
+    fn an_entry_with_a_reason_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unread_cause": "not_located"
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "no_success_payload".to_string(),
+            detail: None,
+        }];
+
+        join_capture_answers(&mut manifest, Vec::new(), &records);
+
+        assert_eq!(
+            provenance_of(&manifest[0]),
+            vec![("", "no_success_payload")]
+        );
+    }
+
+    /// The stamp runs after the capture's answer settles the entry. A clean
+    /// answer types an entry v1 never answered, and a typed entry carries no
+    /// root reason; stamped first, it would keep a `not_recorded` over a
+    /// published type.
+    #[test]
+    fn an_entry_the_capture_settles_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({})
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert!(
+            manifest[0].any_provenance.is_empty(),
+            "{:?}",
+            manifest[0].any_provenance
+        );
+    }
+
+    /// An open member the source declares still settles the entry, and the
+    /// entry keeps only the capture's member finding.
+    #[test]
+    fn a_declared_open_member_settles_and_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "any_provenance": [finding("notes", "unknown", "declared")]
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; notes: unknown; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert_eq!(provenance_of(&manifest[0]), vec![("notes", "declared")]);
     }
 
     /// A shape that names an identifier nothing declares reads as a type and

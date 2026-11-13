@@ -254,6 +254,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
       .optional(),
     raw_text_read: z.literal(true).optional(),
     absent_body_tolerated: z.literal(true).optional(),
+    unread_cause: z.enum(['not_located', 'site_unreadable']).optional(),
   }),
 ]);
 
