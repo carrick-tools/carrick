@@ -7994,12 +7994,12 @@ mod tests {
                     detail: None,
                 };
                 let mut decided = inferred("Endpoint_x_Response", "unknown", None, None);
-                decided.infer_kind = kind;
+                decided.infer_kind = kind.clone();
                 decided.any_provenance = vec![finding()];
                 assert!(inference_decided_no_contract(&decided), "{reason} {kind:?}");
 
                 let mut shaped = inferred("Endpoint_x_Response", "{ a: string }", None, None);
-                shaped.infer_kind = kind;
+                shaped.infer_kind = kind.clone();
                 shaped.any_provenance = vec![finding()];
                 assert!(!inference_decided_no_contract(&shaped), "{reason} {kind:?}");
             }
