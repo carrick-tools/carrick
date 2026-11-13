@@ -1480,6 +1480,36 @@ fn holds_parameter(pieces: &[Piece]) -> bool {
     pieces.iter().any(Piece::is_parameter)
 }
 
+/// Whether a caller still chooses the name `pieces` holds: a parameter, or
+/// a hole of an unread call open on one ([`Piece::waits_on_caller`],
+/// carrick#4022).
+fn holds_open(pieces: &[Piece]) -> bool {
+    pieces.iter().any(Piece::waits_on_caller)
+}
+
+/// Why the name a caller fills is unread, where `own` (the callee's value)
+/// holds a hole of an unread call open on the callee's parameters
+/// ([`Piece::through`], carrick#4022) and `filled` (the caller's) holds that
+/// hole closed: the reason the hole ends at. `None` for any other value, and
+/// where `filled` states a route all the same (`${base(siteUrl)}/notes`, an
+/// unread base glued to a written path, [`decides`]): that call is the site,
+/// and what it sends keeps its anchor there.
+fn closed_hole(own: &[Piece], filled: &[Piece], end: &LabelledEnd) -> Option<Stop> {
+    if !own.iter().any(|piece| piece.through().is_some())
+        || (end.role == "http_client" && render_target(filled).is_some())
+    {
+        return None;
+    }
+    filled.iter().find_map(|piece| match piece {
+        Piece::Opaque {
+            end: super::Root::Hole(reason),
+            link: None,
+            ..
+        } => Some(Stop::from(*reason)),
+        _ => None,
+    })
+}
+
 /// Whether a call whose slot value is `pieces` decides the name, so it is
 /// the site and its callers are not walked: the value holds no parameter, or
 /// for HTTP it states a route the way the request summaries compose one
@@ -1488,7 +1518,7 @@ fn holds_parameter(pieces: &[Piece]) -> bool {
 /// whole path, or a prefix glued to one, leaves it to the callers
 /// (carrick#2433, carrick#2519).
 fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
-    !holds_parameter(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
+    !holds_open(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
 }
 
 /// Whether `pieces` is a message name written as a template whose hole a
@@ -1500,7 +1530,7 @@ fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
 /// ([`decides`]).
 fn is_message_template(pieces: &[Piece], end: &LabelledEnd) -> bool {
     end.role != "http_client"
-        && holds_parameter(pieces)
+        && holds_open(pieces)
         && pieces
             .iter()
             .any(|piece| matches!(piece, Piece::Lit(text) if !text.is_empty()))
@@ -1534,6 +1564,14 @@ fn to_definition(pieces: &[Piece], depth: u8) -> Option<Vec<Piece>> {
         .iter()
         .map(|piece| match piece {
             Piece::Outer(out, inner) if *out == depth => Some((**inner).clone()),
+            // A hole of an unread call (carrick#4022): its parameters read the
+            // same way.
+            piece if piece.through().is_some() => {
+                let held = piece
+                    .through()
+                    .and_then(|inner| to_definition(inner, depth))?;
+                piece.refilled(&|_| held.clone())
+            }
             piece if piece.is_parameter() => None,
             other => Some(other.clone()),
         })
@@ -1578,7 +1616,13 @@ fn filled_with(pieces: &[Piece], call: &CallIr, default: &Defaults<'_>) -> Vec<P
         Piece::ParamKeyOr(index, key, name, or) => {
             key_filled(call, *index, key, name, Some(or.clone()), omitted(*index))
         }
-        other => vec![other.clone()],
+        // A hole of an unread call (carrick#4022): its parameters filled the
+        // same way.
+        other => vec![
+            other
+                .refilled(&|inner| filled_with(inner, call, default))
+                .unwrap_or_else(|| other.clone()),
+        ],
     }))
 }
 
@@ -2561,6 +2605,11 @@ impl<'a> Walk<'a, '_> {
     }
 
     fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
+        self.lead_at(placed, u32::from(placed.depth), end, why);
+    }
+
+    /// [`Self::lead`], with `depth` as the lead's depth.
+    fn lead_at(&mut self, placed: &Placed<'a>, depth: u32, end: &LabelledEnd, why: Stop) {
         // A sibling's own call is a lead in that sibling's scan (carrick#2618).
         if !self.calls.is_own(placed.file) {
             return;
@@ -2570,12 +2619,38 @@ impl<'a> Walk<'a, '_> {
             line: placed.call.site.line,
             span_start: placed.call.site.span_start,
             span_end: placed.call.site.span_end,
-            depth: u32::from(placed.depth),
+            depth,
             end: end.clone(),
             reason: why,
         };
         if !self.out.leads.contains(&lead) {
             self.out.leads.push(lead);
+        }
+    }
+
+    /// The site `down[0]`, whose value `value` fills `below` (the value one
+    /// call down, as its function reads it). Where it closes a hole of an
+    /// unread call that `below` held open (carrick#4022), the call chooses
+    /// the path but no text states it: a lead there, with the reason the
+    /// hole was not read ([`closed_hole`]), at the depth of the functions
+    /// the walk entered from it.
+    fn site_filled(
+        &mut self,
+        down: &[Placed<'a>],
+        end: &LabelledEnd,
+        below: &[Piece],
+        value: Vec<Piece>,
+        args: BTreeSet<usize>,
+    ) {
+        match closed_hole(below, &value, end) {
+            Some(why) => {
+                let entered = u32::try_from(down.len() - 1).unwrap_or(u32::MAX);
+                self.lead_at(&down[0], entered, end, why);
+                if let Some(template) = self.template {
+                    self.lead(&template, end, why);
+                }
+            }
+            None => self.site(down, end, value, args),
         }
     }
 
@@ -2762,7 +2837,8 @@ impl<'a> Walk<'a, '_> {
             // The boundary rule (carrick#2618): a sibling's call never states
             // the request, so the walk goes on to its callers.
             if self.calls.is_own(caller.file) && self.settles(caller, &value, end) {
-                self.site(&longer, end, value, parameter_positions(&own));
+                let args = parameter_positions(&own);
+                self.site_filled(&longer, end, &own, value, args);
             } else {
                 self.up(&longer, &value, end, path);
             }
@@ -3532,7 +3608,7 @@ fn decide(
                 })
                 .collect();
             if walk.settles(&first, &value, end) {
-                walk.site(&down, end, value, positions);
+                walk.site_filled(&down, end, &at_end, value, positions);
             } else {
                 walked.push(format!("{}:{}", site.file, site.line));
                 walk.up(&down, &value, end, &mut Vec::new());
@@ -3603,7 +3679,8 @@ fn decide(
                     .as_ref()
                     .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
             if below_open {
-                walk.site(&chain, end, top, args[0].clone());
+                let below = values.get(1).cloned().flatten().unwrap_or_default();
+                walk.site_filled(&chain, end, &below, top, args[0].clone());
             } else {
                 // The site is the lowest call whose value still settles.
                 let to = (1..n)
