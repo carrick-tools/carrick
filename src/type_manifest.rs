@@ -316,23 +316,30 @@ pub fn dts_servable_types(content: &str) -> usize {
 /// of its line. `held` reads the declared name as written (derived aliases
 /// included), so the caller decides how a derived name maps to its base. Every
 /// other declaration, and every byte of a kept one, stays as it was. Returns
-/// the text and how many declarations went; text that does not parse comes
-/// back unchanged with a count of 0.
-pub fn drop_alias_declarations(dts: &str, held: &dyn Fn(&str) -> bool) -> (String, usize) {
+/// the text and how many declarations went. Text that does not parse is an
+/// `Err` naming where and why, never a silent no-op: the caller keeps the text
+/// and says so ([`DeclarationsUnparsed`]).
+pub fn drop_alias_declarations(
+    dts: &str,
+    held: &dyn Fn(&str) -> bool,
+) -> Result<(String, usize), DeclarationsUnparsed> {
     let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_emitter_writer(Box::new(std::io::sink()), Some(cm.clone()));
-    let parsed = crate::parser::parse_source(
+    let module = crate::parser::try_parse_source(
         std::path::Path::new("surface.d.ts"),
         swc_common::FileName::Custom("surface.d.ts".to_string()),
         dts.to_string(),
         &cm,
-        &handler,
         None,
-    );
-    let Some(module) = parsed else {
-        tracing::warn!("a type declaration file did not parse: its unheld type names stay");
-        return (dts.to_string(), 0);
-    };
+    )
+    .map_err(|error| {
+        let at = cm.lookup_char_pos(error.span().lo);
+        DeclarationsUnparsed {
+            line: at.line,
+            column: at.col_display + 1,
+            offset: cm.lookup_byte_offset(error.span().lo).pos.0 as usize,
+            message: error.kind().msg().to_string(),
+        }
+    })?;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for item in &module.body {
         let (decl, span) = match item {
@@ -382,7 +389,28 @@ pub fn drop_alias_declarations(dts: &str, held: &dyn Fn(&str) -> bool) -> (Strin
         at = *hi;
     }
     out.push_str(&dts[at..]);
-    (out, ranges.len())
+    Ok((out, ranges.len()))
+}
+
+/// Why a declaration text could not be swept: where the parser stopped and
+/// what it said. The text's own bytes are never quoted, so the line carries
+/// no source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationsUnparsed {
+    pub line: usize,
+    pub column: usize,
+    pub offset: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for DeclarationsUnparsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at line {}, column {} (byte {})",
+            self.message, self.line, self.column, self.offset
+        )
+    }
 }
 
 /// Append `export type <alias> = <type_string>;` to a bundled `.d.ts`.
@@ -738,7 +766,7 @@ mod tests {
         );
         let held =
             |name: &str| name == "Endpoint_a_Response" || name == "Endpoint_a_Response_Unwidened";
-        let (out, dropped) = drop_alias_declarations(&dts, &held);
+        let (out, dropped) = drop_alias_declarations(&dts, &held).expect("parses");
         assert_eq!(dropped, 2);
         assert_eq!(
             out,
@@ -752,8 +780,19 @@ mod tests {
     #[test]
     fn drop_alias_declarations_leaves_unparseable_text_alone() {
         let dts = "export type Endpoint_a_Response = {{{\n";
-        let (out, dropped) = drop_alias_declarations(dts, &|_| false);
-        assert_eq!((out.as_str(), dropped), (dts, 0));
+        assert!(drop_alias_declarations(dts, &|_| false).is_err());
+    }
+
+    /// An unquoted hyphenated key is not TypeScript: the failure names the
+    /// line and column and quotes none of the text.
+    #[test]
+    fn drop_alias_declarations_names_where_a_hyphenated_key_stops_the_parse() {
+        let dts =
+            "export type Support = string;\nexport type Endpoint_a_Response = { a-b: number };\n";
+        let failure = drop_alias_declarations(dts, &|_| false).expect_err("does not parse");
+        assert_eq!(failure.line, 2);
+        assert!(failure.offset > dts.find('\n').unwrap());
+        assert!(!failure.to_string().contains("a-b"), "{failure}");
     }
 
     fn entry(type_alias: &str) -> crate::cloud_storage::TypeManifestEntry {

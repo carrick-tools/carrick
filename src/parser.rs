@@ -430,6 +430,25 @@ pub fn parse_source(
     handler: &Handler,
     comments: Option<&dyn swc_common::comments::Comments>,
 ) -> Option<Module> {
+    match try_parse_source(file_path, name, file_content, source_map, comments) {
+        Ok(module) => Some(module),
+        Err(e) => {
+            e.into_diagnostic(handler).emit();
+            None
+        }
+    }
+}
+
+/// [`parse_source`] that hands the parse error back instead of emitting it, so
+/// a caller can say where the text stopped parsing. The error's span reads in
+/// `source_map`, which holds the parsed file.
+pub fn try_parse_source(
+    file_path: &Path,
+    name: FileName,
+    file_content: String,
+    source_map: &Lrc<SourceMap>,
+    comments: Option<&dyn swc_common::comments::Comments>,
+) -> Result<Module, swc_ecma_parser::error::Error> {
     let (syntax, is_typescript) = syntax_for_path(file_path);
 
     // Create source file in the source map
@@ -444,27 +463,14 @@ pub fn parse_source(
     );
     let mut parser = Parser::new_from(lexer);
 
-    // Parse module
-    for e in parser.take_errors() {
-        e.into_diagnostic(handler).emit();
-    }
-
-    match parser.parse_module() {
-        Ok(mut module) => {
-            GLOBALS.set(&Globals::new(), || {
-                let unresolved_mark = Mark::new();
-                let top_level_mark = Mark::new();
-                let mut pass = resolver(unresolved_mark, top_level_mark, is_typescript);
-                module.visit_mut_with(&mut pass);
-            });
-
-            Some(module)
-        }
-        Err(e) => {
-            e.into_diagnostic(handler).emit();
-            None
-        }
-    }
+    let mut module = parser.parse_module()?;
+    GLOBALS.set(&Globals::new(), || {
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        let mut pass = resolver(unresolved_mark, top_level_mark, is_typescript);
+        module.visit_mut_with(&mut pass);
+    });
+    Ok(module)
 }
 
 #[cfg(test)]

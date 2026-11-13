@@ -2155,6 +2155,9 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     for line in crate::scan_health::library_pending_lines() {
         crate::progress::announce(&line);
     }
+    if let Some(line) = crate::scan_health::declarations_unswept_line() {
+        crate::progress::announce(&line);
+    }
     if let Some(summary) = crate::scan_health::summary_line() {
         warn!("{summary}");
     }
@@ -4353,9 +4356,32 @@ fn drop_unheld_type_names(
         .map(|entry| entry.type_alias.clone())
         .collect();
     let held = |name: &str| held_aliases.contains(type_reach::base_alias(name));
+    let service = data.service_name.clone();
+    let mut unparsed = 0;
+    // A text that does not parse stays as it was and is said so: one line in
+    // the log and one in the scan's health, each naming the service, the text
+    // and where the parser stopped.
+    let mut sweep =
+        |text: &str, what: &str| match crate::type_manifest::drop_alias_declarations(text, &held) {
+            Ok(swept) => swept,
+            Err(failure) => {
+                unparsed += 1;
+                let name = service.as_deref().unwrap_or("(root)");
+                warn!(
+                    "Service '{name}': the {what} type declarations did not parse ({failure}); the \
+                 type names no manifest entry holds stay in them"
+                );
+                crate::scan_health::record_declarations_unswept(
+                    service.as_deref(),
+                    what,
+                    &failure.to_string(),
+                );
+                (text.to_string(), 0)
+            }
+        };
     let mut bundle = 0;
     if let Some(text) = data.bundled_types.as_mut() {
-        let (kept, dropped) = crate::type_manifest::drop_alias_declarations(text, &held);
+        let (kept, dropped) = sweep(text, "bundle");
         if dropped > 0 {
             *text = kept;
             bundle = dropped;
@@ -4364,7 +4390,7 @@ fn drop_unheld_type_names(
     let (mut stub, mut records) = (0, 0);
     if let Some(artifact) = data.capture_stub.as_mut() {
         if let Some(text) = artifact.files.get_mut("types/surface.d.ts") {
-            let (kept, dropped) = crate::type_manifest::drop_alias_declarations(text, &held);
+            let (kept, dropped) = sweep(text, "stub");
             if dropped > 0 {
                 *text = kept;
                 stub = dropped;
@@ -4408,7 +4434,7 @@ fn drop_unheld_type_names(
     debug!(
         "Type names no manifest entry holds, dropped after the row passes ({}): {bundle} bundle, \
          {stub} stub, {records} stub records, {reached} reach aliases, {provisional} provisional \
-         leaf entries",
+         leaf entries, {unparsed} unparsed",
         data.service_name.as_deref().unwrap_or(&data.repo_name)
     );
 }
