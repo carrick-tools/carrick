@@ -11839,9 +11839,11 @@ pub fn summarize(
 /// function a key names, some call this pass composed reaches it, and no
 /// call this pass did not compose does; no caller closed it without a row;
 /// and the request is written in a function a key names, holding it open.
-/// A request whose other callers are read so but which a direct call made
-/// where a module is loaded also reaches is not closed: it goes to
-/// `ledger.held` (carrick#4121).
+/// A request whose other callers are read so but which a call this pass
+/// states no row for also reaches (made where a module is loaded, in a
+/// constructor or a callback, or optional) is not closed: it goes to
+/// `ledger.held` (carrick#4121, carrick#4127). A call through a parameter
+/// has no call site to check and keeps the request unread.
 fn closed_at_callers(
     composer: &mut Composer<'_>,
     paths: &[&PathBuf],
@@ -11856,27 +11858,14 @@ fn closed_at_callers(
         // no call site of its own, stays unseen.
         let module_level = &file.module_level;
         for call in &module_level.calls {
-            let Some(target) = composer.target(path, call) else {
-                continue;
-            };
-            if call.invokes_param.is_some() {
-                ledger.unseen.insert(target);
-            } else {
-                ledger.fact_calls.entry(target).or_default().insert((
-                    (*path).clone(),
-                    call.site.line,
-                    call.site.span_start,
-                ));
-            }
+            note_call(composer, path, call, ledger);
         }
         for call in module_level
             .optional_calls
             .iter()
             .chain(&module_level.constructions)
         {
-            if let Some(target) = composer.target(path, call) {
-                ledger.unseen.insert(target);
-            }
+            note_call(composer, path, call, ledger);
         }
         for inner in module_level
             .nested
@@ -11884,16 +11873,16 @@ fn closed_at_callers(
             .chain(&module_level.detached)
             .chain(&module_level.param_functions)
         {
-            reached_from(composer, path, inner, &mut ledger.unseen);
+            note_calls_from(composer, path, inner, ledger);
         }
         for ir in &file.constructor_defaults {
-            reached_from(composer, path, ir, &mut ledger.unseen);
+            note_calls_from(composer, path, ir, ledger);
         }
         for ir in file.functions.values() {
             if ir.constructor {
-                reached_from(composer, path, ir, &mut ledger.unseen);
+                note_calls_from(composer, path, ir, ledger);
             } else {
-                reached_unread(composer, path, ir, &mut ledger.unseen);
+                note_calls_unread(composer, path, ir, ledger);
             }
         }
     }
@@ -11969,22 +11958,34 @@ fn closed_at_callers(
     closed
 }
 
-/// Every function a call in `ir`, or in a function written in it, reaches.
-fn reached_from(
-    composer: &Composer<'_>,
-    file: &Path,
-    ir: &FnIr,
-    reached: &mut HashSet<(PathBuf, String)>,
-) {
+/// Names `call`, which this pass states no row for, in the ledger: with its
+/// call site for the fact check, or as unseen when it goes through a
+/// parameter and has none (carrick#4127).
+fn note_call(composer: &Composer<'_>, file: &Path, call: &CallIr, ledger: &mut CallerLedger) {
+    let Some(target) = composer.target(file, call) else {
+        return;
+    };
+    if call.invokes_param.is_some() {
+        ledger.unseen.insert(target);
+    } else {
+        ledger.fact_calls.entry(target).or_default().insert((
+            file.to_path_buf(),
+            call.site.line,
+            call.site.span_start,
+        ));
+    }
+}
+
+/// Every call in `ir`, or in a function written in it, named by
+/// [`note_call`].
+fn note_calls_from(composer: &Composer<'_>, file: &Path, ir: &FnIr, ledger: &mut CallerLedger) {
     for call in ir
         .calls
         .iter()
         .chain(&ir.optional_calls)
         .chain(&ir.constructions)
     {
-        if let Some(target) = composer.target(file, call) {
-            reached.insert(target);
-        }
+        note_call(composer, file, call, ledger);
     }
     for inner in ir
         .nested
@@ -11992,29 +11993,22 @@ fn reached_from(
         .chain(&ir.detached)
         .chain(&ir.param_functions)
     {
-        reached_from(composer, file, inner, reached);
+        note_calls_from(composer, file, inner, ledger);
     }
 }
 
-/// Every function a call in `ir` reaches that [`emit`] does not read: an
-/// optional call, a construction, and any call in a function written as a
-/// parameter's default.
-fn reached_unread(
-    composer: &Composer<'_>,
-    file: &Path,
-    ir: &FnIr,
-    reached: &mut HashSet<(PathBuf, String)>,
-) {
+/// Every call in `ir` that [`emit`] does not read, named by [`note_call`]:
+/// an optional call, a construction, and any call in a function written as
+/// a parameter's default.
+fn note_calls_unread(composer: &Composer<'_>, file: &Path, ir: &FnIr, ledger: &mut CallerLedger) {
     for call in ir.optional_calls.iter().chain(&ir.constructions) {
-        if let Some(target) = composer.target(file, call) {
-            reached.insert(target);
-        }
+        note_call(composer, file, call, ledger);
     }
     for inner in &ir.param_functions {
-        reached_from(composer, file, inner, reached);
+        note_calls_from(composer, file, inner, ledger);
     }
     for inner in ir.nested.iter().chain(&ir.detached) {
-        reached_unread(composer, file, inner, reached);
+        note_calls_unread(composer, file, inner, ledger);
     }
 }
 
@@ -15211,8 +15205,27 @@ function build() { return {}; }
         assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
     }
 
-    /// A call through a parameter has no call site of its own to check: a
-    /// request it may reach is neither held nor answered (carrick#4127).
+    /// A call through a parameter, written in a module-level function, has
+    /// no call site of its own to check: a request it may reach is neither
+    /// held nor answered (carrick#4127).
+    #[test]
+    fn a_call_through_a_parameter_in_a_function_is_not_held() {
+        let (_dir, index) = summarized(&[
+            ("src/net/notify.ts", NOTIFY),
+            (
+                "src/alerts.ts",
+                "import { notify } from './net/notify';\n\
+                 export const fire = () => notify('/fire');\n\
+                 export const eager = notify('/eager');\n\
+                 export const run = (notify: (endpoint: string) => void) => notify('/run');\n",
+            ),
+        ]);
+        let notify = key_of(&index, "src/net/notify.ts");
+        assert_eq!(index.held_at_fact_calls(&notify), BTreeMap::new());
+        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
+    }
+
+    /// The same, written in a constructor.
     #[test]
     fn a_call_through_a_parameter_is_not_held() {
         let (_dir, index) = summarized(&[
