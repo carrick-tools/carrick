@@ -346,6 +346,11 @@ pub enum CaptureAnchor {
         /// locates; the capture reads the labelled part of the call's result.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<ResultShape>,
+        /// carrick#4232: the kind of the request this anchor carries. A
+        /// `call_result` anchor whose locator lands on no call abstains in the
+        /// capture, the rule the inferrer applies to the same request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        infer_kind: Option<InferKind>,
     },
     /// Inline literal type text (the v1 inline-alias path).
     Literal {
@@ -6244,9 +6249,12 @@ mod tests {
             expression_text: None,
             param_name: None,
             result: None,
+            infer_kind: Some(InferKind::CallResult),
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));
+        // carrick#4232: the capture reads the request's kind off the anchor.
+        assert!(json.contains(r#""infer_kind":"call_result""#), "{json}");
         assert!(json.contains(r#""anchor_origin":"deterministic-infer""#));
         assert!(!json.contains("line_number"));
 
@@ -6501,6 +6509,7 @@ mod tests {
                         expression_text: Some("req.body".into()),
                         param_name: Some("event".into()),
                         result: None,
+                        infer_kind: None,
                     },
                     CaptureAnchor::Literal {
                         alias: "D".into(),
@@ -9061,6 +9070,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             expression_text: None,
             param_name: None,
             result: Some(ResultShape::Member(["data".into()])),
+            infer_kind: None,
         };
         let wire = serde_json::to_string(&anchor).unwrap();
         assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");

@@ -804,6 +804,7 @@ pub(crate) fn derive_capture_anchors(
             expression_text: request.expression_text.clone(),
             param_name,
             result: request.result.clone(),
+            infer_kind: Some(request.infer_kind.clone()),
         });
     }
 
@@ -8424,6 +8425,23 @@ mod tests {
         assert_eq!(param_of(0).as_deref(), Some("msg"));
         assert_eq!(param_of(1).as_deref(), Some("{ orderId, total }"));
         assert_eq!(param_of(2), None);
+        // carrick#4232: every anchor carries its request's kind, so the
+        // capture applies the call-result rule the inferrer does.
+        let kinds: Vec<Option<InferKind>> = anchors
+            .iter()
+            .map(|anchor| match anchor {
+                CaptureAnchor::Infer { infer_kind, .. } => infer_kind.clone(),
+                other => panic!("expected an infer anchor, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(InferKind::FunctionParam),
+                Some(InferKind::FunctionParam),
+                Some(InferKind::Expression),
+            ]
+        );
     }
 
     /// An infer-request alias whose v1 inference produced a real shape rides
@@ -13188,6 +13206,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 expression_text: None,
                 param_name: None,
                 result: None,
+                infer_kind: None,
             }],
             &HashMap::new(),
             None,

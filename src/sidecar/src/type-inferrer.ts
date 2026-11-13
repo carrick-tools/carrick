@@ -89,12 +89,15 @@ import {
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
 import {
+  callNamedBy,
+  callResultNamesNoCall,
   constituentsOf,
   isFrameworkMachinery,
   nodeByLocatorText,
   normalizeLocatorText,
   symbolDeclaredOutside,
   typeIsOrContainsMachinery,
+  wrapsValueTransparently,
 } from './capture/index.js';
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
@@ -3179,11 +3182,10 @@ export class TypeInferrer {
 
     // A call's result is read off the call. A locator that finds no call names
     // nothing this can read, and whatever other node its text overlaps is not
-    // the call's result (carrick#2056); the retype abstains on the same miss.
-    if (!callExpr) {
-      this.log(
-        `Call-result locator at ${request.file_path}:${request.line_number} finds no call; leaving unresolved`
-      );
+    // the call's result (carrick#2056); the retype abstains on the same miss,
+    // and the capture on the same rule (`callNamedBy`, carrick#4232).
+    if (!callExpr || !callNamedBy(callExpr.compilerNode)) {
+      this.log(`${callResultNamesNoCall(`${request.file_path}:${request.line_number}`)}; leaving unresolved`);
       return null;
     }
 
@@ -3841,14 +3843,7 @@ export class TypeInferrer {
    * the read's value as it is: `await`, parentheses, `!`, a cast, `satisfies`.
    */
   private wrapsReadTransparently(node: Node): boolean {
-    return (
-      Node.isParenthesizedExpression(node) ||
-      Node.isAwaitExpression(node) ||
-      Node.isNonNullExpression(node) ||
-      Node.isAsExpression(node) ||
-      Node.isTypeAssertion(node) ||
-      Node.isSatisfiesExpression(node)
-    );
+    return wrapsValueTransparently(node.compilerNode);
   }
 
   /**

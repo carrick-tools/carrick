@@ -193,6 +193,14 @@ export interface InferAnchorRequest {
    * after the awaited unwrap; absent means the type is taken as it stands.
    */
   result?: ResultLabel;
+  /**
+   * carrick#4232: the kind of the inference request this anchor carries. A
+   * `call_result` anchor reads a call's result, so a locator that lands on no
+   * call abstains (`callNamedBy`, the rule the inferrer applies too). The
+   * value is the request's `InferKind` (validated in `validators.ts`); it is
+   * typed as a string here because the capture bundle imports only itself.
+   */
+  infer_kind?: string;
 }
 
 export type CaptureAnchorRequest =
