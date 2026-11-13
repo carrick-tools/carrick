@@ -1166,10 +1166,51 @@ pub fn should_fail_on_missing_types(fatal: bool, allow_missing: bool) -> bool {
     fatal && !allow_missing
 }
 
+/// Why every endpoint would carry no types when the compiler engine never
+/// became ready: the error a person reads when the scan stops for it. The
+/// customer name for the TypeScript component is "compiler engine".
+pub fn engine_not_ready_message(
+    budget_secs: u64,
+    detail: &str,
+    budget_env: &str,
+    allow_env: &str,
+) -> String {
+    format!(
+        "The type sidecar was not ready within {budget_secs}s ({detail}), so this scan \
+         would index every endpoint with no request or response types. \
+         Aborting before the analysis so the existing index keeps its \
+         types. Raise the budget with {budget_env}, or set {allow_env}=1 to scan without \
+         types anyway."
+    )
+}
+
+/// Reason recorded when the compiler engine process could not be started.
+pub const ENGINE_FAILED_TO_START_REASON: &str = "sidecar failed to start";
+/// Reason recorded when the compiler engine bundle was not found.
+pub const ENGINE_NOT_FOUND_REASON: &str = "sidecar not found";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_service::AgentCallError;
+
+    #[test]
+    fn engine_not_ready_error_names_the_compiler_engine() {
+        let message = engine_not_ready_message(30, "timed out", "BUDGET_VAR", "ALLOW_VAR");
+        assert_eq!(
+            message,
+            "The compiler engine was not ready within 30s (timed out), so this scan would \
+             index every endpoint with no request or response types. Aborting keeps the \
+             existing index's types. Raise the budget with BUDGET_VAR, or set ALLOW_VAR=1 \
+             to scan without types anyway."
+        );
+        assert!(!message.to_lowercase().contains("sidecar"));
+        assert_eq!(
+            ENGINE_FAILED_TO_START_REASON,
+            "compiler engine failed to start"
+        );
+        assert_eq!(ENGINE_NOT_FOUND_REASON, "compiler engine not found");
+    }
 
     /// Every test owns its counters. Nothing here reads the process-global, so
     /// two of these running at once cannot see each other's numbers — which is

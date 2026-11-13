@@ -722,14 +722,9 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                     e.is_environmental(),
                     scan_health::allow_missing_types_from_env(),
                 ) {
-                    let message = format!(
-                        "The type sidecar was not ready within {}s ({}), so this scan \
-                         would index every endpoint with no request or response types. \
-                         Aborting before the analysis so the existing index keeps its \
-                         types. Raise the budget with {}, or set {}=1 to scan without \
-                         types anyway.",
+                    let message = scan_health::engine_not_ready_message(
                         budget.as_secs(),
-                        e,
+                        &e.to_string(),
                         type_sidecar::READY_TIMEOUT_ENV,
                         scan_health::ALLOW_MISSING_TYPES_ENV,
                     );
@@ -743,11 +738,17 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else if sidecar_found {
         logging::finish_spinner_warn(&sp, "Sidecar failed to start");
-        scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, "sidecar failed to start");
+        scan_health::record_types_unavailable(
+            scan_health::WHOLE_SCAN,
+            scan_health::ENGINE_FAILED_TO_START_REASON,
+        );
         false
     } else {
         logging::finish_spinner_warn(&sp, "Sidecar not found");
-        scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, "sidecar not found");
+        scan_health::record_types_unavailable(
+            scan_health::WHOLE_SCAN,
+            scan_health::ENGINE_NOT_FOUND_REASON,
+        );
         false
     };
 
