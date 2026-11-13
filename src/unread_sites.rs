@@ -27,6 +27,11 @@
 //!   shows for each is `npm/carrick/src/unread-reasons.json`. Files are
 //!   repo-relative.
 //!
+//! - **A declared operation with no serving code.** A site of slot `handler`
+//!   is no call: it sits on the line of a row the schema states, and says no
+//!   reader found the code that serves it ([`unplaced_producer`]). It is the
+//!   row's reason, not a second row.
+//!
 //! The field's contract (keys, cap, size bound) is carrick#3688's "The
 //! index field" section.
 
@@ -435,6 +440,31 @@ pub fn with_unanswered(
         });
     }
     stops
+}
+
+/// A declared operation no reader found serving code for: one site on the
+/// row's line, slot `handler`, role `producer`, reason
+/// [`Stop::HandlerNotLocated`]. `offset` (the byte of the operation's name)
+/// is both span ends, so two operations on one line stay two sites; `kind`
+/// is the protocol.
+pub fn unplaced_producer(file: &str, line: u32, offset: u32, kind: &str) -> UnreadSite {
+    UnreadSite {
+        file: file.to_string(),
+        line,
+        span_start: offset,
+        span_end: offset,
+        reason: Stop::HandlerNotLocated,
+        also: Vec::new(),
+        slot: "handler".to_string(),
+        callee: None,
+        stop_at: None,
+        depth: 0,
+        labelled_end: None,
+        kind: Some(kind.to_string()),
+        role: Some("producer".to_string()),
+        ends: Vec::new(),
+        listed: false,
+    }
 }
 
 /// An element of a verb decorator's array of paths that is no literal
@@ -1008,6 +1038,19 @@ mod tests {
             span_end: 30060,
             ..stop(file, 3000, reason)
         }
+    }
+
+    #[test]
+    fn two_unplaced_fields_on_one_line_stay_two_sites() {
+        let rows = vec![
+            unplaced_producer("schema.graphql", 3, 20, "graphql"),
+            unplaced_producer("schema.graphql", 3, 31, "graphql"),
+            unplaced_producer("schema.graphql", 3, 31, "graphql"),
+        ];
+        let capped = cap(rows);
+        assert_eq!(capped.total, 2);
+        assert_eq!(capped.by_reason.get(&Stop::HandlerNotLocated), Some(&2));
+        assert!(capped.rows.iter().all(|row| row.slot == "handler"));
     }
 
     #[test]

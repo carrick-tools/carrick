@@ -49,6 +49,13 @@ pub struct GraphqlOp {
     /// document, the unit a document is attributed to a schema by
     /// ([`SchemaCatalogue::attribute`], carrick#1134).
     pub document_line: u32,
+    /// PRODUCER-only: the byte, in `file_path`, where the field's name token
+    /// begins. Two fields on one line differ here, so a site saved for each
+    /// stays two sites (carrick#3989). `0` on a consumer. In a tagged template
+    /// it counts from the template's first byte in the host file; a template
+    /// holding `${}` placeholders is read with the placeholders cut out, so
+    /// there it is a stable key, not an exact byte.
+    pub name_offset: u32,
     /// Deterministic type anchor (`primary_type_symbol`), mirroring the
     /// HTTP/socket anchors (#248). For SDL producers this is the root field's
     /// SDL type expression rendered to its canonical form (`Order`, `Order!`,
@@ -629,7 +636,7 @@ fn parse_graphql_file(content: &str, path: &Path) -> Option<GraphqlExtraction> {
     if content.trim().is_empty() {
         return Some(GraphqlExtraction::default());
     }
-    let parsed = parse_document_text(content, path, 1);
+    let parsed = parse_document_text(content, path, 1, 0);
     if parsed.is_none() {
         crate::scan_health::record_unread_source(
             &path.to_string_lossy(),
@@ -2186,28 +2193,40 @@ pub fn extract_from_document_text(
     file_path: &Path,
     base_line: u32,
 ) -> GraphqlExtraction {
-    parse_document_text(text, file_path, base_line).unwrap_or_default()
+    extract_from_embedded_text(text, file_path, base_line, 0)
 }
 
-/// The 1-based line of a field's name token in `text`. graphql-parser places a
+/// [`extract_from_document_text`] for text that starts `base_offset` bytes into
+/// its host file, so each producer's `name_offset` is a byte of that file.
+pub fn extract_from_embedded_text(
+    text: &str,
+    file_path: &Path,
+    base_line: u32,
+    base_offset: u32,
+) -> GraphqlExtraction {
+    parse_document_text(text, file_path, base_line, base_offset).unwrap_or_default()
+}
+
+/// The 1-based line and the byte of a field's name token in `text`. graphql-parser places a
 /// described field's position at its description, so with one the description
 /// string (a `"""` block or a `"` string) is skipped, then whitespace, commas
 /// and `#` comments, and the name's line is the answer. A field with no
-/// description keeps `line`.
-fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> usize {
-    if !described {
-        return line;
-    }
+/// description keeps `line`. A position that points outside `text` answers
+/// `(line, 0)`.
+fn field_name_place(text: &str, line: usize, column: usize, described: bool) -> (usize, usize) {
     let mut start = 0;
     for _ in 1..line {
         match text[start..].find('\n') {
             Some(i) => start += i + 1,
-            None => return line,
+            None => return (line, 0),
         }
     }
     let Some((offset, _)) = text[start..].char_indices().nth(column.saturating_sub(1)) else {
-        return line;
+        return (line, start);
     };
+    if !described {
+        return (line, start + offset);
+    }
     let bytes = text.as_bytes();
     let mut at = start + offset;
     // Bytes only from here: a description may hold multi-byte characters, and
@@ -2217,7 +2236,7 @@ fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> u
     } else if bytes[at..].starts_with(b"\"") {
         b"\""
     } else {
-        return line;
+        return (line, at);
     };
     at += closer.len();
     while at < bytes.len() {
@@ -2242,16 +2261,24 @@ fn field_name_line(text: &str, line: usize, column: usize, described: bool) -> u
             _ => break,
         }
     }
-    line + bytes[start..at.min(bytes.len())]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
+    (
+        line + bytes[start..at]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count(),
+        at,
+    )
 }
 
 /// [`extract_from_document_text`], with `None` when the text parses as neither
 /// a schema nor an executable document, so a caller that reads a whole file
 /// can record it as unread (carrick#3758).
-fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<GraphqlExtraction> {
+fn parse_document_text(
+    text: &str,
+    file_path: &Path,
+    base_line: u32,
+    base_offset: u32,
+) -> Option<GraphqlExtraction> {
     let mut extraction = GraphqlExtraction::default();
     let mut parsed = false;
     let to_line = |pos_line: usize| base_line.saturating_add(pos_line.saturating_sub(1) as u32);
@@ -2344,16 +2371,18 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
             };
             extraction.schema_types.roots.insert(name.clone(), *kind);
             for field in fields {
+                let (name_line, name_byte) = field_name_place(
+                    text,
+                    field.position.line,
+                    field.position.column,
+                    field.description.is_some(),
+                );
                 extraction.producers.push(GraphqlOp {
                     key: OperationKey::graphql(*kind, field.name.clone()),
                     file_path: file_path.to_path_buf(),
-                    line: to_line(field_name_line(
-                        text,
-                        field.position.line,
-                        field.position.column,
-                        field.description.is_some(),
-                    )),
+                    line: to_line(name_line),
                     document_line: base_line,
+                    name_offset: base_offset.saturating_add(name_byte as u32),
                     // Deterministic anchor: the root field's SDL type
                     // expression (e.g. `Order`, `Order!`, `[Order!]!`).
                     primary_type_symbol: Some(render_sdl_type(&field.field_type)),
@@ -2414,6 +2443,7 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     file_path: file_path.to_path_buf(),
                     line: to_line(field.position.line),
                     document_line: base_line,
+                    name_offset: 0,
                     // Executable documents carry no SDL type — the SDL-derived
                     // anchor stays unset. The consumer's real TS result type is
                     // captured separately at the `client.request<T>(DOC)` call
@@ -2856,7 +2886,14 @@ impl Visit for TaggedTplVisitor<'_> {
         let text = tagged_tpl_text(node);
         if is_graphql_tag_name(&node.tag) || is_graphql_document_text(&text) {
             let base_line = self.cm.lookup_char_pos(node.span().lo).line as u32;
-            let parsed = extract_from_document_text(&text, self.file_path, base_line);
+            // The template's first byte in the file, past its backtick.
+            let base_offset = self
+                .cm
+                .lookup_byte_offset(node.tpl.span.lo)
+                .pos
+                .0
+                .saturating_add(1);
+            let parsed = extract_from_embedded_text(&text, self.file_path, base_line, base_offset);
             // Reuse this single parse to record the const→key association for the
             // enclosing `const NAME = <tag>\`...\`` declarator (set in
             // `visit_var_declarator`), so the document is parsed only once.
@@ -3017,6 +3054,42 @@ mod tests {
         assert_eq!(producer_lines(sdl, 10), vec![12, 17, 19, 20, 23]);
     }
 
+    /// The byte of a producer's name token (carrick#3989): distinct for
+    /// neighbours that share a prefix, past a description, and on one line, and
+    /// shifted by a template's own first byte.
+    #[test]
+    fn a_field_name_offset_points_at_its_name() {
+        let offsets = |text: &str, base: u32| -> Vec<(String, u32)> {
+            extract_from_embedded_text(text, Path::new("schema.graphql"), 1, base)
+                .producers
+                .iter()
+                .map(|op| (op.key.canonical(), op.name_offset))
+                .collect()
+        };
+        let check = |text: &str, base: u32| {
+            for (key, offset) in offsets(text, base) {
+                let name = key.rsplit('|').next().unwrap();
+                assert!(
+                    text[(offset - base) as usize..].starts_with(name),
+                    "{key} at {offset}"
+                );
+            }
+            let mut all: Vec<u32> = offsets(text, base).into_iter().map(|o| o.1).collect();
+            let seen = all.len();
+            all.sort();
+            all.dedup();
+            assert_eq!(all.len(), seen, "offsets are distinct in {text:?}");
+        };
+        check("type Query {\n  crate: Int\n  crates: Int\n}\n", 0);
+        check(
+            "type Query {\n  \"\"\"Described.\n  crate: here\"\"\"\n  crate: Int\n  crates: Int\n}\n",
+            0,
+        );
+        check("type Query { a: Int b: Int }", 0);
+        check("type Query { a: Int b: Int }", 40);
+        assert_eq!(offsets("type Query { a: Int b: Int }", 40)[0].1, 53);
+    }
+
     /// Multi-byte characters in a description must not panic the scan, and an
     /// unterminated description must not either.
     #[test]
@@ -3026,7 +3099,7 @@ mod tests {
         // Unterminated at end of file: the parser rejects it, no panic.
         let open = "type Query {\n  \"\"\"é\u{1F600} never closed\n  one: Int\n}\n";
         let _ = producer_lines(open, 1);
-        assert_eq!(field_name_line(open, 2, 3, true), 5);
+        assert_eq!(field_name_place(open, 2, 3, true).0, 5);
     }
 
     /// A repo with a `.graphql` file inside and a link to one outside it.
