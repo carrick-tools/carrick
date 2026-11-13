@@ -45,6 +45,12 @@ export function localCheckouts(where: ReadonlyMap<string, string>): LocalCheckou
   };
 }
 
+/** `repo`'s full index commit from the fact file's header, or null when it holds none (a short or missing id proves nothing). */
+export function indexedCommit(commits: Readonly<Record<string, string>> | null, repo: string): string | null {
+  const commit = commits?.[repo];
+  return typeof commit === "string" && OBJECT_ID.test(commit) ? commit : null;
+}
+
 /** What one `factLines` call proves against. */
 export type PeerContext = {
   /** The edited file's repo and the checkout it sits in. */
@@ -134,8 +140,8 @@ export function peersUnchanged(others: ReadonlyArray<{ repo: string; file: strin
     for (const [repo, files] of byRepo) {
       const place = ctx.checkouts.place(repo, ctx.at);
       if (place === null) return false;
-      const commit = ctx.commits?.[repo];
-      if (typeof commit !== "string" || !OBJECT_ID.test(commit)) return false;
+      const commit = indexedCommit(ctx.commits, repo);
+      if (commit === null) return false;
       if (!sameAsCommit(ctx, place.top, commit, [...files].sort())) return false;
     }
     return true;
