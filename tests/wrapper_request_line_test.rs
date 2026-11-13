@@ -199,19 +199,21 @@ fn a_function_holding_the_request_open_with_no_caller_keeps_the_request_line() {
     keeps("src/net/forward.ts:4");
 }
 
-/// A call made where a module is loaded states no row: the request line
-/// keeps the model's row beside the row of its one read caller.
+/// A call made where a module loads (`alerts.ts:3`) states the request
+/// in a fact row of its own, beside the summary row of the wrapper's other
+/// caller (`alerts.ts:2`): the request line states no row (carrick#4121).
 #[test]
-fn a_call_where_a_module_loads_keeps_the_request_line() {
-    keeps("src/net/notify.ts:4");
+fn a_call_where_a_module_loads_states_the_request_at_its_callers() {
+    let rows = rows();
+    assert_eq!(
+        rows.get("src/net/notify.ts:4"),
+        None,
+        "the request line restates its callers' requests: {rows:#?}"
+    );
 }
 
 /// The callers' rows and the unread sites are what they were before the
 /// request line's row went.
-///
-/// Since #3918 the module-level call `alerts.ts:3` states a site row of its
-/// own (`POST /v1/eager` in the key), while `notify.ts:4` keeps its model
-/// row: the same request stated twice, tracked as carrick#4121.
 #[test]
 fn caller_rows_and_unread_sites_are_unchanged() {
     let key = key();
@@ -535,6 +537,91 @@ fn the_pair_is_judged_at_each_caller() {
     assert_eq!(verdicts_at(CHECKOUT, 5), both("http|POST|/v1/orders"));
     assert_eq!(verdicts_at(CHECKOUT, 6), both("http|POST|/v1/orders"));
     assert_eq!(verdicts_at(CHECKOUT, 7), both("http|POST|/v1/refunds"));
+}
+
+// A wrapper called where a module loads (carrick#4121): `reorder` is called
+// at module level (`boot.ts:2`, a fact row) and inside a function
+// (`boot.ts:3`, a summary row). The request line states no row, and the
+// request type its model row held moves to both callers.
+
+const BOOT: &str = "web/src/boot.ts";
+
+/// The request line states no row and keeps no type.
+#[test]
+fn a_request_line_its_module_level_caller_states_leaves_no_row_and_no_type() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let at_request_line: Vec<&serde_json::Value> = web()["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["file_path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("web/src/net/reorder.ts")
+        })
+        .collect();
+    assert!(at_request_line.is_empty(), "{at_request_line:#?}");
+    assert_eq!(consumer_entries("web/src/net/reorder.ts"), []);
+}
+
+/// The request side of the pair judged at one caller of `reorder`.
+fn request_verdicts_at(line: u32) -> Vec<(String, String, String)> {
+    verdicts_at(BOOT, line)
+        .into_iter()
+        .filter(|(_, side, _)| side == "request")
+        .collect()
+}
+
+/// The module-level fact row takes the request type of the request line.
+#[test]
+fn a_module_level_fact_row_takes_the_request_type_of_the_request_line() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert!(
+        consumer_entries(BOOT)
+            .iter()
+            .any(|(line, kind, _)| *line == 2 && kind == "request"),
+        "{:#?}",
+        consumer_entries(BOOT)
+    );
+    assert_eq!(
+        request_verdicts_at(2),
+        [(
+            "http|POST|/v1/orders".to_string(),
+            "request".to_string(),
+            "compatible".to_string()
+        )]
+    );
+}
+
+/// The summary row of the wrapper's other caller takes it too.
+#[test]
+fn a_summary_caller_beside_a_module_level_caller_takes_the_request_type() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert!(
+        consumer_entries(BOOT)
+            .iter()
+            .any(|(line, kind, _)| *line == 3 && kind == "request"),
+        "{:#?}",
+        consumer_entries(BOOT)
+    );
+    assert_eq!(
+        request_verdicts_at(3),
+        [(
+            "http|POST|/v1/orders".to_string(),
+            "request".to_string(),
+            "compatible".to_string()
+        )]
+    );
 }
 
 // ── Wrappers that reshape what they hand back (carrick#3961) ────────────
