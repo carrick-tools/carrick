@@ -4008,7 +4008,7 @@ export class TypeInferrer {
         ? unwrapResult.payloadType
         : type;
     const anchor = this.unwrapArrayLevels(this.unwrapPromiseType(anchorSource));
-    return this.createInferredType(
+    return this.unwidenedAtCaller(node, atCaller, this.createInferredType(
       request,
       typeString,
       false,
@@ -4019,7 +4019,7 @@ export class TypeInferrer {
       this.primaryTypeSymbolSource(anchor.element),
       this.unwrapPromiseType(anchorSource),
       anchor.element
-    );
+    ));
   }
 
   /**
@@ -4088,6 +4088,23 @@ export class TypeInferrer {
     const location = this.getNodeLocation(node);
     if (read.kind === 'instantiated') this.readNodes.delete(location);
     return location;
+  }
+
+  /**
+   * An instantiated read whose function writes a literal on its path is
+   * marked as the unwidened reading not made: that reading is the one that
+   * keeps such a literal (`kind: 'order'`) at its literal type, and without
+   * it the body is judged on the widened type alone, so its pair abstains on
+   * a mismatch rather than report one (carrick#2011).
+   */
+  private unwidenedAtCaller(node: Node, read: { kind: string }, result: InferredType): InferredType {
+    if (
+      read.kind === 'instantiated' &&
+      pathOf(node).some((fn) => literalInsertions(fn, node).length > 0)
+    ) {
+      result.unwidened_out_of_budget = true;
+    }
+    return result;
   }
 
   private inferRequestBody(
@@ -4534,7 +4551,7 @@ export class TypeInferrer {
 
     typeString = this.unwrapPromise(typeString, payloadType);
 
-    return this.createInferredType(
+    return this.unwidenedAtCaller(node, atCaller, this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -4548,7 +4565,7 @@ export class TypeInferrer {
         : unwrapResult.wasUnwrapped
           ? unwrapResult.payloadType
           : this.unwrapPromiseType(payloadType)
-    );
+    ));
   }
 
   // ===========================================================================
