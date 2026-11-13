@@ -517,7 +517,16 @@ function renderPropertyName(prop: Symbol, decl: unknown): string {
     | { getNameNode?: () => { getText(): string } | undefined }
     | undefined;
   const text = node?.getNameNode?.()?.getText();
-  return text && text.length > 0 ? text : prop.getName();
+  if (text && text.length > 0) return text;
+  // No name node (a checker-synthesised member): the bare symbol name is not
+  // valid text for a key that is not an identifier (`a-b`, `1st`).
+  const name = prop.getName();
+  // `isIdentifierText` is TypeScript's own check; it is exported at runtime
+  // but absent from the public typings.
+  const isIdentifierText = (ts as unknown as {
+    isIdentifierText: (text: string, languageVersion: ts.ScriptTarget) => boolean;
+  }).isIdentifierText;
+  return isIdentifierText(name, ts.ScriptTarget.Latest) ? name : JSON.stringify(name);
 }
 
 /** True for tuple types (`[a, b]`), which must not be walked as objects. */
