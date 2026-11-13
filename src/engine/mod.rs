@@ -11674,7 +11674,8 @@ struct TypesOutcome {
 ///
 /// Whichever way the stage ends, a caller row asked at its own call keeps
 /// its response entry only where the answer named the body member it read
-/// (carrick#4196, [`withhold_unread_hand_backs`]).
+/// (carrick#4196, [`withhold_unread_hand_backs`]): the resolved stage does
+/// it before its passes read the manifest, and every other exit here.
 #[allow(clippy::too_many_arguments)]
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
@@ -11766,6 +11767,17 @@ fn resolve_types_stage(
                 server_claims,
             ) {
                 Ok(type_resolution) => {
+                    // Before any pass reads the manifest: a caller row whose
+                    // own call named no body member has no entry for the
+                    // anchors, the enrichment or the capture to keep
+                    // (carrick#4196).
+                    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+                        withhold_unread_hand_backs(
+                            manifest,
+                            file_results,
+                            &type_resolution.hand_back_bodies,
+                        );
+                    }
                     debug!(
                         "Type resolution: {} explicit, {} inferred, {} failures",
                         type_resolution.explicit_manifest.len(),

@@ -11707,11 +11707,15 @@ impl FileOrchestrator {
             hand_back_bodies.len(),
             body_asks.len()
         );
-        infer.extend(body_asks.into_iter().filter(|ask| {
-            ask.alias
-                .as_ref()
-                .is_some_and(|alias| hand_back_bodies.contains(alias))
-        }));
+        let kept_asks: Vec<InferRequestItem> = body_asks
+            .into_iter()
+            .filter(|ask| {
+                ask.alias
+                    .as_ref()
+                    .is_some_and(|alias| hand_back_bodies.contains(alias))
+            })
+            .collect();
+        infer.extend(kept_asks.iter().cloned());
 
         // Deterministically-collected explicit requests for non-HTTP protocols
         // (today: Socket.IO payload anchors, #245). They use the same
@@ -11758,7 +11762,10 @@ impl FileOrchestrator {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         // Every request as sent, for the type-reach record (carrick#3101).
         result.note_request_files(&explicit, &infer);
-        result.hand_back_bodies = hand_back_bodies;
+        // Kept only where the answer published is marked too: the type an
+        // entry carries is that answer's, never the first one's.
+        result.hand_back_bodies =
+            crate::services::type_sidecar::hand_back_bodies(&kept_asks, &result.inferred_types);
         debug!(
             "[FileOrchestrator] Sidecar type resolution round trip: {:.1}s",
             round_trip.elapsed().as_secs_f64()
