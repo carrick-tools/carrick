@@ -472,3 +472,65 @@ fn a_rescan_withdraws_the_same_rows() {
     assert_eq!(first.rows, second.rows);
     assert_eq!(first.anchors, second.anchors);
 }
+
+/// The HTTP rows the blob states on `file`, as (`file:line`, method, path,
+/// resolution source), and whether the compiler engine ran.
+fn http_rows_on(scan: &Scan, file: &str) -> BTreeSet<(String, String, String, String)> {
+    assert!(
+        !scan.blob["bundled_types"].is_null(),
+        "the blob has no bundled_types: the compiler engine did not run, so this test checks nothing"
+    );
+    scan.blob["calls"]
+        .as_array()
+        .expect("blob calls")
+        .iter()
+        .filter(|row| row["key"]["protocol"] == "http")
+        .filter(|row| {
+            row["file_path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(&format!("{file}:")))
+        })
+        .map(|row| {
+            (
+                row["file_path"].as_str().expect("file_path").to_string(),
+                row["key"]["method"].as_str().unwrap_or("").to_string(),
+                row["key"]["path"].as_str().unwrap_or("").to_string(),
+                row["resolution_source"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A call into another class's `publish` states no HTTP request (carrick#4120).
+///
+/// `./http-events` is the one module that declares a `publish` with a request
+/// (line 16's `fetch`). The name join keyed lines 15, 17 and 18 by the name
+/// `publish` alone, so each stated that request, although the compiler says
+/// each reaches a different function (`SocketPublisher`, `SwappableFeed`,
+/// `SyncedStore`) and none of them sends it. Only line 16, which reaches
+/// `HttpEvents.publish`, states the request, once, from the request summary.
+/// A rescan reads the same rows from the cached answers.
+///
+/// Needs the compiler engine built (`src/sidecar`), as CI builds it before
+/// this step.
+#[test]
+fn a_call_into_another_class_s_publish_states_no_http_request() {
+    let expected: BTreeSet<(String, String, String, String)> = BTreeSet::from([(
+        format!("{SHIPPING}:16"),
+        "POST".to_string(),
+        "/events/:topic".to_string(),
+        "request_summary".to_string(),
+    )]);
+    let storage = tempfile::tempdir().expect("temp storage dir");
+    let cache = tempfile::tempdir().expect("temp cache dir");
+    let cassettes = fixture_dir().join("__llm__");
+    let first = scan_in(storage.path(), cache.path(), &cassettes);
+    assert_eq!(http_rows_on(&first, SHIPPING), expected, "first scan");
+    let second = scan_in(storage.path(), cache.path(), &cassettes);
+    assert!(
+        second.stderr.contains("already analysed"),
+        "the second scan did not take the incremental path:\n{}",
+        second.stderr
+    );
+    assert_eq!(http_rows_on(&second, SHIPPING), expected, "rescan");
+}
