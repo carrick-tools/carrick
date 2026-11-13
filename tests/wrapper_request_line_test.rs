@@ -285,21 +285,28 @@ fn sidecar_available() -> bool {
 /// service name.
 fn typed_blobs() -> &'static BTreeMap<String, serde_json::Value> {
     static BLOBS: OnceLock<BTreeMap<String, serde_json::Value>> = OnceLock::new();
-    BLOBS.get_or_init(|| {
+    BLOBS.get_or_init(|| scan_typed_fixture(&types_fixture_dir()))
+}
+
+/// Every service's blob from one offline scan of a two-service types
+/// fixture (`repo/`, `library-claims.json`, `model-cassette/`), keyed by
+/// service name.
+fn scan_typed_fixture(fixture: &Path) -> BTreeMap<String, serde_json::Value> {
+    {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = tmp.path().join("workspace");
-        copy_dir(&types_fixture_dir().join("repo"), &repo);
+        copy_dir(&fixture.join("repo"), &repo);
         run_git(&repo, &["init", "-q"]);
         run_git(&repo, &["add", "-A", "-f"]);
         run_git(&repo, &["commit", "-q", "-m", "init"]);
         let cassettes = tmp.path().join("cassettes");
         std::fs::create_dir_all(cassettes.join("library-claims")).unwrap();
         std::fs::copy(
-            types_fixture_dir().join("library-claims.json"),
+            fixture.join("library-claims.json"),
             cassettes.join("library-claims/default.json"),
         )
         .unwrap();
-        copy_dir(&types_fixture_dir().join("model-cassette"), &cassettes);
+        copy_dir(&fixture.join("model-cassette"), &cassettes);
         let storage = tmp.path().join("storage");
         std::fs::create_dir_all(&storage).unwrap();
         let home = tmp.path().join("home");
@@ -354,7 +361,7 @@ fn typed_blobs() -> &'static BTreeMap<String, serde_json::Value> {
             }
         }
         blobs
-    })
+    }
 }
 
 fn web() -> &'static serde_json::Value {
@@ -524,4 +531,169 @@ fn the_pair_is_judged_at_each_caller() {
     assert_eq!(verdicts_at(CHECKOUT, 5), both("http|POST|/v1/orders"));
     assert_eq!(verdicts_at(CHECKOUT, 6), both("http|POST|/v1/orders"));
     assert_eq!(verdicts_at(CHECKOUT, 7), both("http|POST|/v1/refunds"));
+}
+
+// ── Wrappers that reshape what they hand back (carrick#3961) ────────────
+//
+// `tests/fixtures/wrapper-request-line-transform`: `web` calls `api` through
+// `fetch` wrappers whose request lines leave the path to their callers. The
+// response read at a request line is the one a caller holds only where the
+// wrapper hands back the request's own value, or its parsed body (then the
+// caller's own call is typed). A caller of any other wrapper holds the
+// wrapper's own value (an envelope, a token, the raw `Response`): that is no
+// wire response and is never judged against one. Every caller keeps the
+// request type the request line sends.
+
+const APP: &str = "web/src/app.ts";
+const TOOLS: &str = "web/src/tools.ts";
+
+fn transform_blobs() -> &'static BTreeMap<String, serde_json::Value> {
+    static BLOBS: OnceLock<BTreeMap<String, serde_json::Value>> = OnceLock::new();
+    BLOBS.get_or_init(|| {
+        scan_typed_fixture(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/wrapper-request-line-transform"),
+        )
+    })
+}
+
+fn transform_web() -> &'static serde_json::Value {
+    transform_blobs()
+        .get("web")
+        .unwrap_or_else(|| panic!("a blob for web: {:?}", transform_blobs().keys()))
+}
+
+/// The `web` consumer entries of one side, as `"<file>:<line>"`.
+fn transform_entries(side: &str) -> BTreeSet<String> {
+    transform_web()["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["role"] == "consumer" && entry["type_kind"] == side)
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                entry["file_path"].as_str().unwrap_or_default(),
+                entry["line_number"].as_u64().unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+/// The `(side, verdict)` pairs stored for the call at `site`.
+fn transform_verdicts(site: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = transform_blobs()
+        .values()
+        .flat_map(|blob| {
+            blob["compat_verdicts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .flat_map(|pair| {
+            pair["sites"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|at| at["consumer_location"] == site)
+                .flat_map(|at| {
+                    ["request", "response"]
+                        .into_iter()
+                        .filter_map(|side| {
+                            at[side]["verdict"]
+                                .as_str()
+                                .map(|verdict| (side.to_string(), verdict.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn sites(file: &str, lines: &[u32]) -> BTreeSet<String> {
+    lines.iter().map(|line| format!("{file}:{line}")).collect()
+}
+
+/// Every wrapper's request line gives its row to its callers, so each case
+/// below is read at a caller.
+#[test]
+fn the_transform_fixture_states_each_request_at_its_callers() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let rows: BTreeSet<String> = transform_web()["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| row["file_path"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let mut callers = sites(APP, &[8, 9, 10, 11, 12, 16]);
+    callers.extend(sites(TOOLS, &[24, 32]));
+    assert_eq!(rows, callers);
+}
+
+/// A wrapper that hands back an envelope (`getJson`, app.ts:8 and
+/// tools.ts:32), one field of the body (`exchangeToken`, app.ts:9 and
+/// tools.ts:24) or the raw `Response` (`streamPost`, app.ts:11 and :16;
+/// `send`, app.ts:12): its caller holds that value, so it carries no
+/// response type and gets no response verdict.
+#[test]
+fn a_caller_of_a_wrapper_that_reshapes_the_response_is_not_judged_on_it() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(transform_entries("response"), sites(APP, &[10]));
+    let reshaped = sites(APP, &[8, 9, 11, 12, 16])
+        .into_iter()
+        .chain(sites(TOOLS, &[24, 32]));
+    for site in reshaped {
+        let judged: Vec<(String, String)> = transform_verdicts(&site)
+            .into_iter()
+            .filter(|(side, _)| side == "response")
+            .collect();
+        assert_eq!(judged, [], "{site}");
+    }
+}
+
+/// A wrapper that hands back the parsed body unchanged (`readTicket`,
+/// app.ts:10) makes its call's value the response, judged against the
+/// producer.
+#[test]
+fn a_caller_of_a_wrapper_that_hands_back_the_body_is_judged_on_the_response() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        transform_verdicts(&format!("{APP}:10")),
+        [("response".to_string(), "compatible".to_string())]
+    );
+}
+
+/// Each caller of a request line that sends a body keeps a request type,
+/// whether the wrapper builds the body (`exchangeToken`), serialises its
+/// parameter (`streamPost`) or passes its options through (`send`); a GET
+/// caller keeps none. The built body is judged at the caller.
+#[test]
+fn a_withdrawn_request_line_keeps_its_request_type_at_each_caller() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let mut senders = sites(APP, &[9, 11, 12, 16]);
+    senders.extend(sites(TOOLS, &[24]));
+    assert_eq!(transform_entries("request"), senders);
+    for site in [format!("{APP}:9"), format!("{TOOLS}:24")] {
+        assert_eq!(
+            transform_verdicts(&site),
+            [("request".to_string(), "compatible".to_string())],
+            "{site}"
+        );
+    }
 }

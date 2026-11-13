@@ -618,7 +618,8 @@ pub struct DataCallResult {
     /// there carried them, and they move to every caller row that states the
     /// request: the alias is this row's, the place the type is read is the
     /// request line. A side this row already types from its own call keeps
-    /// its own anchor.
+    /// its own anchor. The response moves only where the caller's function
+    /// hands back the request's own value ([`RequestLineAnchors::response`]).
     ///
     /// Never from the model and never on the wire: set after the join, read
     /// by the type requests and the manifest on the same run.
@@ -636,6 +637,13 @@ pub struct RequestLineAnchors {
     pub file: String,
     /// The model's row at the request line.
     pub call: DataCallResult,
+    /// The response read at the request line is the one the caller's row
+    /// holds: the caller's function hands back the request's own value
+    /// unread ([`crate::request_summary::SummaryRow::returns_request_value`]).
+    /// A function that hands back anything else (an envelope, a field, a
+    /// `Response`) leaves its callers no response type and no response
+    /// verdict; only the request moves.
+    pub response: bool,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and

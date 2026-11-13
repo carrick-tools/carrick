@@ -10056,6 +10056,14 @@ struct Summary {
     /// call of it is worth the body, so a row stated at that call can be
     /// typed by the call's value.
     passes_body: bool,
+    /// The function sends one request and returns that request's own value
+    /// unread, as the request resolves (`return http.post<T>(url, body)`),
+    /// here or through a call to a function that does the same
+    /// ([`crate::return_flow::return_shapes`], carrick#3961). What a call of
+    /// it receives is what the request line's call is worth, so the response
+    /// read there is the response its callers hold. The platform's `fetch`
+    /// resolves to a `Response`, not the body, so returning it is not this.
+    returns_request_value: bool,
     /// The function hands out a function that may send (carrick#2281): its
     /// body writes one it does not call whose own summary is incomplete or
     /// states a request, or a callee it calls (or a callback that callee
@@ -10113,6 +10121,12 @@ pub struct SummaryRow {
     /// whatever the function returns (a boolean, a token, a mapped object)
     /// and says nothing about the response body.
     pub at_caller: bool,
+    /// A row at a caller whose function hands back the request's own value
+    /// unread (carrick#3961): the call is worth what the request line's call
+    /// is, so the response read at the request line is the one this call
+    /// holds. Every other row at a caller holds the function's own value
+    /// (an envelope, a field, a `Response`), which is no wire response.
+    pub returns_request_value: bool,
     /// What the request body is at a row stated at a call to a function the
     /// service declares (carrick#1782): what that function does with its
     /// parameters says whether the call's arguments are the body. `None` on
@@ -11320,6 +11334,7 @@ impl Composer<'_> {
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
             passes_body: false,
+            returns_request_value: false,
             hands_out: false,
         };
         // What the functions written in this body send through its
@@ -11429,6 +11444,10 @@ impl Composer<'_> {
             && ir
                 .return_shape
                 .is_some_and(|shape| self.hands_back_body(file, ir, shape));
+        summary.returns_request_value = summary.effects.len() == 1
+            && ir
+                .return_shape
+                .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
         for (effect, through) in lifted {
             summary.state(ir.settle_forward(effect), through);
         }
@@ -11494,6 +11513,36 @@ impl Composer<'_> {
             (ShapeKind::Parsed, None) => self.request_of(file, call).is_some(),
             (ShapeKind::Value, Some((_, callee))) => callee.passes_body,
             _ => false,
+        }
+    }
+
+    /// Whether what `ir` returns ([`FnIr::return_shape`]) is its request's
+    /// own value unread (carrick#3961, [`Summary::returns_request_value`]):
+    /// the call that makes the request, handed back whole, other than the
+    /// platform's `fetch`, or what a call of a function that does the same
+    /// returns. A parse, one member or any other value is not.
+    fn hands_back_request_value(
+        &mut self,
+        file: &Path,
+        ir: &FnIr,
+        shape: crate::return_flow::ReturnShape,
+    ) -> bool {
+        use crate::return_flow::ShapeKind;
+        if shape.kind != ShapeKind::Value {
+            return false;
+        }
+        let Some(call) = ir.calls.iter().find(|call| {
+            call.site.lo == shape.base.lo.0
+                && call.site.hi == shape.base.hi.0
+                && call.invokes_param.is_none()
+        }) else {
+            return false;
+        };
+        match self.callee(file, call) {
+            None => self
+                .request_of(file, call)
+                .is_some_and(|request| request.kind != RequestKind::Fetch),
+            Some((_, callee)) => callee.returns_request_value,
         }
     }
 }
@@ -11861,8 +11910,13 @@ fn emit(
                     };
                     // A function that hands back its one request's parsed
                     // body makes its call worth that body (carrick#1601).
+                    // One that hands back the request's own value unread
+                    // makes its call worth what the request line's call is
+                    // (carrick#3961).
                     let at = if callee.passes_body {
                         RowSite::PassThrough
+                    } else if callee.returns_request_value {
+                        RowSite::CallerOfRequestValue
                     } else {
                         RowSite::Caller
                     };
@@ -12108,6 +12162,11 @@ enum RowSite {
     /// and hands back its parsed body unchanged: the call's value is the
     /// body ([`Summary::passes_body`]).
     PassThrough,
+    /// A call to a function the service declares, which makes one request
+    /// and hands back that request's own value unread: the call's value is
+    /// what the request line's call is worth
+    /// ([`Summary::returns_request_value`], carrick#3961).
+    CallerOfRequestValue,
 }
 
 /// The row an effect supports at `site`, when its URL and method are both
@@ -12153,7 +12212,8 @@ fn row(
         body_literals,
         reaches_request,
         own_site: at == RowSite::Own,
-        at_caller: at == RowSite::Caller,
+        at_caller: matches!(at, RowSite::Caller | RowSite::CallerOfRequestValue),
+        returns_request_value: at == RowSite::CallerOfRequestValue,
         call_body,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
@@ -14697,6 +14757,7 @@ function build() { return {}; }
             reaches_request: None,
             own_site: false,
             at_caller: false,
+            returns_request_value: false,
             call_body: None,
             library_semantics: Vec::new(),
             base_fallbacks: None,

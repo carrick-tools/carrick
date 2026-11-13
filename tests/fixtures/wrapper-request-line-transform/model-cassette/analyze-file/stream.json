@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:2",
+      "line_number": 2,
+      "target": "/v1/${path}",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(`/v1${path}`, { method: 'POST', body: JSON.stringify(body ?? {}) })",
+      "call_expression_line": 2,
+      "payload_expression_text": "body ?? {}",
+      "payload_expression_line": 2,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

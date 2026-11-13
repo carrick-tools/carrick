@@ -5771,7 +5771,10 @@ impl FileOrchestrator {
                 // its callers' rows stating it (carrick#3961), carries the
                 // anchors the model's row there held: the types are read at
                 // that line, under this row's aliases. A side this row
-                // types from its own call keeps its own anchor.
+                // types from its own call keeps its own anchor. The response
+                // is read there only where the function hands back the
+                // request's own value: anything else it returns is its own
+                // value, not the wire response, and is judged against none.
                 let request_line = data_call.request_line.as_deref().map(|moved| {
                     (
                         &moved.call,
@@ -5781,7 +5784,12 @@ impl FileOrchestrator {
                     )
                 });
                 let response_from = if data_call.at_caller {
-                    request_line.clone()
+                    request_line.clone().filter(|_| {
+                        data_call
+                            .request_line
+                            .as_deref()
+                            .is_some_and(|moved| moved.response)
+                    })
                 } else {
                     Some((
                         data_call,
@@ -8915,6 +8923,7 @@ impl FileOrchestrator {
                 call.request_line = Some(Box::new(RequestLineAnchors {
                     file: row.request_at.0.to_string_lossy().into_owned(),
                     call: withdrawn[&row.request_at].clone(),
+                    response: row.returns_request_value,
                 }));
                 carried.insert(row.request_at.clone());
             }
@@ -16683,6 +16692,7 @@ export * from "./aFetch.js";"#,
         let anchors = RequestLineAnchors {
             file: wrapper_path.to_string_lossy().into_owned(),
             call: model_row,
+            response: true,
         };
         let caller = |line: i32, call_body: Option<CallBody>, carried: bool| DataCallResult {
             call_kind: None,
@@ -16932,6 +16942,7 @@ export * from "./aFetch.js";"#,
             reaches_request: Some("src/availability.ts:3".to_string()),
             own_site: !at_caller,
             at_caller,
+            returns_request_value: false,
             call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
@@ -21352,6 +21363,7 @@ export { routes };
             reaches_request: None,
             own_site: true,
             at_caller: false,
+            returns_request_value: false,
             call_body: None,
             library_semantics: Vec::new(),
             base_fallbacks: None,

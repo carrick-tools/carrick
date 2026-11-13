@@ -13557,9 +13557,14 @@ fn stamp_stated_values(
 ///   request body. A row whose function sends a declared parameter unchanged
 ///   keeps its entry, typed from that declaration.
 ///
-/// Neither, for a row that carries the anchors of a request line whose own
-/// row was withdrawn ([`crate::agents::file_analyzer_agent::DataCallResult::request_line`],
-/// carrick#3961): both sides are read at that line.
+/// A row that carries the anchors of a request line whose own row was
+/// withdrawn ([`crate::agents::file_analyzer_agent::DataCallResult::request_line`],
+/// carrick#3961) keeps its request, read at that line, for a verb that sends
+/// a body. It keeps its response
+/// only where its function hands back the request's own value
+/// ([`crate::agents::file_analyzer_agent::RequestLineAnchors::response`]);
+/// any other value its function returns is that function's, not the wire
+/// response, and is judged against none.
 ///
 /// An entry left at `unknown` would still make the site a party to the type
 /// check, read `unverifiable` there and carry that up to its pair, so the
@@ -13577,24 +13582,26 @@ fn drop_call_through_entries(
         .iter()
         .flat_map(|(file_path, result)| {
             // A row that carries its request line's anchors (carrick#3961)
-            // states both sides from there.
-            result
-                .data_calls
-                .iter()
-                .filter(|call| call.request_line.is_none())
-                .flat_map(move |call| {
-                    let response = call.at_caller.then_some(ManifestTypeKind::Response);
-                    let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built))
-                        .then_some(ManifestTypeKind::Request);
-                    response.into_iter().chain(request).map(move |kind| {
-                        (
-                            file_path.as_str(),
-                            normalize_line(call.line_number),
-                            normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
-                            kind,
-                        )
-                    })
+            // states the request from there, and the response only where its
+            // function hands back the request's own value.
+            result.data_calls.iter().flat_map(move |call| {
+                let moved = call.request_line.as_deref();
+                let response = (call.at_caller && !moved.is_some_and(|moved| moved.response))
+                    .then_some(ManifestTypeKind::Response);
+                let method = normalize_manifest_method(call.method.as_deref().unwrap_or_default());
+                let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built)
+                    && (moved.is_none()
+                        || !crate::type_manifest::producer_reads_request_body(&method)))
+                .then_some(ManifestTypeKind::Request);
+                response.into_iter().chain(request).map(move |kind| {
+                    (
+                        file_path.as_str(),
+                        normalize_line(call.line_number),
+                        method.clone(),
+                        kind,
+                    )
                 })
+            })
         })
         .collect();
     if unstated.is_empty() {
@@ -13672,7 +13679,9 @@ fn stamp_manifest_anchor_symbols(
             // whose anchors it carries (carrick#3961), declared as that
             // line's file names it.
             let (anchor, using_file) = match call.request_line.as_deref() {
-                Some(moved) if call.at_caller => (&moved.call, moved.file.as_str()),
+                Some(moved) if call.at_caller && moved.response => {
+                    (&moved.call, moved.file.as_str())
+                }
                 _ => (call, file_path.as_str()),
             };
             if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
