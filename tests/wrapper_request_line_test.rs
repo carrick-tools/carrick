@@ -1018,14 +1018,18 @@ fn a_summaries_owned_undecided_hand_back_is_kept_and_unverifiable() {
         hand_back_verdicts(&format!("{HAND_BACK_APP}:19")),
         [("response".to_string(), "unverifiable".to_string())]
     );
-    assert!(
-        hand_back_entry(&format!("{HAND_BACK_APP}:19")).is_some(),
-        "app.ts:19 keeps a response entry"
-    );
-    assert_eq!(
-        hand_back_response(&format!("{HAND_BACK_APP}:19")),
-        hand_back_response(&format!("{HAND_BACK_APP}:9"))
-    );
+    // The model-owned `callEither` caller (`:9`) and the summaries-owned one
+    // (`:19`) carry the same decided unknown, with the reason it is one.
+    for line in [9, 19] {
+        let site = format!("{HAND_BACK_APP}:{line}");
+        let entry = hand_back_entry(&site)
+            .unwrap_or_else(|| panic!("{site} keeps a response entry: {:#?}", hand_back_blobs()));
+        assert_eq!(entry["type_state"], "unknown", "{site} {entry:#}");
+        assert_eq!(
+            entry["any_provenance"][0]["reason"], "body_member_undecided",
+            "{site} {entry:#}"
+        );
+    }
 }
 
 /// The `web` consumer response entry at `site`, if the manifest holds one.

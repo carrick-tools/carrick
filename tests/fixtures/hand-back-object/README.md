@@ -20,6 +20,11 @@ and each caller's response type is the call's value.
   verdict. A caller whose wrapper's answer names no member keeps no
   response type.
 
+- `app.ts:19` calls `callEitherPlain`: `callEither`'s two returns with no
+  options of its own, so the request summaries own the row. The answer is
+  the same decided `unknown` (`body_member_undecided`), and the row keeps
+  its response entry and reads `unverifiable`, as `app.ts:9` does.
+
 Before carrick#4185, `app.ts:4` and `app.ts:9` were typed as the whole object
 and judged `incompatible`. Before carrick#4196, `app.ts:14` carried no
 response type.
