@@ -1023,7 +1023,7 @@ test("R36.6 (6): with the switch off, no uses_fallback is recorded", async (t) =
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [fnRow("loadOrder", LOAD_LINE)]);
   const file = ws.at("api/src/orders.ts");
   const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") });
-  delete env["CARRICK_FACT_LINES"];
+  env["CARRICK_FACT_LINES"] = "0";
   const run = await runHook("post-edit.ts", {
     payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "off-uses", cwd: ws.root, tool_input: { file_path: file }, tool_response: { structuredPatch: [{ oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ["+  const key = `order:${id}`;"] }] } },
     env,
@@ -1114,7 +1114,7 @@ test("R36.6 (12): ingest skips an op or fn row whose others is empty", async (t)
   assert.deepEqual(counts, [1, 1]);
 });
 
-test("R36.5: with CARRICK_FACT_LINES unset, a package.json Write, a .js Edit and a shell write do no fact work", async (t) => {
+test("R36.5: with CARRICK_FACT_LINES=0, a package.json Write, a .js Edit and a shell write do no fact work", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
   const js = "export function h() {\n  return 1;\n}\n";
   const ws = await workspace(t, { "api/package.json": before, "api/src/util.js": js, "web/src/index.ts": "export {};\n" }, [ZOD]);
@@ -1129,7 +1129,7 @@ test("R36.5: with CARRICK_FACT_LINES unset, a package.json Write, a .js Edit and
       CARRICK_TEST_READS_MATCH: `${ws.at("api")}${path.sep}`,
       CARRICK_TEST_READS_LOG: reads,
     });
-    if (!on) delete env["CARRICK_FACT_LINES"];
+    if (!on) env["CARRICK_FACT_LINES"] = "0";
     const hook = (script: string, payload: Record<string, unknown>) =>
       runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: session, cwd: ws.root, ...payload }, env, nodeArgs: ["--import", path.join(testDir, "count-reads.mjs")] });
     const manifest = ws.at("api/package.json");
@@ -1153,7 +1153,7 @@ test("R36.5: with CARRICK_FACT_LINES unset, a package.json Write, a .js Edit and
   assert.ok(fs.readFileSync(reads, "utf8").length > 0);
 });
 
-test("with CARRICK_FACT_LINES unset, edits that would print fn, name and pkg lines print nothing and run no git", async (t) => {
+test("with CARRICK_FACT_LINES=0, edits that would print fn, name and pkg lines print nothing and run no git", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
   const ws = await workspace(t, { ...STDIN_FILES, "api/src/orders.ts": ORDERS, "api/package.json": before, "web/src/page.ts": PAGE }, [
     FN_PEER,
@@ -1168,7 +1168,7 @@ test("with CARRICK_FACT_LINES unset, edits that would print fn, name and pkg lin
   fs.writeFileSync(path.join(shim, "git"), `#!/bin/sh\necho "$*" >> ${log}\nexec ${real} "$@"\n`, { mode: 0o755 });
   const run = async (on: boolean, session: string) => {
     const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), PATH: `${shim}${path.delimiter}${process.env["PATH"] ?? ""}` });
-    if (!on) delete env["CARRICK_FACT_LINES"];
+    if (!on) env["CARRICK_FACT_LINES"] = "0";
     const call = (file: string, hunk: Hunk) =>
       runHook("post-edit.ts", {
         payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: session, cwd: ws.root, tool_input: { file_path: file, old_string: "x", new_string: "" }, tool_response: { structuredPatch: [{ oldStart: hunk.newStart, oldLines: 0, newLines: 0, ...hunk }] } },
@@ -1366,7 +1366,7 @@ test("R40.4: in a partial clone a shell write and a created file run no git and 
     if (partial) fs.writeFileSync(path.join(ws.at("api"), ".git", "objects", "pack", "pack-0.promisor"), "");
     const git = countingGit(t);
     const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), PATH: git.path });
-    if (!on) delete env["CARRICK_FACT_LINES"];
+    if (!on) env["CARRICK_FACT_LINES"] = "0";
     const hook = async (script: string, payload: Record<string, unknown>) =>
       context((await runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: "partial", cwd: ws.root, ...payload }, env })).stdout);
     const file = ws.at("api/src/orders.ts");
