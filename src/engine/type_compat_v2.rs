@@ -737,15 +737,20 @@ pub(crate) fn derive_capture_anchors(
         // the first expression on a registration line is the registration
         // call, and its own result (a route chain, `void`) would be served as
         // the reply (carrick#2727). It takes the placeholder, as a decided
-        // abstain does.
-        if matches!(
-            request.infer_kind,
-            InferKind::ResponseBody | InferKind::RequestBody
-        ) && request.span_start.is_none()
-            && request.span_end.is_none()
-            && request.expression_text.is_none()
-            && request.param_name.is_none()
-        {
+        // abstain does. A `FunctionReturn` with no span, text or param is the
+        // same (a declaration line or registration call names no response),
+        // and so is a `ResponseBody` with no text and no param whether or not
+        // it carries a span: a span at a registration call re-reads the call
+        // or the installed framework's instance type (carrick#4079). A
+        // `FunctionReturn` with a span (a GraphQL resolver) keeps its anchor.
+        let no_text_no_param = request.expression_text.is_none() && request.param_name.is_none();
+        let no_span = request.span_start.is_none() && request.span_end.is_none();
+        let names_no_payload = match request.infer_kind {
+            InferKind::RequestBody => no_span && no_text_no_param,
+            InferKind::ResponseBody => no_span && no_text_no_param,
+            _ => false,
+        };
+        if names_no_payload {
             anchors.push(CaptureAnchor::Literal {
                 alias: alias.to_string(),
                 type_text: "unknown".to_string(),
@@ -6617,7 +6622,9 @@ mod tests {
             line_number: 7,
             span_start: Some(10),
             span_end: Some(20),
-            expression_text: None,
+            // A located send: the text names the payload (a span alone at a
+            // registration call does not, carrick#4079).
+            expression_text: Some("res.json(body)".to_string()),
             expression_line: None,
             infer_kind: InferKind::ResponseBody,
             alias: Some(alias.to_string()),
@@ -7538,6 +7545,13 @@ mod tests {
             let mut request = response_body_infer(alias);
             request.span_start = None;
             request.span_end = None;
+            request.expression_text = None;
+            request.infer_kind = kind;
+            request
+        };
+        let span_only = |alias: &str, kind: InferKind| {
+            let mut request = response_body_infer(alias);
+            request.expression_text = None;
             request.infer_kind = kind;
             request
         };
@@ -7549,12 +7563,16 @@ mod tests {
             with_text,
             line_only("Endpoint_call_Response", InferKind::CallResult),
             line_only("Endpoint_return_Response", InferKind::FunctionReturn),
+            span_only("Endpoint_span_Response", InferKind::ResponseBody),
+            span_only("Endpoint_resolver_Response", InferKind::FunctionReturn),
+            span_only("Endpoint_span_Request", InferKind::RequestBody),
         ];
 
         let anchors = derive_capture_anchors(&[], &infer, &[], &[], &[], "/repo");
 
-        assert_eq!(anchors.len(), 5, "{anchors:?}");
-        for anchor in &anchors[..2] {
+        assert_eq!(anchors.len(), 8, "{anchors:?}");
+        let placeholders: Vec<&CaptureAnchor> = [0, 1, 4, 5].iter().map(|i| &anchors[*i]).collect();
+        for anchor in placeholders {
             match anchor {
                 CaptureAnchor::Literal {
                     type_text,
@@ -7571,10 +7589,11 @@ mod tests {
                 }
             }
         }
-        for anchor in &anchors[2..] {
+        for i in [2, 3, 6, 7] {
             assert!(
-                matches!(anchor, CaptureAnchor::Infer { .. }),
-                "a located or non-body request keeps its infer anchor, got {anchor:?}"
+                matches!(&anchors[i], CaptureAnchor::Infer { .. }),
+                "a located or non-body request keeps its infer anchor, got {:?}",
+                anchors[i]
             );
         }
     }
