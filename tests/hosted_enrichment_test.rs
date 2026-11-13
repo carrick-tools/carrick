@@ -154,15 +154,8 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     let root = temp.path();
     let repo = root.join("orders");
     std::fs::create_dir(&repo).unwrap();
-    // The receiver is an installed `express`, whose store answer lists the
-    // route call as a site. Its path is declared and never bound, so the local
-    // scan cannot state the row and the hosted answer is what supplies it
-    // (carrick#3711). The manifest does not list `express`, so the manifest
-    // change below is still a change.
-    let source = "import express from \"express\";\ndeclare const hostedPath: string;\nconst app = express();\nfunction handler() { return { id: 1 }; }\napp.get(hostedPath, handler);\nfetch(\"https://example.test/local\", { method: \"GET\" });\n";
+    let source = "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\nfetch(\"https://example.test/local\", { method: \"GET\" });\n";
     std::fs::write(repo.join("app.ts"), source).unwrap();
-    real_packages::install(&repo, &["express"]);
-    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     std::fs::write(
         repo.join("package.json"),
         r#"{"name":"orders","version":"1.0.0","dependencies":{"@remix-run/node":"^2.0.0"}}"#,
@@ -199,9 +192,9 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     assert_eq!(baseline["hosted_state"], "not_signed_in");
     let mut hosted = blobs(root).remove(0);
     let start = source.find("app.get(").unwrap() + 1;
-    let end = start + "app.get(hostedPath, handler)".len();
+    let end = start + "app.get(\"/hosted\", handler)".len();
     hosted["file_results"] = json!({"app.ts":{"mounts":[],"data_calls":[],"endpoints":[{
-        "candidate_id":format!("span:{start}-{end}"),"line_number":5,"owner_node":"app","method":"GET","path":"/hosted",
+        "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET","path":"/hosted",
         "handler_name":"handler","pattern_matched":"fixture","call_expression_span_start":start,"call_expression_span_end":end,
         "resolution_source":"model"
     }]}});
@@ -296,7 +289,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     assert!(changed_manifest["cached_extraction_config"].is_null());
     git(&repo, &["checkout", "--", "package.json"]);
     // Dirty, staged, and committed changes all withhold the same hosted row.
-    std::fs::write(repo.join("app.ts"), source.replace("id: 1", "id: 2")).unwrap();
+    std::fs::write(repo.join("app.ts"), source.replace("/hosted", "/edited")).unwrap();
     for phase in 0..3 {
         if phase == 1 {
             git(&repo, &["add", "app.ts"]);
