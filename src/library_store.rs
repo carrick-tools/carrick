@@ -607,7 +607,7 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
             sent.insert(asked.package);
         }
         if npm_specifier(specifier).is_some() {
-            deno_lock_dirs.extend(lock_dir(install.service_root, install.repo_root));
+            deno_lock_dirs.extend(deno_lock_location(install).map(|(_, dir)| dir));
         }
         if let Some((package, resolved)) = located(specifier, install) {
             installed_names.insert(
@@ -623,7 +623,8 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
         .collect();
     let mut unreadable_lockfiles = BTreeSet::new();
     for lock_dir in &lock_dirs {
-        unreadable_lockfiles.extend(unreadable_in(lock_dir));
+        let deno = deno_lock_file(lock_dir, install);
+        unreadable_lockfiles.extend(unreadable_in(lock_dir, deno.as_deref()));
     }
     AskHealth {
         installed: installed_names.len(),
@@ -634,7 +635,7 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
 
 /// The lockfiles in `lock_dir`, and pnpm's install record beside its
 /// lockfile, that do not parse as their reader parses them.
-fn unreadable_in(lock_dir: &Path) -> Vec<PathBuf> {
+fn unreadable_in(lock_dir: &Path, deno: Option<&Path>) -> Vec<PathBuf> {
     let json = |path: &Path| {
         std::fs::read_to_string(path)
             .ok()
@@ -663,12 +664,12 @@ fn unreadable_in(lock_dir: &Path) -> Vec<PathBuf> {
     // A `deno.lock` that does not parse, or of a format this scanner does
     // not read (format 1, with no `version`, holds no npm package and is
     // read as such).
-    let deno = lock_dir.join("deno.lock");
-    if deno.is_file()
-        && read_json(&deno)
+    if let Some(deno) = deno
+        && deno.is_file()
+        && read_json(deno)
             .is_none_or(|lock| lock.get("version").is_some() && deno_lock_sections(&lock).is_none())
     {
-        out.push(deno);
+        out.push(deno.to_path_buf());
     }
     let pnpm = lock_dir.join("pnpm-lock.yaml");
     if pnpm.is_file() {
@@ -776,8 +777,8 @@ fn locked(
     npm: &crate::request_summary::RegistrySpecifier<'_>,
     install: &Install<'_>,
 ) -> Option<Installed> {
-    let dir = lock_dir(install.service_root, install.repo_root)?;
-    let (name, version) = deno_lock_resolve(&dir.join("deno.lock"), npm)?;
+    let (file, dir) = deno_lock_location(install)?;
+    let (name, version) = deno_lock_resolve(&file, npm)?;
     Some(Installed {
         dir: dir.clone(),
         name,
@@ -807,6 +808,47 @@ fn import_mapped_npm(specifier: &str, install: &Install<'_>) -> Option<String> {
             .max_by_key(|(key, _)| key.len())
             .map(|(key, target)| format!("{target}{}", &specifier[key.len()..]))
     })
+}
+
+/// The `deno.lock` a Deno `npm:` specifier of the service resolves through,
+/// and the directory holding it. The nearest Deno config naming a `lock`
+/// (from the service root up to the repo root) decides: its path, or none at
+/// all for `"lock": false`. With no config naming one, `deno.lock` in the
+/// nearest directory holding a lockfile.
+fn deno_lock_location(install: &Install<'_>) -> Option<(PathBuf, PathBuf)> {
+    match configured_deno_lock(install) {
+        Some(file) => {
+            let file = file?;
+            let dir = file.parent()?.to_path_buf();
+            Some((file, dir))
+        }
+        None => {
+            let dir = lock_dir(install.service_root, install.repo_root)?;
+            Some((dir.join("deno.lock"), dir))
+        }
+    }
+}
+
+/// What the nearest Deno config naming a `lock` says about it: `None` when
+/// no config does, `Some(None)` for `"lock": false`, else the path.
+fn configured_deno_lock(install: &Install<'_>) -> Option<Option<PathBuf>> {
+    roots(install.service_root, install.repo_root)
+        .into_iter()
+        .filter_map(|dir| crate::deno_support::manifest_at(&dir))
+        .find_map(|config| {
+            let json = crate::packages::read_json_config(&config).ok()?;
+            json.get("lock")?;
+            Some(crate::deno_support::lock_path(&config, &json))
+        })
+}
+
+/// The `deno.lock` to read for `lock_dir` (the default's directory), or
+/// `None` when the service's config turns the lock off.
+fn deno_lock_file(lock_dir: &Path, install: &Install<'_>) -> Option<PathBuf> {
+    match configured_deno_lock(install) {
+        Some(file) => file,
+        None => Some(lock_dir.join("deno.lock")),
+    }
 }
 
 /// The nearest directory holding a lockfile, from `from` up to the repo
@@ -935,7 +977,9 @@ fn from_public_registry(name: &str, package: &Installed, install: &Install<'_>) 
     {
         return false;
     }
-    let Some(lock_dir) = lock_dir(&package.install_root, install.repo_root) else {
+    let Some(lock_dir) = lock_dir(&package.install_root, install.repo_root)
+        .or_else(|| deno_lock_location(install).map(|(_, dir)| dir))
+    else {
         return false;
     };
     let answers: Vec<bool> = [
@@ -1485,7 +1529,7 @@ fn deno_lock(
     lock_dir: &Path,
     install: &Install<'_>,
 ) -> Option<bool> {
-    let path = lock_dir.join("deno.lock");
+    let path = deno_lock_file(lock_dir, install)?;
     if !path.is_file() {
         return None;
     }
@@ -3682,6 +3726,41 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// carrick#4070 T1c: the `lock` a Deno config names is the one read, and
+    /// `"lock": false` asks nothing.
+    #[test]
+    fn a_deno_lock_at_a_configured_path_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("locks/deps.lock"), DENO_V5);
+        let ask = |config: &str| {
+            write(&dir.path().join("deno.json"), config);
+            asked(request(
+                &specifiers(&["npm:chalk@5.3.0"]),
+                &install_at(dir.path()),
+            ))
+        };
+        let chalk = one("chalk", "5.3.0", &["chalk"]);
+        assert_eq!(ask(r#"{"lock": "locks/deps.lock"}"#), chalk);
+        assert_eq!(ask(r#"{"lock": {"path": "locks/deps.lock"}}"#), chalk);
+        assert_eq!(ask(r#"{}"#), vec![]);
+        assert_eq!(ask(r#"{"lock": "elsewhere.lock"}"#), vec![]);
+        // Off: the default `deno.lock` is not read either.
+        write(&dir.path().join("deno.lock"), DENO_V5);
+        assert_eq!(ask(r#"{"lock": false}"#), vec![]);
+        assert_eq!(ask(r#"{}"#), chalk);
+        // An unreadable configured lock is named, not the default.
+        write(&dir.path().join("locks/deps.lock"), "{\"version\": \"5\",");
+        write(
+            &dir.path().join("deno.json"),
+            r#"{"lock": "locks/deps.lock"}"#,
+        );
+        let health = ask_health(&specifiers(&["npm:chalk@5.3.0"]), &install_at(dir.path()));
+        assert_eq!(
+            health.unreadable_lockfiles,
+            BTreeSet::from([dir.path().join("locks/deps.lock")])
+        );
     }
 
     #[test]
