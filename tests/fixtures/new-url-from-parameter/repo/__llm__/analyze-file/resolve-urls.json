@@ -40,6 +40,19 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/things/list",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL(\"things/list\", apiBase()))",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }

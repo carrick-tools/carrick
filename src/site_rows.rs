@@ -1268,14 +1268,15 @@ pub struct SiteFold {
     /// Route sites ([`SiteRows::routes`]) where a row already stands at the
     /// line: the index holds the route, so the site is no possible call.
     pub route_kept_reader: usize,
-    /// Leads dropped because the blob already holds a row at their line
-    /// (carrick#2539): the index states that site, so it is no possible call.
+    /// Leads dropped from the possible calls because the blob already holds
+    /// a row at their line (carrick#2539): that row states the site. Each is
+    /// saved in `unread` unless a row the code decided stands there.
     pub lead_on_row_line: usize,
-    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at,
-    /// and the unanswered leads of `lead_on_row_line` no row the code
-    /// decided stands beside (carrick#4123).
+    /// The unread sites ([`SiteRows::unread`]) at a line no row the code
+    /// decided stands at, and the leads of `lead_on_row_line` no row the
+    /// code decided stands beside (carrick#4123, carrick#4151).
     pub unread: Vec<crate::unread_sites::UnreadSite>,
-    /// The unread sites dropped because the blob already holds a row at
+    /// The unread sites dropped because a row the code decided stands at
     /// their line: the index states that call.
     pub unread_on_row_line: usize,
     /// Reader rows at a call above a decided site folded onto the row the
@@ -1477,14 +1478,14 @@ pub fn fold_rows(
     // round: a publish is a call row and a subscriber an endpoint row, so a
     // pub/sub producer lead matches a call row (carrick#3439 T1).
     //
-    // An unanswered question there still left a slot open, unless a row the
-    // code decided (a fact no old-path pass wrote) stands on the line: the
-    // model's row, or an old-path pass's, states that slot as an answer, not
-    // as something the code read. That site is saved as unread with its
-    // reason, and stays out of the possible calls (carrick#4123).
+    // A stop there, of any reason, still left a slot open unless a row the
+    // code decided ([`code_decided`]) stands on the line: the model's row, or
+    // an old-path pass's, states that slot as an answer, not as something the
+    // code read. That site is saved as unread with its reason, and stays out
+    // of the possible calls (carrick#4123, carrick#4151).
     let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32, code_only: bool| {
         rows.iter().any(|existing| {
-            (!code_only || (is_fact(existing) && !is_old_path(existing)))
+            (!code_only || code_decided(existing))
                 && place(root, existing).is_some_and(|(f, l)| f == file && l == line)
         })
     };
@@ -1501,7 +1502,7 @@ pub fn fold_rows(
         };
         if held(false) {
             out.lead_on_row_line += 1;
-            if lead.unread.reason == Stop::Unanswered && !held(true) {
+            if !held(true) {
                 out.unread
                     .push(crate::unread_sites::UnreadSite::unread_lead(lead));
             }
@@ -1798,12 +1799,15 @@ pub fn fold_rows(
         out.stated_at_fact_callers
             .push((held.file.clone(), held.span_start));
     }
-    // An unread site at a line a row stands at once the fold is done, of
-    // either side, is that row's call (a class-only GraphQL call is its
-    // document's row).
+    // An unread site at a line a row the code decided stands at once the
+    // fold is done, of either side, is that row's call (a class-only GraphQL
+    // call is its document's row). Beside only the model's or an old-path
+    // row it is kept (carrick#4151).
     let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
-        rows.iter()
-            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+        rows.iter().any(|existing| {
+            code_decided(existing)
+                && place(root, existing).is_some_and(|(f, l)| f == file && l == line)
+        })
     };
     for unread in &site.unread {
         if held_at(calls, &unread.file, unread.line)
@@ -1822,6 +1826,18 @@ pub fn fold_rows(
 fn is_fact(row: &ApiEndpointDetails) -> bool {
     row.resolution_source
         .is_some_and(|source| source != ResolutionSource::Model)
+}
+
+/// A row the code decided: its source is no candidate (the model's, an
+/// inline literal's, a request descriptor's: [`ResolutionSource::is_candidate`])
+/// and no old-path pass wrote it. It states every slot a stop on its line
+/// asks about, so that stop is that row's site. A row with no source is not
+/// decided. Socket-pass and event-bus rows count as decided: both state a
+/// whole row from a literal name only. The one test for both drops in
+/// [`fold_rows`] (carrick#4151, carrick#4153).
+fn code_decided(row: &ApiEndpointDetails) -> bool {
+    row.resolution_source
+        .is_some_and(|source| !source.is_candidate() && !is_old_path_source(source))
 }
 
 /// A row the file reader stated, which no site answer has touched.
