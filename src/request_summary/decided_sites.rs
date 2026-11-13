@@ -55,10 +55,13 @@ use swc_common::{SourceMap, Span, Spanned, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use super::resolve::{Hop, PartValue, PiecedText, Resolver, SpanAt, TextPart, TextValue};
+use super::resolve::{
+    Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt, TextPart, TextValue,
+};
 use super::row_calls::Reach;
 use super::stop::Stop;
 use super::{CallIr, FnIr, KeyState, Piece, RequestSummaryInputs, Value, concat, render_target};
+use crate::position_rows::Kind;
 
 pub mod boundaries;
 mod composed;
@@ -2740,7 +2743,60 @@ impl<'a> Walk<'a, '_> {
 
     /// A call on an export the store labels with no op: a lead of its own
     /// reason, at the labelled call.
+    /// Whether the runner call `placed` is handed the function `slot` names:
+    /// an object written at the call, else the key of the object the
+    /// argument holds, read by the resolver as a callee's key is
+    /// ([`Resolver::key_values`], carrick#3481): a const, or an in-repo
+    /// factory's returned object.
+    fn supplied(&self, placed: &Placed<'a>, slot: &ArgSlot) -> Supplied {
+        match supplies(placed.call, slot) {
+            Some(true) => return Supplied::Yes,
+            Some(false) => return Supplied::No,
+            None => {}
+        }
+        let (Some(key), true) = (&slot.key, placed.call.bound.is_empty()) else {
+            return Supplied::Unread;
+        };
+        let Some(values) = placed.call.arg_values.get(slot.arg) else {
+            return Supplied::Unread;
+        };
+        let invoke = Invoke {
+            file: placed.file,
+            call: placed.call,
+            construction: false,
+            bound: 0,
+        };
+        let (mut present, mut unread) = (false, false);
+        for value in values {
+            let Some(keyed) = value.at(std::slice::from_ref(key)) else {
+                continue;
+            };
+            for keyed in &keyed {
+                for held in self
+                    .resolver
+                    .read_value(&mut Holds, placed.file, keyed, invoke, false)
+                {
+                    match held {
+                        Held::Stop(Stop::ValueNeverBound) => {}
+                        Held::Stop(_) | Held::Param(..) => unread = true,
+                        Held::Callback | Held::Reached(()) => present = true,
+                    }
+                }
+            }
+        }
+        match (present, unread) {
+            (true, _) => Supplied::Yes,
+            (false, true) => Supplied::Unread,
+            (false, false) => Supplied::No,
+        }
+    }
+
     fn no_op_claim(&mut self, end: &LabelledEnd) {
+        self.end_lead(end, Stop::NoOpClaim);
+    }
+
+    /// A lead at the labelled call `end` itself, for the reason `why`.
+    fn end_lead(&mut self, end: &LabelledEnd, why: Stop) {
         let lead = DecidedLead {
             file: end.file.clone(),
             line: end.line,
@@ -2748,7 +2804,7 @@ impl<'a> Walk<'a, '_> {
             span_end: end.span_end,
             depth: 0,
             end: end.clone(),
-            reason: Stop::NoOpClaim,
+            reason: why,
         };
         if !self.out.leads.contains(&lead) {
             self.out.leads.push(lead);
@@ -3311,17 +3367,52 @@ fn literal_name(pieces: &[Piece]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Whether the labelled call `placed` supplies the slot `slot`: the argument
-/// is written, and, for an option key, an object written at the call holds
-/// the key. A spread before it, or a value the scan cannot read, supplies
-/// nothing it can state.
-fn supplies(call: &CallIr, slot: &ArgSlot) -> bool {
+/// Whether a labelled runner call is handed the function its slot names
+/// (carrick#3481).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Supplied {
+    /// The argument holds the slot's function.
+    Yes,
+    /// The argument is written, or the object it holds is read, and holds no
+    /// such key.
+    No,
+    /// The argument is a value the scan cannot read the key of.
+    Unread,
+}
+
+/// Whether the labelled call `placed` supplies the slot `slot` in the
+/// argument as written: the argument is written, and, for an option key, an
+/// object written at the call holds the key. `None` where the argument is
+/// no object literal written there: a value read through the resolver
+/// ([`Walk::supplied`]).
+fn supplies(call: &CallIr, slot: &ArgSlot) -> Option<bool> {
     match (argument(call, slot.arg), &slot.key) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(Value::Obj(object)), Some(key)) => object.fields.contains_key(key),
-        (Some(_), Some(_)) => false,
+        (None, _) => Some(false),
+        (Some(_), None) => Some(true),
+        (Some(Value::Obj(object)), Some(key)) => match object.key(key) {
+            KeyState::Known(_) | KeyState::Function => Some(true),
+            KeyState::Absent => Some(false),
+            // A spread or a computed key may set it.
+            KeyState::Unread => None,
+        },
+        (Some(_), Some(_)) => None,
     }
+}
+
+/// Reads a value as far as whether it holds anything: the resolver's own
+/// follower for a question that names no end.
+struct Holds;
+
+impl<'a> Follow<'a> for Holds {
+    type Reached = ();
+
+    fn export(&mut self, _: &'a Path, _: u32, _: u32, _: Kind, _: Invoke<'a>) -> Option<()> {
+        None
+    }
+
+    fn definition(&mut self, _: PathBuf, _: String, _: Invoke<'a>) {}
+
+    fn written(&mut self, _: &'a Path, _: &'a FnIr, _: Invoke<'a>, _: Option<Maker<'a>>) {}
 }
 
 /// Each call below the first in `down`: its `file:line` and its callee as
@@ -3559,8 +3650,12 @@ fn decide(
             // own site. A call that does not supply it stays a lead.
             if let Some(slot) = SiteLabel::runner(labels, end) {
                 match calls.at_span(&root.join(&end.file), end.span_start, end.span_end) {
-                    Some(placed) if supplies(placed.call, slot) => walk.out.ran.push(end.at()),
-                    _ => walk.no_op_claim(end),
+                    Some(placed) => match walk.supplied(&placed, slot) {
+                        Supplied::Yes => walk.out.ran.push(end.at()),
+                        Supplied::No => walk.no_op_claim(end),
+                        Supplied::Unread => walk.end_lead(end, Stop::UnreadExpression),
+                    },
+                    None => walk.no_op_claim(end),
                 }
                 continue;
             }
@@ -5196,8 +5291,9 @@ pub(crate) mod tests {
                 &cached("useCached({ key: [\"x\"], load: () => fetch(\"/api/x\") })"),
                 "useCached",
             ),
-            bottom(&cached("useCached(options)"), "useCached"),
-            bottom(&cached("useCached({ ...options })"), "useCached"),
+            bottom(&cached("useCached(bare)"), "useCached"),
+            bottom(&cached("useCached(given)"), "useCached"),
+            bottom(&cached("useCached({ ...extra })"), "useCached"),
             fetch,
         ];
         let mut all = labels.clone();
@@ -5210,8 +5306,12 @@ pub(crate) mod tests {
                 .map(|lead| (lead.line, lead.reason))
                 .collect::<Vec<_>>(),
             vec![
-                (line_of(&text, "useCached(options)"), Stop::NoOpClaim),
-                (line_of(&text, "useCached({ ...options })"), Stop::NoOpClaim),
+                (line_of(&text, "useCached(bare)"), Stop::NoOpClaim),
+                (line_of(&text, "useCached(given)"), Stop::UnreadExpression),
+                (
+                    line_of(&text, "useCached({ ...extra })"),
+                    Stop::UnreadExpression
+                ),
             ]
         );
         assert_eq!(
@@ -5316,7 +5416,10 @@ pub(crate) mod tests {
                 .map(|lead| (lead.line, lead.reason))
                 .collect::<Vec<_>>(),
             vec![
-                (line_of(&text, "client.prefetch(options)"), Stop::NoOpClaim),
+                (
+                    line_of(&text, "client.prefetch(options)"),
+                    Stop::UnreadExpression
+                ),
                 (line_of(&text, "client.mutate(vars)"), Stop::NoOpClaim),
             ]
         );
@@ -5375,6 +5478,56 @@ pub(crate) mod tests {
                 (line_of(&text, "fetch(u)"), Stop::RunsByLibrary),
                 (line_of(&text, "fetch(ctx.url)"), Stop::RunsByLibrary),
                 (line_of(&text, "fetch(w)"), Stop::CallbackParameter),
+            ]
+        );
+    }
+
+    /// carrick#3481: a runner handed its function through a value is read as
+    /// one handed it inline: a const object, or an in-repo factory's returned
+    /// object (in this file or an imported one), that holds the slot's key. A value without the key is a
+    /// `no_op_claim` lead, and a value the scan cannot read (a parameter, a
+    /// spread) an `unread_expression` lead.
+    #[test]
+    fn a_runner_handed_its_function_through_a_value_is_not_a_lead() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let text = std::fs::read_to_string(root.join(STATED)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "useCached", "role": "http_client", "label": "request_runner",
+                  "claims": [{ "kind": "make", "form": "call", "member": null,
+                               "runs": { "arg": 0, "key": "load" } }] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        let cached =
+            |call: &str| stated_end(&text, "cache-kit", "useCached", None, "http_client", call);
+        let sites = [
+            bottom(&cached("useCached(options)"), "useCached"),
+            bottom(&cached("useCached(loadOptions(id))"), "useCached"),
+            bottom(&cached("useCached(buildOptions(\"x\"))"), "useCached"),
+            bottom(&cached("useCached(bare)"), "useCached"),
+            bottom(&cached("useCached(given)"), "useCached"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert_eq!(
+            decided.ran,
+            vec![
+                format!("{STATED}:{}", line_of(&text, "useCached(options)")),
+                format!("{STATED}:{}", line_of(&text, "useCached(loadOptions(id))")),
+                format!("{STATED}:{}", line_of(&text, "useCached(buildOptions(")),
+            ]
+        );
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (line_of(&text, "useCached(bare)"), Stop::NoOpClaim),
+                (line_of(&text, "useCached(given)"), Stop::UnreadExpression),
             ]
         );
     }
