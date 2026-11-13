@@ -7,5 +7,5 @@ function it calls. The store labels nothing.
 
 | File:line | Call | Wanted |
 |---|---|---|
-| `local.ts:8` | `log.warn('x')`, `log` a parameter of `inner`, called by `gate`, which is handed as `{ g: gate }` and run only as `deps.g(args)` in the same module | a saved site whose reason is never `value_never_bound`: the call that runs `gate` writes `log` |
+| `local.ts:8` | `log.warn('x')`, `log` a parameter of `inner`, called by `gate`, which is handed as `{ g: gate }` and run only as `deps.g(args)` in the same module | a saved site whose reason is never `value_never_bound`: the call that runs `gate` writes `log`. The site is kept among the sites, stopped as `callback_into_own_function`: `gate` is handed to a function of this code, and the call that runs it is not read |
 | `gates.ts:7` | `log.warn('checked')`, `log` a parameter of `check`, called by `runGate`, which `wiring.ts` imports, hands as `{ gate: runGate }` and runs only as `deps.gate(args)` | the same as `local.ts:8` |

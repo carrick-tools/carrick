@@ -1142,13 +1142,14 @@ fn callers_above(
     out
 }
 
-/// The span of each name `values` hand on as a value: a value itself, or a
-/// value of an object literal's key, at any depth (`{ g: gate }`). A
-/// member read (`deps.g`) is no name.
-fn named_values<'v>(values: impl Iterator<Item = &'v super::resolve::ValueAt>) -> Vec<(u32, u32)> {
+/// The span of each name a call's arguments (what each may hold, by
+/// position) hand on as a value: an argument itself, or a value of an
+/// object literal's key, at any depth (`{ g: gate }`). A member read
+/// (`deps.g`) is no name.
+fn named_values(args: &[Vec<super::resolve::ValueAt>]) -> Vec<(u32, u32)> {
     use super::resolve::ValueAt;
     let mut spans = Vec::new();
-    let mut stack: Vec<&ValueAt> = values.collect();
+    let mut stack: Vec<&ValueAt> = args.iter().flatten().collect();
     while let Some(value) = stack.pop() {
         match value {
             ValueAt::Read {
@@ -1366,7 +1367,7 @@ impl<'a> Calls<'a> {
                 }
                 if !is_optional && let Some(target) = target_of(at, file, call, in_constructor) {
                     out.callers.entry(target).or_default().push(placed);
-                    for (lo, hi) in named_values(call.arg_values.iter().flatten()) {
+                    for (lo, hi) in named_values(&call.arg_values) {
                         if let Reach::Function(handed, key) =
                             at.source.row_names(file, lo, hi, Kind::Ident)
                         {

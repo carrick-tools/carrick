@@ -3460,9 +3460,14 @@ impl<'a> Walker<'a> {
             // Nothing held, and a function on the way is handed on as a
             // value to a function of the service: the call that runs it is
             // not read, and may bind the callee (carrick#4025). Nothing binds
-            // it is no answer.
+            // it is no answer. The callee's values decide it, so it is kept
+            // among the sites, as `value_never_bound` was.
             if values.is_empty() && handed {
-                outcome.absorb(Outcome::stopped(Stop::CallbackIntoOwnFunction).below(&open.chain));
+                let stopped = Outcome {
+                    valued: true,
+                    ..Outcome::stopped(Stop::CallbackIntoOwnFunction)
+                };
+                outcome.absorb(stopped.below(&open.chain));
                 continue;
             }
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
@@ -4420,6 +4425,19 @@ mod tests {
                 !stops.is_empty() && !stops.contains(&Some(Stop::ValueNeverBound)),
                 "{file}:{line} is saved with a reason other than value_never_bound: \
                  {stops:?}\n{all}"
+            );
+            // Kept among the sites, as `value_never_bound` was, with the
+            // handoff as its reason.
+            let kept: Vec<Option<Stop>> = discovery
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file) && site.line == line)
+                .map(|site| site.stop)
+                .collect();
+            assert_eq!(
+                kept,
+                vec![Some(Stop::CallbackIntoOwnFunction)],
+                "{file}:{line} is a site stopped as callback_into_own_function\n{all}"
             );
         }
     }
