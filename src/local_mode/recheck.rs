@@ -2019,32 +2019,43 @@ mod tests {
     /// (`resolve`) or no record at all is.
     #[test]
     fn a_re_scan_is_engine_ready_unless_it_records_spawn_or_init() {
-        fn index(boundary: serde_json::Value) -> super::super::read_model::LocalIndex {
-            serde_json::from_value(serde_json::json!({
-                "version": 1, "scanner_version": "0", "indexed_at": "", "repos": [{
-                    "path": "/w/web", "name": "web",
-                    "services": [{
-                        "name": "web", "commit": "", "indexed_at": "", "boundary": boundary,
-                        "routes": 0, "calls": 0
-                    }],
-                    "files": {}
-                }]
-            }))
-            .expect("an index")
+        fn index(
+            boundary: Option<crate::boundary::ServiceBoundary>,
+        ) -> super::super::read_model::LocalIndex {
+            let mut index: super::super::read_model::LocalIndex =
+                serde_json::from_value(serde_json::json!({
+                    "version": 1, "scanner_version": "0", "indexed_at": "", "repos": [{
+                        "path": "/w/web", "name": "web",
+                        "services": [{
+                            "name": "web", "commit": "", "indexed_at": "", "boundary": null,
+                            "routes": 0, "calls": 0
+                        }],
+                        "files": {}
+                    }]
+                }))
+                .expect("an index");
+            index.repos[0].services[0].boundary = boundary;
+            index
         }
         let degraded = |stage: &str| {
-            index(serde_json::json!({ "types_degraded": { "stage": stage, "detail": "x" } }))
+            index(Some(crate::boundary::ServiceBoundary {
+                types_degraded: Some(crate::cloud_storage::TypeDegradation {
+                    stage: stage.to_string(),
+                    detail: "x".to_string(),
+                }),
+                ..Default::default()
+            }))
         };
         let read = vec!["web".to_string()];
         assert!(!engine_ready_of(&degraded("spawn"), "web", &read));
         assert!(!engine_ready_of(&degraded("init"), "web", &read));
         assert!(engine_ready_of(&degraded("resolve"), "web", &read));
+        assert!(engine_ready_of(&index(None), "web", &read));
         assert!(engine_ready_of(
-            &index(serde_json::json!(null)),
+            &index(Some(Default::default())),
             "web",
             &read
         ));
-        assert!(engine_ready_of(&index(serde_json::json!({})), "web", &read));
         assert!(
             engine_ready_of(&degraded("spawn"), "another-repo", &read),
             "another repo's record says nothing about this re-scan"
