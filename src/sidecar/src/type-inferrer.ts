@@ -3475,13 +3475,15 @@ export class TypeInferrer {
           `Call result at ${where} holds transport machinery as a member and no member of ` +
             'it is decided as the body; this site states no response contract'
         );
-        return this.transportAbstain(
-          request,
-          callExpr,
-          "this call's result is an object that holds the transport response as one of its " +
+        return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+          path: '',
+          kind: 'unknown',
+          reason: 'body_member_undecided',
+          detail:
+            "this call's result is an object that holds the transport response as one of its " +
             "members, and the called function's code does not decide which member holds the " +
-            'parsed body, so this site states no response contract'
-        );
+            'parsed body, so this site states no response contract',
+        });
       }
     }
 

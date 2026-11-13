@@ -2598,6 +2598,17 @@ pub struct TypeResolutionResult {
     pub hand_back_bodies: std::collections::BTreeSet<String>,
 }
 
+/// A bare `unknown` whose root finding is `body_member_undecided`: the engine
+/// decided the called function does not say which member holds the body, so
+/// the row is kept and reads unverifiable like a model-owned one.
+fn undecided_body_member(answer: &InferredType) -> bool {
+    answer.type_string.trim() == "unknown"
+        && answer
+            .any_provenance
+            .iter()
+            .any(|finding| finding.path.is_empty() && finding.reason == "body_member_undecided")
+}
+
 /// carrick#4196: which of `asks`, each a caller row's own call that the
 /// request summaries own and whose response no request line reads, the
 /// compiler engine answered by naming the body member it read: a wrapper
@@ -2612,7 +2623,10 @@ pub fn hand_back_bodies(
     let asked: HashSet<&str> = asks.iter().filter_map(|ask| ask.alias.as_deref()).collect();
     answers
         .iter()
-        .filter(|answer| answer.body_member.is_some() && asked.contains(answer.alias.as_str()))
+        .filter(|answer| {
+            asked.contains(answer.alias.as_str())
+                && (answer.body_member.is_some() || undecided_body_member(answer))
+        })
         .map(|answer| answer.alias.clone())
         .collect()
 }
