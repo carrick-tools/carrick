@@ -1746,7 +1746,7 @@ pub fn fold_rows(
             stated_at_module.push((*index, held));
         }
     }
-    stated_at_module.sort_by(|a, b| b.0.cmp(&a.0));
+    stated_at_module.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
     stated_at_module.dedup_by_key(|(index, _)| *index);
     for (index, held) in stated_at_module {
         let gone = calls.remove(index);
