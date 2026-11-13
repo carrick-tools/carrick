@@ -187,6 +187,18 @@ impl SiteRow {
         self.inference.is_none()
     }
 
+    /// Whether this is a fact's HTTP request that reaches the labelled call
+    /// through a function: [`fold`] mirrors it as a `wrapper_call` with the
+    /// caller's key and no request linked, and the call-through pass links
+    /// it (carrick#4078).
+    pub fn is_fact_through_call(&self) -> bool {
+        self.fact()
+            && self.through
+            && self.side == RowSide::Call
+            && self.procedure.is_none()
+            && matches!(self.key, OperationKey::Http { .. })
+    }
+
     /// Whether [`fold_rows`] states this row wherever no fact holds its
     /// line: a fact or an answer in the band, on no label-only slot (a row
     /// that needs a reader stands only beside one that agrees).
