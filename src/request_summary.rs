@@ -10915,6 +10915,9 @@ fn declared_client(
     Declared::Unfollowable
 }
 
+/// Each file's calls by span, and what each reaches.
+type ReachedByFile = HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>;
+
 /// The function a call reaches by the compiler's rows, and the requests that
 /// function sends (carrick#4120). Paths are as walked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10936,7 +10939,7 @@ pub struct RequestSummaryIndex {
     /// compiler's rows, keyed by the call's span. Read by the imported-member
     /// join, which drops a member the compiler says the call does not reach
     /// (carrick#4120).
-    reached: Box<HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>>,
+    reached: Box<ReachedByFile>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
     /// The callers among them whose request is closed and does not render
