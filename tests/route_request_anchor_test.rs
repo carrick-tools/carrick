@@ -421,3 +421,47 @@ fn test_live_text_locator_on_body_read_resolves_declared_request_body() {
     };
     assert_is_declared_request_body(&type_string);
 }
+
+/// carrick#4204: with no payload expression, the request body falls back to
+/// the registration call's span, and the request is marked as asked there,
+/// so an unanswered read takes the placeholder rather than the call's type.
+#[test]
+fn a_request_body_asked_at_the_registration_span_is_marked() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo = temp.path();
+    write_fixture_repo(repo);
+    let routes_file = repo
+        .join("src/widgets.routes.ts")
+        .to_string_lossy()
+        .to_string();
+    let mut file_results = analyzer_result(&routes_file, "request", HANDLER_LINE);
+    for result in file_results.values_mut() {
+        for endpoint in &mut result.endpoints {
+            endpoint.payload_expression_text = None;
+            endpoint.payload_expression_line = None;
+        }
+    }
+    let orchestrator = FileOrchestrator::new(AgentService::new());
+    let mount_graph = orchestrator.build_mount_graph(
+        &file_results,
+        &UrlNormalizer::default_permissive(),
+        Path::new(""),
+        Path::new(""),
+    );
+    let (_explicit, infer, _inline) = orchestrator.collect_type_requests(
+        &file_results,
+        &repo.to_string_lossy(),
+        &mount_graph,
+        &Config::default(),
+        &carrick::workspace_resolver::WorkspaceIndex::build_with_aliases(repo, None),
+    );
+    let request = infer
+        .iter()
+        .find(|item| item.infer_kind == InferKind::RequestBody)
+        .expect("a POST endpoint must request request-body inference");
+    assert!(
+        request.span_start.is_some() && request.expression_text.is_none(),
+        "{request:?}"
+    );
+    assert!(request.at_registration, "{request:?}");
+}

@@ -251,7 +251,7 @@ pub struct InferRequestItem {
     /// `site_unreadable`. Never sent to the sidecar.
     #[serde(skip)]
     pub result_unanswered: bool,
-    /// carrick#4204: the request is asked at a route's registration call
+    /// carrick#4204: a route's request body asked at its registration call
     /// itself, so its span is the call and names no payload. The sidecar
     /// follows the handler from there; where it gives no answer, the capture
     /// must not re-read the span (it would publish the call's own type), and

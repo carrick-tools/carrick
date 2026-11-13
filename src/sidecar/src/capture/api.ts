@@ -267,7 +267,8 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    receives and no contract is published (carrick#3004).
  *  - `not_located`: the scan found no value in the code for this payload, so
  *    no type was read for it: no request located one, or the only locator was
- *    a line (carrick#3995).
+ *    a line (carrick#3995) or a route's registration call that the handler
+ *    gave no body read for (carrick#4079, carrick#4204).
  *  - `site_unreadable`: the scan located the site, but the compiler could not
  *    read a type at it (carrick#3995).
  *  - `unplaced_top_type`: the printed shape holds a top type at a member no

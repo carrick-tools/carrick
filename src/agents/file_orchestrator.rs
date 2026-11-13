@@ -5814,7 +5814,7 @@ impl FileOrchestrator {
                             InferLocator::Span {
                                 span_start: endpoint.call_expression_span_start,
                                 span_end: endpoint.call_expression_span_end,
-                                at_registration: true,
+                                at_registration: false,
                             },
                         );
                         if !response_inferred
