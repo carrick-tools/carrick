@@ -4052,6 +4052,28 @@ export function fixed(href: string): boolean {
         );
     }
 
+    /// carrick#4124: a relative literal on a literal base names the URL the
+    /// two resolve to by the URL standard, the base's last segment replaced.
+    #[test]
+    fn a_relative_url_literal_on_a_literal_base_states_the_resolved_url() {
+        let chains = chains_in(&[(
+            "src/base.ts",
+            r#"export function under(): boolean {
+  const pathname = new URL("things", "https://api.example.test/v2/list").pathname;
+  return pathname === "/v2/things";
+}
+"#,
+        )]);
+        assert_eq!(
+            end_of(&chains, "/v2/things"),
+            &serde_json::json!({
+                "kind": "literal",
+                "text": "https://api.example.test/v2/things",
+                "steps": ["URL", "pathname"]
+            })
+        );
+    }
+
     /// A function handed on by name inside an object argument is followed
     /// to the call, as one written there is, with the keys down to it.
     #[test]
