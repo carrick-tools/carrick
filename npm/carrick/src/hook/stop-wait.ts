@@ -37,7 +37,7 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { lateContext } from "./late.ts";
+import { changedLine } from "./late.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
@@ -72,8 +72,6 @@ function readsNothing(result: CheckResult): boolean {
 
 /** Whether an answer needs the reader to act, or only reports a clean file. */
 function actionable(answer: Answer): boolean {
-  // The whole-change check speaks at Stop only with a problem.
-  if (isChanged(answer)) return answer.changed?.exit === 1;
   const result = answer.result;
   if (answer.state !== "answered" || result === undefined) return true;
   if (result !== undefined && readsNothing(result)) return false;
@@ -92,7 +90,6 @@ function hasFindings(answer: Answer): boolean {
 
 /** One answer's lines, for a reader who was not told this edit was being re-checked. */
 function render(answer: Answer): string {
-  if (isChanged(answer)) return answer.changed?.exit === 1 ? (lateContext(answer, false) ?? "") : "";
   const where = answer.relative;
   const result: CheckResult | undefined = answer.result;
   if (answer.state !== "answered" || result === undefined || result.error) {
@@ -285,7 +282,14 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   }
 
   const lines: string[] = [...stated.values()];
-  const rest = delivered.filter((answer) => !folded.has(answer.seq));
+  // A whole-change check speaks through the one reader the carriers use: a
+  // problem, or the clean line for a set Stop named, once per set.
+  for (const answer of delivered) {
+    if (!isChanged(answer)) continue;
+    const text = changedLine(session, answer, home);
+    if (text) lines.push(text);
+  }
+  const rest = delivered.filter((answer) => !isChanged(answer) && !folded.has(answer.seq));
   if (rest.some(actionable)) {
     for (const answer of rest) {
       const text = render(answer);

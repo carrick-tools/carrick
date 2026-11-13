@@ -37,14 +37,23 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
  * finding or a named clean result, once per set). Null for any other answer,
  * and for a set already said this session.
  */
-function cleanNamedLine(session: string, answer: Answer): string | null {
+function cleanNamedLine(session: string, answer: Answer, home?: string): string | null {
   if (!isChanged(answer) || answer.changed?.exit !== 0) return null;
   const files = [...new Set(answer.named ?? [])].sort();
   if (files.length === 0) return null;
   const key = `clean:${files.join("\n")}`;
-  if (wasSaid(session, answer.root, key)) return null;
-  markSaid(session, answer.root, key);
+  if (wasSaid(session, answer.root, key, home)) return null;
+  markSaid(session, answer.root, key, home);
   return changedCleanLine(files);
+}
+
+/**
+ * The one reader of a finished `check --changed` answer, for every hook that
+ * speaks it (the carriers and Stop): a problem, or the clean line for the set a
+ * Stop named, once per set. Null when there is nothing to say.
+ */
+export function changedLine(session: string, answer: Answer, home?: string): string | null {
+  return lateContext(answer, false) ?? cleanNamedLine(session, answer, home);
 }
 
 /**
@@ -60,7 +69,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       const key = answer.result ? toldKey(answer.result, answer.relative) : null;
       const uses = key === null || !wasTold(session, key);
-      const context = lateContext(answer, uses) ?? cleanNamedLine(session, answer);
+      const context = isChanged(answer) ? changedLine(session, answer) : lateContext(answer, uses);
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
       // A lead the probe already delivered is in `led`; this one is for a file
