@@ -11,7 +11,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { carrickHooks } from "../src/init/settings.ts";
+import { carrickHooks, flattenHooks } from "../src/init/settings.ts";
 import { PLATFORMS, platformPackage } from "../src/native.ts";
 import { manifest } from "../../platform/build.mjs";
 
@@ -150,22 +150,9 @@ test("the host manifests name this CLI's commands, and travel with the package",
   // manifests are copied in at prepack; the repo's copy is the source.
   assert.ok((pkg["files"] as string[]).includes("plugin"));
   const hooks = readJson(path.join(repoRoot, "plugin", "hooks", "hooks.json"));
-  const commands = Object.values(hooks["hooks"]).flatMap((groups: any) =>
-    groups.flatMap((group: any) => group.hooks.map((entry: any) => entry.command)),
-  );
-  assert.deepEqual(commands.sort(), [
-    "carrick hook post-edit",
-    "carrick hook post-read",
-    "carrick hook session-start",
-    "carrick hook stop",
-    "carrick hook subagent-stop",
-    "carrick hook user-prompt",
-  ]);
-  // The plugin's Stop and prompt entries are the ones `carrick init` writes.
-  assert.deepEqual(hooks["hooks"]["Stop"], carrickHooks()["Stop"]);
-  assert.deepEqual(hooks["hooks"]["UserPromptSubmit"], carrickHooks()["UserPromptSubmit"]);
-  assert.deepEqual(hooks["hooks"]["SubagentStop"], carrickHooks()["SubagentStop"]);
-  const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
+  // One list: the plugin registers exactly what `carrick init` writes, event,
+  // matcher, command and timeout (carrick#4084).
+  assert.deepEqual(flattenHooks(hooks["hooks"]), flattenHooks(carrickHooks()));  const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);
 });
