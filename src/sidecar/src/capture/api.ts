@@ -273,6 +273,12 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    name) that builds a new value from it, and nothing in the chain states
  *    the body, so the value the chain ends in is not the response the call
  *    receives and no contract is published (carrick#3004).
+ *  - `bound_by_callers`: the type here is still an open type parameter of a
+ *    generic function, which only that function's callers set, so the site
+ *    states no type of its own.
+ *  - `body_member_undecided`: the call's result is an object that holds the
+ *    transport response beside other members, and the called function's code
+ *    does not settle which member holds the parsed body.
  *  - `not_located`: the scan found no value in the code for this payload, so
  *    no type was read for it: no request located one, or the only locator was
  *    a line (carrick#3995).
@@ -297,6 +303,8 @@ export type TypeProvenanceReason =
   | 'body_built_by_callee'
   | 'reshaped_by_callback'
   | 'result_member_missing'
+  | 'bound_by_callers'
+  | 'body_member_undecided'
   | 'not_located'
   | 'site_unreadable'
   | 'unplaced_top_type'

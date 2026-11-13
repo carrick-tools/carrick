@@ -564,7 +564,7 @@ pub struct TypeProvenance {
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
     /// `serialised_body_unread`, `body_built_by_callee`, `result_member_missing`,
-    /// `reshaped_by_callback`, `not_located`, `site_unreadable`,
+    /// `reshaped_by_callback`, `bound_by_callers`, `body_member_undecided`, `not_located`, `site_unreadable`,
     /// `unplaced_top_type`, `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.

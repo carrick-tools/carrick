@@ -278,6 +278,7 @@ const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
   'serialised_body_unread',
   'body_built_by_callee',
   'reshaped_by_callback',
+  'body_member_undecided',
 ]);
 
 /** One response branch's payload, before branches are joined. */

@@ -441,7 +441,11 @@ fn path_names_a_member(path: &str) -> bool {
 /// part, so the site states no contract (carrick#2818). `reshaped_by_callback`:
 /// a call's untyped result is handed unread to a callback in its chain that
 /// builds a new value from it, and nothing states the body, so the value the
-/// chain ends in is not the response (carrick#3004).
+/// chain ends in is not the response (carrick#3004). `bound_by_callers`: the
+/// type at the site is an open type parameter of a generic function that only
+/// its callers set. `body_member_undecided`: a call's result holds the
+/// transport response beside other members and the called function's code does
+/// not settle which member holds the body.
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "no_success_payload",
     "no_request_body",
@@ -450,6 +454,8 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
     "body_built_by_callee",
     "result_member_missing",
     "reshaped_by_callback",
+    "bound_by_callers",
+    "body_member_undecided",
 ];
 
 /// True when an inference answered a bare top type because the inferrer read
@@ -7973,6 +7979,32 @@ mod tests {
             inference_decided_no_contract(&decided),
             "a body a chain callback reshapes is a decided abstain"
         );
+    }
+
+    /// The vocabulary words `bound_by_callers` and `body_member_undecided`
+    /// are decided on a bare top type at a call result and a response body,
+    /// and never beside a printed shape.
+    #[test]
+    fn the_caller_bound_and_undecided_member_words_are_decided_abstains() {
+        for reason in ["bound_by_callers", "body_member_undecided"] {
+            for kind in [InferKind::CallResult, InferKind::ResponseBody] {
+                let finding = || crate::services::type_sidecar::TypeProvenance {
+                    path: String::new(),
+                    kind: "unknown".to_string(),
+                    reason: reason.to_string(),
+                    detail: None,
+                };
+                let mut decided = inferred("Endpoint_x_Response", "unknown", None, None);
+                decided.infer_kind = kind.clone();
+                decided.any_provenance = vec![finding()];
+                assert!(inference_decided_no_contract(&decided), "{reason} {kind:?}");
+
+                let mut shaped = inferred("Endpoint_x_Response", "{ a: string }", None, None);
+                shaped.infer_kind = kind.clone();
+                shaped.any_provenance = vec![finding()];
+                assert!(!inference_decided_no_contract(&shaped), "{reason} {kind:?}");
+            }
+        }
     }
 
     /// carrick#2628: a request locator on an argument of a call into a
