@@ -88,6 +88,14 @@ pub struct FactFiles {
     /// reader states there is not a request the call makes. The site selects
     /// its file and lists nothing.
     pub graphql_client_calls: BTreeMap<String, BTreeSet<(u32, u32)>>,
+    /// The packages each library call is made through, by file and SWC span:
+    /// the receiver trace's own answer to "which package does this call
+    /// reach", for every call through a package export or an instance one of
+    /// its makers built. The orchestrator reads it against the packages
+    /// framework detection answered with no client, so a row the reader
+    /// states at a call into one is withdrawn (a cache or state library's
+    /// calls are not requests).
+    pub library_calls: BTreeMap<String, BTreeMap<(u32, u32), BTreeSet<String>>>,
     /// Packages the first answer left without exports.
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
@@ -189,6 +197,13 @@ impl FactFiles {
             for site in &library.sites {
                 let relative = site.file.strip_prefix(root).unwrap_or(&site.file);
                 let file = relative.to_string_lossy().replace('\\', "/");
+                facts
+                    .library_calls
+                    .entry(file.clone())
+                    .or_default()
+                    .entry((site.span_start, site.span_end))
+                    .or_default()
+                    .insert(site.package().to_string());
                 if first.exports.iter().any(|claim| {
                     claim.role == LibraryRole::ServerFramework
                         && claim.specifier == site.specifier
@@ -228,6 +243,7 @@ impl FactFiles {
         self.listed.retain(|file, _| owns(file));
         self.calls.retain(|(file, _, _), _| owns(file));
         self.server_framework_starts.retain(|file, _| owns(file));
+        self.library_calls.retain(|file, _| owns(file));
         self
     }
 
@@ -293,6 +309,31 @@ impl FactFiles {
         self.graphql_client_calls
             .iter()
             .any(|(file, spans)| module.ends_with(Path::new(file)) && spans.contains(&span))
+    }
+
+    /// Whether every package the call at `span` in `module` is made through
+    /// satisfies `wanted`, and no end of it is listed for the reader (an HTTP
+    /// client or a server framework makes a real request or route there, so
+    /// the reader's row stands). `false` for a call no library site reads.
+    /// `module` is compared component-wise by its tail, as
+    /// [`Self::graphql_client_call`].
+    pub fn only_through(
+        &self,
+        module: &Path,
+        span: (u32, u32),
+        wanted: impl Fn(&str) -> bool,
+    ) -> bool {
+        let listed = self
+            .listed
+            .iter()
+            .any(|(file, spans)| module.ends_with(Path::new(file)) && spans.contains(&span));
+        !listed
+            && self.library_calls.iter().any(|(file, calls)| {
+                module.ends_with(Path::new(file))
+                    && calls
+                        .get(&span)
+                        .is_some_and(|packages| packages.iter().all(|package| wanted(package)))
+            })
     }
 
     /// What discovery recorded at the call at `span` in `file`, or `None`
