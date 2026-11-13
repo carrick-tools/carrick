@@ -498,6 +498,18 @@ impl RequestSummaryInputs {
         }
     }
 
+    /// Whether the compiler's rows, not the call graph, say what the call at
+    /// `lo..hi` in `file` reaches: the run walks the rows, the call is not one
+    /// the rows left to the graph (`kept`), and the import it goes through
+    /// resolved ([`Self::fell_back`]'s other half). `false` without rows.
+    pub(crate) fn rows_answer(&self, file: &Path, lo: u32, hi: u32) -> bool {
+        let Some(row_calls) = &self.row_calls else {
+            return false;
+        };
+        !row_calls.kept.contains(&(file.to_path_buf(), lo, hi))
+            && self.rows_say(file, lo, hi) != Reach::Unknown(HoleReason::UnresolvedImport)
+    }
+
     /// What the rows alone say the call at `lo..hi` in `file` reaches.
     fn rows_say(&self, file: &Path, lo: u32, hi: u32) -> Reach {
         let at = (file.to_path_buf(), lo, hi);
@@ -1020,6 +1032,100 @@ mod tests {
         // call graph.
         assert_eq!(with.fell_back(), 17);
         assert_eq!(with.unfollowed_count(), 0, "{:?}", with.unfollowed());
+    }
+
+    /// Per line: each call's callee file name and the requests it sends
+    /// (file name, span start).
+    type ReachedByLine = BTreeMap<u32, Vec<(String, Vec<(String, u32)>)>>;
+
+    /// What the rows say each call written in `file` reaches, by line.
+    fn reached_requests(walked: &Walked, index: &RequestSummaryIndex, file: &str) -> ReachedByLine {
+        let path = walked.path(file);
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().to_string();
+        let mut out: ReachedByLine = BTreeMap::new();
+        for (call_file, call, _) in every_call(&walked.inputs.files) {
+            if call_file != path {
+                continue;
+            }
+            let Some(reached) = index
+                .reached(&path)
+                .and_then(|calls| calls.get(&(call.site.span_start, call.site.span_end)))
+            else {
+                continue;
+            };
+            out.entry(call.site.line).or_default().push((
+                name(&reached.file),
+                reached
+                    .requests
+                    .iter()
+                    .map(|(file, start)| (name(file), *start))
+                    .collect(),
+            ));
+        }
+        out
+    }
+
+    /// carrick#4120: with the rows, a call into a repository function records
+    /// the function's file and the requests it sends, keyed by the call's own
+    /// span. The request is named in the numbering of
+    /// `RequestMember::request_start`: the call's file-local start plus
+    /// `SWC_SPAN_BASE`.
+    #[test]
+    fn a_call_the_rows_answer_records_its_callee_and_the_requests_it_sends() {
+        let Some(on) = calls(&[], true) else {
+            return;
+        };
+        let index = summarize(&on.inputs, &LibrarySemantics::default());
+        let helpers = std::fs::read_to_string(on.path("services/calls/src/helpers.ts")).unwrap();
+        let request_start =
+            helpers.find("fetch(").unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+        let reached = reached_requests(&on, &index, CALLERS);
+        assert_eq!(
+            reached.get(&29),
+            Some(&vec![(
+                "helpers.ts".to_string(),
+                vec![("helpers.ts".to_string(), request_start)]
+            )]),
+            "{reached:#?}"
+        );
+    }
+
+    /// carrick#4120: the two calls of one chain share a start and reach
+    /// different functions, so each has its own entry.
+    #[test]
+    fn the_calls_of_one_chain_record_their_own_callees() {
+        const CHAIN: &str = "src/chain.ts";
+        const SOURCE: &str = "import { Users } from \"./models\";\n\nexport class Api {\n  users(): Users {\n    return new Users();\n  }\n}\n\nexport function chained(api: Api): Promise<Response> {\n  return api.users().list();\n}\n";
+        let Some(on) = calls(&[(CHAIN, SOURCE)], true) else {
+            return;
+        };
+        let index = summarize(&on.inputs, &LibrarySemantics::default());
+        let reached = reached_requests(&on, &index, &format!("services/calls/{CHAIN}"));
+        let files: BTreeSet<String> = reached
+            .get(&10)
+            .map(|calls| calls.iter().map(|(file, _)| file.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            files,
+            BTreeSet::from(["chain.ts".to_string(), "models.ts".to_string()]),
+            "{reached:#?}"
+        );
+        assert_eq!(reached[&10].len(), 2, "{reached:#?}");
+    }
+
+    /// carrick#4120: the call graph's answer is a by-name join, so a call
+    /// read from it records nothing.
+    #[test]
+    fn a_call_read_from_the_call_graph_records_no_callee() {
+        let Some(off) = calls(&[], false) else {
+            return;
+        };
+        let index = summarize(&off.inputs, &LibrarySemantics::default());
+        assert!(index.row_count() > 0, "the call graph still states rows");
+        assert!(
+            reached_requests(&off, &index, CALLERS).is_empty(),
+            "no rows, no recorded callee"
+        );
     }
 
     const PROBE_FILE: &str = "web/src/components/Sync.ts";

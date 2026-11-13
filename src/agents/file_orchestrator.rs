@@ -606,6 +606,10 @@ pub struct FileRouteDerivation {
     pub endpoints: Vec<EndpointResult>,
 }
 
+/// The request members a file's calls joined, by call span, each with the
+/// module it was read from (carrick#4120).
+type JoinedMembers = HashMap<u32, (PathBuf, ResolvedMember)>;
+
 /// Statistics about the file-centric analysis
 #[derive(Debug, Default)]
 pub struct ProcessingStats {
@@ -656,6 +660,10 @@ pub struct ProcessingStats {
     /// fact with two provenances. A subset of `total_endpoints` +
     /// `total_data_calls`. See [`ResolutionSource`].
     pub deterministic_rows_emitted: BTreeMap<ResolutionSource, usize>,
+    /// Imported-member joins refused because the compiler says the call
+    /// reaches a function that does not send the member's request
+    /// (carrick#4120).
+    pub imported_members_refused: usize,
     /// Model rows withdrawn at call sites whose callee provably sends nothing
     /// (carrick#1555).
     pub summary_rows_withdrawn: usize,
@@ -2548,8 +2556,10 @@ impl FileOrchestrator {
             /// same-repo module, keyed by the site's call-expression start
             /// offset (carrick#588). The member states the whole request, so
             /// its method and URL are applied to the site after the LLM pass.
-            /// Empty for files that import no such module.
-            resolved_members: HashMap<u32, ResolvedMember>,
+            /// Empty for files that import no such module. Each member is
+            /// kept with the module it was read from, which the compiler's
+            /// answer for the call is read against (carrick#4120).
+            resolved_members: HashMap<u32, (PathBuf, ResolvedMember)>,
             /// Call sites in this file that named an indexed request member
             /// and did NOT resolve to it (carrick#656), as (span, member
             /// name). Aggregated per member once every file's join is in, and
@@ -2814,7 +2824,7 @@ impl FileOrchestrator {
                     pf.path_str.clone(),
                     pf.resolved_members
                         .iter()
-                        .map(|(span, resolved)| (*span, resolved.name.clone()))
+                        .map(|(span, (_, resolved))| (*span, resolved.name.clone()))
                         .collect(),
                 );
             }
@@ -3824,13 +3834,14 @@ impl FileOrchestrator {
                     // The join's outcome, and the sites it declined
                     // (carrick#656) — both come back from the walk, because
                     // the module a declined site named is only known there.
-                    (pf.resolved_members, pf.unresolved_member_sites) =
-                        Self::resolve_imported_members(
-                            joinable,
-                            rings,
-                            &import_owners,
-                            &receiver_imports,
-                        );
+                    let (name_joined, declined) = Self::resolve_imported_members(
+                        joinable,
+                        rings,
+                        &import_owners,
+                        &receiver_imports,
+                    );
+                    pf.unresolved_member_sites = declined;
+                    pf.resolved_members = name_joined;
                     // A call through an imported object constant's member
                     // (carrick#1733) names its module and its object, so it
                     // answers ahead of the name join at the same site.
@@ -4580,6 +4591,14 @@ impl FileOrchestrator {
             let file = Path::new(&pf.path_str);
             if let Some(silent) = summaries.silent(file) {
                 pf.silent_sites = silent.clone();
+            }
+            if let Some(reached) = summaries.reached(file) {
+                stats.imported_members_refused += Self::refuse_members_the_compiler_contradicts(
+                    &mut pf.resolved_members,
+                    &pf.candidate_map,
+                    reached,
+                    &pf.path_str,
+                );
             }
             pf.resolved = Self::resolve_candidates(
                 &pf.candidate_map,
@@ -7320,7 +7339,7 @@ impl FileOrchestrator {
         candidate_map: &HashMap<String, CandidateTarget>,
         surfaces: &HashMap<String, PackageSurface>,
         receiver_origins: &ReceiverOrigins,
-    ) -> HashMap<u32, ResolvedMember> {
+    ) -> HashMap<u32, (PathBuf, ResolvedMember)> {
         let mut resolved = HashMap::new();
         if surfaces.is_empty() {
             return resolved;
@@ -7342,10 +7361,13 @@ impl FileOrchestrator {
             if let Some(owned) = members.get(name) {
                 resolved.insert(
                     candidate.span_start,
-                    ResolvedMember {
-                        name: name.to_string(),
-                        member: owned.member.clone(),
-                    },
+                    (
+                        owned.module.clone(),
+                        ResolvedMember {
+                            name: name.to_string(),
+                            member: owned.member.clone(),
+                        },
+                    ),
                 );
             }
         }
@@ -8394,7 +8416,7 @@ impl FileOrchestrator {
     #[allow(clippy::too_many_arguments)]
     fn resolve_candidates(
         candidate_map: &HashMap<String, CandidateTarget>,
-        resolved_members: &HashMap<u32, ResolvedMember>,
+        resolved_members: &HashMap<u32, (PathBuf, ResolvedMember)>,
         local_wrapper_calls: &[LocalWrapperCall],
         aliases: &EnvAliasMap,
         whole_url_fallbacks: &WholeUrlFallbackMap,
@@ -8628,7 +8650,7 @@ impl FileOrchestrator {
             // A request member of an imported same-repo module
             // (carrick#588/#623/#655). Both facts are literals in the member's
             // own source.
-            if let Some(resolved) = resolved_members.get(&candidate.span_start) {
+            if let Some((_, resolved)) = resolved_members.get(&candidate.span_start) {
                 let member = &resolved.member;
                 // The call hands the member its parameters: what the body at
                 // the site is follows from what the member sends
@@ -10828,7 +10850,7 @@ impl FileOrchestrator {
         rings: Vec<Vec<(PathBuf, RequestMemberIndex)>>,
         import_owners: &HashMap<String, Option<PathBuf>>,
         receiver_imports: &HashMap<PathBuf, BTreeSet<PathBuf>>,
-    ) -> (HashMap<u32, ResolvedMember>, Vec<(u32, String)>) {
+    ) -> (JoinedMembers, Vec<(u32, String)>) {
         let rings: Vec<_> = rings
             .into_iter()
             .map(fold_indexes_with_conflicts)
@@ -10868,10 +10890,13 @@ impl FileOrchestrator {
             }
             resolved.insert(
                 candidate.span_start,
-                ResolvedMember {
-                    name: name.to_string(),
-                    member: owned.member.clone(),
-                },
+                (
+                    owned.module.clone(),
+                    ResolvedMember {
+                        name: name.to_string(),
+                        member: owned.member.clone(),
+                    },
+                ),
             );
         }
         // `candidate_map` iterates in hash order and a count computed from
@@ -10896,7 +10921,7 @@ impl FileOrchestrator {
         candidate_map: &HashMap<String, CandidateTarget>,
         object_receivers: &HashMap<String, (PathBuf, String)>,
         member_cache: &HashMap<PathBuf, RequestMemberIndex>,
-    ) -> HashMap<u32, ResolvedMember> {
+    ) -> HashMap<u32, (PathBuf, ResolvedMember)> {
         let mut resolved = HashMap::new();
         for candidate in candidate_map.values() {
             let (Some(receiver), Some(property)) =
@@ -10913,13 +10938,79 @@ impl FileOrchestrator {
             };
             resolved.insert(
                 candidate.span_start,
-                ResolvedMember {
-                    name,
-                    member: member.clone(),
-                },
+                (
+                    module.clone(),
+                    ResolvedMember {
+                        name,
+                        member: member.clone(),
+                    },
+                ),
             );
         }
         resolved
+    }
+
+    /// Refuse the name join's member at a call the compiler says reaches a
+    /// function that does not send the member's request (carrick#4120).
+    ///
+    /// The name join keys a call by its callee name alone, so a `publish` on
+    /// any receiver joins the one module that declares a `publish` with a
+    /// request. `reached` is the summaries' read of what each call reaches by
+    /// the compiler's rows. The join is refused when all three hold: the rows
+    /// name the call's callee, that callee is declared in another file than
+    /// the member's module, and none of the requests that callee sends is the
+    /// member's. The last keeps a delegate: a same-named method whose body
+    /// calls the member still joins. A call the rows do not answer has no
+    /// entry in `reached`, so the join stands exactly as before. Returns how
+    /// many were refused.
+    fn refuse_members_the_compiler_contradicts(
+        resolved_members: &mut HashMap<u32, (PathBuf, ResolvedMember)>,
+        candidate_map: &HashMap<String, CandidateTarget>,
+        reached: &BTreeMap<(u32, u32), crate::request_summary::ReachedCallee>,
+        file: &str,
+    ) -> usize {
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let span_ends: HashMap<u32, (u32, usize)> = candidate_map
+            .values()
+            .map(|candidate| {
+                (
+                    candidate.span_start,
+                    (candidate.span_end, candidate.line_number),
+                )
+            })
+            .collect();
+        let mut refused: Vec<u32> = Vec::new();
+        for (span, (module, resolved)) in resolved_members.iter() {
+            let Some((end, _)) = span_ends.get(span) else {
+                continue;
+            };
+            let Some(callee) = reached.get(&(*span, *end)) else {
+                continue;
+            };
+            let module = canonical(module);
+            if canonical(&callee.file) == module {
+                continue;
+            }
+            let sends_the_member = callee.requests.iter().any(|(request_file, start)| {
+                *start == resolved.member.request_start && canonical(request_file) == module
+            });
+            if !sends_the_member {
+                refused.push(*span);
+            }
+        }
+        refused.sort_unstable();
+        for span in &refused {
+            if let Some((_, resolved)) = resolved_members.remove(span) {
+                debug!(
+                    "Refusing imported member {} at {file}:{}: the compiler says the call reaches {}, which does not send the member's request",
+                    resolved.name,
+                    span_ends[span].1,
+                    reached[&(*span, span_ends[span].0)].file.display()
+                );
+            }
+        }
+        refused.len()
     }
 
     /// The member name a candidate call site names: its callee property
@@ -19975,7 +20066,7 @@ export { routes };
     fn emit_and_join_with(
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
-        resolved_members: &HashMap<u32, ResolvedMember>,
+        resolved_members: &HashMap<u32, (PathBuf, ResolvedMember)>,
         local_wrapper_calls: &[LocalWrapperCall],
         aliases: &EnvAliasMap,
         whole_url_fallbacks: &WholeUrlFallbackMap,
@@ -20024,7 +20115,7 @@ export { routes };
     fn emit_and_join_core(
         model: FileAnalysisResult,
         candidate_map: &HashMap<String, CandidateTarget>,
-        resolved_members: &HashMap<u32, ResolvedMember>,
+        resolved_members: &HashMap<u32, (PathBuf, ResolvedMember)>,
         local_wrapper_calls: &[LocalWrapperCall],
         aliases: &EnvAliasMap,
         whole_url_fallbacks: &WholeUrlFallbackMap,
@@ -21553,13 +21644,20 @@ export { routes };
         );
     }
 
-    fn resolved_member(span: u32, method: &str, target: &str) -> HashMap<u32, ResolvedMember> {
+    fn resolved_member(
+        span: u32,
+        method: &str,
+        target: &str,
+    ) -> HashMap<u32, (PathBuf, ResolvedMember)> {
         HashMap::from([(
             span,
-            ResolvedMember {
-                name: "member".to_string(),
-                member: ring_member(method, target),
-            },
+            (
+                PathBuf::from("client.ts"),
+                ResolvedMember {
+                    name: "member".to_string(),
+                    member: ring_member(method, target),
+                },
+            ),
         )])
     }
 
@@ -21638,7 +21736,9 @@ export { routes };
         };
         let orders = [("ordersApi", "orders.api.ts", "ordersApi")];
         assert_eq!(
-            through(Some("ordersApi"), "addNote", &orders).get(&100),
+            through(Some("ordersApi"), "addNote", &orders)
+                .get(&100)
+                .map(|(_, member)| member),
             Some(&ring_outcome(
                 "ordersApi.addNote",
                 "POST",
@@ -21651,7 +21751,8 @@ export { routes };
                 "addNote",
                 &[("ordersApi", "admin.api.ts", "ordersApi")]
             )
-            .get(&100),
+            .get(&100)
+            .map(|(_, member)| member),
             Some(&ring_outcome(
                 "ordersApi.addNote",
                 "POST",
@@ -21665,7 +21766,8 @@ export { routes };
                 "addNote",
                 &[("orders", "orders.api.ts", "ordersApi")]
             )
-            .get(&100),
+            .get(&100)
+            .map(|(_, member)| member),
             Some(&ring_outcome(
                 "ordersApi.addNote",
                 "POST",
@@ -21709,7 +21811,7 @@ export { routes };
             &HashMap::new(),
         );
         assert_eq!(
-            resolved.get(&100),
+            resolved.get(&100).map(|(_, member)| member),
             Some(&ring_outcome(
                 "listThings",
                 "GET",
@@ -21733,7 +21835,7 @@ export { routes };
             &HashMap::new(),
         );
         assert_eq!(
-            resolved.get(&100),
+            resolved.get(&100).map(|(_, member)| member),
             Some(&ring_outcome(
                 "listThings",
                 "GET",
@@ -21847,6 +21949,119 @@ export { routes };
         );
         assert!(resolved.is_empty(), "{resolved:?}");
         assert!(declined.is_empty(), "{declined:?}");
+    }
+
+    /// Run the refusal on one name-joined site (span 100..140) whose member
+    /// is written at `request_start` in `module`, with what the rows say the
+    /// call reaches: the callee's file and the requests it sends (file, span
+    /// start). Returns how many were refused and whether the member survives.
+    fn refuse_one(
+        module: &Path,
+        request_start: u32,
+        reached: Option<(&Path, Vec<(&Path, u32)>)>,
+    ) -> (usize, bool) {
+        let mut member = ring_member("POST", "/events/:topic");
+        member.request_start = request_start;
+        let mut resolved = HashMap::from([(
+            100,
+            (
+                module.to_path_buf(),
+                ResolvedMember {
+                    name: "publish".to_string(),
+                    member,
+                },
+            ),
+        )]);
+        let reached: BTreeMap<(u32, u32), crate::request_summary::ReachedCallee> = reached
+            .into_iter()
+            .map(|(file, requests)| {
+                (
+                    (100, 140),
+                    crate::request_summary::ReachedCallee {
+                        file: file.to_path_buf(),
+                        requests: requests
+                            .iter()
+                            .map(|(file, start)| (file.to_path_buf(), *start))
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        let refused = FileOrchestrator::refuse_members_the_compiler_contradicts(
+            &mut resolved,
+            &site("this.http", "publish"),
+            &reached,
+            "caller.ts",
+        );
+        (refused, resolved.contains_key(&100))
+    }
+
+    /// carrick#4120: a call the compiler says reaches a function of another
+    /// file that sends nothing of the member's is refused.
+    #[test]
+    fn a_call_the_compiler_sends_to_another_file_loses_the_name_joined_member() {
+        let (refused, kept) = refuse_one(
+            Path::new("events.ts"),
+            50,
+            Some((Path::new("socket.ts"), vec![])),
+        );
+        assert_eq!((refused, kept), (1, false));
+        // Another request of its own is still not the member's.
+        let (refused, kept) = refuse_one(
+            Path::new("events.ts"),
+            50,
+            Some((Path::new("socket.ts"), vec![(Path::new("socket.ts"), 9)])),
+        );
+        assert_eq!((refused, kept), (1, false));
+        // The member's span in a different file is not the member's.
+        let (refused, kept) = refuse_one(
+            Path::new("events.ts"),
+            50,
+            Some((Path::new("socket.ts"), vec![(Path::new("socket.ts"), 50)])),
+        );
+        assert_eq!((refused, kept), (1, false));
+    }
+
+    /// carrick#4120: a same-named delegate whose body reaches the member's
+    /// request keeps the join.
+    #[test]
+    fn a_callee_that_sends_the_members_request_keeps_the_join() {
+        let (refused, kept) = refuse_one(
+            Path::new("events.ts"),
+            50,
+            Some((Path::new("facade.ts"), vec![(Path::new("events.ts"), 50)])),
+        );
+        assert_eq!((refused, kept), (0, true));
+    }
+
+    /// carrick#4120: a call that reaches the member's own file keeps the
+    /// join, and so does a call the rows do not answer.
+    #[test]
+    fn a_call_into_the_members_own_file_or_with_no_answer_keeps_the_join() {
+        let (refused, kept) = refuse_one(
+            Path::new("events.ts"),
+            50,
+            Some((Path::new("events.ts"), vec![])),
+        );
+        assert_eq!((refused, kept), (0, true));
+        let (refused, kept) = refuse_one(Path::new("events.ts"), 50, None);
+        assert_eq!((refused, kept), (0, true));
+    }
+
+    /// carrick#4120: the callee's path reaches the member's own file through
+    /// a symlinked directory: the same file.
+    #[cfg(unix)]
+    #[test]
+    fn a_callee_path_through_a_symlink_to_the_members_file_keeps_the_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("events.ts"), "export {};\n").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        let module = real.join("events.ts");
+        let through_link = dir.path().join("link/events.ts");
+        let (refused, kept) = refuse_one(&module, 50, Some((&through_link, vec![])));
+        assert_eq!((refused, kept), (0, true));
     }
 
     /// carrick#2745: with the fact layer choosing files, a member whose
@@ -22359,7 +22574,7 @@ export { routes };
             &origins,
         );
         assert_eq!(
-            resolved.get(&100),
+            resolved.get(&100).map(|(_, member)| member),
             Some(&ring_outcome(
                 "retrieveWidget",
                 "GET",
@@ -22549,7 +22764,7 @@ export { routes };
             (false, CallBaseKind::Relative),
         ] {
             let mut resolved = resolved_member(100, "POST", "/api/v2/things");
-            resolved.get_mut(&100).unwrap().member.base_unread = unread;
+            resolved.get_mut(&100).unwrap().1.member.base_unread = unread;
             let (mut result, _) = emit_and_join_with(
                 FileAnalysisResult::default(),
                 &candidate_map,

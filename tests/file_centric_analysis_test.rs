@@ -324,6 +324,7 @@ fn test_processing_stats_tracking() {
         fact_layer_files: 0,
         fallback_selection: Default::default(),
         deterministic_rows_emitted: Default::default(),
+        imported_members_refused: 0,
         summary_rows_withdrawn: 0,
         summary_dispatch_settled: 0,
         dispatch_guesses_cleared: 0,
