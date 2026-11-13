@@ -349,6 +349,13 @@ pub enum CaptureAnchor {
         /// record, which the check phase reads from every stored stub.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         absent_body_tolerated: bool,
+        /// carrick#3995: why the alias's text is a placeholder, when the
+        /// driver knows: `not_located` when no request located a value for
+        /// it. The capture copies it onto the alias's record, and the scan
+        /// stamps it on an entry that stays untyped with no other reason. No
+        /// verdict reads it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unread_cause: Option<&'static str>,
     },
 }
 
@@ -484,6 +491,11 @@ pub struct CaptureAliasRecord {
     /// demoted alias and on a stub an earlier build captured.
     #[serde(default)]
     pub surface_hash: Option<String>,
+    /// carrick#3995: the literal anchor's [`CaptureAnchor::Literal`]
+    /// `unread_cause`, echoed by the capture. Read only to say why an entry
+    /// is untyped: never a verdict input, never part of `surface_hash`.
+    #[serde(default)]
+    pub unread_cause: Option<String>,
 }
 
 impl CaptureAliasRecord {
@@ -520,7 +532,8 @@ pub struct TypeProvenance {
     /// `no_payload_evidence`, `machinery_envelope`, `coerced_input`,
     /// `no_success_payload`, `no_request_body`, `projected_value_only`,
     /// `serialised_body_unread`, `body_built_by_callee`, `result_member_missing`,
-    /// `reshaped_by_callback`, `not_recorded`.
+    /// `reshaped_by_callback`, `not_located`, `site_unreadable`,
+    /// `unplaced_top_type`, `not_recorded`.
     pub reason: String,
     /// One scrubbed sentence a reader can act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5536,6 +5549,20 @@ pub enum SidecarError {
 }
 
 impl SidecarError {
+    /// Why the compiler engine failed, in words a customer reads (it ends up
+    /// in a service's `types_degraded` detail). The raw error is for the log.
+    pub fn customer_cause(&self) -> &'static str {
+        match self {
+            SidecarError::SpawnFailed(_)
+            | SidecarError::InitFailed(_)
+            | SidecarError::NotReady(_) => "it could not be started",
+            SidecarError::Timeout => "it ran out of time",
+            SidecarError::ProcessDied | SidecarError::IoError(_) => "it stopped unexpectedly",
+            SidecarError::Interrupted(_) => "it was interrupted",
+            _ => "it reported an error",
+        }
+    }
+
     /// Whether this failure is environmental — the machine or this run having
     /// a bad day — rather than a repeatable property of the checkout.
     ///
@@ -6175,6 +6202,7 @@ mod tests {
             printed_names: Vec::new(),
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         };
         let json = serde_json::to_string(&literal).unwrap();
         assert!(json.contains(r#""kind":"literal""#));
@@ -6194,6 +6222,7 @@ mod tests {
             }],
             raw_text_read: false,
             absent_body_tolerated: false,
+            unread_cause: None,
         };
         let json = serde_json::to_string(&located).unwrap();
         assert!(json.contains(r#""source_file":"src/routes.ts""#));
@@ -6423,6 +6452,7 @@ mod tests {
                         }],
                         raw_text_read: true,
                         absent_body_tolerated: true,
+                        unread_cause: None,
                     },
                 ],
                 out_dir: "/tmp/stub".into(),

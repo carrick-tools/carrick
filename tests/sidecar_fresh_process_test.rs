@@ -186,6 +186,7 @@ fn capture(sidecar: TypeSidecar, alias: &'static str) -> (TypeSidecar, SidecarEr
                 printed_names: Vec::new(),
                 raw_text_read: false,
                 absent_body_tolerated: false,
+                unread_cause: None,
             }],
             "/out",
             None,

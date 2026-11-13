@@ -1,24 +1,30 @@
 name: Release
 
-# Two entry points:
-#   - push to main, where release-please decides whether a release was created
-#   - workflow_dispatch against an existing tag, to publish a release that was
-#     tagged but never shipped (carrick#1242)
+# Entry points:
+#   - push to `release`: the cut. `release` is a pointer branch that only ever
+#     moves (fast-forward) to a main commit main's check passed. The `cut` job
+#     asks scripts/release-cut-check.py whether that sha may be cut, and fails
+#     closed; on "cut" it tags the sha, writes the GitHub Release and relabels
+#     the version PR (scripts/release-cut.sh). release-please runs on main in
+#     release-pr.yml and only writes the version PR.
+#   - workflow_dispatch with `cut_sha`: the same cut, for a push run that never
+#     started. Without `dry_run` the sha must be where `release` points.
+#   - workflow_dispatch with `tag`: publish an existing tag that was tagged but
+#     never shipped (carrick#1242).
 #
-# A transient GitHub API error inside release-please strands a release: the tag
-# and the GitHub Release exist, but every publish job is gated on
-# `release_created`, and on a re-run release-please sees the release already
-# exists and answers `false`, so they all skip again — for ever. 0.3.74 was only
-# rescued because 0.3.75 carried its content.
+# A cut that fails half way is resumed by running it again: every write in
+# release-cut.sh skips what already exists, and the check says "resume" for a
+# tag already at the sha whose version PR is still `autorelease: pending`.
 #
-# Both paths resolve through the `target` job, which is the ONLY place a tag,
+# Every path resolves through the `target` job, which is the ONLY place a tag,
 # its commit and the decision to publish are decided. Every later job builds
 # from `target`'s resolved commit sha, so a dispatch run cannot build one commit
 # and publish it under another commit's version.
 #
 # Nothing but a real release exercises the jobs below `target`, so the dispatch
-# form takes a `dry_run` input: it resolves the tag, checks the commit carries
-# that version, and stops. That is the way to rehearse this path.
+# form takes a `dry_run` input. With `tag` it resolves the tag, checks the
+# commit carries that version, and stops. With `cut_sha` it prints the cut
+# decision and stops before any write. That is the way to rehearse both paths.
 #
 # The dispatch is ONE step, not two: it needs no run approval. The
 # first-time-contributor policy that holds the release PR's checks at
@@ -29,15 +35,21 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [release]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to publish, e.g. carrick-v0.3.74. Must already exist; nothing here creates a tag."
-        required: true
+        description: "Existing release tag to publish, e.g. carrick-v0.3.74. Must already exist; this path creates no tag. Leave empty with cut_sha."
+        required: false
+        default: ""
+        type: string
+      cut_sha:
+        description: "Full sha to cut. Without dry_run it must be where the release branch points. Leave empty with tag."
+        required: false
+        default: ""
         type: string
       dry_run:
-        description: "Resolve and check the tag, then stop. Nothing is built, published, attached or moved."
+        description: "Resolve and check the tag or the cut, then stop. Nothing is tagged, built, published, attached, relabelled or moved."
         required: false
         default: false
         type: boolean
@@ -51,45 +63,172 @@ permissions:
 env:
   GLIBC_FLOOR: "2.28"
 
-# One release at a time: a push to main and a `workflow_dispatch` rescue of an
-# older tag would otherwise publish npm packages and move release assets
-# concurrently. Queued rather than cancelled, because an npm publish killed
-# half way through cannot be re-run (carrick#1140).
+# One release at a time: a cut and a `workflow_dispatch` rescue of an older tag
+# would otherwise publish npm packages and move release assets concurrently.
+# Queued rather than cancelled, because an npm publish killed half way through
+# cannot be re-run (carrick#1140).
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release-please:
-    if: ${{ github.event_name == 'push' }}
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      # With the default GITHUB_TOKEN the release PR is authored by
-      # `app/github-actions`, which has no merged commit of its own, so GitHub's
-      # first-time-contributor approval parks every workflow run on the release
-      # branch at `action_required` until a maintainer approves it by hand
-      # (carrick#1270; it bit 0.3.74 through 0.3.78). A token owned by a
-      # contributor makes the PR theirs and the runs start on their own. Falls
-      # back to GITHUB_TOKEN when the secret is absent, so nothing breaks
-      # before it exists.
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
-        id: release
-        with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
-
-  # The single resolver for both entry points. Everything downstream reads
-  # `needs.target.outputs.*` and nothing downstream reads release-please, so the
-  # two paths cannot drift.
+  # Decides whether the sha may be cut, and cuts it. The decision is
+  # scripts/release-cut-check.py's, the one answerer to "may this sha be cut"
+  # (also read by the advance command and auto-release); nothing here restates
+  # its rules. Exit 0 = cut (or resume), 3 = nothing to cut (green, publishes
+  # nothing), anything else = red: a hold, a check that could not run, or a
+  # missing script all fail closed.
   #
-  # `always()` because on the dispatch path release-please is skipped, and a
-  # skipped dependency would skip this job too. A release-please that FAILED
-  # must not publish anything, hence the explicit `result == 'success'`.
+  # Runs on every push to `release`, and on a dispatch unless it names only a
+  # `tag` (the rescue path, which skips it). A dispatch naming both, or
+  # neither, fails here.
+  cut:
+    if: ${{ github.event_name == 'push' || inputs.tag == '' || inputs.cut_sha != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: read
+    outputs:
+      release_created: ${{ steps.write.outputs.release_created }}
+      tag_name: ${{ steps.write.outputs.tag_name }}
+    steps:
+      - name: Pick the sha to cut
+        id: pick
+        env:
+          # Through the environment, never interpolated into the script.
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_CUT_SHA: ${{ inputs.cut_sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            SHA="$PUSH_SHA"
+          else
+            if [ -n "$INPUT_TAG" ] || [ -z "$INPUT_CUT_SHA" ]; then
+              echo "::error::Give exactly one of tag (publish an existing tag) and cut_sha (cut a sha)."
+              exit 1
+            fi
+            SHA="$INPUT_CUT_SHA"
+            case "$SHA" in
+              *[!0-9a-f]*|"")
+                echo "::error::cut_sha must be a full lower-case sha (40 hex characters)."
+                exit 1
+                ;;
+            esac
+            if [ "${#SHA}" -ne 40 ]; then
+              echo "::error::cut_sha must be a full lower-case sha (40 hex characters)."
+              exit 1
+            fi
+            # A real cut publishes only what `release` points at, so the
+            # branch stays the record of what is released.
+            if [ "$DRY_RUN" != "true" ]; then
+              if ! AT=$(gh api "repos/$REPO/git/ref/heads/release" --jq '.object.sha' 2>"$RUNNER_TEMP/ref.txt"); then
+                cat "$RUNNER_TEMP/ref.txt"
+                echo "::error::The release branch could not be read. A cut without dry_run cuts only where release points."
+                exit 1
+              fi
+              if [ "$AT" != "$SHA" ]; then
+                echo "::error::release points at $AT, not $SHA. Advance release to the sha instead; its push cuts it."
+                exit 1
+              fi
+            fi
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "cut candidate: $SHA"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.pick.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # The scripts from this workflow's own commit, not the cut sha's, so the
+      # rules that decide are the ones this run was started with.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          sparse-checkout: |
+            scripts/release-cut-check.py
+            scripts/release-cut.sh
+          sparse-checkout-cone-mode: false
+
+      - name: May this sha be cut
+        id: check
+        env:
+          SHA: ${{ steps.pick.outputs.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          set +e
+          python3 release-tools/scripts/release-cut-check.py --json "$SHA" >"$RUNNER_TEMP/check.out"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/check.out"
+          case "$code" in
+            0) ;;
+            3)
+              echo "::notice::Nothing to cut at $SHA; nothing is tagged or published."
+              echo "decision=none" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            1) echo "::error::release-cut-check holds $SHA (reasons above). Nothing was tagged or published."; exit 1 ;;
+            *) echo "::error::release-cut-check could not decide on $SHA (exit $code). Nothing was tagged or published."; exit 1 ;;
+          esac
+          JSON=$(grep '^{' "$RUNNER_TEMP/check.out" | tail -1)
+          VERSION=$(jq -er '.version' <<<"$JSON")
+          PR=$(jq -er '.pr' <<<"$JSON")
+          RELEASE_COMMIT=$(jq -er '.release_commit' <<<"$JSON")
+          {
+            echo "decision=cut"
+            echo "version=$VERSION"
+            echo "pr=$PR"
+            echo "release_commit=$RELEASE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Tag, write the Release, relabel the version PR
+        id: write
+        env:
+          SHA: ${{ steps.pick.outputs.sha }}
+          DECISION: ${{ steps.check.outputs.decision }}
+          VERSION: ${{ steps.check.outputs.version }}
+          PR: ${{ steps.check.outputs.pr }}
+          RELEASE_COMMIT: ${{ steps.check.outputs.release_commit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$DECISION" != "cut" ]; then
+            printf 'release_created=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::Dry run: $SHA would be cut as carrick-v$VERSION (version PR #$PR). Nothing was written."
+            printf 'release_created=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash release-tools/scripts/release-cut.sh "$SHA" "$VERSION" "$PR" "$RELEASE_COMMIT"
+          printf 'release_created=true\ntag_name=carrick-v%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+  # The single resolver for every entry point. Everything downstream reads
+  # `needs.target.outputs.*` and nothing downstream reads `cut`, so the paths
+  # cannot drift.
+  #
+  # `always()` because on the tag rescue path `cut` is skipped, and a skipped
+  # dependency would skip this job too. A `cut` that FAILED must not publish
+  # anything, hence the explicit results; a skipped `cut` counts only on the
+  # tag path.
   target:
-    needs: release-please
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.release-please.result == 'success') }}
+    needs: cut
+    if: ${{ always() && (needs.cut.result == 'success' || (needs.cut.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.tag != '')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -112,15 +251,16 @@ jobs:
           # input is attacker-controlled text as far as the shell is concerned.
           INPUT_TAG: ${{ inputs.tag }}
           DRY_RUN: ${{ inputs.dry_run }}
-          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
-          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
-          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_CREATED: ${{ needs.cut.outputs.release_created }}
+          RELEASE_TAG: ${{ needs.cut.outputs.tag_name }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          # The tag path is the one dispatch that skips `cut`; every other run
+          # publishes only what `cut` tagged.
+          if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
             case "$TAG" in
               *[!A-Za-z0-9.+-]*)
@@ -135,7 +275,7 @@ jobs:
             esac
           else
             if [ "$RELEASE_CREATED" != "true" ]; then
-              echo "release-please created no release; nothing to publish."
+              echo "The cut created no release; nothing to publish."
               printf 'resolved=false\npublish=false\n' >> "$GITHUB_OUTPUT"
               exit 0
             fi

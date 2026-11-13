@@ -2133,7 +2133,10 @@ fn record(
         }
     }
     let http = matches!(label.role.as_str(), "http_client" | "server_framework");
-    let procedure = site.end.procedure.is_some();
+    // A client call's procedure (`site.end`) or a server procedure op's site
+    // (`site.procedure`, set by the procedure pass): both state the wire
+    // method through one answerer (cloud#2743 item 5).
+    let procedure = site.end.procedure.is_some() || site.procedure.is_some();
     let mut method_label = label.method.clone().unwrap_or_default();
     if procedure {
         method_label = procedure_wire_label(method_label, label.member.as_deref());

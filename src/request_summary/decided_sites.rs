@@ -463,11 +463,58 @@ impl SiteLabel {
                     request,
                     yields,
                     name_scope,
+                    runs,
                     ..
                 } = claim
                 else {
                     continue;
                 };
+                // A member that runs the function it is handed (carrick#3481
+                // T5, `client.prefetch({ load })`): a runner on that member,
+                // as a maker's `runs` is, never a nameless op label (its
+                // call would state a site beside the one inside the function
+                // it runs). A receiver-scoped member is not matched by
+                // `runner`, and a `runs` bound to the maker (`mutate` runs
+                // the function the hook was given) is a walk from the
+                // instance's later calls that is not read yet: both state no
+                // label, so their calls state no site.
+                if let Some(runs) = runs {
+                    if runs.bound.is_none()
+                        && of
+                            .as_deref()
+                            .and_then(crate::library_claims::scope_step)
+                            .is_none()
+                    {
+                        labels.push(SiteLabel {
+                            new,
+                            package: export.package.clone(),
+                            export: export.export.clone(),
+                            member: member.clone(),
+                            role: role.clone(),
+                            op: None,
+                            side: side.clone(),
+                            by_origin,
+                            name: None,
+                            payload: None,
+                            handler: None,
+                            method: None,
+                            reserved: Vec::new(),
+                            runs: Some(RunsMake {
+                                slot: ArgSlot {
+                                    arg: runs.arg as usize,
+                                    key: runs.key.clone(),
+                                },
+                                new,
+                            }),
+                            request: None,
+                            scope: None,
+                            yields: None,
+                            name_scope: None,
+                            name_at_maker: false,
+                        });
+                    }
+                    continue;
+                }
                 let walks_an_array = |slot: &crate::services::type_sidecar::ClaimSlot| {
                     slot.each || slot.at.is_some()
                 };
@@ -1480,6 +1527,36 @@ fn holds_parameter(pieces: &[Piece]) -> bool {
     pieces.iter().any(Piece::is_parameter)
 }
 
+/// Whether a caller still chooses the name `pieces` holds: a parameter, or
+/// a hole of an unread call open on one ([`Piece::waits_on_caller`],
+/// carrick#4022).
+fn holds_open(pieces: &[Piece]) -> bool {
+    pieces.iter().any(Piece::waits_on_caller)
+}
+
+/// Why the name a caller fills is unread, where `own` (the callee's value)
+/// holds a hole of an unread call open on the callee's parameters
+/// ([`Piece::through`], carrick#4022) and `filled` (the caller's) holds that
+/// hole closed: the reason the hole ends at. `None` for any other value, and
+/// where `filled` states a route all the same (`${base(siteUrl)}/notes`, an
+/// unread base glued to a written path, [`decides`]): that call is the site,
+/// and what it sends keeps its anchor there.
+fn closed_hole(own: &[Piece], filled: &[Piece], end: &LabelledEnd) -> Option<Stop> {
+    if !own.iter().any(|piece| piece.through().is_some())
+        || (end.role == "http_client" && render_target(filled).is_some())
+    {
+        return None;
+    }
+    filled.iter().find_map(|piece| match piece {
+        Piece::Opaque {
+            end: super::Root::Hole(reason),
+            link: None,
+            ..
+        } => Some(Stop::from(*reason)),
+        _ => None,
+    })
+}
+
 /// Whether a call whose slot value is `pieces` decides the name, so it is
 /// the site and its callers are not walked: the value holds no parameter, or
 /// for HTTP it states a route the way the request summaries compose one
@@ -1488,7 +1565,7 @@ fn holds_parameter(pieces: &[Piece]) -> bool {
 /// whole path, or a prefix glued to one, leaves it to the callers
 /// (carrick#2433, carrick#2519).
 fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
-    !holds_parameter(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
+    !holds_open(pieces) || (end.role == "http_client" && render_target(pieces).is_some())
 }
 
 /// Whether `pieces` is a message name written as a template whose hole a
@@ -1500,7 +1577,7 @@ fn decides(pieces: &[Piece], end: &LabelledEnd) -> bool {
 /// ([`decides`]).
 fn is_message_template(pieces: &[Piece], end: &LabelledEnd) -> bool {
     end.role != "http_client"
-        && holds_parameter(pieces)
+        && holds_open(pieces)
         && pieces
             .iter()
             .any(|piece| matches!(piece, Piece::Lit(text) if !text.is_empty()))
@@ -1534,6 +1611,14 @@ fn to_definition(pieces: &[Piece], depth: u8) -> Option<Vec<Piece>> {
         .iter()
         .map(|piece| match piece {
             Piece::Outer(out, inner) if *out == depth => Some((**inner).clone()),
+            // A hole of an unread call (carrick#4022): its parameters read the
+            // same way.
+            piece if piece.through().is_some() => {
+                let held = piece
+                    .through()
+                    .and_then(|inner| to_definition(inner, depth))?;
+                piece.refilled(&|_| held.clone())
+            }
             piece if piece.is_parameter() => None,
             other => Some(other.clone()),
         })
@@ -1578,7 +1663,13 @@ fn filled_with(pieces: &[Piece], call: &CallIr, default: &Defaults<'_>) -> Vec<P
         Piece::ParamKeyOr(index, key, name, or) => {
             key_filled(call, *index, key, name, Some(or.clone()), omitted(*index))
         }
-        other => vec![other.clone()],
+        // A hole of an unread call (carrick#4022): its parameters filled the
+        // same way.
+        other => vec![
+            other
+                .refilled(&|inner| filled_with(inner, call, default))
+                .unwrap_or_else(|| other.clone()),
+        ],
     }))
 }
 
@@ -2561,6 +2652,11 @@ impl<'a> Walk<'a, '_> {
     }
 
     fn lead(&mut self, placed: &Placed<'a>, end: &LabelledEnd, why: Stop) {
+        self.lead_at(placed, u32::from(placed.depth), end, why);
+    }
+
+    /// [`Self::lead`], with `depth` as the lead's depth.
+    fn lead_at(&mut self, placed: &Placed<'a>, depth: u32, end: &LabelledEnd, why: Stop) {
         // A sibling's own call is a lead in that sibling's scan (carrick#2618).
         if !self.calls.is_own(placed.file) {
             return;
@@ -2570,12 +2666,38 @@ impl<'a> Walk<'a, '_> {
             line: placed.call.site.line,
             span_start: placed.call.site.span_start,
             span_end: placed.call.site.span_end,
-            depth: u32::from(placed.depth),
+            depth,
             end: end.clone(),
             reason: why,
         };
         if !self.out.leads.contains(&lead) {
             self.out.leads.push(lead);
+        }
+    }
+
+    /// The site `down[0]`, whose value `value` fills `below` (the value one
+    /// call down, as its function reads it). Where it closes a hole of an
+    /// unread call that `below` held open (carrick#4022), the call chooses
+    /// the path but no text states it: a lead there, with the reason the
+    /// hole was not read ([`closed_hole`]), at the depth of the functions
+    /// the walk entered from it.
+    fn site_filled(
+        &mut self,
+        down: &[Placed<'a>],
+        end: &LabelledEnd,
+        below: &[Piece],
+        value: Vec<Piece>,
+        args: BTreeSet<usize>,
+    ) {
+        match closed_hole(below, &value, end) {
+            Some(why) => {
+                let entered = u32::try_from(down.len() - 1).unwrap_or(u32::MAX);
+                self.lead_at(&down[0], entered, end, why);
+                if let Some(template) = self.template {
+                    self.lead(&template, end, why);
+                }
+            }
+            None => self.site(down, end, value, args),
         }
     }
 
@@ -2762,7 +2884,8 @@ impl<'a> Walk<'a, '_> {
             // The boundary rule (carrick#2618): a sibling's call never states
             // the request, so the walk goes on to its callers.
             if self.calls.is_own(caller.file) && self.settles(caller, &value, end) {
-                self.site(&longer, end, value, parameter_positions(&own));
+                let args = parameter_positions(&own);
+                self.site_filled(&longer, end, &own, value, args);
             } else {
                 self.up(&longer, &value, end, path);
             }
@@ -3532,7 +3655,7 @@ fn decide(
                 })
                 .collect();
             if walk.settles(&first, &value, end) {
-                walk.site(&down, end, value, positions);
+                walk.site_filled(&down, end, &at_end, value, positions);
             } else {
                 walked.push(format!("{}:{}", site.file, site.line));
                 walk.up(&down, &value, end, &mut Vec::new());
@@ -3603,7 +3726,8 @@ fn decide(
                     .as_ref()
                     .is_none_or(|pieces| !walk.settles(&chain[1], pieces, end));
             if below_open {
-                walk.site(&chain, end, top, args[0].clone());
+                let below = values.get(1).cloned().flatten().unwrap_or_default();
+                walk.site_filled(&chain, end, &below, top, args[0].clone());
             } else {
                 // The site is the lowest call whose value still settles.
                 let to = (1..n)
@@ -5001,6 +5125,80 @@ pub(crate) mod tests {
         let decided = decided_sites(&inputs, &root, &[unclaimed], &[]);
         assert_eq!(decided.leads.len(), 1);
         assert!(decided.ran.is_empty());
+    }
+
+    /// carrick#3481 T5: an op whose `runs` names no maker is a runner on its
+    /// member: a call that hands it the function states no site and is no
+    /// lead, one that hands none it can read is a lead. An op whose `runs` is
+    /// bound to the maker states no site at its call.
+    #[test]
+    fn an_op_that_runs_the_function_it_is_handed_is_a_runner_on_its_member() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let file = STATED;
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "LoadClient", "role": "http_client", "label": "request_runner",
+                  "claims": [
+                    { "kind": "op", "op": "request", "member": "prefetch", "on": "instance",
+                      "runs": { "arg": 0, "key": "load" } },
+                    { "kind": "op", "op": "request", "member": "mutate", "on": "instance",
+                      "runs": { "arg": 0, "key": "send", "bound": "maker" } }
+                  ] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        // The member is a runner; no op label is made for either member.
+        assert!(labels.iter().all(|label| label.op.is_none()));
+        assert_eq!(labels.len(), 1);
+        let end = |member: &str, call: &str| {
+            let mut end = stated_end(
+                &text,
+                "cache-kit",
+                "LoadClient",
+                Some(member),
+                "http_client",
+                call,
+            );
+            end.file = file.into();
+            end
+        };
+        let inline = "client.prefetch({ key: [\"p\"], load: () => fetch(\"/api/p\") })";
+        let prefetch = end("prefetch", inline);
+        assert_eq!(
+            SiteLabel::runner(&labels, &prefetch),
+            Some(&ArgSlot {
+                arg: 0,
+                key: Some("load".into())
+            })
+        );
+        let sites = [
+            bottom(&prefetch, "prefetch"),
+            bottom(&end("prefetch", "client.prefetch(options)"), "prefetch"),
+            bottom(&end("mutate", "client.mutate(vars)"), "mutate"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert!(decided.sites.is_empty());
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (line_of(&text, "client.prefetch(options)"), Stop::NoOpClaim),
+                (line_of(&text, "client.mutate(vars)"), Stop::NoOpClaim),
+            ]
+        );
+        assert_eq!(
+            decided.ran,
+            vec![format!(
+                "{file}:{}",
+                line_of(&text, "client.prefetch({ key")
+            )]
+        );
     }
 
     /// carrick#2426: a decided site whose name is one the store settled the

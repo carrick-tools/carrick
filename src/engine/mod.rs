@@ -10214,7 +10214,7 @@ fn add_graphql_request_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        v1_state_before_demotion: None,
+        v1_before_demotion: None,
     });
 }
 
@@ -10481,7 +10481,7 @@ fn add_protocol_manifest_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        v1_state_before_demotion: None,
+        v1_before_demotion: None,
     });
 }
 
@@ -11136,14 +11136,13 @@ fn resolve_types_if_available(
         // The reason the run recorded at spawn, not a list of everything that
         // could have gone wrong: this string is what the boundary line reads
         // out to whoever is looking at a service with no types.
-        let detail =
-            match crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN) {
-                Some(reason) => format!("sidecar unavailable: {}", reason),
-                None => "sidecar unavailable (not found, failed to start, or failed to \
-                     initialize)"
-                    .to_string(),
-            };
-        cloud_data.type_extraction_status = Some(format!("type extraction skipped: {}", detail));
+        if let Some(reason) =
+            crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN)
+        {
+            debug!("The compiler engine was unavailable: {}", reason);
+        }
+        let detail = "the compiler engine was not found or could not be started".to_string();
+        cloud_data.type_extraction_status = Some(detail.clone());
         cloud_data.types_degraded = Some(TypeDegradation {
             stage: "spawn".to_string(),
             detail,
@@ -11258,11 +11257,22 @@ fn resolve_types_if_available(
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
                     debug!("Continuing without bundled types");
-                    cloud_data.type_extraction_status =
-                        Some(format!("type resolution failed: {}", e));
+                    // A death of memory the run recorded for this service is the
+                    // cause; the client's error only says the process died.
+                    let detail = match crate::scan_health::first_type_memory_death_of(
+                        crate::current_service::name().as_deref(),
+                    ) {
+                        Some(death) => type_compat_v2::resolution_memory_death(&death),
+                        None => format!(
+                            "the compiler engine could not read types because {}",
+                            e.downcast_ref::<crate::services::type_sidecar::SidecarError>()
+                                .map_or("it reported an error", |e| e.customer_cause())
+                        ),
+                    };
+                    cloud_data.type_extraction_status = Some(detail.clone());
                     cloud_data.types_degraded = Some(TypeDegradation {
                         stage: "resolve".to_string(),
-                        detail: e.to_string(),
+                        detail,
                     });
                     TypesOutcome::default()
                 }
@@ -11271,11 +11281,14 @@ fn resolve_types_if_available(
         Err(e) => {
             warn!("Sidecar not ready: {}", e);
             debug!("Skipping type resolution");
-            cloud_data.type_extraction_status =
-                Some(format!("type extraction skipped: sidecar not ready: {}", e));
+            let detail = format!(
+                "the compiler engine was not ready to read types because {}",
+                e.customer_cause()
+            );
+            cloud_data.type_extraction_status = Some(detail.clone());
             cloud_data.types_degraded = Some(TypeDegradation {
                 stage: "init".to_string(),
-                detail: e.to_string(),
+                detail,
             });
             crate::scan_health::record_types_unavailable(
                 config.service_name.as_deref().unwrap_or("(root)"),
@@ -13092,8 +13105,8 @@ fn apply_resolved_definitions(
             });
         if v1_unanswered && settles {
             let state = entry
-                .v1_state_before_demotion
-                .unwrap_or(ManifestTypeState::Implicit);
+                .v1_before_demotion
+                .map_or(ManifestTypeState::Implicit, |v1| v1.state);
             let is_explicit = state == ManifestTypeState::Explicit;
             entry.is_explicit = is_explicit;
             entry.type_state = state;
@@ -13143,6 +13156,18 @@ fn read_capture_records(
 /// and the positions the emitted tree cannot resolve, which print as a name
 /// and read `any` (carrick#1446). An alias with no record leaves its entry as
 /// it was.
+///
+/// An entry still `Unknown` with no finding after the merge gets one root
+/// finding that says why (carrick#3995), so no untyped entry the capture saw
+/// reaches a reader without a reason:
+///
+///  - a shape v1 printed with a top type nothing placed reads
+///    `unplaced_top_type`, with the kind the shape holds. The record's cause
+///    describes the capture's own read, not v1's shape;
+///  - otherwise the record's `unread_cause`, or `not_recorded` when the record
+///    has none.
+///
+/// No verdict reads any of these words, and the finding carries no detail.
 fn stamp_capture_provenance(
     manifest: &mut [TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
@@ -13159,6 +13184,27 @@ fn stamp_capture_provenance(
                 .chain(&record.unresolved_in_tree)
                 .cloned(),
         );
+        if entry.type_state != ManifestTypeState::Unknown || !entry.any_provenance.is_empty() {
+            continue;
+        }
+        let (kind, reason) = match entry.v1_before_demotion {
+            Some(v1) => (
+                if v1.holds_any { "any" } else { "unknown" },
+                "unplaced_top_type",
+            ),
+            None => (
+                "unknown",
+                record.unread_cause.as_deref().unwrap_or("not_recorded"),
+            ),
+        };
+        entry
+            .any_provenance
+            .push(crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+                detail: None,
+            });
     }
 }
 
@@ -13880,7 +13926,7 @@ fn add_manifest_pair(
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         });
     }
 }
@@ -14007,11 +14053,15 @@ fn enrich_manifest_with_type_resolution(
                 // about it beside the demotion: whether the source wrote that
                 // top type is the capture record's to say, and when it did,
                 // the entry returns to this state (carrick#1752).
-                entry.v1_state_before_demotion = (!placeholder).then_some(if *is_explicit {
-                    ManifestTypeState::Explicit
-                } else {
-                    ManifestTypeState::Implicit
-                });
+                entry.v1_before_demotion =
+                    (!placeholder).then_some(crate::cloud_storage::V1Demotion {
+                        state: if *is_explicit {
+                            ManifestTypeState::Explicit
+                        } else {
+                            ManifestTypeState::Implicit
+                        },
+                        holds_any: type_compat_v2::text_uses_any_as_type(type_string),
+                    });
                 entry.is_explicit = false;
                 entry.type_state = ManifestTypeState::Unknown;
                 entry.evidence.is_explicit = false;
@@ -16337,8 +16387,10 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         assert!(run.data.capture_stub.is_none());
         assert!(
             run.status().starts_with("type capture failed: ")
-                && run.status().contains("process ended during the capture")
-                && run.status().contains("retried in a fresh process"),
+                && run
+                    .status()
+                    .contains("compiler engine ended during the capture")
+                && run.status().contains("on the retry in a fresh process"),
             "the status does not say the sidecar died: {}",
             run.status()
         );
@@ -17977,7 +18029,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
-                v1_state_before_demotion: None,
+                v1_before_demotion: None,
             }]),
             file_results: Some(file_results),
             cached_detection: None,
@@ -24527,7 +24579,7 @@ unfollowed_member_calls_total: 0,
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         }
     }
 
@@ -26651,6 +26703,178 @@ unfollowed_member_calls_total: 0,
             provenance_of(&manifest[0]),
             vec![("notes", "declared"), ("status", "unresolved_import")]
         );
+    }
+
+    // ---- carrick#3995: an untyped entry says why -------------------------
+
+    fn root_findings(entry: &TypeManifestEntry) -> Vec<(&str, &str, Option<&str>)> {
+        entry
+            .any_provenance
+            .iter()
+            .filter(|p| p.path.is_empty())
+            .map(|p| (p.kind.as_str(), p.reason.as_str(), p.detail.as_deref()))
+            .collect()
+    }
+
+    /// A placeholder the driver sent because no request located a value for
+    /// the alias says so on the entry: one root finding with the record's
+    /// cause, and no detail.
+    #[test]
+    fn a_placeholder_record_carrying_a_cause_stamps_it_at_the_root() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "anchor_kind": "literal",
+                "anchor_origin": "manifest-placeholder",
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unread_cause": "not_located"
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "unknown")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+        assert_eq!(
+            root_findings(&manifest[0]),
+            vec![("unknown", "not_located", None)]
+        );
+    }
+
+    /// A record with no cause still leaves no untyped entry with an empty
+    /// list: it says the scan recorded no cause. An entry with no record is
+    /// left alone.
+    #[test]
+    fn a_record_with_no_cause_stamps_not_recorded() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView"), consumer_entry("NoRecord")];
+
+        join_capture_answers(&mut manifest, vec![captured("OrderView", "any")], &records);
+
+        assert_eq!(
+            root_findings(&manifest[0]),
+            vec![("unknown", "not_recorded", None)]
+        );
+        assert!(manifest[1].any_provenance.is_empty());
+    }
+
+    /// A shape v1 printed with a top type nothing places reads
+    /// `unplaced_top_type`, whatever cause the record carries: the capture's
+    /// cause describes its own read, not v1's shape. The kind is what the
+    /// printed shape holds.
+    #[test]
+    fn a_demoted_shape_with_an_unplaced_top_type_says_so() {
+        for (shape, kind) in [
+            ("{ id: string; meta: any; }", "any"),
+            ("{ id: string; meta: unknown; }", "unknown"),
+        ] {
+            let mut manifest = enriched_explicit(shape);
+            assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+            let records = records_from(serde_json::json!([record_json(
+                "OrderView",
+                serde_json::json!({
+                    "self_check": "decayed_internal",
+                    "top_type_at_self_check": true,
+                    "unread_cause": "not_located"
+                }),
+            )]));
+
+            join_capture_answers(&mut manifest, Vec::new(), &records);
+
+            assert_eq!(
+                root_findings(&manifest[0]),
+                vec![(kind, "unplaced_top_type", None)],
+                "v1 printed {shape}"
+            );
+        }
+    }
+
+    /// An entry that already says why (the inferrer's own reason) is not
+    /// stamped again.
+    #[test]
+    fn an_entry_with_a_reason_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "self_check": "decayed_internal",
+                "top_type_at_self_check": true,
+                "unread_cause": "not_located"
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+        manifest[0].any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "no_success_payload".to_string(),
+            detail: None,
+        }];
+
+        join_capture_answers(&mut manifest, Vec::new(), &records);
+
+        assert_eq!(
+            provenance_of(&manifest[0]),
+            vec![("", "no_success_payload")]
+        );
+    }
+
+    /// The stamp runs after the capture's answer settles the entry. A clean
+    /// answer types an entry v1 never answered, and a typed entry carries no
+    /// root reason; stamped first, it would keep a `not_recorded` over a
+    /// published type.
+    #[test]
+    fn an_entry_the_capture_settles_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({})
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Unknown);
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert!(
+            manifest[0].any_provenance.is_empty(),
+            "{:?}",
+            manifest[0].any_provenance
+        );
+    }
+
+    /// An open member the source declares still settles the entry, and the
+    /// entry keeps only the capture's member finding.
+    #[test]
+    fn a_declared_open_member_settles_and_is_not_stamped() {
+        let records = records_from(serde_json::json!([record_json(
+            "OrderView",
+            serde_json::json!({
+                "any_provenance": [finding("notes", "unknown", "declared")]
+            }),
+        )]));
+        let mut manifest = vec![consumer_entry("OrderView")];
+
+        join_capture_answers(
+            &mut manifest,
+            vec![captured("OrderView", "{ id: string; notes: unknown; }")],
+            &records,
+        );
+
+        assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+        assert_eq!(provenance_of(&manifest[0]), vec![("notes", "declared")]);
     }
 
     /// A shape that names an identifier nothing declares reads as a type and
@@ -30630,6 +30854,77 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 )
             })
             .collect()
+    }
+
+    /// LED-2: a type resolution whose process died of memory says so in the
+    /// service's `types_degraded` detail, as the capture words it, not only
+    /// that the process died.
+    #[test]
+    fn a_memory_death_in_resolution_is_named_in_the_detail() {
+        use crate::services::type_sidecar::SymbolRequest;
+        const SERVICE: &str = "led2-resolve-death";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("types.ts"),
+            "export interface Order { id: string }",
+        )
+        .unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return fs.writeSync(1, JSON.stringify({ request_id, status: 'ready' }) + '\n');
+  fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n');
+  process.exit(134);
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &Config::default());
+        let mut data = service_data("fixture", Some(SERVICE));
+        let outcome = crate::current_service::sync_scope(Some(SERVICE.to_string()), || {
+            resolve_types_if_available(
+                Some(&sidecar),
+                &FileOrchestrator::new(crate::agent_service::AgentService::new()),
+                &HashMap::new(),
+                root.to_str().unwrap(),
+                None,
+                &MountGraph::default(),
+                &Config::default(),
+                &service_module_index(root.to_str().unwrap(), &Config::default()),
+                &[SymbolRequest {
+                    symbol_name: "Order".into(),
+                    source_file: "types.ts".into(),
+                    alias: Some("Order".into()),
+                    array_depth: None,
+                    payload_borrow_witness: false,
+                    consumer_response: false,
+                }],
+                &[],
+                &[],
+                None,
+                &mut data,
+            )
+        });
+        crate::scan_health::forget_type_memory_loss(Some(SERVICE));
+        assert!(outcome.stub_dir.is_none());
+        let degraded = data.types_degraded.as_ref().expect("types_degraded");
+        assert_eq!(degraded.stage, "resolve");
+        assert!(
+            degraded
+                .detail
+                .starts_with("the compiler engine ran out of memory while reading types, with ")
+                && degraded.detail.contains("memory limit"),
+            "the detail does not name the memory death: {}",
+            degraded.detail
+        );
     }
 
     /// DS-V-2: a scan whose verification died answers no check, so each

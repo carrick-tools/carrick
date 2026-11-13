@@ -111,6 +111,11 @@ export interface LiteralAnchorRequest {
    * reads it.
    */
   absent_body_tolerated?: true;
+  /**
+   * carrick#3995: why the text is a placeholder, when the driver knows.
+   * Copied onto the alias's record; no verdict reads it.
+   */
+  unread_cause?: TypeProvenanceReason;
 }
 
 /**
@@ -260,6 +265,13 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    name) that builds a new value from it, and nothing in the chain states
  *    the body, so the value the chain ends in is not the response the call
  *    receives and no contract is published (carrick#3004).
+ *  - `not_located`: the scan found no value in the code for this payload, so
+ *    no type was read for it: no request located one, or the only locator was
+ *    a line (carrick#3995).
+ *  - `site_unreadable`: the scan located the site, but the compiler could not
+ *    read a type at it (carrick#3995).
+ *  - `unplaced_top_type`: the printed shape holds a top type at a member no
+ *    layer placed (carrick#3995). Stamped at the entry's root.
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
  */
@@ -277,6 +289,9 @@ export type TypeProvenanceReason =
   | 'body_built_by_callee'
   | 'reshaped_by_callback'
   | 'result_member_missing'
+  | 'not_located'
+  | 'site_unreadable'
+  | 'unplaced_top_type'
   | 'not_recorded';
 
 /**
@@ -393,6 +408,11 @@ export interface CaptureAliasRecord {
    * type alone.
    */
   absent_body_tolerated?: true;
+  /**
+   * carrick#3995: the literal anchor's `unread_cause`. Read only to say why
+   * the entry is untyped: never a verdict input, never in `surface_hash`.
+   */
+  unread_cause?: TypeProvenanceReason;
   /**
    * carrick#3135: lowercase hex SHA-256 of everything the judge reads for
    * this alias from its own stub: the alias's `export type` statement, every
