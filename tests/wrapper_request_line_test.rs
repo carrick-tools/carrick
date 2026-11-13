@@ -879,7 +879,7 @@ fn a_generic_wrappers_own_row_publishes_no_open_type_parameter() {
         .unwrap_or_else(|| panic!("{:#?}", consumer_entries(GENERIC)));
     assert_eq!(own["type_state"], "unknown", "{own:#}");
     assert_eq!(
-        own["any_provenance"][0]["reason"], "body_built_by_callee",
+        own["any_provenance"][0]["reason"], "bound_by_callers",
         "{own:#}"
     );
     assert_ne!(request_type_at(GENERIC, 5).as_deref(), Some("{ body: T; }"));
@@ -941,7 +941,7 @@ fn a_body_built_from_a_loose_parameter_reads_the_declared_type() {
         .unwrap_or_else(|| panic!("{:#?}", consumer_entries(GEN)));
     assert_eq!(relay["type_state"], "unknown", "{relay:#}");
     assert_eq!(
-        relay["any_provenance"][0]["reason"], "body_built_by_callee",
+        relay["any_provenance"][0]["reason"], "bound_by_callers",
         "{relay:#}"
     );
 }

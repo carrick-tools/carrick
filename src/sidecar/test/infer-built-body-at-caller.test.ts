@@ -175,7 +175,7 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
     assert.strictEqual(text, 'unknown');
     assert.deepStrictEqual(
       provenance.map((p) => p.reason),
-      ['body_built_by_callee']
+      ['bound_by_callers']
     );
   });
 
@@ -184,7 +184,7 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
     assert.strictEqual(text, 'unknown');
     assert.deepStrictEqual(
       provenance.map((p) => p.reason),
-      ['body_built_by_callee']
+      ['bound_by_callers']
     );
   });
 
@@ -227,7 +227,7 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
     assert.strictEqual(text, 'unknown');
     assert.deepStrictEqual(
       provenance.map((p) => p.reason),
-      ['body_built_by_callee']
+      ['bound_by_callers']
     );
   });
 
@@ -236,7 +236,7 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
     assert.strictEqual(text, 'unknown');
     assert.deepStrictEqual(
       provenance.map((p) => p.reason),
-      ['body_built_by_callee']
+      ['bound_by_callers']
     );
   });
 
@@ -245,7 +245,7 @@ describe('carrick#4128: a body a generic wrapper builds takes its caller instant
     assert.strictEqual(text, 'unknown');
     assert.deepStrictEqual(
       provenance.map((p) => p.reason),
-      ['body_built_by_callee']
+      ['bound_by_callers']
     );
   });
 

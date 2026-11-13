@@ -267,9 +267,7 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *  - `body_built_by_callee`: a request locator names an argument of a call
  *    into a function that builds the request body from it, and the body that
  *    function builds cannot be typed, so the argument is not the body and no
- *    contract is published (carrick#2628). Also a body built inside a generic
- *    function from its type parameter, read with no call that binds the
- *    parameter or at a call that leaves it open (carrick#4128, carrick#4164).
+ *    contract is published (carrick#2628).
  *  - `reshaped_by_callback`: a consumer call's untyped result is handed
  *    unread to a callback in its chain (`.mapOk`, `.then`, `.andThen`, any
  *    name) that builds a new value from it, and nothing in the chain states
@@ -277,7 +275,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    receives and no contract is published (carrick#3004).
  *  - `bound_by_callers`: the type here is still an open type parameter of a
  *    generic function, which only that function's callers set, so the site
- *    states no type of its own.
+ *    states no type of its own: a body or payload read with no call that binds
+ *    the parameter, or at a call that leaves it open (carrick#4128,
+ *    carrick#4164), and a response, call result, return or variable read
+ *    inside the generic function itself (carrick#4201).
  *  - `body_member_undecided`: the call's result is an object that holds the
  *    transport response beside other members, and the called function's code
  *    does not settle which member holds the parsed body.

@@ -436,15 +436,17 @@ fn path_names_a_member(path: &str) -> bool {
 /// (carrick#2200). `body_built_by_callee`: a request locator names an
 /// argument of a call into a function that builds the body from it, and the
 /// body it builds cannot be typed, so the argument is not the body
-/// (carrick#2628), or a body a generic function builds from a type parameter
-/// no call binds (carrick#4128, carrick#4164). `result_member_missing`: the library store labels which
+/// (carrick#2628). `result_member_missing`: the library store labels which
 /// part of a call's result holds the body, and the type at the call has no such
 /// part, so the site states no contract (carrick#2818). `reshaped_by_callback`:
 /// a call's untyped result is handed unread to a callback in its chain that
 /// builds a new value from it, and nothing states the body, so the value the
 /// chain ends in is not the response (carrick#3004). `bound_by_callers`: the
 /// type at the site is an open type parameter of a generic function that only
-/// its callers set. `body_member_undecided`: a call's result holds the
+/// its callers set: a body read with no call that binds it or at a call that
+/// leaves it open (carrick#4128, carrick#4164), or a response, call result,
+/// return or variable read inside that function (carrick#4201).
+/// `body_member_undecided`: a call's result holds the
 /// transport response beside other members and the called function's code does
 /// not settle which member holds the body.
 const DECIDED_ABSTAIN_REASONS: &[&str] = &[
