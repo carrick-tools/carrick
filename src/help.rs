@@ -121,9 +121,11 @@ ENVIRONMENT VARIABLES:
     CARRICK_NO_KEEP_AWAKE           The --no-keep-awake flag as a variable, for
                                     a machine that should never be kept awake
     CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the type sidecar
-                                    never became ready. Off by default: such a
-                                    run would index every endpoint with no
-                                    request or response types
+                                    never became ready, and upload a service
+                                    whose types this run lost in place of a
+                                    stored index that has them. Off by
+                                    default: such a run indexes endpoints with
+                                    no request or response types
 "#;
 
 /// The commands the `carrick` npm package adds on top of this binary's own
