@@ -30341,7 +30341,13 @@ unfollowed_member_calls_total: 0,
                 .all(|request| request.result.is_none())
         );
         // No labels: byte-identical to the requests with the label stripped.
-        let bare = site_infer_requests(&fold, &[], "/repo", &ResultIndex::default(), &HashMap::new());
+        let bare = site_infer_requests(
+            &fold,
+            &[],
+            "/repo",
+            &ResultIndex::default(),
+            &HashMap::new(),
+        );
         let strip = |items: &[crate::services::type_sidecar::InferRequestItem]| {
             items
                 .iter()
