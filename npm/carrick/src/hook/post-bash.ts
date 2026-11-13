@@ -103,10 +103,11 @@ async function main(): Promise<void> {
   const { wasRead } = reuse;
   const fresh =
     channel.channel === "hook" ? reads.filter((file) => !(session && wasRead(session, file))).slice(0, MAX_FILES) : [];
-  const { answerRead } = await import("./read-answer.ts");
-  const answers = (await Promise.all(fresh.map((file) => answerRead(file, payload.cwd, session)))).filter(
-    (line): line is string => line !== null,
-  );
+  const { answerReads } = await import("./read-answer.ts");
+  // A command that also writes keeps the binary's read answer (the edit flow's
+  // own fact lines share no cap with it).
+  const read = await answerReads(fresh, payload.cwd, session, { facts: capped.length === 0 });
+  const answers = [...read.contexts];
 
   const response = payload.tool_response;
   const output = typeof response === "string" ? response : response?.stdout;
@@ -141,6 +142,8 @@ async function main(): Promise<void> {
   }
   const { deliverLate, emitPostToolUse } = await import("./late.ts");
   emitPostToolUse([...deliverLate(session), ...answers]);
+  // Claimed only now that the lines are printed.
+  if (session) reuse.markFacts(session, read.claims);
 }
 
 await main();

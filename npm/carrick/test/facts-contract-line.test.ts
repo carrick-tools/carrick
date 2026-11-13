@@ -315,6 +315,62 @@ test("with CARRICK_CONTRACT_LINES=1 an edit prints the contract line; a Read pri
   assert.ok(!read.stdout.includes("is called from"), read.stdout);
 });
 
+// A Read never prints a contract line, whatever the switches: producer side
+// (`api/src/tasks.ts`) and consumer side (`web/src/client.ts`).
+
+/** The producer's operations and one consumer call of `GET /tasks`, contract and op rows for each. */
+function bothSides() {
+  return [
+    ...taskRows(),
+    contractRow({
+      side: "consumer",
+      repo: "web",
+      service: "web",
+      file: "src/client.ts",
+      line: 1,
+      name: "loadTasks",
+      locator: "call",
+      groups: [group("GET /tasks", A, [place("api", "src/tasks.ts", 5)], "consumer")],
+    }),
+    opRow("loadTasks", "GET /tasks", "consumer", "web", "src/client.ts", 1),
+  ];
+}
+
+const isContract = (line: string) => / which (expects|sends): /.test(line);
+
+test("a Read prints no contract line even when the caller asks for the contract kind", async (t) => {
+  const ws = await workspace(t, bothSides());
+  for (const rel of ["api/src/tasks.ts", "web/src/client.ts"]) {
+    const read = await factLines(ws.root, [{ file: ws.at(rel), read: true }], "read-contract", { home: ws.home, contract: true });
+    assert.ok(read.lines.length > 0, `${rel}: the Read prints its op lines`);
+    assert.ok(!read.lines.some(isContract), `${rel}: ${read.lines.join(" | ")}`);
+    assert.deepEqual(Object.keys(read.claims).filter((key) => key.startsWith("contract::")), [], rel);
+    // The proof is not vacuous: an edit of the same file prints a contract line.
+    const edit = await factLines(ws.root, [{ file: ws.at(rel), whole: true }], "edit-contract", { home: ws.home, contract: true });
+    assert.ok(edit.lines.some(isContract), `${rel}: ${edit.lines.join(" | ")}`);
+  }
+});
+
+test("with every switch on, the Read hook prints no contract line on either side", async (t) => {
+  const ws = await workspace(t, bothSides());
+  for (const rel of ["api/src/tasks.ts", "web/src/client.ts"]) {
+    const read = await runHook("post-read.ts", {
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Read",
+        session_id: `hook-read-all-on-${rel.split("/")[0]}`,
+        cwd: ws.root,
+        tool_input: { file_path: ws.at(rel) },
+        tool_response: { file: { filePath: ws.at(rel), content: "x" } },
+      },
+      env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_READ_LINES: "1", CARRICK_CONTRACT_LINES: "1", CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json") }),
+    });
+    assert.equal(read.code, 0);
+    assert.ok(context(read.stdout).includes("op line for"), `${rel}: the Read printed its op line: ${read.stdout}`);
+    assert.ok(!context(read.stdout).split("\n\n").some(isContract), `${rel}: ${read.stdout}`);
+  }
+});
+
 /** Every file under `dir` by relative path, with its hash. */
 function snapshot(dir: string): Map<string, string> {
   const seen = new Map<string, string>();

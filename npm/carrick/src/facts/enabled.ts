@@ -17,3 +17,13 @@ export function factsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 export function contractLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   return env["CARRICK_CONTRACT_LINES"] === "1" && factsEnabled(env);
 }
+
+/**
+ * The Read's switch: opt-in, on only when `CARRICK_READ_LINES` is exactly
+ * `"1"` and fact lines are on. Off, a Read (and a shell command that reads)
+ * takes the binary's `check` answer and never opens the fact file
+ * (`hook/read-answer.ts`).
+ */
+export function readLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env["CARRICK_READ_LINES"] === "1" && factsEnabled(env);
+}

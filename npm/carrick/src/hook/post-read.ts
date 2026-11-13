@@ -17,11 +17,11 @@ import { readStdin } from "./stdin.ts";
 import path from "node:path";
 import { resolveChannel } from "../channel.ts";
 import { createLogger } from "../log.ts";
-import { wasRead } from "./reuse.ts";
+import { markFacts, wasRead } from "./reuse.ts";
 import { sessionKey } from "./session-key.ts";
 import { markInvoker } from "./invoker.ts";
 import { deliverLate, emitPostToolUse as emit } from "./late.ts";
-import { answerRead } from "./read-answer.ts";
+import { answerReads } from "./read-answer.ts";
 import { timed, type Timing } from "./timings.ts";
 
 const log = createLogger("carrick-hook");
@@ -61,9 +61,12 @@ async function main(timing: Timing): Promise<void> {
   if (session && wasRead(session, file)) return emit(late);
 
   const waitStarted = Date.now();
-  const context = await answerRead(file, payload.cwd, session);
+  const answers = await answerReads([file], payload.cwd, session);
   timing.waitedMs = Date.now() - waitStarted;
-  emit(context ? [...late, context] : late);
+  if (answers.factsMs !== undefined) timing.factsMs = answers.factsMs;
+  emit([...late, ...answers.contexts]);
+  // Claimed only now that the lines are printed.
+  if (session) markFacts(session, answers.claims);
 }
 
 await timed("post-read", main);
