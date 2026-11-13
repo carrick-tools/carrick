@@ -429,11 +429,11 @@ pub fn request(specifiers: &BTreeSet<String>, install: &Install<'_>) -> Option<A
         };
         let wire = if asked.runtime {
             asked.package.clone()
-        } else if let Some(imported) = &asked.imported_as {
-            // An npm alias or a Deno `npm:` specifier: the store is asked
-            // under the real package, and the answer read back onto the
-            // spelling imported.
-            format!("{}{}", asked.package, &specifier[imported.len()..])
+        } else if asked.imported_as.is_some() {
+            // An npm alias, a Deno `npm:` specifier or an import-map entry
+            // for one: the store is asked under the real package, and the
+            // answer read back onto the spelling imported.
+            format!("{}{}", asked.package, asked.subpath)
         } else {
             specifier.clone()
         };
@@ -609,9 +609,9 @@ pub fn ask_health(specifiers: &BTreeSet<String>, install: &Install<'_>) -> AskHe
         if npm_specifier(specifier).is_some() {
             deno_lock_dirs.extend(lock_dir(install.service_root, install.repo_root));
         }
-        if let Some(package) = located(specifier, install) {
+        if let Some((package, resolved)) = located(specifier, install) {
             installed_names.insert(
-                crate::request_summary::package_name(specifier).to_string(),
+                crate::request_summary::package_name(&resolved).to_string(),
                 package,
             );
         }
@@ -691,6 +691,9 @@ struct AskedAs {
     /// The package name the service imports it by, when that is an npm alias
     /// for `package`.
     imported_as: Option<String>,
+    /// What follows the package in the specifier the install resolved (`/jsx`
+    /// of `npm:hono@4/jsx`): the wire's subpath for an alias.
+    subpath: String,
 }
 
 /// The package and version `specifier` is asked about, if it is asked about
@@ -711,6 +714,7 @@ fn asked_as(
             version: runtime.version.clone(),
             runtime: true,
             imported_as: None,
+            subpath: String::new(),
         })
     };
     // `node:events`: the runtime's module, at its types package's version.
@@ -724,15 +728,16 @@ fn asked_as(
     {
         return Some(asked);
     }
-    let name = crate::request_summary::package_name(specifier);
-    let package = located(specifier, install)?;
-    let spelling = crate::request_summary::package_spelling(specifier);
+    let (package, resolved) = located(specifier, install)?;
+    let name = crate::request_summary::package_name(&resolved);
+    let spelling = crate::request_summary::package_spelling(&resolved);
     from_public_registry(name, &package, install).then(|| AskedAs {
         // An npm alias (`npm:<real>@<range>`) is asked under the real name its
         // installed manifest states, and a Deno `npm:` specifier under the
         // name its lock resolves, never the spelling (the store serves only
         // names npm does).
         imported_as: (package.name != spelling).then(|| spelling.to_string()),
+        subpath: resolved[spelling.len()..].to_string(),
         package: package.name,
         version: package.version,
         runtime: false,
@@ -750,18 +755,57 @@ fn npm_specifier(specifier: &str) -> Option<crate::request_summary::RegistrySpec
 /// lockfile, from the service root up to the repo root (carrick#4070,
 /// carrick#1722): what Deno's install recorded for that request, whether or
 /// not it wrote a `node_modules`. Any other specifier resolves to its
-/// installed copy ([`installed`]).
-fn located(specifier: &str, install: &Install<'_>) -> Option<Installed> {
+/// installed copy ([`installed`]); with none, a bare specifier the nearest
+/// Deno import map sends to an `npm:` package resolves as that package.
+/// Alongside the copy, the specifier it was resolved as (the `npm:` target of
+/// an import-map entry, else `specifier` itself).
+fn located(specifier: &str, install: &Install<'_>) -> Option<(Installed, String)> {
     let Some(npm) = npm_specifier(specifier) else {
-        return installed(crate::request_summary::package_name(specifier), install);
+        if let Some(package) = installed(crate::request_summary::package_name(specifier), install) {
+            return Some((package, specifier.to_string()));
+        }
+        let mapped = import_mapped_npm(specifier, install)?;
+        let npm = npm_specifier(&mapped)?;
+        return Some((locked(&npm, install)?, mapped));
     };
+    Some((locked(&npm, install)?, specifier.to_string()))
+}
+
+/// The copy a `deno.lock` records for `npm`.
+fn locked(
+    npm: &crate::request_summary::RegistrySpecifier<'_>,
+    install: &Install<'_>,
+) -> Option<Installed> {
     let dir = lock_dir(install.service_root, install.repo_root)?;
-    let (name, version) = deno_lock_resolve(&dir.join("deno.lock"), &npm)?;
+    let (name, version) = deno_lock_resolve(&dir.join("deno.lock"), npm)?;
     Some(Installed {
         dir: dir.clone(),
         name,
         version,
         install_root: dir,
+    })
+}
+
+/// The `npm:` specifier the nearest Deno config's import map sends the bare
+/// `specifier` to: an exact key, else the longest key ending in `/` that
+/// prefixes it, with the rest of the specifier appended to the target.
+fn import_mapped_npm(specifier: &str, install: &Install<'_>) -> Option<String> {
+    let facts = roots(install.service_root, install.repo_root)
+        .into_iter()
+        .find_map(|dir| crate::deno_support::manifest_at(&dir))
+        .and_then(|config| crate::packages::read_manifest(&config).ok())?;
+    let exact = facts
+        .npm_imports
+        .iter()
+        .find(|(key, _)| key == specifier)
+        .map(|(_, target)| target.clone());
+    exact.or_else(|| {
+        facts
+            .npm_imports
+            .iter()
+            .filter(|(key, _)| key.ends_with('/') && specifier.starts_with(key.as_str()))
+            .max_by_key(|(key, _)| key.len())
+            .map(|(key, target)| format!("{target}{}", &specifier[key.len()..]))
     })
 }
 
@@ -3442,6 +3486,35 @@ mod tests {
             .collect();
         spellings.sort();
         spellings
+    }
+
+    /// carrick#4070 T1b: a bare import the Deno import map sends to an `npm:`
+    /// package is asked as that package when no `node_modules` holds it.
+    #[test]
+    fn a_bare_import_mapped_to_npm_without_node_modules_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("deno.lock"), DENO_V5);
+        write(
+            &dir.path().join("deno.json"),
+            r#"{"imports": {"c": "npm:chalk@5.3.0", "c/": "npm:chalk@5.3.0/", "other": "jsr:@std/path@1"}}"#,
+        );
+        let imports = ["c", "c/sub", "other"];
+        let ask = request(&specifiers(&imports), &install_at(dir.path())).unwrap();
+        assert_eq!(read_back(&ask, "chalk", "5.3.0"), vec!["c", "c/sub"]);
+        assert_eq!(
+            asked(Some(ask)),
+            one("chalk", "5.3.0", &["chalk", "chalk/sub"])
+        );
+        // An installed copy still outranks the map.
+        write(
+            &dir.path().join("deno.json"),
+            r#"{"imports": {"chalk": "npm:elsewhere@1"}}"#,
+        );
+        install_package(dir.path(), "chalk", "5.3.0");
+        assert_eq!(
+            asked(request(&specifiers(&["chalk"]), &install_at(dir.path()))),
+            one("chalk", "5.3.0", &["chalk"])
+        );
     }
 
     /// carrick#4070: a Deno `npm:` specifier is asked under the package its
