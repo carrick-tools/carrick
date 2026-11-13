@@ -1,0 +1,108 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/broker",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/broker",
+          "export": "BrokerClient",
+          "role": "broker",
+          "label": "broker",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "publish", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "subscribe", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/jobs",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/jobs",
+          "export": "JobQueue",
+          "role": "broker",
+          "label": "broker",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "add", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "@fixture/jobs",
+          "export": "enqueue",
+          "role": "broker",
+          "label": "broker",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": null, "on": "export", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/streams",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture/streams",
+          "export": "Subject",
+          "role": "in_process_bus",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "next", "of": "instance:new", "payload": { "arg": 0 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "subscribe", "of": "instance:new", "handler": { "arg": 0 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "node:events",
+      "version": "22.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "node:events",
+          "export": "EventEmitter",
+          "role": "in_process_bus",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "send", "member": "emit", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "on", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

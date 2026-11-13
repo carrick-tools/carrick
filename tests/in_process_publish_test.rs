@@ -286,6 +286,14 @@ fn broker_rows_stay_when_detection_lists_nothing() {
         let entry = entry.expect("answer file");
         std::fs::copy(entry.path(), analyze.join(entry.file_name())).expect("copy answer");
     }
+    // The store's answer for the installed packages is not detection: keep it.
+    let claims = cassettes.path().join("library-claims");
+    std::fs::create_dir_all(&claims).expect("library-claims dir");
+    std::fs::copy(
+        fixture_dir().join("__llm__/library-claims/default.json"),
+        claims.join("default.json"),
+    )
+    .expect("copy library claims");
     // The recorded detection answer with every list emptied.
     let recorded = fixture_dir().join("__llm__/framework-detect/framework-detect.json");
     let mut detection: serde_json::Value =
