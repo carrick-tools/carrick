@@ -236,6 +236,9 @@ pub struct SiteRows {
     /// that request (carrick#4121). The fold withdraws the request line's
     /// reader row where a fact row stands at every one of those calls.
     pub held_open: Vec<HeldOpen>,
+    /// The sites a scope check the trace's ask got no answer for could
+    /// have decided ([`Decided::scopes_unanswered`], carrick#4155).
+    pub scopes_unanswered: std::collections::BTreeSet<(String, u32, u32)>,
 }
 
 /// A request line held open by functions called directly where a module is
@@ -1043,6 +1046,7 @@ pub fn of(
         names: site_names(decided, records),
         dry_run_names: decided.dry_run_names.clone(),
         held_open: Vec::new(),
+        scopes_unanswered: decided.scopes_unanswered.clone(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {

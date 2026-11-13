@@ -129,12 +129,20 @@ pub struct GraphqlMount {
     pub stop: Option<Stop>,
 }
 
+/// What the trace's ask returned for each scope check
+/// ([`super::super::discovery::MemberDeclarations::scope_answers`]).
+type ScopeAnswers =
+    HashMap<super::super::discovery::AskedScope, super::super::discovery::ScopeAnswer>;
+
 /// The member declarations the request's verdicts name for the claim
-/// `claim_id` of `export`, sorted and without repeats.
+/// `claim_id` of `export`, sorted and without repeats. A claim the ask got
+/// no answer for names none: no procedure label reads it (carrick#4155:
+/// a dead ask leaves the procedure ops themselves unread, saved
+/// `unanswered` by [`super::super::discovery::Discovery::declarations_unanswered`]).
 fn verified_declarations(
     export: &crate::library_claims::ExportClaims,
     claim_id: &str,
-    verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
+    verified: &ScopeAnswers,
 ) -> Vec<(String, u32)> {
     let mut declarations: Vec<(String, u32)> = verified
         .iter()
@@ -143,7 +151,9 @@ fn verified_declarations(
                 && asked.export == export.export
                 && asked.claim_id == claim_id
         })
-        .flat_map(|(_, declarations)| declarations.iter().cloned())
+        .filter_map(|(_, answer)| answer.verified())
+        .flatten()
+        .cloned()
         .collect();
     declarations.sort();
     declarations.dedup();
@@ -156,7 +166,7 @@ impl ProcedureLabels {
     /// and receiver, as [`ScopeLabel::from_exports`] reads them).
     pub fn from_exports(
         exports: &[crate::library_claims::ExportClaims],
-        verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
+        verified: &ScopeAnswers,
     ) -> Self {
         use crate::services::type_sidecar::{
             BoundName, ClaimProtocol, LibraryClaim, MakeForm, OpName,

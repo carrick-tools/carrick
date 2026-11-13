@@ -733,13 +733,25 @@ pub fn cap(mut rows: Vec<UnreadSite>) -> Capped {
 
 /// Write a service's unread sites on its blob: the possible calls the fold
 /// lists (`listed`) and the other stops it kept (`stops`), as one list.
-/// `possible_calls` is written from that list's listed rows.
-pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[PossibleCall]) {
+/// `possible_calls` is written from that list's listed rows. Each row at a
+/// site of `scopes_unanswered` ([`Decided::scopes_unanswered`]) says
+/// `unanswered` beside its own reason.
+pub fn attach(
+    data: &mut CloudRepoData,
+    stops: Vec<UnreadSite>,
+    listed: &[PossibleCall],
+    scopes_unanswered: &BTreeSet<(String, u32, u32)>,
+) {
     let mut rows: Vec<UnreadSite> = listed.iter().map(UnreadSite::listed).collect();
     rows.extend(stops.into_iter().map(|row| UnreadSite {
         listed: false,
         ..row
     }));
+    // A site the decided pass could have scoped had the trace's ask
+    // answered (carrick#4155): each row there, possible call or not.
+    for (file, lo, hi) in scopes_unanswered {
+        mark_unanswered(&mut rows, (file.as_str(), *lo, *hi), |_| true);
+    }
     crate::possible_calls::attach(
         data,
         rows.iter()
@@ -1196,7 +1208,7 @@ mod tests {
         assert_eq!(capped.rows[2].file, "b.ts");
         assert_eq!(capped.rows[3].file, "c.ts");
         let mut data = blob();
-        attach(&mut data, capped.rows, &[]);
+        attach(&mut data, capped.rows, &[], &BTreeSet::new());
         assert!(data.unread_sites_not_listed.is_none());
     }
 
@@ -1209,6 +1221,7 @@ mod tests {
             &mut data,
             vec![stop("a.ts", 3, Stop::ValueCallee)],
             &[listed],
+            &BTreeSet::new(),
         );
         let rows = data.unread_sites.unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -1241,6 +1254,7 @@ mod tests {
             &mut data,
             vec![stop("a.ts", 7, Stop::ValueCallee), labelled_stop],
             &listed,
+            &BTreeSet::new(),
         );
         assert_eq!(
             serde_json::to_value(&data.possible_calls).unwrap(),
@@ -1298,6 +1312,7 @@ mod tests {
                 },
             ],
             &[],
+            &BTreeSet::new(),
         );
         let wire = serde_json::to_value(&data).unwrap();
         assert_eq!(
