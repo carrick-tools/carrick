@@ -342,6 +342,15 @@ impl UnreadItem {
 /// Unread calls a human answer lists before it counts the rest.
 const MAX_UNREAD_LINES: usize = 8;
 
+/// The [`crate::request_summary::Stop`] word of a site the scan asked about and
+/// got no answer for.
+const UNANSWERED_REASON: &str = "unanswered";
+
+/// What a re-check with no ready compiler engine says in place of one line per
+/// unanswered library site (carrick#3948).
+const ENGINE_NOT_READY_LINE: &str =
+    "Library calls in this file were not checked on this edit: the compiler engine was not ready.";
+
 /// What the type check did, as a check answer states it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TypeCheckState {
@@ -881,6 +890,17 @@ impl CheckOutput {
             .is_some_and(|recheck| recheck.ran != "none")
     }
 
+    /// This answer came from a re-check whose compiler engine was not ready
+    /// (`recheck.engine_ready`), so its `unanswered` sites are that re-check's
+    /// own gap.
+    fn engine_not_ready_on_recheck(&self) -> bool {
+        self.rechecked()
+            && self
+                .recheck
+                .as_ref()
+                .is_some_and(|recheck| recheck.engine_ready == Some(false))
+    }
+
     /// The human form: the same content in the same order, for a model reading
     /// a terminal.
     pub fn render(&self) -> String {
@@ -959,17 +979,30 @@ impl CheckOutput {
             out.push('\n');
         }
 
-        if !self.unread.is_empty() {
-            for item in self.unread.iter().take(MAX_UNREAD_LINES) {
+        // A re-check with no ready engine saved every library site it asked
+        // about `unanswered`; one line says so, and the sites stay saved in
+        // the blob (carrick#3948). Other reasons list as before.
+        let (collapsed, unread): (Vec<&UnreadItem>, Vec<&UnreadItem>) =
+            self.unread.iter().partition(|item| {
+                self.engine_not_ready_on_recheck() && item.reason == UNANSWERED_REASON
+            });
+        if !collapsed.is_empty() {
+            out.push_str(ENGINE_NOT_READY_LINE);
+            out.push('\n');
+        }
+        if !unread.is_empty() {
+            for item in unread.iter().take(MAX_UNREAD_LINES) {
                 out.push_str(&item.line());
                 out.push('\n');
             }
-            if self.unread.len() > MAX_UNREAD_LINES {
+            if unread.len() > MAX_UNREAD_LINES {
                 out.push_str(&format!(
                     "and {} more calls Carrick could not read in this file.\n",
-                    self.unread.len() - MAX_UNREAD_LINES
+                    unread.len() - MAX_UNREAD_LINES
                 ));
             }
+        }
+        if !self.unread.is_empty() {
             out.push('\n');
         }
 
@@ -1622,6 +1655,7 @@ mod tests {
         answer
     }
 
+    /// The sentence, written out so a change to the one in the code shows here.
     const ENGINE_NOT_READY_LINE: &str = "Library calls in this file were not checked on this edit: the compiler engine was not ready.";
 
     /// carrick#3948: a re-check whose engine was not ready prints one line for

@@ -118,12 +118,24 @@ pub struct Fresh {
 }
 
 /// Whether the compiler engine was ready for the re-scan that built `index`
-/// for repo `name`: no service of it records that the engine was not found
-/// (`spawn`) or missed its ready budget (`init`). A died-mid-run engine
-/// (`resolve`, `capture`) was ready, so it is not a "not ready" here.
-pub(super) fn engine_ready_of(index: &super::read_model::LocalIndex, name: &str) -> bool {
-    let _ = (index, name);
-    true
+/// for repo `name`: none of the `reread` services records that the engine was
+/// not found (`spawn`) or missed its ready budget (`init`). A service carried
+/// from the index was not part of this re-scan, so its record says nothing. A
+/// died-mid-run engine (`resolve`, `capture`) was ready, so it is not a "not
+/// ready" here.
+pub(super) fn engine_ready_of(
+    index: &super::read_model::LocalIndex,
+    name: &str,
+    reread: &[String],
+) -> bool {
+    !index
+        .repos
+        .iter()
+        .filter(|repo| repo.name == name)
+        .flat_map(|repo| repo.services.iter())
+        .filter(|service| reread.contains(&service.name))
+        .filter_map(|service| service.boundary.as_ref()?.types_degraded.as_ref())
+        .any(|degraded| matches!(degraded.stage.as_str(), "spawn" | "init"))
 }
 
 /// How many new functions one answer carries.
@@ -1161,7 +1173,7 @@ fn inside(
         elapsed: Duration::default(),
         scope: plan.scope.clone(),
         moved,
-        engine_ready: engine_ready_of(&rejoined.index, &name),
+        engine_ready: engine_ready_of(&rejoined.index, &name, &plan.scope.reread),
     })
 }
 
@@ -2023,14 +2035,23 @@ mod tests {
         let degraded = |stage: &str| {
             index(serde_json::json!({ "types_degraded": { "stage": stage, "detail": "x" } }))
         };
-        assert!(!engine_ready_of(&degraded("spawn"), "web"));
-        assert!(!engine_ready_of(&degraded("init"), "web"));
-        assert!(engine_ready_of(&degraded("resolve"), "web"));
-        assert!(engine_ready_of(&index(serde_json::json!(null)), "web"));
-        assert!(engine_ready_of(&index(serde_json::json!({})), "web"));
+        let read = vec!["web".to_string()];
+        assert!(!engine_ready_of(&degraded("spawn"), "web", &read));
+        assert!(!engine_ready_of(&degraded("init"), "web", &read));
+        assert!(engine_ready_of(&degraded("resolve"), "web", &read));
+        assert!(engine_ready_of(
+            &index(serde_json::json!(null)),
+            "web",
+            &read
+        ));
+        assert!(engine_ready_of(&index(serde_json::json!({})), "web", &read));
         assert!(
-            engine_ready_of(&degraded("spawn"), "another-repo"),
+            engine_ready_of(&degraded("spawn"), "another-repo", &read),
             "another repo's record says nothing about this re-scan"
+        );
+        assert!(
+            engine_ready_of(&degraded("spawn"), "web", &["other".to_string()]),
+            "a service this re-check did not re-read says nothing about it"
         );
     }
 

@@ -1,6 +1,6 @@
 // How long each hook held the agent, written down so a slow one is seen.
 //
-// Every hook invocation appends one line to `<root>/.carrick/hook-timings.jsonl`:
+// Every hook invocation, and every background re-check the runner finishes, appends one line to `<root>/.carrick/hook-timings.jsonl`:
 // which hook, when it started, how long it ran, how much of that it spent
 // blocking on a check, and what it did. No code, no file contents, no path
 // beyond the workspace-relative edited file. The file keeps its last
@@ -17,7 +17,14 @@ import { performance } from "node:perf_hooks";
 import { initialisedRoot } from "../init/outdated.ts";
 import { writeAtomic } from "./reuse.ts";
 
-export type TimedHook = "session-start" | "post-read" | "post-edit" | "prompt-submit" | "stop" | "subagent-stop";
+export type TimedHook =
+  | "session-start"
+  | "post-read"
+  | "post-edit"
+  | "recheck"
+  | "prompt-submit"
+  | "stop"
+  | "subagent-stop";
 
 export type Outcome = "printed" | "silent" | "error";
 
@@ -40,6 +47,12 @@ export type TimingRecord = {
    * fallback carrick#3966 retires).
    */
   uses_fallback?: true;
+  /**
+   * Post-edit and re-check rows, when the answer they read says: whether the
+   * compiler engine was ready for the re-scan (`recheck.engine_ready`), so the
+   * rate of re-checks that missed it can be read later (carrick#3948).
+   */
+  engine_ready?: boolean;
 };
 
 /** The file keeps this many of its last lines. */
@@ -49,6 +62,7 @@ export const WINDOW_MS = 7 * 24 * 60 * 60_000;
 /** A hook whose p90 is above this is named at session start. */
 export const SLOW_HOOK_MS = 1000;
 
+/** The hooks whose own duration `carrick status` and the session start report; a `recheck` row runs in the background, so the agent never waits on it. */
 const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "prompt-submit", "stop", "subagent-stop"];
 
 export function timingsPath(root: string): string {
@@ -66,7 +80,15 @@ export type Timing = {
   factsMs?: number;
   /** The uses-count line was printed because no fact file covered the file. */
   usesFallback?: boolean;
+  /** Whether the compiler engine was ready for the re-scan the answer came from, when it says. */
+  engineReady?: boolean;
 };
+
+/** `recheck.engine_ready` of an answer, or undefined where no re-scan ran. */
+export function engineReadyOf(result: { recheck?: { engine_ready?: boolean } } | null | undefined): boolean | undefined {
+  const ready = result?.recheck?.engine_ready;
+  return typeof ready === "boolean" ? ready : undefined;
+}
 
 /** Append `record` to the file under `root` and trim it to `MAX_LINES`. Never throws. */
 export function appendTiming(root: string, record: TimingRecord): void {
@@ -204,6 +226,7 @@ export async function timed(
         };
         if (timing.factsMs !== undefined) record.facts_ms = timing.factsMs;
         if (timing.usesFallback) record.uses_fallback = true;
+        if (timing.engineReady !== undefined) record.engine_ready = timing.engineReady;
         if (timing.file) record.file = path.isAbsolute(timing.file) ? path.relative(root, timing.file) : timing.file;
         appendTiming(root, record);
       }
