@@ -13,9 +13,12 @@
 //!   payload: a GET.
 //! - `lib/uploads.ts` sends a payload with `method: "POST"` written beside it.
 //!
-//! The first three keep the model's verb. The last two used to take the
-//! helper's; that pass is deleted and they keep the model's too (#2676), so
-//! only the first three are asserted.
+//! None of the first three is overruled to a GET. Their helpers write nothing
+//! of the model's path either, so each model row is withdrawn and the site
+//! saved unread (carrick#4206): no row there states a GET, or anything. The
+//! last two used to take the helper's verb; that pass is deleted and they keep
+//! the model's (#2676). `catalog.search` writes `/v1/catalog`, so the search
+//! screen's row stands.
 //!
 //! See `tests/fixtures/payload-without-method/README.md` for the answer key.
 
@@ -63,9 +66,6 @@ fn a_payload_with_no_method_does_not_state_a_get() {
     rows.sort();
 
     let expected: Vec<(String, i64, String)> = [
-        ("src/checkout.ts", 4, "POST"),
-        ("src/profile-screen.ts", 4, "PUT"),
-        ("src/refund-screen.ts", 4, "POST"),
         ("src/search-screen.ts", 4, "GET"),
         ("src/upload-screen.ts", 4, "POST"),
     ]
