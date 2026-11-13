@@ -53,6 +53,11 @@ on:
         required: false
         default: false
         type: boolean
+      lock_refresh_version:
+        description: "Run only the lockfile refresh (job lock-refresh-only) against this already-published version, e.g. 0.3.154. Nothing is cut or published. With dry_run it prints the diff and opens no PR. Leave empty for a normal run."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -83,7 +88,7 @@ jobs:
   # `tag` (the rescue path, which skips it). A dispatch naming both, or
   # neither, fails here.
   cut:
-    if: ${{ github.event_name == 'push' || inputs.tag == '' || inputs.cut_sha != '' }}
+    if: ${{ github.event_name == 'push' || (inputs.lock_refresh_version == '' && (inputs.tag == '' || inputs.cut_sha != '')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -860,30 +865,31 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.target.outputs.version }}
-        run: |
-          set -euo pipefail
-          LOCK=npm/carrick/package-lock.json
-          HAVE=$(node -p "require('./$LOCK').version")
-          if [ "$HAVE" != "$VERSION" ]; then
-            echo "::notice::main's lockfile is at $HAVE, not $VERSION; a newer release owns the refresh."
-            exit 0
-          fi
-          python3 scripts/npm-lock-refresh.py "$VERSION" "$LOCK"
-          if git diff --quiet -- "$LOCK"; then
-            echo "The lockfile already carries the $VERSION entries; nothing to open."
-            exit 0
-          fi
-          BRANCH="lock-refresh-$VERSION"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add "$LOCK"
-          git commit -m "chore(npm): refresh lockfile platform entries to $VERSION" \
-            -m "Mechanical: the five @carrick-tools/cli-* entries take the published version's resolved URL and integrity (carrick#3789)."
-          git push --force origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
-            --title "chore(npm): refresh lockfile platform entries to $VERSION" \
-            --body "Mechanical, opened by release.yml after $VERSION was published. Only the five \`node_modules/@carrick-tools/cli-*\` entries change (version, resolved, integrity), from \`npm view\`. Merges on green. Refs #3789."
+        run: bash scripts/npm-lock-refresh-pr.sh
+
+  # The same refresh on its own, for a version that is already published
+  # (workflow_dispatch `lock_refresh_version`): proves the step without a
+  # release, or reruns it when the job above failed. With `dry_run` it prints
+  # the diff and opens nothing. The version goes through the environment, and
+  # the script refuses anything that is not x.y.z.
+  lock-refresh-only:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.lock_refresh_version != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Refresh the platform entries
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.lock_refresh_version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bash scripts/npm-lock-refresh-pr.sh
 
   # The VS Code extension, packaged at the release version and published to the
   # galleries. Its own job on purpose: the extension is a manifest that starts

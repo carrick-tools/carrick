@@ -9,12 +9,14 @@ each publish `npm ci` fails on main until those five entries are refreshed
     python3 scripts/npm-lock-refresh.py <version> [lockfile]
 
 Tests: scripts/npm-lock-refresh.test.py. Read by .github/workflows/release.yml
-(job `lock-refresh`).
+(jobs `lock-refresh` and `lock-refresh-only`, through
+scripts/npm-lock-refresh-pr.sh).
 """
 import json
 import pathlib
 import subprocess
 import sys
+import time
 
 PREFIX = "node_modules/@carrick-tools/cli-"
 DEFAULT_LOCK = pathlib.Path(__file__).resolve().parent.parent / "npm" / "carrick" / "package-lock.json"
@@ -25,13 +27,24 @@ def fail(message):
     sys.exit(1)
 
 
-def npm_view(name, version):
+# The registry can lag a publish by a minute or two (carrick#4137): retry the
+# lookup before calling a freshly published version missing.
+ATTEMPTS = 8
+WAIT_SECONDS = 20
+
+
+def npm_view(name, version, run=subprocess.run, sleep=time.sleep):
     """(tarball url, integrity) the registry serves for name@version."""
-    out = subprocess.run(
-        ["npm", "view", f"{name}@{version}", "dist.tarball", "dist.integrity", "--json"],
-        capture_output=True, text=True)
-    if out.returncode != 0:
-        fail(f"npm view {name}@{version} failed: {out.stderr.strip()[:300]}")
+    for attempt in range(1, ATTEMPTS + 1):
+        out = run(
+            ["npm", "view", f"{name}@{version}", "dist.tarball", "dist.integrity", "--json"],
+            capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            break
+        if attempt == ATTEMPTS:
+            fail(f"npm view {name}@{version} failed after {ATTEMPTS} tries: {out.stderr.strip()[:300]}")
+        print(f"npm view {name}@{version} not served yet (try {attempt}/{ATTEMPTS}); waiting {WAIT_SECONDS}s")
+        sleep(WAIT_SECONDS)
     dist = json.loads(out.stdout)
     return dist.get("dist.tarball", ""), dist.get("dist.integrity", "")
 

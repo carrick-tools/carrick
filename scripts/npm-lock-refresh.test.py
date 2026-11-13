@@ -116,9 +116,33 @@ class Wiring(unittest.TestCase):
         body = self.job(self.rel, "lock-refresh")
         self.assertRegex(body, r"needs: \[target, publish\]")
         self.assertIn("is_latest == 'true'", body)
-        self.assertIn("scripts/npm-lock-refresh.py", body)
-        self.assertIn("chore(npm): refresh lockfile platform entries", body)
+        self.assertIn("scripts/npm-lock-refresh-pr.sh", body)
         self.assertIn("RELEASE_PLEASE_TOKEN", body)
+        script = (ROOT / "scripts/npm-lock-refresh-pr.sh").read_text()
+        self.assertIn("scripts/npm-lock-refresh.py", script)
+        self.assertIn("chore(npm): refresh lockfile platform entries", script)
+
+    def test_dispatch_runs_the_refresh_alone(self):
+        body = self.job(self.rel, "lock-refresh-only")
+        self.assertIn("inputs.lock_refresh_version != ''", body)
+        self.assertIn("scripts/npm-lock-refresh-pr.sh", body)
+        self.assertIn("RELEASE_PLEASE_TOKEN", body)
+        self.assertNotIn("needs:", body)
+        # The cut must not run on that dispatch.
+        self.assertIn("inputs.lock_refresh_version == ''", self.job(self.rel, "cut"))
+
+    def test_registry_lookup_retries_then_gives_up(self):
+        class R:
+            def __init__(self, code, out=""):
+                self.returncode, self.stdout, self.stderr = code, out, "E404"
+        good = R(0, json.dumps({"dist.tarball": "u", "dist.integrity": "sha512-x"}))
+        seq = [R(1), R(1), good]
+        waits = []
+        got = nlr.npm_view("a/b", "1.0.0", run=lambda *a, **k: seq.pop(0), sleep=waits.append)
+        self.assertEqual(got, ("u", "sha512-x"))
+        self.assertEqual(len(waits), 2)
+        with self.assertRaises(SystemExit):
+            nlr.npm_view("a/b", "1.0.0", run=lambda *a, **k: R(1), sleep=lambda s: None)
 
     def test_publish_job_is_unchanged_by_the_refresh(self):
         self.assertNotIn("npm-lock-refresh", self.job(self.rel, "publish"))
