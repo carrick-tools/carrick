@@ -313,16 +313,47 @@ fn observe(
 /// Run the same edit on two identical workspaces, as shipped and with the
 /// retype off, and return both.
 fn both(make: fn() -> tempfile::TempDir, edit_it: impl Fn(&Path) + Copy) -> (Observed, Observed) {
+    both_with_env(make, edit_it, &[])
+}
+
+/// `both`, with an environment every command of both runs shares.
+fn both_with_env(
+    make: fn() -> tempfile::TempDir,
+    edit_it: impl Fn(&Path) + Copy,
+    env: &[(&str, &str)],
+) -> (Observed, Observed) {
     let shipped_root = make();
-    let shipped = observe(shipped_root.path(), edit_it, &[], &[]);
+    let shipped = observe(shipped_root.path(), edit_it, env, env);
     let skipped_root = make();
-    let skipped = observe(
-        skipped_root.path(),
-        edit_it,
-        &[],
-        &[(SKIP_RETYPE_FOR_TEST_ENV, "1")],
-    );
+    let mut skip_env = env.to_vec();
+    skip_env.push((SKIP_RETYPE_FOR_TEST_ENV, "1"));
+    let skipped = observe(skipped_root.path(), edit_it, env, &skip_env);
     (shipped, skipped)
+}
+
+/// A mock fixture dir holding the library store's answer for `socket.io` and
+/// `socket.io-client` as the parity test's cassettes give it for the corpus's
+/// two socket repos. Socket rows are the fact layer's alone (carrick#3854), so
+/// a refresh with no claims states none and no socket pair forms.
+fn socket_claims_cassette() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut claims = Vec::new();
+    for repo in ["payments-svc", "web-frontend"] {
+        let path = fixtures()
+            .join("socket-claims-xrepo/corpus-1")
+            .join(repo)
+            .join("__llm__/library-claims/default.json");
+        let answer = read_json(&path);
+        claims.extend(answer["library_claims"].as_array().expect("claims").clone());
+    }
+    let target = dir.path().join("library-claims");
+    std::fs::create_dir_all(&target).expect("create cassette dir");
+    std::fs::write(
+        target.join("default.json"),
+        serde_json::to_string(&serde_json::json!({ "library_claims": claims })).unwrap(),
+    )
+    .expect("write cassette");
+    dir
 }
 
 /// Run the same edit on two identical workspaces, with the join's settle on
@@ -658,7 +689,13 @@ fn socket_pair_check_changed_is_the_same_without_the_retype() {
             "  amountCents: string;\n  status:",
         );
     };
-    let (shipped, skipped) = both(socket_workspace, payload_edit);
+    let claims = socket_claims_cassette();
+    let cassettes = claims.path().to_str().expect("utf-8 path");
+    let (shipped, skipped) = both_with_env(
+        socket_workspace,
+        payload_edit,
+        &[("CARRICK_MOCK_FIXTURE_DIR", cassettes)],
+    );
 
     assert!(
         shipped
@@ -737,7 +774,13 @@ fn socket_pair_prints_the_same_with_the_join_settle_off() {
             "  amountCents: string;\n  status:",
         );
     };
-    let (on, off) = settle_on_off(socket_workspace, payload_edit, &[]);
+    let claims = socket_claims_cassette();
+    let cassettes = claims.path().to_str().expect("utf-8 path");
+    let (on, off) = settle_on_off(
+        socket_workspace,
+        payload_edit,
+        &[("CARRICK_MOCK_FIXTURE_DIR", cassettes)],
+    );
     assert!(
         on.text
             .contains("incompatible  route SERVER->CLIENT payment:settled"),
