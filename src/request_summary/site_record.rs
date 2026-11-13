@@ -3461,6 +3461,80 @@ mod tests {
         assert!(!whole.to_string().contains("Unwritten"), "{whole}");
     }
 
+    /// carrick#4128: a socket emit whose wrapper builds the payload itself
+    /// (the call below states it, the caller decides the name) fills the
+    /// request slot with the value the wrapper builds, read where the
+    /// wrapper builds it.
+    #[test]
+    fn a_request_slot_is_the_body_a_call_below_builds() {
+        let fixture = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&fixture);
+        let session = std::fs::read_to_string(fixture.join("src/realtime/session.ts")).unwrap();
+        let call = "wire.emit(name, { at: Date.now() })";
+        let start = session.find(call).unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+        let end = super::super::decided_sites::LabelledEnd {
+            package: "@fixture/wire".into(),
+            export: "connect".into(),
+            member: Some("emit".into()),
+            role: "socket".into(),
+            op: Some("send".into()),
+            file: "src/realtime/session.ts".into(),
+            line: 7,
+            span_start: start,
+            new: false,
+            scope: None,
+            procedure: None,
+            span_end: start + call.len() as u32,
+        };
+        let site = super::super::decided_sites::DiscoverySite {
+            file: end.file.clone(),
+            line: end.line,
+            span_start: end.span_start,
+            span_end: end.span_end,
+            callee: "wire.emit".into(),
+            end: Some(end),
+            chain: Vec::new(),
+            stop: None,
+            receiver: None,
+            reached: None,
+            bound: Vec::new(),
+        };
+        let answer: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        )
+        .unwrap();
+        let labels = SiteLabel::from_store_answer(&answer);
+        let decided = decided_sites(&inputs, &fixture, &[site], &labels);
+        let records = site_records(&inputs, &[], &fixture, &decided, &labels);
+        let record = records
+            .iter()
+            .find(|record| record.state.point.at == "src/realtime/rooms.ts:4")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:#?}",
+                    records
+                        .iter()
+                        .map(|r| &r.state.point.at)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(record.anchors.payload_at, None);
+        let (span_start, span_end) = {
+            let body = "{ at: Date.now() }";
+            let lo = session.find(body).unwrap() as u32 + crate::swc_scanner::SWC_SPAN_BASE;
+            (lo, lo + body.len() as u32)
+        };
+        assert_eq!(
+            record.payloads.request,
+            Some(PayloadAt::Value(AnchorAt {
+                file: "src/realtime/session.ts".to_string(),
+                line: 7,
+                span_start,
+                span_end,
+            }))
+        );
+    }
+
     /// The records of `env.ts`: each call its own discovery site.
     fn env_records() -> (Vec<SiteRecord>, String) {
         let root = decided_fixture();
@@ -3878,7 +3952,7 @@ mod tests {
     /// (carrick#2519, carrick#2520).
     #[test]
     fn a_composed_path_forces_the_name_and_the_basis_is_recorded() {
-        use crate::request_summary::decided_sites::tests::{PATHS, paths_decided};
+        use super::super::decided_sites::tests::{PATHS, paths_decided};
         let root = decided_fixture();
         let inputs = crate::engine::discover_request_inputs(&root);
         let (decided, text) = paths_decided();

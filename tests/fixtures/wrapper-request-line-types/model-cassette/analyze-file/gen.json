@@ -1,0 +1,20 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "pubsub_operations": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:2",
+      "line_number": 2,
+      "target": "/v1/orders",
+      "method": "POST",
+      "pattern_matched": "placeGeneric(",
+      "call_expression_text": "placeGeneric('/orders', 'book')",
+      "call_expression_line": 2,
+      "payload_expression_text": "'book'",
+      "payload_expression_line": 2,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}

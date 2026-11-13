@@ -788,3 +788,102 @@ fn a_withdrawn_request_line_keeps_its_request_type_at_each_caller() {
         );
     }
 }
+
+// ── A through site takes the body its wrapper builds (carrick#4128) ─────
+//
+// `restock` builds its body (`{ body: 'book' }`) and leaves the path open.
+// `stock.ts:3` calls it with a path the fact layer reads, so it is a
+// decided site whose payload the wrapper builds: its request slot is that
+// body. `stock.ts:2` is a lead, so `restock.ts:5` keeps its model row.
+
+const STOCK: &str = "web/src/stock.ts";
+const SHOP: &str = "web/src/shop.ts";
+const GEN: &str = "web/src/gen.ts";
+
+/// The request type printed for the consumer entry at `file:line`.
+fn request_type_at(file: &str, line: u32) -> Option<String> {
+    let alias = web()["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["role"] == "consumer"
+                && entry["type_kind"] == "request"
+                && entry["file_path"] == file
+                && entry["line_number"] == line
+        })?["type_alias"]
+        .as_str()?
+        .to_string();
+    web()["bundled_types"].as_str()?.lines().find_map(|text| {
+        text.strip_prefix(&format!("export type {alias} = "))
+            .map(|rest| rest.trim_end_matches(';').trim().to_string())
+    })
+}
+
+#[test]
+fn a_through_fact_row_takes_the_body_its_wrapper_builds() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        request_type_at(STOCK, 3).as_deref(),
+        Some("{ body: string; }"),
+        "{:#?}",
+        consumer_entries(STOCK)
+    );
+    assert_eq!(
+        request_verdicts_in(STOCK, 3),
+        [(
+            "http|POST|/v1/orders".to_string(),
+            "request".to_string(),
+            "compatible".to_string()
+        )]
+    );
+    // The lead keeps the wrapper's model row.
+    assert!(
+        web()["calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["file_path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("web/src/net/restock.ts")),
+        "{:#?}",
+        web()["calls"]
+    );
+}
+
+fn request_verdicts_in(file: &str, line: u32) -> Vec<(String, String, String)> {
+    verdicts_at(file, line)
+        .into_iter()
+        .filter(|(_, side, _)| side == "request")
+        .collect()
+}
+
+/// A wrapper that sends `JSON.stringify(data)` forwards its parameter whole:
+/// the caller's own argument is still the body. One that builds `{ body }`
+/// from a loosely typed parameter reads the declared inner type, the right
+/// shape; the caller's argument (a string) was the wrong one. A generic
+/// parameter must never print as a bare type parameter.
+#[test]
+fn a_body_built_from_a_loose_parameter_reads_the_declared_type() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        request_type_at(SHOP, 3).as_deref(),
+        Some("{ body: string; }")
+    );
+    assert_eq!(
+        request_type_at(SHOP, 4).as_deref(),
+        Some("{ body: unknown; }")
+    );
+    let generic = request_type_at(GEN, 2);
+    assert!(
+        generic.is_some() && generic.as_deref() != Some("{ body: T; }"),
+        "a generic parameter leaked through: {generic:?}"
+    );
+}
