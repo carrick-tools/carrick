@@ -1,0 +1,59 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "${API_ORIGIN}/api/releases/confirm",
+      "method": "POST",
+      "pattern_matched": "sendRequest(",
+      "call_expression_text": "sendRequest(url, {...})",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:14",
+      "line_number": 14,
+      "target": "${API_ORIGIN}/api/releases",
+      "method": "POST",
+      "pattern_matched": "sendRequest(",
+      "call_expression_text": "sendRequest(url.href, {...})",
+      "call_expression_line": 14,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:20",
+      "line_number": 20,
+      "target": "${API_ORIGIN}/api/bundles/preview",
+      "method": "POST",
+      "pattern_matched": "sendRequest(",
+      "call_expression_text": "sendRequest(url.toString(), {...})",
+      "call_expression_line": 20,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:26",
+      "line_number": 26,
+      "target": "${API_ORIGIN}/api/bundles/${name}/upload",
+      "method": "POST",
+      "pattern_matched": "sendRequest(",
+      "call_expression_text": "sendRequest(`${url}`, {...})",
+      "call_expression_line": 26,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

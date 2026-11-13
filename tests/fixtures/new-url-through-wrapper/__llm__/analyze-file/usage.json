@@ -1,0 +1,59 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "${API_ORIGIN}/api/usage",
+      "method": "POST",
+      "pattern_matched": "sendRequest(",
+      "call_expression_text": "sendRequest(new URL('/api/usage', resolveOrigin()), {...})",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:16",
+      "line_number": 16,
+      "target": "${origin}/api/ping",
+      "method": "GET",
+      "pattern_matched": "fetch(",
+      "call_expression_text": "fetch(new URL('/api/ping', origin), { method: 'GET' })",
+      "call_expression_line": 16,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "${API_ORIGIN}/api/heartbeat",
+      "method": "POST",
+      "pattern_matched": "sendTimed(",
+      "call_expression_text": "sendTimed(new URL('/api/heartbeat', origin), { method: 'POST' })",
+      "call_expression_line": 21,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:26",
+      "line_number": 26,
+      "target": "${API_ORIGIN}/api/settings",
+      "method": "POST",
+      "pattern_matched": "sendUpdate(",
+      "call_expression_text": "sendUpdate(new URL('/api/settings', origin), { method: 'POST' })",
+      "call_expression_line": 26,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}
