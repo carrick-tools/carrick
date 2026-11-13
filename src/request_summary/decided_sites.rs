@@ -5322,7 +5322,10 @@ pub(crate) mod tests {
                 .map(|lead| (lead.line, lead.reason))
                 .collect::<Vec<_>>(),
             vec![
-                (line_of(&text, "client.prefetch(options)"), Stop::NoOpClaim),
+                (
+                    line_of(&text, "client.prefetch(options)"),
+                    Stop::UnreadExpression
+                ),
                 (line_of(&text, "client.mutate(vars)"), Stop::NoOpClaim),
             ]
         );
