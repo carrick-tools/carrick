@@ -951,7 +951,15 @@ impl MemberDeclarations {
                 Vec::new()
             }
         };
-        MemberDeclarations::of(ask, &verdicts)
+        MemberDeclarations {
+            unanswered: ask
+                .ops
+                .iter()
+                .flatten()
+                .map(|op| (op.package.clone(), op.member.clone()))
+                .collect(),
+            ..MemberDeclarations::of(ask, &verdicts)
+        }
     }
 
     /// Whether the ask got no answer for the op check `row`'s declaration

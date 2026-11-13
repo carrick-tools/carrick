@@ -386,6 +386,15 @@ pub fn from_scan(
             Some(held) => held.also(site.reason),
         }
     }
+    // A call whose member declaration the receiver trace's ask left
+    // unanswered (carrick#3991): the answer would have read its callee. A
+    // row there that reached a labelled end is listed for another slot,
+    // which the answer does not decide.
+    for (file, lo, hi) in &discovery.declarations_unanswered {
+        mark_unanswered(&mut out, (file.as_str(), *lo, *hi), |row| {
+            row.labelled_end.is_none()
+        });
+    }
     out
 }
 
