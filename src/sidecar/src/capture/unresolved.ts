@@ -17,7 +17,12 @@
  */
 
 import ts from 'typescript';
-import { findUncarriedPositions, findUnresolvedPlaceholders, type UnresolvedAtAnchor } from './deep-walk.js';
+import {
+  findUncarriedPositions,
+  findUnresolvedPlaceholders,
+  isErrorPlaceholder,
+  type UnresolvedAtAnchor,
+} from './deep-walk.js';
 
 /** Files the specifier walk visits from one anchor before it stops. */
 const MAX_REACHABLE_FILES = 256;
@@ -58,6 +63,12 @@ export function unresolvedAtAnchor(
   const uncarried = uncarriedByProgram.get(program);
   const found = findUnresolvedPlaceholders(type, program, checker, location);
   if (uncarried) found.push(...findUncarriedPositions(type, program, checker, location, uncarried));
+  // The member walk leaves the root to its callers (carrick#3995). A call,
+  // `.then`, member read or binding through a value that did not resolve
+  // keeps the placeholder, while the emitted stub prints it as a plain `any`
+  // the self-check would read as declared. The root is the alias's own type
+  // only when no prefix maps it under a member.
+  if (pathPrefix === '' && isErrorPlaceholder(type)) found.unshift('');
   const paths = [...new Set(found)].map((path) => prefixPath(pathPrefix, path));
   if (paths.length === 0) return undefined;
   return { paths, specifiers: unresolvedSpecifiersReachableFrom(program, sourceFile) };
