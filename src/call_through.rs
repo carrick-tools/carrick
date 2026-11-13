@@ -269,6 +269,22 @@ impl CallThroughSites {
             LeafCallee::Sibling { .. } => true,
         })
     }
+
+    /// [`Self::typed_leaves`], each ask and each line the fold took a model
+    /// row at logged at debug: what the scan asked, read from its run log.
+    pub fn asked_leaves(&self) -> Vec<&LeafCall> {
+        for (file, line) in &self.folded {
+            debug!("Call-through fold took a model row at {file}:{line}");
+        }
+        let asked: Vec<&LeafCall> = self.typed_leaves().collect();
+        for leaf in &asked {
+            debug!(
+                "Call-through leaf type asked at {}:{}",
+                leaf.file, leaf.line
+            );
+        }
+        asked
+    }
 }
 
 /// The function a [`LeafCall`] reaches.
@@ -4603,6 +4619,49 @@ mod tests {
                 name: name.to_string(),
             },
         }
+    }
+
+    /// carrick#4113: a leaf's type is asked only where the fold took a model
+    /// row at the leaf's own line, the one place a typeless leaf row would
+    /// otherwise lose the model's type.
+    #[test]
+    fn typed_leaves_are_only_the_leaves_at_a_line_the_fold_took() {
+        let at = |line: u32, callee: LeafCallee| LeafCall {
+            line,
+            last_line: line,
+            span_start: line,
+            span_end: line + 1,
+            callee,
+            ..boundary_leaf("lib/q.ts", "load")
+        };
+        let own = DefinitionSite {
+            file: "web/b.ts".to_string(),
+            line: 1,
+        };
+        let sibling = || LeafCallee::Sibling {
+            file: "lib/q.ts".to_string(),
+            name: "load".to_string(),
+        };
+        let sites = CallThroughSites {
+            leaves: vec![
+                at(3, sibling()),
+                at(4, sibling()),
+                at(5, LeafCallee::Own(own.clone())),
+                at(6, LeafCallee::Own(own.clone())),
+            ],
+            return_shapes: HashMap::from([(
+                own,
+                BodyShape {
+                    kind: ShapeKind::Value,
+                    first_line: 2,
+                    last_line: 2,
+                },
+            )]),
+            folded: vec![("web/a.ts".to_string(), 3), ("web/a.ts".to_string(), 5)],
+            ..Default::default()
+        };
+        let asked: Vec<u32> = sites.typed_leaves().map(|leaf| leaf.line).collect();
+        assert_eq!(asked, [3, 5]);
     }
 
     /// Settle three services: `web` calls `load` of `lib/q.ts` at its line 3.

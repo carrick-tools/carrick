@@ -159,8 +159,16 @@ fn reach_aliases() -> &'static ReachAliases {
     &scan().2
 }
 
-fn scan() -> &'static (Blobs, String, ReachAliases) {
-    static SCAN: OnceLock<(Blobs, String, ReachAliases)> = OnceLock::new();
+/// The run log's lines on which leaf types were asked and on which the fold
+/// took a model row.
+fn leaf_ask_lines() -> &'static [String] {
+    &scan().3
+}
+
+type Scanned = (Blobs, String, ReachAliases, Vec<String>);
+
+fn scan() -> &'static Scanned {
+    static SCAN: OnceLock<Scanned> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -173,17 +181,25 @@ fn scan() -> &'static (Blobs, String, ReachAliases) {
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
             .env("HOME", &home);
         run(cmd);
-        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        let logs: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
             .expect("the scan keeps a run log")
             .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-            .flat_map(|log| {
-                log.lines()
-                    .filter(|line| line.contains("Call-through rows settled"))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+            .collect();
+        let settled = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .find(|line| line.contains("Call-through rows settled"))
+            .expect("the pass logs what it settled")
+            .to_string();
+        let asks: Vec<String> = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .filter(|line| {
+                line.contains("Call-through leaf type asked at")
+                    || line.contains("Call-through fold took a model row at")
             })
-            .next()
-            .expect("the pass logs what it settled");
+            .map(str::to_string)
+            .collect();
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -208,7 +224,7 @@ fn scan() -> &'static (Blobs, String, ReachAliases) {
                 Some((service.to_string(), names))
             })
             .collect();
-        (blobs, settled, reach)
+        (blobs, settled, reach, asks)
     })
 }
 
@@ -1736,4 +1752,31 @@ fn every_saved_type_name_has_a_manifest_entry() {
         }
     }
     assert!(checked > 0, "the scan saved no type names to check");
+}
+
+/// carrick#4113: a leaf call's type is asked only where the fold took a model
+/// row at its line, the one place a leaf row would otherwise lose the type.
+/// Anywhere else the ask costs a compiler answer and no row carries it.
+#[test]
+fn leaf_types_are_asked_only_where_the_fold_took_a_model_row() {
+    let at = |marker: &str| -> std::collections::BTreeSet<String> {
+        leaf_ask_lines()
+            .iter()
+            .filter_map(|line| {
+                line.split_once(marker)
+                    .map(|(_, rest)| rest.trim().to_string())
+            })
+            .collect()
+    };
+    let asked = at("Call-through leaf type asked at ");
+    let folded = at("Call-through fold took a model row at ");
+    assert!(
+        asked.contains(&format!("{TYPED_COMMANDS}:15")),
+        "the leaf at a folded line is asked: {asked:#?}"
+    );
+    let elsewhere: Vec<&String> = asked.difference(&folded).collect();
+    assert!(
+        elsewhere.is_empty(),
+        "leaf types asked off a folded line: {elsewhere:#?}"
+    );
 }
