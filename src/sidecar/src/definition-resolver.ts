@@ -86,9 +86,6 @@ export class DefinitionResolver {
             moduleResolution: 100, // Bundler
             strict: true,
             skipLibCheck: true,
-            // As the self-check: only what the stub names, never every
-            // `@types` package the linked install holds.
-            types: [],
           }),
           skipAddingFilesFromTsConfig: true,
           ...(resolveModules && {

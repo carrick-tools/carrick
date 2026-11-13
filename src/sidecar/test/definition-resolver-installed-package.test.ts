@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import { captureStub } from '../src/capture/index.js';
 import type { CaptureStubResult } from '../src/capture/api.js';
 import { DefinitionResolver } from '../src/definition-resolver.js';
+import { UNTRUSTED_TREE_ENV } from '../src/capture/checkout.js';
 
 const SOURCE_TS = `import { makeThing } from 'pkg';
 
@@ -203,5 +204,27 @@ describe('carrick#3995 T5: the resolver reads a bare package import as the self-
       assert.ok(definition, 'no definition');
       assert.strictEqual(definition.expanded, 'Span', JSON.stringify(definition));
     });
+  });
+
+  // Under CARRICK_UNTRUSTED_TREE the self-check's host is the bounded one; the
+  // resolver resolves through it and still reads a package the checkout holds.
+  describe('an untrusted tree', () => {
+    let saved: string | undefined;
+    before(() => {
+      saved = process.env[UNTRUSTED_TREE_ENV];
+      process.env[UNTRUSTED_TREE_ENV] = '1';
+    });
+    after(() => {
+      if (saved === undefined) delete process.env[UNTRUSTED_TREE_ENV];
+      else process.env[UNTRUSTED_TREE_ENV] = saved;
+    });
+
+    it('resolves a package installed inside the checkout', () => {
+      const captured = capture(true);
+      made.push(captured.repoDir, captured.outRoot);
+      const [definition] = new DefinitionResolver().resolveFromStub(captured.result.stub_dir, [ALIAS]);
+      assert.strictEqual(definition?.expanded, 'Thing', JSON.stringify(definition));
+    });
+
   });
 });
