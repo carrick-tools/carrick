@@ -11161,6 +11161,12 @@ pub struct ReachedCallee {
 pub struct RequestSummaryIndex {
     rows: HashMap<PathBuf, BTreeMap<u32, Vec<SummaryRow>>>,
     silent: HashMap<PathBuf, BTreeSet<u32>>,
+    /// The requests a call's text rules out and the call sends no other
+    /// way (carrick#3679, carrick#4093), by the call's span start: the file
+    /// each is written in and the span start of its call, as
+    /// [`ReachedCallee::requests`] names them. Read by the imported-member
+    /// join, which drops a member whose request is one of them.
+    ruled_out: HashMap<PathBuf, BTreeMap<u32, BTreeSet<(PathBuf, u32)>>>,
     /// The function each call of the service's files reaches by the
     /// compiler's rows, keyed by the call's span. Read by the imported-member
     /// join, which drops a member the compiler says the call does not reach
@@ -11477,6 +11483,12 @@ impl RequestSummaryIndex {
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {
         self.silent.get(file)
+    }
+
+    /// The requests each call of `file` rules out ([`Self::ruled_out`]),
+    /// by the call's span start.
+    pub fn ruled_out(&self, file: &Path) -> Option<&BTreeMap<u32, BTreeSet<(PathBuf, u32)>>> {
+        self.ruled_out.get(file)
     }
 
     /// The function each call of `file` reaches by the compiler's rows,
@@ -12272,6 +12284,10 @@ fn emit(
                     .target(file, call)
                     .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
                 let mut open_verbs = OpenVerbs::default();
+                // The requests this call's text rules out, and those it
+                // sends (carrick#4093).
+                let mut ruled_out: BTreeSet<(PathBuf, u32)> = BTreeSet::new();
+                let mut sent: BTreeSet<(PathBuf, u32)> = BTreeSet::new();
                 for effect in &callee.effects {
                     // A JSX element states only what its props fill in
                     // (carrick#1949).
@@ -12282,9 +12298,12 @@ fn emit(
                         effect.instantiate_omitting(&call.args, &call.spread_args, &|index| {
                             call.omits(index)
                         });
+                    let request = (effect.site.file.clone(), effect.site.span_start);
                     if instantiated.ruled_out {
+                        ruled_out.insert(request);
                         continue;
                     }
+                    sent.insert(request);
                     // What this call writes for a method that is a parameter
                     // (carrick#2049).
                     if matches!(effect.method, MethodValue::Param(_)) {
@@ -12417,6 +12436,14 @@ fn emit(
                             }
                         }
                     }
+                }
+                let ruled_out: BTreeSet<_> = ruled_out.difference(&sent).cloned().collect();
+                if !ruled_out.is_empty() {
+                    index
+                        .ruled_out
+                        .entry(file.to_path_buf())
+                        .or_default()
+                        .insert(call.site.span_start, ruled_out);
                 }
                 if let Some(method) = open_verbs.verb() {
                     index
