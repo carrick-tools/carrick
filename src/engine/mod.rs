@@ -2215,8 +2215,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         run.held_back = owes || run.types_held;
         if run.types_held {
             let line = format!(
-                "Not uploading {}: this run lost its types ({}) and its stored index has them, \
-                 so the stored index stays. Set {}=1 to upload it without types.",
+                "Not uploading {} because this run lost its types ({}). Its stored index has them \
+                 and stays. Set {}=1 to upload it without types.",
                 run.label,
                 run.data
                     .types_degraded
@@ -3229,7 +3229,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // run as one that never landed (carrick#4157).
     if !types_held.is_empty() && !closed_by_final_write && !incomplete {
         let reason = format!(
-            "types lost at resolution, stored index kept: {}",
+            "types lost while reading, stored index kept: {}",
             types_held.join(", ")
         );
         storage
@@ -3247,8 +3247,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             "Nothing was uploaded."
         };
         return Err(format!(
-            "Kept the stored index of {}: this run lost their types. {others} Set {}=1 to \
-             upload without types.",
+            "Kept the stored index of {} because this run lost their types. {others} Set {}=1 \
+             to upload without types.",
             types_held.join(", "),
             crate::scan_health::ALLOW_MISSING_TYPES_ENV
         )

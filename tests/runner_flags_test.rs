@@ -947,17 +947,17 @@ fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
 
 /// What a run says when it keeps a service's stored index because it lost
 /// that service's types, and uploads the others (carrick#3992).
-const KEPT_FOR_TYPES: &str = "Kept the stored index of beta: this run lost their types. The other \
-                              services were uploaded. Set CARRICK_ALLOW_MISSING_TYPES=1 to upload \
+const KEPT_FOR_TYPES: &str = "Kept the stored index of beta because this run lost their types. The \
+                              other services were uploaded. Set CARRICK_ALLOW_MISSING_TYPES=1 to upload \
                               without types.";
 
 /// The same, when every service the run analysed was kept.
-const KEPT_ALL_FOR_TYPES: &str = "Kept the stored index of beta: this run lost their types. \
+const KEPT_ALL_FOR_TYPES: &str = "Kept the stored index of beta because this run lost their types. \
                                   Nothing was uploaded. Set CARRICK_ALLOW_MISSING_TYPES=1 to \
                                   upload without types.";
 
 /// The warning line of a service kept for its types.
-const NOT_UPLOADING_BETA: &str = "Not uploading beta: this run lost its types (";
+const NOT_UPLOADING_BETA: &str = "Not uploading beta because this run lost its types (";
 
 /// carrick#3992: the two-service repo, scanned into one local store by a
 /// stand-in whose `beta` process dies at type resolution while `home/die`

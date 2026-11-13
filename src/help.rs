@@ -120,11 +120,11 @@ ENVIRONMENT VARIABLES:
                                     than spelling the command
     CARRICK_NO_KEEP_AWAKE           The --no-keep-awake flag as a variable, for
                                     a machine that should never be kept awake
-    CARRICK_ALLOW_MISSING_TYPES     Scan and exit 0 even when the compiler
-                                    engine never became ready, and upload a
-                                    service whose types this run lost in
-                                    place of a stored index that has them.
-                                    Off by default: such a run indexes
+    CARRICK_ALLOW_MISSING_TYPES     Exit 0 even when the compiler engine
+                                    never became ready, and upload a service
+                                    whose types this run lost instead of
+                                    keeping its stored index, which has them.
+                                    Off by default. Such a run indexes
                                     endpoints with no request or response
                                     types
 "#;
