@@ -1,0 +1,32 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:15",
+      "line_number": 15,
+      "target": "/v1/jobs/close",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 15,
+      "payload_expression_text": "input",
+      "payload_expression_line": 15,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:21",
+      "line_number": 21,
+      "target": "/v1/jobs/open",
+      "method": "POST",
+      "pattern_matched": "fetch(",
+      "call_expression_text": null,
+      "call_expression_line": 21,
+      "payload_expression_text": "input",
+      "payload_expression_line": 21,
+      "primary_type_symbol": "OpenReply",
+      "type_import_source": null
+    }
+  ]
+}

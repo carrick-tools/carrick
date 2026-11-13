@@ -251,6 +251,31 @@ pub fn is_catch_all_path(path: &str) -> bool {
     path.ends_with("/*") || path.ends_with("/**") || path.ends_with("/(.*)")
 }
 
+/// Whether `endpoint_path` is a catch-all (`/*`, `/**`, `/(.*)`) that routes
+/// `call_path` AND the call states a literal segment inside the wildcard's
+/// tail (carrick#4186). Such a route says nothing about that segment, so its
+/// handler's type is a generic envelope, not the contract of the call's path:
+/// the edge stands (routing truth) but the type check must not judge the pair.
+///
+/// A placeholder in the tail does not count: `/packets/**` vs `/packets/:enc`
+/// states no literal the route fails to cover, so that pair is still
+/// compared. The prefix is trimmed as `agreement_with_wildcards` trims it.
+///
+/// Not a wasm export and read by nothing that decides routing: it changes no
+/// part of `paths_match`, `match_agreement` or `match_verdict`; only the type
+/// pairing reads it.
+pub fn catch_all_covers_call_literal(endpoint_path: &str, call_path: &str) -> bool {
+    if !is_catch_all_path(endpoint_path) || match_agreement(endpoint_path, call_path).is_none() {
+        return false;
+    }
+    let prefix = if endpoint_path.ends_with("/(.*)") {
+        endpoint_path.trim_end_matches("/(.*)")
+    } else {
+        endpoint_path.trim_end_matches("/**").trim_end_matches("/*")
+    };
+    path_literal_specificity(call_path) > path_literal_specificity(prefix)
+}
+
 /// Whether a CONSUMER call path names nothing the index can join on: it has
 /// no literal segment at all. That is the empty string, `/`, a bare or
 /// leading-slash wildcard (`*`, `/*`, `/**`, `/(.*)`), and a path that
