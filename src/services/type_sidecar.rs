@@ -270,6 +270,62 @@ pub struct InferRequestItem {
     pub through_call: Option<ThroughCall>,
 }
 
+impl InferRequestItem {
+    /// carrick#4165: a `RequestConfig` request naming no option key is a
+    /// call no call up from the labelled one writes a body argument for
+    /// (`site_payloads::SitePayloads::requests`, `PayloadAt::Absent`). The
+    /// scanner answers it ([`Self::no_body_answer`]), so it is never sent
+    /// to the sidecar; the capture takes `RequestConfig`'s placeholder for
+    /// it, so the call's own value is never read as the body.
+    pub fn answered_no_body(&self) -> bool {
+        self.infer_kind == InferKind::RequestConfig && self.member.is_none()
+    }
+
+    /// The scanner's answer to a request [`Self::answered_no_body`] holds
+    /// for: `unknown`, decided at its root as `no_request_body`, the reason
+    /// the compiler engine gives an options literal that states the body
+    /// absent. `None` for any other request.
+    pub fn no_body_answer(&self) -> Option<InferredType> {
+        if !self.answered_no_body() {
+            return None;
+        }
+        Some(InferredType {
+            alias: self.alias.clone()?,
+            type_string: "unknown".to_string(),
+            is_explicit: false,
+            source_location: SourceLocation {
+                file_path: self.file_path.clone(),
+                start_line: self.line_number,
+                end_line: self.line_number,
+                start_column: None,
+                end_column: None,
+            },
+            infer_kind: InferKind::RequestConfig,
+            primary_type_symbol: None,
+            array_depth: None,
+            primary_type_symbol_source: None,
+            declaring_package: None,
+            member_return_type: None,
+            any_provenance: vec![TypeProvenance {
+                path: String::new(),
+                kind: "unknown".to_string(),
+                reason: "no_request_body".to_string(),
+                detail: None,
+            }],
+            unwidened_type_string: None,
+            unwidened_out_of_budget: false,
+            stated_body: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+            absent_body_tolerated: false,
+            response_modes: None,
+            model_symbol_relation: None,
+            machinery: false,
+            anchor_machinery: false,
+        })
+    }
+}
+
 /// A call's place in its file, in the sidecar's numbering
 /// ([`InferRequestItem::through_call`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

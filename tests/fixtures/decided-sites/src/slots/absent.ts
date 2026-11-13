@@ -1,0 +1,53 @@
+// carrick#4165: a call that writes nothing at the label's payload argument
+// sends no body there, read up the calls to the one that decides the site. A
+// wrapper parameter with a default is filled by it, and a spread may fill any
+// position: neither is read as absent.
+
+export function ping(): Promise<Response> {
+  return fetch(`${process.env.API}/absent/ping`);
+}
+
+// The labelled call inside the wrapper writes no body: no caller can.
+function bump(id: string) {
+  return fetch(`${process.env.API}/absent/${id}/bump`);
+}
+
+export function bumpOne(): Promise<Response> {
+  return bump("1");
+}
+
+// The wrapper hands its own optional parameter on, and the caller leaves it
+// out.
+function carry(path: string, body?: unknown) {
+  return fetch(`${process.env.API}${path}`, body as RequestInit);
+}
+
+export function carried(): Promise<Response> {
+  return carry("/absent/carried");
+}
+
+// Controls: the parameter's default fills it, also under a wrapper that
+// hands on a parameter with none, and a spread may.
+function send(url: string, init: unknown = {}) {
+  return fetch(`${process.env.API}${url}`, init as RequestInit);
+}
+
+export function defaulted(): Promise<Response> {
+  return send("/absent/defaulted");
+}
+
+function relay(url: string, init?: unknown) {
+  return send(url, init);
+}
+
+export function relayed(): Promise<Response> {
+  return relay("/absent/relayed");
+}
+
+export function spread(rest: [RequestInit]): Promise<Response> {
+  return fetch(`${process.env.API}/absent/spread`, ...rest);
+}
+
+export function options(): Promise<Response> {
+  return fetch(`${process.env.API}/absent/options`, { headers: {} });
+}

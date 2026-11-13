@@ -290,6 +290,10 @@ pub enum PayloadAt {
     /// `request_config` question, which confirms there is no spread, computed
     /// key or method in it; its null answer never anchors a body.
     Unwritten { at: AnchorAt, key: String },
+    /// No call from the labelled one up to the call at `at` writes the
+    /// payload argument (carrick#4165): the call sends no body. The scanner
+    /// answers it; nothing is read there.
+    Absent { at: AnchorAt },
 }
 
 impl PayloadAt {
@@ -298,7 +302,8 @@ impl PayloadAt {
             PayloadAt::Value(at)
             | PayloadAt::Result(at)
             | PayloadAt::Param { at, .. }
-            | PayloadAt::Unwritten { at, .. } => at,
+            | PayloadAt::Unwritten { at, .. }
+            | PayloadAt::Absent { at } => at,
         }
     }
 }
@@ -2482,6 +2487,18 @@ fn record(
     let carried = site.payload_slot.as_ref().and_then(|binding| {
         let (arg, key) = match binding {
             SlotBinding::Written { arg, key } | SlotBinding::Unwritten { arg, key } => (*arg, key),
+            // No call writes the payload argument (carrick#4165): the call
+            // itself is the place.
+            SlotBinding::Absent => {
+                return Some(PayloadAt::Absent {
+                    at: AnchorAt {
+                        file: file.to_string(),
+                        line: call_line,
+                        span_start: site.span_start,
+                        span_end: site.span_end,
+                    },
+                });
+            }
         };
         let expr = parts.arg_exprs.get(arg)?;
         let parsed = sources.get(file)?;

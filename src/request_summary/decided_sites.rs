@@ -741,6 +741,11 @@ pub enum SlotBinding {
     /// `key` absent (no spread, no computed key, no method): the call sends
     /// nothing there.
     Unwritten { arg: usize, key: String },
+    /// No call from the labelled one up to the deciding call writes the
+    /// label's payload argument (carrick#4165): each leaves it out, or hands
+    /// on whole a parameter of its own that has no default and that its
+    /// caller leaves out. The call sends no payload there.
+    Absent,
 }
 
 /// The function that handles a receive site or one key of a handler table:
@@ -2130,7 +2135,20 @@ fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<P
 /// is written, as [`payload_binding`] reads it: the index in `down` of the
 /// call that writes it, and that call's argument and option key.
 fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option<String>)> {
-    walk_bound(down, slot, false)
+    match walk_bound(down, slot, false)? {
+        Walked::Bound(at, arg, key) => Some((at, arg, key)),
+        Walked::Omitted { .. } => None,
+    }
+}
+
+/// What [`walk_bound`] reads up the calls: the call that writes the value
+/// (its index in `down`, its argument and option key), or that a call
+/// leaves the argument out (carrick#4165), with each parameter the calls
+/// below it hand on whole: `(k, index)`, the parameter at `index` of the
+/// function `down[k]` is written in.
+enum Walked {
+    Bound(usize, usize, Option<String>),
+    Omitted { through: Vec<(usize, usize)> },
 }
 
 /// The option key `slot` names, read at the deciding call (`down[0]`) by
@@ -2140,11 +2158,30 @@ fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option
 /// destructured one, as the method slot reads them ([`written_at`]). The
 /// carry that stops below the deciding call gives nothing: a call below
 /// builds the value.
-fn payload_slot(down: &[Placed<'_>], slot: &ArgSlot) -> Option<SlotBinding> {
-    let key = slot.key.as_ref()?;
-    let (0, arg, Some(carried)) = walk_bound(down, slot, true)? else {
-        return None;
+///
+/// A call that leaves the argument out, positional or keyed, states it
+/// absent (carrick#4165): at the labelled call nothing is written; above it
+/// the argument is a parameter each call below hands on whole.
+/// `defaulted(placed, index)` says the function `placed` is written in gives
+/// that parameter a default: a default at any of them fills it, as does one
+/// a closure's parameter may have (not read).
+fn payload_slot(
+    down: &[Placed<'_>],
+    slot: &ArgSlot,
+    defaulted: &dyn Fn(&Placed<'_>, usize) -> bool,
+) -> Option<SlotBinding> {
+    let (arg, carried) = match walk_bound(down, slot, true)? {
+        Walked::Omitted { through } => {
+            let filled = through.iter().any(|&(k, index)| {
+                let placed = &down[k];
+                placed.depth != 0 || defaulted(placed, index)
+            });
+            return (!filled).then_some(SlotBinding::Absent);
+        }
+        Walked::Bound(0, arg, Some(carried)) => (arg, carried),
+        Walked::Bound(..) => return None,
     };
+    let key = slot.key.as_ref()?;
     let Value::Obj(object) = argument(down.first()?.call, arg)? else {
         return None;
     };
@@ -2164,11 +2201,7 @@ fn payload_slot(down: &[Placed<'_>], slot: &ArgSlot) -> Option<SlotBinding> {
 /// The walk behind [`bound_at`]. With `options` it also carries an option
 /// key through a hop's spread or rest ([`payload_slot`]), and returns `None`
 /// where it would stop below the deciding call.
-fn walk_bound(
-    down: &[Placed<'_>],
-    slot: &ArgSlot,
-    options: bool,
-) -> Option<(usize, usize, Option<String>)> {
+fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walked> {
     let whole_param = |value: &Value| match value {
         Value::Str(pieces) => match pieces.as_slice() {
             [Piece::Param(index, _)] => Some(*index),
@@ -2178,10 +2211,11 @@ fn walk_bound(
     };
     let mut arg = slot.arg;
     let mut key = slot.key.clone();
+    let mut through = Vec::new();
     for k in (1..down.len()).rev() {
         let placed = &down[k];
         if placed.call.site_args.is_some() && placed.call.args.get(arg).is_none() {
-            return None;
+            return Some(Walked::Omitted { through });
         }
         let passed = match (&key, argument(placed.call, arg)) {
             (_, None) => None,
@@ -2199,9 +2233,10 @@ fn walk_bound(
             Some((index, field)) => {
                 arg = index;
                 key = field;
+                through.push((k, index));
                 continue;
             }
-            None if !options => return Some((k, arg, key)),
+            None if !options => return Some(Walked::Bound(k, arg, key)),
             None => {}
         }
         // The caller's options under a spread or a rest, with the key not
@@ -2223,12 +2258,13 @@ fn walk_bound(
             }
             _ => return None,
         };
+        through.push((k, arg));
     }
     let first = down.first()?;
     if first.call.site_args.is_some() && first.call.args.get(arg).is_none() {
-        return None;
+        return Some(Walked::Omitted { through });
     }
-    Some((0, arg, key))
+    Some(Walked::Bound(0, arg, key))
 }
 
 /// What a label's method slot holds at a decided site (label v2,
@@ -2589,6 +2625,22 @@ impl<'a> Walk<'a, '_> {
         self.resolver.text_of_value(at, text).ok()
     }
 
+    /// Whether the function `callee` (definition `key` of `file`) gives its
+    /// parameter at `index` a default (carrick#4165). A function that is
+    /// not found may: it reads as defaulted.
+    fn defaults_param(&self, callee: (&Path, Option<&str>), index: usize) -> bool {
+        let Some((_, function)) = callee
+            .1
+            .and_then(|key| self.resolver.function(callee.0, key))
+        else {
+            return true;
+        };
+        function
+            .param_default_texts
+            .iter()
+            .any(|(position, keys, _)| *position == index && keys.is_empty())
+    }
+
     /// `down` is the calls from the site (first) to the labelled call
     /// (last).
     fn site(
@@ -2647,7 +2699,11 @@ impl<'a> Walk<'a, '_> {
         };
         let payload_slot = label
             .and_then(|label| label.payload.as_ref())
-            .and_then(|slot| payload_slot(down, slot));
+            .and_then(|slot| {
+                payload_slot(down, slot, &|placed, index| {
+                    self.defaults_param((placed.file, placed.key), index)
+                })
+            });
         let handler = handler_slot
             .and_then(|slot| bound_at(down, slot))
             .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
@@ -6951,6 +7007,67 @@ pub(crate) mod tests {
                 key: "body".into(),
             })
         );
+    }
+
+    /// carrick#4165: the label's payload argument, positional or keyed, that
+    /// no call from the labelled one up to the deciding call writes is
+    /// stated absent: at the deciding call, at the labelled call inside a
+    /// wrapper, and through a wrapper's own parameter its caller leaves out.
+    /// A parameter with a default is filled by it, and a spread may fill any
+    /// position: neither is absent. A label that names no payload slot
+    /// states nothing.
+    #[test]
+    fn a_payload_argument_no_call_writes_is_stated_absent() {
+        const ABSENT: &str = "src/slots/absent.ts";
+        let calls = [
+            "fetch(`${process.env.API}/absent/ping`)",
+            "fetch(`${process.env.API}/absent/${id}/bump`)",
+            "fetch(`${process.env.API}${path}`, body as RequestInit)",
+            "fetch(`${process.env.API}${url}`, init as RequestInit)",
+            "fetch(`${process.env.API}/absent/spread`, ...rest)",
+            "fetch(`${process.env.API}/absent/options`, { headers: {} })",
+        ];
+        let slots = |label: &SiteLabel| {
+            let (decided, text, _) = decided_at(ABSENT, &calls, label);
+            move |needle: &str| {
+                let line = line_of(&text, needle);
+                let mut here = decided.sites.iter().filter(|site| site.line == line);
+                let site = here.next().unwrap_or_else(|| panic!("no site at {needle}"));
+                assert!(here.next().is_none(), "{needle}");
+                site.payload_slot.clone()
+            }
+        };
+        let mut positional = fetch_label();
+        positional.payload = Some(ArgSlot { arg: 1, key: None });
+        let slot_at = slots(&positional);
+        assert_eq!(slot_at("/absent/ping`)"), Some(SlotBinding::Absent));
+        assert_eq!(slot_at("bump(\"1\")"), Some(SlotBinding::Absent));
+        assert_eq!(
+            slot_at("carry(\"/absent/carried\")"),
+            Some(SlotBinding::Absent)
+        );
+        assert_eq!(slot_at("send(\"/absent/defaulted\")"), None);
+        assert_eq!(slot_at("relay(\"/absent/relayed\")"), None);
+        assert_eq!(slot_at("/absent/spread`, ...rest)"), None);
+        assert_eq!(slot_at("/absent/options`, {"), None);
+
+        let mut keyed = fetch_label();
+        keyed.payload = Some(ArgSlot {
+            arg: 1,
+            key: Some("data".into()),
+        });
+        let slot_at = slots(&keyed);
+        assert_eq!(slot_at("/absent/ping`)"), Some(SlotBinding::Absent));
+        assert_eq!(
+            slot_at("/absent/options`, {"),
+            Some(SlotBinding::Unwritten {
+                arg: 1,
+                key: "data".into(),
+            })
+        );
+
+        let slot_at = slots(&fetch_label());
+        assert_eq!(slot_at("/absent/ping`)"), None);
     }
 
     // -----------------------------------------------------------------------
