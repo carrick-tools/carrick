@@ -30,6 +30,10 @@ use std::time::Duration;
 #[path = "support/seed_stages.rs"]
 mod seed_stages;
 
+/// Copies a fixture's library store answer into its cassettes (carrick#3711).
+#[path = "support/library_claims.rs"]
+mod library_claims;
+
 /// The tests in this binary share the process environment and the injected
 /// fault, so they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -246,11 +250,14 @@ fn sidecar_for(repo: &Path) -> Option<TypeSidecar> {
     Some(sidecar)
 }
 
-async fn scan_with(store: &Store, repo: &Path, typed: bool) {
-    let sidecar = if typed { sidecar_for(repo) } else { None };
-    if typed {
-        assert!(sidecar.is_some(), "the type cases need the built sidecar");
-    }
+/// Production local mode runs the compiler engine, so every scan here does
+/// (carrick#3711 L3).
+async fn scan(store: &Store, repo: &Path) {
+    let sidecar = sidecar_for(repo);
+    assert!(
+        sidecar.is_some(),
+        "the scans need the built compiler engine"
+    );
     run_analysis_engine_with_sidecar(
         store.clone(),
         repo.to_str().unwrap(),
@@ -261,19 +268,15 @@ async fn scan_with(store: &Store, repo: &Path, typed: bool) {
     .expect("scan failed");
 }
 
-async fn scan(store: &Store, repo: &Path) {
-    scan_with(store, repo, false).await;
-}
-
 /// Scan `repo` as PR #7 and return the whole result it posted, which is what
 /// the cloud renders the PR comment and check from.
-async fn pr_payload_with(store: &Store, repo: &Path, typed: bool) -> serde_json::Value {
+async fn pr_payload(store: &Store, repo: &Path) -> serde_json::Value {
     // SAFETY: the tests in this binary run one at a time (SERIAL).
     unsafe {
         std::env::set_var("GITHUB_REF", "refs/pull/7/merge");
         std::env::set_var("GITHUB_EVENT_NAME", "pull_request");
     }
-    scan_with(store, repo, typed).await;
+    scan(store, repo).await;
     unsafe {
         std::env::remove_var("GITHUB_REF");
         std::env::remove_var("GITHUB_EVENT_NAME");
@@ -293,16 +296,8 @@ fn findings_of(payload: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// Scan `repo` as PR #7 and return every finding it posted.
-async fn pr_scan_with(store: &Store, repo: &Path, typed: bool) -> Vec<serde_json::Value> {
-    findings_of(&pr_payload_with(store, repo, typed).await)
-}
-
 async fn pr_scan(store: &Store, repo: &Path) -> Vec<serde_json::Value> {
-    pr_scan_with(store, repo, false).await
-}
-
-async fn pr_payload(store: &Store, repo: &Path) -> serde_json::Value {
-    pr_payload_with(store, repo, false).await
+    findings_of(&pr_payload(store, repo).await)
 }
 
 fn wrong_verb(findings: &[serde_json::Value]) -> serde_json::Value {
@@ -365,7 +360,7 @@ fn head(repo: &Path) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
+fn setup() -> (Workspace, PathBuf, PathBuf) {
     // SAFETY: the tests in this binary run one at a time (SERIAL).
     unsafe {
         std::env::set_var("CARRICK_MOCK_ALL", "1");
@@ -379,9 +374,37 @@ fn setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
         std::env::remove_var("GITHUB_EVENT_PATH");
     }
     let tmp = tempfile::tempdir().unwrap();
+    // The fixture's library store answer: the consumer's `fetch` is a call
+    // because the store labels it (carrick#3711).
+    let cassettes = tmp.path().join("cassettes");
+    library_claims::install(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/local-mode-workspace"),
+        &cassettes,
+    );
+    let guard = Cassettes::from(&cassettes);
     let producer = fixture_repo(tmp.path(), "catalog-web");
     let consumer = fixture_repo(tmp.path(), "inventory-svc");
-    (tmp, producer, consumer)
+    (
+        Workspace {
+            tmp,
+            _cassettes: guard,
+        },
+        producer,
+        consumer,
+    )
+}
+
+/// The temp dir of a `setup`, holding the store answer in place until it drops.
+struct Workspace {
+    tmp: tempfile::TempDir,
+    _cassettes: Cassettes,
+}
+
+impl std::ops::Deref for Workspace {
+    type Target = tempfile::TempDir;
+    fn deref(&self) -> &Self::Target {
+        &self.tmp
+    }
 }
 
 #[tokio::test]
@@ -1268,13 +1291,13 @@ async fn a_two_service_pr_that_leaves_main_as_it_is_posts_what_the_full_comparis
     let _cassettes = Cassettes::from(&cassettes);
 
     let store = Store::default();
-    scan_with(&store, &repo, true).await;
+    scan(&store, &repo).await;
     assert_not_rewritten(&store);
     std::fs::write(repo.join("NOTES.txt"), "unscanned\n").unwrap();
     commit(&repo, "pr: notes");
 
     let runs = main_side_runs();
-    let skipped = pr_payload_with(&store, &repo, true).await;
+    let skipped = pr_payload(&store, &repo).await;
     assert_eq!(main_side_runs(), runs, "same surface, main's side skipped");
     for line in [6, 11] {
         let finding = call_at(&findings_of(&skipped), line);
@@ -1284,7 +1307,7 @@ async fn a_two_service_pr_that_leaves_main_as_it_is_posts_what_the_full_comparis
     let changed = set_one_function_kind(&store, "retype-http-client", Some("web"), "ArrowFunction");
     let why = format!("{changed} is ArrowFunction in main's copy of web");
     let runs = main_side_runs();
-    let compared = pr_payload_with(&store, &repo, true).await;
+    let compared = pr_payload(&store, &repo).await;
     assert_eq!(main_side_runs(), runs + 1, "{why}: main's side ran");
     assert_same_result(&compared, &skipped, &why);
 }
@@ -1297,17 +1320,17 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     let _serial = SERIAL.lock().await;
     let (_tmp, producer, consumer) = setup();
     let store = Store::default();
-    scan_with(&store, &producer, true).await;
+    scan(&store, &producer).await;
 
     // Main reads the count as a string; the producer returns a number. The
     // PR only edits the file above the call.
     set_consumer_count_type(&consumer, "string");
     commit(&consumer, "main: string count");
-    scan_with(&store, &consumer, true).await;
+    scan(&store, &consumer).await;
     set_consumer_verb(&consumer, "GET", 3);
     commit(&consumer, "pr: unrelated edit above the call");
     let runs = main_side_runs();
-    let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
+    let finding = type_mismatch(&pr_scan(&store, &consumer).await);
     assert_eq!(main_side_runs(), runs + 1, "main's side ran its type check");
     assert_eq!(finding["on_main"], serde_json::json!(true), "{finding:#}");
 
@@ -1315,10 +1338,10 @@ async fn a_type_mismatch_is_checked_against_mains_stored_surface() {
     set_consumer_count_type(&consumer, "number");
     set_consumer_verb(&consumer, "GET", 0);
     commit(&consumer, "main: number count");
-    scan_with(&store, &consumer, true).await;
+    scan(&store, &consumer).await;
     set_consumer_count_type(&consumer, "string");
     commit(&consumer, "pr: string count");
-    let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
+    let finding = type_mismatch(&pr_scan(&store, &consumer).await);
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
 
@@ -1330,16 +1353,16 @@ async fn a_typed_pr_result_counts_each_compared_pair_under_its_verdict() {
     let _serial = SERIAL.lock().await;
     let (_tmp, producer, consumer) = setup();
     let store = Store::default();
-    scan_with(&store, &producer, true).await;
-    scan_with(&store, &consumer, true).await;
+    scan(&store, &producer).await;
+    scan(&store, &consumer).await;
 
     set_consumer_verb(&consumer, "GET", 3);
     commit(&consumer, "pr: unrelated edit above the call");
-    let agreeing = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+    let agreeing = pr_payload(&store, &consumer).await["checked"]["pairs"].clone();
 
     set_consumer_count_type(&consumer, "string");
     commit(&consumer, "pr: string count");
-    let broken = pr_payload_with(&store, &consumer, true).await["checked"]["pairs"].clone();
+    let broken = pr_payload(&store, &consumer).await["checked"]["pairs"].clone();
 
     // The consumer's three calls share the response type the PR breaks.
     assert_eq!(
@@ -1419,7 +1442,7 @@ async fn a_break_main_stored_from_its_own_retype_is_on_main() {
     let _cassettes = Cassettes::from(&cassettes);
 
     let store = Store::default();
-    scan_with(&store, &repo, true).await;
+    scan(&store, &repo).await;
     {
         let repos = store.repos.lock().unwrap();
         let stored: Vec<String> = repos
@@ -1475,7 +1498,7 @@ async fn a_break_main_stored_from_its_own_retype_is_on_main() {
     );
 
     let runs = main_side_runs();
-    let findings = pr_scan_with(&store, &repo, true).await;
+    let findings = pr_scan(&store, &repo).await;
     assert_eq!(main_side_runs(), runs + 1, "main's side ran");
     for line in [6, 11] {
         let finding = call_at(&findings, line);
@@ -1494,7 +1517,7 @@ async fn main_side_takes_mains_stored_outcomes_and_sends_no_check() {
     let _cassettes = Cassettes::from(&cassettes);
 
     let store = Store::default();
-    scan_with(&store, &repo, true).await;
+    scan(&store, &repo).await;
     {
         let repos = store.repos.lock().unwrap();
         let web = repos
@@ -1522,7 +1545,7 @@ async fn main_side_takes_mains_stored_outcomes_and_sends_no_check() {
     commit(&repo, "pr: a function after the calls");
 
     let (runs, checks) = (main_side_runs(), main_side_checks());
-    let on = pr_payload_with(&store, &repo, true).await;
+    let on = pr_payload(&store, &repo).await;
     assert_eq!(main_side_runs(), runs + 1, "main's side ran");
     assert_eq!(
         main_side_checks(),
@@ -1533,7 +1556,7 @@ async fn main_side_takes_mains_stored_outcomes_and_sends_no_check() {
     let (runs, checks) = (main_side_runs(), main_side_checks());
     let off = {
         let _off = EnvVar::set("CARRICK_TYPE_REACH", "off");
-        pr_payload_with(&store, &repo, true).await
+        pr_payload(&store, &repo).await
     };
     assert_eq!(main_side_runs(), runs + 1, "main's side ran");
     assert_eq!(
@@ -1562,13 +1585,13 @@ async fn a_pr_that_breaks_a_call_the_producer_fixed_introduces_it() {
     let _serial = SERIAL.lock().await;
     let (_tmp, producer, consumer) = setup();
     let store = Store::default();
-    scan_with(&store, &producer, true).await;
+    scan(&store, &producer).await;
 
     // Main reads the count as a string; the producer returns a number, and
     // main's scan stores the mismatch.
     set_consumer_count_type(&consumer, "string");
     commit(&consumer, "main: string count");
-    scan_with(&store, &consumer, true).await;
+    scan(&store, &consumer).await;
 
     // The producer now returns a string, and re-indexes. Main's consumer is
     // not rescanned, so its stored row still says incompatible.
@@ -1580,12 +1603,12 @@ async fn a_pr_that_breaks_a_call_the_producer_fixed_introduces_it() {
     assert_ne!(source, fixed, "the producer's count type moved");
     std::fs::write(&route, fixed).unwrap();
     commit(&producer, "producer: string count");
-    scan_with(&store, &producer, true).await;
+    scan(&store, &producer).await;
 
     // The PR reads the count as a number again.
     set_consumer_count_type(&consumer, "number");
     commit(&consumer, "pr: number count");
-    let finding = type_mismatch(&pr_scan_with(&store, &consumer, true).await);
+    let finding = type_mismatch(&pr_scan(&store, &consumer).await);
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
 }
 
@@ -1782,7 +1805,7 @@ async fn pr_delta(store: &Store, repo: &Path) -> serde_json::Value {
         std::env::set_var("GITHUB_REF", "refs/pull/7/merge");
         std::env::set_var("GITHUB_EVENT_NAME", "pull_request");
     }
-    scan_with(store, repo, false).await;
+    scan(store, repo).await;
     unsafe {
         std::env::remove_var("GITHUB_REF");
         std::env::remove_var("GITHUB_EVENT_NAME");
@@ -2514,7 +2537,7 @@ impl MainSnapshot {
 /// Scan `repo` typed, with the model answering from its own `__llm__`.
 async fn scan_seed_repo(store: &Store, repo: &Path) {
     let _cassettes = Cassettes::from(&repo.join("__llm__"));
-    scan_with(store, repo, true).await;
+    scan(store, repo).await;
 }
 
 /// Seed main's trees under `trees` and scan them into the three stores.
@@ -2849,7 +2872,7 @@ async fn seed_payload_from(
         type_reach: Arc::new(Mutex::new(reach.clone())),
     };
     let _cassettes = Cassettes::from(&repo.join("__llm__"));
-    pr_payload_with(&store, &repo, true).await
+    pr_payload(&store, &repo).await
 }
 
 /// The finding of `kind` for `method path` that names `site` among its call
@@ -4961,7 +4984,7 @@ async fn a_pr_that_edits_the_producers_response_type_introduces_the_break() {
     let repo = two_service_repo(tmp.path());
     let base = head(&repo);
     let store = Store::default();
-    scan_with(&store, &repo, true).await;
+    scan(&store, &repo).await;
 
     edit(
         &repo,
@@ -4973,7 +4996,7 @@ async fn a_pr_that_edits_the_producers_response_type_introduces_the_break() {
     );
     commit(&repo, "pr: the producer answers the count as a string");
     event_with_base(tmp.path(), &base);
-    let findings = pr_scan_with(&store, &repo, true).await;
+    let findings = pr_scan(&store, &repo).await;
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     let finding = type_mismatch(&findings);
     assert_eq!(finding["on_main"], serde_json::json!(false), "{finding:#}");
@@ -4989,11 +5012,11 @@ async fn two_service_pr(change: impl Fn(&Path)) -> serde_json::Value {
     let repo = two_service_repo(tmp.path());
     let base = head(&repo);
     let store = Store::default();
-    scan_with(&store, &repo, false).await;
+    scan(&store, &repo).await;
     change(&repo);
     commit(&repo, "pr: seed");
     event_with_base(tmp.path(), &base);
-    let payload = pr_payload_with(&store, &repo, false).await;
+    let payload = pr_payload(&store, &repo).await;
     unsafe { std::env::remove_var("GITHUB_EVENT_PATH") };
     payload
 }
@@ -5171,13 +5194,13 @@ async fn printed_schema_pr_payload(
     commit(&repo, "main: edit");
     let _cassettes = Cassettes::from(&repo.join("__llm__"));
     let store = Store::default();
-    scan_with(&store, &repo, true).await;
+    scan(&store, &repo).await;
     let base = head(&repo);
     git(&repo, &["checkout", "-q", "-b", "pr"]);
     change(&repo);
     commit(&repo, "pr: edit");
     event_with_base(tmp.path(), &base);
-    pr_payload_with(&store, &repo, true).await
+    pr_payload(&store, &repo).await
 }
 
 fn parcel_page_finding(payload: &serde_json::Value) -> Option<serde_json::Value> {
