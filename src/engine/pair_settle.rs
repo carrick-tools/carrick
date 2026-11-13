@@ -20,8 +20,16 @@
 //! and main's judge did not leave the pair to the consumer's own code, which
 //! the retype reads and no hash covers.
 //!
-//! Anything else is judged as before. Only a pull request run settles: a run
-//! that uploads never builds a [`SettleFrom`].
+//! The workspace join settles too (carrick#3884): every scan the join reads
+//! already judged and retyped its own pairs and stored each consumer's final
+//! outcome, so the join takes that outcome instead of judging the pair again.
+//! Its terms are [`SettleFrom::join`]'s, not a pull request's: the record must
+//! be this build's, at its blob's commit, with an equal `spec_hash` and
+//! `judged` set. A dirty tree and a pair left to the consumer's own code both
+//! settle, because the record was written from the tree the join reads.
+//!
+//! Anything else is judged as before. A run that uploads never builds a
+//! [`SettleFrom`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -106,14 +114,81 @@ struct MainGeneration {
 pub(crate) enum SettleSide {
     PullRequest,
     MainSide,
+    /// The workspace join, from the scans' own records (carrick#3884).
+    Join,
 }
 
-/// What a pull request run settles pairs from.
+/// What a run settles pairs from.
 pub(crate) struct SettleFrom {
     main: HashMap<String, MainGeneration>,
     carried: HashSet<String>,
     reach: HashMap<String, ReachDecision>,
     side: SettleSide,
+    /// The join's side: each service's record, or why it cannot be read.
+    join: HashMap<String, Result<HashMap<String, StoredPairOutcome>, JoinMiss>>,
+    /// The join also judges each settled pair and counts the differences.
+    verify: bool,
+}
+
+/// Why the join judged a pair instead of taking its stored outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum JoinMiss {
+    /// The consumer's blob holds no record, or no outcome under the pair's
+    /// key. A record over `PAIR_OUTCOMES_CAP_BYTES` was dropped at write
+    /// time and reads as this.
+    NoRecord,
+    /// The record was written by another build, or by a build with tracked
+    /// changes its commit does not hold.
+    OtherBuild,
+    /// The record is another format, at another commit than its blob, holds a
+    /// key twice, or its service id names two blobs.
+    Unreadable,
+    /// The pair's inputs differ from the ones the stored outcome was judged on.
+    Hash,
+    /// The stored outcome was caused by the run, not the two types.
+    NotJudged,
+    /// The producer's blob is not in the join's input.
+    NoProducer,
+}
+
+impl JoinMiss {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            JoinMiss::NoRecord => "no record",
+            JoinMiss::OtherBuild => "other build",
+            JoinMiss::Unreadable => "unreadable record",
+            JoinMiss::Hash => "hash",
+            JoinMiss::NotJudged => "not judged",
+            JoinMiss::NoProducer => "no producer",
+        }
+    }
+}
+
+/// `blob`'s record by pair key, when the join may read it: this format, at
+/// the blob's commit, by this clean build, each key once.
+fn join_record(
+    blob: &CloudRepoData,
+    this_build: Option<&ScannerBuild>,
+) -> Result<HashMap<String, StoredPairOutcome>, JoinMiss> {
+    let record = blob.pair_outcomes.as_ref().ok_or(JoinMiss::NoRecord)?;
+    if record.version != PAIR_OUTCOMES_VERSION || record.commit != blob.commit_hash {
+        return Err(JoinMiss::Unreadable);
+    }
+    if !same_build(record.scanner_build.as_ref(), this_build)
+        || !clean(record.scanner_build.as_ref())
+    {
+        return Err(JoinMiss::OtherBuild);
+    }
+    let mut by_key = HashMap::with_capacity(record.outcomes.len());
+    for outcome in &record.outcomes {
+        if by_key
+            .insert(outcome.pair_key.clone(), outcome.clone())
+            .is_some()
+        {
+            return Err(JoinMiss::Unreadable);
+        }
+    }
+    Ok(by_key)
 }
 
 /// A build that names tracked changes its commit does not hold is no build
@@ -179,7 +254,68 @@ impl SettleFrom {
             carried: carried.into_iter().collect(),
             reach,
             side: SettleSide::PullRequest,
+            join: HashMap::new(),
+            verify: false,
         }
+    }
+
+    /// What the workspace join settles from (carrick#3884): every blob it
+    /// reads. A pair settles when [`Self::join_settled`] accepts its
+    /// consumer's record. Unlike a pull request's terms, neither a dirty tree,
+    /// two commits, nor a pair left to the consumer's code refuses it: the
+    /// record was written by the scan that read that tree, with this build.
+    /// `verify` asks the join to judge every settled pair too and count the
+    /// differences (`CARRICK_JOIN_SETTLE=verify`).
+    pub(crate) fn join<'a>(
+        blobs: impl IntoIterator<Item = &'a CloudRepoData>,
+        this_build: Option<&ScannerBuild>,
+        verify: bool,
+    ) -> Self {
+        let mut join = HashMap::new();
+        for blob in blobs {
+            let id = blob
+                .service_name
+                .clone()
+                .unwrap_or_else(|| blob.repo_name.clone());
+            // A service id that names two blobs: which record is the pair's
+            // is not known, so neither is read.
+            join.entry(id)
+                .and_modify(|seen| *seen = Err(JoinMiss::Unreadable))
+                .or_insert_with(|| join_record(blob, this_build));
+        }
+        Self {
+            main: HashMap::new(),
+            carried: HashSet::new(),
+            reach: HashMap::new(),
+            side: SettleSide::Join,
+            join,
+            verify,
+        }
+    }
+
+    /// The join's stored outcome for `pair`, or why it is judged instead.
+    pub(crate) fn join_settled(&self, pair: &BuiltPair) -> Result<&StoredPairOutcome, JoinMiss> {
+        if !self.join.contains_key(&pair.producer_service) {
+            return Err(JoinMiss::NoProducer);
+        }
+        let record = self
+            .join
+            .get(&pair.consumer_service)
+            .ok_or(JoinMiss::NoRecord)?
+            .as_ref()
+            .map_err(|miss| *miss)?;
+        let stored = record.get(&pair.spec.pair_key).ok_or(JoinMiss::NoRecord)?;
+        if !stored.judged {
+            return Err(JoinMiss::NotJudged);
+        }
+        if stored.spec_hash != spec_hash(pair) {
+            return Err(JoinMiss::Hash);
+        }
+        Ok(stored)
+    }
+
+    pub(crate) fn verifies(&self) -> bool {
+        self.verify
     }
 
     /// What main's side of a pull request run settles from (carrick#3127).
@@ -224,6 +360,12 @@ impl SettleFrom {
     /// Main's outcome for `pair`, when the pair settles, and whether it
     /// settled with a reached side (carrick#3135).
     pub(crate) fn settled(&self, pair: &BuiltPair) -> Option<(&StoredPairOutcome, Settled)> {
+        if self.side == SettleSide::Join {
+            return self
+                .join_settled(pair)
+                .ok()
+                .map(|stored| (stored, Settled::ThisRun));
+        }
         let producer = self.main.get(&pair.producer_service)?;
         let consumer = self.main.get(&pair.consumer_service)?;
         if !producer.usable || !consumer.usable || producer.commit != consumer.commit {
@@ -252,6 +394,8 @@ pub(crate) enum Settled {
     Unreached,
     /// A side is reached, and the judge would read main's input (carrick#3135).
     SameJudgeInput,
+    /// The join took the outcome the scan of its consumer stored (carrick#3884).
+    ThisRun,
 }
 
 /// Whether the judge would read for `pair` what it read for main's `stored`

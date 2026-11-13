@@ -206,6 +206,24 @@ fn should_upload_data() -> bool {
     upload_decision_from_env().unwrap_or(false)
 }
 
+/// The A/B switch for the join's settle (carrick#3884): unset settles, `off`
+/// judges every pair as before, `verify` settles and also judges the settled
+/// pairs, logging how many differ.
+const JOIN_SETTLE_ENV: &str = "CARRICK_JOIN_SETTLE";
+
+/// What the workspace join settles its pairs from: the records the scans
+/// stored on each consumer's blob (carrick#3884).
+fn join_settle(all_repo_data: &[CloudRepoData]) -> Option<pair_settle::SettleFrom> {
+    let mode = env::var(JOIN_SETTLE_ENV).ok();
+    (mode.as_deref() != Some("off")).then(|| {
+        pair_settle::SettleFrom::join(
+            all_repo_data,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            mode.as_deref() == Some("verify"),
+        )
+    })
+}
+
 /// Whether this run writes main's hosted index. A run that names a local cache
 /// directory (`CARRICK_LOCAL_STORAGE_DIR`, the local check and indexer) uploads
 /// to that directory, not to the index, so it does not count.
@@ -1395,8 +1413,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // What the check did rides back in the join file, because this
         // process's own warning is swallowed by the indexer that spawned it
         // (carrick#1490).
+        // Each scan already judged and retyped its own pairs and stored the
+        // outcome on its consumer's blob: the join takes it (carrick#3884).
+        let settle = join_settle(&all_repo_data);
         let (analyzer, type_check) =
-            build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar, None).await?;
+            build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar, settle).await?;
         let results = analyzer.get_results();
         crate::local_mode::LocalJoin::from_results(&results, type_check, &analyzer.call_bases())
             .write(&out_path)?;
@@ -2913,10 +2934,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 &sdk_join.unresolved_for(&id),
                 &git_state.commit,
                 git_state.dirty,
+                !uploads_to_hosted_index(),
             ) {
                 info!(
-                    "scope: {} carried and written at this commit: its verdicts, SDK edges or \
-                     boundary changed",
+                    "scope: {} carried and written at this commit: its verdicts, SDK edges, \
+                     boundary or its outcomes' build changed",
                     run.label
                 );
                 payloads.push(refreshed);

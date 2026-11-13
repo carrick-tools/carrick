@@ -2447,24 +2447,60 @@ pub(crate) fn run_check(
     }
     let mut settled: Vec<PairCheckOutcome> = Vec::new();
     let mut settled_pairs: Vec<BuiltPair> = Vec::new();
-    let pairs: Vec<BuiltPair> = match settle {
+    // `CARRICK_JOIN_SETTLE=verify`: the settled pairs the join judges as well,
+    // only to count where its judge and the stored outcome differ.
+    let mut verify_keys: HashSet<String> = HashSet::new();
+    let mut pairs: Vec<BuiltPair> = match settle {
         Some(settle) => {
             let total = all_pairs.len();
             let mut pairs = Vec::with_capacity(total);
             let mut reached = 0usize;
+            let mut misses: BTreeMap<super::pair_settle::JoinMiss, usize> = BTreeMap::new();
             for pair in all_pairs {
-                match settle.settled(&pair) {
+                let found = match settle.side() {
+                    super::pair_settle::SettleSide::Join => match settle.join_settled(&pair) {
+                        Ok(stored) => Some((stored, super::pair_settle::Settled::ThisRun)),
+                        Err(miss) => {
+                            *misses.entry(miss).or_default() += 1;
+                            None
+                        }
+                    },
+                    _ => settle.settled(&pair),
+                };
+                match found {
                     Some((stored, how)) => {
                         if how == super::pair_settle::Settled::SameJudgeInput {
                             reached += 1;
                         }
                         settled.push(stored_outcome(&pair, stored));
-                        settled_pairs.push(pair);
+                        if settle.verifies() {
+                            verify_keys.insert(pair.spec.pair_key.clone());
+                            pairs.push(pair);
+                        } else {
+                            settled_pairs.push(pair);
+                        }
                     }
                     None => pairs.push(pair),
                 }
             }
             match settle.side() {
+                super::pair_settle::SettleSide::Join => {
+                    let not: Vec<String> = misses
+                        .iter()
+                        .map(|(miss, count)| format!("{} {count}", miss.as_str()))
+                        .collect();
+                    info!(
+                        "join settle: {} of {total} pairs taken from the scans' stored outcomes; \
+                         {} not: {}",
+                        settled.len(),
+                        total - settled.len(),
+                        if not.is_empty() {
+                            "none".to_string()
+                        } else {
+                            not.join(", ")
+                        }
+                    );
+                }
                 super::pair_settle::SettleSide::PullRequest => {
                     info!(
                         "type_reach: {} of {total} pairs settled from main",
@@ -2675,6 +2711,19 @@ pub(crate) fn run_check(
         "v2 check after-judge timing: retype {retype_ms} ms, post-passes {} ms",
         passes_started.elapsed().as_millis()
     );
+    if !verify_keys.is_empty() {
+        let (judged_again, kept): (Vec<_>, Vec<_>) = outcomes
+            .into_iter()
+            .partition(|outcome| verify_keys.contains(&outcome.pair_key));
+        outcomes = kept;
+        log_join_settle_differences(&settled, &judged_again);
+        let (verified, unsettled): (Vec<_>, Vec<_>) = pairs
+            .into_iter()
+            .partition(|pair| verify_keys.contains(&pair.spec.pair_key));
+        pairs = unsettled;
+        settled_pairs = verified;
+        unresolved_sides.retain(|key, _| !verify_keys.contains(key));
+    }
     let settled_keys: HashSet<String> = settled.iter().map(|o| o.pair_key.clone()).collect();
     outcomes.append(&mut settled);
 
@@ -3603,6 +3652,9 @@ const RETYPE_PROCESS_FLOOR_MB: u64 = 1024;
 const RETYPE_UNSENT: &str =
     "the retype check did not run: no sidecar process was left to send the call to";
 
+/// Set by the retype-reach test only: the check retypes no consumer call.
+const SKIP_RETYPE_FOR_TEST_ENV: &str = "CARRICK_TEST_SKIP_RETYPE";
+
 /// Judge every HTTP response pair whose CONSUMER left the verdict unresolved
 /// by retyping the consumer's call with the producer's response type and
 /// reading the consumer file's own type-check (carrick#1491).
@@ -3620,6 +3672,11 @@ fn retype_consumer_calls(
     local_consumers: &LocalConsumers,
     outcomes: &mut [PairCheckOutcome],
 ) {
+    // Test only: `tests/check_changed_retype_reach_test.rs` runs a check with
+    // and without the retype to see whether any printed line depends on it.
+    if std::env::var_os(SKIP_RETYPE_FOR_TEST_ENV).is_some() {
+        return;
+    }
     let (by_service, decided) = retype_items(pairs, consumer_blamed, local_consumers);
     let decided: HashMap<&str, &RetypeOutcome> = decided
         .iter()
@@ -4278,6 +4335,39 @@ fn run_caused(check_succeeded: bool, gate: Option<&str>) -> bool {
 fn not_judged(mut outcome: PairCheckOutcome) -> PairCheckOutcome {
     outcome.judged = false;
     outcome
+}
+
+/// `CARRICK_JOIN_SETTLE=verify` (carrick#3884): how many settled pairs the
+/// join's own judge answered differently, one line per pair. A pair the
+/// stored outcome left to the consumer agrees when the join's judge leaves it
+/// to the consumer too: the join reads no consumer code to retype it with.
+fn log_join_settle_differences(settled: &[PairCheckOutcome], judged_again: &[PairCheckOutcome]) {
+    let by_key: HashMap<&str, &PairCheckOutcome> = judged_again
+        .iter()
+        .map(|outcome| (outcome.pair_key.as_str(), outcome))
+        .collect();
+    let mut differ = 0usize;
+    for stored in settled {
+        let Some(join) = by_key.get(stored.pair_key.as_str()) else {
+            continue;
+        };
+        let agrees = if stored.left_to_consumer {
+            join.left_to_consumer
+        } else {
+            join.bucket == stored.bucket
+        };
+        if !agrees {
+            differ += 1;
+            info!(
+                "join settle verify differs: {} stored={:?} join={:?}",
+                stored.pair_key, stored.bucket, join.bucket
+            );
+        }
+    }
+    info!(
+        "join settle verify: {} settled, {differ} differ",
+        settled.len()
+    );
 }
 
 /// A settled pair's outcome: this run's pair, main's verdict (carrick#3104).
@@ -13537,6 +13627,223 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             !settles(&twice, &both, HashMap::new()),
             "a key stored twice"
         );
+    }
+
+    // ---- the join settles from the scans' stored outcomes (carrick#3884) ----
+
+    fn join_from(blobs: &[CloudRepoData]) -> super::super::pair_settle::SettleFrom {
+        super::super::pair_settle::SettleFrom::join(
+            blobs,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            false,
+        )
+    }
+
+    /// The C8 pair of [`settle_repos`], and a stored outcome for it that the
+    /// judge left to the consumer and the retype decided.
+    fn join_c8() -> (BuiltPair, PairCheckOutcome) {
+        let c8 = build_check_pairs(&settle_repos())
+            .into_iter()
+            .find(|pair| pair.consumer_alias == "C8")
+            .unwrap();
+        let mut outcome = outcome_for(
+            &c8,
+            VerdictBucket::Incompatible,
+            Some("retype:consumer".to_string()),
+            None,
+            true,
+            None,
+            Vec::new(),
+        );
+        outcome.left_to_consumer = true;
+        (c8, outcome)
+    }
+
+    /// A `check --changed` tree is dirty and a retype-decided pair is left to
+    /// the consumer: a pull request's terms refuse both, the join's take it.
+    #[test]
+    fn join_side_settles_a_dirty_tree_outcome_left_to_the_consumer() {
+        let (c8, outcome) = join_c8();
+        let mut blobs = main_blobs(&[outcome]);
+        for blob in &mut blobs {
+            blob.dirty = Some(true);
+        }
+        assert!(
+            settle_from(&blobs, &["api", "web"], HashMap::new())
+                .settled(&c8)
+                .is_none(),
+            "a pull request's terms refuse a dirty tree"
+        );
+        let join = join_from(&blobs);
+        let (stored, how) = join.settled(&c8).expect("the join settles it");
+        assert_eq!(how, super::super::pair_settle::Settled::ThisRun);
+        assert_eq!(stored.bucket, VerdictBucket::Incompatible);
+        assert!(stored.left_to_consumer);
+    }
+
+    /// What keeps the join from taking a stored outcome. Each is judged.
+    #[test]
+    fn join_side_refuses_each_guard() {
+        use super::super::pair_settle::JoinMiss;
+        let (c8, outcome) = join_c8();
+        let miss = |blobs: &[CloudRepoData]| join_from(blobs).join_settled(&c8).err();
+        assert_eq!(
+            miss(&main_blobs(std::slice::from_ref(&outcome))),
+            None,
+            "the control"
+        );
+
+        let mut moved = outcome.clone();
+        moved.spec_hash = "another".to_string();
+        assert_eq!(miss(&main_blobs(&[moved])), Some(JoinMiss::Hash));
+
+        let unjudged = PairCheckOutcome {
+            judged: false,
+            ..outcome.clone()
+        };
+        assert_eq!(miss(&main_blobs(&[unjudged])), Some(JoinMiss::NotJudged));
+
+        let mut other_build = main_blobs(std::slice::from_ref(&outcome));
+        other_build[1].pair_outcomes.as_mut().unwrap().scanner_build =
+            Some(crate::cloud_storage::ScannerBuild {
+                commit: "another".to_string(),
+                dirty: false,
+            });
+        assert_eq!(miss(&other_build), Some(JoinMiss::OtherBuild));
+
+        let mut other_commit = main_blobs(std::slice::from_ref(&outcome));
+        other_commit[1].commit_hash = "newer".to_string();
+        assert_eq!(miss(&other_commit), Some(JoinMiss::Unreadable));
+
+        let mut twice = main_blobs(std::slice::from_ref(&outcome));
+        let record = twice[1].pair_outcomes.as_mut().unwrap();
+        record.outcomes.push(record.outcomes[0].clone());
+        assert_eq!(miss(&twice), Some(JoinMiss::Unreadable));
+
+        let mut old_format = main_blobs(std::slice::from_ref(&outcome));
+        old_format[1].pair_outcomes.as_mut().unwrap().version = 0;
+        assert_eq!(miss(&old_format), Some(JoinMiss::Unreadable));
+
+        let blobs = main_blobs(std::slice::from_ref(&outcome));
+        assert_eq!(miss(&blobs[1..]), Some(JoinMiss::NoProducer));
+
+        let mut doubled = main_blobs(std::slice::from_ref(&outcome));
+        doubled.push(doubled[1].clone());
+        assert_eq!(
+            miss(&doubled),
+            Some(JoinMiss::Unreadable),
+            "one id, two blobs"
+        );
+
+        let mut none = main_blobs(&[outcome]);
+        none[1].pair_outcomes = None;
+        assert_eq!(miss(&none), Some(JoinMiss::NoRecord));
+    }
+
+    /// The four kinds of consumer blob a join reads (carrick#3884 R3), each
+    /// built as the scan writes it. Each settles; a carried consumer the
+    /// child did not rewrite, whose record another build wrote, does not.
+    #[test]
+    fn join_side_reads_every_kind_of_consumer_blob() {
+        let (c8, outcome) = join_c8();
+        let build = crate::cloud_storage::ScannerBuild::current();
+        let settles = |blobs: &[CloudRepoData]| join_from(blobs).join_settled(&c8).is_ok();
+
+        // Analysed by this run: a dirty tree at head, its record this run's.
+        let mut analysed = settle_repos();
+        for blob in &mut analysed {
+            blob.commit_hash = "head".to_string();
+            blob.dirty = Some(true);
+        }
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut analysed,
+            std::slice::from_ref(&outcome),
+            "head",
+            build.as_ref(),
+        );
+        assert!(settles(&analysed), "analysed");
+
+        // Carried and rewritten: the stored blob restamped at head, dirty.
+        let mut rewritten = main_blobs(std::slice::from_ref(&outcome));
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut rewritten,
+            std::slice::from_ref(&outcome),
+            "head",
+            build.as_ref(),
+        );
+        crate::change_scope::stamp_carried(&mut rewritten[1], "head", true);
+        assert!(settles(&rewritten), "carried and rewritten");
+
+        // Carried and not rewritten: the index's blob and record as stored,
+        // at an older commit than the producer's.
+        let mut kept = main_blobs(std::slice::from_ref(&outcome));
+        kept[0].commit_hash = "head".to_string();
+        kept[0].dirty = Some(true);
+        assert!(settles(&kept), "carried, not rewritten, same build");
+        kept[1].pair_outcomes.as_mut().unwrap().scanner_build =
+            Some(crate::cloud_storage::ScannerBuild {
+                commit: "another".to_string(),
+                dirty: false,
+            });
+        assert!(!settles(&kept), "carried, not rewritten, another build");
+
+        // Retained: a repo the run did not scan, as the index holds it.
+        assert!(settles(&main_blobs(&[outcome])), "retained");
+    }
+
+    /// carrick#3884 through a stand-in compiler engine: a pair the join
+    /// settles is never sent to the check, and comes out with the stored
+    /// bucket. `verify` judges it as well and still returns the stored one.
+    #[test]
+    fn a_pair_the_join_settles_is_never_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let log = root.join("asked.log");
+        let sidecar = recording_sidecar(&root, &log);
+        let repos = settle_repos();
+        let main = run_check(&sidecar, &repos, &settle_consumers(&root), None);
+        asked(&log);
+        // The scan's retype decided C8 a break; C9 stays as judged.
+        let decided: Vec<PairCheckOutcome> = main
+            .iter()
+            .cloned()
+            .map(|mut outcome| {
+                if outcome.pair_key.ends_with("C8") {
+                    outcome.bucket = VerdictBucket::Incompatible;
+                }
+                outcome
+            })
+            .collect();
+        let mut blobs = main_blobs(&decided);
+        for blob in &mut blobs {
+            blob.dirty = Some(true);
+        }
+        let joined = run_check(
+            &sidecar,
+            &blobs,
+            &LocalConsumers::new(),
+            Some(&join_from(&blobs)),
+        );
+        assert_eq!(asked(&log), Vec::<String>::new(), "no pair is judged");
+        assert_eq!(format!("{joined:?}"), format!("{decided:?}"));
+
+        let unsettled = run_check(&sidecar, &blobs, &LocalConsumers::new(), None);
+        assert_eq!(asked(&log), ["check api/P~web/C8", "check api/P~web/C9"]);
+        assert!(
+            unsettled
+                .iter()
+                .all(|o| o.bucket == VerdictBucket::Unverifiable),
+            "without the settle the join leaves both to the consumer"
+        );
+
+        let verify = super::super::pair_settle::SettleFrom::join(
+            &blobs,
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+            true,
+        );
+        let verified = run_check(&sidecar, &blobs, &LocalConsumers::new(), Some(&verify));
+        assert_eq!(asked(&log), ["check api/P~web/C8", "check api/P~web/C9"]);
+        assert_eq!(format!("{verified:?}"), format!("{decided:?}"));
     }
 
     /// [`settle_repos`] with each stub's capture records carrying `hashes`

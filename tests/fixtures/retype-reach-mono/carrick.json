@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "api", "directory": "apps/api" },
+    { "name": "web", "directory": "apps/web" }
+  ]
+}
