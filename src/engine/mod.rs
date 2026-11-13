@@ -8127,19 +8127,22 @@ fn result_index_of(
     }
     let discovery = discovery_of(inputs, root, claims, context);
     let ask = result_checks(claims, &discovery);
-    let verdicts = match sidecar {
+    let index = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
-            match sidecar.verify_library_claims(from_dir, &ask.checks) {
-                Ok(answer) => answer.verdicts,
-                Err(error) => {
-                    warn!(%error, "result shapes: the result ask failed; none indexed");
-                    Vec::new()
-                }
+            let answer = sidecar.verify_library_claims(from_dir, &ask.checks);
+            if let Err(error) = &answer {
+                // The asked calls are held unanswered, so their types say
+                // they were read without the answer (carrick#4154).
+                warn!(%error, "result shapes: the result ask failed; none verified");
             }
+            ResultIndex::answered(
+                &ask,
+                answer.as_ref().map(|answer| answer.verdicts.as_slice()),
+                &discovery,
+            )
         }
-        _ => Vec::new(),
+        _ => ResultIndex::of(&ask, &[], &discovery),
     };
-    let index = ResultIndex::of(&ask, &verdicts, &discovery);
     debug!(
         checks = index.checks,
         not_reached = index.not_reached,
@@ -10800,6 +10803,7 @@ fn site_infer_requests(
             alias: Some(alias),
             param_name,
             route_path: None,
+            result_unanswered: false,
         }
     };
     let mut requests = Vec::new();
@@ -10842,6 +10846,7 @@ fn site_infer_requests(
                         alias: Some(alias(ManifestTypeKind::Request)),
                         param_name: None,
                         route_path: None,
+                        result_unanswered: false,
                     });
                 }
                 // A built request's anchor is its object literal, not a
@@ -10859,6 +10864,8 @@ fn site_infer_requests(
                 );
                 // The store's label for the call's result (carrick#2910).
                 call_result.result = results.at_anchor(&anchors.call, repo_path);
+                call_result.result_unanswered =
+                    results.unanswered_at_anchor(&anchors.call, repo_path);
                 requests.push(call_result);
             }
             (OperationKey::Http { .. }, _) => {}
@@ -32038,6 +32045,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
