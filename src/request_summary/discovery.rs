@@ -4351,6 +4351,209 @@ mod tests {
         assert!(request.also.contains(&Stop::Unanswered), "{request:?}");
     }
 
+    /// A traced fixture through the whole site pass, with `declarations` as
+    /// the trace's answer: each saved site and possible call as the blob
+    /// carries it, and each decided site's composed and procedure paths, by
+    /// span.
+    #[allow(clippy::type_complexity)]
+    fn traced_rows(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+    ) -> (
+        Vec<crate::unread_sites::UnreadSite>,
+        BTreeMap<(String, u32, u32), Vec<String>>,
+    ) {
+        use super::super::decided_sites::{
+            MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::of(exports).tracing(declarations),
+            &on.repo,
+        );
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = SiteLabel::from_exports(exports);
+        let decided = decided_sites_traced_with(
+            &on.inputs,
+            &[],
+            &on.repo,
+            &discovered,
+            &labels,
+            &MakerLabel::from_exports(exports),
+            &ScopeLabel::from_exports(exports, &declarations.verified_scopes),
+            &ProcedureLabels::from_exports(exports, &declarations.verified_scopes),
+        );
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let rows = crate::site_rows::of(&decided, &records, &labels, &Default::default());
+        let unread = crate::unread_sites::from_scan(&discovery, &decided, &[], &[], &on.repo);
+        let mut data: crate::cloud_storage::CloudRepoData =
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "r",
+                "endpoints": [], "calls": [], "mounts": [], "apps": {},
+                "imported_handlers": [], "function_definitions": {},
+                "config_json": null, "package_json": null, "packages": null,
+                "last_updated": "2026-11-13T00:00:00Z", "commit_hash": "abc"
+            }))
+            .unwrap();
+        let listed: Vec<crate::possible_calls::PossibleCall> =
+            rows.leads.iter().chain(&rows.routes).cloned().collect();
+        crate::unread_sites::attach(&mut data, unread, &listed);
+        let mut sites: BTreeMap<(String, u32, u32), Vec<String>> = BTreeMap::new();
+        for site in &decided.sites {
+            let composed: Vec<String> = site
+                .composed
+                .iter()
+                .map(|composed| format!("{:?} {}", composed.path, composed.end))
+                .collect();
+            let procedure = site
+                .procedure
+                .as_ref()
+                .map(|procedure| format!("{:?} {:?}", procedure.full_paths, procedure.stop));
+            sites
+                .entry((site.file.clone(), site.span_start, site.span_end))
+                .or_default()
+                .push(format!(
+                    "{:?} {composed:?} {procedure:?} trimmed={}",
+                    site.key, site.composed_trimmed
+                ));
+        }
+        (data.unread_sites.unwrap_or_default(), sites)
+    }
+
+    /// carrick#4155: the declaration ask carries the scope checks too, so a
+    /// dead ask leaves the decided pass without the scope members that bind
+    /// a route's prefix and a procedure router's keys. Run with the real
+    /// answer and with a dead ask: each span where the dead run saves
+    /// another site, or decides another path, says `unanswered` beside its
+    /// own reason, and no other span does. The dead run's moves, as
+    /// `file:line`, and the spans marked that did not move.
+    fn dead_ask_scope_moves(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        answered: &MemberDeclarations,
+    ) -> (Vec<String>, Vec<String>) {
+        let ask = declaration_ask(&on.inputs, exports);
+        assert!(
+            ask.scopes.iter().flatten().count() > 0,
+            "the fixture asks scope checks"
+        );
+        let dead = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let (real_rows, real_sites) = traced_rows(on, exports, answered);
+        let (dead_rows, dead_sites) = traced_rows(on, exports, &dead);
+        let rows_at = |rows: &[crate::unread_sites::UnreadSite], at: &(String, u32, u32)| {
+            let mut found: Vec<String> = rows
+                .iter()
+                .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .map(|row| format!("{} {} {:?}", row.reason.as_str(), row.slot, row.callee))
+                .collect();
+            found.sort();
+            found
+        };
+        let mut spans: BTreeSet<(String, u32, u32)> = BTreeSet::new();
+        for row in real_rows.iter().chain(&dead_rows) {
+            spans.insert((row.file.clone(), row.span_start, row.span_end));
+        }
+        spans.extend(real_sites.keys().cloned());
+        spans.extend(dead_sites.keys().cloned());
+        let line_of = |at: &(String, u32, u32)| {
+            dead_rows
+                .iter()
+                .chain(&real_rows)
+                .find(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .map_or(0, |row| row.line)
+        };
+        let mut unmarked: Vec<String> = Vec::new();
+        let mut marked_unmoved: Vec<String> = Vec::new();
+        let mut moved: Vec<String> = Vec::new();
+        for at in &spans {
+            let here: Vec<&crate::unread_sites::UnreadSite> = dead_rows
+                .iter()
+                .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .collect();
+            let marked = !here.is_empty()
+                && here.iter().all(|row| {
+                    row.also.contains(&Stop::Unanswered) && row.reason != Stop::Unanswered
+                });
+            let moves = rows_at(&real_rows, at) != rows_at(&dead_rows, at)
+                || real_sites.get(at) != dead_sites.get(at);
+            let name = format!("{}:{}", at.0, line_of(at));
+            if moves {
+                moved.push(name.clone());
+                if !marked {
+                    unmarked.push(format!(
+                        "{name} real {:?} {:?} / dead {:?} {:?}",
+                        rows_at(&real_rows, at),
+                        real_sites.get(at),
+                        here.iter()
+                            .map(|row| format!("{} also {:?}", row.reason.as_str(), row.also))
+                            .collect::<Vec<_>>(),
+                        dead_sites.get(at)
+                    ));
+                }
+            } else if here.iter().any(|row| row.also.contains(&Stop::Unanswered)) {
+                marked_unmoved.push(name);
+            }
+        }
+        assert!(
+            unmarked.is_empty(),
+            "{} of {} moved span(s) not marked unanswered:\n{}",
+            unmarked.len(),
+            moved.len(),
+            unmarked.join("\n")
+        );
+        moved.sort();
+        marked_unmoved.sort();
+        (moved, marked_unmoved)
+    }
+
+    /// carrick#4155 on scope members that mount a router, run a plugin and
+    /// return a scoped app (`receiver-scopes`). The routers a `route` mount
+    /// places keep their sites in a dead run, served relative to a mount
+    /// the trace cannot place: those say `unanswered`. The other ten moves
+    /// are the op half's (carrick#3991), marked before this fix.
+    #[test]
+    fn a_failed_declaration_ask_saves_scoped_route_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_named("receiver-scopes")
+            .expect("the receiver-scopes fixture walks: a skipped test proves nothing");
+        let (moved, marked_unmoved) = dead_ask_scope_moves(&on, &exports, &answered);
+        assert_eq!(moved.len(), 17, "{moved:#?}");
+        for mounted in [
+            "src/admin.ts:8",
+            "src/aliased.ts:8",
+            "src/extra.ts:9",
+            "src/reports.ts:9",
+            "src/shared.ts:8",
+            "src/users.ts:8",
+            "src/users.ts:9",
+        ] {
+            assert!(
+                moved.iter().any(|at| at == mounted),
+                "{mounted}: {moved:#?}"
+            );
+        }
+        assert_eq!(marked_unmoved, Vec::<String>::new(), "moved: {moved:#?}");
+    }
+
+    /// carrick#4155 on procedure router members that collect and merge
+    /// (`procedure-router`). A dead ask leaves every procedure op unread at
+    /// discovery, so each site it moves is the op half's (carrick#3991).
+    /// Marked though it does not move: `t.procedure.stream`, a member the
+    /// label states no method for, whose declaration the ask decides.
+    #[test]
+    fn a_failed_declaration_ask_saves_procedure_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_in("procedure-router", ".", "api")
+            .expect("the procedure-router fixture walks: a skipped test proves nothing");
+        let (moved, marked_unmoved) = dead_ask_scope_moves(&on, &exports, &answered);
+        assert_eq!(moved.len(), 17, "{moved:#?}");
+        assert_eq!(marked_unmoved, ["src/router.ts:16"], "moved: {moved:#?}");
+    }
+
     /// carrick#2432 slice B: an implementation the walk cannot enter (one
     /// only a `.d.ts` declares, or a property that is no function) is not
     /// silently dropped. A call whose only implementations are like that
