@@ -10846,6 +10846,7 @@ fn site_infer_requests(
                         alias: Some(alias(ManifestTypeKind::Request)),
                         param_name: None,
                         route_path: None,
+                        result_unanswered: false,
                     });
                 }
                 // A built request's anchor is its object literal, not a
