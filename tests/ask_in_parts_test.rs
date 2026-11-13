@@ -109,10 +109,11 @@ fn table_source(tag: &str) -> String {
     for n in 0..HANDLER_MODULES {
         writeln!(out, "import {{ h{n} }} from \"./handlers/h{n}\";").unwrap();
     }
-    // Two lines, as the window constants count them; no import, so the
-    // table's own import table names only the handler modules.
-    out.push_str("// The routes register on an installed package's table.\n");
-    out.push_str("declare const table: import(\"fixture-table\").Table;\n");
+    // Two declarations, as the window constants count them, typed by the
+    // installed package with no import: the table's import table names only
+    // the handler modules.
+    out.push_str("type Table = import(\"fixture-table\").Table;\n");
+    out.push_str("declare const table: Table;\n");
     out.push_str("const local = (req: any, res: any) => {};\n");
     for i in 0..LOCAL_SINGLES {
         single(&mut out, tag, i, "local");
@@ -1142,7 +1143,7 @@ async fn a_part_prompt_shows_its_window_and_lists_its_own_candidates_imports_and
     ];
     // The declarations each part shows beside its window: the first part's
     // window holds every one it uses; the middle part uses the table, which
-    // is made by a function declared above it; the last part the same.
+    // is typed by an alias declared above it; the last part the same.
     let context: [&[(u32, u32)]; 3] = [&[], &[(5, 5), (6, 6)], &[(5, 5), (6, 6)]];
     for (index, ((part, (from, to)), modules)) in
         parts.iter().zip(PART_RANGES).zip(modules).enumerate()
