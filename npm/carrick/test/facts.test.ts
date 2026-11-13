@@ -1269,8 +1269,8 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   const file = ws.at("orders-api/src/routes/orders.ts");
   // The `check --changed` the first Stop queues answers late, whichever runner
   // takes it (the edit's or Stop's): a second Stop that finds its clean answer
-  // claims it in silence (as on main), and the next carrier then has nothing
-  // to say about it. Held back, the second Stop always runs first.
+  // states the clean check itself (carrick#4085), and the next carrier then
+  // has nothing to say about it. Held back, the second Stop always runs first.
   const slowCheck = { CARRICK_FAKE_FULL_DELAY_MS: "2000" };
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "lead",
