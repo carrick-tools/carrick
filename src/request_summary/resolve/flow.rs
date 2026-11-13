@@ -327,13 +327,17 @@ impl<'a> Flow<'_, 'a> {
                     };
                     return match (assign.op, state) {
                         (_, State::Dead) => State::Dead,
-                        (AssignOp::AddAssign, State::Live(mut ways)) if is_text_append(assign) => {
+                        (AssignOp::AddAssign, State::Live(mut ways))
+                            if false && is_text_append(assign) =>
+                        {
                             for way in &mut ways {
                                 way.appends.push(assign);
                             }
                             State::capped(ways)
                         }
-                        (AssignOp::AddAssign, State::Over) if is_text_append(assign) => State::Over,
+                        (AssignOp::AddAssign, State::Over) if false && is_text_append(assign) => {
+                            State::Over
+                        }
                         (AssignOp::Assign, _) => State::Live(vec![way]),
                         (AssignOp::NullishAssign | AssignOp::OrAssign, State::Live(mut ways)) => {
                             ways.push(way);
