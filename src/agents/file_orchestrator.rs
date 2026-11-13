@@ -4603,6 +4603,14 @@ impl FileOrchestrator {
             let file = Path::new(&pf.path_str);
             if let Some(silent) = summaries.silent(file) {
                 pf.silent_sites = silent.clone();
+                // The name join's member at a call whose callee the
+                // summaries read whole and found sends nothing from it, a
+                // call whose text rules out every request the callee sends
+                // included (carrick#4093): the join reads a request the
+                // call never makes.
+                let before = pf.resolved_members.len();
+                pf.resolved_members.retain(|span, _| !silent.contains(span));
+                stats.imported_members_refused += before - pf.resolved_members.len();
             }
             if let Some(reached) = summaries.reached(file) {
                 stats.imported_members_refused += Self::refuse_members_the_compiler_contradicts(
