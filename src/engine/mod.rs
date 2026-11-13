@@ -7952,22 +7952,20 @@ fn member_declarations(
     let started = Instant::now();
     let ask = declaration_ask(inputs, claims);
     let mut failed = false;
-    let verdicts = match sidecar {
+    let declarations = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
             #[cfg(test)]
             DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
-            match sidecar.verify_library_claims(from_dir, &ask.checks) {
-                Ok(answer) => answer.verdicts,
-                Err(error) => {
-                    warn!(%error, "receiver trace: the declaration ask failed; none indexed");
-                    failed = true;
-                    Vec::new()
-                }
-            }
+            let answer = sidecar
+                .verify_library_claims(from_dir, &ask.checks)
+                .map(|answer| answer.verdicts);
+            failed = !answer
+                .as_ref()
+                .is_ok_and(|verdicts| verdicts.len() == ask.checks.len());
+            MemberDeclarations::answered(&ask, answer)
         }
-        _ => Vec::new(),
+        _ => MemberDeclarations::of(&ask, &[]),
     };
-    let declarations = MemberDeclarations::of(&ask, &verdicts);
     debug!(
         checks = declarations.checks,
         not_reached = declarations.not_reached,

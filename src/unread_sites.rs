@@ -395,6 +395,15 @@ pub fn from_scan(
             Some(held) => held.also(site.reason),
         }
     }
+    // A call whose member declaration the receiver trace's ask left
+    // unanswered (carrick#3991): the answer would have read its callee. A
+    // row there that reached a labelled end is listed for another slot,
+    // which the answer does not decide.
+    for (file, lo, hi) in &discovery.declarations_unanswered {
+        mark_unanswered(&mut out, (file.as_str(), *lo, *hi), |row| {
+            row.labelled_end.is_none()
+        });
+    }
     out
 }
 
@@ -486,13 +495,27 @@ pub fn with_unanswered_implementations(
 ) -> Vec<UnreadSite> {
     for (file, lo, hi) in asked {
         let file = crate::site_rows::relative(root, &file.to_string_lossy());
-        for row in stops.iter_mut().filter(|row| {
-            row.reason == Stop::InterfaceMember && row.at() == (file.as_str(), *lo, *hi)
-        }) {
-            row.also(Stop::Unanswered);
-        }
+        mark_unanswered(&mut stops, (file.as_str(), *lo, *hi), |row| {
+            row.reason == Stop::InterfaceMember
+        });
     }
     stops
+}
+
+/// `unanswered` beside the reason of every saved site at `at` that an ask
+/// with no answer would have decided (`applies`): the merge each failed
+/// ask's sites share (carrick#3991).
+fn mark_unanswered(
+    stops: &mut [UnreadSite],
+    at: (&str, u32, u32),
+    applies: impl Fn(&UnreadSite) -> bool,
+) {
+    for row in stops
+        .iter_mut()
+        .filter(|row| row.at() == at && applies(row))
+    {
+        row.also(Stop::Unanswered);
+    }
 }
 
 /// A saved site that reached a decorator export: where it is, and what the
@@ -1411,6 +1434,69 @@ mod tests {
             ),
             (Some("pubsub"), Some("producer"), "name")
         );
+    }
+
+    /// carrick#3991: a call the dead declaration ask would have decided says
+    /// `unanswered` beside its reason; a row there that reached a labelled
+    /// end is listed for a slot the answer does not decide, and is left alone.
+    #[test]
+    fn a_dead_declaration_ask_marks_only_rows_with_no_labelled_end() {
+        let site = DiscoverySite {
+            file: "src/a.ts".to_string(),
+            line: 3,
+            span_start: 30,
+            span_end: 44,
+            callee: "app.get".to_string(),
+            end: None,
+            chain: Vec::new(),
+            stop: Some(Stop::PackageUnmatched),
+            receiver: None,
+            reached: None,
+            bound: Vec::new(),
+            also: Vec::new(),
+        };
+        let end = LabelledEnd {
+            package: "a-server-lib".to_string(),
+            export: "default".to_string(),
+            member: Some("get".to_string()),
+            role: "server_framework".to_string(),
+            op: Some("receive".to_string()),
+            file: "src/c.ts".to_string(),
+            line: 5,
+            span_start: 50,
+            span_end: 60,
+            new: false,
+            scope: None,
+            procedure: None,
+        };
+        let discovery = Discovery {
+            unfollowed: vec![site],
+            declarations_unanswered: [
+                ("src/a.ts".to_string(), 30, 44),
+                ("src/c.ts".to_string(), 50, 60),
+            ]
+            .into(),
+            ..Discovery::default()
+        };
+        let decided = Decided {
+            stops: vec![DecidedStop {
+                file: "src/c.ts".to_string(),
+                line: 5,
+                span_start: 50,
+                span_end: 60,
+                callee: Some("app.get".to_string()),
+                depth: 0,
+                end,
+                reason: Stop::Recursion,
+            }],
+            ..Decided::default()
+        };
+        let rows = from_scan(&discovery, &decided, &[], &[], Path::new("/repo"));
+        let by_file = |file: &str| rows.iter().find(|row| row.file == file).unwrap();
+        assert_eq!(by_file("src/a.ts").reason, Stop::PackageUnmatched);
+        assert_eq!(by_file("src/a.ts").also, vec![Stop::Unanswered]);
+        assert_eq!(by_file("src/c.ts").reason, Stop::Recursion);
+        assert!(by_file("src/c.ts").also.is_empty());
     }
 
     /// A caller the send side could not compose is one unread site at the
