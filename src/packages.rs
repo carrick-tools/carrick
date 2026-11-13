@@ -67,6 +67,11 @@ pub struct ManifestFacts {
     /// Deno member would report no dependents, which is a claim rather than
     /// an absence (carrick#994).
     pub local_imports: Vec<String>,
+    /// Import-map entries (`imports` and `scopes`, the config's own first)
+    /// whose target is an `npm:` package: key to target, in the order
+    /// written. A bare import the map sends to npm is that package, whether
+    /// or not Deno wrote a `node_modules` (carrick#4070).
+    pub npm_imports: Vec<(String, String)>,
 }
 
 pub(crate) fn read_json_config(path: &Path) -> Result<serde_json::Value, io::Error> {
@@ -127,11 +132,13 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
             bin: json.get("bin").is_some(),
             workspace: Vec::new(),
             local_imports: Vec::new(),
+            npm_imports: Vec::new(),
         });
     }
 
     let mut dependencies = BTreeMap::new();
     let mut local_imports = Vec::new();
+    let mut npm_imports = Vec::new();
     let external_map = crate::deno_support::import_map_path(path, &json)?
         .map(|path| read_json_config(&path))
         .transpose()?;
@@ -143,8 +150,14 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
                 .into_iter()
                 .flat_map(|scopes| scopes.values().filter_map(serde_json::Value::as_object)),
         ) {
-            for target in entries.values().filter_map(serde_json::Value::as_str) {
+            for (key, target) in entries
+                .iter()
+                .filter_map(|(key, target)| Some((key, target.as_str()?)))
+            {
                 if let Some((name, spec)) = deno_registry_identity(target) {
+                    if target.starts_with("npm:") {
+                        npm_imports.push((key.clone(), target.to_string()));
+                    }
                     dependencies.entry(name).or_insert(spec);
                 } else if target.starts_with("./") || target.starts_with("../") {
                     local_imports.push(target.to_string());
@@ -206,6 +219,7 @@ pub fn read_manifest(path: &Path) -> Result<ManifestFacts, io::Error> {
         bin: json.get("bin").is_some(),
         workspace,
         local_imports,
+        npm_imports,
     })
 }
 
