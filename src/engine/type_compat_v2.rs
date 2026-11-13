@@ -746,8 +746,8 @@ pub(crate) fn derive_capture_anchors(
         let no_text_no_param = request.expression_text.is_none() && request.param_name.is_none();
         let no_span = request.span_start.is_none() && request.span_end.is_none();
         let names_no_payload = match request.infer_kind {
-            InferKind::RequestBody => no_span && no_text_no_param,
-            InferKind::ResponseBody => no_span && no_text_no_param,
+            InferKind::RequestBody | InferKind::FunctionReturn => no_span && no_text_no_param,
+            InferKind::ResponseBody => no_text_no_param,
             _ => false,
         };
         if names_no_payload {
