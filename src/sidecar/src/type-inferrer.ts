@@ -9277,6 +9277,16 @@ export class TypeInferrer {
    * at the first body read" without assuming which framework produced it.
    * Returns null (not a spurious type) for a genuinely payload-less handler.
    */
+  /** The property access that reads a member straight off `cast`, parentheses aside. */
+  private memberReadOffCast(cast: Node): Node | undefined {
+    let outer: Node = cast;
+    while (Node.isParenthesizedExpression(outer.getParent())) outer = outer.getParentOrThrow();
+    const parent = outer.getParent();
+    return parent && Node.isPropertyAccessExpression(parent) && parent.getExpression() === outer
+      ? parent
+      : undefined;
+  }
+
   private inferRequestReadFromHandler(func: FunctionLike): string | null {
     const body = func.getBody();
     if (!body) {
@@ -9306,10 +9316,16 @@ export class TypeInferrer {
       // B. an `as T` cast (`req.body as TrackRequest`) or a typed binding
       // (`const b: TrackRequest = …`). Read the annotation/cast target.
       if (Node.isAsExpression(descendant)) {
+        // A member read off the cast (`(req as unknown as { body: T }).body`)
+        // reads that member: the cast's whole object is one level too many
+        // (carrick#4212). The checker types the member access itself.
+        const member = this.memberReadOffCast(descendant);
         const typeNode = descendant.getTypeNode();
-        const resolved = typeNode
-          ? this.structuralTextFromTypeNode(typeNode)
-          : null;
+        const resolved = member
+          ? this.structuralTextFromType(member.getType(), member)
+          : typeNode
+            ? this.structuralTextFromTypeNode(typeNode)
+            : null;
         if (resolved) {
           found = resolved;
           traversal.stop();
