@@ -764,6 +764,45 @@ pub fn attach(data: &mut CloudRepoData, stops: Vec<UnreadSite>, listed: &[Possib
     data.unread_sites_not_listed = (!not_listed.is_empty()).then_some(not_listed);
 }
 
+/// The three unread-site keys [`attach`] writes on a blob, read back off the
+/// blobs of one scan for the `CARRICK_OUTPUT_JSON` output (carrick#3958). It
+/// reads what `attach` wrote and produces no list of its own; over several
+/// services the rows join in service order and the counts add.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UnreadSiteKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites: Option<Vec<UnreadSite>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread_sites_by_reason: Option<BTreeMap<Stop, u32>>,
+}
+
+impl UnreadSiteKeys {
+    pub fn of_blobs<'a>(blobs: impl IntoIterator<Item = &'a CloudRepoData>) -> Self {
+        let mut keys = Self::default();
+        for blob in blobs {
+            if let Some(rows) = &blob.unread_sites {
+                keys.unread_sites
+                    .get_or_insert_with(Vec::new)
+                    .extend(rows.iter().cloned());
+            }
+            if let Some(total) = blob.unread_sites_total {
+                *keys.unread_sites_total.get_or_insert(0) += total;
+            }
+            if let Some(by_reason) = &blob.unread_sites_by_reason {
+                let into = keys
+                    .unread_sites_by_reason
+                    .get_or_insert_with(BTreeMap::new);
+                for (reason, count) in by_reason {
+                    *into.entry(*reason).or_insert(0) += count;
+                }
+            }
+        }
+        keys
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

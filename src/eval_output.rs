@@ -31,6 +31,10 @@ pub struct EvalProjection {
     pub cross_repo_matches: Vec<CrossRepoMatch>,
     /// Dependency version conflicts across the scanned repos (contract §4).
     pub dependency_conflicts: Vec<EvalDependencyConflict>,
+    /// The sites the scan could not read, the same three keys the blob
+    /// carries (carrick#3958), set by the engine from the scanned blobs.
+    #[serde(flatten, default)]
+    pub unread: crate::unread_sites::UnreadSiteKeys,
 }
 
 /// One extracted operation (endpoint or call), flattened for scoring.
@@ -262,6 +266,7 @@ impl EvalProjection {
                 .collect(),
             cross_repo_matches,
             dependency_conflicts,
+            unread: Default::default(),
         }
     }
 

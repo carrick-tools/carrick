@@ -2823,7 +2823,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // an eval run wants only the JSON, no upload or comment side effects. (Eval
     // mode never uploads, so `upload_payloads` is always `None` here.)
     if std::env::var("CARRICK_OUTPUT_JSON").is_ok() {
-        let projection = crate::eval_output::EvalProjection::from_results(
+        let mut projection = crate::eval_output::EvalProjection::from_results(
             &results,
             &eval_type_manifest,
             &analyzer.call_raw_targets(),
@@ -2831,6 +2831,8 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             &analyzer.call_unfollowed_members(),
             &analyzer.call_own_routes(),
         );
+        projection.unread =
+            crate::unread_sites::UnreadSiteKeys::of_blobs(runs.iter().map(|run| &run.data));
         crate::outln!("{}", serde_json::to_string_pretty(&projection)?);
         return Ok(());
     }
