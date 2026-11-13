@@ -9025,13 +9025,50 @@ fn fold_graphql_transport_calls(
 /// otherwise the resolver the model located (carrick#1157); otherwise the
 /// schema line. Only the row reads this: the producer's type stays anchored
 /// at `resolver_file`/`resolver_line` or the schema.
-fn graphql_producer_row_place(op: &crate::graphql::GraphqlOp) -> (&Path, u32) {
+///
+/// The third answer is why the row stays on the schema line
+/// ([`crate::request_summary::Stop::HandlerNotLocated`], carrick#3989): no reader placed the
+/// resolver, or two places disagree. A field with only a backing type located
+/// has a handler the model read but no line to point at, so it says nothing.
+fn graphql_producer_row_place(
+    op: &crate::graphql::GraphqlOp,
+) -> (&Path, u32, Option<crate::request_summary::Stop>) {
     use crate::graphql::SchemaKeyedPlace;
+    use crate::request_summary::Stop;
     match (&op.schema_keyed_place, &op.resolver_file, op.resolver_line) {
-        (Some(SchemaKeyedPlace::At { file, line }), _, _) => (file, *line),
-        (None, Some(file), Some(line)) => (file, line),
-        _ => (&op.file_path, op.line),
+        (Some(SchemaKeyedPlace::At { file, line }), _, _) => (file, *line, None),
+        (None, Some(file), Some(line)) => (file, line, None),
+        (None, Some(_), None) => (&op.file_path, op.line, None),
+        _ => (&op.file_path, op.line, Some(Stop::HandlerNotLocated)),
     }
+}
+
+/// The unread sites of the GraphQL root fields no reader placed a resolver
+/// for, one at each field's name on its schema line, read from
+/// [`graphql_producer_row_place`] and from nowhere else. A field of a mocked
+/// schema is no row of this service's own, so it is not saved.
+fn unplaced_producer_sites(
+    graphql: &crate::graphql::GraphqlExtraction,
+    repo_path: &str,
+    service: &Config,
+) -> Vec<crate::unread_sites::UnreadSite> {
+    graphql
+        .producers
+        .iter()
+        .filter_map(|op| {
+            let (file, line, why) = graphql_producer_row_place(op);
+            why?;
+            if protocol_producer_provenance(file, repo_path, service).is_mock() {
+                return None;
+            }
+            Some(crate::unread_sites::unplaced_producer(
+                &crate::site_rows::relative(Path::new(repo_path), &file.to_string_lossy()),
+                line,
+                op.name_offset,
+                "graphql",
+            ))
+        })
+        .collect()
 }
 
 /// Where a GraphQL, socket or pub/sub producer row's evidence comes from
@@ -9135,7 +9172,7 @@ fn append_deterministic_protocol_operations(
             .extend(graphql.producers.iter().map(|op| {
                 // The schema states the field, the model only places the
                 // resolver, so the row is the schema's either way (carrick#3091).
-                let (file, line) = graphql_producer_row_place(op);
+                let (file, line, _) = graphql_producer_row_place(op);
                 let row = to_producer(op.key.clone(), file, line);
                 ApiEndpointDetails {
                     resolution_source: Some(
@@ -9242,11 +9279,16 @@ fn append_deterministic_protocol_operations(
             &extractions.library.unanswered,
             Path::new(repo_path),
         );
-        let unread = crate::unread_sites::with_unanswered_implementations(
+        let mut unread = crate::unread_sites::with_unanswered_implementations(
             unread,
             &extractions.implementations_unanswered,
             Path::new(repo_path),
         );
+        unread.extend(unplaced_producer_sites(
+            &extractions.graphql,
+            repo_path,
+            service,
+        ));
         crate::unread_sites::attach(cloud_data, unread, &site.leads);
         debug!(
             unread_sites = cloud_data.unread_sites_total.unwrap_or_default(),
@@ -27436,6 +27478,7 @@ unfollowed_member_calls_total: 0,
             file_path: PathBuf::from("src/schema.graphql"),
             line: 3,
             document_line: 1,
+            name_offset: 0,
             primary_type_symbol: anchor.map(String::from),
             payload_type_symbol: None,
             payload_type_source: None,
@@ -27467,6 +27510,7 @@ unfollowed_member_calls_total: 0,
             file_path: PathBuf::from("web-frontend/lib/graphql.ts"),
             line: 76,
             document_line: 70,
+            name_offset: 0,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: payload_source.map(String::from),
@@ -27891,6 +27935,7 @@ unfollowed_member_calls_total: 0,
             file_path: PathBuf::from(file_path),
             line: 10,
             document_line: 9,
+            name_offset: 0,
             primary_type_symbol: None,
             payload_type_symbol: payload_symbol.map(String::from),
             payload_type_source: None,
@@ -31979,7 +32024,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 .expect("producer")
         };
         let served = |field: &str| {
-            let (file, line) = graphql_producer_row_place(producer(field));
+            let (file, line, _) = graphql_producer_row_place(producer(field));
             format!("{}:{line}", file.display())
         };
         let type_anchor = |field: &str| {
@@ -32010,6 +32055,87 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         assert_eq!(type_anchor("twice").as_deref(), Some("src/twice.ts:4"));
         assert_eq!(type_anchor("model").as_deref(), Some("src/model.ts:9"));
+    }
+
+    /// Why a row stays on its schema line (carrick#3989): one producer per arm
+    /// of [`graphql_producer_row_place`].
+    #[test]
+    fn graphql_producer_row_place_says_why_a_row_stays_on_the_schema() {
+        use crate::graphql::SchemaKeyedPlace;
+        use crate::operation::GraphqlOperationKind::Query;
+        use crate::request_summary::Stop;
+        let why = |edit: &dyn Fn(&mut crate::graphql::GraphqlOp)| {
+            let mut op = graphql_op(Query, "crates", None);
+            edit(&mut op);
+            graphql_producer_row_place(&op).2
+        };
+        assert_eq!(
+            why(&|op| {
+                op.schema_keyed_place = Some(SchemaKeyedPlace::At {
+                    file: PathBuf::from("src/a.ts"),
+                    line: 5,
+                })
+            }),
+            None,
+            "a schema-keyed place"
+        );
+        assert_eq!(
+            why(&|op| {
+                op.resolver_file = Some(PathBuf::from("src/a.ts"));
+                op.resolver_line = Some(7);
+            }),
+            None,
+            "a resolver the model located"
+        );
+        assert_eq!(
+            why(&|op| op.resolver_file = Some(PathBuf::from("src/a.ts"))),
+            None,
+            "a backing type only"
+        );
+        assert_eq!(why(&|_| {}), Some(Stop::HandlerNotLocated), "no claim");
+        assert_eq!(
+            why(&|op| {
+                op.schema_keyed_place = Some(SchemaKeyedPlace::Ambiguous);
+                op.resolver_file = Some(PathBuf::from("src/a.ts"));
+                op.resolver_line = Some(7);
+            }),
+            Some(Stop::HandlerNotLocated),
+            "two places disagree, and the model's line does not break the tie"
+        );
+    }
+
+    /// One site per unplaced field of the service's own schema, on the row's
+    /// line; a located field and a mocked schema's field save none.
+    #[test]
+    fn unplaced_producer_sites_save_only_the_unplaced_own_fields() {
+        use crate::operation::GraphqlOperationKind::Query;
+        use crate::request_summary::Stop;
+        let producer = |field: &str, file: &str, offset: u32| {
+            let mut op = graphql_op(Query, field, None);
+            op.file_path = PathBuf::from(file);
+            op.name_offset = offset;
+            op
+        };
+        let mut located = producer("crate", "src/schema.graphql", 30);
+        located.resolver_file = Some(PathBuf::from("src/crate.ts"));
+        located.resolver_line = Some(4);
+        let graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![
+                producer("crates", "src/schema.graphql", 40),
+                located,
+                producer("relabelCrate", "src/__mocks__/crates.graphql", 50),
+            ],
+            ..Default::default()
+        };
+        let sites = unplaced_producer_sites(&graphql, "/repo", &Config::default());
+        let shown: Vec<_> = sites
+            .iter()
+            .map(|site| (site.file.as_str(), site.line, site.span_start, site.reason))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![("src/schema.graphql", 3, 40, Stop::HandlerNotLocated)]
+        );
     }
 
     /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
@@ -32370,6 +32496,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             file_path: PathBuf::from(file),
             line,
             document_line: line,
+            name_offset: 0,
             primary_type_symbol: None,
             ..graphql_op(Query, field, None)
         };
@@ -32455,6 +32582,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             file_path: PathBuf::from(file),
             line,
             document_line: line,
+            name_offset: 0,
             primary_type_symbol: None,
             ..graphql_op(Query, field, None)
         };

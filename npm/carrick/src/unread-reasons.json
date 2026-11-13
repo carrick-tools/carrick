@@ -55,5 +55,6 @@
   "procedure_unmounted": "the procedure's adapter has no path prefix and no call mounts it, so Carrick can't tell where it is served",
   "procedure_no_adapter": "no adapter in this repository is handed this procedure's router, so Carrick can't find a path for it",
   "procedure_subscription_not_http": "it is a subscription, and the library's labels state no request method for it",
-  "graphql_mount_path_unread": "the GraphQL server's endpoint path is not written in the code (often a library default), so Carrick can't tell where it is served"
+  "graphql_mount_path_unread": "the GraphQL server's endpoint path is not written in the code (often a library default), so Carrick can't tell where it is served",
+  "handler_not_located": "operation declared here, but Carrick found no handler or resolver that serves it"
 }
