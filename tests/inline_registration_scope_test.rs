@@ -70,6 +70,28 @@ type Mount<'a> = (&'a str, &'a str, &'a str, &'a str, Option<&'a str>);
 type Route<'a> = (&'a str, &'a str, &'a str, &'a str);
 
 fn answer(file: &str, mounts: &[Mount], routes: &[Route]) -> (String, FileAnalysisResult) {
+    answer_with(file, mounts, routes, candidate_at)
+}
+
+/// The id the name rule (C3) gives the call that starts on `line`. Only
+/// `src/handler.ts` reads it: its router and its handler's `c` are untyped,
+/// so the fact layer lists neither call. Left for #3702 to name.
+fn name_rule_candidate_at(file: &str, line: usize) -> String {
+    carrick::swc_scanner::SwcScanner::new()
+        .scan_content(&root().join(file), &source(file), &[], &[])
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.line_number == line)
+        .unwrap_or_else(|| panic!("no candidate at {file}:{line}"))
+        .candidate_id
+}
+
+fn answer_with(
+    file: &str,
+    mounts: &[Mount],
+    routes: &[Route],
+    candidate: fn(&str, usize) -> String,
+) -> (String, FileAnalysisResult) {
     let mounts: Vec<serde_json::Value> = mounts
         .iter()
         .map(|(needle, parent, child, path, import)| {
@@ -88,7 +110,7 @@ fn answer(file: &str, mounts: &[Mount], routes: &[Route]) -> (String, FileAnalys
         .map(|(needle, owner, method, path)| {
             let line = line_of(file, needle);
             serde_json::json!({
-                "candidate_id": candidate_at(file, line),
+                "candidate_id": candidate(file, line),
                 "line_number": line,
                 "owner_node": owner,
                 "method": method,
@@ -405,13 +427,14 @@ async fn a_route_handler_callback_is_not_a_scope() {
     // The model may read `c.get('user')` inside the handler as a row hanging
     // from `c`. The call that passes the callback registers a route, so the
     // callback is handed a request and is no scope.
-    let handler = answer(
+    let handler = answer_with(
         "src/handler.ts",
         &[],
         &[
             ("router.get('/me'", "router", "GET", "/me"),
             ("c.get('user')", "c", "GET", "user"),
         ],
+        name_rule_candidate_at,
     );
     let result = analyze(vec![handler]).await;
     assert!(
