@@ -52,6 +52,9 @@ pub const ALLOW_PARTIAL_ENV: &str = "CARRICK_ALLOW_PARTIAL_ANALYSIS";
 /// existing index is not thinned; a sidecar that never becomes ready aborts
 /// before the analysis, because nothing after that point can recover the
 /// types and the whole LLM spend would buy a typeless index (carrick#748).
+/// It also lands a service whose types the run lost at resolution in place
+/// of a stored index that has them, which the run otherwise keeps
+/// ([`crate::engine::durability::holds_back_for_types`], carrick#3992).
 pub const ALLOW_MISSING_TYPES_ENV: &str = "CARRICK_ALLOW_MISSING_TYPES";
 
 /// Set this (the cloud runner does) to stop the run at the first type-checker

@@ -2168,7 +2168,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     //
     // `CARRICK_ALLOW_PARTIAL_ANALYSIS` still lands a held-back service; the
     // loss is reported either way.
+    //
+    // A service whose types this run lost at resolution, where its stored
+    // index has them, is held back the same way (carrick#3992): the index
+    // stays stale but typed, rather than current and typeless.
+    // `CARRICK_ALLOW_MISSING_TYPES` lands it.
     let allow_partial = crate::scan_health::allow_partial_from_env();
+    let allow_missing_types = crate::scan_health::allow_missing_types_from_env();
+    let run_cap_mb = crate::services::type_sidecar::heap_cap_mb();
     let laptop = run_start.is_laptop();
     let authorized_basename = run_context
         .repo_full_name
@@ -2190,8 +2197,37 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 repo.repo_name == repo_name && repo.service_name == run.data.service_name
             }),
         };
-        run.held_back = durability::holds_back(&run.owed, has_index, laptop, allow_partial);
-        if run.held_back {
+        run.types_held = should_upload && {
+            let stored = previous_generations.iter().find(|repo| {
+                repo.repo_name == repo_name && repo.service_name == run.data.service_name
+            });
+            let memory_death =
+                crate::scan_health::first_type_memory_death_of(run.data.service_name.as_deref());
+            durability::holds_back_for_types(
+                run.data.types_degraded.as_ref(),
+                memory_death.as_ref(),
+                run_cap_mb,
+                stored,
+                allow_missing_types,
+            )
+        };
+        let owes = durability::holds_back(&run.owed, has_index, laptop, allow_partial);
+        run.held_back = owes || run.types_held;
+        if run.types_held {
+            let line = format!(
+                "Not uploading {} because this run lost its types ({}). Its stored index has them \
+                 and stays. Set {}=1 to upload it without types.",
+                run.label,
+                run.data
+                    .types_degraded
+                    .as_ref()
+                    .map_or("", |lost| lost.detail.as_str()),
+                crate::scan_health::ALLOW_MISSING_TYPES_ENV
+            );
+            warn!("{line}");
+            logging::annotate(logging::Annotation::Warning, &line);
+        }
+        if owes {
             warn!(
                 "Not uploading {}: it already has an index and this run still owes it model \
                  work ({}), so uploading would replace that index with a thinner one. Set {} to \
@@ -3177,6 +3213,47 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
             .into());
         }
     }
+    // A service kept at its stored index for its types (step 4c,
+    // carrick#3992). As with pending work, CI's exit code is the only place
+    // it shows. The laptop, and the local indexer that drives a laptop's
+    // scans, said it in the run and keep the served generation, so they exit
+    // 0.
+    let types_held: Vec<&str> = runs
+        .iter()
+        .filter(|run| run.types_held)
+        .map(|run| run.label.as_str())
+        .collect();
+    // A run that wrote no final write (every analysed service held) and owes
+    // no model work closes its scan with the same marker the pending path
+    // above writes, so the slot is released and a runner does not read the
+    // run as one that never landed (carrick#4157).
+    if !types_held.is_empty() && !closed_by_final_write && !incomplete {
+        let reason = format!(
+            "types lost while reading, stored index kept: {}",
+            types_held.join(", ")
+        );
+        storage
+            .report_scan_failed(
+                crate::scan_stage::current().as_str(),
+                &fail_reason(&reason, &logging::Redaction::for_run(Some(repo_path))),
+            )
+            .await;
+    }
+    let laptop_run = laptop || crate::local_mode::hosted::driven_by_the_indexer();
+    if !laptop_run && !allow_missing_types && !types_held.is_empty() {
+        let others = if runs.iter().any(|run| !run.held_back && !run.carried) {
+            "The other services were uploaded."
+        } else {
+            "Nothing was uploaded."
+        };
+        return Err(format!(
+            "Kept the stored index of {} because this run lost their types. {others} Set {}=1 \
+             to upload without types.",
+            types_held.join(", "),
+            crate::scan_health::ALLOW_MISSING_TYPES_ENV
+        )
+        .into());
+    }
 
     // The last word of a run whose index is not what it should be. Everything
     // above happened; this is what makes the exit code say so (carrick#1067).
@@ -3240,6 +3317,10 @@ struct ServiceRun {
     owed: durability::OwedWork,
     /// Decided once every service has been analysed (step 4c).
     held_back: bool,
+    /// Held back because this run lost its types and its stored index has
+    /// them ([`durability::holds_back_for_types`], carrick#3992). Decided in
+    /// step 4c, only on a run that uploads.
+    types_held: bool,
     /// Not analysed: `data` is its stored generation (`--changed-only`,
     /// carrick#2227).
     carried: bool,
@@ -3285,6 +3366,7 @@ impl ServiceRun {
             data: stored,
             owed: durability::OwedWork::default(),
             held_back: false,
+            types_held: false,
             carried: true,
             call_through,
             boundaries,
@@ -3863,6 +3945,7 @@ impl ServiceScan {
             data,
             owed,
             held_back: false,
+            types_held: false,
             carried: false,
             call_through: analysis.call_through,
             boundaries: analysis.route_boundaries,

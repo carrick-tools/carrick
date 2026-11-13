@@ -715,7 +715,9 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 // rows noticed (carrick#748). Stop here instead: before the
                 // analysis, so the LLM spend is not paid for a typeless
                 // result, and before the upload, so the typed index already
-                // in the cloud survives.
+                // in the cloud survives. A sidecar that dies later, at
+                // resolution, is decided per service by
+                // `engine::durability::holds_back_for_types` (carrick#3992).
                 if scan_health::should_fail_on_missing_types(
                     e.is_environmental(),
                     scan_health::allow_missing_types_from_env(),

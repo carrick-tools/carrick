@@ -865,6 +865,179 @@ async fn on_a_laptop_a_held_back_service_keeps_its_served_generation() {
     assert!(markers[0].1.contains("beta"), "{markers:?}");
 }
 
+/// A stand-in compiler engine under `dir`: it answers every request, except
+/// that `beta`'s process exits at type resolution (`infer` or `bundle`) while
+/// `die` exists, after writing `died`. Returns its entry point.
+fn engine_that_dies_at_beta_resolution(dir: &Path, die: &Path, died: &Path) -> PathBuf {
+    let entry = dir.join("dist/src/index.js");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(
+        &entry,
+        format!(
+            r#"const fs = require("fs");
+let root = "";
+let buffered = "";
+process.stdin.on("data", (chunk) => {{
+  buffered += chunk;
+  let end;
+  while ((end = buffered.indexOf("\n")) >= 0) {{
+    const line = buffered.slice(0, end);
+    buffered = buffered.slice(end + 1);
+    if (!line.trim()) continue;
+    let request;
+    try {{ request = JSON.parse(line); }} catch (e) {{ continue; }}
+    const answer = (fields) =>
+      fs.writeSync(1, JSON.stringify(Object.assign({{ request_id: request.request_id }}, fields)) + "\n");
+    if (request.action === "shutdown") process.exit(0);
+    if (request.action === "init") {{
+      root = request.repo_root || "";
+      answer({{ status: "ready", init_time_ms: 1 }});
+      continue;
+    }}
+    if (root.endsWith("beta") && (request.action === "infer" || request.action === "bundle") && fs.existsSync({die:?})) {{
+      fs.writeFileSync({died:?}, request.action);
+      process.exit(1);
+    }}
+    switch (request.action) {{
+      case "bundle":
+        answer({{ status: "success", dts_content: "", manifest: [], symbol_failures: [] }});
+        break;
+      case "infer":
+        answer({{ status: "success", inferred_types: [] }});
+        break;
+      case "resolve_definitions":
+        answer({{ status: "success", definitions: [] }});
+        break;
+      default:
+        answer({{ status: "error", errors: ["the stand-in answers nothing else"] }});
+    }}
+  }}
+}});
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+"#,
+            die = die.to_string_lossy(),
+            died = died.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    entry
+}
+
+/// A laptop first index of `repo` (its services `indexed`) in which beta's
+/// types land, then a rescan in which the compiler engine dies at beta's
+/// type resolution; the rescan exits 0. Returns the rescan's storage and how
+/// many uploads the first index made.
+async fn laptop_rescan_that_loses_beta_types(
+    tmp: &Path,
+    repo: &Path,
+    indexed: &[&str],
+) -> (StubStorage, usize) {
+    let die = tmp.join("die");
+    let died = tmp.join("died");
+    let entry = engine_that_dies_at_beta_resolution(&tmp.join("engine"), &die, &died);
+    let sidecar =
+        carrick::services::type_sidecar::TypeSidecar::spawn(&entry).expect("the stand-in spawns");
+    sidecar.start_init(repo, None);
+    sidecar
+        .wait_ready(std::time::Duration::from_secs(60))
+        .expect("the stand-in is ready");
+
+    let first = StubStorage::laptop(&[]);
+    run_analysis_engine_with_sidecar(first.clone(), repo.to_str().unwrap(), Some(&sidecar), false)
+        .await
+        .expect("a clean first index");
+    let landed = first.uploads().len();
+    let typed = first.latest("beta").expect("beta landed");
+    assert!(typed.types_degraded.is_none(), "{:?}", typed.types_degraded);
+    assert!(
+        typed.type_manifest.as_ref().is_some_and(|m| !m.is_empty()),
+        "beta's first index has no type manifest"
+    );
+
+    let rescan = StubStorage {
+        indexed: Some(indexed.iter().map(|s| s.to_string()).collect()),
+        ..first.clone()
+    };
+    std::fs::write(&die, "plain").unwrap();
+    run_analysis_engine_with_sidecar(rescan.clone(), repo.to_str().unwrap(), Some(&sidecar), true)
+        .await
+        .expect("a laptop run that kept a service's types exits 0");
+    assert!(
+        died.exists(),
+        "the stand-in never died at beta's resolution"
+    );
+    (rescan, landed)
+}
+
+/// carrick#3992 on the laptop path: a rescan whose compiler engine dies at
+/// beta's type resolution, where beta's stored index has its types, keeps
+/// that index and its served generation, lands the other two, and exits 0.
+/// The last write closes the scan, so no fail marker is written.
+#[tokio::test]
+#[serial]
+async fn on_a_laptop_a_service_that_lost_its_types_keeps_its_served_generation() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = three_service_repo(tmp.path());
+    let (rescan, landed) =
+        laptop_rescan_that_loses_beta_types(tmp.path(), &repo, &["alpha", "beta", "gamma"]).await;
+
+    let mut fresh: Vec<String> = rescan.uploads()[landed..]
+        .iter()
+        .filter_map(|u| u.data.service_name.clone())
+        .collect();
+    fresh.sort();
+    assert_eq!(fresh, ["alpha", "gamma"], "beta's typed index is kept");
+    assert_eq!(*rescan.kept.lock().unwrap(), ["beta"]);
+    let markers = rescan.scan_failed.lock().unwrap().clone();
+    assert!(markers.is_empty(), "{markers:?}");
+}
+
+/// carrick#4157: a laptop rescan of a single-service repo whose only
+/// service is kept for its types writes nothing, so no write closes the
+/// scan: the fail marker does, naming the service.
+#[tokio::test]
+#[serial]
+async fn on_a_laptop_a_run_that_keeps_every_service_closes_with_the_marker() {
+    offline_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("monorepo");
+    write(
+        &repo,
+        "carrick.json",
+        r#"{ "services": [ { "name": "beta", "directory": "services/beta" } ] }"#,
+    );
+    write(
+        &repo,
+        "package.json",
+        r#"{ "name": "monorepo", "private": true }"#,
+    );
+    write(
+        &repo,
+        "services/beta/package.json",
+        r#"{ "name": "beta", "dependencies": { "express": "4.18.2" } }"#,
+    );
+    write(
+        &repo,
+        "services/beta/src/server.ts",
+        "import express from \"express\";\n\nconst app = express();\n\n\
+         app.get(\"/beta/status\", async (_req, res) => {\n  \
+         const upstream = await fetch(\"http://localhost:9000/api/health\");\n  \
+         res.json({ ok: upstream.ok });\n});\n\napp.listen(3000);\n",
+    );
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+
+    let (rescan, landed) = laptop_rescan_that_loses_beta_types(tmp.path(), &repo, &["beta"]).await;
+    assert_eq!(rescan.uploads().len(), landed, "beta's typed index is kept");
+    assert_eq!(*rescan.kept.lock().unwrap(), ["beta"]);
+    let markers = rescan.scan_failed.lock().unwrap().clone();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert!(markers[0].1.contains("beta"), "{markers:?}");
+}
+
 /// A spent run-wide retry budget skips the in-run retry (carrick#1126): one
 /// detection failure that the retry would have absorbed leaves the service
 /// pending instead, and the run finishes without asking again.
