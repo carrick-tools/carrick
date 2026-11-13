@@ -72,7 +72,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::implementations::{Followed, Implementations};
-use super::resolve::{Follow, Invoke, MAX_VALUES, Maker, Resolver, defaults_of};
+use super::resolve::{
+    Follow, Invoke, MAX_VALUES, Maker, Resolver, defaults_of, note_unfilled,
+    unread_where_spread_unfilled,
+};
 use super::row_calls::Reach;
 use super::*;
 use crate::library_claims::{ExportClaims, applies, runtime_packages_of, scope_step};
@@ -1222,6 +1225,10 @@ struct Open<'a> {
     /// The functions entered from where the walk started down to the body
     /// that holds `invoke`.
     chain: Vec<ChainHop>,
+    /// A ref came from a key a caller writes only through a spread of its
+    /// own parameter (ruling R-SP): when the refs' callers hold nothing,
+    /// the key keeps the reading it had before the rule (carrick#4025).
+    spread: bool,
 }
 
 /// One value a callee may hold, read (carrick#2432): `Reached` is what the
@@ -3243,6 +3250,7 @@ impl<'a> Walker<'a> {
     ) -> Outcome<'a> {
         for open in std::mem::take(&mut inner.open) {
             let mut values = open.known;
+            let mut spread = open.spread;
             for (depth, index, keys) in open.refs {
                 if depth == 1
                     && let Some(maker) = maker
@@ -3276,16 +3284,20 @@ impl<'a> Walker<'a> {
                     continue;
                 }
                 let resolver = self.values;
-                values.extend(resolver.passed(
+                values.extend(resolver.passed_noting(
                     self,
                     Some(invoke),
                     index,
                     &keys,
                     defaults_of(callee),
                     open.invoke,
+                    &mut spread,
                 ));
             }
-            let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
+            let mut settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
+            for open in &mut settled.open {
+                open.spread |= spread;
+            }
             inner.absorb(settled);
         }
         inner
@@ -3346,6 +3358,7 @@ impl<'a> Walker<'a> {
                     known,
                     invoke,
                     chain,
+                    spread: false,
                 }],
                 ..Outcome::default()
             };
@@ -3424,15 +3437,24 @@ impl<'a> Walker<'a> {
         let resolver = self.values;
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
+            let mut unfilled = 0;
             for (out, index, keys) in &open.refs {
-                values.extend(resolver.callers_pass(
+                let before = unfilled;
+                let held = resolver.callers_pass_noting(
                     self,
                     (file, key, depth),
                     (*out, *index, keys),
                     open.invoke,
                     &mut Vec::new(),
-                ));
+                    &mut unfilled,
+                );
+                note_unfilled(&mut unfilled, before, open.spread, &held);
+                values.extend(held);
             }
+            // A key written through a spread of a parameter its callers do
+            // not fill, and nothing else held: each write keeps the reading
+            // it had before ruling R-SP (carrick#4025).
+            unread_where_spread_unfilled(&mut values, unfilled);
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
         }
@@ -4191,6 +4213,318 @@ mod tests {
         assert!(
             at("n1/cache.ts", 19).iter().all(|site| site.end.is_none()),
             "a client that sends nothing has no end"
+        );
+    }
+
+    /// Discovery of `tests/fixtures/spread-absent-key`, its sites at
+    /// `file:line` by their stops, and every site and unfollowed call for a
+    /// failure message.
+    fn spread_absent_key() -> Option<(Discovery, String)> {
+        let on = walked("spread-absent-key", "", "", &[], true)?;
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/spread-absent-key/__llm__/library-claims/default.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let discovery = discover(&on.inputs, &Labels::of_answer(&answer), &on.repo);
+        let all = format!("{:?} {:?}", discovery.sites, discovery.unfollowed);
+        Some((discovery, all))
+    }
+
+    /// The stops of the sites discovery keeps at `file:line`.
+    fn stops_at(discovery: &Discovery, file: &str, line: u32) -> Vec<Option<Stop>> {
+        discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with(file) && site.line == line)
+            .map(|site| site.stop)
+            .collect()
+    }
+
+    /// Ruling R-SP (carrick#2448, #3504): a key read through object spreads
+    /// is absent where every spread source resolves to an object that does
+    /// not write it. The hooks call the SDK with
+    /// `{ ...options, signal, throwOnError }`, `options` the hook's own
+    /// parameter whose callers never write `client`, so
+    /// `options?.client ?? client` holds the module client alone and the
+    /// calls reach the client's `fetch` with no `several_values` stop. The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_no_spread_source_writes_is_absent() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for (file, line) in [
+            ("src/sdk.ts", 7),
+            ("src/sdk.ts", 14),
+            ("src/sdk.ts", 22),
+            ("hooks/queries.ts", 8),
+            ("hooks/queries.ts", 15),
+            ("hooks/queries.ts", 22),
+        ] {
+            let stops = stops_at(&discovery, file, line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(Option::is_none),
+                "{file}:{line} reaches the client with no stop: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay: a spread source the resolver does not read
+    /// (`...JSON.parse(raw)`) may write the key, so it stays unread and the
+    /// receiver keeps two values. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_an_unread_spread_source_may_write_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [8, 15] {
+            let stops = stops_at(&discovery, "unread/stored.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "unread/stored.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay: the sources are parameters of callbacks a
+    /// library runs (`key[0]`, `fnOptions`). Nothing in the repository passes
+    /// them, so they cannot be resolved here and `client` stays unread; the
+    /// receiver keeps two values. Reading what a library passes to a callback
+    /// is a store question, filed under the V1 shape hold. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_library_callback_parameter_spread_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [17, 21] {
+            let stops = stops_at(&discovery, "src/callbacks.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "callbacks.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP: a named-binding spread source that writes the key
+    /// (`call({ ...base, signal })`, `const base = { run: send }` local to the caller) is read, so the
+    /// key reads that value: `options.run(...)` enters `send` and stops
+    /// nowhere. Before the rule the key was unread and the call stopped. The
+    /// answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_is_read() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let stops = stops_at(&discovery, "writes/same.ts", 7);
+        assert!(
+            !stops.is_empty() && stops.iter().all(Option::is_none),
+            "writes/same.ts:7 enters `send` with no stop: {stops:?}\n{all}"
+        );
+    }
+
+    /// Ruling R-SP, must-stay: a spread source that writes another client
+    /// (`{ ...base, signal }`, `base = { client: offline }`) carries what it
+    /// writes, so the receiver holds both clients and keeps two values. The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_another_client_keeps_several_values() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for line in [16, 23] {
+            let stops = stops_at(&discovery, "writes/offline.ts", line);
+            assert!(
+                !stops.is_empty() && stops.iter().all(|stop| *stop == Some(Stop::SeveralValues)),
+                "writes/offline.ts:{line} keeps several values: {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay (v1-agent on carrick#4025): `args` reaches
+    /// `check` only through spreads (of the parameter, and of a local binding
+    /// that spreads it), and the gate holding it is run only through a value
+    /// (`deps.gate(...)`), so the resolver finds no caller of it, though one
+    /// writes `log`. The rule must not state `value_never_bound` there: each
+    /// `log.warn` keeps the reason a spread the resolver cannot read gives
+    /// (`checkParsed`, the same read through `...JSON.parse(raw)`). The
+    /// answer key is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_through_a_parameter_run_only_as_a_value_keeps_the_unread_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        // A callee the walk stops at with no labelled end is listed among
+        // the calls it did not follow, or as a site.
+        let unfollowed_at = |line: u32| -> Vec<Option<Stop>> {
+            discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with("through_value/gates.ts") && site.line == line)
+                .map(|site| site.stop)
+                .collect()
+        };
+        let twin = unfollowed_at(35);
+        assert!(
+            !twin.is_empty() && !twin.contains(&Some(Stop::ValueNeverBound)),
+            "gates.ts:35 states the unread reason: {twin:?}\n{all}"
+        );
+        for line in [9, 23] {
+            let stops = unfollowed_at(line);
+            assert_eq!(
+                stops, twin,
+                "gates.ts:{line} keeps the twin's reason, not value_never_bound\n{all}"
+            );
+        }
+    }
+
+    /// Ruling R-SP, must-stay (v1-agent on carrick#3856, #4025): where a
+    /// spread source writes a key from a parameter whose callers the
+    /// resolver does not find (a function run only through a value, a method
+    /// another service calls), each such write keeps the reading it had
+    /// before the rule, so the site states main's reason and never
+    /// `value_never_bound`. `meters.ts` spreads a local object that writes
+    /// `log` from a parameter; `refusals.ts` spreads the parameter in the
+    /// gate and in an arrow inside it; `panel.ts` builds a class with
+    /// `{ token, ...params }` and calls its field; `relay.ts` passes the key
+    /// through two spreads. `builder.ts` is the rule's read: `handle` read
+    /// through the builder method's `{ ...options, tag }`, `options` a
+    /// parameter of a function written inside the builder, is a callback
+    /// what runs that method fills. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_key_a_spread_source_writes_from_an_unfilled_parameter_keeps_mains_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let at = |file: &str, line: u32| -> (Vec<Option<Stop>>, Vec<Option<Stop>>) {
+            let of = |sites: &Vec<DiscoverySite>| -> Vec<Option<Stop>> {
+                sites
+                    .iter()
+                    .filter(|site| site.file.ends_with(file) && site.line == line)
+                    .map(|site| site.stop)
+                    .collect()
+            };
+            (of(&discovery.sites), of(&discovery.unfollowed))
+        };
+        let unread = (vec![Some(Stop::UnreadExpression)], Vec::new());
+        for (file, line) in [
+            ("through_value/meters.ts", 15),
+            ("through_value/refusals.ts", 9),
+        ] {
+            assert_eq!(at(file, line), unread, "{file}:{line}\n{all}");
+        }
+        assert_eq!(
+            at("through_value/panel.ts", 19),
+            (Vec::new(), vec![Some(Stop::ValueCallee)]),
+            "panel.ts:19\n{all}"
+        );
+        // The calls into the meter stop inside it, as before the rule: no
+        // site of their own.
+        for line in [23, 24, 33] {
+            assert_eq!(
+                at("through_value/meters.ts", line),
+                (Vec::new(), Vec::new()),
+                "meters.ts:{line}\n{all}"
+            );
+        }
+        // Two spreads on the way up are one unread write, as before the
+        // rule: the twin's reading.
+        assert_eq!(
+            at("through_value/relay.ts", 9),
+            at("through_value/gates.ts", 35),
+            "relay.ts:9\n{all}"
+        );
+        assert_eq!(
+            at("through_value/builder.ts", 8),
+            (vec![Some(Stop::InjectedCallee)], Vec::new()),
+            "builder.ts:8\n{all}"
+        );
+        // A key no spread source writes reads as a literal that does not
+        // write it.
+        assert_eq!(
+            at("through_value/clock.ts", 8),
+            at("through_value/clock.ts", 13),
+            "clock.ts:8\n{all}"
+        );
+    }
+
+    /// The `(file, line)` of each labelled end of the sites discovery keeps
+    /// at `file:line`, with the stops beside them.
+    fn ends_at(
+        discovery: &Discovery,
+        file: &str,
+        line: u32,
+    ) -> (Vec<(String, String)>, Vec<Option<Stop>>) {
+        let sites: Vec<&DiscoverySite> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with(file) && site.line == line)
+            .collect();
+        let ends = sites
+            .iter()
+            .filter_map(|site| site.end.as_ref())
+            .map(|end| (end.package.clone(), end.export.clone()))
+            .collect();
+        (ends, sites.iter().map(|site| site.stop).collect())
+    }
+
+    /// Ruling R-SP, must-keep (v1-agent on carrick#3856): an action is
+    /// handed the members a factory returns, by one caller as they are and
+    /// by another as `{ ...tableDeps(), mint }`. Each member sends a command
+    /// built from a labelled export of the table client, one inside a
+    /// callback a paging helper runs. Read through the spread, both callers
+    /// hold the same members, so each `deps.*` call keeps its labelled end
+    /// and stops nowhere. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_member_read_through_a_spread_of_a_factory_keeps_its_labelled_end() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for (line, export) in [(9, "GetRow"), (10, "QueryRows")] {
+            let (ends, stops) = ends_at(&discovery, "deps_spread/action.ts", line);
+            assert!(
+                ends.contains(&("fixture-table".to_string(), export.to_string()))
+                    && ends.iter().all(|(package, _)| package == "fixture-table")
+                    && stops.iter().all(Option::is_none),
+                "action.ts:{line} reaches `{export}` with no stop: {ends:?} {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// A callee whose one caller hands it a value the resolver does not
+    /// read holds one stop, and the call is saved with a reason, never
+    /// dropped (v1-agent on carrick#3856): `agree` passes a lone held stop
+    /// up as no stop, and the call's own row names the hole. The answer key
+    /// is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_callee_holding_one_stop_is_saved_with_a_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let saved = |line: u32| -> Vec<(Option<SiteEnd>, Option<Stop>)> {
+            discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with("deps_spread/action.ts") && site.line == line)
+                .map(|site| (site.end.clone(), site.stop))
+                .collect()
+        };
+        assert_eq!(
+            (saved(15), saved(20)),
+            (
+                vec![(None, Some(Stop::ValueCallee))],
+                vec![(None, Some(Stop::ValueCallee))]
+            ),
+            "action.ts:15 and :20 are saved with a reason\n{all}"
         );
     }
 

@@ -170,3 +170,7 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/in-process-publish/node_modules/@types/node/
 !tests/fixtures/in-process-publish/node_modules/@types/node/package.json
 !tests/fixtures/in-process-publish/node_modules/@types/node/index.d.ts
+!tests/fixtures/spread-absent-key/repo/node_modules/
+!tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/
+!tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/package.json
+!tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/index.d.ts

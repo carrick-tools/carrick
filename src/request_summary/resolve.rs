@@ -1590,10 +1590,17 @@ pub(super) enum ValueAt {
     /// An object literal: each key's values, and whether a spread or a
     /// computed key may put any other key in it. `entries` is the
     /// procedures walk's alone; every other reader reads `fields`.
+    ///
+    /// `spreads` holds what each spread may hold, in source order, where a
+    /// spread is the only way a key `fields` lacks may enter (no computed
+    /// key, method or accessor, every spread read within the cap); `None`
+    /// otherwise. [`Self::at`] reads a key `fields` lacks from them (ruling
+    /// R-SP, carrick#2448, #3504).
     Object {
         fields: BTreeMap<String, Vec<ValueAt>>,
         open: bool,
         entries: ObjectEntries,
+        spreads: Option<Vec<Vec<ValueAt>>>,
     },
     /// Text a name states (carrick#3504 S2, [`text::text_of`]): only the
     /// text reader ([`Resolver::text_values`]) reads the variants below.
@@ -1797,6 +1804,7 @@ impl ValueAt {
                 fields,
                 open,
                 entries,
+                spreads,
             } => Self::Object {
                 fields: fields
                     .iter()
@@ -1804,6 +1812,12 @@ impl ValueAt {
                     .collect(),
                 open: *open,
                 entries: entries.map(Self::enclosed),
+                spreads: spreads.as_ref().map(|spreads| {
+                    spreads
+                        .iter()
+                        .map(|values| values.iter().map(Self::enclosed).collect())
+                        .collect()
+                }),
             },
             Self::Returned {
                 lo,
@@ -1850,6 +1864,7 @@ impl ValueAt {
                 fields,
                 open,
                 entries,
+                spreads,
             } => Self::Object {
                 fields: fields
                     .iter()
@@ -1862,6 +1877,12 @@ impl ValueAt {
                     .collect(),
                 open: *open,
                 entries: entries.map(Self::unparameterised),
+                spreads: spreads.as_ref().map(|spreads| {
+                    spreads
+                        .iter()
+                        .map(|values| values.iter().map(Self::unparameterised).collect())
+                        .collect()
+                }),
             },
             Self::Returned {
                 lo,
@@ -1888,8 +1909,9 @@ impl ValueAt {
     }
 
     /// The values at `keys` inside this one, read where it is written. `None`
-    /// when a closed object literal holds nothing under a key: the caller
-    /// wrote nothing there.
+    /// when a closed object literal holds nothing under a key, or when every
+    /// spread of one that only spreads open it writes nothing there: the
+    /// caller wrote nothing there.
     pub(super) fn at(&self, path: &[String]) -> Option<Vec<ValueAt>> {
         let Some((key, rest)) = path.split_first() else {
             return Some(vec![self.clone()]);
@@ -1900,7 +1922,12 @@ impl ValueAt {
                 index: *index,
                 keys: keys.iter().chain(path).cloned().collect(),
             }]),
-            Self::Object { fields, open, .. } => match fields.get(key) {
+            Self::Object {
+                fields,
+                open,
+                spreads,
+                ..
+            } => match fields.get(key) {
                 Some(values) => {
                     let mut out = Vec::new();
                     for value in values {
@@ -1908,7 +1935,26 @@ impl ValueAt {
                     }
                     Some(out)
                 }
-                None if *open => Some(vec![Self::Unread]),
+                // A key only a spread may write (ruling R-SP): what each
+                // spread's source holds there, each read as a key of that
+                // source is (a parameter's at its callers, a name's at the
+                // objects it holds). Absent only where no source writes it;
+                // a source read as nothing keeps it unread.
+                None if *open => match spreads {
+                    Some(spreads) => {
+                        let mut out = Vec::new();
+                        for values in spreads {
+                            if values.is_empty() {
+                                out.push(Self::Unread);
+                            }
+                            for value in values {
+                                out.extend(value.at(path).unwrap_or_default());
+                            }
+                        }
+                        (!out.is_empty()).then_some(out)
+                    }
+                    None => Some(vec![Self::Unread]),
+                },
                 None => None,
             },
             // A key of a factory call or of a name (`runWith(make())`,
@@ -1932,6 +1978,47 @@ impl ValueAt {
             // A deeper key, or a key of a value read elsewhere: no span of
             // its own to read a row at.
             _ => Some(vec![Self::Unread]),
+        }
+    }
+
+    /// Whether [`Self::at`] reads `path` through a spread and lands on a
+    /// parameter (ruling R-SP): the spread source is the parameter itself
+    /// (`{ ...args }`) or an object that writes the key from one
+    /// (`{ ...base }`, `base = { log }`, `log` a parameter). The key's value
+    /// is then left to the parameter's callers, where before the rule it
+    /// read as unread ([`unread_where_spread_unfilled`]).
+    pub(super) fn spread_param_at(&self, path: &[String]) -> bool {
+        self.param_through_spread(path, false)
+    }
+
+    /// [`Self::spread_param_at`], `through` set once the read has passed a
+    /// spread.
+    fn param_through_spread(&self, path: &[String], through: bool) -> bool {
+        if matches!(self, Self::Param { .. }) {
+            return through;
+        }
+        let Some((key, rest)) = path.split_first() else {
+            return false;
+        };
+        let Self::Object {
+            fields,
+            open,
+            spreads,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match fields.get(key) {
+            Some(values) => values
+                .iter()
+                .any(|value| value.param_through_spread(rest, through)),
+            None if *open => spreads
+                .iter()
+                .flatten()
+                .flatten()
+                .any(|value| value.param_through_spread(path, true)),
+            None => false,
         }
     }
 }
@@ -2305,6 +2392,9 @@ impl Reader<'_> {
                     }
                 };
                 let over = depth + 1 > cap;
+                // What each spread holds, while spreads alone open the
+                // object and each is read within the cap (ruling R-SP).
+                let mut spreads: Option<Vec<Vec<ValueAt>>> = (!over).then(Vec::new);
                 for (index, prop) in object.props.iter().enumerate() {
                     let line = self.source_map.lookup_char_pos(prop.span().lo).line as u32;
                     let entry = |key: Option<String>, values: Option<Vec<ValueAt>>| ObjectEntry {
@@ -2321,6 +2411,9 @@ impl Reader<'_> {
                             } else {
                                 self.values_in(&spread.expr, scope, bound, depth + 1, cap)
                             };
+                            if let Some(spreads) = spreads.as_mut() {
+                                spreads.push(values.clone());
+                            }
                             entries.props.push(entry(None, Some(values)));
                         }
                         continue;
@@ -2341,12 +2434,16 @@ impl Reader<'_> {
                                         vec![ValueAt::Function(method.function.span.lo.0)],
                                     );
                                 }
-                                None => open = true,
+                                None => {
+                                    open = true;
+                                    spreads = None;
+                                }
                             }
                             continue;
                         }
                         _ => {
                             open = true;
+                            spreads = None;
                             continue;
                         }
                     };
@@ -2374,6 +2471,7 @@ impl Reader<'_> {
                         // A computed key.
                         (None, _) => {
                             open = true;
+                            spreads = None;
                             let values = if over { deep(value.as_ref()) } else { values };
                             entries.props.push(entry(None, Some(values)));
                         }
@@ -2383,6 +2481,7 @@ impl Reader<'_> {
                     fields,
                     open,
                     entries,
+                    spreads: spreads.filter(|_| open),
                 }]
             }
             _ => vec![ValueAt::Unread],
@@ -2852,6 +2951,34 @@ pub(super) fn written_in(factory: &FnIr, function: &FnIr) -> bool {
 
 pub(super) fn defaults_of<'a>(callee: Option<(&'a Path, &'a FnIr)>) -> Option<Defaults<'a>> {
     callee.map(|(file, callee)| (file, callee.param_defaults.as_slice()))
+}
+
+/// The values a key holds, `unfilled` the writes of it read through a
+/// spread whose parameter's callers held nothing ([`ValueAt::spread_param_at`]).
+/// When nothing else is held, each such write keeps the reading it had
+/// before ruling R-SP, unread, one per write as before the rule, rather
+/// than stating that nothing binds the key: a function run only through a
+/// value, or a method another service calls, has no caller the resolver
+/// finds, though one writes the key (carrick#4025).
+pub(super) fn unread_where_spread_unfilled<R>(values: &mut Vec<Held<R>>, unfilled: usize) {
+    if values.is_empty() {
+        values.extend((0..unfilled).map(|_| Held::Stop(Stop::UnreadExpression)));
+    }
+}
+
+/// Count one write read through a spread (`spread`) whose parameter's
+/// callers held nothing (`held` empty). Before ruling R-SP the read stopped
+/// at the spread nearest the call, so the unfilled writes counted further
+/// up for this one (`unfilled` past `before`) collapse into it.
+pub(super) fn note_unfilled<R>(
+    unfilled: &mut usize,
+    before: usize,
+    spread: bool,
+    held: &[Held<R>],
+) {
+    if spread && held.is_empty() {
+        *unfilled = before + 1;
+    }
 }
 
 /// One per service run, built after the compiler rows are read: the one
@@ -3656,6 +3783,7 @@ impl<'a> Resolver<'a> {
         }
         let defaults: Defaults<'a> = (file, origin.defaults.as_slice());
         let mut out = Vec::new();
+        let mut unfilled = 0;
         for value in &from.values {
             match value {
                 ValueAt::Param {
@@ -3676,18 +3804,29 @@ impl<'a> Resolver<'a> {
                             construction: true,
                             bound: 0,
                         };
-                        for held in
-                            self.passed(follow, Some(at), *index, keys, Some(defaults), invoke)
-                        {
+                        let mut spread = false;
+                        for held in self.passed_noting(
+                            follow,
+                            Some(at),
+                            *index,
+                            keys,
+                            Some(defaults),
+                            invoke,
+                            &mut spread,
+                        ) {
                             match held {
                                 Held::Param(out_depth, index, keys) => {
-                                    out.extend(self.callers_pass(
+                                    let before = unfilled;
+                                    let held = self.callers_pass_noting(
                                         follow,
                                         (placed.file, placed.key, placed.depth),
                                         (out_depth, index, &keys),
                                         invoke,
                                         &mut Vec::new(),
-                                    ));
+                                        &mut unfilled,
+                                    );
+                                    note_unfilled(&mut unfilled, before, spread, &held);
+                                    out.extend(held);
                                 }
                                 other => out.push(other),
                             }
@@ -3699,6 +3838,7 @@ impl<'a> Resolver<'a> {
                 other => out.extend(self.read_value(follow, file, other, invoke, false)),
             }
         }
+        unread_where_spread_unfilled(&mut out, unfilled);
         self.fields_reading.borrow_mut().remove(&reading);
         Some(self.settle(out))
     }
@@ -3728,6 +3868,23 @@ impl<'a> Resolver<'a> {
         defaults: Option<Defaults<'a>>,
         invoke: Invoke<'a>,
     ) -> Vec<Held<F::Reached>> {
+        self.passed_noting(follow, at, index, keys, defaults, invoke, &mut false)
+    }
+
+    /// [`Self::passed`], setting `through_spread` when the call writes the
+    /// keys only through a spread of a parameter
+    /// ([`ValueAt::spread_param_at`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn passed_noting<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        at: Option<Invoke<'a>>,
+        index: usize,
+        keys: &[String],
+        defaults: Option<Defaults<'a>>,
+        invoke: Invoke<'a>,
+        through_spread: &mut bool,
+    ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let mut written: Vec<ValueAt> = Vec::new();
         let mut defaulted = at.is_none();
@@ -3745,6 +3902,7 @@ impl<'a> Resolver<'a> {
                 _ if spread || own.is_none() => written.push(ValueAt::Unread),
                 Some(values) => {
                     for value in values {
+                        *through_spread |= value.spread_param_at(keys);
                         match value.at(keys) {
                             Some(values) => written.extend(values),
                             None => defaulted = true,
@@ -3796,6 +3954,22 @@ impl<'a> Resolver<'a> {
         invoke: Invoke<'a>,
         passing: &mut Vec<(PathBuf, String)>,
     ) -> Vec<Held<F::Reached>> {
+        self.callers_pass_noting(follow, at, param, invoke, passing, &mut 0)
+    }
+
+    /// [`Self::callers_pass`], counting in `unfilled` the callers' writes
+    /// read through a spread of a parameter whose own callers held nothing
+    /// ([`unread_where_spread_unfilled`]), for the caller that sees every
+    /// value the key may hold to decide.
+    pub(super) fn callers_pass_noting<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        at: (&'a Path, Option<&'a str>, u8),
+        param: (u8, usize, &[String]),
+        invoke: Invoke<'a>,
+        passing: &mut Vec<(PathBuf, String)>,
+        unfilled: &mut usize,
+    ) -> Vec<Held<F::Reached>> {
         let _query = self.enter();
         let (file, key, depth) = at;
         let (out, index, keys) = param;
@@ -3828,15 +4002,24 @@ impl<'a> Resolver<'a> {
                 construction: false,
                 bound: 0,
             };
-            for value in self.passed(follow, Some(at), index, keys, callee, invoke) {
+            let mut spread = false;
+            let passed =
+                self.passed_noting(follow, Some(at), index, keys, callee, invoke, &mut spread);
+            for value in passed {
                 match value {
-                    Held::Param(out, index, keys) => values.extend(self.callers_pass(
-                        follow,
-                        (caller.file, caller.key, caller.depth),
-                        (out, index, &keys),
-                        invoke,
-                        passing,
-                    )),
+                    Held::Param(out, index, keys) => {
+                        let before = *unfilled;
+                        let held = self.callers_pass_noting(
+                            follow,
+                            (caller.file, caller.key, caller.depth),
+                            (out, index, &keys),
+                            invoke,
+                            passing,
+                            unfilled,
+                        );
+                        note_unfilled(unfilled, before, spread, &held);
+                        values.extend(held);
+                    }
                     other => values.push(other),
                 }
             }
