@@ -9,6 +9,7 @@
  */
 
 import type { ResultLabel } from './result-label.js';
+import type { InferKind } from '../types.js';
 
 export type { ResultLabel };
 
@@ -193,6 +194,12 @@ export interface InferAnchorRequest {
    * after the awaited unwrap; absent means the type is taken as it stands.
    */
   result?: ResultLabel;
+  /**
+   * carrick#4232: the kind of the inference request this anchor carries. A
+   * `call_result` anchor reads a call's result, so a locator that lands on no
+   * call abstains (`callNamedBy`, the rule the inferrer applies too).
+   */
+  infer_kind?: InferKind;
 }
 
 export type CaptureAnchorRequest =

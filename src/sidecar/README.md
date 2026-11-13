@@ -294,6 +294,11 @@ An `infer` anchor with a `param_name` is read as that parameter of the handler
 at or around its line, which is how a subscriber is anchored: what it receives
 is its contract. A name no parameter has demotes the alias to `unknown` with
 the reason recorded; the expression on the line is never read in its place.
+An `infer` anchor's optional `infer_kind` is the kind of the inference request
+it carries. A `call_result` anchor reads a call's result, so a locator that
+lands on no call (a JSX element, or the line's first expression when that is
+not a call or a wrapper of one) abstains as `unknown` with cause `not_located`,
+the same rule the inferrer applies to that request.
 A literal anchor's optional `source_file` names the file its text was printed
 from; it joins the analysis program so names the text prints bare are found
 declared, and is omitted for inline text that has no file.

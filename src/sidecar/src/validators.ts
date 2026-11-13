@@ -245,6 +245,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     param_name: z.string().optional(),
     unwrap: z.enum(['awaited', 'none']).optional(),
     result: ResultLabelSchema.optional(),
+    infer_kind: InferKindSchema.optional(),
   }),
   z.object({
     kind: z.literal('literal'),

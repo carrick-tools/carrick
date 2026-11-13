@@ -81,11 +81,14 @@ export { moduleExport } from './anchors.js';
 // One node locator and one machinery test for the inferrer and the capture
 // (carrick#3500).
 export {
+  callNamedBy,
+  callResultNamesNoCall,
   isFrameworkMachinery,
   nodeByLocatorText,
   normalizeLocatorText,
   symbolDeclaredOutside,
   typeIsOrContainsMachinery,
+  wrapsValueTransparently,
   type DeclaredOutside,
 } from './site-node.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar

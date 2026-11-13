@@ -16,6 +16,54 @@
 import ts from 'typescript';
 
 // ===========================================================================
+// Call-result locators
+// ===========================================================================
+
+/**
+ * The call a `call_result` locator's node names, or undefined when it names
+ * none (carrick#2056, carrick#4232): one rule for the inferrer and the capture.
+ *
+ * A call's result is read off the call. The node may wrap the call in what
+ * leaves its value as it is (`await`, parentheses, `as`, `<T>`, `!`,
+ * `satisfies`) or be the variable the call initialises. Anything else, a JSX
+ * element whose attribute holds a call included, is not the call's result.
+ */
+export function callNamedBy(node: ts.Node | undefined): ts.CallExpression | undefined {
+  let current = node;
+  if (current && ts.isVariableDeclaration(current)) current = current.initializer;
+  while (current && wrapsValueTransparently(current)) current = current.expression;
+  return current && ts.isCallExpression(current) ? current : undefined;
+}
+
+/**
+ * A wrapper that leaves its operand's value as it is: `await`, parentheses,
+ * `!`, a cast, `satisfies`.
+ */
+export function wrapsValueTransparently(
+  node: ts.Node
+): node is
+  | ts.AwaitExpression
+  | ts.ParenthesizedExpression
+  | ts.NonNullExpression
+  | ts.AsExpression
+  | ts.TypeAssertion
+  | ts.SatisfiesExpression {
+  return (
+    ts.isAwaitExpression(node) ||
+    ts.isParenthesizedExpression(node) ||
+    ts.isNonNullExpression(node) ||
+    ts.isAsExpression(node) ||
+    ts.isTypeAssertionExpression(node) ||
+    ts.isSatisfiesExpression(node)
+  );
+}
+
+/** Why a call-result locator is refused, worded once for both readers. */
+export function callResultNamesNoCall(where: string): string {
+  return `the call-result locator at ${where} names no call; a call's result is read off the call, so the anchor abstains`;
+}
+
+// ===========================================================================
 // Framework machinery
 // ===========================================================================
 

@@ -20,7 +20,7 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
-import { firstExactLocatorMatch } from './site-node.js';
+import { callNamedBy, callResultNamesNoCall, firstExactLocatorMatch } from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
@@ -456,6 +456,20 @@ export function resolveAnchor(
         unreadCause: 'not_located',
       };
     }
+  }
+  // carrick#4232: a call-result anchor reads a call's result. A locator that
+  // lands on no call (a JSX element on the call's line, the line's first
+  // expression) names nothing to read, the same rule the inferrer applies.
+  if (request.infer_kind === 'call_result' && !callNamedBy(found.node)) {
+    return {
+      request,
+      aliasText: 'unknown',
+      serialization: 'structural_fallback',
+      abstainReason: `${callResultNamesNoCall(
+        describeNode(sourceFile, request.source_file, found.node)
+      )} rather than publish that node's type`,
+      unreadCause: 'not_located',
+    };
   }
   let located = found.node;
   // carrick#1162: a serialised body is the JSON of its argument. The call's own
