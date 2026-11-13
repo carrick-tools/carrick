@@ -86,8 +86,11 @@ function logPath(t: { after: (fn: () => void) => void }): string {
   return path.join(dir, "argv.log");
 }
 
-/** Run post-read for a Read of `rel`; `env` can drop the switch. */
-function read(ws: Ws, rel: string, session: string, argvLog: string, env: Record<string, string> = {}) {
+/** The Read switch on: every test below that expects fact lines at a Read sets it. */
+const READ_ON = { CARRICK_READ_LINES: "1" };
+
+/** Run post-read for a Read of `rel`, the Read switch on; `env` can change the switches. */
+function read(ws: Ws, rel: string, session: string, argvLog: string, env: Record<string, string> = READ_ON) {
   const file = ws.at(rel);
   return runHook("post-read.ts", {
     payload: {
@@ -102,13 +105,50 @@ function read(ws: Ws, rel: string, session: string, argvLog: string, env: Record
   });
 }
 
-/** Run post-bash for a shell command with no output. */
-function shell(ws: Ws, command: string, session: string, argvLog: string) {
+/** Run post-bash for a shell command with no output, the Read switch on; `env` can change the switches. */
+function shell(ws: Ws, command: string, session: string, argvLog: string, env: Record<string, string> = READ_ON) {
   return runHook("post-bash.ts", {
     payload: { hook_event_name: "PostToolUse", tool_name: "Bash", session_id: session, cwd: ws.root, tool_input: { command }, tool_response: { stdout: "" } },
-    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"), CARRICK_FAKE_ARGV_LOG: argvLog }),
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"), CARRICK_FAKE_ARGV_LOG: argvLog, ...env }),
   });
 }
+
+/**
+ * Compare `stdout` with the snapshot `name`, written from origin/main's hooks
+ * (`UPDATE_SNAPSHOTS=1` with main's `src/` checked out) so equal means what
+ * main prints today.
+ */
+function sameAsMain(stdout: string, name: string): void {
+  const snapshot = path.join(import.meta.dirname, "fixtures", name);
+  if (process.env["UPDATE_SNAPSHOTS"] === "1") fs.writeFileSync(snapshot, stdout);
+  assert.equal(stdout, fs.readFileSync(snapshot, "utf8"));
+}
+
+test("with the Read switch unset, a Read prints byte for byte what main prints", async (t) => {
+  const ws = await workspace(t, FILES, ROWS);
+  const log = logPath(t);
+  const run = await read(ws, "api/src/orders.ts", "read-unset", log, {});
+  assert.equal(argvCalls(log), 1);
+  sameAsMain(run.stdout, "facts-read-unset-read.snapshot.txt");
+});
+
+test("with the Read switch unset, a shell read prints byte for byte what main prints", async (t) => {
+  const ws = await workspace(t, FILES, ROWS);
+  const log = logPath(t);
+  const run = await shell(ws, "cat api/src/orders.ts api/src/more.ts", "read-unset-shell", log, {});
+  assert.equal(argvCalls(log), 2);
+  sameAsMain(run.stdout, "facts-read-unset-shell.snapshot.txt");
+});
+
+test("any Read switch value but \"1\" keeps main's answer", async (t) => {
+  const ws = await workspace(t, FILES, ROWS);
+  for (const value of ["0", "true", ""]) {
+    const log = logPath(t);
+    const run = await read(ws, "api/src/orders.ts", `read-value-${value}`, log, { CARRICK_READ_LINES: value });
+    assert.equal(argvCalls(log), 1, `CARRICK_READ_LINES=${JSON.stringify(value)}`);
+    sameAsMain(run.stdout, "facts-read-unset-read.snapshot.txt");
+  }
+});
 
 test("a Read with a fact file starts no carrick process and names the file's dependents", async (t) => {
   const ws = await workspace(t, FILES, ROWS);
@@ -168,7 +208,7 @@ test("a throwing fn lookup sends the Read to the binary's check, once (P7)", asy
 });
 
 test("a stale fact file starts the refresh at a Read, a fresh one does not", async (t) => {
-  const refresh = { CARRICK_NO_FACTS_REFRESH: "" };
+  const refresh = { ...READ_ON, CARRICK_NO_FACTS_REFRESH: "" };
   const marker = (ws: Ws) => path.join(ws.root, ".carrick", FACTS_MARKER);
   const fresh = await workspace(t, FILES, ROWS);
   await read(fresh, "api/src/orders.ts", "read-fresh", logPath(t), refresh);

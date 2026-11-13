@@ -344,7 +344,7 @@ export function pickLines(
  * operation and its type, tiered by how the edit reaches the operation
  * (tier 1: the op matcher; tier 2: a changed function the operation's code
  * calls; tier 3: the file's other operations, on its first contract line of
- * the session). Reads never pass it.
+ * the session). A `read` edit never gets the contract kind, even with it.
  */
 export async function factLines(
   root: string,
@@ -456,9 +456,10 @@ export async function factLines(
       if (!SCANNED.test(edit.file)) continue;
       // The file's contract rows. Only the file's first contract line of the
       // session may add the rest of its operations (tier 3), which needs no
-      // changed lines and no clean scan.
+      // changed lines and no clean scan. A Read never says a contract line,
+      // whatever the caller asked.
       let contractRows: ContractRow[] = [];
-      if (options.contract === true) {
+      if (options.contract === true && !edit.read) {
         try {
           contractRows = facts.contracts(at.repo, at.rel).filter(printable);
         } catch (error) {

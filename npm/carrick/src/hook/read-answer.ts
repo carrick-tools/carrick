@@ -2,16 +2,19 @@
 // only. Shared by `hook post-read` (a Read of the file) and `hook post-bash`
 // (a shell command that reads it).
 //
-// With a fact file the answer is the fact lines of the whole file (op and fn
-// kinds, `facts/lines.ts` with `read: true`), read locally; no carrick process
-// starts. A file the fact file cannot answer (`FactOutcome.answered`) takes the
-// binary's `check`, as it did before. The lines the fact file prints carry no
-// uses-count line, and one that was said here is not said again at the edit.
+// Behind its own opt-in switch, `CARRICK_READ_LINES=1` (`readLinesEnabled`):
+// unset, every file takes the binary's `check`, as before. With it on and a
+// fact file, the answer is the fact lines of the whole file (op and fn kinds,
+// `facts/lines.ts` with `read: true`; never a contract line), read locally; no
+// carrick process starts. A file the fact file cannot answer
+// (`FactOutcome.answered`) takes the binary's `check`. The lines the fact file
+// prints carry no uses-count line, and one that was said here is not said
+// again at the edit.
 
 import path from "node:path";
 import { createLogger } from "../log.ts";
 import { resolveRoot, rootNote } from "../root.ts";
-import { factsEnabled } from "../facts/enabled.ts";
+import { readLinesEnabled } from "../facts/enabled.ts";
 import { markRead, markTold, toldKey } from "./reuse.ts";
 
 const log = createLogger("carrick-hook");
@@ -86,7 +89,7 @@ export async function answerReads(
   const used: string[] = [];
   let factsMs: number | undefined;
   const unanswered: Array<{ file: string; root: string }> = [];
-  const { MAX_FACT_LINES, factLines } = factsEnabled() && options.facts !== false ? await import("../facts/lines.ts") : { MAX_FACT_LINES: 0, factLines: null };
+  const { MAX_FACT_LINES, factLines } = readLinesEnabled() && options.facts !== false ? await import("../facts/lines.ts") : { MAX_FACT_LINES: 0, factLines: null };
   for (const [root, group] of roots) {
     const outcome =
       factLines === null
