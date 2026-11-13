@@ -140,19 +140,22 @@ impl Routes {
     }
 
     async fn analyze(&self, ahead: AheadRole) -> FileCentricAnalysisResult {
-        self.analyze_with(ahead, FileOrchestrator::new(AgentService::new()))
-            .await
+        let facts = fact_files::walked(&self.root).await;
+        self.analyze_with(
+            ahead,
+            FileOrchestrator::new(AgentService::new()).with_fact_files(fact_files::source(&facts)),
+        )
+        .await
     }
 
-    /// [`Self::analyze`] by `orchestrator`, as the caller built it.
+    /// [`Self::analyze`] by `orchestrator`, as the caller built it with its
+    /// own fact files.
     async fn analyze_with(
         &self,
         ahead: AheadRole,
         orchestrator: FileOrchestrator,
     ) -> FileCentricAnalysisResult {
-        let facts = fact_files::walked(&self.root).await;
         orchestrator
-            .with_fact_files(fact_files::source(&facts))
             .with_answers_ahead(ahead)
             .analyze_files(
                 &self.files,
@@ -326,12 +329,15 @@ async fn a_failed_ask_ahead_is_asked_again_by_the_loop() {
 #[serial]
 async fn a_file_the_lane_stopped_unmatched_in_is_not_asked_ahead() {
     use carrick::agents::file_orchestrator::FactFileSource;
-    use carrick::request_summary::fact_files::{FactFiles, Followed};
+    use carrick::request_summary::fact_files::Followed;
     use carrick::request_summary::stop::Stop;
     offline();
     let routes = Routes::new("t4077");
+    // The fact layer's files for the tree, with the lane's untraced stop in
+    // `src/a.ts` added, as its first discovery records it.
+    let walked = fact_files::walked(&routes.root).await;
     let facts = || {
-        let mut facts = FactFiles::default();
+        let mut facts = walked.clone();
         facts.calls.insert(
             ("src/a.ts".to_string(), 1, 2),
             Followed::Unfollowed(Stop::PackageUnmatched),

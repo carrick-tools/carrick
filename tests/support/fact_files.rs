@@ -16,33 +16,152 @@ use carrick::request_summary::fact_files::FactFiles;
 use carrick::swc_scanner::{ScanResult, SwcScanner};
 use std::path::{Path, PathBuf};
 
-/// An installed route-table package for trees a test writes itself
-/// (carrick#3711 R2): `makeTable()` builds a table whose `get` and `post`
-/// register routes, and whose `route(path)` returns the verbs registered on
-/// one path. With its lockfile entry and its store answer under `__llm__`.
+/// A package invented for trees a test writes itself (carrick#3711 R2): its
+/// declarations, and the store's answer for it (one `library_claims` entry).
+pub struct Invented {
+    pub name: &'static str,
+    pub types: &'static str,
+    pub claims: &'static str,
+}
+
+/// The installed route-table package: `makeTable()` builds a `Table` whose
+/// `get` and `post` register routes, and whose `route(path)` returns the
+/// verbs registered on one path.
+pub const TABLE: Invented = Invented {
+    name: "fixture-table",
+    types: TABLE_TYPES,
+    claims: TABLE_CLAIMS,
+};
+
+/// The installed request-client package: `makeClient()` builds a `Client`
+/// whose `get(url)` sends a request, and `makeConfigClient()` a
+/// `ConfigClient` whose `get({ url })` and `post({ url, body })` do.
+pub const HTTP: Invented = Invented {
+    name: "fixture-http",
+    types: HTTP_TYPES,
+    claims: HTTP_CLAIMS,
+};
+
+/// The installed plugin server `inline-registration-scope` declares: an `App`
+/// whose `register(plugin, { prefix })` and `group(prefix, fn)` run a
+/// callback under a prefix, and whose `get` and `post` register routes. Read
+/// from that fixture, so there is one copy.
+pub const PLUGIN: Invented = Invented {
+    name: "fixture-plugin-server",
+    types: include_str!(
+        "../fixtures/inline-registration-scope/node_modules/fixture-plugin-server/index.d.ts"
+    ),
+    claims: include_str!(
+        "../fixtures/inline-registration-scope/__llm__/library-claims/default.json"
+    ),
+};
+
+/// [`TABLE`] installed in `root`, with its lockfile entry and its store answer
+/// under `__llm__`.
 pub fn install_table_package(root: &Path) {
-    let files = [
-        (
-            "node_modules/fixture-table/package.json",
-            r#"{ "name": "fixture-table", "version": "1.0.0", "types": "index.d.ts" }"#,
-        ),
-        ("node_modules/fixture-table/index.d.ts", TABLE_TYPES),
-        (
-            "package.json",
-            r#"{ "name": "table-service", "version": "1.0.0", "private": true, "dependencies": { "fixture-table": "^1.0.0" } }"#,
-        ),
-        ("package-lock.json", TABLE_LOCK),
-        (
-            "tsconfig.json",
-            r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
-        ),
-        ("__llm__/library-claims/default.json", TABLE_CLAIMS),
-    ];
-    for (relative, text) in files {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
+    install_invented(root, &[&TABLE]);
+}
+
+/// Each of `packages` installed in `root`: its `node_modules` entry, the
+/// manifest's dependency and the lockfile's public entry, a tsconfig, and
+/// their store answers under `__llm__`.
+pub fn install_invented(root: &Path, packages: &[&Invented]) {
+    let dependencies: serde_json::Map<String, serde_json::Value> = packages
+        .iter()
+        .map(|package| (package.name.to_string(), serde_json::json!("^1.0.0")))
+        .collect();
+    let mut locked = serde_json::Map::new();
+    locked.insert(
+        String::new(),
+        serde_json::json!({ "name": "table-service", "version": "1.0.0", "dependencies": dependencies }),
+    );
+    for package in packages {
+        let name = package.name;
+        locked.insert(
+            format!("node_modules/{name}"),
+            serde_json::json!({
+                "version": "1.0.0",
+                "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz"),
+            }),
+        );
+        write(
+            root,
+            &format!("node_modules/{name}/package.json"),
+            &serde_json::json!({ "name": name, "version": "1.0.0", "types": "index.d.ts" })
+                .to_string(),
+        );
+        write(
+            root,
+            &format!("node_modules/{name}/index.d.ts"),
+            package.types,
+        );
     }
+    write(
+        root,
+        "package.json",
+        &serde_json::json!({ "name": "table-service", "version": "1.0.0", "private": true, "dependencies": dependencies })
+            .to_string(),
+    );
+    write(
+        root,
+        "package-lock.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "table-service",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": locked,
+        }))
+        .unwrap(),
+    );
+    write(
+        root,
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "target": "es2022", "module": "commonjs", "moduleResolution": "node", "strict": true, "skipLibCheck": true, "types": [] }, "include": ["src/**/*"] }"#,
+    );
+    // An answer is one `library_claims` entry, or a whole cassette of them.
+    let claims: Vec<serde_json::Value> = packages
+        .iter()
+        .flat_map(|package| {
+            let answer: serde_json::Value =
+                serde_json::from_str(package.claims).expect("an invented answer");
+            match answer.get("library_claims") {
+                Some(serde_json::Value::Array(entries)) => entries.clone(),
+                _ => vec![answer],
+            }
+        })
+        .collect();
+    write(
+        root,
+        "__llm__/library-claims/default.json",
+        &serde_json::json!({ "library_claims": claims }).to_string(),
+    );
+}
+
+/// The real-name stand-ins `installed` (`tests/fixtures/real-packages`) in
+/// `root`, with a manifest listing them when it has none, and the store's
+/// answer for `answered` under `root/__llm__`.
+pub fn install_real(root: &Path, installed: &[&str], answered: &[&str]) {
+    if !root.join("package.json").exists() {
+        let dependencies: serde_json::Map<String, serde_json::Value> = installed
+            .iter()
+            .map(|name| (name.to_string(), serde_json::json!("*")))
+            .collect();
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({ "name": "fixture", "private": true, "dependencies": dependencies })
+                .to_string(),
+        )
+        .unwrap();
+    }
+    real_packages::install(root, installed);
+    real_packages::write_claims(&root.join("__llm__"), answered);
+}
+
+fn write(root: &Path, relative: &str, text: &str) {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
 }
 
 const TABLE_TYPES: &str = "export interface Request {\n  path: string;\n}\n\
@@ -53,24 +172,7 @@ export interface Route {\n  get(...handlers: Handler[]): this;\n  post(...handle
 export interface Table {\n  get(path: string, ...handlers: Handler[]): this;\n  post(path: string, ...handlers: Handler[]): this;\n  route(path: string): Route;\n}\n\
 declare function makeTable(): Table;\nexport default makeTable;\n";
 
-const TABLE_LOCK: &str = r#"{
-  "name": "table-service",
-  "version": "1.0.0",
-  "lockfileVersion": 3,
-  "requires": true,
-  "packages": {
-    "": { "name": "table-service", "version": "1.0.0", "dependencies": { "fixture-table": "^1.0.0" } },
-    "node_modules/fixture-table": {
-      "version": "1.0.0",
-      "resolved": "https://registry.npmjs.org/fixture-table/-/fixture-table-1.0.0.tgz"
-    }
-  }
-}
-"#;
-
 const TABLE_CLAIMS: &str = r#"{
-  "library_claims": [
-    {
       "package": "fixture-table",
       "version": "1.0.0",
       "status": "answered",
@@ -95,8 +197,50 @@ const TABLE_CLAIMS: &str = r#"{
           "patterns": []
         }
       ]
-    }
-  ]
+}
+"#;
+
+const HTTP_TYPES: &str = "export interface Client {\n  get(url: string): Promise<unknown>;\n}\n\
+export interface RequestConfig {\n  url: string;\n  params?: unknown;\n  body?: unknown;\n}\n\
+export interface ConfigClient {\n  get(config: RequestConfig): Promise<unknown>;\n  post(config: RequestConfig): Promise<unknown>;\n}\n\
+declare function makeClient(): Client;\nexport default makeClient;\n\
+export declare function makeConfigClient(): ConfigClient;\n";
+
+const HTTP_CLAIMS: &str = r#"{
+      "package": "fixture-http",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-http",
+          "export": "default",
+          "role": "http_client",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "method_default": "GET", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        {
+          "specifier": "fixture-http",
+          "export": "makeConfigClient",
+          "role": "http_client",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": "get", "of": "instance:()", "name": { "arg": 0, "key": "url" }, "method_default": "GET", "picker": "fixture-picker" },
+            { "op": "request", "member": "post", "of": "instance:()", "name": { "arg": 0, "key": "url" }, "method_default": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
 }
 "#;
 
@@ -147,20 +291,7 @@ pub fn walked_copy(fixture: &Path, installed: &[&str], answered: &[&str]) -> Fac
     let dir = tempfile::tempdir().expect("a copy dir");
     let copy = dir.path().canonicalize().unwrap().join("repo");
     copy_tree(fixture, &copy);
-    if !copy.join("package.json").exists() {
-        let dependencies: serde_json::Map<String, serde_json::Value> = installed
-            .iter()
-            .map(|name| (name.to_string(), serde_json::json!("*")))
-            .collect();
-        std::fs::write(
-            copy.join("package.json"),
-            serde_json::json!({ "name": "fixture", "private": true, "dependencies": dependencies })
-                .to_string(),
-        )
-        .unwrap();
-    }
-    real_packages::install(&copy, installed);
-    real_packages::write_claims(&copy.join("__llm__"), answered);
+    install_real(&copy, installed, answered);
     walked_blocking(&copy)
 }
 

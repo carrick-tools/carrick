@@ -8,7 +8,8 @@
 //! Nothing here is a second path: the rows are the real sidecar's walk, the
 //! store is asked through the scan's own ask (answered offline from
 //! `<CARRICK_MOCK_FIXTURE_DIR>/library-claims/default.json` under
-//! `CARRICK_MOCK_ALL`), and the files come from [`super::first_discovery`].
+//! `CARRICK_MOCK_ALL`), and the files come from the scan's traced first
+//! discovery ([`super::fact_files_of`]).
 //! A package the tree does not install, or lists in no public lockfile, is
 //! never asked about, as in a scan.
 
@@ -52,7 +53,6 @@ pub async fn fact_files_of_tree(
     let sidecar = crate::services::TypeSidecar::spawn(sidecar_script).expect("spawn the sidecar");
     sidecar.set_scan_root(&repo);
     let recipe = sidecar.recipe();
-    drop(sidecar);
     crate::position_rows::record_service_rows(
         &recipe,
         &crate::position_rows::ServiceWalk {
@@ -90,15 +90,27 @@ pub async fn fact_files_of_tree(
         &repo,
         Default::default(),
     )?;
+    // Traced, as the scan's own first discovery is (carrick#4077): the
+    // sidecar answers the member declarations a typed receiver reads.
+    let semantics_root = super::service_scan_root(&repo_path, &config);
     let (early, first) = tokio::sync::oneshot::channel();
-    let (_, first) = tokio::join!(super::settled_library_answer(Some(&ask), early), first);
-    let first = first.expect("the store's first answer is sent");
-    Some(super::first_discovery(
-        &ask.sites,
-        first,
-        &inputs,
-        &[],
-        &repo,
-        &Default::default(),
-    ))
+    let (sender, facts) = tokio::sync::oneshot::channel();
+    tokio::join!(
+        super::settled_library_answer(Some(&ask), early),
+        super::fact_files_of(
+            Some(&ask),
+            first,
+            &inputs,
+            &[],
+            &repo,
+            &Default::default(),
+            super::FirstTrace::Traced {
+                sidecar: Some(&sidecar),
+                from_dir: &semantics_root,
+            },
+            sender,
+        ),
+    );
+    drop(sidecar);
+    facts.expect("the fact files are sent")
 }

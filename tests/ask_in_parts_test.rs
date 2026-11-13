@@ -49,6 +49,9 @@ use std::path::{Path, PathBuf};
 #[path = "support/shapes.rs"]
 mod shapes;
 
+#[path = "support/fact_files.rs"]
+mod fact_files;
+
 const ROUTE: &str = "/analyze-file";
 
 /// What a file is cut under when the verdict states no part size.
@@ -85,9 +88,18 @@ const CANDIDATES: usize = SINGLES + CHAIN_LINKS;
 const PART_RANGES: [(usize, usize); 3] = [(0, 30), (30, 62), (62, 70)];
 const PART_WINDOWS: [(u32, u32); 3] = [(1, 37), (38, 67), (68, 75)];
 
+/// A handler module: its one call is a request on an installed client.
 fn handler_source(n: usize) -> String {
-    format!("export function h{n}(req: any, res: any) {{\n  res.send({{ handled: {n} }});\n}}\n")
+    format!(
+        "import makeClient from \"fixture-http\"; const http = makeClient();\n\
+         export function h{n}(req: any, res: any) {{\n  return http.get(\"/handled/{n}\");\n}}\n"
+    )
 }
+
+/// The installed request client a written file's requests go through, on one
+/// line, so the file's lines stay where its assertions read them.
+const CONFIG_CLIENT: &str =
+    "import { makeConfigClient } from \"fixture-http\"; const client = makeConfigClient();";
 
 fn single(out: &mut String, tag: &str, i: usize, handler: &str) {
     writeln!(out, "table.get(\"/{tag}/r/{i}\", {handler});").unwrap();
@@ -98,7 +110,7 @@ fn table_source(tag: &str) -> String {
     for n in 0..HANDLER_MODULES {
         writeln!(out, "import {{ h{n} }} from \"./handlers/h{n}\";").unwrap();
     }
-    out.push_str("declare function makeTable(): any;\n");
+    out.push_str("import makeTable from \"fixture-table\";\n");
     out.push_str("const table = makeTable();\n");
     out.push_str("const local = (req: any, res: any) => {};\n");
     for i in 0..LOCAL_SINGLES {
@@ -142,6 +154,12 @@ impl Fixture {
         // Canonical, as the engine hands the orchestrator its root: the
         // prompt names a file by its path under this.
         let root = tmp.path().canonicalize().expect("a canonical temp dir");
+        // The receivers' packages, installed with the store's answer, so the
+        // fact layer lists the calls the reader is asked about (carrick#3711).
+        fact_files::install_invented(
+            &root,
+            &[&fact_files::TABLE, &fact_files::HTTP, &fact_files::PLUGIN],
+        );
         let mut files = Vec::new();
         for (relative, contents) in modules {
             let path = root.join(relative);
@@ -171,7 +189,9 @@ impl Fixture {
         cached: &HashMap<String, FileAnalysisResult>,
         consumer: &GraphqlConsumerHints,
     ) -> FileCentricAnalysisResult {
+        let facts = fact_files::walked(&self.root).await;
         FileOrchestrator::new(AgentService::new())
+            .with_fact_files(fact_files::source(&facts))
             .analyze_files(
                 &self.files,
                 cached,
@@ -1347,7 +1367,7 @@ async fn a_request_that_was_cut_is_never_sent_again() {
     let one = Fixture::of(
         &[(
             "src/onegroup_table.ts".to_string(),
-            "declare function makeTable(): any;\nconst table = makeTable();\ntable.get(\"/onegroup/r/0\", () => {});\n"
+            "import makeTable from \"fixture-table\";\nconst table = makeTable();\ntable.get(\"/onegroup/r/0\", () => {});\n"
                 .to_string(),
         )],
         "src/onegroup_table.ts",
@@ -1363,7 +1383,7 @@ async fn a_request_that_was_cut_is_never_sent_again() {
     // Six registrations and no imported module: one part, whose prompt is the
     // whole prompt. It is halved without being sent.
     let mut source =
-        String::from("declare function makeTable(): any;\nconst table = makeTable();\n");
+        String::from("import makeTable from \"fixture-table\";\nconst table = makeTable();\n");
     for i in 0..6 {
         writeln!(source, "table.get(\"/sixgroups/r/{i}\", () => {{}});").unwrap();
     }
@@ -1629,7 +1649,7 @@ async fn a_file_at_the_line_is_sent_whole() {
     // A request, then a declaration under a comment that pads the file.
     let source = |padding: usize| {
         format!(
-            "declare const client: any;\n\
+            "{CONFIG_CLIENT}\n\
              export function readOne(id: string) {{\n  \
              return client.get({{ url: \"/{tag}/items/0\", params: {{ id }} }});\n}}\n\
              // {}\n\
@@ -1738,9 +1758,9 @@ async fn the_route_table_literal_keeps_every_route() {
 }
 
 /// A module of `requests` one-request functions after `head`, under one
-/// ambient declaration of the client they call.
+/// line making the installed client they call.
 fn requests_after(tag: &str, head: &str, requests: usize) -> String {
-    let mut source = String::from("declare const client: any;\n");
+    let mut source = format!("{CONFIG_CLIENT}\n");
     source.push_str(head);
     for i in 0..requests {
         writeln!(
@@ -1801,7 +1821,7 @@ async fn a_candidate_inside_an_item_that_cannot_be_cut_names_the_file() {
     let tag = "uncuttable";
     let body = "uncuttablebody".repeat(300_000 / 14);
     let source = format!(
-        "declare const client: any;\nexport function sendBig() {{\n  return client.post({{ url: \"/{tag}/items/0\", body: \"{body}\" }});\n}}\n"
+        "{CONFIG_CLIENT}\nexport function sendBig() {{\n  return client.post({{ url: \"/{tag}/items/0\", body: \"{body}\" }});\n}}\n"
     );
     let subject = format!("src/{tag}.ts");
     let fx = Fixture::of(&[(subject.clone(), source)], &subject);
@@ -1863,7 +1883,7 @@ fn plugin_source(tag: &str, n: usize, padded: bool) -> String {
         String::new()
     };
     format!(
-        "export async function plugin{n}(app: any) {{\n  app.get(\"/{tag}/p/{n}\", async () => ({{ plugin: {n} }}));\n}}\n// {padding}\n"
+        "export async function plugin{n}(app: import(\"fixture-plugin-server\").App) {{\n  app.get(\"/{tag}/p/{n}\", async () => ({{ plugin: {n} }}));\n}}\n// {padding}\n"
     )
 }
 
@@ -1883,8 +1903,10 @@ fn wiring_source(tag: &str, plugins: usize) -> String {
         .unwrap();
     }
     out.push_str("];\n");
-    out.push_str("export async function wire(server: any) {\n");
-    out.push_str("  await server.register(async (api: any) => {\n");
+    out.push_str("export async function wire(server: import(\"fixture-plugin-server\").App) {\n");
+    out.push_str(
+        "  await server.register(async (api: import(\"fixture-plugin-server\").App) => {\n",
+    );
     out.push_str("    const settings = { ready: true };\n");
     for n in 0..plugins {
         writeln!(out, "    await api.register(plugin{n});").unwrap();
@@ -2221,7 +2243,7 @@ async fn a_single_item_refused_for_size_loses_the_file_by_name() {
     let tag = "refusedone";
     // One line, so the file is one item however far it is opened.
     let source = format!(
-        "declare const client: any; export function readOne() {{ return client.get({{ url: \"/{tag}/items/0\" }}); }}\n"
+        "{CONFIG_CLIENT} export function readOne() {{ return client.get({{ url: \"/{tag}/items/0\" }}); }}\n"
     );
     let subject = format!("src/{tag}.ts");
     let fx = Fixture::of(&[(subject.clone(), source)], &subject);

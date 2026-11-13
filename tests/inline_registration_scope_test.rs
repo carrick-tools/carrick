@@ -9,7 +9,13 @@
 //!
 //! Each test drives the whole file analysis over the fixture with canned
 //! model answers (`cached_model_results`), so no model is asked: what moves
-//! is what the deterministic layer does with the rows the model states.
+//! is what the deterministic layer does with the rows the model states. The
+//! calls the model is shown are the fact layer's, from the fixture's
+//! installed server package and its store answer, handed in as a scan hands
+//! them (carrick#3711).
+
+#[path = "support/fact_files.rs"]
+mod fact_files;
 
 use carrick::agent_service::AgentService;
 use carrick::agents::file_analyzer_agent::FileAnalysisResult;
@@ -17,13 +23,20 @@ use carrick::agents::file_orchestrator::{FileCentricAnalysisResult, FileOrchestr
 use carrick::agents::framework_guidance_agent::{FrameworkGuidance, ProtocolGuidance};
 use carrick::framework_detector::DetectionResult;
 use carrick::operation::Protocol;
-use carrick::swc_scanner::SwcScanner;
+use carrick::request_summary::fact_files::FactFiles;
 use serial_test::serial;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/inline-registration-scope")
+}
+
+/// The fixture's fact files, walked once for the binary.
+fn facts() -> &'static FactFiles {
+    static FACTS: OnceLock<FactFiles> = OnceLock::new();
+    FACTS.get_or_init(|| fact_files::walked_blocking(&root()))
 }
 
 fn source(file: &str) -> String {
@@ -43,17 +56,11 @@ fn line_of(file: &str, needle: &str) -> usize {
     lines[0]
 }
 
-/// The id the scanner gives the call that starts on `line`, as the model
-/// would echo it.
+/// The id the scanner gives the fact layer's call that starts on `line`, as
+/// the model would echo it.
 fn candidate_at(file: &str, line: usize) -> String {
-    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[], &[]);
-    scanned
-        .candidates
-        .iter()
-        .find(|candidate| candidate.line_number == line)
-        .unwrap_or_else(|| panic!("no candidate at {file}:{line}"))
-        .candidate_id
-        .clone()
+    fact_files::listed_candidate_at(facts(), &root(), file, line)
+        .unwrap_or_else(|| panic!("the fact layer lists no call at {file}:{line}"))
 }
 
 /// A mount row the model states: `(needle on the call's line, parent,
@@ -154,6 +161,7 @@ async fn analyze(answers: Vec<(String, FileAnalysisResult)>) -> FileCentricAnaly
         .collect();
     let cached: HashMap<String, FileAnalysisResult> = answers.into_iter().collect();
     FileOrchestrator::new(AgentService::new())
+        .with_fact_files(fact_files::source(facts()))
         .analyze_files(
             &files,
             &cached,
@@ -687,7 +695,7 @@ type Case<'a> = (&'a str, &'a str, &'a str);
 /// case)`.
 fn reports(rows: &[(&str, usize, &str, &str, Option<Case>)]) -> (String, FileAnalysisResult) {
     let file = "src/reports.ts";
-    let scanned = SwcScanner::new().scan_content(&root().join(file), &source(file), &[], &[]);
+    let scanned = fact_files::listed_sites(facts(), &root(), file);
     let endpoints: Vec<serde_json::Value> = rows
         .iter()
         .map(|(needle, nth, method, path, case)| {
