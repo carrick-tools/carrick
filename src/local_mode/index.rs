@@ -826,19 +826,7 @@ fn keep_rows_where(scan_dir: &Path, kept: &Path, wanted: impl Fn(&Path) -> bool)
         if !wanted(&path) {
             continue;
         }
-        let to = kept.join(name);
-        let record = crate::position_rows::walked_at_path(&to);
-        let _ = std::fs::remove_file(&record);
-        let partial = crate::position_rows::partial_path(&to);
-        if std::fs::copy(&path, &partial)
-            .and_then(|_| std::fs::rename(&partial, &to))
-            .is_err()
-        {
-            let _ = std::fs::remove_file(&partial);
-            let _ = std::fs::remove_file(&to);
-            continue;
-        }
-        let _ = std::fs::copy(crate::position_rows::walked_at_path(&path), &record);
+        crate::position_rows::land(Some(&path), &kept.join(name));
     }
 }
 

@@ -29,7 +29,7 @@
 //! Off, there is no lane: the queue and the loop run as they did.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -61,6 +61,12 @@ pub(super) struct Walked {
     /// The rows file, when the walk wrote one. A temporary one is removed
     /// when this is dropped, which is when the run ends.
     rows: Option<Destination>,
+    /// Where the walk's rows go in the local store once the run keeps the
+    /// service's blob, or are cleared from when it wrote none: set only for
+    /// a walk this run ran with a store (carrick#4183).
+    lands_at: Option<PathBuf>,
+    /// The declared service's name, as its blob carries it.
+    service: Option<String>,
     scan_root: PathBuf,
     label: String,
     /// The walk's sidecar at its peak, in MB (carrick#3083). `None` when
@@ -113,6 +119,23 @@ impl Slots {
             .get(service)
             .is_some_and(|walking| walking.load(Ordering::SeqCst))
             && self.get(service).is_none()
+    }
+
+    /// Land every ended walk's rows in the local store, once the run has
+    /// decided which services it keeps on their stored generation: a `held`
+    /// service's stored rows and their record stay as they are, so they keep
+    /// matching the blob that stays (carrick#4183). The one writer of the
+    /// store's rows.
+    pub(super) fn land(&self, held: impl Fn(Option<&str>) -> bool) {
+        for walked in self.walks.iter().filter_map(OnceLock::get) {
+            let Some(to) = &walked.lands_at else {
+                continue;
+            };
+            if held(walked.service.as_deref()) {
+                continue;
+            }
+            crate::position_rows::land(walked.rows.as_ref().map(Destination::path), to);
+        }
     }
 
     fn fill(&self, service: usize, walked: Walked) {
@@ -389,6 +412,8 @@ pub(super) fn reuse(
     crate::position_rows::kept_rows(&kept, commit, &scan_root, &files)?;
     Ok(Walked {
         rows: Some(Destination::kept(kept)),
+        lands_at: None,
+        service: service.service_name.clone(),
         scan_root,
         label,
         peak_mb: None,
@@ -396,8 +421,9 @@ pub(super) fn reuse(
 }
 
 /// Walk one service's per-position compiler rows: written where `place`
-/// says (beside its blob with a local store, under the OS temp dir
-/// otherwise), named by the stem the blob will carry. The files are the ones
+/// says (under the run's temp dir, to land beside its blob with a local
+/// store once the run keeps it, [`Slots::land`]), named by the stem the blob
+/// will carry. The files are the ones
 /// discovery walks; every path is sent under the repo's canonical root, as
 /// the service's sidecar root is.
 ///
@@ -417,14 +443,16 @@ fn walk(
         .as_deref()
         .unwrap_or("(root)")
         .to_string();
-    let no_rows = |scan_root: PathBuf, label: String| Walked {
+    let no_rows = |scan_root: PathBuf, label: String, lands_at: Option<PathBuf>| Walked {
         rows: None,
+        lands_at,
+        service: service.service_name.clone(),
         scan_root,
         label,
         peak_mb: None,
     };
     let Some(recipe) = recipe else {
-        return no_rows(scan_root, label);
+        return no_rows(scan_root, label, None);
     };
     let out = place(
         &super::get_repository_name(&canonical),
@@ -444,12 +472,14 @@ fn walk(
         Ok((_, peak_mb)) => peak_mb,
         Err(error) => {
             debug!("Position rows for service {label} were not written: {error}");
-            return no_rows(scan_root, label);
+            return no_rows(scan_root, label, out.lands_at().map(Path::to_path_buf));
         }
     };
     crate::position_rows::record_walked_at(out.path(), at);
     Walked {
+        lands_at: out.lands_at().map(Path::to_path_buf),
         rows: Some(out),
+        service: service.service_name.clone(),
         scan_root,
         label,
         peak_mb,

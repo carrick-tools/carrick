@@ -293,15 +293,19 @@ pub fn content_hash(bytes: &[u8]) -> String {
 
 /// Where one service's rows file goes this run.
 ///
-/// Beside the blobs when there is a local store, and kept there. Otherwise
-/// under a directory of this run's own in the OS temp dir: the file and, once
-/// empty, the directory are removed when this is dropped, which is when the
-/// run ends (carrick#2413).
+/// Under a directory of this run's own in the OS temp dir: the file, its
+/// walk record and, once empty, the directory are removed when this is
+/// dropped, which is when the run ends (carrick#2413). With a local store the
+/// rows land beside the blobs too, but only once the run has decided it keeps
+/// the service's blob ([`Destination::lands_at`]): a service held on its
+/// stored generation keeps that generation's rows (carrick#4183).
 #[derive(Debug)]
 pub struct Destination {
     path: PathBuf,
-    /// The per-run temp directory the file sits in, when there is no store.
+    /// The per-run temp directory the file sits in; `None` for kept rows.
     temporary: Option<PathBuf>,
+    /// Where the rows go in the local store if the run keeps them.
+    lands_at: Option<PathBuf>,
 }
 
 impl Destination {
@@ -309,12 +313,20 @@ impl Destination {
         &self.path
     }
 
-    /// Rows an earlier pass kept at `path`: never removed by this run.
+    /// Rows an earlier pass kept at `path`: never removed by this run, and
+    /// already where they are kept.
     pub fn kept(path: PathBuf) -> Self {
         Self {
             path,
             temporary: None,
+            lands_at: None,
         }
+    }
+
+    /// Where the rows go in the local store once the run keeps the
+    /// service's blob ([`land`]); `None` with no store, or for kept rows.
+    pub fn lands_at(&self) -> Option<&Path> {
+        self.lands_at.as_deref()
     }
 
     /// Whether the file is removed when this is dropped.
@@ -328,6 +340,7 @@ impl Drop for Destination {
         if let Some(dir) = &self.temporary {
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_file(partial_path(&self.path));
+            let _ = std::fs::remove_file(walked_at_path(&self.path));
             // Another service of this run may still be writing beside it.
             let _ = std::fs::remove_dir(dir);
         }
@@ -338,8 +351,8 @@ impl Drop for Destination {
 ///
 /// `uploads` is whether the run writes an index (`--upload`, a main push, the
 /// laptop indexer into its store). A run that writes nothing (`--no-upload`,
-/// a PR scan) leaves the local store untouched too, so its rows go under the
-/// per-run temp directory like the Action's (carrick#3283).
+/// a PR scan) leaves the local store untouched too, so its rows never land
+/// there (carrick#3283).
 pub fn destination(uploads: bool, repo_name: &str, service_name: Option<&str>) -> Destination {
     destination_from(
         std::env::var_os(CACHE_DIR_ENV)
@@ -361,19 +374,42 @@ pub fn destination_from(
     service_name: Option<&str>,
 ) -> Destination {
     let name = format!("{}.jsonl.gz", blob_stem(repo_name, service_name));
-    match store.filter(|dir| !dir.as_os_str().is_empty()) {
-        Some(store) => Destination {
-            path: store.join(POSITIONS_DIR).join(name),
-            temporary: None,
-        },
-        None => {
-            let dir = temp.join(format!("carrick-positions-{}", std::process::id()));
-            Destination {
-                path: dir.join(name),
-                temporary: Some(dir),
-            }
-        }
+    let dir = temp.join(format!("carrick-positions-{}", std::process::id()));
+    Destination {
+        path: dir.join(&name),
+        temporary: Some(dir),
+        lands_at: store
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|store| store.join(POSITIONS_DIR).join(name)),
     }
+}
+
+/// Put the rows file at `rows` and its walk record at `to`, or, with `rows`
+/// `None` (a walk that wrote none), remove what `to` holds. The record goes
+/// first and lands last, and the rows land whole (copied under a temporary
+/// name, then renamed), so a reader never pairs new rows with an old record.
+/// Best effort: rows that did not land are walked next time. Whether the rows
+/// landed.
+pub fn land(rows: Option<&Path>, to: &Path) -> bool {
+    let record = walked_at_path(to);
+    let _ = std::fs::remove_file(&record);
+    let Some(rows) = rows else {
+        let _ = std::fs::remove_file(to);
+        return false;
+    };
+    let partial = partial_path(to);
+    let copied = to
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::copy(rows, &partial))
+        .and_then(|_| std::fs::rename(&partial, to));
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(to);
+        return false;
+    }
+    let _ = std::fs::copy(walked_at_path(rows), &record);
+    true
 }
 
 /// The directory a laptop pass keeps its rows in between passes
@@ -1000,34 +1036,56 @@ pub fn record_service_rows(
 mod tests {
     use super::*;
 
-    fn path_of(destination: Destination) -> (PathBuf, bool) {
-        (destination.path().to_path_buf(), destination.is_temporary())
+    fn lands_at(destination: Destination) -> (Option<PathBuf>, bool) {
+        (
+            destination.lands_at().map(Path::to_path_buf),
+            destination.is_temporary(),
+        )
     }
 
+    /// carrick#4183: with a store the rows are walked under the run's temp
+    /// directory and land beside the blobs under the blob stem.
     #[test]
-    fn the_rows_file_sits_beside_the_blobs_under_the_blob_stem() {
+    fn the_rows_file_lands_beside_the_blobs_under_the_blob_stem() {
         let temp = Path::new("/tmp");
         assert_eq!(
-            path_of(destination_from(
+            lands_at(destination_from(
                 Some(Path::new("/store")),
                 temp,
                 "repo",
                 Some("apps/api")
             )),
             (
-                PathBuf::from("/store/positions/repo__apps_api.jsonl.gz"),
-                false
+                Some(PathBuf::from("/store/positions/repo__apps_api.jsonl.gz")),
+                true
             )
         );
         assert_eq!(
-            path_of(destination_from(
+            lands_at(destination_from(
                 Some(Path::new("/store")),
                 temp,
                 "repo",
                 None
             )),
-            (PathBuf::from("/store/positions/repo.jsonl.gz"), false)
+            (Some(PathBuf::from("/store/positions/repo.jsonl.gz")), true)
         );
+    }
+
+    /// carrick#4183: landed rows carry their walk record; a walk with no
+    /// rows clears what the store held.
+    #[test]
+    fn landing_copies_rows_and_record_and_no_rows_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = dir.path().join("walked.jsonl.gz");
+        std::fs::write(&rows, b"rows").unwrap();
+        std::fs::write(walked_at_path(&rows), b"stamp\nabc\n").unwrap();
+        let to = dir.path().join("store/positions/repo.jsonl.gz");
+        assert!(land(Some(&rows), &to));
+        assert_eq!(std::fs::read(&to).unwrap(), b"rows");
+        assert_eq!(std::fs::read(walked_at_path(&to)).unwrap(), b"stamp\nabc\n");
+        assert!(!partial_path(&to).exists());
+        assert!(!land(None, &to));
+        assert!(!to.exists() && !walked_at_path(&to).exists());
     }
 
     /// carrick#2413: with no store the scan still walks, into a directory
