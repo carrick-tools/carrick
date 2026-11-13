@@ -243,6 +243,23 @@ pub struct InferRequestItem {
     /// other request, so those serialise as they did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_path: Option<String>,
+    /// carrick#4128: the call that reaches the function this request's
+    /// expression sits in, set where a site's payload is read in the wrapper
+    /// that builds it. The sidecar reads a type parameter of that function as
+    /// this call instantiates it, and publishes none it leaves open. Absent
+    /// from every other request, so those serialise as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_call: Option<ThroughCall>,
+}
+
+/// A call's place in its file, in the sidecar's numbering
+/// ([`InferRequestItem::through_call`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThroughCall {
+    /// The file the call is in, as `file_path` is given.
+    pub file_path: String,
+    pub span_start: u32,
+    pub span_end: u32,
 }
 
 // ============================================================================
@@ -6113,6 +6130,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            through_call: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains(r#""file_path":"src/routes.ts""#));
@@ -6373,6 +6391,11 @@ mod tests {
                         alias: Some("A".into()),
                         param_name: Some("event".into()),
                         route_path: None,
+                        through_call: Some(ThroughCall {
+                            file_path: "/repo/src/checkout.ts".into(),
+                            span_start: 30,
+                            span_end: 60,
+                        }),
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6839,6 +6862,7 @@ mod tests {
             alias: None,
             param_name: None,
             route_path: None,
+            through_call: None,
         };
         let others = [item(InferKind::CallResult), item(InferKind::FunctionReturn)];
         assert_eq!(claims_for_route_rows(&others, Some(&claims)), None);
@@ -8723,6 +8747,7 @@ mod tests {
             alias: Some(alias.into()),
             param_name: None,
             route_path: None,
+            through_call: None,
         };
         let explicit = vec![
             symbol_request("ItemDto", "Returned", None),
@@ -8949,6 +8974,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: Some(format!("A{line}")),
                 param_name: None,
                 route_path: None,
+                through_call: None,
             })
             .collect();
         crate::scan_health::forget_service_losses(Some(SERVICE));
@@ -8996,6 +9022,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             alias: None,
             param_name: None,
             route_path: None,
+            through_call: None,
             member: None,
             result,
         };
@@ -9134,6 +9161,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some("A".to_string()),
             param_name: None,
             route_path: None,
+            through_call: None,
         }];
         assert!(
             sidecar.infer_types(&infer, None).is_err(),

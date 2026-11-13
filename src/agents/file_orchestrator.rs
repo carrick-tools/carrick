@@ -1751,6 +1751,7 @@ pub(crate) fn route_response_request(
         )),
         param_name: None,
         route_path: None,
+        through_call: None,
     }
 }
 
@@ -5345,6 +5346,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        through_call: None,
                     });
                     true
                 }
@@ -5372,6 +5374,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        through_call: None,
                     });
                     true
                 }
@@ -5398,6 +5401,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        through_call: None,
                     });
                     true
                 }
@@ -6258,6 +6262,7 @@ impl FileOrchestrator {
                 member: None,
                 result: None,
                 route_path: None,
+                through_call: None,
             });
         }
         debug!(
@@ -6632,6 +6637,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: None,
                         route_path: None,
+                        through_call: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6653,6 +6659,7 @@ impl FileOrchestrator {
                         alias: Some(alias),
                         param_name: Some(text.clone()),
                         route_path: None,
+                        through_call: None,
                     },
                 };
                 requests.push(request);
@@ -6908,6 +6915,7 @@ impl FileOrchestrator {
                 alias: Some(alias),
                 param_name: None,
                 route_path: None,
+                through_call: None,
             });
         }
         debug!(
@@ -7079,6 +7087,7 @@ impl FileOrchestrator {
                     alias: Some(alias),
                     param_name: None,
                     route_path: None,
+                    through_call: None,
                 });
             }
         }

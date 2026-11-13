@@ -99,6 +99,7 @@ import {
 import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
+import { enclosingTypeParameterIn, instantiatedAtCall } from './type-parameters.js';
 import { loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
@@ -3972,7 +3973,9 @@ export class TypeInferrer {
       return null;
     }
 
-    const type = node.getType();
+    const atCaller = this.typeAtThroughCall(node, request);
+    if (atCaller.kind === 'open') return atCaller.abstain;
+    const type = atCaller.type;
     let typeString = typeText(type, node);
 
     // Apply extraction config
@@ -3997,7 +4000,7 @@ export class TypeInferrer {
       request,
       typeString,
       false,
-      this.getNodeLocation(node),
+      this.locationOfRead(node, atCaller),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
@@ -4005,6 +4008,74 @@ export class TypeInferrer {
       this.unwrapPromiseType(anchorSource),
       anchor.element
     );
+  }
+
+  /**
+   * The type of `node`, a payload the scanner reads inside the wrapper that
+   * builds it (carrick#4128), as the call it names in `through_call`
+   * instantiates that wrapper: `{ body: item }` in `place<T>(item: T)` reads
+   * `{ body: Book }` at `place(book)`. A type parameter the call leaves open
+   * is never published: the answer is a decided `unknown`. A request with no
+   * `through_call` reads the type at `node` as it stands.
+   */
+  private typeAtThroughCall(
+    node: Node,
+    request: InferRequestItem
+  ):
+    | { kind: 'as_read' | 'instantiated'; type: Type }
+    | { kind: 'open'; abstain: InferredType } {
+    const read = node.getType();
+    const through = request.through_call;
+    if (!through) return { kind: 'as_read', type: read };
+    const callerFile = this.getSourceFile(through.file_path);
+    const call = callerFile
+      ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
+      : undefined;
+    const checker = this.project.getTypeChecker();
+    // A call the span does not find reaches nothing: whatever the read holds
+    // open stays open.
+    const outcome = call
+      ? instantiatedAtCall(checker.compilerObject, read.compilerType, node.compilerNode, call.compilerNode)
+      : openAt(checker.compilerObject, read.compilerType, node.compilerNode);
+    if (outcome.kind === 'as_read') return { kind: 'as_read', type: read };
+    if (outcome.kind === 'instantiated' && call) {
+      return {
+        kind: 'instantiated',
+        // Read through ts-morph's own checker, so the type is the wrapper the
+        // rest of the inferrer reads.
+        type: checker.getTypeOfSymbolAtLocation(
+          { compilerSymbol: outcome.symbol } as unknown as Parameters<typeof checker.getTypeOfSymbolAtLocation>[0],
+          call
+        ),
+      };
+    }
+    const open = outcome.kind === 'open' ? outcome.name : '';
+    this.log(
+      `Payload at ${request.file_path}:${request.line_number} holds the type parameter '${open}', ` +
+        'which the call that reaches it does not bind; leaving it unknown'
+    );
+    return {
+      kind: 'open',
+      abstain: this.decidedAbstain(request, this.getNodeLocation(node), {
+        path: '',
+        kind: 'unknown',
+        reason: 'body_built_by_callee',
+        detail:
+          `the body is built inside a generic function, and the call that reaches it leaves ` +
+          `its type parameter '${open}' unset, so the call states no body type`,
+      }),
+    };
+  }
+
+  /**
+   * Where a read's answer points. An instantiated read is not re-read
+   * unwidened: that reading is made at the node, inside the generic
+   * function, where the type parameter is open again (carrick#4128).
+   */
+  private locationOfRead(node: Node, read: { kind: string }): SourceLocation {
+    const location = this.getNodeLocation(node);
+    if (read.kind === 'instantiated') this.readNodes.delete(location);
+    return location;
   }
 
   private inferRequestBody(
@@ -4356,7 +4427,9 @@ export class TypeInferrer {
       }
     }
 
-    const payloadType = node.getType();
+    const atCaller = this.typeAtThroughCall(node, request);
+    if (atCaller.kind === 'open') return atCaller.abstain;
+    const payloadType = atCaller.type;
     let typeString = typeText(payloadType, node);
     let isExplicit = false;
 
@@ -4453,7 +4526,7 @@ export class TypeInferrer {
       request,
       typeString,
       isExplicit,
-      this.getNodeLocation(node),
+      this.locationOfRead(node, atCaller),
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       undefined,
       undefined,
@@ -11920,4 +11993,14 @@ function nodeAtSpan(span: SavedSpan): Node | undefined {
 /** `undefined`, `null` and `void`: what a labelled read removes (carrick#2818). */
 function isNullishType(type: Type): boolean {
   return type.isUndefined() || type.isNull() || type.getText() === 'void';
+}
+
+/** {@link instantiatedAtCall} with no call to read: a parameter `type` holds open stays open. */
+function openAt(
+  checker: ts.TypeChecker,
+  type: ts.Type,
+  at: ts.Node
+): { kind: 'as_read' } | { kind: 'open'; name: string } {
+  const name = enclosingTypeParameterIn(checker, type, at);
+  return name === undefined ? { kind: 'as_read' } : { kind: 'open', name };
 }

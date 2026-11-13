@@ -130,6 +130,15 @@ export const InferRequestItemSchema = z.object({
   result: ResultLabelSchema.optional(),
   // The route row's own path, sent where its line serves several (carrick#1029).
   route_path: z.string().min(1).optional(),
+  // The call that reaches the function the expression is in (carrick#4128).
+  through_call: z
+    .object({
+      file_path: z.string().min(1),
+      span_start: z.number().int().nonnegative(),
+      span_end: z.number().int().nonnegative(),
+    })
+    .strict()
+    .optional(),
 });
 
 /**

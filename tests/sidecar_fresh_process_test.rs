@@ -163,6 +163,7 @@ fn infer(
                 alias: Some(alias.to_string()),
                 param_name: None,
                 route_path: None,
+                through_call: None,
             }],
             None,
         )
