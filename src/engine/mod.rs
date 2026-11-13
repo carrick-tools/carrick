@@ -13498,15 +13498,17 @@ fn stamp_capture_provenance(
 /// A service that lost its types says so on every entry (carrick#3995).
 ///
 /// When the compiler engine never started, was not ready, or the capture
-/// failed, the service has no capture stub and no capture record, so
+/// failed, the service is `types_degraded` (the one answerer for "this
+/// service lost its types"), no capture record exists, so
 /// [`stamp_capture_provenance`] never ran and every `Unknown` entry would
 /// reach a reader with no reason. Each one still empty gets the one root
 /// finding `site_unreadable`: the site was located and the engine could not
 /// read a type there. The cause stays on the service (`types_degraded`).
 /// An entry a stage already explained is left alone, and so is a service
-/// with a stub. No detail: a failure text holds paths and customer text.
+/// that did not lose its types (a service with nothing to type has no
+/// `types_degraded`). No detail: a failure text holds paths and customer text.
 fn stamp_service_type_loss(cloud_data: &mut CloudRepoData) {
-    if cloud_data.capture_stub.is_some() {
+    if cloud_data.types_degraded.is_none() {
         return;
     }
     let Some(manifest) = cloud_data.type_manifest.as_mut() else {
@@ -25036,16 +25038,19 @@ unfollowed_member_calls_total: 0,
         );
     }
 
-    /// A service with no capture stub says so on every still-empty Unknown
-    /// entry; an entry a stage explained, and a service with a stub, are left
-    /// alone (carrick#3995).
+    /// A types-degraded service says so on every still-empty Unknown entry;
+    /// an entry a stage explained, and a service that did not lose its
+    /// types, are left alone (carrick#3995).
     #[test]
-    fn a_service_without_a_stub_stamps_site_unreadable_on_empty_unknown_entries() {
+    fn a_types_degraded_service_stamps_site_unreadable_on_empty_unknown_entries() {
         let mut explained = consumer_entry("Explained");
         explained.any_provenance.push(provenance("", "declared"));
         let mut data = service_data("repo", None);
         data.type_manifest = Some(vec![consumer_entry("Empty"), explained]);
-        data.capture_stub = None;
+        data.types_degraded = Some(TypeDegradation {
+            stage: "spawn".to_string(),
+            detail: "d".to_string(),
+        });
         stamp_service_type_loss(&mut data);
         let manifest = data.type_manifest.as_ref().unwrap();
         assert_eq!(manifest[0].any_provenance.len(), 1);
@@ -25056,20 +25061,16 @@ unfollowed_member_calls_total: 0,
         assert_eq!(manifest[1].any_provenance.len(), 1);
         assert_eq!(manifest[1].any_provenance[0].reason, "declared");
 
-        let mut with_stub = service_data("repo", None);
-        with_stub.type_manifest = Some(vec![consumer_entry("Empty")]);
-        with_stub.capture_stub = Some(crate::cloud_storage::CaptureStubArtifact {
-            artifact_version: 1,
-            package_name: String::new(),
-            ts_version: String::new(),
-            bare_checkout: false,
-            files: Default::default(),
-        });
-        stamp_service_type_loss(&mut with_stub);
+        let mut healthy = service_data("repo", None);
+        healthy.type_manifest = Some(vec![consumer_entry("Empty")]);
+        healthy.capture_stub = None;
+        healthy.types_degraded = None;
+        stamp_service_type_loss(&mut healthy);
         assert!(
-            with_stub.type_manifest.as_ref().unwrap()[0]
+            healthy.type_manifest.as_ref().unwrap()[0]
                 .any_provenance
-                .is_empty()
+                .is_empty(),
+            "no stub and no types_degraded stamps nothing"
         );
     }
 
