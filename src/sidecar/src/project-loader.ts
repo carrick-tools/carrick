@@ -300,11 +300,16 @@ export class ProjectLoader {
           this.buildProject = (kind) => {
             const deno = new DenoProject(denoConfig, this.repoRoot);
             this.denoProject = deno;
+            // Under CARRICK_UNTRUSTED_TREE the bound also admits the npm
+            // packages this graph resolved, and the resolver and the root
+            // list below hand the compiler nothing it refuses (carrick#4076).
+            const bound = untrustedReadBound(this.repoRoot, deno.readRoots);
+            deno.bindReadBound(bound);
             // The graph's external-library verdicts, kept past the program
             // rebuilds that drop them (carrick#1731).
             const imports = new ExternalImports();
             const project = new Project({
-              ...this.fileSystemOption(),
+              ...this.fileSystemOption(bound),
               compilerOptions: sidecarCompilerOptions(optionsFor(kind, deno.parsed.options as CompilerOptions)),
               skipAddingFilesFromTsConfig: true,
               resolutionHost: imports.recording((host, getOptions) => ({
@@ -318,7 +323,11 @@ export class ProjectLoader {
             registerExternalImports(project, imports);
             pinProgramRoots(project, []);
             if (kind === 'listed') {
-              for (const file of deno.parsed.fileNames) project.addSourceFileAtPath(file);
+              // A listed file or a `types` root the bound refuses (a tracked
+              // link out, an outside path) is skipped, read as missing.
+              for (const file of deno.parsed.fileNames) {
+                if (!bound || bound.allows(file)) project.addSourceFileAtPath(file);
+              }
               for (const diagnostic of deno.diagnostics) this.logError(diagnostic);
             }
             return project;
@@ -438,8 +447,9 @@ export class ProjectLoader {
    * the compiler's own files (carrick#3509) and, under CARRICK_UNTRUSTED_TREE,
    * nothing whose real path is outside the checkout (carrick#2230).
    */
-  private fileSystemOption(): { libFolderPath: string; fileSystem: FileSystemHost } {
-    const bound = untrustedReadBound(this.repoRoot);
+  private fileSystemOption(
+    bound: ReadBound | undefined = untrustedReadBound(this.repoRoot)
+  ): { libFolderPath: string; fileSystem: FileSystemHost } {
     return defaultLibraryOptions(bound ? boundedFileSystem(bound) : undefined);
   }
 

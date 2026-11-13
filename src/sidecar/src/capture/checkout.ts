@@ -7,9 +7,12 @@
  * wrapper and every caller passes the compiler what it passed before. Set,
  * the compiler reads no file whose REAL path (links followed) is outside the
  * checkout, outside the sidecar's own install (its TypeScript library files),
- * and outside the directories the caller names as its own (a capture's stub).
- * A refused file reads as missing, so its types become `any`: the posture an
- * unprepared tree already has.
+ * and outside the directories the caller names as its own: a capture's stub,
+ * and the npm package directories the scan's own Deno graph resolved,
+ * beneath its npm cache (carrick#4076). A refused file reads as missing, so
+ * its types become `any`: the posture an unprepared tree already has. The
+ * Deno resolver and the Deno root-file list hand the compiler nothing the
+ * bound refuses, so a refused file never fails the whole service.
  */
 
 import * as fs from 'node:fs';
@@ -83,13 +86,18 @@ function within(real: string, root: string): boolean {
   return real === root || real.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
 }
 
+/** The sidecar's own install directory: outside any scanned checkout, so a
+ * command run there reads none of the tree's configuration. */
+export function sidecarInstallDir(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+}
+
 /** Where the sidecar's own files live: its install, and the TypeScript package
  * whose `lib.*.d.ts` every program reads (beside the sidecar in the npm
  * package, so not always beneath it). */
 function sidecarRoots(): string[] {
-  const here = path.dirname(fileURLToPath(import.meta.url));
   const roots = [
-    path.resolve(here, '..', '..', '..'),
+    sidecarInstallDir(),
     path.dirname(path.dirname(ts.getDefaultLibFilePath({}))),
   ];
   const configured = process.env.CARRICK_SIDECAR_DIR;
