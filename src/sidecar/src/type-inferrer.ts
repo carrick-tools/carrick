@@ -258,6 +258,10 @@ const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
  */
 type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
 
+/** An error or redirect send carries no body the route's contract describes. */
+const isDroppedResponseStatus = (status: ResponseSiteStatus): boolean =>
+  status === 'error' || status === 'redirect';
+
 /**
  * The reasons an `unknown` answer is a decision, not a failure to read: the
  * list `DECIDED_ABSTAIN_REASONS` in `src/engine/type_compat_v2.rs` holds
@@ -1983,11 +1987,13 @@ export class TypeInferrer {
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
         );
-        return this.buildFunctionReturnInferredType(
-          request,
-          atLine.handler,
-          extractionConfig,
-          true
+        return (
+          this.buildFunctionReturnInferredType(
+            request,
+            atLine.handler,
+            extractionConfig,
+            true
+          ) ?? this.labelledSendBodies(request, atLine.handler)
         );
       }
       // carrick#807: the request named an expression and the file holds none
@@ -2660,14 +2666,8 @@ export class TypeInferrer {
     // carrick#2472 C2: the service's labels answer first. A labelled send is
     // a send, an unlabelled member of a labelled reply object is a setter;
     // where no label speaks, the structural reading decides.
-    const labelledSend = (candidate: Node) =>
-      this.statedParams.sendAt(this.peelTransparentExpression(candidate));
-    const isLabelledSend = (candidate: Node): boolean => {
-      const labelled = labelledSend(candidate);
-      return labelled !== undefined && labelled !== 'setter';
-    };
     const isSend = (candidate: Node): boolean => {
-      const labelled = labelledSend(candidate);
+      const labelled = this.statedParams.sendAt(this.peelTransparentExpression(candidate));
       if (labelled !== undefined) return labelled !== 'setter';
       return this.isResponseSend(candidate, extractionConfig);
     };
@@ -2691,8 +2691,7 @@ export class TypeInferrer {
     const locatedBranch = locatingBranches.find((branch) => contains(branch, site));
     if (!locatedBranch) return undefined;
 
-    const dropped = (status: ResponseSiteStatus): boolean =>
-      status === 'error' || status === 'redirect';
+    const dropped = isDroppedResponseStatus;
     const siteStatus = this.responseSiteStatus(site, true);
     if (!tied && !dropped(siteStatus)) return undefined;
     let branches: Node[];
@@ -2706,7 +2705,7 @@ export class TypeInferrer {
           .filter(
             (s) =>
               s.send === locatedBranch ||
-              isLabelledSend(s.send) ||
+              this.isLabelledSend(s.send) ||
               this.statementEndsFunctionPath(s.statement, func)
           )
           .map((s) => s.send),
@@ -2889,6 +2888,45 @@ export class TypeInferrer {
     // argument the route passes also decides it.
     inferred.response_modes = { reads: sorted };
     return inferred;
+  }
+
+  /** A call the service's labels name a body send; a labelled setter is not one (carrick#2472 C2). */
+  private isLabelledSend(candidate: Node): boolean {
+    const labelled = this.statedParams.sendAt(this.peelTransparentExpression(candidate));
+    return labelled !== undefined && labelled !== 'setter';
+  }
+
+  /**
+   * carrick#4081: a line-only row at a registration whose handler returns
+   * nothing. Its body is what the handler sends: every labelled send it makes
+   * as a statement, error and redirect sends dropped, the success bodies
+   * joined, as `inferFromResponseSites` reads them from a located send. Only
+   * labelled sends count; an unlabelled one leaves the row unread. A reply
+   * parameter that states its payload answers first (`withStatedReply`), so
+   * this yields to it.
+   */
+  private labelledSendBodies(
+    request: InferRequestItem,
+    handler: FunctionLike
+  ): InferredType | null {
+    if (!this.statedParams.readsReplies || this.statedParams.reply(handler)) return null;
+    const survivors = this.responseSendStatements(handler, (candidate) =>
+      this.isLabelledSend(candidate)
+    )
+      .map((s) => s.send)
+      .filter((send) => !isDroppedResponseStatus(this.responseSiteStatus(send, true)));
+    if (survivors.length === 0) return null;
+    const recovered = this.recoverPayloadFromResponseExpressions(
+      survivors,
+      false,
+      this.wireFormatFor(request)
+    );
+    if (!recovered) return null;
+    this.log(
+      `Route at ${request.file_path}:${request.line_number} returns nothing; ` +
+        'publishing the success bodies its handler sends through labelled sends'
+    );
+    return this.inferredFromRecoveredPayload(request, recovered);
   }
 
   /**
