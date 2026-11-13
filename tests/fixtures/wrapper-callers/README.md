@@ -85,3 +85,31 @@ Answer key (the row at each call line in `use-exits.ts`):
 - 45, a query set under a truthiness test (`if (q) url = "/api/c4?query=1"`):
   the URL waits on no caller, so its row is stated at the send
   (`src/clients/exits.ts` line 170): one row keying `GET /api/c4`.
+
+## Tests on the path to a request (`src/clients/path-guards.ts`)
+
+A request after an `if` on a parameter whose branch exits (`return`,
+`throw`), or inside the branch of one, whatever its URL is written as
+(carrick#4093). A caller whose text takes the other way is not given the
+row; a caller that passes something the scan does not read as text keeps
+it. The tests on the path are the value resolver's flow
+(`src/request_summary/resolve/flow.rs`, `tests_at`).
+
+Answer key (the row at each call line in `src/use-path-guards.ts`):
+
+- 13, `if (verb === "GET") return` before the send, called with `"GET"`:
+  no row.
+- 14, the same called with `"POST"`: `POST /api/items.list`.
+- 15, the same called with the caller's own parameter, and nothing calls
+  the caller: `POST /api/items.list`.
+- 16, a helper called in the branch of `kind === "PUSH"` and after it,
+  called with `"PUSH"`: `POST /api/sync/push` only.
+- 17, the same called with `"PULL"`: `POST /api/sync/pull` only. The
+  helper's own calls (`src/clients/path-guards.ts` lines 24 and 26) keep
+  their rows.
+- 18, `opts.mode.startsWith("dry")` throws before the send, called with
+  `{ mode: "dry-run" }`: no row.
+- 19, the same with `{ mode: "live" }`: `POST /api/items.list`.
+- 20, a literal URL after `if (verb !== "PUT") return`, called with
+  `"GET"`: no row.
+- 21, the same called with `"PUT"`: `PUT /api/literal`.
