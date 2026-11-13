@@ -1176,18 +1176,17 @@ pub fn engine_not_ready_message(
     allow_env: &str,
 ) -> String {
     format!(
-        "The type sidecar was not ready within {budget_secs}s ({detail}), so this scan \
-         would index every endpoint with no request or response types. \
-         Aborting before the analysis so the existing index keeps its \
-         types. Raise the budget with {budget_env}, or set {allow_env}=1 to scan without \
-         types anyway."
+        "The compiler engine was not ready within {budget_secs}s ({detail}), so this scan \
+         would index every endpoint with no request or response types. Aborting keeps the \
+         existing index's types. Raise the budget with {budget_env}, or set {allow_env}=1 \
+         to scan without types anyway."
     )
 }
 
 /// Reason recorded when the compiler engine process could not be started.
-pub const ENGINE_FAILED_TO_START_REASON: &str = "sidecar failed to start";
+pub const ENGINE_FAILED_TO_START_REASON: &str = "compiler engine failed to start";
 /// Reason recorded when the compiler engine bundle was not found.
-pub const ENGINE_NOT_FOUND_REASON: &str = "sidecar not found";
+pub const ENGINE_NOT_FOUND_REASON: &str = "compiler engine not found";
 
 #[cfg(test)]
 mod tests {

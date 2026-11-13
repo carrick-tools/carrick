@@ -665,7 +665,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location
     // =======================================================================
-    let sp = logging::spinner("Initializing sidecar...");
+    let sp = logging::spinner("Initializing compiler engine...");
     let mut sidecar_found = false;
     let sidecar = match discover_sidecar_path() {
         Some(sidecar_path) => {
@@ -697,7 +697,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Waiting for sidecar to be ready...");
         match sidecar.wait_ready(budget) {
             Ok(()) => {
-                logging::finish_spinner(&sp, "Sidecar ready");
+                logging::finish_spinner(&sp, "Compiler engine ready");
                 true
             }
             Err(e) => {
@@ -706,7 +706,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                 // stopped for rather than for a readiness budget it never
                 // served (carrick#1387).
                 shutdown::check()?;
-                logging::finish_spinner_warn(&sp, "Sidecar unavailable");
+                logging::finish_spinner_warn(&sp, "Compiler engine unavailable");
                 // Without the sidecar every endpoint this run indexes carries
                 // no request or response type. The scan can still produce a
                 // route surface, so nothing downstream fails and the run
@@ -731,20 +731,20 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
                     logging::annotate(logging::Annotation::Error, &message);
                     return Err(message.into());
                 }
-                warn!("Sidecar failed to initialize: {}", e);
+                warn!("Compiler engine failed to initialize: {}", e);
                 scan_health::record_types_unavailable(scan_health::WHOLE_SCAN, &e.to_string());
                 false
             }
         }
     } else if sidecar_found {
-        logging::finish_spinner_warn(&sp, "Sidecar failed to start");
+        logging::finish_spinner_warn(&sp, "Compiler engine failed to start");
         scan_health::record_types_unavailable(
             scan_health::WHOLE_SCAN,
             scan_health::ENGINE_FAILED_TO_START_REASON,
         );
         false
     } else {
-        logging::finish_spinner_warn(&sp, "Sidecar not found");
+        logging::finish_spinner_warn(&sp, "Compiler engine not found");
         scan_health::record_types_unavailable(
             scan_health::WHOLE_SCAN,
             scan_health::ENGINE_NOT_FOUND_REASON,

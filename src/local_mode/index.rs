@@ -2704,13 +2704,15 @@ mod tests {
             findings: Vec::new(),
             unmatched: Vec::new(),
             type_check: super::super::JoinTypeCheck::Skipped {
-                reason: "sidecar not found".to_string(),
+                reason: "compiler engine not found".to_string(),
             },
         };
         let skipped = type_check_summary(&join, &[], &BTreeMap::new());
         assert_eq!(
             skipped.lines(),
-            ["type check skipped: sidecar not found. No pair in this index has a type verdict."]
+            [
+                "type check skipped: compiler engine not found. No pair in this index has a type verdict."
+            ]
         );
 
         let join = LocalJoin {
@@ -2739,11 +2741,15 @@ mod tests {
 
         // The consumer's own scan skipped its check: that reason, which the
         // indexer would otherwise swallow, is the one stated.
-        let summary = type_check_summary(&join, &[uploaded(Some("sidecar not found"))], &positions);
+        let summary = type_check_summary(
+            &join,
+            &[uploaded(Some("compiler engine not found"))],
+            &positions,
+        );
         assert_eq!(
             summary.lines()[1],
             "1 verdict(s) for web are not in Carrick Cloud: its type check was skipped: \
-             sidecar not found."
+             compiler engine not found."
         );
     }
 
@@ -2752,7 +2758,7 @@ mod tests {
     #[test]
     fn a_scans_type_check_state_crosses_the_marker_channel() {
         let skipped = super::super::JoinTypeCheck::Skipped {
-            reason: "sidecar not found".to_string(),
+            reason: "compiler engine not found".to_string(),
         };
         let line = format!(
             "@carrick-type-check {}",

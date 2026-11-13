@@ -869,7 +869,7 @@ mod tests {
         scan.error = Some(format!(
             "the scan of api failed: {reason}\n\
              Carrick run continuing run_id=4f2a\n\
-             Initializing sidecar...\n\
+             Initializing compiler engine...\n\
              [FileOrchestrator] Type resolution warnings: [\"/Users/ada/api/src/a.ts\"]\n\
              Gateway status 429 with non-envelope body (missing field `success`)\n\
              ... 2756 line(s) not shown, except ..."
