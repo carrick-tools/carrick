@@ -4261,7 +4261,10 @@ mod tests {
                     &files,
                     &std::collections::HashMap::new(),
                     &guidance,
-                    &crate::framework_detector::DetectionResult::default(),
+                    &crate::framework_detector::DetectionResult {
+                        data_fetchers: vec!["express".to_string()],
+                        ..Default::default()
+                    },
                     &root,
                     &root,
                     &crate::workspace_resolver::WorkspaceIndex::build_with_aliases(&root, None),
