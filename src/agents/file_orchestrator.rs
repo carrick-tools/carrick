@@ -1757,6 +1757,16 @@ pub(crate) fn route_response_request(
     }
 }
 
+/// [`FileOrchestrator::collect_type_requests_and_body_asks`]'s answer: the
+/// explicit requests, the infer requests, the inline aliases, and the asks a
+/// caller row's response waits on (carrick#4196).
+pub type TypeRequestsAndBodyAsks = (
+    Vec<SymbolRequest>,
+    Vec<InferRequestItem>,
+    Vec<(String, String)>,
+    Vec<InferRequestItem>,
+);
+
 impl FileOrchestrator {
     pub fn new(agent_service: AgentService) -> Self {
         Self {
@@ -5245,12 +5255,7 @@ impl FileOrchestrator {
         mount_graph: &MountGraph,
         config: &Config,
         modules: &WorkspaceIndex,
-    ) -> (
-        Vec<SymbolRequest>,
-        Vec<InferRequestItem>,
-        Vec<(String, String)>,
-        Vec<InferRequestItem>,
-    ) {
+    ) -> TypeRequestsAndBodyAsks {
         // Convert repo_path to absolute for path resolution
         let repo_root = std::path::Path::new(repo_path);
         let repo_root_absolute = if repo_root.is_absolute() {
