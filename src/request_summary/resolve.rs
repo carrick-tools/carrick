@@ -289,6 +289,10 @@ pub(super) struct FieldWrite {
 #[derive(Default)]
 struct WriteCensus {
     writes: HashMap<BindingKey, Vec<u32>>,
+    /// Where each `name += "text"` starts ([`is_text_append`]): a write no
+    /// reader but the send side's flow places, so every other reader sees
+    /// the binding as unplaceable ([`Self::is_unplaceable`]).
+    appends: HashMap<BindingKey, Vec<u32>>,
     unplaceable: HashSet<BindingKey>,
     declared: HashMap<BindingKey, usize>,
     /// `with` or a direct `eval` may write any binding.
@@ -501,6 +505,7 @@ impl WriteCensus {
     fn is_unplaceable(&self, key: &BindingKey) -> bool {
         self.opaque
             || self.unplaceable.contains(key)
+            || self.appends.contains_key(key)
             || self.declared.get(key).copied().unwrap_or(0) > 1
     }
 
@@ -509,6 +514,7 @@ impl WriteCensus {
     fn placed_writes(&self) -> PlacedWrites {
         PlacedWrites {
             writes: self.writes.clone(),
+            appends: self.appends.clone(),
             unplaceable: self
                 .unplaceable
                 .iter()
@@ -533,7 +539,10 @@ impl WriteCensus {
 #[derive(Debug, Clone, Default)]
 pub(super) struct PlacedWrites {
     writes: HashMap<BindingKey, Vec<u32>>,
-    /// Written in a form no reader states, or declared twice.
+    /// Where each text append (`name += "text"`) starts.
+    appends: HashMap<BindingKey, Vec<u32>>,
+    /// Written in a form no reader states, or declared twice. An appended
+    /// name is not in it for that alone ([`Self::of_written`]).
     unplaceable: HashSet<BindingKey>,
     /// `with` or a direct `eval` may write any binding.
     opaque: bool,
@@ -541,12 +550,33 @@ pub(super) struct PlacedWrites {
 
 impl PlacedWrites {
     /// Where each plain assignment to `key` starts, when every write of it
-    /// is one ([`WriteCensus::is_unplaceable`]); `None` otherwise.
+    /// is one ([`WriteCensus::is_unplaceable`]); `None` otherwise, a text
+    /// append included.
     pub(super) fn of(&self, key: &BindingKey) -> Option<&[u32]> {
-        if self.opaque || self.unplaceable.contains(key) {
+        if self.opaque || self.unplaceable.contains(key) || self.appends.contains_key(key) {
             return None;
         }
         Some(self.writes.get(key).map_or(&[], Vec::as_slice))
+    }
+
+    /// Where each plain assignment and each text append to `key` starts:
+    /// what the send side's flow reads ([`flow::reaching`]), for the census
+    /// check ([`super::alternatives::Alternation::census_checked`]). `None`
+    /// when the module is opaque, the name is declared twice or it is
+    /// written in any other form.
+    pub(super) fn of_written(&self, key: &BindingKey) -> Option<BTreeSet<u32>> {
+        if self.opaque || self.unplaceable.contains(key) {
+            return None;
+        }
+        Some(
+            self.writes
+                .get(key)
+                .into_iter()
+                .chain(self.appends.get(key))
+                .flatten()
+                .copied()
+                .collect(),
+        )
     }
 }
 
@@ -683,6 +713,18 @@ pub(super) fn is_placed_assign(op: AssignOp) -> bool {
     )
 }
 
+/// `+=` whose right side is a string or template literal: string
+/// concatenation whatever the target holds, so the send side's flow reads it
+/// as the ways that reach the target followed by that text (carrick#3679
+/// S8). `page += 2` and `url += suffix` are not.
+pub(super) fn is_text_append(assign: &AssignExpr) -> bool {
+    assign.op == AssignOp::AddAssign
+        && matches!(
+            crate::graphql_document_sites::unwrap_expression(&assign.right),
+            Expr::Lit(Lit::Str(_)) | Expr::Tpl(_)
+        )
+}
+
 /// The object pattern of a destructuring assignment target when every
 /// property is a plain key bound to a plain name with no default
 /// (carrick#3504 S2b-5).
@@ -702,6 +744,8 @@ impl Visit for WriteCensus {
                 let key = ident_key(&binding.id);
                 if is_placed_assign(assign.op) {
                     self.writes.entry(key).or_default().push(assign.span.lo.0);
+                } else if is_text_append(assign) {
+                    self.appends.entry(key).or_default().push(assign.span.lo.0);
                 } else {
                     self.unplaceable.insert(key);
                 }
@@ -4673,6 +4717,27 @@ mod tests {
             .cloned()
             .unwrap_or_else(|| panic!("`{name}` is declared"));
         (census, key)
+    }
+
+    /// A text append is placed for the census check alone: every other reader
+    /// sees the binding as unplaceable (carrick#3679 S8, the `+=` ruling).
+    #[test]
+    fn an_append_is_unplaced_for_every_reader_but_the_census_check() {
+        let (census, key) = census_over("let u = \"/a\"; if (f) u = \"/b\"; u += \"?x=1\";", "u");
+        let placed = census.placed_writes();
+        assert!(placed.of(&key).is_none());
+        assert!(census.is_unplaceable(&key));
+        let writes = census.writes.get(&key).unwrap();
+        let appends = census.appends.get(&key).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(appends.len(), 1);
+        assert_eq!(
+            placed.of_written(&key),
+            Some(writes.iter().chain(appends).copied().collect())
+        );
+        // A right side that is not literal text stays unplaceable for all.
+        let (census, key) = census_over("let u = \"/a\"; u += suffix;", "u");
+        assert!(census.placed_writes().of_written(&key).is_none());
     }
 
     /// Whether the module keeps the object `name` holds through its entries
