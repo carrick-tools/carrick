@@ -1018,13 +1018,18 @@ fn a_summaries_owned_undecided_hand_back_is_kept_and_unverifiable() {
         hand_back_verdicts(&format!("{HAND_BACK_APP}:19")),
         [("response".to_string(), "unverifiable".to_string())]
     );
-    let kept = hand_back_response(&format!("{HAND_BACK_APP}:19"));
-    assert!(kept.is_some(), "app.ts:19 keeps a response entry");
-    assert_eq!(kept, hand_back_response(&format!("{HAND_BACK_APP}:9")));
+    assert!(
+        hand_back_entry(&format!("{HAND_BACK_APP}:19")).is_some(),
+        "app.ts:19 keeps a response entry"
+    );
+    assert_eq!(
+        hand_back_response(&format!("{HAND_BACK_APP}:19")),
+        hand_back_response(&format!("{HAND_BACK_APP}:9"))
+    );
 }
 
-/// The response type the `web` consumer entry at `site` carries.
-fn hand_back_response(site: &str) -> Option<String> {
+/// The `web` consumer response entry at `site`, if the manifest holds one.
+fn hand_back_entry(site: &str) -> Option<&'static serde_json::Value> {
     hand_back_blobs()
         .get("web")
         .and_then(|blob| blob["type_manifest"].as_array())
@@ -1039,6 +1044,11 @@ fn hand_back_response(site: &str) -> Option<String> {
                     entry["line_number"].as_u64().unwrap_or_default()
                 ) == site
         })
+}
+
+/// The response type the `web` consumer entry at `site` carries.
+fn hand_back_response(site: &str) -> Option<String> {
+    hand_back_entry(site)
         .and_then(|entry| entry["expanded_definition"].as_str().map(str::to_string))
 }
 
