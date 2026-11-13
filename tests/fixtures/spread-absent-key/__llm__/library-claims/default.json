@@ -33,6 +33,16 @@
      "patterns": []
     }
    ]
+  },
+  {
+   "package": "fixture-table",
+   "version": "1.0.0",
+   "status": "answered",
+   "exports": [
+    {"specifier": "fixture-table", "export": "TableClient", "role": "http_client", "side": null, "makes": [], "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": []},
+    {"specifier": "fixture-table", "export": "GetRow", "role": "http_client", "side": null, "makes": [], "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": []},
+    {"specifier": "fixture-table", "export": "QueryRows", "role": "http_client", "side": null, "makes": [], "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": []}
+   ]
   }
  ]
 }

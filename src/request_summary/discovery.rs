@@ -4455,6 +4455,79 @@ mod tests {
         );
     }
 
+    /// The `(file, line)` of each labelled end of the sites discovery keeps
+    /// at `file:line`, with the stops beside them.
+    fn ends_at(
+        discovery: &Discovery,
+        file: &str,
+        line: u32,
+    ) -> (Vec<(String, String)>, Vec<Option<Stop>>) {
+        let sites: Vec<&DiscoverySite> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with(file) && site.line == line)
+            .collect();
+        let ends = sites
+            .iter()
+            .filter_map(|site| site.end.as_ref())
+            .map(|end| (end.package.clone(), end.export.clone()))
+            .collect();
+        (ends, sites.iter().map(|site| site.stop).collect())
+    }
+
+    /// Ruling R-SP, must-keep (v1-agent on carrick#3856): an action is
+    /// handed the members a factory returns, by one caller as they are and
+    /// by another as `{ ...tableDeps(), mint }`. Each member sends a command
+    /// built from a labelled export of the table client, one inside a
+    /// callback a paging helper runs. Read through the spread, both callers
+    /// hold the same members, so each `deps.*` call keeps its labelled end
+    /// and stops nowhere. The answer key is
+    /// `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_member_read_through_a_spread_of_a_factory_keeps_its_labelled_end() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        for (line, export) in [(9, "GetRow"), (10, "QueryRows")] {
+            let (ends, stops) = ends_at(&discovery, "deps_spread/action.ts", line);
+            assert!(
+                ends.contains(&("fixture-table".to_string(), export.to_string()))
+                    && ends.iter().all(|(package, _)| package == "fixture-table")
+                    && stops.iter().all(Option::is_none),
+                "action.ts:{line} reaches `{export}` with no stop: {ends:?} {stops:?}\n{all}"
+            );
+        }
+    }
+
+    /// A callee whose one caller hands it a value the resolver does not
+    /// read holds one stop, and the call is saved with a reason, never
+    /// dropped (v1-agent on carrick#3856): `agree` passes a lone held stop
+    /// up as no stop, and the call's own row names the hole. The answer key
+    /// is `tests/fixtures/spread-absent-key/README.md`.
+    #[test]
+    fn a_callee_holding_one_stop_is_saved_with_a_reason() {
+        let Some((discovery, all)) = spread_absent_key() else {
+            return;
+        };
+        let saved = |line: u32| -> Vec<(Option<SiteEnd>, Option<Stop>)> {
+            discovery
+                .sites
+                .iter()
+                .chain(&discovery.unfollowed)
+                .filter(|site| site.file.ends_with("deps_spread/action.ts") && site.line == line)
+                .map(|site| (site.end.clone(), site.stop))
+                .collect()
+        };
+        assert_eq!(
+            (saved(15), saved(20)),
+            (
+                vec![(None, Some(Stop::ValueCallee))],
+                vec![(None, Some(Stop::ValueCallee))]
+            ),
+            "action.ts:15 and :20 are saved with a reason\n{all}"
+        );
+    }
+
     /// carrick#2448 T2: the method a maker call binds. `get` and `post` of
     /// the client are `makeMethodFn('GET')` and `makeMethodFn('POST')`; the
     /// arrow they return reads `method` from its factory, so the site's method

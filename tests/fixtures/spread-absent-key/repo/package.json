@@ -1,1 +1,1 @@
-{"name":"spread-absent-key","version":"1.0.0","private":true}
+{"name":"spread-absent-key","version":"1.0.0","private":true,"dependencies":{"fixture-table":"^1.0.0"}}
