@@ -6670,6 +6670,7 @@ impl Reader<'_> {
                     // where the body declares the name once: the census keys
                     // writes by binding, the table by line and name; never
                     // `binding_count`, which counts assignment targets too.
+                    let start = ir.local_bindings.len();
                     ir.local_bindings.extend(self.local_entries(
                         var,
                         declarator,
@@ -6678,6 +6679,19 @@ impl Reader<'_> {
                         |name| reassigned.names.contains(name),
                         false,
                     ));
+                    // A `let` written again: which writes reach each read
+                    // (carrick#3679 S8), computed here, where the body is in
+                    // hand. A `var` is hoisted and stays the census's set.
+                    if var.kind == VarDeclKind::Let
+                        && let Pat::Ident(ident) = &declarator.name
+                        && reassigned.names.contains(ident.id.sym.as_ref())
+                        && let Some(entry) = ir.local_bindings[start..]
+                            .iter_mut()
+                            .find(|entry| entry.key == ident_key(&ident.id))
+                    {
+                        entry.flow =
+                            resolve::flow::reaching(stmts, &entry.key).map(|found| found.table());
+                    }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
                     // One never set again is a local receiver, below. Its
@@ -6849,6 +6863,7 @@ impl Reader<'_> {
                 plain: declarator.init.is_some(),
                 block,
                 defaulted: false,
+                flow: None,
             });
         }
         // `const { a, b: name } = init`: each plain key is a local of its own
@@ -6872,6 +6887,7 @@ impl Reader<'_> {
                     plain: false,
                     block,
                     defaulted: false,
+                    flow: None,
                 });
             }
         }
@@ -8965,6 +8981,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 plain: false,
                 block: self.depth > 0,
                 defaulted: false,
+                flow: None,
             };
             self.push_entry(entry);
         }

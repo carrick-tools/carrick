@@ -37,6 +37,7 @@ use crate::position_rows::{Kind, Row};
 use std::cell::{Cell, RefCell};
 
 mod documents;
+pub(super) mod flow;
 mod text;
 mod text_reader;
 
@@ -120,6 +121,12 @@ pub(super) struct ModuleBinding {
     /// Only such a binding's initialiser is what the procedures walk reads
     /// a router name as (carrick#3538).
     pub(super) plain: bool,
+    /// For a function's own written `let`, the ways that reach each read,
+    /// keyed by where the read starts ([`flow::reaching`], carrick#3679 S8):
+    /// [`Resolver::written_at`] answers from it. Empty where the flow
+    /// refused the local or disagrees with the write census (D6): every
+    /// reader then keeps the initialiser and every write.
+    pub(super) reads: BTreeMap<u32, Vec<flow::WayAt>>,
 }
 
 impl ModuleBinding {
@@ -243,6 +250,11 @@ pub(super) struct LocalBinding {
     /// [`param_bindings`] would mark every defaulted callback parameter as
     /// colliding with it.
     pub(super) defaulted: bool,
+    /// Which writes reach each read (carrick#3679 S8, [`flow::reaching`]):
+    /// a `let` the body declares once at its top level and writes again,
+    /// where the flow places every write. [`module_bindings`] checks it
+    /// against the census before the table keeps it.
+    pub(super) flow: Option<flow::WrittenReads>,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -1016,6 +1028,9 @@ pub(super) fn module_bindings(
                         text_only: true,
                         object_kept: false,
                         plain: false,
+                        // Module-level writes may run in any function, in
+                        // any order (carrick#3679 S8 P7).
+                        reads: BTreeMap::new(),
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -1043,6 +1058,7 @@ pub(super) fn module_bindings(
                 text_only: false,
                 object_kept: census.object_held(&key),
                 plain: true,
+                reads: BTreeMap::new(),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1087,6 +1103,7 @@ pub(super) fn module_bindings(
                 text_only: !local.block && !local.reassigned,
                 object_kept: false,
                 plain: local.plain,
+                reads: flow_checked(local, &census),
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut held) => {
@@ -1123,6 +1140,24 @@ pub(super) fn module_bindings(
         written_through_at(module, &census),
         census.placed_writes(),
     )
+}
+
+/// The flow's ways at each read of `local`, where the write census agrees
+/// with it (D6, carrick#3679 S8): the census places every write of the
+/// binding, the module has no `with` or `eval`, and the census's writes are
+/// the flow's. Otherwise none, and every reader keeps the census's set.
+fn flow_checked(local: &LocalBinding, census: &WriteCensus) -> BTreeMap<u32, Vec<flow::WayAt>> {
+    let Some(found) = &local.flow else {
+        return BTreeMap::new();
+    };
+    let mut placed: Vec<u32> = census.writes.get(&local.key).cloned().unwrap_or_default();
+    let mut seen = found.writes.clone();
+    placed.sort_unstable();
+    seen.sort_unstable();
+    if census.is_unplaceable(&local.key) || placed != seen {
+        return BTreeMap::new();
+    }
+    found.reads.clone()
 }
 
 /// Whose locals a [`FnIr`] of [`module_bindings`]' walk holds.
@@ -2602,6 +2637,7 @@ impl Reader<'_> {
                 plain: false,
                 block: false,
                 defaulted: true,
+                flow: None,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -3857,6 +3893,28 @@ impl<'a> Resolver<'a> {
             .files
             .get_key_value(&declaring)?;
         Some((path.as_path(), ir, line, symbol.to_string()))
+    }
+
+    /// Which writes of the function's own `let` `symbol`, declared on `line`
+    /// of `file`, reach the read of it starting at `read_lo`, and under
+    /// which `if` tests ([`flow::reaching`], carrick#3679 S8): one way per
+    /// path. `None` where the flow refused the local, the census disagrees
+    /// with it, no path reaches the read, or more than [`MAX_VALUES`] ways
+    /// do: the reader then keeps the initialiser and every write.
+    pub(super) fn written_at(
+        &self,
+        file: &Path,
+        (line, symbol): (u32, &str),
+        read_lo: u32,
+    ) -> Option<&'a [flow::WayAt]> {
+        self.inputs_for(file)
+            .files
+            .get(file)?
+            .module_bindings
+            .get(&(line, symbol.to_string()))?
+            .reads
+            .get(&read_lo)
+            .map(Vec::as_slice)
     }
 
     /// Every value the module binding `symbol`, declared on `line` of `file`,
