@@ -12197,11 +12197,13 @@ fn merge_rows(rows: &mut Vec<SummaryRow>) {
 }
 
 /// Whether a call of `callee`, written in `ir`, provably sends nothing
-/// (carrick#1555): the callee is complete and states no request, no callback
-/// it invokes states one, and the call is not an element (which reads only
-/// what its props fill in). A callee that hands out a function that may send
-/// is not silent at a call that writes a route (carrick#2281): the call may be
-/// binding that route into what it hands out.
+/// (carrick#1555): the callee is complete and states no request this call
+/// does not rule out (a test of a parameter the call's text takes the other
+/// way, carrick#3679, carrick#4093), no callback it invokes states one, and
+/// the call is not an element (which reads only what its props fill in). A
+/// callee that hands out a function that may send is not silent at a call
+/// that writes a route (carrick#2281): the call may be binding that route
+/// into what it hands out.
 fn is_silent(
     composer: &mut Composer<'_>,
     file: &Path,
@@ -12209,7 +12211,15 @@ fn is_silent(
     call: &CallIr,
     callee: &Summary,
 ) -> bool {
-    if call.jsx || !callee.complete || !callee.effects.is_empty() {
+    if call.jsx || !callee.complete {
+        return false;
+    }
+    let sends = callee.effects.iter().any(|effect| {
+        !effect
+            .instantiate_omitting(&call.args, &call.spread_args, &|index| call.omits(index))
+            .ruled_out
+    });
+    if sends {
         return false;
     }
     for (index, arg) in call.args.iter().enumerate() {
