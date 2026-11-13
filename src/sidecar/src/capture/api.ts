@@ -409,8 +409,11 @@ export interface CaptureAliasRecord {
    */
   absent_body_tolerated?: true;
   /**
-   * carrick#3995: the literal anchor's `unread_cause`. Read only to say why
-   * the entry is untyped: never a verdict input, never in `surface_hash`.
+   * carrick#3995: why the alias is untyped. A literal anchor's own
+   * `unread_cause` when the driver sent one, otherwise the cause the capture
+   * decided at the anchor (`machinery_envelope`, `site_unreadable`,
+   * `not_located`). Read only to say why the entry is untyped: never a
+   * verdict input, never in `surface_hash`.
    */
   unread_cause?: TypeProvenanceReason;
   /**

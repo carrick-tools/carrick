@@ -12,6 +12,7 @@ import type {
   InferAnchorRequest,
   PrintedName,
   SymbolAnchorRequest,
+  TypeProvenanceReason,
 } from './api.js';
 import {
   printTypeForDestination,
@@ -78,6 +79,15 @@ export interface ResolvedAnchor {
    * record states for a literal anchor, whose text is what the index serves.
    */
   namesUnemittedModule?: true;
+  /**
+   * carrick#3995: why the alias is untyped, decided here: `machinery_envelope`
+   * for a demotion off framework machinery, `site_unreadable` for every other
+   * demotion, `not_located` for an abstain because the anchor named no
+   * payload. Absent on a typed alias and on an abstain decided from the code
+   * (its reason is stated elsewhere). Recorded as the record's `unread_cause`,
+   * which only the index reads: never a verdict input, never in `surface_hash`.
+   */
+  unreadCause?: TypeProvenanceReason;
 }
 
 /**
@@ -162,17 +172,18 @@ export function resolveAnchor(
   }
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
-  const demote = (reason: string): ResolvedAnchor => ({
+  const demote = (reason: string, cause: TypeProvenanceReason): ResolvedAnchor => ({
     request,
     aliasText: 'unknown',
     serialization: 'structural_fallback',
     failureReason: reason,
+    unreadCause: cause,
   });
 
   if (request.kind === 'literal') {
     const text = request.type_text.trim();
     if (!text) {
-      return demote('empty literal type text');
+      return demote('empty literal type text', 'site_unreadable');
     }
     const bareIdentifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text);
     const siblingSpec = bareIdentifier
@@ -228,7 +239,7 @@ export function resolveAnchor(
   const sourceAbs = resolveSourceFile(args.repoRoot, request.source_file);
   const sourceFile = program.getSourceFile(sourceAbs);
   if (!sourceFile) {
-    return demote(`source file not in program: ${request.source_file}`);
+    return demote(`source file not in program: ${request.source_file}`, 'site_unreadable');
   }
   const spec = entryRelativeSpecifier(
     args.entryDir,
@@ -241,7 +252,8 @@ export function resolveAnchor(
     const exported = moduleExport(checker, sourceFile, request.symbol_name);
     if (!exported) {
       return demote(
-        `'${request.symbol_name}' is not an export of ${request.source_file}`
+        `'${request.symbol_name}' is not an export of ${request.source_file}`,
+        'site_unreadable'
       );
     }
     // The anchor is the ELEMENT symbol; array_depth restores the use-site's
@@ -273,7 +285,8 @@ export function resolveAnchor(
       return demote(
         `'${request.symbol_name}' is a value export with no type-space meaning, ` +
           `and no sibling type alias derives from it (e.g. \`typeof ${request.symbol_name}\`); ` +
-          'demoted so the surface line stays valid'
+          'demoted so the surface line stays valid',
+        'site_unreadable'
       );
     }
 
@@ -347,7 +360,8 @@ export function resolveAnchor(
     const exported = moduleExport(checker, sourceFile, request.symbol_name);
     if (!exported) {
       return demote(
-        `handler '${request.symbol_name}' is not an export of ${request.source_file}`
+        `handler '${request.symbol_name}' is not an export of ${request.source_file}`,
+        'site_unreadable'
       );
     }
     const declaration = exported.valueDeclaration ?? exported.declarations?.[0];
@@ -357,17 +371,18 @@ export function resolveAnchor(
     );
     const callSignatures = handlerType.getCallSignatures();
     if (callSignatures.length === 0) {
-      return demote(`handler '${request.symbol_name}' has no call signatures`);
+      return demote(`handler '${request.symbol_name}' has no call signatures`, 'site_unreadable');
     }
     if (callSignatures.length > 1) {
       // ReturnType<> silently resolves the LAST overload only.
       return demote(
-        `handler '${request.symbol_name}' is an overload set (${callSignatures.length} signatures)`
+        `handler '${request.symbol_name}' is an overload set (${callSignatures.length} signatures)`,
+        'site_unreadable'
       );
     }
     if ((callSignatures[0].getTypeParameters() ?? []).length > 0) {
       // Type parameters erase to their constraint/unknown under ReturnType<>.
-      return demote(`handler '${request.symbol_name}' is generic`);
+      return demote(`handler '${request.symbol_name}' is generic`, 'site_unreadable');
     }
     const returned = callSignatures[0].getReturnType();
     const unresolved = unresolvedAtAnchor(
@@ -396,7 +411,8 @@ export function resolveAnchor(
     if (!param) {
       return demote(
         `no handler parameter '${request.param_name}' resolved in ` +
-          `${request.source_file} (${paramLocatorHints(request)})`
+          `${request.source_file} (${paramLocatorHints(request)})`,
+        'site_unreadable'
       );
     }
     return finishInferAnchor(
@@ -411,7 +427,7 @@ export function resolveAnchor(
   }
   const found = locate(sourceFile, request);
   if (!found) {
-    return demote(locatorFailureReason(request));
+    return demote(locatorFailureReason(request), 'site_unreadable');
   }
   // carrick#1785: the line fallback takes the first expression on the line,
   // and a declaration's NAME is an expression to `ts.isExpression`. On a line
@@ -433,6 +449,7 @@ export function resolveAnchor(
           `${describeNode(sourceFile, request.source_file, declaration)}; a ` +
           `declaration's name is not a payload, so the anchor abstains rather ` +
           `than publish the declared entity's own type`,
+        unreadCause: 'not_located',
       };
     }
   }
@@ -450,7 +467,7 @@ export function resolveAnchor(
   let reaimNote: string | undefined;
   const builderReaim = reaimBuilderChainPayload(checker, located);
   if (builderReaim.kind === 'demote') {
-    return demote(builderReaim.reason);
+    return demote(builderReaim.reason, 'site_unreadable');
   }
   if (builderReaim.kind === 'reaim') {
     located = builderReaim.node;
@@ -483,11 +500,12 @@ function finishInferAnchor(
   repoRoot: string
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
-  const demote = (reason: string): ResolvedAnchor => ({
+  const demote = (reason: string, cause: TypeProvenanceReason): ResolvedAnchor => ({
     request,
     aliasText: 'unknown',
     serialization: 'structural_fallback',
     failureReason: reason,
+    unreadCause: cause,
   });
   const rawType = checker.getTypeAtLocation(located);
   let type = rawType;
@@ -567,6 +585,7 @@ function finishInferAnchor(
         `bare top type ('${checker.typeToString(type)}'); the anchor names no ` +
         `payload span, expression or parameter, so it abstains rather than ` +
         `publish a top type as a contract`,
+      unreadCause: 'not_located',
     };
   }
   // carrick#371 fail-closed guard: a producer anchor whose resolved type IS or
@@ -583,15 +602,16 @@ function finishInferAnchor(
   if (typeIsOrContainsMachinery(program, type, repoRoot)) {
     return demote(
       'resolved type is or contains framework machinery (Response/Request-shaped); ' +
-        'degraded to unknown rather than emit a wrapper envelope as a response contract'
+        'degraded to unknown rather than emit a wrapper envelope as a response contract',
+      'machinery_envelope'
     );
   }
   if (!placeholder) {
-    return demote('internal: no placeholder destination for infer anchor');
+    return demote('internal: no placeholder destination for infer anchor', 'site_unreadable');
   }
   const printed = printTypeForDestination(program, type, placeholder);
   if (!printed.text) {
-    return demote(printed.failure ?? 'node builder print failed');
+    return demote(printed.failure ?? 'node builder print failed', 'site_unreadable');
   }
   const atAnchor = unresolvedAtAnchor(program, sourceFile, type, located);
   // carrick#1377: a member the print named undeclared and this rewrote to

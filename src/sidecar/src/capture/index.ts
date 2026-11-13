@@ -1266,6 +1266,7 @@ function demoteDanglingAliases(args: {
         `declaration emit was skipped for module '${dangling}'; ` +
         'alias demoted to keep the partially emitted tree usable',
       namesUnemittedModule: true,
+      unreadCause: 'site_unreadable',
     };
   });
 
@@ -1345,6 +1346,7 @@ function resolveAnchorsByOwner(
           failureReason:
             `typed under ${owner.configPath}, the project that owns its file, whose options differ ` +
             `from ${emit.configPath}, which emits the surface; the module it names would be declared under the wrong options`,
+          unreadCause: 'site_unreadable',
         };
       });
       if (owner !== emit) {

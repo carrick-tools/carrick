@@ -491,9 +491,11 @@ pub struct CaptureAliasRecord {
     /// demoted alias and on a stub an earlier build captured.
     #[serde(default)]
     pub surface_hash: Option<String>,
-    /// carrick#3995: the literal anchor's [`CaptureAnchor::Literal`]
-    /// `unread_cause`, echoed by the capture. Read only to say why an entry
-    /// is untyped: never a verdict input, never part of `surface_hash`.
+    /// carrick#3995: why the alias is untyped. The literal anchor's
+    /// [`CaptureAnchor::Literal`] `unread_cause` when the driver sent one,
+    /// otherwise the cause the capture decided at the anchor. Read only to say
+    /// why an entry is untyped: never a verdict input, never part of
+    /// `surface_hash`.
     #[serde(default)]
     pub unread_cause: Option<String>,
 }

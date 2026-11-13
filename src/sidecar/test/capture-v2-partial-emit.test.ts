@@ -164,6 +164,8 @@ describe('capture v2: partially skipped declaration emit keeps the emitted subse
     assert.strictEqual(reply.serialization, 'structural_fallback');
     assert.strictEqual(reply.self_check, 'decayed_internal');
     assert.match(reply.capture_failure_reason ?? '', /declaration emit was skipped for module/);
+    // carrick#3995: the site was named, and no type could be read through it.
+    assert.strictEqual(reply.unread_cause, 'site_unreadable');
   });
 
   it('the demoted surface line is `unknown`, never a dangling import', () => {
