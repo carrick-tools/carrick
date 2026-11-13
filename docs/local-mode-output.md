@@ -256,6 +256,7 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `deadline` | `true` \| absent | on a `none` whose re-check started and ran past its budget, so the rows are the indexed ones because time ran out. With it, as with `known_miss`, `check <file> --recheck` exits 2. Absent otherwise |
 | `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
 | `moved` | array \| absent | rows outside the edited file whose state this edit moved (below). Absent when the edit moved nothing |
+| `engine_ready` | boolean \| absent | whether the compiler engine was ready for this re-check's re-scan: `false` when it was not found or missed its ready budget. The hook writes it to its timing rows. Absent when no re-scan ran |
 
 ### `recheck.moved`
 
