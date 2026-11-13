@@ -189,16 +189,16 @@ fn a_side_with_one_declared_any_member_is_served_as_its_shape() {
 }
 
 /// carrick#3995 T4: a service whose compiler engine never started says so on
-/// every untyped entry. `CARRICK_SIDECAR_DIR` names an empty directory, so
-/// the engine cannot spawn and no service has a capture stub.
+/// every untyped entry. `PATH` names an empty directory, so `node` cannot be
+/// found, the engine cannot spawn and no service has a capture stub.
 #[test]
 fn a_service_that_lost_its_types_says_so_on_every_unknown_entry() {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
-    let empty_sidecar = tempfile::tempdir().expect("empty sidecar dir");
+    let empty_path = tempfile::tempdir().expect("empty PATH dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_carrick"));
     cmd.arg(fixture_dir())
-        .env("CARRICK_SIDECAR_DIR", empty_sidecar.path())
+        .env("PATH", empty_path.path())
         .env("CARRICK_LOCAL_STORAGE_DIR", storage.path())
         .env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
         .env("CARRICK_CACHE_DIR", cache.path())
