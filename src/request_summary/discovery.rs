@@ -247,6 +247,12 @@ pub struct Discovery {
     /// not final until the store answers it (carrick#2813): the fact layer
     /// lists the call for the reader when the key is still pending.
     pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
+    /// The calls, by file and SWC span, whose member declaration the walk
+    /// read for an op the receiver trace's ask got no answer for
+    /// ([`MemberDeclarations::answered`], carrick#3991): the answer would
+    /// have decided them. Their unread sites say `unanswered` beside their
+    /// own reason ([`crate::unread_sites::from_scan`]).
+    pub declarations_unanswered: BTreeSet<(String, u32, u32)>,
     /// Each call of the service's own files and the functions of the
     /// repository the walk entered from it, sorted by file and span: the
     /// definition a call names, each implementation of an interface member
@@ -911,9 +917,56 @@ pub struct MemberDeclarations {
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
     pub not_reached: usize,
+    /// The op checks' (store key, member) pairs when the ask got no answer
+    /// (it failed, or came back short): a call whose `call` row names one
+    /// is a call the answer would have decided, saved `unanswered` beside
+    /// its own reason ([`Discovery::declarations_unanswered`], carrick#3991).
+    /// Empty when the verifier answered, including answers that verified
+    /// nothing.
+    unanswered: HashSet<(String, String)>,
 }
 
 impl MemberDeclarations {
+    /// The declarations the verifier's `answer` to `ask` names. An `Err`,
+    /// or an answer with a verdict count other than the checks', indexes
+    /// nothing and keeps the op checks it left open (carrick#3991).
+    pub fn answered<E: std::fmt::Display>(
+        ask: &DeclarationAsk,
+        answer: Result<Vec<SemanticsResult>, E>,
+    ) -> Self {
+        let verdicts = match answer {
+            Ok(verdicts) if verdicts.len() == ask.checks.len() => {
+                return MemberDeclarations::of(ask, &verdicts);
+            }
+            Ok(verdicts) => {
+                tracing::warn!(
+                    asked = ask.checks.len(),
+                    answered = verdicts.len(),
+                    "receiver trace: the declaration answer does not match the ask; none indexed"
+                );
+                verdicts
+            }
+            Err(error) => {
+                tracing::warn!(%error, "receiver trace: the declaration ask failed; none indexed");
+                Vec::new()
+            }
+        };
+        MemberDeclarations::of(ask, &verdicts)
+    }
+
+    /// Whether the ask got no answer for the op check `row`'s declaration
+    /// and symbol stand for.
+    fn left_open(&self, row: &Row, exports: &[ExportClaims]) -> bool {
+        let Some(symbol) = row.symbol() else {
+            return false;
+        };
+        !self.unanswered.is_empty()
+            && !in_repo(row)
+            && store_keys(row, exports)
+                .into_iter()
+                .any(|key| self.unanswered.contains(&(key, symbol.to_string())))
+    }
+
     /// The declarations the verdicts for `ask` name. A verdict counts only
     /// for the check at its own position that it names.
     pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
@@ -1203,6 +1256,10 @@ struct Outcome<'a> {
     /// answer holds nothing for (`unanswered_package`), when that call's own
     /// walk found nothing (carrick#2813).
     unanswered: BTreeSet<String>,
+    /// The walk passed a call the receiver trace's dead ask would have
+    /// decided ([`Discovery::declarations_unanswered`]), when that call's
+    /// own walk found nothing (carrick#3991).
+    declarations_open: bool,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
     /// The outcome of a value the resolver read to a labelled export or a
@@ -1293,6 +1350,7 @@ impl<'a> Outcome<'a> {
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
+        self.declarations_open |= other.declarations_open;
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1530,6 +1588,8 @@ struct Walker<'a> {
     /// Calls whose member declaration stands for more than one op
     /// (carrick#2474 R1, [`Self::one_op`]): no site.
     ambiguous: std::cell::Cell<usize>,
+    /// The calls [`Discovery::declarations_unanswered`] lists.
+    declarations_unanswered: std::cell::RefCell<BTreeSet<(String, u32, u32)>>,
     /// What each call of the service's own files entered, by file and span
     /// ([`Discovery::entered`]).
     entered: BTreeMap<(PathBuf, u32, u32), EnteredAt>,
@@ -2252,6 +2312,13 @@ impl<'a> Walker<'a> {
     /// no declared op.
     fn declared_op(&self, row: &Row, invoke: Invoke<'_>) -> Option<SiteEnd> {
         let declarations = self.labels.declarations.filter(|_| !invoke.construction)?;
+        if declarations.left_open(row, self.labels.exports) {
+            self.declarations_unanswered.borrow_mut().insert((
+                self.rel(invoke.file),
+                invoke.call.site.span_start,
+                invoke.call.site.span_end,
+            ));
+        }
         let ops = declarations.at(row.decl_file()?, row.decl_line()?);
         if ops.is_empty() {
             return None;
@@ -2926,12 +2993,25 @@ impl<'a> Walker<'a> {
             {
                 inner.unanswered.extend(self.unanswered_keys(file, call));
             }
+            if inner.ends.is_empty() && self.declaration_left_open(file, call) {
+                inner.declarations_open = true;
+            }
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// Whether the walk read `call`'s member declaration for an op the
+    /// receiver trace's dead ask left open ([`Self::declared_op`]).
+    fn declaration_left_open(&self, file: &Path, call: &CallIr) -> bool {
+        self.declarations_unanswered.borrow().contains(&(
+            self.rel(file),
+            call.site.span_start,
+            call.site.span_end,
+        ))
     }
 
     /// The store keys of `call`'s declaration that the answer holds nothing
@@ -3012,6 +3092,15 @@ impl<'a> Walker<'a> {
                     bound: Vec::new(),
                 };
             if outcome.ends.is_empty() {
+                // A walk that passed a call the dead declaration ask would
+                // have decided is a call that ask left open (carrick#3991).
+                if outcome.declarations_open {
+                    self.declarations_unanswered.borrow_mut().insert((
+                        self.rel(file),
+                        call.site.span_start,
+                        call.site.span_end,
+                    ));
+                }
                 if !outcome.unanswered.is_empty() {
                     discovery.unanswered_at.insert(
                         (self.rel(file), call.site.span_start, call.site.span_end),
@@ -3645,6 +3734,7 @@ pub fn discover_with(
         callbacks: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
+        declarations_unanswered: std::cell::RefCell::new(BTreeSet::new()),
         entered: BTreeMap::new(),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -3689,6 +3779,7 @@ pub fn discover_with(
             targets,
         })
         .collect();
+    discovery.declarations_unanswered = walker.declarations_unanswered.take();
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {
         discovery
@@ -4070,6 +4161,140 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].reason, Stop::MissedInside);
         assert!(kept[0].also.is_empty());
+    }
+
+    /// The receiver-trace fixture's unread sites, with `declarations` as the
+    /// trace's answer.
+    fn unread_traced(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+    ) -> Vec<crate::unread_sites::UnreadSite> {
+        let discovery = discover(
+            &on.inputs,
+            &Labels::of(exports).tracing(declarations),
+            &on.repo,
+        );
+        crate::unread_sites::from_scan(
+            &discovery,
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &[],
+            &on.repo,
+        )
+    }
+
+    /// The receiver-trace fixture walked with the verifier's real answer,
+    /// and its declaration ask.
+    fn traced_with_ask() -> (
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+        DeclarationAsk,
+    ) {
+        let (on, exports, declarations) = traced_fixture()
+            .expect("the receiver-trace fixture walks: a skipped test proves nothing");
+        let ask = declaration_ask(&on.inputs, &exports);
+        assert!(
+            ask.ops.iter().flatten().count() > 0,
+            "the fixture asks op checks"
+        );
+        (on, exports, declarations, ask)
+    }
+
+    /// carrick#3991: a declaration ask that died after its retry saves each
+    /// call it would have decided `unanswered` beside the call's own reason.
+    /// Every site the real answer reads and the dead ask leaves unread says
+    /// so, and its reason is the walk's.
+    #[test]
+    fn a_failed_declaration_ask_saves_its_sites_unanswered() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let read = unread_traced(&on, &exports, &answered);
+        let unread = unread_traced(&on, &exports, &failed);
+        let opened: Vec<_> = unread
+            .iter()
+            .filter(|row| {
+                !read.iter().any(|held| {
+                    (held.file.as_str(), held.span_start, held.span_end)
+                        == (row.file.as_str(), row.span_start, row.span_end)
+                })
+            })
+            .collect();
+        for (file, callee) in [
+            ("helpers.ts", "app.get"),
+            ("client.ts", "client.get"),
+            ("routes.ts", "this.app.get"),
+        ] {
+            assert!(
+                opened
+                    .iter()
+                    .any(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee)),
+                "{file} {callee} is a site the dead ask leaves unread: {opened:?}"
+            );
+        }
+        for row in &opened {
+            assert!(
+                row.also.contains(&Stop::Unanswered),
+                "{}:{} {:?} {:?}",
+                row.file,
+                row.line,
+                row.callee,
+                row.reason
+            );
+            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
+        }
+        // A short answer is no answer either.
+        let short = MemberDeclarations::answered(&ask, Ok::<_, &str>(Vec::new()));
+        assert_eq!(
+            unread_traced(&on, &exports, &short),
+            unread,
+            "a short answer saves the same sites"
+        );
+    }
+
+    /// An ask that answered adds nothing, whatever it verified.
+    #[test]
+    fn an_answered_declaration_ask_adds_nothing() {
+        let (on, exports, answered, _) = traced_with_ask();
+        assert!(!answered.is_empty(), "the verifier answered the fixture");
+        for row in unread_traced(&on, &exports, &answered) {
+            assert!(
+                !row.also.contains(&Stop::Unanswered),
+                "{}:{} {:?}",
+                row.file,
+                row.line,
+                row.callee
+            );
+        }
+    }
+
+    /// A call the ask was not for keeps its row as it was: an in-repo
+    /// class's own `get`, a local interface's `get` and an untyped
+    /// receiver's. A call of the same package's other `get` (`request.get`)
+    /// was asked for: its declaration is one the answer decides, so it says
+    /// `unanswered` too.
+    #[test]
+    fn a_failed_declaration_ask_leaves_calls_it_was_not_for_alone() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let read = unread_traced(&on, &exports, &answered);
+        let unread = unread_traced(&on, &exports, &failed);
+        let at = |rows: &[crate::unread_sites::UnreadSite], callee: &str| {
+            rows.iter()
+                .find(|row| {
+                    row.file.ends_with("negatives.ts") && row.callee.as_deref() == Some(callee)
+                })
+                .cloned()
+        };
+        for callee in ["new Local().get", "shape.get", "target.get"] {
+            assert_eq!(at(&unread, callee), at(&read, callee), "{callee}");
+            if let Some(row) = at(&unread, callee) {
+                assert!(!row.also.contains(&Stop::Unanswered), "{callee}");
+            }
+        }
+        let request = at(&unread, "request.get").expect("request.get is an unread site");
+        assert!(request.also.contains(&Stop::Unanswered), "{request:?}");
     }
 
     /// carrick#2432 slice B: an implementation the walk cannot enter (one
