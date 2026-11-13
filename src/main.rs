@@ -697,7 +697,12 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         debug!("Waiting for sidecar to be ready...");
         match sidecar.wait_ready(budget) {
             Ok(()) => {
-                logging::finish_spinner(&sp, "Compiler engine ready");
+                logging::finish_spinner(
+                    &sp, // Left as "Sidecar ready": the runner image smoke test greps the scan
+                    // log for this exact line (carrick-cloud runner/image/smoke.sh). Reword
+                    // it together with that check (carrick#4221).
+                    "Sidecar ready",
+                );
                 true
             }
             Err(e) => {
