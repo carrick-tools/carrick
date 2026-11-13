@@ -217,3 +217,15 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/
 !tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/package.json
 !tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/index.d.ts
+!tests/fixtures/alias-shaped-type-imports/node_modules/
+!tests/fixtures/parallel-services/node_modules/
+!tests/fixtures/graphql-document-call-sites/apps/api/node_modules/
+!tests/fixtures/graphql-document-call-sites-named-config/apps/api/node_modules/
+!tests/fixtures/graphql-nested-walk/apps/api/node_modules/
+!tests/fixtures/graphql-schemas-setting/apps/api/node_modules/
+!tests/fixtures/graphql-undeclared-selection/apps/api/node_modules/
+!tests/fixtures/graphql-undeclared-selection-printed/apps/api/node_modules/
+!tests/fixtures/graphql-printed-removal/apps/api/node_modules/
+!tests/fixtures/graphql-walked-vendor-schema/apps/api/node_modules/
+!tests/fixtures/graphql-walked-vendor-schema/apps/gateway/node_modules/
+!tests/fixtures/deno-under-workspace-glob/apps/api/node_modules/

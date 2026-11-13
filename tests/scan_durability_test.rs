@@ -34,6 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 /// One upload, as the engine made it.
 #[derive(Clone)]
 struct Upload {
@@ -1032,6 +1035,19 @@ async fn scan_with_one_owed_file(
     }
     let tmp = tempfile::tempdir().unwrap();
     let repo = three_service_repo(tmp.path());
+    // Each service imports `express`, installed from the public registry (the
+    // one install at the repo root serves all three), and the store labels its
+    // routes, so the one route a file holds is a candidate.
+    real_packages::install(&repo, &["express"]);
+    let cassettes = tmp.path().join("cassettes");
+    real_packages::write_claims(&cassettes, &["express"]);
+    // SAFETY: as in `offline_env`; the next `offline_env` removes it.
+    unsafe {
+        std::env::set_var(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        );
+    }
     let storage = StubStorage::laptop_on_current_cloud(&[]);
 
     fail();
