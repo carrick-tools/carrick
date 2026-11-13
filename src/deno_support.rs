@@ -166,6 +166,21 @@ pub(crate) fn import_map_path(
     Ok(Some(config.parent().unwrap_or(Path::new(".")).join(path)))
 }
 
+/// The lockfile a Deno `config` names: its `lock` string or `lock.path`, else
+/// `deno.lock` beside it. `None` when it says `"lock": false`.
+pub(crate) fn lock_path(config: &Path, json: &serde_json::Value) -> Option<PathBuf> {
+    let lock = match json.get("lock") {
+        Some(serde_json::Value::Bool(false)) => return None,
+        Some(serde_json::Value::String(path)) => path.as_str(),
+        Some(serde_json::Value::Object(lock)) => lock
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("deno.lock"),
+        _ => "deno.lock",
+    };
+    Some(config.parent().unwrap_or(Path::new(".")).join(lock))
+}
+
 /// Include inherited manifests and all declared workspace exports: a sibling's
 /// export change can change a service's types without changing its own config.
 pub fn resolution_inputs(root: &Path, manifests: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
@@ -194,17 +209,8 @@ pub fn resolution_inputs(root: &Path, manifests: &[PathBuf]) -> io::Result<Vec<P
         if let Some(map) = import_map_path(&config, &json)? {
             inputs.insert(map);
         }
-        let lock = match json.get("lock") {
-            Some(serde_json::Value::Bool(false)) => None,
-            Some(serde_json::Value::String(path)) => Some(path.as_str()),
-            Some(serde_json::Value::Object(lock)) => lock
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .or(Some("deno.lock")),
-            _ => Some("deno.lock"),
-        };
-        if let Some(lock) = lock {
-            inputs.insert(config.parent().unwrap().join(lock));
+        if let Some(lock) = lock_path(&config, &json) {
+            inputs.insert(lock);
         }
         inputs.insert(config);
     }
