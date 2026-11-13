@@ -1199,9 +1199,12 @@ fn a_service_that_uploads_lands_its_position_rows() {
     let fixture = LateTypeLoss::new();
     typed_first_index(&fixture);
     let seeded = walked_commit(&fixture.store, "beta");
+    assert!(seeded.is_some(), "the seed run left no record for beta");
     let head = fixture.change_both();
 
-    let run = fixture.scan(Some("heap"), false, &[]);
+    // One service at a time: a death beside alpha would not stop the run, so
+    // nothing would be held.
+    let run = fixture.scan(Some("heap"), false, &[("CARRICK_SERVICE_CONCURRENCY", "1")]);
     assert_eq!(run.code, Some(1), "{}\n{}", run.stderr, run.log);
     assert_eq!(walked_commit(&fixture.store, "alpha"), Some(head.clone()));
     assert_eq!(walked_commit(&fixture.store, "beta"), seeded);
