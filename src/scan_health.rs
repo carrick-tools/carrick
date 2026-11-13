@@ -1058,14 +1058,13 @@ pub fn type_memory_stop() -> Result<(), TypesOutOfMemory> {
     )
 }
 
-/// Whether `service` is to be analysed again, alone, at the run's cap: the
-/// run was told to stop on a memory death, and its checker died of memory
-/// in a way that does not stop the run (beside another service, or under a
-/// cap below the run's; carrick#3084).
+/// Whether `service` is to be analysed again, alone, at the run's cap: its
+/// checker died of memory in a way that does not stop a run told to stop on
+/// one (beside another service, or under a cap below the run's;
+/// carrick#3084). In every mode: without [`FAIL_ON_TYPE_MEMORY_ENV`] such a
+/// death would otherwise land the service typeless, keeping the low cap that
+/// killed it for the next scan (carrick#4180).
 pub fn to_analyse_again_alone(service: Option<&str>) -> bool {
-    if !fail_on_type_memory_from_env() {
-        return false;
-    }
     let run_cap = crate::services::type_sidecar::heap_cap_mb();
     registry()
         .lock()

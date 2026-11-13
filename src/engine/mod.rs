@@ -1771,10 +1771,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     };
     drop(answers_lane);
     // A service whose type checker died of memory beside another service,
-    // or under a cap below the run's, in a run told to stop on such a death,
-    // is analysed again alone at the run's cap (carrick#3084). From this
-    // run's own blob, so nothing is asked of the model again. If it dies
-    // again, that death stops the run below, as one alone always has.
+    // or under a cap below the run's, is analysed again alone at the run's
+    // cap, in every mode (carrick#3084, carrick#4180). From this run's own
+    // blob, so nothing is asked of the model again. If it dies again, that
+    // death stops a run told to stop on one, as one alone always has, and
+    // otherwise is the loss the hold keeps the stored index for (carrick#3992).
     for (at, outcome) in outcomes.iter_mut().enumerate() {
         scan.analyse_again_alone(at, outcome, run_cap_mb).await;
     }
@@ -3656,12 +3657,14 @@ impl ServiceScan {
     /// Analyse the service at `at` again, alone, at the run's cap
     /// `run_cap_mb`, when `outcome` finished but its type checker died of
     /// memory in a way that does not stop a run told to stop on one: beside
-    /// another service, or under a cap below the run's (carrick#3084).
+    /// another service, or under a cap below the run's (carrick#3084). In
+    /// every mode (carrick#4180).
     ///
     /// It starts from this run's own blob, after its memory death and type
     /// loss are forgotten, so nothing is asked of the model again. If it dies
-    /// again, that death is alone at the run's cap: `outcome` becomes the
-    /// stop, and the run ends with it as one alone always has.
+    /// again, that death is alone at the run's cap: a run told to stop on one
+    /// ends with it, and any other holds the service when its stored index
+    /// is typed ([`durability::holds_back_for_types`]).
     async fn analyse_again_alone(
         self: &std::sync::Arc<Self>,
         at: usize,
