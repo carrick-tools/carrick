@@ -3438,6 +3438,7 @@ impl<'a> Walker<'a> {
         for open in std::mem::take(&mut outcome.open) {
             let mut values = open.known;
             let mut unfilled = 0;
+            let mut handed = false;
             for (out, index, keys) in &open.refs {
                 let before = unfilled;
                 let held = resolver.callers_pass_noting(
@@ -3447,6 +3448,7 @@ impl<'a> Walker<'a> {
                     open.invoke,
                     &mut Vec::new(),
                     &mut unfilled,
+                    &mut handed,
                 );
                 note_unfilled(&mut unfilled, before, open.spread, &held);
                 values.extend(held);
@@ -3455,6 +3457,14 @@ impl<'a> Walker<'a> {
             // not fill, and nothing else held: each write keeps the reading
             // it had before ruling R-SP (carrick#4025).
             unread_where_spread_unfilled(&mut values, unfilled);
+            // Nothing held, and a function on the way is handed on as a
+            // value to a function of the service: the call that runs it is
+            // not read, and may bind the callee (carrick#4025). Nothing binds
+            // it is no answer.
+            if values.is_empty() && handed {
+                outcome.absorb(Outcome::stopped(Stop::CallbackIntoOwnFunction).below(&open.chain));
+                continue;
+            }
             let settled = self.agree(values, open.invoke, open.chain, OF_VALUES);
             outcome.absorb(settled);
         }
