@@ -115,11 +115,21 @@ fn scan() -> &'static Scan {
 #[test]
 fn a_root_service_reads_no_graphql_file_inside_a_nested_service() {
     let Scan { rows, output } = scan();
-    let root_notices: Vec<&str> = output
-        .lines()
-        .filter(|line| line.contains("apps/api/src/schema.graphql"))
-        .filter(|line| !line.contains("'catalog-api'"))
-        .collect();
+    // A boundary line sits under its service's header (`<service> at <hash>:`),
+    // so the nested schema's own unread sites are `catalog-api`'s, not the root's.
+    let mut section = "";
+    let mut root_notices: Vec<&str> = Vec::new();
+    for line in output.lines() {
+        if let Some((service, _)) = line.split_once(" at ").filter(|_| !line.starts_with(' ')) {
+            section = service;
+        }
+        if line.contains("apps/api/src/schema.graphql")
+            && !line.contains("'catalog-api'")
+            && section != "catalog-api"
+        {
+            root_notices.push(line);
+        }
+    }
     assert!(root_notices.is_empty(), "{root_notices:#?}");
 
     let root_rows: Vec<&Row> = rows
