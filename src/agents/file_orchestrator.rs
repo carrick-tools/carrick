@@ -606,6 +606,10 @@ pub struct FileRouteDerivation {
     pub endpoints: Vec<EndpointResult>,
 }
 
+/// The request members a file's calls joined, by call span, each with the
+/// module it was read from (carrick#4120).
+type JoinedMembers = HashMap<u32, (PathBuf, ResolvedMember)>;
+
 /// Statistics about the file-centric analysis
 #[derive(Debug, Default)]
 pub struct ProcessingStats {
@@ -10846,7 +10850,7 @@ impl FileOrchestrator {
         rings: Vec<Vec<(PathBuf, RequestMemberIndex)>>,
         import_owners: &HashMap<String, Option<PathBuf>>,
         receiver_imports: &HashMap<PathBuf, BTreeSet<PathBuf>>,
-    ) -> (HashMap<u32, (PathBuf, ResolvedMember)>, Vec<(u32, String)>) {
+    ) -> (JoinedMembers, Vec<(u32, String)>) {
         let rings: Vec<_> = rings
             .into_iter()
             .map(fold_indexes_with_conflicts)

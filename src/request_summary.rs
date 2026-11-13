@@ -10936,7 +10936,7 @@ pub struct RequestSummaryIndex {
     /// compiler's rows, keyed by the call's span. Read by the imported-member
     /// join, which drops a member the compiler says the call does not reach
     /// (carrick#4120).
-    reached: HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>,
+    reached: Box<HashMap<PathBuf, BTreeMap<(u32, u32), ReachedCallee>>>,
     /// Requests this pass reached whose URL it could not state.
     pub undetermined: usize,
     /// The callers among them whose request is closed and does not render

@@ -1034,17 +1034,15 @@ mod tests {
         assert_eq!(with.unfollowed_count(), 0, "{:?}", with.unfollowed());
     }
 
-    /// What the rows say each call written in `file` reaches, by line, as
-    /// the callee's file name and the requests it sends (file name, span
-    /// start).
-    fn reached_requests(
-        walked: &Walked,
-        index: &RequestSummaryIndex,
-        file: &str,
-    ) -> BTreeMap<u32, Vec<(String, Vec<(String, u32)>)>> {
+    /// Per line: each call's callee file name and the requests it sends
+    /// (file name, span start).
+    type ReachedByLine = BTreeMap<u32, Vec<(String, Vec<(String, u32)>)>>;
+
+    /// What the rows say each call written in `file` reaches, by line.
+    fn reached_requests(walked: &Walked, index: &RequestSummaryIndex, file: &str) -> ReachedByLine {
         let path = walked.path(file);
         let name = |path: &Path| path.file_name().unwrap().to_string_lossy().to_string();
-        let mut out: BTreeMap<u32, Vec<(String, Vec<(String, u32)>)>> = BTreeMap::new();
+        let mut out: ReachedByLine = BTreeMap::new();
         for (call_file, call, _) in every_call(&walked.inputs.files) {
             if call_file != path {
                 continue;
