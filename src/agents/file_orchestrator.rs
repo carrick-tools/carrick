@@ -4263,8 +4263,18 @@ impl FileOrchestrator {
             use tracing::Instrument;
             use tracing::instrument::WithSubscriber;
             let ahead = std::sync::Arc::new(crate::agents::asked_ahead::AskedAhead::default());
+            // The lane's discovery is untraced (it holds no type checker). A
+            // file where it stopped at an unmatched networked call may list
+            // more spans in the analysis's traced discovery, so an answer
+            // asked here for this prompt's bytes would never be taken: the
+            // analysis asks it (carrick#4077 R4).
             let held: Vec<(&PendingFile, Asking, crate::agents::asked_ahead::Hold)> = to_dispatch
                 .iter()
+                .filter(|pf| {
+                    !fact_files
+                        .as_ref()
+                        .is_some_and(|facts| facts.stops_unmatched_in(&pf.prompt_path))
+                })
                 .filter_map(|pf| {
                     let (key, asking) = self.asked_ahead_as(&pf.parted(), guidance)?;
                     ahead.hold(key).map(|hold| (pf, asking, hold))

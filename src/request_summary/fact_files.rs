@@ -301,6 +301,21 @@ impl FactFiles {
         self.calls.get(&(file.to_string(), span.0, span.1))
     }
 
+    /// Whether discovery saved a call in `file` as a networked package's call
+    /// that matched no label ([`Stop::PackageUnmatched`]), whether or not
+    /// the walk entered code first. Discovery with the receiver trace on may
+    /// list more of `file` than this discovery did (carrick#4077 R4).
+    pub fn stops_unmatched_in(&self, file: &str) -> bool {
+        self.calls.iter().any(|((at, _, _), followed)| {
+            at == file
+                && matches!(
+                    followed,
+                    Followed::Stopped(Stop::PackageUnmatched)
+                        | Followed::Unfollowed(Stop::PackageUnmatched)
+                )
+        })
+    }
+
     /// The spans `file` lists for the reader, none when it lists nothing.
     pub fn listed_in(&self, file: &str) -> BTreeSet<(u32, u32)> {
         self.listed.get(file).cloned().unwrap_or_default()
@@ -503,7 +518,7 @@ mod tests {
             .collect();
         assert_eq!(spans.len(), 2);
         let read = |first: &FirstAnswer| {
-            let labels = Labels::of_answered(&first.exports, &first.answered);
+            let labels = Labels::of(&first.exports).answered(&first.answered);
             let discovery = discover(&on.inputs, &labels, &on.repo);
             FactFiles::of(&discovery, &Decided::default(), None, first, &on.repo)
         };
