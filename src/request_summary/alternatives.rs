@@ -524,8 +524,8 @@ impl Alternation {
         };
         let unplaced = writes.iter().any(|(local, read)| {
             placed
-                .of(local)
-                .is_none_or(|census| census.iter().copied().collect::<BTreeSet<_>>() != *read)
+                .of_written(local)
+                .is_none_or(|census| census != *read)
         });
         if unplaced {
             *self = Alternation::Single;
@@ -877,6 +877,8 @@ enum SentFrom {
 #[derive(Debug, Clone)]
 struct SentWay {
     from: SentFrom,
+    /// The right sides of the `+=` writes that ran after `from`, in order.
+    appends: Vec<Expr>,
     tests: Vec<((u32, u32), bool)>,
 }
 
@@ -895,6 +897,11 @@ impl WrittenLocal {
     pub(super) fn of(found: &super::resolve::flow::Reaching<'_>) -> Self {
         use super::resolve::flow::Source;
         let way = |way: &super::resolve::flow::Way<'_>| SentWay {
+            appends: way
+                .appends
+                .iter()
+                .map(|assign| (*assign.right).clone())
+                .collect(),
             from: match way.from {
                 Source::Init(init) => SentFrom::Init(init.clone()),
                 Source::Unwritten => SentFrom::Unwritten,
@@ -958,6 +965,10 @@ impl Reader<'_> {
                 SentFrom::Unwritten => Alternatives::unwritten(),
                 SentFrom::Write(..) => return None,
             };
+            // `+=` extends the way's value by its text, in the order they ran.
+            for text in &way.appends {
+                reading = reading.then(&self.reading_of(text, scope)?)?;
+            }
             // A value read from a written local no way reaches here says
             // nothing of this one.
             let unread = reading.readings.iter().any(|reading| {
