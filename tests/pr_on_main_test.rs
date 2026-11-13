@@ -585,8 +585,7 @@ fn peer_value(lines: &[String]) -> String {
 }
 
 /// carrick#2284: a PR result names the index commits the run compared with
-/// and counts what it checked. The run here is untyped, so every pair it
-/// matched is one it did not compare.
+/// and counts what it checked.
 #[tokio::test]
 async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked() {
     let _serial = SERIAL.lock().await;
@@ -641,16 +640,15 @@ async fn a_pr_result_names_the_index_it_compared_with_and_counts_what_it_checked
         }),
         "{payload:#}"
     );
-    // Two pairs: the imported-member pass's rows at `src/inventory.ts:9` and
-    // `:17`. With no sidecar the walk writes no rows, and its index is all
-    // holes (`walk_lane::Walked::index`, `PositionIndex::missing`): the
-    // request summaries state no row (`rows_missing` at every site the call
-    // graph follows), so their three rows, `src/client.ts:14` among them,
-    // are gone, as with 0.3.143 and the fact-layer switches on.
+    // Three pairs, all compared: the compiler engine runs (as in production
+    // local mode), so the walk writes its rows and `src/client.ts:14` is a
+    // third pair beside the imported-member pass's rows at
+    // `src/inventory.ts:9` and `:17` (carrick#3711 L3: was two not_compared
+    // when this ran without it).
     assert_eq!(
         payload["checked"],
         serde_json::json!({
-            "pairs": { "compatible": 0, "unverifiable": 0, "incompatible": 0, "not_compared": 2 },
+            "pairs": { "compatible": 3, "unverifiable": 0, "incompatible": 0, "not_compared": 0 },
             "pairs_left_uncompared": 0,
             "dependencies": { "shared": 1, "changed": 1 },
         }),
