@@ -5,10 +5,15 @@
   "stated_at_callers": [
     "src/net/warm.ts:4"
   ],
+  "stated_at_fact_callers": {
+    "src/net/boot.ts:4": ["src/load.ts:12", "src/load.ts:15"],
+    "src/net/timer.ts:4": ["src/load.ts:17", "src/load.ts:18"],
+    "src/net/opt.ts:4": ["src/more.ts:5"],
+    "src/net/nested.ts:4": ["src/more.ts:7"]
+  },
   "kept": {
     "src/net/arg.ts:4": "POST /v1/:endpoint",
-    "src/net/boot.ts:4": "POST /v1/:endpoint",
-    "src/net/timer.ts:4": "POST /v1/:endpoint",
+    "src/net/ctor.ts:4": "POST /v1/:endpoint",
     "src/net/left.ts:4": "POST /v1/:endpoint",
     "src/net/right.ts:4": "POST /v1/:endpoint"
   }

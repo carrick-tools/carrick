@@ -2,9 +2,10 @@
 //! where a module loads (carrick#4121). The fact layer states each such call
 //! as a row of its own; once every call holding the request line open has a
 //! fact row that stands, the model's row at the request line is the same
-//! request stated again, and it goes. A call the fact layer does not decide,
-//! a call in a constructor or a callback, and two such calls on one line
-//! keep the model's row.
+//! request stated again, and it goes (carrick#4127: whatever the call's
+//! place, a constructor body, a callback, an optional call). A call the fact
+//! layer does not decide, a request written in a constructor, and two such
+//! calls on one line keep the model's row.
 //!
 //! Drives the real scanner binary on `.`, as the Action runs it, over a
 //! committed copy of `tests/fixtures/wrapper-request-line-module/repo` (one
@@ -200,17 +201,67 @@ fn an_undecided_module_level_call_keeps_the_request_line() {
     keeps("src/net/arg.ts:4");
 }
 
-/// A wrapper also called from a constructor has a caller no row states.
-#[test]
-fn a_call_in_a_constructor_keeps_the_request_line() {
-    keeps("src/net/boot.ts:4");
+/// The request line states no row, and each of its callers states the
+/// request as a fact row (carrick#4127).
+fn states_at_callers(at: &str) {
+    let key = key();
+    let callers: Vec<&str> = key["stated_at_fact_callers"][at]
+        .as_array()
+        .unwrap_or_else(|| panic!("{at} is in the answer key"))
+        .iter()
+        .map(|caller| caller.as_str().unwrap())
+        .collect();
+    let rows = rows();
+    assert!(
+        !rows.contains_key(at),
+        "{at} restates its callers' requests: {:?}\n{rows:#?}",
+        rows.get(at)
+    );
+    for caller in callers {
+        let stated: Vec<&(String, String)> = rows
+            .get(caller)
+            .into_iter()
+            .flatten()
+            .filter(|(_, source)| source != "model")
+            .collect();
+        assert_eq!(stated.len(), 1, "{caller}: {rows:#?}");
+    }
 }
 
-/// A call in a callback written where a module loads is not one the scan
-/// reads as a module-level call.
+/// A wrapper also called from a constructor has a caller no summary row
+/// states, and the fact layer states it: the request line is the same
+/// request stated again.
 #[test]
-fn a_call_in_a_module_level_callback_keeps_the_request_line() {
-    keeps("src/net/timer.ts:4");
+fn a_call_in_a_constructor_states_the_request_at_its_callers() {
+    states_at_callers("src/net/boot.ts:4");
+}
+
+/// A call in a callback written where a module loads has a call site of its
+/// own, which the fact layer states.
+#[test]
+fn a_call_in_a_module_level_callback_states_the_request_at_its_callers() {
+    states_at_callers("src/net/timer.ts:4");
+}
+
+/// An optional call (`sendOpt?.('/opt')`) is not composed by the summaries.
+#[test]
+fn an_optional_call_states_the_request_at_its_caller() {
+    states_at_callers("src/net/opt.ts:4");
+}
+
+/// A callback through a helper (`[1].forEach(() => viaHelper('/nested'))`)
+/// reaches the wrapper through a function the summaries do not read.
+#[test]
+fn a_callback_through_a_helper_states_the_request_at_its_caller() {
+    states_at_callers("src/net/nested.ts:4");
+}
+
+/// A request written in a class constructor is never held or answered by the
+/// summaries (carrick#2404): its line keeps the model's row beside the fact
+/// row at the construction.
+#[test]
+fn a_request_written_in_a_constructor_keeps_its_line() {
+    keeps("src/net/ctor.ts:4");
 }
 
 /// Two module-level calls of two wrappers on one line: no one row there is

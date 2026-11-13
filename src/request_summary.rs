@@ -15188,10 +15188,11 @@ function build() { return {}; }
         );
     }
 
-    /// A module-level call written inside a callback is out of this pass's
-    /// sight, so the request is neither held nor answered.
+    /// carrick#4127: a call written inside a callback has a call site of its
+    /// own, which the fact layer may state: the request is held at it, with
+    /// the module-level call, and not answered.
     #[test]
-    fn a_module_level_call_inside_a_callback_is_not_held() {
+    fn a_module_level_call_inside_a_callback_is_held_at_that_call() {
         let (_dir, index) = summarized(&[
             ("src/net/notify.ts", NOTIFY),
             (
@@ -15200,6 +15201,32 @@ function build() { return {}; }
                  export const fire = () => notify('/fire');\n\
                  export const eager = notify('/eager');\n\
                  setTimeout(() => notify('/tick'));\n",
+            ),
+        ]);
+        let notify = key_of(&index, "src/net/notify.ts");
+        let held = index.held_at_fact_calls(&notify);
+        let (_, at) = held.iter().next().unwrap();
+        let lines: Vec<u32> = at.fact_calls.iter().map(|(_, line, _)| *line).collect();
+        assert_eq!(lines, vec![3, 4], "{held:?}");
+        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
+    }
+
+    /// A call through a parameter has no call site of its own to check: a
+    /// request it may reach is neither held nor answered (carrick#4127).
+    #[test]
+    fn a_call_through_a_parameter_is_not_held() {
+        let (_dir, index) = summarized(&[
+            ("src/net/notify.ts", NOTIFY),
+            (
+                "src/alerts.ts",
+                "import { notify } from './net/notify';\n\
+                 export const fire = () => notify('/fire');\n\
+                 export const eager = notify('/eager');\n\
+                 export class Pager {\n\
+                 \x20 constructor(notify: (endpoint: string) => void) {\n\
+                 \x20   notify('/page');\n\
+                 \x20 }\n\
+                 }\n",
             ),
         ]);
         let notify = key_of(&index, "src/net/notify.ts");
