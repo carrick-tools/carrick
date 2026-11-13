@@ -612,6 +612,38 @@ pub struct DataCallResult {
     /// reads it as the unmatched reason `static_asset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_asset: Option<String>,
+    /// The type anchors of the request this row's call reaches, at the
+    /// request's own line, where that line states no row of its own because
+    /// its callers' rows state the request (carrick#3961). The model's row
+    /// there carried them, and they move to every caller row that states the
+    /// request: the alias is this row's, the place the type is read is the
+    /// request line. A side this row already types from its own call keeps
+    /// its own anchor. The response moves only where the caller's function
+    /// hands back the request's own value ([`RequestLineAnchors::response`]).
+    ///
+    /// Never from the model and never on the wire: set after the join, read
+    /// by the type requests and the manifest on the same run.
+    #[serde(skip)]
+    pub request_line: Option<Box<RequestLineAnchors>>,
+}
+
+/// The model's row at a request line its callers' rows state
+/// ([`DataCallResult::request_line`], carrick#3961), with the file it sits
+/// in: its call span, call text, payload and type symbol locate the request
+/// and response types there.
+#[derive(Debug, Clone)]
+pub struct RequestLineAnchors {
+    /// The request line's file, as the scan keys its results.
+    pub file: String,
+    /// The model's row at the request line.
+    pub call: DataCallResult,
+    /// The response read at the request line is the one the caller's row
+    /// holds: the caller's function hands back the request's own value
+    /// unread ([`crate::request_summary::SummaryRow::returns_request_value`]).
+    /// A function that hands back anything else (an envelope, a field, a
+    /// `Response`) leaves its callers no response type and no response
+    /// verdict; only the request moves.
+    pub response: bool,
 }
 
 /// A GraphQL resolver the file-analyzer found: the schema field it answers and
@@ -2166,6 +2198,7 @@ mod tests {
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -2232,6 +2265,7 @@ mod tests {
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

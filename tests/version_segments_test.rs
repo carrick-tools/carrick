@@ -58,6 +58,9 @@ struct Scan {
     rows: BTreeMap<String, BTreeSet<String>>,
     /// The `file:line` of each possible call.
     leads: BTreeSet<String>,
+    /// Every call row at a `file:line`, whoever found it: the key text and
+    /// the source.
+    all_rows: BTreeMap<String, Vec<(String, String)>>,
 }
 
 fn scan() -> &'static Scan {
@@ -79,6 +82,8 @@ fn run_scan() -> Scan {
         cassettes.join("library-claims/default.json"),
     )
     .unwrap();
+    // The model's answers for a callee's own call (carrick#3961).
+    copy_dir(&fixture_dir().join("model-cassette"), &cassettes);
     let storage = tmp.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
     let home = tmp.path().join("home");
@@ -121,6 +126,7 @@ fn run_scan() -> Scan {
     );
     let mut rows: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut leads = BTreeSet::new();
+    let mut all_rows: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut blobs = 0;
     for entry in std::fs::read_dir(&storage).expect("the store reads") {
         let path = entry.expect("dir entry").path();
@@ -131,9 +137,6 @@ fn run_scan() -> Scan {
         let blob: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         for row in blob["calls"].as_array().into_iter().flatten() {
-            if row["resolution_source"] == "model" {
-                continue;
-            }
             let key = &row["key"];
             let name = ["path", "topic", "event", "field"]
                 .iter()
@@ -144,7 +147,14 @@ fn run_scan() -> Scan {
                 None => name.to_string(),
             };
             let at = row["file_path"].as_str().unwrap_or_default();
-            rows.entry(at.to_string()).or_default().insert(row_text);
+            let source = row["resolution_source"].as_str().unwrap_or_default();
+            all_rows
+                .entry(at.to_string())
+                .or_default()
+                .push((row_text.clone(), source.to_string()));
+            if source != "model" {
+                rows.entry(at.to_string()).or_default().insert(row_text);
+            }
         }
         for lead in blob["possible_calls"].as_array().into_iter().flatten() {
             let file = lead["file_path"].as_str().unwrap_or_default();
@@ -153,7 +163,11 @@ fn run_scan() -> Scan {
         }
     }
     assert_eq!(blobs, 1, "the scan stored one blob");
-    Scan { rows, leads }
+    Scan {
+        rows,
+        leads,
+        all_rows,
+    }
 }
 
 fn key() -> serde_json::Value {
@@ -252,4 +266,19 @@ fn a_runtime_version_stays_a_placeholder() {
 #[test]
 fn a_defaulted_method_key_is_the_method_a_caller_omits() {
     check(&["src/use-method.ts", "src/use-bag-method.ts"]);
+}
+
+/// A callee that reads a defaulted key states its call once: the callers'
+/// rows, each with the key it sends, and no model row at the callee's own
+/// call (carrick#3961). Any other model row stays.
+#[test]
+fn a_callee_with_a_defaulted_key_is_stated_once() {
+    let scan = scan();
+    let at = "src/client/param-key.ts:7";
+    let got = scan.all_rows.get(at).cloned().unwrap_or_default();
+    assert!(
+        got.iter().all(|(_, source)| source != "model"),
+        "{at}: a model row restates the callers' call: {got:?}\n{:#?}",
+        scan.all_rows
+    );
 }

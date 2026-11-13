@@ -447,6 +447,7 @@ mod tests {
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         }
     }
 

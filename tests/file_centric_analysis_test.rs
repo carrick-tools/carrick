@@ -165,6 +165,7 @@ fn test_file_analysis_result_structures() {
         at_caller: false,
         call_body: None,
         static_asset: None,
+        request_line: None,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -267,6 +268,7 @@ fn test_file_analysis_result_serialization() {
             at_caller: false,
             call_body: None,
             static_asset: None,
+            request_line: None,
         }],
         dispatch_tables: Vec::new(),
     };
@@ -335,6 +337,8 @@ fn test_processing_stats_tracking() {
         model_endpoints_dropped_unanchored: 0,
         model_endpoints_dropped_unanchored_sites: Vec::new(),
         model_only_rows: 0,
+        model_rows_stated_at_callers: 0,
+        request_lines_carried_to_callers: 0,
         candidates_awaiting_model: 0,
         total_mounts: 3,
         total_endpoints: 10,
@@ -636,6 +640,7 @@ fn test_data_call_extraction() {
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -664,6 +669,7 @@ fn test_data_call_extraction() {
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             },
             DataCallResult {
                 call_kind: None,
@@ -692,6 +698,7 @@ fn test_data_call_extraction() {
                 at_caller: false,
                 call_body: None,
                 static_asset: None,
+                request_line: None,
             },
         ],
         dispatch_tables: Vec::new(),

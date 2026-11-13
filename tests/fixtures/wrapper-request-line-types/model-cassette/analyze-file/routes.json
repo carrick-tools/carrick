@@ -1,0 +1,39 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:7",
+      "line_number": 7,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/v1/orders",
+      "handler_name": "anonymous",
+      "pattern_matched": ".post(",
+      "payload_expression_text": "req.body",
+      "payload_expression_line": 8,
+      "response_expression_text": "order",
+      "response_expression_line": 9,
+      "emission_style": "imperative-send",
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:12",
+      "line_number": 12,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/v1/refunds",
+      "handler_name": "anonymous",
+      "pattern_matched": ".post(",
+      "payload_expression_text": "req.body",
+      "payload_expression_line": 13,
+      "response_expression_text": "refund",
+      "response_expression_line": 14,
+      "emission_style": "imperative-send",
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": [],
+  "pubsub_operations": []
+}

@@ -10074,6 +10074,14 @@ struct Summary {
     /// call of it is worth the body, so a row stated at that call can be
     /// typed by the call's value.
     passes_body: bool,
+    /// The function sends one request and returns that request's own value
+    /// unread, as the request resolves (`return http.post<T>(url, body)`),
+    /// here or through a call to a function that does the same
+    /// ([`crate::return_flow::return_shapes`], carrick#3961). What a call of
+    /// it receives is what the request line's call is worth, so the response
+    /// read there is the response its callers hold. The platform's `fetch`
+    /// resolves to a `Response`, not the body, so returning it is not this.
+    returns_request_value: bool,
     /// The function hands out a function that may send (carrick#2281): its
     /// body writes one it does not call whose own summary is incomplete or
     /// states a request, or a callee it calls (or a callback that callee
@@ -10131,6 +10139,12 @@ pub struct SummaryRow {
     /// whatever the function returns (a boolean, a token, a mapped object)
     /// and says nothing about the response body.
     pub at_caller: bool,
+    /// A row at a caller whose function hands back the request's own value
+    /// unread (carrick#3961): the call is worth what the request line's call
+    /// is, so the response read at the request line is the one this call
+    /// holds. Every other row at a caller holds the function's own value
+    /// (an envelope, a field, a `Response`), which is no wire response.
+    pub returns_request_value: bool,
     /// What the request body is at a row stated at a call to a function the
     /// service declares (carrick#1782): what that function does with its
     /// parameters says whether the call's arguments are the body. `None` on
@@ -10926,6 +10940,31 @@ pub struct RequestSummaryIndex {
     /// The calls the rows and stops were composed through (C11 T1). Read
     /// by [`Self::placements`].
     chains: Box<Chains>,
+    /// What says whether a request its own line leaves open is stated by its
+    /// callers alone (carrick#3961), gathered while the rows are.
+    ledger: Box<CallerLedger>,
+}
+
+/// What the callers of the requests whose own line leaves the path open
+/// tell about them (carrick#3961): whether every call of every function
+/// holding such a request open is one this pass read.
+#[derive(Debug, Default)]
+struct CallerLedger {
+    /// The requests a caller closed and no row states there: a caller stop,
+    /// or a row that did not render.
+    stops: HashSet<(PathBuf, u32)>,
+    /// The requests a function no key names holds open (a function written
+    /// inside another, which its callers reach through a value).
+    open: HashSet<(PathBuf, u32)>,
+    /// The functions some call this pass composed reaches.
+    seen: HashSet<(PathBuf, String)>,
+    /// The functions some call this pass did not compose reaches: a call
+    /// made where a module is loaded, in a constructor, an optional call, or
+    /// one whose callee only the call graph names.
+    unseen: HashSet<(PathBuf, String)>,
+    /// The requests, by file and span start, whose every caller this pass
+    /// read and stated ([`RequestSummaryIndex::answered_at_callers`]).
+    closed: HashSet<(PathBuf, u32)>,
 }
 
 /// The calls the summaries' rows and stops were composed through (C11 T1,
@@ -11093,6 +11132,52 @@ impl RequestSummaryIndex {
         }
         self.rows.retain(|_, sites| !sites.is_empty());
         withdrawn
+    }
+
+    /// The requests written in `file` that their callers' rows state, by
+    /// span start (carrick#3961): the request's own line leaves its path to
+    /// the callers, so it states no row, and every call of every function
+    /// holding it open was read and stated a row (no caller stop, no caller
+    /// out of this pass's sight). A row stated at the request's own line by
+    /// any other source is the same request stated once more.
+    pub fn answered_at_callers(&self, file: &Path) -> BTreeSet<u32> {
+        self.ledger
+            .closed
+            .iter()
+            .filter(|(at_file, _)| at_file == file)
+            .filter(|(at_file, start)| {
+                !self
+                    .rows
+                    .get(at_file)
+                    .is_some_and(|sites| sites.contains_key(start))
+            })
+            .filter(|at| {
+                self.rows
+                    .values()
+                    .flat_map(|sites| sites.values().flatten())
+                    .any(|row| row.request_at == **at && row.reaches_request.is_none())
+            })
+            .map(|(_, start)| *start)
+            .collect()
+    }
+
+    /// The call sites, by file and span start, whose rows state the request
+    /// at `request_at` (its file and span start) as a request their callee
+    /// leaves open ([`Self::answered_at_callers`], carrick#3961).
+    pub fn stating_callers(&self, request_at: &(PathBuf, u32)) -> BTreeSet<(PathBuf, u32)> {
+        self.rows
+            .iter()
+            .flat_map(|(file, sites)| {
+                sites
+                    .iter()
+                    .filter(|(_, rows)| {
+                        rows.iter().any(|row| {
+                            row.request_at == *request_at && row.reaches_request.is_none()
+                        })
+                    })
+                    .map(move |(start, _)| (file.clone(), *start))
+            })
+            .collect()
     }
 
     /// Call sites of `file` whose callee provably sends nothing, by span
@@ -11267,6 +11352,7 @@ impl Composer<'_> {
             complete: !ir.bodyless && !ir.unfollowed,
             invokes: ir.invoked_params.clone(),
             passes_body: false,
+            returns_request_value: false,
             hands_out: false,
         };
         // What the functions written in this body send through its
@@ -11376,6 +11462,10 @@ impl Composer<'_> {
             && ir
                 .return_shape
                 .is_some_and(|shape| self.hands_back_body(file, ir, shape));
+        summary.returns_request_value = summary.effects.len() == 1
+            && ir
+                .return_shape
+                .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
         for (effect, through) in lifted {
             summary.state(ir.settle_forward(effect), through);
         }
@@ -11441,6 +11531,36 @@ impl Composer<'_> {
             (ShapeKind::Parsed, None) => self.request_of(file, call).is_some(),
             (ShapeKind::Value, Some((_, callee))) => callee.passes_body,
             _ => false,
+        }
+    }
+
+    /// Whether what `ir` returns ([`FnIr::return_shape`]) is its request's
+    /// own value unread (carrick#3961, [`Summary::returns_request_value`]):
+    /// the call that makes the request, handed back whole, other than the
+    /// platform's `fetch`, or what a call of a function that does the same
+    /// returns. A parse, one member or any other value is not.
+    fn hands_back_request_value(
+        &mut self,
+        file: &Path,
+        ir: &FnIr,
+        shape: crate::return_flow::ReturnShape,
+    ) -> bool {
+        use crate::return_flow::ShapeKind;
+        if shape.kind != ShapeKind::Value {
+            return false;
+        }
+        let Some(call) = ir.calls.iter().find(|call| {
+            call.site.lo == shape.base.lo.0
+                && call.site.hi == shape.base.hi.0
+                && call.invokes_param.is_none()
+        }) else {
+            return false;
+        };
+        match self.callee(file, call) {
+            None => self
+                .request_of(file, call)
+                .is_some_and(|request| request.kind != RequestKind::Fetch),
+            Some((_, callee)) => callee.returns_request_value,
         }
     }
 }
@@ -11529,7 +11649,126 @@ pub fn summarize(
             merge_rows(rows);
         }
     }
+    index.ledger.closed = closed_at_callers(&mut composer, &paths, &mut index.ledger);
     index
+}
+
+/// The requests whose own line leaves the path open and whose every caller
+/// this pass read (carrick#3961): each function holding one open is a
+/// function a key names, some call this pass composed reaches it, and no
+/// call this pass did not compose does; no caller closed it without a row;
+/// and the request is written in a function a key names, holding it open.
+fn closed_at_callers(
+    composer: &mut Composer<'_>,
+    paths: &[&PathBuf],
+    ledger: &mut CallerLedger,
+) -> HashSet<(PathBuf, u32)> {
+    let files = composer.files;
+    for path in paths {
+        let file = &files[*path];
+        reached_from(composer, path, &file.module_level, &mut ledger.unseen);
+        for ir in &file.constructor_defaults {
+            reached_from(composer, path, ir, &mut ledger.unseen);
+        }
+        for ir in file.functions.values() {
+            if ir.constructor {
+                reached_from(composer, path, ir, &mut ledger.unseen);
+            } else {
+                reached_unread(composer, path, ir, &mut ledger.unseen);
+            }
+        }
+    }
+    let mut holders: HashMap<(PathBuf, u32), Vec<(PathBuf, String)>> = HashMap::new();
+    let mut written_in: HashSet<(PathBuf, u32)> = HashSet::new();
+    for path in paths {
+        let mut keys: Vec<&String> = files[*path].functions.keys().collect();
+        keys.sort();
+        for key in keys {
+            let ir = &files[*path].functions[key];
+            if ir.constructor {
+                continue;
+            }
+            let Some(summary) = composer.summary(path, key) else {
+                continue;
+            };
+            for effect in summary.effects.iter().filter(|effect| effect.has_params()) {
+                let at = (effect.site.file.clone(), effect.site.span_start);
+                if effect.site.file == **path
+                    && ir
+                        .calls
+                        .iter()
+                        .any(|call| call.site.span_start == effect.site.span_start)
+                {
+                    written_in.insert(at.clone());
+                }
+                holders
+                    .entry(at)
+                    .or_default()
+                    .push(((*path).clone(), key.clone()));
+            }
+        }
+    }
+    holders
+        .into_iter()
+        .filter(|(at, held)| {
+            written_in.contains(at)
+                && !ledger.stops.contains(at)
+                && !ledger.open.contains(at)
+                && held
+                    .iter()
+                    .all(|holder| ledger.seen.contains(holder) && !ledger.unseen.contains(holder))
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Every function a call in `ir`, or in a function written in it, reaches.
+fn reached_from(
+    composer: &Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    reached: &mut HashSet<(PathBuf, String)>,
+) {
+    for call in ir
+        .calls
+        .iter()
+        .chain(&ir.optional_calls)
+        .chain(&ir.constructions)
+    {
+        if let Some(target) = composer.target(file, call) {
+            reached.insert(target);
+        }
+    }
+    for inner in ir
+        .nested
+        .iter()
+        .chain(&ir.detached)
+        .chain(&ir.param_functions)
+    {
+        reached_from(composer, file, inner, reached);
+    }
+}
+
+/// Every function a call in `ir` reaches that [`emit`] does not read: an
+/// optional call, a construction, and any call in a function written as a
+/// parameter's default.
+fn reached_unread(
+    composer: &Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    reached: &mut HashSet<(PathBuf, String)>,
+) {
+    for call in ir.optional_calls.iter().chain(&ir.constructions) {
+        if let Some(target) = composer.target(file, call) {
+            reached.insert(target);
+        }
+    }
+    for inner in &ir.param_functions {
+        reached_from(composer, file, inner, reached);
+    }
+    for inner in ir.nested.iter().chain(&ir.detached) {
+        reached_unread(composer, file, inner, reached);
+    }
 }
 
 /// One row per statement at a site, whatever end its base was reached by:
@@ -11612,6 +11851,9 @@ fn emit(
         let mut rows: Vec<SummaryRow> = Vec::new();
         match composer.callee(file, call) {
             Some((callee_file, callee)) => {
+                if let Some(target) = composer.target(file, call) {
+                    index.ledger.seen.insert(target);
+                }
                 let callee_ir = composer
                     .target(file, call)
                     .and_then(|(target, key)| files.get(&target)?.functions.get(&key));
@@ -11647,6 +11889,14 @@ fn emit(
                         // Still open: a caller further up fills it. The verb
                         // may be settled here all the same (carrick#2676).
                         open_verbs.read(effect, &instantiated.method);
+                        // A function written inside another holds it open
+                        // for callers no key names (carrick#3961).
+                        if !top_level {
+                            index
+                                .ledger
+                                .open
+                                .insert((effect.site.file.clone(), effect.site.span_start));
+                        }
                         continue;
                     }
                     open_verbs.closed = true;
@@ -11678,8 +11928,13 @@ fn emit(
                     };
                     // A function that hands back its one request's parsed
                     // body makes its call worth that body (carrick#1601).
+                    // One that hands back the request's own value unread
+                    // makes its call worth what the request line's call is
+                    // (carrick#3961).
                     let at = if callee.passes_body {
                         RowSite::PassThrough
+                    } else if callee.returns_request_value {
+                        RowSite::CallerOfRequestValue
                     } else {
                         RowSite::Caller
                     };
@@ -11708,6 +11963,10 @@ fn emit(
                         }
                         None => {
                             index.undetermined += 1;
+                            index.ledger.stops.insert((
+                                instantiated.site.file.clone(),
+                                instantiated.site.span_start,
+                            ));
                             // The request is closed at this caller and does
                             // not render: the caller is a site the send side
                             // could not compose (carrick#3688 F).
@@ -11768,6 +12027,14 @@ fn emit(
                 // row, and claims the site as a summary does anywhere else:
                 // the passes that read the site's own source cannot read the
                 // client's base, so their reading is not the one to keep.
+                // A function of the repository this pass did not compose
+                // (carrick#3961): its callers are not all read.
+                if let Some(target) = composer
+                    .target(file, call)
+                    .or_else(|| composer.inputs.sites.target(file, call.site.lo).cloned())
+                {
+                    index.ledger.unseen.insert(target);
+                }
                 let request = composer.request_of(file, call);
                 if request.is_none()
                     && let Some(reason) = composer.unfollowed(file, call)
@@ -11913,6 +12180,11 @@ enum RowSite {
     /// and hands back its parsed body unchanged: the call's value is the
     /// body ([`Summary::passes_body`]).
     PassThrough,
+    /// A call to a function the service declares, which makes one request
+    /// and hands back that request's own value unread: the call's value is
+    /// what the request line's call is worth
+    /// ([`Summary::returns_request_value`], carrick#3961).
+    CallerOfRequestValue,
 }
 
 /// The row an effect supports at `site`, when its URL and method are both
@@ -11958,7 +12230,8 @@ fn row(
         body_literals,
         reaches_request,
         own_site: at == RowSite::Own,
-        at_caller: at == RowSite::Caller,
+        at_caller: matches!(at, RowSite::Caller | RowSite::CallerOfRequestValue),
+        returns_request_value: at == RowSite::CallerOfRequestValue,
         call_body,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
@@ -14502,6 +14775,7 @@ function build() { return {}; }
             reaches_request: None,
             own_site: false,
             at_caller: false,
+            returns_request_value: false,
             call_body: None,
             library_semantics: Vec::new(),
             base_fallbacks: None,
