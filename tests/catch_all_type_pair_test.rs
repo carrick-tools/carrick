@@ -52,9 +52,11 @@ fn carrick(root: &Path) -> Command {
 fn scan() -> &'static Scan {
     static SCAN: OnceLock<Scan> = OnceLock::new();
     SCAN.get_or_init(|| {
-        let cache = tempfile::tempdir().expect("temp cache dir");
+        // The stdout projection (edges) and the stored blobs (verdicts) come
+        // from two scans: `CARRICK_OUTPUT_JSON` does not store the verdicts.
+        let projection_cache = tempfile::tempdir().expect("temp cache dir");
         let output = carrick(&fixture())
-            .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
+            .env("CARRICK_LOCAL_STORAGE_DIR", projection_cache.path())
             .env("CARRICK_OUTPUT_JSON", "1")
             .output()
             .expect("failed to spawn carrick");
@@ -71,6 +73,17 @@ fn scan() -> &'static Scan {
             .unwrap_or_else(|| panic!("no JSON in scanner stdout:\n{stdout}"));
         let projection = serde_json::from_str(&stdout[start..])
             .unwrap_or_else(|e| panic!("projection parse failed: {e}\n{stdout}"));
+
+        let cache = tempfile::tempdir().expect("temp cache dir");
+        let output = carrick(&fixture())
+            .env("CARRICK_LOCAL_STORAGE_DIR", cache.path())
+            .output()
+            .expect("failed to spawn carrick");
+        assert!(
+            output.status.success(),
+            "scan failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let blobs = std::fs::read_dir(cache.path())
             .expect("read the storage dir")
             .filter_map(Result::ok)
