@@ -1033,7 +1033,8 @@ pub fn read(
     // The word each check that did not verify saves a dropped call with
     // (carrick#3947, carrick#3946), where the verdict at its position names
     // it: `failed` is `uncorroborated`, a check the verifier's time budget
-    // did not reach `unanswered`. Any other `unchecked` saves nothing.
+    // did not reach `unanswered`, any other `unchecked` `label_unchecked`
+    // (carrick#4162).
     let unverified_words: HashMap<(String, String), Stop> = checks
         .iter()
         .zip(&verdicts)
@@ -1045,6 +1046,8 @@ pub fn read(
                 Stop::Uncorroborated
             } else if verdict.not_reached_in_time() {
                 Stop::Unanswered
+            } else if verdict.verdict == SemanticsVerdict::Unchecked {
+                Stop::LabelUnchecked
             } else {
                 return None;
             };
@@ -1339,9 +1342,11 @@ impl Reading<'_, '_> {
 
     /// Why the call states no row, with the op the reason is for, when the
     /// reader read it and dropped it (carrick#3947, carrick#3946): a name
-    /// slot a verified op read no name at, then a check the verifier's time
-    /// budget did not reach (`unanswered`), then a check answered `failed`
-    /// (`uncorroborated`), as `words` spells each check. `None` when no
+    /// slot a verified op read no name at, then by a fixed rank (carrick#4162)
+    /// a check the verifier's time budget did not reach (`unanswered`), a
+    /// check answered `unchecked` for another reason (`label_unchecked`), a
+    /// check answered `failed` (`uncorroborated`), as `words` spells each
+    /// check. `None` when no
     /// claim that states a message row applied here, or none of its checks
     /// has a word.
     fn unstated(&self, words: &HashMap<(String, String), Stop>) -> Option<(Stop, LibraryOp)> {
@@ -1357,11 +1362,13 @@ impl Reading<'_, '_> {
                     .map(|word| (*word, *op))
             })
             .collect();
-        worded
-            .iter()
-            .find(|(word, _)| *word == Stop::Unanswered)
-            .or_else(|| worded.first())
-            .copied()
+        // A fixed rank, not the order of the checks (carrick#4162).
+        let rank = |word: Stop| match word {
+            Stop::Unanswered => 0,
+            Stop::LabelUnchecked => 1,
+            _ => 2,
+        };
+        worded.iter().min_by_key(|(word, _)| rank(*word)).copied()
     }
 
     /// The op of the first claim on `through` that would state a message
