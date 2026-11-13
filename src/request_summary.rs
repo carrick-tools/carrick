@@ -2160,6 +2160,7 @@ pub fn extract_file_ir(
         held_inits: Default::default(),
         block_bindings: Default::default(),
         function_returns: Default::default(),
+        way_tests: Default::default(),
     };
     module_scope.guards = guards::ModuleGuards::of(module, &imports, definition_keys, &reader);
 
@@ -5355,6 +5356,10 @@ struct Scope<'a> {
     /// of the conditionals it holds (carrick#2050): only a local whose
     /// initialiser holds one is here.
     alts: HashMap<BindingKey, Alternatives>,
+    /// Each `let` the body declares at its top level and writes again, with
+    /// the ways the value resolver's flow says reach each of its reads
+    /// (carrick#3679 S8): what [`Reader::alternatives`] reads it as.
+    written_locals: HashMap<BindingKey, alternatives::WrittenLocal>,
     /// The names the function assigns again, anywhere in it: a test that
     /// reads one is not the same test twice (carrick#2051).
     reassigned: HashSet<String>,
@@ -5409,6 +5414,7 @@ impl<'a> Scope<'a> {
             fetches: HashSet::new(),
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            written_locals: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: HashMap::new(),
@@ -5622,6 +5628,11 @@ struct Reader<'a> {
     /// What each function returns, by where its node starts
     /// ([`FileIr::block_returns`], carrick#3794).
     function_returns: std::cell::RefCell<HashMap<u32, Vec<ValueAt>>>,
+    /// The first guard read at each comparison, by its site `(lo, hi)`, as
+    /// the walk records it ([`FnIr::guards`]): what a test on a written
+    /// local's way reads as at a send further down ([`Reader::way_guard`],
+    /// carrick#3679).
+    way_tests: std::cell::RefCell<HashMap<(u32, u32), GuardIr>>,
 }
 
 /// The binding a function-local value is held in, for the procedures walk
@@ -6505,6 +6516,7 @@ impl Reader<'_> {
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            written_locals: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
@@ -6610,6 +6622,7 @@ impl Reader<'_> {
             fetches,
             param_verbs: HashMap::new(),
             alts: HashMap::new(),
+            written_locals: HashMap::new(),
             reassigned: HashSet::new(),
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
@@ -6671,9 +6684,6 @@ impl Reader<'_> {
         let mut reassigned = Reassigned::default();
         let mut declared = Declarations::default();
         let mut written_through = HashSet::new();
-        // Each local declared once and written again whose ways are read,
-        // with where each write read so far starts (carrick#3679).
-        let mut written: HashMap<BindingKey, BTreeSet<u32>> = HashMap::new();
         for stmt in stmts {
             stmt.visit_with(&mut reassigned);
             stmt.visit_with(&mut declared);
@@ -6773,7 +6783,10 @@ impl Reader<'_> {
                     ));
                     // A `let` written again: which writes reach each read
                     // (carrick#3679 S8), computed here, where the body is in
-                    // hand. A `var` is hoisted and stays the census's set.
+                    // hand. One computation answers both readers: its span
+                    // projection goes to the binding table for the text
+                    // reader, and the send side reads its ways at each send.
+                    // A `var` is hoisted and stays the census's set.
                     if var.kind == VarDeclKind::Let
                         && let Pat::Ident(ident) = &declarator.name
                         && reassigned.names.contains(ident.id.sym.as_ref())
@@ -6781,8 +6794,13 @@ impl Reader<'_> {
                             .iter_mut()
                             .find(|entry| entry.key == ident_key(&ident.id))
                     {
-                        entry.flow =
-                            resolve::flow::reaching(stmts, &entry.key).map(|found| found.table());
+                        let found = resolve::flow::reaching(stmts, &entry.key);
+                        entry.flow = found.as_ref().map(resolve::flow::Reaching::table);
+                        if let Some(found) = &found {
+                            scope
+                                .written_locals
+                                .insert(entry.key.clone(), alternatives::WrittenLocal::of(found));
+                        }
                     }
                     // A `let` set again on every path to one of a few makers'
                     // instances, read where it is returned (carrick#1689).
@@ -6861,22 +6879,6 @@ impl Reader<'_> {
                             }
                         }
                     }
-                    // A `let` or `var` declared once and written again: every
-                    // write is a way the value resolver's census places
-                    // (carrick#3679), read as each statement after it writes
-                    // it ([`Self::written_ways`]). One with no initialiser
-                    // holds nothing until a write sets it.
-                    if let Pat::Ident(ident) = &declarator.name
-                        && var.kind != VarDeclKind::Const
-                        && reassigned.names.contains(ident.id.sym.as_ref())
-                        && reassigned.declared_once(&declared, ident.id.sym.as_ref())
-                    {
-                        let key = ident_key(&ident.id);
-                        written.insert(key.clone(), BTreeSet::new());
-                        if declarator.init.is_none() {
-                            scope.alts.insert(key.clone(), Alternatives::unwritten(key));
-                        }
-                    }
                     if let (Pat::Ident(ident), Some(init)) = (&declarator.name, &declarator.init) {
                         let name = ident.id.sym.to_string();
                         let key = ident_key(&ident.id);
@@ -6905,19 +6907,13 @@ impl Reader<'_> {
                         }
                         // What a conditional in it leaves it able to read as
                         // (carrick#2050): a request built from it states
-                        // one row per branch. One written again is its
-                        // initialiser until a write sets it (carrick#3679).
-                        let alts = if !unsettled {
-                            self.alternatives(init, scope)
-                        } else if let Some(placed) = written.get(&key) {
-                            self.reading_of(init, scope)
-                                .map(|state| state.of_local(&key, placed))
-                        } else {
+                        // one row per branch. One written again is read
+                        // through [`Scope::written_locals`] (carrick#3679).
+                        let alts = if unsettled {
                             None
+                        } else {
+                            self.alternatives(init, scope)
                         };
-                        if alts.is_none() {
-                            written.remove(&key);
-                        }
                         scope.locals.insert(key.clone(), value);
                         match alts {
                             Some(alts) => {
@@ -6938,46 +6934,7 @@ impl Reader<'_> {
                 }
                 continue;
             }
-            // A local this statement writes reads as nothing inside it, and
-            // as each way the statement leaves it after it (carrick#3679).
-            // Every local's ways are read before any is put back, so one the
-            // statement writes from another reads it as nothing, whichever
-            // order the locals are taken in.
-            let mut keys: Vec<BindingKey> = written
-                .keys()
-                .filter(|key| alternatives::writes_local(stmt, key))
-                .cloned()
-                .collect();
-            keys.sort();
-            let before: Vec<(BindingKey, Alternatives)> = keys
-                .into_iter()
-                .filter_map(|key| {
-                    let state = scope.alts.remove(&key)?;
-                    Some((key, state))
-                })
-                .collect();
             self.walk(stmt, scope, ir);
-            let mut after = Vec::new();
-            for (key, state) in before {
-                let placed = written.get_mut(&key).expect("a written local");
-                let mut flow = alternatives::WriteFlow {
-                    local: &key,
-                    scope,
-                    guards: &ir.guards,
-                    path: Vec::new(),
-                    placed: &mut *placed,
-                };
-                match self.written_ways(stmt, state, &mut flow) {
-                    Some(state) => {
-                        let state = state.of_local(&key, placed);
-                        after.push((key, state));
-                    }
-                    None => {
-                        written.remove(&key);
-                    }
-                }
-            }
-            scope.alts.extend(after);
         }
     }
 

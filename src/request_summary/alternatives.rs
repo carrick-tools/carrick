@@ -290,23 +290,12 @@ impl Alternatives {
         }
     }
 
-    /// A local written more than once, declared with no value (carrick#3679):
-    /// one reading, unwritten, resting on the local's writes.
-    pub(super) fn unwritten(local: BindingKey) -> Self {
+    /// A way of a local written more than once on which no write has set it
+    /// (carrick#3679): one reading, unwritten.
+    fn unwritten() -> Self {
         let mut readings = Self::single(Vec::new());
         readings.readings[0].unwritten = true;
-        readings.writes.insert(local, BTreeSet::new());
         readings
-    }
-
-    /// The readings as those of the local `local`, whose writes so far start
-    /// at `placed`.
-    pub(super) fn of_local(mut self, local: &BindingKey, placed: &BTreeSet<u32>) -> Self {
-        self.writes
-            .entry(local.clone())
-            .or_default()
-            .extend(placed.iter().copied());
-        self
     }
 
     /// Each reading where the test `guard` goes the way `holds` says; every
@@ -352,13 +341,24 @@ impl Alternatives {
         })
     }
 
-    /// `self || right` and `self ?? right`, where `self` reads a local
-    /// written more than once: a reading no write set is `right`'s, and any
-    /// other is its own (text a write sets is never empty text here).
-    fn or_else(&self, right: &Alternatives) -> Option<Alternatives> {
+    /// `self || right` (`op` is `LogicalOr`) and `self ?? right`, where
+    /// `self` reads a local written more than once: a reading no write set
+    /// falls through to `right` under either, and so does one that is
+    /// literally `""` under `||` alone (`"" ?? path` is `""`). Any other
+    /// reading keeps its own value, one whose truthiness the text does not
+    /// state (a parameter, a value nothing read) included.
+    fn or_else(&self, op: BinaryOp, right: &Alternatives) -> Option<Alternatives> {
+        let falls_through = |reading: &Reading| {
+            reading.unwritten
+                || (op == BinaryOp::LogicalOr
+                    && reading
+                        .pieces
+                        .iter()
+                        .all(|piece| matches!(piece, Piece::Lit(text) if text.is_empty())))
+        };
         let mut readings = Vec::new();
         for left in &self.readings {
-            if !left.unwritten {
+            if !falls_through(left) {
                 readings.push(left.clone());
                 continue;
             }
@@ -574,17 +574,22 @@ impl Reader<'_> {
                 left.then(&right)
             }
             Expr::Ident(ident) if scope.param_index(ident).is_none() => {
-                scope.alts.get(&ident_key(ident)).cloned()
+                let key = ident_key(ident);
+                match scope.written_locals.get(&key) {
+                    Some(written) => self.written_reading(ident, &key, written, scope),
+                    None => scope.alts.get(&key).cloned(),
+                }
             }
             // `q || path` over a local written more than once: where no
-            // write set `q`, the value is `path` (carrick#3679).
+            // write set `q` (or, under `||`, set it to `""`), the value is
+            // `path` (carrick#3679).
             Expr::Bin(bin)
                 if matches!(bin.op, BinaryOp::LogicalOr | BinaryOp::NullishCoalescing) =>
             {
                 let left = self
                     .alternatives(&bin.left, scope)
                     .filter(Alternatives::is_written)?;
-                left.or_else(&self.reading_of(&bin.right, scope)?)
+                left.or_else(bin.op, &self.reading_of(&bin.right, scope)?)
             }
             _ => None,
         }
@@ -854,130 +859,150 @@ impl Reader<'_> {
     }
 }
 
-/// What [`Reader::written_ways`] reads one local's writes with.
-pub(super) struct WriteFlow<'f, 's> {
-    /// The local written more than once.
-    pub(super) local: &'f BindingKey,
-    pub(super) scope: &'f Scope<'s>,
-    /// The guards the walk of the body read ([`super::FnIr::guards`]).
-    pub(super) guards: &'f [super::guards::GuardIr],
-    /// The guards of the `if` tests the statement sits under, each with the
-    /// branch taken.
-    pub(super) path: Vec<(Option<WayGuard>, bool)>,
-    /// Where each write read so far starts, for the write census
-    /// ([`Alternation::census_checked`]).
-    pub(super) placed: &'f mut BTreeSet<u32>,
+/// Where one way of a written local's value comes from, as the send side
+/// reads it ([`super::resolve::flow::Source`], owned).
+#[derive(Debug, Clone)]
+enum SentFrom {
+    /// The initialiser.
+    Init(Expr),
+    /// No initialiser, or a nullish one.
+    Unwritten,
+    /// A placed write, with its operator and its right side.
+    Write(AssignOp, Expr),
+}
+
+/// One way of a written local at a read: where its value comes from, and
+/// each `if` test on the path, by the span of the comparison the guards read
+/// (under any `!` and parentheses), with the branch taken.
+#[derive(Debug, Clone)]
+struct SentWay {
+    from: SentFrom,
+    tests: Vec<((u32, u32), bool)>,
+}
+
+/// What the value resolver's flow ([`super::resolve::flow::reaching`]) says
+/// of a `let` declared at the top level of a function body and written again
+/// (carrick#3679 S8): the ways at each of its reads, by where the read's
+/// identifier starts, and where every write the flow placed starts, for the
+/// write census ([`Alternation::census_checked`]).
+#[derive(Debug, Clone, Default)]
+pub(super) struct WrittenLocal {
+    reads: BTreeMap<u32, Vec<SentWay>>,
+    writes: BTreeSet<u32>,
+}
+
+impl WrittenLocal {
+    pub(super) fn of(found: &super::resolve::flow::Reaching<'_>) -> Self {
+        use super::resolve::flow::Source;
+        let way = |way: &super::resolve::flow::Way<'_>| SentWay {
+            from: match way.from {
+                Source::Init(init) => SentFrom::Init(init.clone()),
+                Source::Unwritten => SentFrom::Unwritten,
+                Source::Write(assign) => SentFrom::Write(assign.op, (*assign.right).clone()),
+            },
+            tests: way
+                .tests
+                .iter()
+                .map(|(test, holds)| {
+                    let span = compared(test).span();
+                    ((span.lo.0, span.hi.0), *holds)
+                })
+                .collect(),
+        };
+        WrittenLocal {
+            reads: found
+                .reads
+                .iter()
+                .map(|(at, ways)| (*at, ways.iter().map(way).collect()))
+                .collect(),
+            writes: found.writes.iter().copied().collect(),
+        }
+    }
+}
+
+/// A test under any number of `!` and parentheses: the comparison the
+/// guards read at it ([`super::guards::GuardIr::negated`] carries the `!`).
+fn compared(test: &Expr) -> &Expr {
+    let mut inner = test;
+    loop {
+        match inner {
+            Expr::Paren(paren) => inner = &paren.expr,
+            Expr::Unary(unary) if unary.op == UnaryOp::Bang => inner = &unary.arg,
+            _ => return inner,
+        }
+    }
 }
 
 impl Reader<'_> {
-    /// What the local `flow.local`, written more than once, may hold after
-    /// `stmt` runs, given what it may hold before it (`state`) under the
-    /// tests of `flow.path` (carrick#3679, the ruling R3): one way per
-    /// write. A write replaces every way it is reached on; an `if` keeps
-    /// each branch's ways, under its test where a caller decides the test
-    /// ([`WayGuard`]) and unguarded where it is any other test.
-    ///
-    /// `None` where a write is in any other statement or expression (a loop,
-    /// a `try`, a `switch`, a write inside a call or a nested function), or
-    /// its value reads the local itself: what the local holds there is not
-    /// read.
-    pub(super) fn written_ways(
+    /// What the written local `local` reads as at `ident` (carrick#3679,
+    /// the ruling R3): one reading per way the flow says reaches the read,
+    /// each under its tests, a test a caller decides as a [`WayGuard`] and
+    /// any other kept unguarded. `None` where no way reaches the read as the
+    /// flow reads it (inside a function written in the body, past the cap),
+    /// or where one way is not read (a logical assignment, a value nothing
+    /// here reads): the readings would not be every value sent.
+    fn written_reading(
         &self,
-        stmt: &Stmt,
-        state: Alternatives,
-        flow: &mut WriteFlow<'_, '_>,
+        ident: &Ident,
+        local: &BindingKey,
+        written: &WrittenLocal,
+        scope: &Scope<'_>,
     ) -> Option<Alternatives> {
-        let local = flow.local;
-        if !writes_local(stmt, local) {
-            return Some(state);
+        let ways = written.reads.get(&ident.span.lo.0)?;
+        let mut out: Option<Alternatives> = None;
+        for way in ways {
+            let mut reading = match &way.from {
+                SentFrom::Init(value) | SentFrom::Write(AssignOp::Assign, value) => {
+                    self.reading_of(value, scope)?
+                }
+                SentFrom::Unwritten => Alternatives::unwritten(),
+                SentFrom::Write(..) => return None,
+            };
+            // A value read from a written local no way reaches here says
+            // nothing of this one.
+            let unread = reading.readings.iter().any(|reading| {
+                reading.pieces.iter().any(|piece| {
+                    matches!(
+                        piece,
+                        Piece::Opaque {
+                            end: Root::Hole(HoleReason::Reassigned),
+                            ..
+                        }
+                    )
+                })
+            });
+            if unread {
+                return None;
+            }
+            for (test, holds) in &way.tests {
+                reading = reading.under(self.way_guard(*test, scope).as_ref(), *holds);
+            }
+            // Every reading takes a test both ways: the way is never taken.
+            if reading.readings.is_empty() {
+                continue;
+            }
+            out = Some(match out {
+                None => reading,
+                Some(held) => held.either(&reading)?,
+            });
         }
-        match stmt {
-            Stmt::Expr(statement) => {
-                let Expr::Assign(assign) = statement.expr.unwrap_parens() else {
-                    return None;
-                };
-                let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left else {
-                    return None;
-                };
-                if assign.op != AssignOp::Assign
-                    || ident_key(&target.id) != *local
-                    || reads_local(&assign.right, local)
-                {
-                    return None;
-                }
-                flow.placed.insert(assign.span.lo.0);
-                let mut written = self.reading_of(&assign.right, flow.scope)?;
-                // A value read from a local this pass holds no ways for (one
-                // the same statement writes too) says nothing of this one.
-                let unread = written.readings.iter().any(|reading| {
-                    reading.pieces.iter().any(|piece| {
-                        matches!(
-                            piece,
-                            Piece::Opaque {
-                                end: Root::Hole(HoleReason::Reassigned),
-                                ..
-                            }
-                        )
-                    })
-                });
-                if unread {
-                    return None;
-                }
-                for (guard, holds) in &flow.path {
-                    written = written.under(guard.as_ref(), *holds);
-                }
-                (!written.readings.is_empty()).then_some(written)
-            }
-            Stmt::Block(block) => {
-                let mut state = state;
-                for inner in &block.stmts {
-                    state = self.written_ways(inner, state, flow)?;
-                }
-                Some(state)
-            }
-            Stmt::If(branching) => {
-                let guard = self.way_guard(&branching.test, flow.scope, flow.guards);
-                let mut taken = |stmt: Option<&Stmt>, holds: bool| {
-                    let state = state.under(guard.as_ref(), holds);
-                    let Some(stmt) = stmt else {
-                        return Some(state);
-                    };
-                    flow.path.push((guard.clone(), holds));
-                    let out = self.written_ways(stmt, state, flow);
-                    flow.path.pop();
-                    out
-                };
-                let consequent = taken(Some(&branching.cons), true)?;
-                let alternate = taken(branching.alt.as_deref(), false)?;
-                consequent.either(&alternate)
-            }
-            _ => None,
-        }
+        let mut out = out.filter(|out| !out.readings.is_empty())?;
+        out.writes
+            .entry(local.clone())
+            .or_default()
+            .extend(written.writes.iter().copied());
+        Some(out)
     }
 
     /// The test of an `if` as one a caller decides (the ruling R3): the
-    /// guard [`super::guards`] read at it compares the function's own
-    /// parameter, or one key of it, that the body never assigns, with text
-    /// by `===` / `!==`, or tests a prefix of it (`startsWith`, an anchored
-    /// literal pattern), under any number of `!`. `None` for any other test.
-    fn way_guard(
-        &self,
-        test: &Expr,
-        scope: &Scope<'_>,
-        guards: &[super::guards::GuardIr],
-    ) -> Option<WayGuard> {
-        let mut inner = test;
-        loop {
-            match inner {
-                Expr::Paren(paren) => inner = &paren.expr,
-                Expr::Unary(unary) if unary.op == UnaryOp::Bang => inner = &unary.arg,
-                _ => break,
-            }
-        }
-        let span = inner.span();
-        let guard = guards
-            .iter()
-            .find(|guard| guard.site.lo == span.lo.0 && guard.site.hi == span.hi.0)?;
+    /// guard [`super::guards`] read at the comparison spanning `test`
+    /// compares the function's own parameter, or one key of it, that the
+    /// body never assigns, with text by `===` / `!==`, or tests a prefix of
+    /// it (`startsWith`, an anchored literal pattern), under any number of
+    /// `!`. `None` for any other test.
+    fn way_guard(&self, test: (u32, u32), scope: &Scope<'_>) -> Option<WayGuard> {
+        let way_tests = self.way_tests.borrow();
+        let guard = way_tests.get(&test)?;
         let ((depth, index, keys), test) = guard.parameter_test()?;
         let name = &scope.params.get(index)?.as_ref()?.0;
         if depth != 0 || scope.reassigned.contains(name) {
@@ -994,56 +1019,6 @@ impl Reader<'_> {
             holds: !guard.negated,
         })
     }
-}
-
-/// Whether `stmt` writes the local `local` anywhere, inside a function
-/// written in it too.
-pub(super) fn writes_local(stmt: &Stmt, local: &BindingKey) -> bool {
-    use swc_ecma_visit::{Visit, VisitWith};
-    struct Writes<'k> {
-        local: &'k BindingKey,
-        found: bool,
-    }
-    impl Visit for Writes<'_> {
-        fn visit_assign_expr(&mut self, assign: &AssignExpr) {
-            if let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left {
-                self.found |= ident_key(&target.id) == *self.local;
-            }
-            assign.visit_children_with(self);
-        }
-        fn visit_update_expr(&mut self, update: &UpdateExpr) {
-            if let Expr::Ident(target) = &*update.arg {
-                self.found |= ident_key(target) == *self.local;
-            }
-            update.visit_children_with(self);
-        }
-    }
-    let mut writes = Writes {
-        local,
-        found: false,
-    };
-    stmt.visit_with(&mut writes);
-    writes.found
-}
-
-/// Whether `expr` names the local `local`.
-fn reads_local(expr: &Expr, local: &BindingKey) -> bool {
-    use swc_ecma_visit::{Visit, VisitWith};
-    struct Reads<'k> {
-        local: &'k BindingKey,
-        found: bool,
-    }
-    impl Visit for Reads<'_> {
-        fn visit_ident(&mut self, ident: &Ident) {
-            self.found |= ident_key(ident) == *self.local;
-        }
-    }
-    let mut reads = Reads {
-        local,
-        found: false,
-    };
-    expr.visit_with(&mut reads);
-    reads.found
 }
 
 /// The pieces of a URL up to its query or fragment.

@@ -1741,6 +1741,11 @@ impl CallWalker<'_, '_, '_> {
                 .is_some_and(|test| test.is_conjunct(span)),
             literal_at,
         };
+        self.reader
+            .way_tests
+            .borrow_mut()
+            .entry((guard.site.lo, guard.site.hi))
+            .or_insert_with(|| guard.clone());
         self.ir.guards.push(guard);
     }
 
