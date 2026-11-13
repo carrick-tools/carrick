@@ -14,6 +14,11 @@
 //!
 //! `split_once_timing_log` prints the per-call time of both over the same
 //! fixture. It asserts nothing about time.
+//!
+//! The oracle has learned one rule since c8c654a7, the named catch-all of
+//! carrick#4205 (`*name`, `{*name}`, a trailing `{/*name}`): `split_route`,
+//! `catch_all_prefix` and `is_named_wildcard` below are copies of the
+//! crate's, so the parity proof still covers named wildcards.
 
 use std::time::Instant;
 
@@ -23,7 +28,8 @@ use carrick_match::{
     reportable_agreement, reportable_agreement_with_dispatch,
 };
 
-/// The c8c654a7 matcher, verbatim but for `pub` and the pool's shape.
+/// The c8c654a7 matcher, verbatim but for `pub`, the pool's shape and the
+/// carrick#4205 named catch-all.
 mod frozen {
     use std::collections::HashMap;
 
@@ -41,14 +47,65 @@ mod frozen {
             .or_else(|| agreement_with_wildcards(endpoint_path, call_path))
     }
 
+    /// carrick#4205: `split('/')`, with a trailing `{/*name}` read as the
+    /// segment `*name` after its prefix.
+    fn split_route(path: &str) -> impl Iterator<Item = &str> {
+        let (head, tail) = match optional_wildcard_tail(path) {
+            Some(open) => {
+                let above = &path[..open];
+                (
+                    above.strip_suffix('/').unwrap_or(above),
+                    Some(&path[open + 2..path.len() - 1]),
+                )
+            }
+            None => (path, None),
+        };
+        head.split('/').chain(tail)
+    }
+
+    fn optional_wildcard_tail(path: &str) -> Option<usize> {
+        let body = path.strip_suffix('}')?;
+        let open = body.rfind("{/*")?;
+        is_wildcard_name(&body[open + 3..]).then_some(open)
+    }
+
+    fn is_wildcard_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    }
+
+    fn is_named_wildcard(seg: &str) -> bool {
+        let inner = seg
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or(seg);
+        inner.strip_prefix('*').is_some_and(is_wildcard_name)
+    }
+
+    fn catch_all_prefix(path: &str) -> Option<&str> {
+        if path.ends_with("/*") || path.ends_with("/**") {
+            return Some(path.trim_end_matches("/**").trim_end_matches("/*"));
+        }
+        if path.ends_with("/(.*)") {
+            return Some(path.trim_end_matches("/(.*)"));
+        }
+        if let Some(open) = optional_wildcard_tail(path) {
+            let above = &path[..open];
+            return Some(above.strip_suffix('/').unwrap_or(above));
+        }
+        let (above, last) = path.rsplit_once('/')?;
+        is_named_wildcard(last).then_some(above)
+    }
+
     pub fn path_literal_specificity(path: &str) -> u32 {
-        path.split('/')
+        split_route(path)
             .filter(|seg| is_literal_segment(seg.trim_end_matches('?')))
             .count() as u32
     }
 
     pub fn is_catch_all_path(path: &str) -> bool {
-        path.ends_with("/*") || path.ends_with("/**") || path.ends_with("/(.*)")
+        catch_all_prefix(path).is_some()
     }
 
     pub fn is_unknown_call_path(call_path: &str) -> bool {
@@ -114,12 +171,12 @@ mod frozen {
     }
 
     fn is_wildcard_segment(seg: &str) -> bool {
-        seg == "*" || seg == "**" || seg == "(.*)"
+        seg == "*" || seg == "**" || seg == "(.*)" || is_named_wildcard(seg)
     }
 
     fn agreement_with_params(endpoint_path: &str, call_path: &str) -> Option<u32> {
-        let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
-        let call_segments: Vec<&str> = call_path.split('/').collect();
+        let endpoint_segments: Vec<&str> = split_route(endpoint_path).collect();
+        let call_segments: Vec<&str> = split_route(call_path).collect();
         let endpoint_required_count = endpoint_segments
             .iter()
             .filter(|s| !s.ends_with('?'))
@@ -163,24 +220,18 @@ mod frozen {
                 None => false,
             }
         }
-        if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
-            let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
+        if let Some(prefix) = catch_all_prefix(endpoint_path) {
             return prefix_matches_on_boundary(prefix, call_path)
                 .then(|| path_literal_specificity(prefix));
         }
-        if endpoint_path.ends_with("/(.*)") {
-            let prefix = endpoint_path.trim_end_matches("/(.*)");
-            return prefix_matches_on_boundary(prefix, call_path)
-                .then(|| path_literal_specificity(prefix));
-        }
-        let endpoint_segments: Vec<&str> = endpoint_path.split('/').collect();
-        let call_segments: Vec<&str> = call_path.split('/').collect();
+        let endpoint_segments: Vec<&str> = split_route(endpoint_path).collect();
+        let call_segments: Vec<&str> = split_route(call_path).collect();
         if endpoint_segments.len() != call_segments.len() {
             return None;
         }
         let mut agreement = 0u32;
         for (endpoint_seg, call_seg) in endpoint_segments.iter().zip(call_segments.iter()) {
-            if *endpoint_seg == "*" {
+            if *endpoint_seg == "*" || is_named_wildcard(endpoint_seg) {
                 continue;
             }
             if endpoint_seg != call_seg {
@@ -194,9 +245,8 @@ mod frozen {
     }
 
     fn call_param_over_route_literal(route_path: &str, call_path: &str) -> bool {
-        route_path
-            .split('/')
-            .zip(call_path.split('/'))
+        split_route(route_path)
+            .zip(split_route(call_path))
             .any(|(route, call)| {
                 is_param_segment(call) && is_literal_segment(route.trim_end_matches('?'))
             })
@@ -363,7 +413,7 @@ impl Rng {
 
 /// Segments a route may carry: literals with version segments, the four
 /// param spellings and a rest param, optional markers, every wildcard
-/// token, a named wildcard (a literal to the matcher), a mixed template
+/// token, the named wildcards of carrick#4205, a mixed template
 /// segment, a lookalike prefix and blank segments.
 const ROUTE_SEGMENTS: &[&str] = &[
     "api",
@@ -385,6 +435,8 @@ const ROUTE_SEGMENTS: &[&str] = &[
     "**",
     "(.*)",
     "*slug",
+    "*rest",
+    "{*rest}",
     "v${n}",
     "",
     " ",
@@ -422,6 +474,8 @@ const ODD_PATHS: &[&str] = &[
     "/v2/users/:id",
     "/api/v1/users/:id/orders",
     "/api/v1/users/123/orders",
+    "/v1{/*rest}",
+    "/{/*rest}",
 ];
 
 fn path(rng: &mut Rng, alphabet: &[&str]) -> String {
@@ -523,7 +577,7 @@ fn aimed_at(route: &str) -> [String; 4] {
         .split('/')
         .map(|seg| match seg.trim_end_matches('?') {
             seg if carrick_match::is_param_segment(seg) => "123",
-            "*" | "**" | "(.*)" => "x",
+            seg if carrick_match::is_wildcard_segment(seg) => "x",
             _ => seg,
         })
         .collect::<Vec<_>>()

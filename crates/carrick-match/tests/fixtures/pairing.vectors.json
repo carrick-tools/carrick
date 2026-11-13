@@ -1829,6 +1829,203 @@
         "winners": [],
         "routed": []
       }
+    },
+    {
+      "id": "named-catch-all-pairs-a-deeper-call",
+      "source": "carrick#4205: path-to-regexp v8 (Express 5) named wildcard",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/v1/*rest"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/v1/users/7"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "optional-named-catch-all-pairs-the-bare-prefix",
+      "source": "carrick#4205: path-to-regexp v8 (Express 5) named wildcard",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "ALL",
+            "path": "/proxy{/*splat}"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/proxy"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "optional-named-catch-all-pairs-a-deeper-call",
+      "source": "carrick#4205: path-to-regexp v8 (Express 5) named wildcard",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "ALL",
+            "path": "/proxy{/*splat}"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "POST",
+          "path": "/proxy/a/b"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "bare-named-catch-all-route-corroborates-nothing",
+      "source": "carrick#4205: path-to-regexp v8 (Express 5) named wildcard",
+      "input": {
+        "producers": [
+          {
+            "service": "spa",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/*splat"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/api/x"
+        }
+      },
+      "expect": {
+        "outcome": "no_literal_agreement",
+        "winners": [],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "catch_all_route",
+            "agreement": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "concrete-route-beats-a-named-catch-all",
+      "source": "carrick#4205: path-to-regexp v8 (Express 5) named wildcard",
+      "input": {
+        "producers": [
+          {
+            "service": "gateway",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/v1/*rest"
+          },
+          {
+            "service": "users",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/v1/users/:id"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/v1/users/7"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2
+          }
+        ]
+      }
     }
   ],
   "identity": [
@@ -1887,6 +2084,14 @@
     {
       "path": "/v${n}/users",
       "route_identity": "/v${n}/users"
+    },
+    {
+      "path": "/v1/*rest",
+      "route_identity": "/v1/*rest"
+    },
+    {
+      "path": "/proxy{/*splat}",
+      "route_identity": "/proxy{/*splat}"
     }
   ],
   "canonical": [
