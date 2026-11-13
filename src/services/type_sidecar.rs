@@ -7893,6 +7893,61 @@ mod tests {
         }
     }
 
+    /// carrick#4196: a caller row whose owner never asked for a body keeps
+    /// its response entry where the engine named the body member it read, or
+    /// decided it cannot say which member holds the body
+    /// (`body_member_undecided`, a bare `unknown`), so the row reads
+    /// unverifiable like a model-owned one. Any other answer is the wrapper's.
+    #[test]
+    fn hand_back_bodies_keeps_a_named_member_and_a_decided_undecided_member() {
+        let ask = |alias: &str| InferRequestItem {
+            member: None,
+            result: None,
+            file_path: "src/app.ts".to_string(),
+            line_number: 1,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+            route_path: None,
+            result_unanswered: false,
+            through_call: None,
+        };
+        let finding = |reason: &str| TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: reason.to_string(),
+            detail: None,
+        };
+        let mut named = inferred("Named", None, None);
+        named.body_member = Some("json".to_string());
+        let mut undecided = inferred("Undecided", None, None);
+        undecided.type_string = "unknown".to_string();
+        undecided.any_provenance = vec![finding("body_member_undecided")];
+        let mut envelope = inferred("Envelope", None, None);
+        envelope.type_string = "unknown".to_string();
+        envelope.any_provenance = vec![finding("machinery_envelope")];
+        let mut shaped = inferred("Shaped", None, None);
+        shaped.any_provenance = vec![finding("body_member_undecided")];
+        let mut elsewhere = inferred("Elsewhere", None, None);
+        elsewhere.type_string = "unknown".to_string();
+        elsewhere.any_provenance = vec![finding("body_member_undecided")];
+        let asks = [
+            ask("Named"),
+            ask("Undecided"),
+            ask("Envelope"),
+            ask("Shaped"),
+        ];
+        let kept = hand_back_bodies(&asks, &[named, undecided, envelope, shaped, elsewhere]);
+        assert_eq!(
+            kept.into_iter().collect::<Vec<_>>(),
+            ["Named".to_string(), "Undecided".to_string()]
+        );
+    }
+
     /// #306: the timeline shape. The LLM anchor is the bare element
     /// (`TimelineEvent` from `TimelineEvent[]`), so the explicit bundle would
     /// erase the array; the same-alias inference resolved the use site to the

@@ -10,7 +10,7 @@
  * decided from the wrapper's own code, never from the member's name. Where
  * the wrapper cannot be read (a library hands the object back, or the
  * returns disagree), the site states no response contract
- * (`machinery_envelope`), so the object is never compared.
+ * (`body_member_undecided`), so the object is never compared.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -198,7 +198,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     );
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
     assert.strictEqual(inferred.body_member, undefined);
   });
 
@@ -210,7 +210,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     );
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
     assert.strictEqual(inferred.body_member, undefined);
   });
 
@@ -218,7 +218,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     const inferred = await infer('Endpoint_Reply_Response_Hook', HOOK_LINE, 'action.run()');
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
     assert.strictEqual(inferred.body_member, undefined);
   });
 

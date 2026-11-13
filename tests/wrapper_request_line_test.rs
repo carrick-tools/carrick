@@ -1003,6 +1003,26 @@ fn a_hand_back_object_with_no_decided_body_member_is_unverifiable() {
     );
 }
 
+/// `callEitherPlain` is `callEither` with no options of its own, so the
+/// request summaries own its caller's row (carrick#4196). The engine decides
+/// it cannot say which member holds the body (`body_member_undecided`), and
+/// that row keeps its response entry, `unknown`, and reads `unverifiable`
+/// like the model-owned `callEither` caller.
+#[test]
+fn a_summaries_owned_undecided_hand_back_is_kept_and_unverifiable() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:19")),
+        [("response".to_string(), "unverifiable".to_string())]
+    );
+    let kept = hand_back_response(&format!("{HAND_BACK_APP}:19"));
+    assert!(kept.is_some(), "app.ts:19 keeps a response entry");
+    assert_eq!(kept, hand_back_response(&format!("{HAND_BACK_APP}:9")));
+}
+
 /// The response type the `web` consumer entry at `site` carries.
 fn hand_back_response(site: &str) -> Option<String> {
     hand_back_blobs()

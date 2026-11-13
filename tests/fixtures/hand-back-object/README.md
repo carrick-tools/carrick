@@ -11,7 +11,7 @@ and each caller's response type is the call's value.
   `api`.
 - `app.ts:9` calls `callEither`, whose two returns fill different members
   from the body read: no member is decided, so the site states no response
-  contract (`machinery_envelope`) and the pair is `unverifiable`.
+  contract (`body_member_undecided`) and the pair is `unverifiable`.
 
 - `app.ts:14` calls `callPlain`, which fetches with no options of its own,
   so the request summaries own the caller's row (carrick#4196). The
