@@ -867,3 +867,41 @@ fn a_hand_back_object_with_no_decided_body_member_is_unverifiable() {
         [("response".to_string(), "unverifiable".to_string())]
     );
 }
+
+/// The response type the `web` consumer entry at `site` carries.
+fn hand_back_response(site: &str) -> Option<String> {
+    hand_back_blobs()
+        .get("web")
+        .and_then(|blob| blob["type_manifest"].as_array())
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["role"] == "consumer"
+                && entry["type_kind"] == "response"
+                && format!(
+                    "{}:{}",
+                    entry["file_path"].as_str().unwrap_or_default(),
+                    entry["line_number"].as_u64().unwrap_or_default()
+                ) == site
+        })
+        .and_then(|entry| entry["expanded_definition"].as_str().map(str::to_string))
+}
+
+/// `callPlain` fetches with no options of its own, so the request summaries
+/// own its caller's row (carrick#4196). The compiler engine's answer at the
+/// call names the member it read, so that caller takes the same response
+/// type, and the same verdict, as a caller whose row the model owns.
+#[test]
+fn a_hand_back_caller_gets_one_response_type_whoever_owns_its_row() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let modelled = hand_back_response(&format!("{HAND_BACK_APP}:4"));
+    assert!(modelled.is_some(), "app.ts:4 carries a response type");
+    assert_eq!(hand_back_response(&format!("{HAND_BACK_APP}:14")), modelled);
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:14")),
+        [("response".to_string(), "compatible".to_string())]
+    );
+}
