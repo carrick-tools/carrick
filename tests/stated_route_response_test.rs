@@ -97,12 +97,12 @@ fn a_route_the_trace_writes_types_its_response_from_its_handler() {
     let item = "{ id: string; connected: boolean; }";
     assert_eq!(
         typed("/api/v1/items/:id"),
-        ("explicit".to_string(), Some(item.to_string())),
+        ("implicit".to_string(), Some(item.to_string())),
         "{types:#?}"
     );
     assert_eq!(
         typed("/api/v1/items"),
-        ("explicit".to_string(), Some(format!("{item}[]"))),
+        ("implicit".to_string(), Some(format!("{item}[]"))),
         "{types:#?}"
     );
 }
