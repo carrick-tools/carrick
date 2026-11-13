@@ -23,7 +23,7 @@ import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { splitRemote } from "../git-remote.ts";
-import { factsEnabled } from "./enabled.ts";
+import { contractLinesEnabled, factsEnabled } from "./enabled.ts";
 import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
@@ -98,7 +98,7 @@ function stagedUrlAllowed(url: string): boolean {
  * readable file holding both. The cloud answers `unchanged` only when both
  * match, so a wording fix (a new writer) reaches this file without a new scan.
  */
-async function knownFile(root: string): Promise<{ digest: string; writer: number } | null> {
+async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest: string; writer: number; contract: boolean } | null> {
   const file = factsPath(root);
   if (!fs.existsSync(file)) return null;
   const sqlite = await loadSqlite();
@@ -107,10 +107,15 @@ async function knownFile(root: string): Promise<{ digest: string; writer: number
   try {
     const open = new sqlite.DatabaseSync(file, { readOnly: true });
     db = open;
-    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
+    const meta = new Map(open.prepare("SELECT key, value FROM meta WHERE key IN ('digest', 'writer', 'contract')").all().map((raw) => [String(raw["key"]), String(raw["value"])]));
     const digest = meta.get("digest");
     const writer = Number(meta.get("writer"));
-    return digest && Number.isInteger(writer) ? { digest, writer } : null;
+    if (!digest || !Number.isInteger(writer)) return null;
+    // With the contract line on, a file an older package built has no `contracts`
+    // table to read from: no known digest, so the cloud sends the whole file.
+    if (contractLinesEnabled(env) && !open.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contracts'").get()) return null;
+    // Whether the file carries contract rows follows the file, not the switch.
+    return { digest, writer, contract: meta.get("contract") === "1" };
   } catch {
     return null;
   } finally {
@@ -135,13 +140,13 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
       log("no single project for this workspace; no fact file");
       return "none";
     }
-    const known = await knownFile(root);
+    const known = await knownFile(root, env);
     const response = await request(`${API_BASE}/mcp/facts`, {
       method: "POST",
       redirect: "error",
       signal: AbortSignal.timeout(30_000),
       headers: { Authorization: `Bearer ${credential.token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ project, schema: SCHEMA, ...(known ? { known_digest: known.digest, known_writer: known.writer } : {}) }),
+      body: JSON.stringify({ project, schema: SCHEMA, ...(known ? { known_digest: known.digest, known_writer: known.writer, ...(known.contract ? { known_contract: true } : {}) } : {}) }),
     });
     if (response.status === 404) {
       log("facts route not found; no fact file");
@@ -185,7 +190,7 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const text = (gzipped ? zlib.gunzipSync(bytes) : bytes).toString("utf8");
     const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown }> };
     const names = (header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string");
-    const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now);
+    const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now, { contract: answer["contract"] === true });
     return built ? "written" : "none";
   } catch (error) {
     log("fact refresh failed", String(error));

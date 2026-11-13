@@ -68,6 +68,38 @@ export type PkgRow = {
   text: string;
 };
 
+/** One printed type of a contract row's other side (`k: "contract"`, group), as the wire states it. */
+export type ContractGroup = {
+  type: string;
+  symbol: string | null;
+  home: { file: string; line: number } | null;
+  places: Array<{ service: string; repo: string; file: string; line: number | null; loc: string }>;
+  total: number;
+  shown: number;
+  lead: string | null;
+  more: string | null;
+  tail: string | null;
+  shortened: boolean;
+};
+
+/** A contract row (`k: "contract"`): the other end of an operation and its type. */
+export type ContractRow = {
+  side: "producer" | "consumer";
+  protocol: string;
+  label: string;
+  direction: "request" | "response";
+  service: string;
+  repo: string;
+  file: string;
+  line: number | null;
+  name: string | null;
+  site: string | null;
+  locator: "registration" | "call";
+  groups: ContractGroup[];
+  untyped: Array<{ service: string; repo: string; file: string; line: number | null; reason: string }>;
+  total: number;
+};
+
 /** This package's table layout; bumped with every table a new row kind adds. */
 export const LOCAL_LAYOUT = 3;
 
@@ -115,6 +147,12 @@ export type FactStore = {
   declaredOnlyElsewhere: (names: readonly string[], repo: string, file: string) => Set<string>;
   /** The `pkg` row of a package, or null. */
   packageRow: (name: string) => PkgRow | null;
+  /**
+   * The contract rows of `file` in `repo`, in wire order. `[]` for a file built
+   * without the `contracts` table (an older file): its statement is prepared on
+   * the first call, never in `openFacts`, so such a file opens as it always did.
+   */
+  contracts: (repo: string, file: string) => ContractRow[];
   close: () => void;
 };
 
@@ -170,6 +208,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
       "SELECT name FROM names WHERE name IN (SELECT value FROM json_each(?)) GROUP BY name HAVING SUM(repo = ? AND file = ?) = 0",
     );
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
+    let contracts: ReturnType<typeof open.prepare> | null | undefined;
     handed = true;
     return {
       meta,
@@ -200,6 +239,18 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         const raw = packageRow.get(name);
         if (!raw) return null;
         return { package: String(raw["package"]), services: JSON.parse(String(raw["services"])) as PkgRow["services"], text: String(raw["text"]) };
+      },
+      contracts: (repo, rel) => {
+        if (contracts === undefined) {
+          try {
+            contracts = open.prepare("SELECT row FROM contracts WHERE repo = ? AND file = ? ORDER BY id");
+          } catch {
+            // No table: a file an older package built.
+            contracts = null;
+          }
+        }
+        if (contracts === null) return [];
+        return contracts.all(repo, rel).map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
       },
       close: () => open.close(),
     };
@@ -234,9 +285,10 @@ export type FactHeader = {
  * Build the fact file at `dest` from NDJSON `text` (header line, then rows),
  * written under a temporary name and renamed. `local` maps each repo to its
  * main checkout here. Returns the header, or null when the text is not a
- * schema this package reads (nothing is written then).
+ * schema this package reads (nothing is written then). `options.contract`:
+ * the cloud's answer said this file carries contract rows; it is kept in `meta`.
  */
-export async function buildFacts(text: string, dest: string, local: LocalRepo[], fetchedAt: string): Promise<FactHeader | null> {
+export async function buildFacts(text: string, dest: string, local: LocalRepo[], fetchedAt: string, options: { contract?: boolean } = {}): Promise<FactHeader | null> {
   const lines = text.split("\n").filter((line) => line.length > 0);
   if (lines.length === 0) return null;
   const header = JSON.parse(lines[0]!) as FactHeader;
@@ -250,7 +302,7 @@ export async function buildFacts(text: string, dest: string, local: LocalRepo[],
   const temp = `${dest}.${process.pid}.tmp`;
   fs.rmSync(temp, { force: true });
   try {
-    writeFactsDatabase(sqlite, temp, header, lines, local, fetchedAt);
+    writeFactsDatabase(sqlite, temp, header, lines, local, fetchedAt, options.contract === true);
     fs.renameSync(temp, dest);
   } catch (error) {
     // No half-built file is left behind, whatever failed.
@@ -261,7 +313,7 @@ export async function buildFacts(text: string, dest: string, local: LocalRepo[],
 }
 
 /** The row kinds this package reads. */
-const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg"]);
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract"]);
 
 const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
 const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
@@ -279,10 +331,10 @@ const someOf = (value: unknown, each: (entry: Record<string, unknown>) => boolea
  * that does not is skipped at ingest, so no line prints from a half row.
  */
 function wholeRow(raw: Record<string, unknown>): boolean {
-  if (!isText(raw["text"])) return false;
   switch (raw["k"]) {
     case "op":
       return (
+        isText(raw["text"]) &&
         (raw["side"] === "producer" || raw["side"] === "consumer") &&
         isText(raw["protocol"]) &&
         isText(raw["label"]) &&
@@ -297,6 +349,7 @@ function wholeRow(raw: Record<string, unknown>): boolean {
     // An fn or name row states a line, so it needs one (R33.7, F15).
     case "fn":
       return (
+        isText(raw["text"]) &&
         isText(raw["repo"]) &&
         isText(raw["file"]) &&
         Number.isInteger(raw["line"]) &&
@@ -305,9 +358,10 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         someOf(raw["others"], (other) => isText(other["repo"]) && isText(other["file"]) && isLine(other["line"]) && isNameOrNull(other["name"]))
       );
     case "name":
-      return isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && Number.isInteger(raw["line"]);
+      return isText(raw["text"]) && isText(raw["name"]) && isText(raw["repo"]) && isText(raw["file"]) && Number.isInteger(raw["line"]);
     case "pkg":
       return (
+        isText(raw["text"]) &&
         isText(raw["package"]) &&
         allOf(
           raw["services"],
@@ -319,13 +373,41 @@ function wholeRow(raw: Record<string, unknown>): boolean {
             (entry["others_text"] === undefined || isText(entry["others_text"])),
         )
       );
+    // A contract row carries no top-level `text`: its words are in its groups.
+    case "contract":
+      return (
+        (raw["side"] === "producer" || raw["side"] === "consumer") &&
+        isText(raw["protocol"]) &&
+        isText(raw["label"]) &&
+        (raw["direction"] === "request" || raw["direction"] === "response") &&
+        isText(raw["service"]) &&
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        isLine(raw["line"]) &&
+        isNameOrNull(raw["name"]) &&
+        (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
+        (raw["locator"] === "registration" || raw["locator"] === "call") &&
+        Number.isInteger(raw["total"]) &&
+        allOf(raw["untyped"], (entry) => isText(entry["repo"]) && isText(entry["file"]) && isLine(entry["line"])) &&
+        Array.isArray(raw["groups"]) &&
+        raw["groups"].length > 0 &&
+        allOf(raw["groups"], (group) => {
+          if (!isText(group["type"]) || !Number.isInteger(group["total"]) || !Number.isInteger(group["shown"])) return false;
+          if (!allOf(group["places"], (place) => isText(place["repo"]) && isText(place["file"]) && isText(place["loc"]) && isLine(place["line"]))) return false;
+          const places = (group["places"] as unknown[]).length;
+          const shown = Number(group["shown"]);
+          if (shown < 0 || shown > places) return false;
+          // A printed group carries its whole sentence; a request group prints none.
+          return shown === 0 || (typeof group["lead"] === "string" && typeof group["more"] === "string" && typeof group["tail"] === "string");
+        })
+      );
     default:
       return false;
   }
 }
 
 /** Write the fact database at `temp` from the header and NDJSON row lines. */
-function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string): void {
+function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, lines: string[], local: LocalRepo[], fetchedAt: string, contract: boolean): void {
   const db = new sqlite.DatabaseSync(temp);
   try {
     db.exec(`
@@ -340,6 +422,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       );
       CREATE TABLE names (id INTEGER PRIMARY KEY, name TEXT, repo TEXT, file TEXT, line INTEGER, text TEXT);
       CREATE TABLE pkgs (id INTEGER PRIMARY KEY, package TEXT, services TEXT, text TEXT);
+      CREATE TABLE contracts (
+        id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, side TEXT, protocol TEXT, label TEXT,
+        direction TEXT, name TEXT, site TEXT, row TEXT
+      );
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     // Each repo's index commit, which the peer proof checks files against
@@ -358,6 +444,8 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       built_at: header.built_at,
       fetched_at: fetchedAt,
       commits: JSON.stringify(commits),
+      // Set when the cloud's answer said this file carries contract rows (`known_contract` on the next fetch).
+      ...(contract ? { contract: "1" } : {}),
     })) {
       meta.run(key, value);
     }
@@ -369,6 +457,9 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const fn = db.prepare("INSERT INTO fns (repo, file, line, name, others, total, text) VALUES (?, ?, ?, ?, ?, ?, ?)");
     const declared = db.prepare("INSERT INTO names (name, repo, file, line, text) VALUES (?, ?, ?, ?, ?)");
     const pkg = db.prepare("INSERT INTO pkgs (package, services, text) VALUES (?, ?, ?)");
+    const contractRow = db.prepare(
+      "INSERT INTO contracts (repo, file, line, side, protocol, label, direction, name, site, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
     db.exec("BEGIN");
     let skipped = 0;
     for (const line of lines.slice(1)) {
@@ -379,6 +470,21 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
       if (!KNOWN_KINDS.has(String(raw["k"]))) continue;
       if (!wholeRow(raw)) {
         skipped += 1;
+        continue;
+      }
+      if (raw["k"] === "contract") {
+        contractRow.run(
+          String(raw["repo"]),
+          String(raw["file"]),
+          Number(raw["line"]),
+          String(raw["side"]),
+          String(raw["protocol"]),
+          String(raw["label"]),
+          String(raw["direction"]),
+          typeof raw["name"] === "string" ? raw["name"] : null,
+          typeof raw["site"] === "string" ? raw["site"] : null,
+          JSON.stringify(raw),
+        );
         continue;
       }
       if (raw["k"] === "fn") {
@@ -417,7 +523,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     }
     db.exec("COMMIT");
     if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file);");
   } finally {
     closeQuietly(db);
   }
