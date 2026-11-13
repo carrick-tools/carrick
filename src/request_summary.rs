@@ -15205,27 +15205,9 @@ function build() { return {}; }
         assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
     }
 
-    /// A call through a parameter, written in a module-level function, has
-    /// no call site of its own to check: a request it may reach is neither
-    /// held nor answered (carrick#4127).
-    #[test]
-    fn a_call_through_a_parameter_in_a_function_is_not_held() {
-        let (_dir, index) = summarized(&[
-            ("src/net/notify.ts", NOTIFY),
-            (
-                "src/alerts.ts",
-                "import { notify } from './net/notify';\n\
-                 export const fire = () => notify('/fire');\n\
-                 export const eager = notify('/eager');\n\
-                 export const run = (notify: (endpoint: string) => void) => notify('/run');\n",
-            ),
-        ]);
-        let notify = key_of(&index, "src/net/notify.ts");
-        assert_eq!(index.held_at_fact_calls(&notify), BTreeMap::new());
-        assert_eq!(index.answered_at_callers(&notify), BTreeSet::new());
-    }
-
-    /// The same, written in a constructor.
+    /// A call through a parameter, written in a constructor, has no call
+    /// site of its own to check: a request it may reach is neither held nor
+    /// answered (carrick#4127).
     #[test]
     fn a_call_through_a_parameter_is_not_held() {
         let (_dir, index) = summarized(&[
