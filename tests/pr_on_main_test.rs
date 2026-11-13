@@ -4837,7 +4837,7 @@ async fn reach_a_lockfile_move_of_a_loaded_package_stays_whole() {
 /// edits the consumer before main's commit.
 async fn main_copy_hiding_the_wrong_verb(
     on_main_branch: impl Fn(&Path),
-) -> (tempfile::TempDir, PathBuf, Store) {
+) -> (Workspace, PathBuf, Store) {
     let (tmp, producer, consumer) = setup();
     let store = Store::default();
     scan(&store, &producer).await;
@@ -5096,9 +5096,7 @@ fn set_root_version(repo: &Path, version: &str) {
 /// scanned, main moves to B by the bump alone and is scanned again, and the
 /// consumer's copy is put back at A, as a scoped push that carries it leaves
 /// it. `catalog-web` sits at B. The run's base is B.
-async fn carried_across_a_version_bump(
-    main_verb: &str,
-) -> (tempfile::TempDir, PathBuf, Store, String) {
+async fn carried_across_a_version_bump(main_verb: &str) -> (Workspace, PathBuf, Store, String) {
     let (tmp, _, _) = setup();
     let repo = two_service_repo(tmp.path());
     let consumer = repo.join("inventory-svc");
