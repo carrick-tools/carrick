@@ -34,7 +34,9 @@
 //! | `retireParcel` | nowhere admitted | `dist/schema.graphql:4` |
 //!
 //! Without the package in detection no file is admitted for its schema
-//! fields, and every field is served at its printed schema line.
+//! fields, and a model answer can leave a field out. Either way the fields
+//! are served where they are resolved: the printed schema says which root
+//! type each fields object belongs to (carrick#1295).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -170,34 +172,82 @@ fn a_code_first_schema_is_served_where_its_fields_are_resolved() {
     );
 }
 
-#[test]
-fn without_the_builder_package_in_detection_no_file_is_admitted_for_its_schema() {
+/// The rows of the answer key above.
+fn answer_key() -> BTreeSet<(String, String)> {
+    rows(&[
+        ("query|health", "apps/api/src/graphql/kit.ts:19"),
+        ("query|parcels", "apps/api/src/graphql/parcels/queries.ts:8"),
+        ("query|parcel", "apps/api/src/graphql/parcels/queries.ts:12"),
+        (
+            "query|heaviestWeight",
+            "apps/api/src/graphql/parcels/queries.ts:18",
+        ),
+        (
+            "query|recentParcels",
+            "apps/api/src/graphql/parcels/queries.ts:23",
+        ),
+        (
+            "query|parcelCount",
+            "apps/api/src/graphql/parcels/queries.ts:27",
+        ),
+        (
+            "query|archivedParcels",
+            "apps/api/src/graphql/parcels/queries.ts:30",
+        ),
+        (
+            "query|pendingParcels",
+            "apps/api/src/graphql/parcels/queries.ts:34",
+        ),
+        (
+            "mutation|dispatchParcel",
+            "apps/api/src/graphql/parcels/mutations.ts:5",
+        ),
+        ("mutation|recallParcel", "apps/api/dist/schema.graphql:3"),
+        ("mutation|retireParcel", "apps/api/dist/schema.graphql:4"),
+    ])
+}
+
+/// The fixture's cassettes, copied to a temp dir and edited by `edit`.
+fn edited_cassettes(edit: impl FnOnce(&Path)) -> tempfile::TempDir {
     let cassettes = tempfile::tempdir().expect("temp cassette dir");
     copy_tree(&fixture_dir().join("__llm__"), cassettes.path());
-    let detection = cassettes
-        .path()
-        .join("framework-detect/framework-detect.json");
-    let mut answer: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&detection).expect("read detection"))
-            .expect("parse detection");
-    answer["data_fetchers"] = serde_json::json!([]);
-    std::fs::write(&detection, serde_json::to_vec(&answer).unwrap()).expect("write detection");
+    edit(cassettes.path());
+    cassettes
+}
 
-    let printed = "apps/api/dist/schema.graphql";
-    assert_eq!(
-        scan_graphql_endpoints(cassettes.path()),
-        rows(&[
-            ("query|archivedParcels", &format!("{printed}:13")),
-            ("query|health", &format!("{printed}:14")),
-            ("query|heaviestWeight", &format!("{printed}:15")),
-            ("query|parcel", &format!("{printed}:16")),
-            ("query|parcelCount", &format!("{printed}:17")),
-            ("query|parcels", &format!("{printed}:18")),
-            ("query|pendingParcels", &format!("{printed}:19")),
-            ("query|recentParcels", &format!("{printed}:20")),
-            ("mutation|dispatchParcel", &format!("{printed}:2")),
-            ("mutation|recallParcel", &format!("{printed}:3")),
-            ("mutation|retireParcel", &format!("{printed}:4")),
-        ])
-    );
+fn edit_json(file: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut answer: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(file).expect("read cassette"))
+            .expect("parse cassette");
+    edit(&mut answer);
+    std::fs::write(file, serde_json::to_vec(&answer).unwrap()).expect("write cassette");
+}
+
+/// Without the builder's package in detection, no field module is admitted
+/// to the model for its schema (carrick#1157's gate). The fields are still
+/// located: the printed schema says which root type each field object
+/// belongs to, and the module builds it at module scope (carrick#1295).
+#[test]
+fn without_the_builder_package_in_detection_fields_are_still_located_from_the_schema() {
+    let cassettes = edited_cassettes(|dir| {
+        edit_json(
+            &dir.join("framework-detect/framework-detect.json"),
+            |answer| {
+                answer["data_fetchers"] = serde_json::json!([]);
+            },
+        );
+    });
+    assert_eq!(scan_graphql_endpoints(cassettes.path()), answer_key());
+}
+
+/// A field module the model is asked about, answering with no field list,
+/// still serves its fields where they are resolved (carrick#1295).
+#[test]
+fn a_field_the_model_leaves_out_is_located_from_the_schema() {
+    let cassettes = edited_cassettes(|dir| {
+        edit_json(&dir.join("analyze-file/queries.json"), |answer| {
+            answer["graphql_operations"] = serde_json::json!([]);
+        });
+    });
+    assert_eq!(scan_graphql_endpoints(cassettes.path()), answer_key());
 }

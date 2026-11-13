@@ -1,0 +1,15 @@
+{
+  "services": [
+    {
+      "serviceName": "shipping-api",
+      "directory": "apps/api",
+      "tsconfig": "tsconfig.json",
+      "graphqlSchemas": ["apps/api/dist/schema.graphql"]
+    },
+    {
+      "serviceName": "shipping-web",
+      "directory": "apps/web",
+      "internalEnvVars": ["SHIPPING_API_URL"]
+    }
+  ]
+}

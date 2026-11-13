@@ -476,6 +476,7 @@ fn site_consumer(
         payload_type_source: None,
         resolver_file: None,
         resolver_line: None,
+        schema_keyed_place: None,
         response_type_symbol: None,
         response_type_source: None,
         consumer_located_type_symbol: None,

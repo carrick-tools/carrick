@@ -6736,6 +6736,100 @@ fn yield_bus_to_sockets(extractions: &mut ProtocolExtractions, repo_path: &str, 
     extractions.socket_sites = sites;
 }
 
+/// Where the schema-keyed reader placed one root field (carrick#1295): the
+/// file as the scan walked it and the line of the field's property.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaKeyedClaim {
+    key: OperationKey,
+    file: String,
+    line: u32,
+}
+
+/// The root fields the service's code defines, keyed by its own schema
+/// ([`crate::graphql_resolver_anchor::root_field_claims`], carrick#1295),
+/// read over every file of the service outside its mock and test trees. Run
+/// only when the service has schema fields to place.
+fn schema_keyed_root_fields(
+    repo_path: &str,
+    service: &Config,
+    files: &[PathBuf],
+    graphql: &crate::graphql::GraphqlExtraction,
+    service_modules: &crate::workspace_resolver::WorkspaceIndex,
+) -> Vec<SchemaKeyedClaim> {
+    if graphql.producers.is_empty() || graphql.schema_types.roots.is_empty() {
+        return Vec::new();
+    }
+    let mut reader =
+        crate::graphql_schema_builder::PackageValueReader::new(Some(service_modules.clone()));
+    let mut claims = Vec::new();
+    for file in files {
+        if protocol_producer_provenance(file, repo_path, service).is_mock() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for claim in crate::graphql_resolver_anchor::root_field_claims(
+            file,
+            &content,
+            &graphql.schema_types,
+            &mut reader,
+        ) {
+            claims.push(SchemaKeyedClaim {
+                key: OperationKey::graphql(claim.kind, claim.field),
+                file: file.to_string_lossy().into_owned(),
+                line: claim.line,
+            });
+        }
+    }
+    debug!(
+        claims = claims.len(),
+        "graphql root fields placed by the schema-keyed reader"
+    );
+    claims
+}
+
+/// Records where the schema-keyed reader placed each producer
+/// (carrick#1295): one place, or `Ambiguous` when two claims disagree on
+/// `(file, line)`. This moves where the row is served and nothing else: the
+/// model's resolver location, which anchors the producer's type, is joined
+/// by [`merge_graphql_resolver_locations`] exactly as without the reader.
+fn apply_schema_keyed_claims(
+    graphql: &mut crate::graphql::GraphqlExtraction,
+    claims: &[SchemaKeyedClaim],
+) {
+    use crate::graphql::SchemaKeyedPlace;
+    let by_key: HashMap<String, usize> = graphql
+        .producers
+        .iter()
+        .enumerate()
+        .map(|(idx, op)| (op.key.canonical(), idx))
+        .collect();
+    for claim in claims {
+        let Some(&idx) = by_key.get(&claim.key.canonical()) else {
+            continue;
+        };
+        let producer = &mut graphql.producers[idx];
+        let place = SchemaKeyedPlace::At {
+            file: PathBuf::from(&claim.file),
+            line: claim.line,
+        };
+        producer.schema_keyed_place = match &producer.schema_keyed_place {
+            None => Some(place),
+            Some(first) if *first == place => Some(place),
+            Some(first) => {
+                debug!(
+                    op = %claim.key.canonical(),
+                    first = ?first,
+                    second = %format!("{}:{}", claim.file, claim.line),
+                    "conflicting schema-keyed graphql field claims"
+                );
+                Some(SchemaKeyedPlace::Ambiguous)
+            }
+        };
+    }
+}
+
 /// The directories to walk for a service's own GraphQL SDL files
 /// ([`crate::graphql::service_walk_roots`]): its directory, leaving out its
 /// nested services' (carrick#553), plus its `include` roots.
@@ -6775,6 +6869,8 @@ fn scan_protocol_extractions(
     graphql.producers.retain(|op| {
         declared.files.contains(&op.file_path) || !exclusion.excludes(&op.file_path, false)
     });
+    let structural = schema_keyed_root_fields(repo_path, service, files, &graphql, service_modules);
+    apply_schema_keyed_claims(&mut graphql, &structural);
     merge_graphql_resolver_locations(&mut graphql, file_results);
     // The detected socket clients gate the pass's unknown-direction half; its
     // Socket.IO rules are independent of them (carrick#1281).
@@ -8578,7 +8674,8 @@ fn settle_graphql_documents(
     let label = service.service_name.as_deref().unwrap_or("(root)");
     // A schema the service's walk found is one it serves only with evidence
     // that it serves a schema at all (carrick#1189): it declares one, it serves
-    // HTTP routes, or the model joined a resolver or backing type to a field.
+    // HTTP routes, the model joined a resolver or backing type to a field, or
+    // the schema-keyed reader placed one in its code (carrick#1295).
     // A client app with a vendor schema copied into its tree has none of
     // these. Any HTTP route is broader than a GraphQL server (a backend-for-
     // frontend with a vendor copy has one), but it keeps an SDL-first server's
@@ -8586,10 +8683,13 @@ fn settle_graphql_documents(
     // with a detected GraphQL-server signal.
     let serves_schema = !service.graphql_schemas.is_empty()
         || !mount_graph.endpoints.is_empty()
-        || graphql
-            .producers
-            .iter()
-            .any(|producer| producer.resolver_file.is_some());
+        || graphql.producers.iter().any(|producer| {
+            producer.resolver_file.is_some()
+                || matches!(
+                    producer.schema_keyed_place,
+                    Some(crate::graphql::SchemaKeyedPlace::At { .. })
+                )
+        });
     let unserved = catalogue.settle_walked_schemas(label, graphql, serves_schema);
     if unserved > 0 {
         info!(
@@ -8731,6 +8831,20 @@ fn fold_graphql_transport_calls(
     });
 }
 
+/// Where a GraphQL producer row is served: the schema-keyed reader's place
+/// first (carrick#1295), with two of them keeping the row on its schema line;
+/// otherwise the resolver the model located (carrick#1157); otherwise the
+/// schema line. Only the row reads this: the producer's type stays anchored
+/// at `resolver_file`/`resolver_line` or the schema.
+fn graphql_producer_row_place(op: &crate::graphql::GraphqlOp) -> (&Path, u32) {
+    use crate::graphql::SchemaKeyedPlace;
+    match (&op.schema_keyed_place, &op.resolver_file, op.resolver_line) {
+        (Some(SchemaKeyedPlace::At { file, line }), _, _) => (file, *line),
+        (None, Some(file), Some(line)) => (file, line),
+        _ => (&op.file_path, op.line),
+    }
+}
+
 /// Where a GraphQL, socket or pub/sub producer row's evidence comes from
 /// (#380), classified as an HTTP route's is
 /// ([`crate::file_finder::endpoint_provenance`]): from the row's file relative
@@ -8832,10 +8946,8 @@ fn append_deterministic_protocol_operations(
             .extend(graphql.producers.iter().map(|op| {
                 // The schema states the field, the model only places the
                 // resolver, so the row is the schema's either way (carrick#3091).
-                let row = match (&op.resolver_file, op.resolver_line) {
-                    (Some(file), Some(line)) => to_producer(op.key.clone(), file, line),
-                    _ => to_producer(op.key.clone(), &op.file_path, op.line),
-                };
+                let (file, line) = graphql_producer_row_place(op);
+                let row = to_producer(op.key.clone(), file, line);
                 ApiEndpointDetails {
                     resolution_source: Some(
                         crate::agents::file_analyzer_agent::ResolutionSource::GraphqlSchema,
@@ -27043,6 +27155,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: None,
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -27073,6 +27186,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: payload_source.map(String::from),
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -27132,7 +27246,7 @@ unfollowed_member_calls_total: 0,
                 "src/gql.ts",
                 None,
             )],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -27182,7 +27296,7 @@ unfollowed_member_calls_total: 0,
                 "src/gql.ts",
                 None,
             )],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -27210,7 +27324,7 @@ unfollowed_member_calls_total: 0,
                 "./src/gql.ts",
                 None,
             )],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -27234,7 +27348,7 @@ unfollowed_member_calls_total: 0,
                 Some("Order"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         fold_graphql_transport_calls(&mut mount_graph, &graphql);
@@ -27275,7 +27389,7 @@ unfollowed_member_calls_total: 0,
                 "src/gql.ts",
                 None,
             )],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         settle_graphql_documents(
@@ -27496,6 +27610,7 @@ unfollowed_member_calls_total: 0,
             payload_type_source: None,
             resolver_file: None,
             resolver_line: None,
+            schema_keyed_place: None,
             response_type_symbol: None,
             response_type_source: None,
             consumer_located_type_symbol: None,
@@ -31252,6 +31367,112 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
+    /// One file's analysis naming `field`'s resolver at `line`.
+    fn model_claim(field: &str, line: i32) -> FileAnalysisResult {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: vec![],
+            graphql_operations: vec![GraphqlOperation {
+                kind: crate::operation::GraphqlOperationKind::Query,
+                field: field.to_string(),
+                resolver_function: Some(field.to_string()),
+                resolver_line: Some(line),
+                primary_type_symbol: None,
+                type_import_source: None,
+                backing_type_symbol: None,
+                backing_type_source: None,
+            }],
+            pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
+        }
+    }
+
+    fn schema_keyed(field: &str, file: &str, line: u32) -> SchemaKeyedClaim {
+        SchemaKeyedClaim {
+            key: OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, field),
+            file: file.to_string(),
+            line,
+        }
+    }
+
+    /// The schema-keyed reader's claims decide where a field is SERVED before
+    /// the model's location (carrick#1295): alone, over a model claim at
+    /// another line, and failing closed to the schema line when two disagree.
+    /// The model still places a field the reader does not claim. What anchors
+    /// the producer's TYPE is the model's resolver location alone, exactly as
+    /// without the reader: a field only the reader placed has none.
+    #[test]
+    fn schema_keyed_claims_move_the_row_and_never_the_type_anchor() {
+        use crate::operation::GraphqlOperationKind::Query;
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: ["alone", "both", "twice", "model"]
+                .into_iter()
+                .map(|field| graphql_op(Query, field, Some("Parcel")))
+                .collect(),
+            ..Default::default()
+        };
+        let file_results: HashMap<String, FileAnalysisResult> = [
+            ("src/both.ts", model_claim("both", 27)),
+            ("src/twice.ts", model_claim("twice", 4)),
+            ("src/model.ts", model_claim("model", 9)),
+        ]
+        .into_iter()
+        .map(|(file, result)| (file.to_string(), result))
+        .collect();
+        let structural = [
+            schema_keyed("alone", "src/alone.ts", 5),
+            schema_keyed("both", "src/both.ts", 20),
+            schema_keyed("twice", "src/twice.ts", 4),
+            schema_keyed("twice", "src/copy.ts", 4),
+        ];
+
+        apply_schema_keyed_claims(&mut graphql, &structural);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+
+        let producer = |field: &str| {
+            graphql
+                .producers
+                .iter()
+                .find(|op| op.key.canonical() == format!("graphql|query|{field}"))
+                .expect("producer")
+        };
+        let served = |field: &str| {
+            let (file, line) = graphql_producer_row_place(producer(field));
+            format!("{}:{line}", file.display())
+        };
+        let type_anchor = |field: &str| {
+            let op = producer(field);
+            op.resolver_file
+                .as_ref()
+                .map(|file| format!("{}:{}", file.display(), op.resolver_line.unwrap_or(0)))
+        };
+        // Where each row is served.
+        assert_eq!(served("alone"), "src/alone.ts:5");
+        assert_eq!(
+            served("both"),
+            "src/both.ts:20",
+            "the schema-keyed claim beats the model's line"
+        );
+        assert_eq!(
+            served("twice"),
+            "src/schema.graphql:3",
+            "two schema-keyed places fail closed, and the model does not break the tie"
+        );
+        assert_eq!(served("model"), "src/model.ts:9");
+        // What anchors each producer's type: the model's location, untouched.
+        assert_eq!(type_anchor("alone"), None, "the reader adds no type anchor");
+        assert_eq!(
+            type_anchor("both").as_deref(),
+            Some("src/both.ts:27"),
+            "the reader does not move the model's type anchor"
+        );
+        assert_eq!(type_anchor("twice").as_deref(), Some("src/twice.ts:4"));
+        assert_eq!(type_anchor("model").as_deref(), Some("src/model.ts:9"));
+    }
+
     /// Stage B1 merge: the file-analyzer's `graphql_operations` join their
     /// resolver location onto the SDL producer sharing the same canonical key.
     /// The SDL producer alone has no resolver location; after the merge it points
@@ -31271,7 +31492,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         // file_results keyed by path, carrying the matching LLM graphql_operation
@@ -31375,7 +31596,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("[Order!]!"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -31440,7 +31661,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("[Order!]!"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -31499,7 +31720,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 graphql_op(GraphqlOperationKind::Query, "orders", Some("[Order!]!")),
             ],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -31839,7 +32060,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("Ticket"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -31916,7 +32137,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("Ticket"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let claim = |function: &str, line: i32| GraphqlOperation {
@@ -31970,7 +32191,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 Some("Ticket"),
             )],
             consumers: vec![],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
         let mut agreeing_results: HashMap<String, FileAnalysisResult> = HashMap::new();
         agreeing_results.insert(
@@ -32005,7 +32226,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![anchored],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -32066,7 +32287,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer_a, consumer_b],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -32146,7 +32367,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     "/work/web/lib/graphql.ts",
                     None,
                 )],
-                input_declarations: Default::default(),
+                ..Default::default()
             };
             let file_results = HashMap::from([(key.to_string(), locate("OrderUpdate"))]);
             merge_graphql_consumer_locations(&mut graphql, &file_results, repo);
@@ -32187,7 +32408,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let mut graphql = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![consumer],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let mut file_results: HashMap<String, FileAnalysisResult> = HashMap::new();
@@ -32233,7 +32454,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     Some("Order"),
                 )],
                 consumers: vec![graphql_op(GraphqlOperationKind::Query, "order", None)],
-                input_declarations: Default::default(),
+                ..Default::default()
             },
             sockets: crate::socket_io::SocketExtraction {
                 listeners: vec![],
@@ -33758,7 +33979,7 @@ io.on("bare:in", (event) => {});
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![],
                 consumers: vec![consumer.clone()],
-                input_declarations: Default::default(),
+                ..Default::default()
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
@@ -33846,7 +34067,7 @@ io.on("bare:in", (event) => {});
         let extraction = crate::graphql::GraphqlExtraction {
             producers: vec![],
             consumers: vec![located_only, both, neither],
-            input_declarations: Default::default(),
+            ..Default::default()
         };
 
         let orchestrator = FileOrchestrator::new(AgentService::new());
@@ -33899,7 +34120,7 @@ io.on("bare:in", (event) => {});
             graphql: crate::graphql::GraphqlExtraction {
                 producers: vec![producer.clone()],
                 consumers: vec![],
-                input_declarations: Default::default(),
+                ..Default::default()
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
@@ -33967,7 +34188,7 @@ io.on("bare:in", (event) => {});
                     Some("Order"),
                 )],
                 consumers: vec![],
-                input_declarations: Default::default(),
+                ..Default::default()
             },
             sockets: crate::socket_io::SocketExtraction::default(),
             library: Default::default(),
