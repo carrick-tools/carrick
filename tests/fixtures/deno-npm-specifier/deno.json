@@ -1,0 +1,3 @@
+{
+  "tasks": { "dev": "deno run --allow-net src/app.ts" }
+}
