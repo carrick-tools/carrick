@@ -660,7 +660,20 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
 /// what the request returns. Those entries go, and are counted.
 #[test]
 fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
-    for (file, line) in [(HOOKS, 9), (HOOKS, 14), (HOOKS, 19)] {
+    // `chained.ts` lines 9, 20 and 21: a callback's call and a call a promise
+    // method is read off carry no type either (carrick#2832). With the fetch
+    // claim (carrick#4078) the fold takes the model's rows there and a leaf
+    // row states each at the call inside; the type asked at that call goes,
+    // as the client function does not hand back the request's body
+    // (carrick#4113).
+    for (file, line) in [
+        (HOOKS, 9),
+        (HOOKS, 14),
+        (HOOKS, 19),
+        (CHAINED, 9),
+        (CHAINED, 20),
+        (CHAINED, 21),
+    ] {
         let entries = consumer_entries_at("web", file, line);
         assert!(
             entries.is_empty(),
@@ -668,15 +681,16 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         );
         assert_eq!(response_verdicts_at(file, line), []);
     }
-    // With `chained.ts` lines 9, 20 and 21: a callback's call and a call a
-    // promise method is read off carry no type either (carrick#2832). With
-    // `inline-commands.ts` lines 9, 13, 22 and `inline-hooks.ts:6` too: every
-    // scan walks with the compiler's rows (`position_rows::destination` has
-    // no switch), which correct those four (carrick#2822), and a corrected
-    // call through drops the type anchored at the caller's call there as at
-    // the other eighteen.
+    // The corrected rows that lost their type. With `inline-commands.ts`
+    // lines 9, 13, 22 and `inline-hooks.ts:6`: every scan walks with the
+    // compiler's rows (`position_rows::destination` has no switch), which
+    // correct those four (carrick#2822), and a corrected call through drops
+    // the type anchored at the caller's call there as at the others. The
+    // `chained.ts` rows are leaf rows now, not corrected ones, and are not
+    // counted here; the fact row at `typed-commands.ts:54`, whose chain does
+    // not hand back the body, is (carrick#4078).
     assert!(
-        settled_line().contains("(22 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(20 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -709,8 +723,9 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 145 and 157 of `commands.ts` and line 15 of `typed-commands.ts`
-    // keep their response entry.
+    // Lines 145 and 157 of `commands.ts` and the fact row at
+    // `typed-client.ts:34` keep their response entry. `typed-commands.ts:15`
+    // is a leaf row, which asks only a response (carrick#4113).
     assert!(
         settled_line().contains("3 kept the response type and lost the request type)"),
         "{}",
