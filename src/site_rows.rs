@@ -948,6 +948,22 @@ pub fn site_names(decided: &Decided, records: &[SiteRecord]) -> crate::name_cens
     out
 }
 
+/// Key every HTTP request a site row states as every consumer row is keyed:
+/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
+/// the target as written, with the base the row states.
+pub fn key_requests_canonically(
+    rows: &mut SiteRows,
+    normalizer: &crate::url_normalizer::UrlNormalizer,
+) {
+    for row in &mut rows.rows {
+        if row.side == RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+        {
+            *path = normalizer.consumer_call_path(path, row.base.as_ref());
+        }
+    }
+}
+
 /// The rows and possible calls a service's records come to, read with the
 /// labels the store answered and the cloud's answers. The lead-bucket
 /// records and the undecided calls are [`crate::possible_calls::from_sites`]'s.
