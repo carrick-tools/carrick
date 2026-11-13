@@ -848,17 +848,23 @@ fn a_row_at_a_call_into_a_graphql_client_is_withdrawn() {
 }
 
 /// A call can reach a GraphQL client and an HTTP client at once (a helper that
-/// runs a hook and a fetch). It makes a real request, so the reader's row there
-/// is kept and no GraphQL withdrawal is logged for it.
+/// runs a hook and a fetch). It makes a real request, so no GraphQL withdrawal
+/// is logged for the reader's row there. The row itself goes later, in the
+/// call-through pass: `loadBoth(path)` is handed its path by a parameter and
+/// writes nothing of the model's `/api/mixed` (carrick#4206).
 #[test]
-fn a_row_at_a_call_with_a_graphql_end_and_an_http_end_is_kept() {
+fn a_call_with_a_graphql_end_and_an_http_end_logs_no_graphql_withdrawal() {
     let on = choosing();
     let kept: Vec<_> = on
         .calls
         .iter()
         .filter(|call| call["path"] == "/api/mixed")
         .collect();
-    assert_eq!(kept.len(), 1, "the HTTP row is kept: {:#?}", on.calls);
+    assert!(
+        kept.is_empty(),
+        "the model's path is read off nothing in the code: {:#?}",
+        on.calls
+    );
     assert!(
         !on.log_has(&["Withdrawing HTTP row", "/api/mixed"]),
         "no withdrawal at a call with an HTTP end: {}",
