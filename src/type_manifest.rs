@@ -332,11 +332,12 @@ pub fn drop_alias_declarations(
         None,
     )
     .map_err(|error| {
-        let at = cm.lookup_char_pos(error.span().lo);
+        let span = swc_common::Spanned::span(&error);
+        let at = cm.lookup_char_pos(span.lo);
         DeclarationsUnparsed {
             line: at.line,
             column: at.col_display + 1,
-            offset: cm.lookup_byte_offset(error.span().lo).pos.0 as usize,
+            offset: cm.lookup_byte_offset(span.lo).pos.0 as usize,
             message: error.kind().msg().to_string(),
         }
     })?;
