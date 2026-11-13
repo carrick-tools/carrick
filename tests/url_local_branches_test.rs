@@ -271,6 +271,22 @@ fn a_literal_url_after_an_exit_is_stated_only_for_callers_that_pass() {
 }
 
 #[test]
+fn a_hop_that_hands_the_tested_parameter_on_leaves_it_to_its_callers() {
+    // `relay(path, verb)` passes `verb` to `send`, whose path exits on
+    // `"GET"`: the hop's callers decide it.
+    let clients = "src/clients/path-guards.ts";
+    assert_eq!(rows_in(clients, 58), Vec::<String>::new());
+    assert_eq!(rows_in(clients, 59), ["POST /api/relayed"]);
+}
+
+#[test]
+fn a_caller_in_the_senders_own_file_that_takes_the_exit_has_no_row() {
+    let clients = "src/clients/path-guards.ts";
+    assert_eq!(rows_in(clients, 60), Vec::<String>::new());
+    assert_eq!(rows_in(clients, 61), Vec::<String>::new());
+}
+
+#[test]
 fn a_query_written_under_a_truthiness_test_states_one_row() {
     // carrick#3984's snippet: both ways key one route, one row. The URL
     // waits on no caller, so the row is stated at the send itself.

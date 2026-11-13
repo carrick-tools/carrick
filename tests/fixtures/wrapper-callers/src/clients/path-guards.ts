@@ -45,3 +45,18 @@ export async function literalAfterExit(verb: string): Promise<unknown> {
   const res = await fetch("/api/literal", { method: "PUT" });
   return res.json();
 }
+
+// g5: a hop that hands the tested parameter on, called in this file.
+export class Relay {
+  inner = new ExitBeforeSend();
+  relay = async (path: string, verb: string): Promise<unknown> =>
+    this.inner.send(path, verb);
+}
+
+export async function sameFileCallers(): Promise<void> {
+  const hop = new Relay();
+  await hop.relay("/relayed", "GET");
+  await hop.relay("/relayed", "POST");
+  await literalAfterExit("GET");
+  await new ExitBeforeSend().send("/same", "GET");
+}

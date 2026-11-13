@@ -113,3 +113,11 @@ Answer key (the row at each call line in `src/use-path-guards.ts`):
 - 20, a literal URL after `if (verb !== "PUT") return`, called with
   `"GET"`: no row.
 - 21, the same called with `"PUT"`: `PUT /api/literal`.
+
+And at each call line in `src/clients/path-guards.ts` (`sameFileCallers`):
+
+- 58, a hop that hands `verb` on to line 13's client, called with `"GET"`:
+  no row.
+- 59, the same hop called with `"POST"`: `POST /api/relayed`.
+- 60 and 61, line 20's and line 13's calls written in the sender's own
+  file: no row.
