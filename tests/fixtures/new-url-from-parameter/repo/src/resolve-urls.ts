@@ -15,3 +15,13 @@ export async function relativeUnderBase() {
 export async function relativeReplacesLastSegment() {
   return fetch(new URL("things/list", "https://api.example.test/v2"));
 }
+
+// A relative input on a base the source does not write whole.
+export async function relativeOnRuntimeBase() {
+  return fetch(new URL("things/list", apiBase()));
+}
+
+// Control: the same base as a template prefix.
+export async function templateOnRuntimeBase() {
+  return fetch(`${apiBase()}/things/list`);
+}
