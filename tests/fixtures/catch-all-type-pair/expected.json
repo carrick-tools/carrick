@@ -1,0 +1,17 @@
+{
+  "_doc": "Answer key for tests/catch_all_type_pair_test.rs. The catch-all /v1/* serves POST /v1/jobs/close, so that edge is stored; its wildcard covers the literal segments `jobs` and `close`, so the type check judges nothing there. POST /v1/jobs/open is served by its own concrete route and is a real request break.",
+  "matches": [
+    {
+      "producer_repo": "gateway",
+      "producer_key": "http|ALL|/v1/*",
+      "consumer_repo": "worker",
+      "consumer_key": "http|POST|/v1/jobs/close"
+    },
+    {
+      "producer_repo": "gateway",
+      "producer_key": "http|POST|/v1/jobs/open",
+      "consumer_repo": "worker",
+      "consumer_key": "http|POST|/v1/jobs/open"
+    }
+  ]
+}
