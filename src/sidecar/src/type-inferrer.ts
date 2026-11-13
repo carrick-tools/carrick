@@ -3421,6 +3421,47 @@ export class TypeInferrer {
       });
     }
 
+    // carrick#4185: the value is an object that holds transport machinery as
+    // a member (`{ res: Response; json: Reply }`), a function's hand-back of
+    // the response beside its parsed body. Judged against a producer's body,
+    // every member of it reads as one the producer does not send, so it is
+    // never published whole. The body is the member the function the call
+    // makes fills from the response's body read, read off that function's
+    // own returns and through the library-label reader, so one reader answers
+    // which part of a call's value holds the body. A value it cannot decide
+    // states no response contract.
+    if (!unwrapResult.wasUnwrapped && !carrierPayload) {
+      const published = printedType ?? this.unwrapPromiseType(returnType);
+      if (
+        this.typeIsOrContainsResponseMachinery(published) &&
+        !this.typeIsFrameworkMachinery(published)
+      ) {
+        const callValue = this.unwrapPromiseType(callExpr.getType());
+        const member =
+          published.compilerType === callValue.compilerType
+            ? this.handBackBodyMember(callExpr)
+            : undefined;
+        if (member) {
+          this.log(
+            `Call result at ${where} is a hand-back object around the response; ` +
+              `its body is the member '${member}' the called function fills from the body read`
+          );
+          return this.labelledCallResult(request, callExpr, { member: [member] });
+        }
+        this.log(
+          `Call result at ${where} holds transport machinery as a member and no member of ` +
+            'it is decided as the body; this site states no response contract'
+        );
+        return this.transportAbstain(
+          request,
+          callExpr,
+          "this call's result is an object that holds the transport response as one of its " +
+            "members, and the called function's code does not decide which member holds the " +
+            'parsed body, so this site states no response contract'
+        );
+      }
+    }
+
     typeString = this.unwrapPromise(typeString, returnType);
 
     // carrick#2594: the call's value is untyped (`Promise<any>`,
@@ -5571,6 +5612,65 @@ export class TypeInferrer {
    * re-reading the raw call (`inference_decided_no_contract`,
    * engine/type_compat_v2.rs).
    */
+  /**
+   * carrick#4185: the member of the object a call's function hands back that
+   * holds the response's parsed body, decided from that function's code:
+   * every `return` of it is an object literal, and in each exactly one member
+   * is filled from a platform whole-body read (`json: (await res.json()) as
+   * Reply`), itself or through a `const` it initialises, and every return
+   * names the same member. The member's name never decides it. A function
+   * the service does not declare (a library, a declaration with no body)
+   * decides nothing.
+   */
+  private handBackBodyMember(callExpr: CallExpression): string | undefined {
+    const callee = calledFunction(callExpr) as FunctionLike | undefined;
+    if (!callee || this.runtimeFile(callee.getSourceFile().compilerNode)) return undefined;
+    const returned = this.returnedExpressions(callee);
+    if (returned.length === 0) return undefined;
+
+    const readsBody = (value: Node): boolean => {
+      let inner = this.unwrapExpressionNode(value);
+      if (Node.isIdentifier(inner) || Node.isShorthandPropertyAssignment(inner)) {
+        const symbol = Node.isShorthandPropertyAssignment(inner)
+          ? inner.getValueSymbol()
+          : inner.getSymbol();
+        const local = symbol?.getDeclarations()?.[0];
+        if (
+          !local ||
+          !Node.isVariableDeclaration(local) ||
+          local.getVariableStatement()?.getDeclarationKind() !== VariableDeclarationKind.Const
+        ) {
+          return false;
+        }
+        inner = this.unwrapExpressionNode(local.getInitializer());
+      }
+      return (
+        Node.isCallExpression(inner) &&
+        this.isPlatformBodyRead(inner, WHOLE_BODY_READS, 'platform_only')
+      );
+    };
+
+    let decided: string | undefined;
+    for (const expression of returned) {
+      const literal = this.unwrapExpressionNode(expression);
+      if (!Node.isObjectLiteralExpression(literal)) return undefined;
+      const holding = literal.getProperties().flatMap((property) => {
+        if (Node.isPropertyAssignment(property)) {
+          const value = property.getInitializer();
+          return value && readsBody(value) ? [property.getName()] : [];
+        }
+        if (Node.isShorthandPropertyAssignment(property)) {
+          return readsBody(property) ? [property.getName()] : [];
+        }
+        return [];
+      });
+      if (holding.length !== 1) return undefined;
+      if (decided !== undefined && decided !== holding[0]) return undefined;
+      decided = holding[0];
+    }
+    return decided;
+  }
+
   private transportAbstain(
     request: InferRequestItem,
     callExpr: CallExpression,
