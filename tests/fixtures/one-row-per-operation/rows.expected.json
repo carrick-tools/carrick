@@ -1,0 +1,11 @@
+{
+  "calls": {
+    "src/written.ts:8": ["GET /api/same"],
+    "src/written.ts:15": ["GET /api/first", "GET /api/second"],
+    "src/written.ts:21": ["GET /api/const"],
+    "src/written.ts:26": ["GET /api/twice"],
+    "src/written.ts:33": ["GET /api/queries"],
+    "src/written.ts:38": ["GET /api/inline"],
+    "src/written.ts:46": ["GET /api/based"]
+  }
+}

@@ -948,6 +948,40 @@ pub fn site_names(decided: &Decided, records: &[SiteRecord]) -> crate::name_cens
     out
 }
 
+/// Key every HTTP request a site row states as every consumer row is keyed:
+/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
+/// the target as written, with the base the row states. A record's rows that
+/// now key alike are one row (carrick#3984): the names of one call that
+/// differ only in a query or a fragment state one operation. The first in
+/// record order stays, with its base. Rows that differ in their anchors (the
+/// call), side, key, procedure or name scope are distinct operations and stay.
+pub fn key_requests_canonically(
+    rows: &mut SiteRows,
+    normalizer: &crate::url_normalizer::UrlNormalizer,
+) {
+    for row in &mut rows.rows {
+        if row.side == RowSide::Call
+            && let OperationKey::Http { path, .. } = &mut row.key
+        {
+            *path = normalizer.consumer_call_path(path, row.base.as_ref());
+        }
+    }
+    let mut kept: Vec<SiteRow> = Vec::with_capacity(rows.rows.len());
+    for row in std::mem::take(&mut rows.rows) {
+        let repeat = kept.iter().any(|earlier| {
+            earlier.anchors == row.anchors
+                && earlier.side == row.side
+                && earlier.key == row.key
+                && earlier.procedure == row.procedure
+                && earlier.name_scope == row.name_scope
+        });
+        if !repeat {
+            kept.push(row);
+        }
+    }
+    rows.rows = kept;
+}
+
 /// The rows and possible calls a service's records come to, read with the
 /// labels the store answered and the cloud's answers. The lead-bucket
 /// records and the undecided calls are [`crate::possible_calls::from_sites`]'s.
@@ -988,7 +1022,8 @@ pub fn of(
         }
         let slot = |slot| filled(record, answered, slot);
         // A name the code states as several values is one row each
-        // (carrick#3504 S2b-8); else the one the slot holds.
+        // (carrick#3504 S2b-8); else the one the slot holds. Names that key
+        // alike are folded once keyed ([`key_requests_canonically`]).
         let names: Vec<Filled> = if record.names.is_empty() {
             slot(Slot::Name).into_iter().collect()
         } else {
@@ -1064,15 +1099,6 @@ pub fn of(
                 out.leads.push(lead(Stop::BelowBand));
                 continue;
             };
-            // Two names one key reads alike are one row.
-            if !record.names.is_empty()
-                && out
-                    .rows
-                    .iter()
-                    .any(|other| other.anchors == record.anchors && other.key == key)
-            {
-                continue;
-            }
             // A client procedure call (carrick#3186): its name is the
             // procedure's key path, which is identity, never a path. The row
             // is an HTTP call with the RPC word as its method, an empty path
@@ -1437,7 +1463,8 @@ pub fn fold_rows(
         // The rows one record states for a name the code gives several
         // values (carrick#3504 S2b-8) stand side by side: a row with a
         // sibling's key is that sibling's, and neither keeps the site from
-        // this row nor gives way to it.
+        // this row nor gives way to it. Siblings key apart: rows that key
+        // alike are one row already ([`key_requests_canonically`]).
         let siblings: Vec<&OperationKey> = site
             .rows
             .iter()

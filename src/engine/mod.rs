@@ -7428,7 +7428,7 @@ async fn site_rows_of(
             "receiver trace: routes served at a full path"
         );
     }
-    key_site_requests_canonically(&mut rows, &UrlNormalizer::new(service));
+    crate::site_rows::key_requests_canonically(&mut rows, &UrlNormalizer::new(service));
     let mut leads_by_reason: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for lead in &rows.leads {
@@ -10216,22 +10216,6 @@ fn add_graphql_request_entry(
         stated_values: Default::default(),
         v1_before_demotion: None,
     });
-}
-
-/// Key every HTTP request a site row states as every consumer row is keyed:
-/// on its canonical call path ([`UrlNormalizer::consumer_call_path`]), never
-/// the target as written, with the base the row states.
-fn key_site_requests_canonically(
-    rows: &mut crate::site_rows::SiteRows,
-    normalizer: &UrlNormalizer,
-) {
-    for row in &mut rows.rows {
-        if row.side == crate::site_rows::RowSide::Call
-            && let OperationKey::Http { path, .. } = &mut row.key
-        {
-            *path = normalizer.consumer_call_path(path, row.base.as_ref());
-        }
-    }
 }
 
 /// The manifest role a site row's side takes.
@@ -28932,7 +28916,7 @@ unfollowed_member_calls_total: 0,
             ],
             ..crate::site_rows::SiteRows::default()
         };
-        key_site_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
+        crate::site_rows::key_requests_canonically(&mut rows, &UrlNormalizer::new(&config));
         let keys: Vec<String> = rows.rows.iter().map(|row| row.key.canonical()).collect();
         assert_eq!(
             keys,
@@ -28990,7 +28974,7 @@ unfollowed_member_calls_total: 0,
                 rows: vec![site],
                 ..crate::site_rows::SiteRows::default()
             };
-            key_site_requests_canonically(&mut rows, &normalizer);
+            crate::site_rows::key_requests_canonically(&mut rows, &normalizer);
             let consumer = normalizer.consumer_call_path(target, base.as_ref());
             assert_eq!(consumer, key);
             assert_eq!(
