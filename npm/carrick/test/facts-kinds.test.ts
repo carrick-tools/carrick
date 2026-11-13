@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fakeEnv, fixturePath, runHook, testDir } from "./helpers.ts";
+import { drainRunner, fakeEnv, fixturePath, runHook, testDir, waitForSessionAnswers } from "./helpers.ts";
 import { commitAll, commitRepos, gitIn } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite } from "../src/facts/store.ts";
 import { refreshFacts } from "../src/facts/fetch.ts";
@@ -52,7 +52,9 @@ async function workspace(
 ): Promise<Ws> {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-kinds-")));
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-kinds-home-")));
-  t.after(() => {
+  t.after(async () => {
+    // An edit with a fact file queues its check: no runner outlives the test.
+    await drainRunner(root);
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   });
@@ -97,6 +99,20 @@ function patchEdit(ws: Ws, file: string, hunks: Hunk[], options: { session?: str
 function context(stdout: string): string {
   if (!stdout.trim()) return "";
   return (JSON.parse(stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext;
+}
+
+/**
+ * With a fact file an edit's check is queued in place of the probe (T12-2):
+ * wait for the runner's answer, then what the next carrier (a shell command
+ * that writes nothing) prints for `session`.
+ */
+async function nextCarrier(ws: Ws, session: string, fixture = "check-uses.json"): Promise<string> {
+  await waitForSessionAnswers(ws.home, session);
+  const run = await runHook("post-bash.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Bash", session_id: session, cwd: ws.root, tool_input: { command: "ls" }, tool_response: { stdout: "" } },
+    env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath(fixture) }),
+  });
+  return context(run.stdout);
 }
 
 /** The 1-based line of `file` holding `needle`. */
@@ -198,13 +214,19 @@ test("fn: with a fact file the uses-count line is not printed, and no fallback i
   assert.equal("uses_fallback" in records[0]!, false);
 });
 
-/** Run post-edit for `payload`'s tool call on `file`, the probe answering with uses. */
-function usesRun(ws: Ws, file: string, extra: Record<string, unknown>) {
-  return runHook("post-edit.ts", {
-    // A session per run: the uses line is told once per file per session.
-    payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: `uses-${path.basename(file)}-${String(extra["tool_name"] ?? "")}`, cwd: ws.root, tool_input: { file_path: file }, ...extra },
+/**
+ * Run post-edit for `payload`'s tool call on `file`, the check answering with
+ * uses: what it prints, then what the next carrier prints (T12-2: with a fact
+ * file the uses line arrives there).
+ */
+async function usesRun(ws: Ws, file: string, extra: Record<string, unknown>): Promise<string> {
+  // A session per run: the uses line is told once per file per session.
+  const session = `uses-${path.basename(file)}-${String(extra["tool_name"] ?? "")}`;
+  const run = await runHook("post-edit.ts", {
+    payload: { hook_event_name: "PostToolUse", tool_name: "Edit", session_id: session, cwd: ws.root, tool_input: { file_path: file }, ...extra },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json") }),
   });
+  return [context(run.stdout), await nextCarrier(ws, session)].filter(Boolean).join("\n\n");
 }
 
 test("the uses-count line still prints where the fn lookup did not run for the file (ruling 9)", async (t) => {
@@ -221,14 +243,14 @@ test("the uses-count line still prints where the fn lookup did not run for the f
   };
   const ws = await workspace(t, files, rows);
   const said = {
-    graphql: context((await edit(ws, "api/src/schema.graphql", "  order(id: ID!): Order")).stdout),
-    typesOnly: context((await edit(ws, "api/src/types.ts", "  id: string;")).stdout),
-    writeOver: context((await usesRun(ws, ws.at("api/src/orders.ts"), { tool_name: "Write", tool_response: { type: "update" } })).stdout),
-    unparseable: context((await edit(ws, "api/src/broken.ts", "export function loadOrder(")).stdout),
+    graphql: await edit(ws, "api/src/schema.graphql", "  order(id: ID!): Order"),
+    typesOnly: await edit(ws, "api/src/types.ts", "  id: string;"),
+    writeOver: await usesRun(ws, ws.at("api/src/orders.ts"), { tool_name: "Write", tool_response: { type: "update" } }),
+    unparseable: await edit(ws, "api/src/broken.ts", "export function loadOrder("),
   };
   // A fact file with no fn rows at all: the lookup has nothing to say for any file.
   const empty = await workspace(t, files, [OP_LOAD]);
-  const noFn = context((await edit(empty, "api/src/orders.ts", "  const key = `order:${id}`;")).stdout);
+  const noFn = await edit(empty, "api/src/orders.ts", "  const key = `order:${id}`;");
   for (const [what, text] of Object.entries({ ...said, noFn })) assert.match(text, USES_LINE, what);
 });
 
@@ -256,11 +278,7 @@ async function lateAnswer(t: { after: (fn: () => void) => void }, rows: Array<Re
   const at = lineOf(file, "const key");
   const payload = (target: string, extra: Record<string, unknown>) => ({ hook_event_name: "PostToolUse", tool_name: "Edit", session_id: "late", cwd: ws.root, tool_input: { file_path: target }, ...extra });
   await runHook("post-edit.ts", { payload: payload(file, { tool_response: { structuredPatch: [{ newStart: at, lines: ["+  const key = `order:${id}`;"] }] } }), env });
-  const sessions = path.join(ws.home, ".carrick", "sessions");
-  const until = Date.now() + 20_000;
-  while (Date.now() < until && !(fs.existsSync(sessions) && fs.readdirSync(sessions).some((name) => name.endsWith(".answer.json")))) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
+  await waitForSessionAnswers(ws.home, "late");
   return context((await runHook("post-edit.ts", { payload: payload(ws.at("README.md"), {}), env })).stdout);
 }
 
@@ -661,7 +679,7 @@ test("pkg: silent for an unchanged dependency and a package with no row", async 
   assert.equal(none, "");
 });
 
-test("pkg: a Codex patch over a source file and a package.json probes only the source file", async (t) => {
+test("pkg: a Codex patch over a source file and a package.json checks only the source file", async (t) => {
   const before = MANIFEST(['    "zod": "^3.22.0"']);
   // `web` is checked out; its manifest holds the rows' specs (written by `commitRepos`).
   const ws = await workspace(t, { "api/package.json": before, "web/src/index.ts": "export {};\n", "api/src/orders.ts": ORDERS }, [ZOD]);
@@ -684,6 +702,8 @@ test("pkg: a Codex patch over a source file and a package.json probes only the s
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), CARRICK_FAKE_ARGV_LOG: argvLog }),
   });
   assert.equal(context(run.stdout), ZOD_FOR_API);
+  // With a fact file the check is the queued one, not a probe (T12-2).
+  await waitForSessionAnswers(ws.home, "mixed");
   const calls = fs.readFileSync(argvLog, "utf8");
   assert.match(calls, /api\/src\/orders\.ts/);
   assert.doesNotMatch(calls, /package\.json/);
@@ -788,8 +808,9 @@ test("R33.6: the uses-count line prints when the fn line is held back by its pee
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS, "web/src/page.ts": PAGE }, [FN_PEER]);
   fs.appendFileSync(ws.at("web/src/page.ts"), "// edited after the index\n");
   const text = context((await usesEdit(ws, "held")).stdout);
-  assert.match(text, USES_LINE);
   assert.ok(!text.includes(LOAD_LINE), text);
+  // The uses line arrives with the queued check's answer (T12-2).
+  assert.match(await nextCarrier(ws, "held"), USES_LINE);
 });
 
 test("R33.6: the uses-count line prints when op lines fill the cap before the fn line", async (t) => {
@@ -797,7 +818,8 @@ test("R33.6: the uses-count line prints when op lines fill the cap before the fn
   const ws = await workspace(t, { "api/src/orders.ts": ORDERS }, [op("GET /a"), op("SOCKET b"), op("PUBSUB c"), fnRow("loadOrder", LOAD_LINE)]);
   const text = context((await usesEdit(ws, "capped")).stdout);
   assert.ok(text.includes("GET /a line") && !text.includes(LOAD_LINE), text);
-  assert.match(text, USES_LINE);
+  // The uses line arrives with the queued check's answer (T12-2).
+  assert.match(await nextCarrier(ws, "capped"), USES_LINE);
 });
 
 test("R33.6: the uses-count line stays out after the fn line was said earlier in the session", async (t) => {

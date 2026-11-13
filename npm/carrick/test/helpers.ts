@@ -123,6 +123,43 @@ export function firstCall(argvLog: string): { argv: string[]; cwd: string } | nu
   }
 }
 
+/**
+ * Wait, at most 20 s, until no re-check runner holds the workspace's lock and
+ * its queue is empty, so no runner a test started outlives the test's temp
+ * folders. Returns whether it drained.
+ */
+export async function drainRunner(root: string): Promise<boolean> {
+  const rechecks = path.join(root, ".carrick", "rechecks");
+  const queued = () => {
+    try {
+      return fs.readdirSync(path.join(rechecks, "queue")).length;
+    } catch {
+      return 0;
+    }
+  };
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (!fs.existsSync(path.join(rechecks, "runner.lock")) && queued() === 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+/**
+ * A counted wait (at most 50 x 100 ms) until the runner has written `count`
+ * answers for `session` under `home`. Throws when it has not.
+ */
+export async function waitForSessionAnswers(home: string, session: string, count = 1): Promise<void> {
+  const sessions = path.join(home, ".carrick", "sessions");
+  let found = 0;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const names = fs.existsSync(sessions) ? fs.readdirSync(sessions) : [];
+    found = names.filter((name) => name.startsWith(`${session}.recheck.`) && name.endsWith(".answer.json")).length;
+    if (found >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`the runner wrote ${found} of ${count} answer(s) for ${session}`);
+}
+
 export type HookRun = { stdout: string; stderr: string; code: number | null; ms: number };
 
 /** Run one of the hook scripts the way Claude Code runs it: payload on stdin. */

@@ -37,7 +37,7 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { adoptedLine, changedLine, hasFindings } from "./late.ts";
+import { adoptedLine, changedLine, deliverOne, hasFindings } from "./late.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
@@ -114,12 +114,16 @@ export type StopResult = {
 /**
  * Claim the right to print each finished answer: the ones this call owns. The
  * session's own answers go through the session check below; an ended
- * sub-agent's (carrick#4074) are `adopted` and print their findings alone.
+ * sub-agent's (carrick#4074) are `adopted` and print their findings alone. An
+ * answer queued in place of the edit-time probe is delivered whole or not at
+ * all (R46.2): Stop claims it only with a finding it prints, and otherwise
+ * leaves it for the next carrier, which prints all of it.
  */
 function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[] } {
   const own: Answer[] = [];
   const adopted: Answer[] = [];
   for (const { owner, answer } of owedFor(session, home)) {
+    if (answer.instead_of_probe && !hasFindings(answer)) continue;
     if (!claimDelivery(owner, answer.seq, home, now)) continue;
     (owner === session ? own : adopted).push(answer);
   }
@@ -181,6 +185,15 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       gap(`its re-check is still running after ${seconds} s`);
       continue;
     }
+    // An answer queued in place of the probe that the binary refused is not
+    // stated, as the probe's refusal was not recorded (R46.5).
+    if (answer.instead_of_probe && answer.result?.error) {
+      coverage.files -= 1;
+      continue;
+    }
+    // An answer that answered the edit counts here as any answer does,
+    // flagged or not (R51.1); one that did not is a gap below.
+    const covered = () => coverage.covered.push(answer);
     const result = answer.result;
     if (answer.state !== "answered" || result === undefined) {
       gap(answer.failure ?? "the re-check gave no answer");
@@ -191,7 +204,7 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       continue;
     }
     if (readsNothing(result)) {
-      coverage.covered.push(answer);
+      covered();
       continue;
     }
     if (!answersTheEdit(result)) {
@@ -203,7 +216,7 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       gap(staleClause(stale, "it"));
       continue;
     }
-    coverage.covered.push(answer);
+    covered();
   }
   return coverage;
 }
@@ -243,8 +256,10 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     const coverage = sessionCoverage(session, root, home, clock());
     if (coverage.files === 0) continue;
     if (coverage.gaps.length === 0) {
+      // An answer queued in place of the probe prints its own lines below, as
+      // the probe's would have: its problems are counted here, not listed.
       const fresh = delivered
-        .filter((answer) => answer.root === root && !isChanged(answer) && answer.result !== undefined)
+        .filter((answer) => answer.root === root && !isChanged(answer) && !answer.instead_of_probe && answer.result !== undefined)
         .map((answer) => ({ result: answer.result!, where: answer.relative }));
       const said = sessionCheckedLines(
         coverage.covered.map((answer) => ({ result: answer.result!, where: answer.relative })),
@@ -255,7 +270,9 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
         stated.set(root, said.text);
         if (said.key !== null) markSaid(session, root, said.key, home);
       }
-      for (const answer of delivered) if (answer.root === root && !isChanged(answer)) folded.add(answer.seq);
+      for (const answer of delivered) {
+        if (answer.root === root && !isChanged(answer) && !answer.instead_of_probe) folded.add(answer.seq);
+      }
       markStated(session, root, coverage.upTo, true, home);
       continue;
     }
@@ -291,6 +308,12 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   const rest = delivered.filter((answer) => !isChanged(answer) && !folded.has(answer.seq));
   if (rest.some(actionable)) {
     for (const answer of rest) {
+      // Queued in place of the probe: printed whole, as the next carrier
+      // would have printed it (R46.2).
+      if (answer.instead_of_probe) {
+        lines.push(...deliverOne(session, answer, home));
+        continue;
+      }
       const text = render(answer);
       if (text) lines.push(text);
     }

@@ -270,6 +270,36 @@ test("a changed entry runs after every per-file entry, one per session and root,
   }
 });
 
+// R46.4: an answer queued in place of the probe skips the `answersTheEdit`
+// gate only where the probe would have printed it in hand. A re-check that
+// ran out of time, or a re-scan that started and failed, is one the probe
+// would have deferred: gated as an ordinary late answer is.
+test("an answer queued in place of the probe is gated as before when the probe would have deferred it", () => {
+  const base = parseCheckResult(fs.readFileSync(fixturePath("check-stale-uses.json"), "utf8"))!;
+  const scope = { reread: ["inventory-svc"], not_reread: [], stale: [] };
+  const answer = (result: typeof base, flagged: boolean) => ({
+    seq: "1",
+    session: "s",
+    file: "/w/src/client.ts",
+    relative: "src/client.ts",
+    root: "/w",
+    state: "answered" as const,
+    enqueued_at: new Date().toISOString(),
+    started_at: null,
+    finished_at: new Date().toISOString(),
+    ...(flagged ? { instead_of_probe: true as const } : {}),
+    result,
+  });
+  // The probe would have printed this one in hand (a known miss): its uses line arrives late.
+  assert.match(lateContext(answer(base, true), true) ?? "", /Other files use what this file declares/);
+  const ranOut = { ...base, recheck: { ran: "none" as const, elapsed_ms: 180_000, deadline: true, reason: "ran past its budget" } };
+  const failed = { ...base, recheck: { ran: "none" as const, elapsed_ms: 900, scope, reason: "the re-scan failed" } };
+  for (const result of [ranOut, failed]) {
+    assert.equal(lateContext(answer(result, false), true), null, "unflagged: gated");
+    assert.equal(lateContext(answer(result, true), true), null, "flagged: gated as before");
+  }
+});
+
 test("a file answered in hand counts as covered", () => {
   const s = scratch();
   try {

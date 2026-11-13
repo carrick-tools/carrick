@@ -63,6 +63,7 @@ function answer(home: string, entry: QueueEntry, result: CheckResult): void {
     enqueued_at: entry.enqueued_at,
     started_at: entry.enqueued_at,
     finished_at: new Date().toISOString(),
+    ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
     result,
   };
   writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
@@ -414,6 +415,72 @@ test("stop says a re-check is still running, once, without waiting, and delivers
   assert.equal(fourth.stdout, "", "delivered once");
 });
 
+// R46.2: an answer queued in place of the probe is delivered whole or not at
+// all. With nothing Stop would print for it, Stop leaves it unclaimed and does
+// not count it; the next carrier prints what the probe would have in hand.
+test("Stop leaves an answer queued in place of the probe with no finding unclaimed, and the next carrier prints its uses line", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  assert.equal(entry.instead_of_probe, true);
+  // Answered the edit, no problem, a uses line: nothing Stop prints.
+  answer(home, entry, { ...clean(), uses_lines: fixture("check-stale-uses.json").uses_lines! });
+  const run = await stopWith(home);
+  assert.equal(run.stdout, "", "nothing for it at Stop: not unchecked, not running");
+  assert.equal(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), false, "unclaimed");
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+});
+
+// Ruling on R46.2: a flagged answer that did not answer the edit is a gap at
+// its first Stop, named as with the switch off, once; the next carrier still
+// prints what the probe would have printed in hand (its uses line).
+test("Stop names a flagged answer that did not answer the edit as a gap, once, and the next carrier prints its uses line", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  answer(home, entry, fixture("check-stale-uses.json"));
+  const first = context((await stopWith(home)).stdout);
+  assert.ok(first.startsWith("Carrick did not check the whole change: user-service/src/routes/users.ts: no re-check of it ran."), first);
+  assert.equal((await stopWith(home)).stdout, "", "named once");
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+});
+
+// R46.2: with a finding Stop prints, Stop prints the answer as the next
+// carrier would have (problem, uses and lead lines), once, and claims it.
+test("Stop prints an answer queued in place of the probe whole when it holds a finding, and nothing prints it again", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  // Recorded, as the edit hook records every file it queues.
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  const lead = fixture("check-deferred-lead.json").recheck!.new_functions!;
+  const whole: CheckResult = {
+    ...problem(),
+    recheck: { ran: "extraction+types", elapsed_ms: 1, new_functions: lead },
+    uses_lines: fixture("check-stale-uses.json").uses_lines!,
+  };
+  answer(home, entry, whole);
+  const run = await stopWith(home);
+  const said = context(run.stdout);
+  const once = (pattern: RegExp) =>
+    assert.equal((said.match(new RegExp(pattern.source, `${pattern.flags}g`)) ?? []).length, 1, `${pattern} once in:\n${said}`);
+  // The session's count, then the answer as the next carrier would print it.
+  assert.ok(said.startsWith("Carrick checked the 1 file this session edited (user-service): 2 contract problems.\n\n"), said);
+  once(/after your earlier edit to it: 2 contract problems\./);
+  once(/^- .*type_mismatch/m);
+  once(/Other files use what this file declares/);
+  once(/`slugify` looks like `toSlug`/);
+  assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), "claimed at Stop");
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "the next carrier prints nothing of it");
+});
+
 test("a clean late answer alone prints nothing and is marked delivered; beside a problem both print", async (t) => {
   const { workspace, home } = setup(t);
   const entry = queue(workspace.root, home, workspace.file);
@@ -641,6 +708,68 @@ test("a second Stop over the same operations prints nothing, a new operation pri
   answer(home, queue(workspace.root, home, workspace.file), more);
   const third = stopAnswers(SESSION, { home, ensure: () => false });
   assert.match(third.lines.join("\n"), /^Carrick checked the 2 operations this session changed/);
+});
+
+/** A clean answer that judged one operation of `relative` (a route at `line`). */
+function cleanJudged(relative: string, routePath: string, line: number): CheckResult {
+  return { ...clean(), file: relative, items: [judgedRoute(routePath, line)], recheck: { ran: "extraction+types", elapsed_ms: 1 } };
+}
+
+/** A second TS file in the workspace's service, beside the edited one. */
+function otherFile(workspace: { service: string }): string {
+  const other = path.join(workspace.service, "src", "routes", "orders.ts");
+  fs.writeFileSync(other, "export {};\n");
+  return other;
+}
+
+// R51.1: a flagged answer that answered the edit counts at Stop exactly as an
+// unflagged one, whether or not a carrier has already claimed it.
+test("Stop counts two flagged clean answers as 2 operations when a carrier already delivered the first", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const other = otherFile(workspace);
+  const first = Date.now() - 5000;
+  const a = enqueue(workspace.root, SESSION, [workspace.file], first, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, first, home, [workspace.file]);
+  answer(home, a, cleanJudged("src/routes/users.ts", "/api/users", 10));
+  await bashHook(home, workspace.root);
+  assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${a.seq}.delivered`)), "the carrier delivered the first");
+  const second = Date.now();
+  const b = enqueue(workspace.root, SESSION, [other], second, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, second, home, [other]);
+  answer(home, b, cleanJudged("src/routes/orders.ts", "/api/orders", 5));
+  const said = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.match(said, /^Carrick checked the 2 operations this session changed \(.*\): both sides agree\.$/, said);
+});
+
+test("Stop counts a flagged finding and a flagged clean answer as the 2 files this session edited", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const other = otherFile(workspace);
+  const now = Date.now();
+  const [a, b] = enqueue(workspace.root, SESSION, [workspace.file, other], now, { home, insteadOfProbe: true });
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file, other]);
+  answer(home, a!, problem());
+  answer(home, b!, cleanJudged("src/routes/orders.ts", "/api/orders", 5));
+  const said = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.ok(said.startsWith("Carrick checked the 2 files this session edited (user-service): "), said);
+});
+
+test("Stop says both sides agree for one flagged clean answer with a judged operation, and the next carrier still prints its uses line once", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  const now = Date.now();
+  const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
+  recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
+  answer(home, entry, { ...cleanJudged("src/routes/users.ts", "/api/users", 10), uses_lines: fixture("check-stale-uses.json").uses_lines! });
+  const stop = stopAnswers(SESSION, { home, ensure: () => false }).lines.join("\n\n");
+  assert.equal(
+    stop,
+    "Carrick checked the 1 operation this session changed (GET /api/users at user-service/src/routes/users.ts:10): both sides agree.",
+  );
+  const next = context((await bashHook(home, workspace.root)).stdout);
+  assert.match(next, /Other files use what this file declares: `carrick check user-service\/src\/routes\/users\.ts` lists the 2 uses/);
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once");
 });
 
 test("a Stop whose only gap is a file no service reads prints nothing and queues nothing", async (t) => {
