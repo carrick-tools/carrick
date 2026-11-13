@@ -463,11 +463,58 @@ impl SiteLabel {
                     request,
                     yields,
                     name_scope,
+                    runs,
                     ..
                 } = claim
                 else {
                     continue;
                 };
+                // A member that runs the function it is handed (carrick#3481
+                // T5, `client.prefetch({ load })`): a runner on that member,
+                // as a maker's `runs` is, never a nameless op label (its
+                // call would state a site beside the one inside the function
+                // it runs). A receiver-scoped member is not matched by
+                // `runner`, and a `runs` bound to the maker (`mutate` runs
+                // the function the hook was given) is a walk from the
+                // instance's later calls that is not read yet: both state no
+                // label, so their calls state no site.
+                if let Some(runs) = runs {
+                    if runs.bound.is_none()
+                        && of
+                            .as_deref()
+                            .and_then(crate::library_claims::scope_step)
+                            .is_none()
+                    {
+                        labels.push(SiteLabel {
+                            new,
+                            package: export.package.clone(),
+                            export: export.export.clone(),
+                            member: member.clone(),
+                            role: role.clone(),
+                            op: None,
+                            side: side.clone(),
+                            by_origin,
+                            name: None,
+                            payload: None,
+                            handler: None,
+                            method: None,
+                            reserved: Vec::new(),
+                            runs: Some(RunsMake {
+                                slot: ArgSlot {
+                                    arg: runs.arg as usize,
+                                    key: runs.key.clone(),
+                                },
+                                new,
+                            }),
+                            request: None,
+                            scope: None,
+                            yields: None,
+                            name_scope: None,
+                            name_at_maker: false,
+                        });
+                    }
+                    continue;
+                }
                 let walks_an_array = |slot: &crate::services::type_sidecar::ClaimSlot| {
                     slot.each || slot.at.is_some()
                 };
@@ -5078,6 +5125,80 @@ pub(crate) mod tests {
         let decided = decided_sites(&inputs, &root, &[unclaimed], &[]);
         assert_eq!(decided.leads.len(), 1);
         assert!(decided.ran.is_empty());
+    }
+
+    /// carrick#3481 T5: an op whose `runs` names no maker is a runner on its
+    /// member: a call that hands it the function states no site and is no
+    /// lead, one that hands none it can read is a lead. An op whose `runs` is
+    /// bound to the maker states no site at its call.
+    #[test]
+    fn an_op_that_runs_the_function_it_is_handed_is_a_runner_on_its_member() {
+        let root = decided_fixture();
+        let inputs = crate::engine::discover_request_inputs(&root);
+        let file = STATED;
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let exports: Vec<crate::library_claims::ExportClaims> =
+            serde_json::from_value(serde_json::json!([
+                { "package": "cache-kit", "version": "1.0.0", "specifier": "cache-kit",
+                  "export": "LoadClient", "role": "http_client", "label": "request_runner",
+                  "claims": [
+                    { "kind": "op", "op": "request", "member": "prefetch", "on": "instance",
+                      "runs": { "arg": 0, "key": "load" } },
+                    { "kind": "op", "op": "request", "member": "mutate", "on": "instance",
+                      "runs": { "arg": 0, "key": "send", "bound": "maker" } }
+                  ] }
+            ]))
+            .unwrap();
+        let labels = SiteLabel::from_exports(&exports);
+        // The member is a runner; no op label is made for either member.
+        assert!(labels.iter().all(|label| label.op.is_none()));
+        assert_eq!(labels.len(), 1);
+        let end = |member: &str, call: &str| {
+            let mut end = stated_end(
+                &text,
+                "cache-kit",
+                "LoadClient",
+                Some(member),
+                "http_client",
+                call,
+            );
+            end.file = file.into();
+            end
+        };
+        let inline = "client.prefetch({ key: [\"p\"], load: () => fetch(\"/api/p\") })";
+        let prefetch = end("prefetch", inline);
+        assert_eq!(
+            SiteLabel::runner(&labels, &prefetch),
+            Some(&ArgSlot {
+                arg: 0,
+                key: Some("load".into())
+            })
+        );
+        let sites = [
+            bottom(&prefetch, "prefetch"),
+            bottom(&end("prefetch", "client.prefetch(options)"), "prefetch"),
+            bottom(&end("mutate", "client.mutate(vars)"), "mutate"),
+        ];
+        let decided = decided_sites(&inputs, &root, &sites, &labels);
+        assert!(decided.sites.is_empty());
+        assert_eq!(
+            decided
+                .leads
+                .iter()
+                .map(|lead| (lead.line, lead.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (line_of(&text, "client.prefetch(options)"), Stop::NoOpClaim),
+                (line_of(&text, "client.mutate(vars)"), Stop::NoOpClaim),
+            ]
+        );
+        assert_eq!(
+            decided.ran,
+            vec![format!(
+                "{file}:{}",
+                line_of(&text, "client.prefetch({ key")
+            )]
+        );
     }
 
     /// carrick#2426: a decided site whose name is one the store settled the
