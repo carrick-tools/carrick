@@ -46,6 +46,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
 #[path = "support/shapes.rs"]
 mod shapes;
 
@@ -1389,12 +1391,45 @@ async fn a_request_that_was_cut_is_never_sent_again() {
 #[serial]
 async fn a_mocked_scan_sends_one_request_a_file() {
     offline();
-    let fx = Fixture::table("mocked");
+    // The table and each handler module register their routes on an installed
+    // `express`: its store answer labels the calls, and a file is asked about
+    // only when it holds one (carrick#3711).
+    let tag = "mocked";
+    let mut modules: Vec<(String, String)> = (0..HANDLER_MODULES)
+        .map(|n| {
+            (
+                format!("src/handlers/h{n}.ts"),
+                format!(
+                    "import express from \"express\";\n{}const app = express();\napp.get(\"/{tag}/h/{n}\", h{n});\n",
+                    handler_source(n)
+                ),
+            )
+        })
+        .collect();
+    modules.push((
+        format!("src/{tag}_table.ts"),
+        table_source(tag).replace(
+            "declare function makeTable(): any;\nconst table = makeTable();\n",
+            "import express from \"express\";\nconst table = express();\n",
+        ),
+    ));
+    let fx = Fixture::of(&modules, &format!("src/{tag}_table.ts"));
     std::fs::write(
         fx.root.join("package.json"),
         r#"{"name":"mocked-table","version":"1.0.0"}"#,
     )
     .unwrap();
+    real_packages::install(&fx.root, &["express"]);
+    let answers = tempfile::tempdir().expect("a temp dir");
+    let cassettes = answers.path().join("cassettes");
+    real_packages::write_claims(&cassettes, &["express"]);
+    // SAFETY: `#[serial]`, as in `offline`.
+    unsafe {
+        std::env::set_var(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        );
+    }
 
     let before = agent_service::request_counts();
     carrick::engine::run_analysis_engine_with_sidecar(

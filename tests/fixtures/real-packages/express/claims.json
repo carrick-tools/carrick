@@ -29,7 +29,8 @@
       "scopes": [],
       "ops": [
         { "op": "receive", "member": "get", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
-        { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+        { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" },
+        { "op": "receive", "member": "delete", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "DELETE", "picker": "fixture-picker" }
       ],
       "reserved": [],
       "calls": [],
