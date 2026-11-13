@@ -1,0 +1,66 @@
+{
+  "library_claims": [
+    {
+      "package": "fastify",
+      "version": "4.28.1",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fastify",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null,
+              "picker": "fixture-picker"
+            }
+          ],
+          "scopes": [
+            {
+              "member": "register",
+              "of": "type:fastify#FastifyInstance",
+              "name": {
+                "arg": 1,
+                "key": "prefix"
+              },
+              "runs": {
+                "arg": 0
+              },
+              "yields": {
+                "param": 0,
+                "export": "FastifyInstance",
+                "side": "server"
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "get",
+              "of": "type:fastify#FastifyInstance",
+              "name": {
+                "arg": 0
+              },
+              "handler": {
+                "arg": 1
+              },
+              "method": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [],
+          "receiver_types": {
+            "instance:()": [
+              "type:fastify#FastifyInstance"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1696,6 +1696,41 @@ impl ResolutionSource {
     }
 }
 
+/// The request for the response of a route no payload was located for
+/// (carrick#4071): a line-only `response_body` at the route's registration
+/// line, under the alias the manifest gives the operation at that site
+/// (`site_id` is [`build_site_id`] of the same file, line and key). The
+/// type layer follows the handler the registration names. The
+/// `NoPayload` arm of `collect_type_requests` and the rows the receiver
+/// trace writes both ask through this one function. Never by span (the
+/// registration call contains the handler) and with no `route_path`.
+pub(crate) fn route_response_request(
+    file_abs: &str,
+    line: u32,
+    key: &OperationKey,
+    site_id: &str,
+) -> InferRequestItem {
+    InferRequestItem {
+        member: None,
+        result: None,
+        file_path: file_abs.to_string(),
+        line_number: line,
+        infer_kind: InferKind::ResponseBody,
+        span_start: None,
+        span_end: None,
+        expression_text: None,
+        expression_line: None,
+        alias: Some(build_manifest_type_alias_with_site_id(
+            key,
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            Some(site_id),
+        )),
+        param_name: None,
+        route_path: None,
+    }
+}
+
 impl FileOrchestrator {
     pub fn new(agent_service: AgentService) -> Self {
         Self {
@@ -5094,6 +5129,13 @@ impl FileOrchestrator {
             /// handler's declaration line and the sidecar resolves the function
             /// via `findFunctionByLine`.
             Line,
+            /// A route with no located payload, asked at its registration
+            /// line ([`route_response_request`]); the request carries its
+            /// own alias, built from the operation and its site.
+            RouteResponse {
+                key: &'a OperationKey,
+                site_id: &'a str,
+            },
         }
 
         // The verified result of the consumer call whose response requests
@@ -5193,6 +5235,15 @@ impl FileOrchestrator {
                         param_name: None,
                         route_path: None,
                     });
+                    true
+                }
+                InferLocator::RouteResponse { key, site_id } => {
+                    infer_requests.push(route_response_request(
+                        file_path,
+                        line_number,
+                        key,
+                        site_id,
+                    ));
                     true
                 }
                 InferLocator::Line => {
@@ -5586,7 +5637,10 @@ impl FileOrchestrator {
                             line_number,
                             InferKind::ResponseBody,
                             response_alias.clone(),
-                            InferLocator::Line,
+                            InferLocator::RouteResponse {
+                                key: &key,
+                                site_id: &site_id,
+                            },
                         );
                     }
                     Some(EmissionStyle::ImperativeSend) | None => {
