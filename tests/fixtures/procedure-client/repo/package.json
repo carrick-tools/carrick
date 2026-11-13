@@ -5,6 +5,8 @@
   "dependencies": {
     "fixture-procs": "^1.0.0",
     "fixture-remote": "^1.0.0",
+    "fixture-sub-plain": "^1.0.0",
+    "fixture-sub-sse": "^1.0.0",
     "fixture-web": "^1.0.0"
   }
 }
