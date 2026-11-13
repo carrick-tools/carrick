@@ -188,7 +188,7 @@ impl<'a> State<'a> {
 /// Whether two ways come from the same place under the same tests.
 fn same(a: &Way<'_>, b: &Way<'_>) -> bool {
     let from = |way: &Way<'_>| match way.from {
-        Source::Init(_) => (0, 0),
+        Source::Init(init) => (0, init.span().lo.0),
         Source::Unwritten => (1, 0),
         Source::Write(assign) => (2, assign.span.lo.0),
     };
