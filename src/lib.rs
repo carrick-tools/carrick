@@ -27,6 +27,7 @@ pub mod derive_candidates;
 pub mod derive_reach;
 pub mod dispatch;
 pub mod engine;
+pub mod engine_stamp;
 pub mod env_alias;
 pub mod eval_output;
 pub mod event_emitter;
