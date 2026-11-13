@@ -679,7 +679,14 @@ function checkedRecord(
     !anchor.abstainReason &&
     !(anchor.request.kind === 'literal' && anchor.request.type_text.trim() === 'unknown') &&
     !unreadCause(anchor).unread_cause
-      ? { unread_cause: 'declared' as const }
+      ? {
+          // The anchor's source program read this top type through a
+          // reference that did not resolve (carrick#3995): the root twin of
+          // `provenanceOf`.
+          unread_cause: anchor.unresolved?.paths.includes('')
+            ? ('unresolved_import' as const)
+            : ('declared' as const),
+        }
       : {}),
     ...unreadCause(anchor),
   };

@@ -17,7 +17,12 @@
  */
 
 import ts from 'typescript';
-import { findUncarriedPositions, findUnresolvedPlaceholders, type UnresolvedAtAnchor } from './deep-walk.js';
+import {
+  findUncarriedPositions,
+  findUnresolvedPlaceholders,
+  isErrorPlaceholder,
+  type UnresolvedAtAnchor,
+} from './deep-walk.js';
 
 /** Files the specifier walk visits from one anchor before it stops. */
 const MAX_REACHABLE_FILES = 256;
@@ -58,9 +63,63 @@ export function unresolvedAtAnchor(
   const uncarried = uncarriedByProgram.get(program);
   const found = findUnresolvedPlaceholders(type, program, checker, location);
   if (uncarried) found.push(...findUncarriedPositions(type, program, checker, location, uncarried));
+  // The member walk leaves the root to its callers. The root is the alias's
+  // own type only when no prefix maps it under a member.
+  if (pathPrefix === '' && rootReadsUnresolved(checker, type, location)) found.unshift('');
   const paths = [...new Set(found)].map((path) => prefixPath(pathPrefix, path));
   if (paths.length === 0) return undefined;
   return { paths, specifiers: unresolvedSpecifiersReachableFrom(program, sourceFile) };
+}
+
+/** How many syntax steps the callee walk takes before it gives up. */
+const MAX_CALLEE_STEPS = 32;
+
+/**
+ * True when `type`, read at `location`, is a top type the source program got
+ * from a reference that did not resolve (carrick#3995): the compiler's
+ * placeholder itself, or a genuine `any`/`unknown` returned by a call whose
+ * callee chain reaches the placeholder. A call through an unresolved value is
+ * untyped, so its result is a plain `any` the emitted stub prints like an
+ * author's; this is the one place the two can still be told apart.
+ *
+ * Only the callee chain is read, never the arguments: a resolved callee
+ * (a repo wrapper stating `Promise<unknown>`, a library's `JSON.parse`)
+ * declares its own result, whatever it is passed.
+ */
+function rootReadsUnresolved(checker: ts.TypeChecker, type: ts.Type, location: ts.Node): boolean {
+  if (isErrorPlaceholder(type)) return true;
+  if (!(type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown))) return false;
+  let node: ts.Node = location;
+  for (let step = 0; step < MAX_CALLEE_STEPS; step++) {
+    if (
+      ts.isParenthesizedExpression(node) ||
+      ts.isAwaitExpression(node) ||
+      ts.isNonNullExpression(node)
+    ) {
+      node = node.expression;
+    } else if (ts.isCallExpression(node)) {
+      node = node.expression;
+    } else if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      if (isErrorPlaceholder(checker.getTypeAtLocation(node))) return true;
+      node = node.expression;
+    } else if (ts.isIdentifier(node)) {
+      if (isErrorPlaceholder(checker.getTypeAtLocation(node))) return true;
+      // An unannotated binding reads its initializer's type: follow it.
+      const declaration = checker.getSymbolAtLocation(node)?.valueDeclaration;
+      if (
+        !declaration ||
+        !ts.isVariableDeclaration(declaration) ||
+        declaration.type ||
+        !declaration.initializer
+      ) {
+        return false;
+      }
+      node = declaration.initializer;
+    } else {
+      return false;
+    }
+  }
+  return false;
 }
 
 /** Join a walk path under a prefix in the walk's own notation. */
