@@ -50,6 +50,20 @@ Not read (`refuse.ts`, `evalfile.ts`): each is a hole.
 
 Choices (`alt.ts`, carrick#3504 S2b-1): `?:`, `??` and `||` read every branch, never collapsed. `p_coalesce` is a hole (`maybe`, a runtime value) and `/fallback`; `p_cond` is `/api` and `/other`; `p_chain` is a hole, `/api` and `/last`; `p_union` is `/u/a`, `/u/b` and `/u/c`.
 
+`order.ts` (carrick#3679 S8): a function's own `let` written again holds, at
+each read, only the values whose writes reach it in the order the body runs
+(`src/request_summary/resolve/flow.rs`). Each probe is a call of a `p_*`
+function whose argument is the local.
+
+| Probe | Texts | Why |
+|---|---|---|
+| `p_after` | `/before` | the write follows the read |
+| `p_exit` | `/a` | the branch that writes `/b` returns |
+| `p_both` | `/a`, `/b` | either branch may run |
+| `p_looped` | `/a`, a `reassigned` hole | a write in a loop: the flow refuses the local, and the set stands |
+| `p_nullish` | `/a`, `/b` | an unconditional `??=` adds a way and keeps the one that reaches it |
+| `p_hidden` | `/a`, `/b` | a write in an `if` test: the flow refuses the local, and the set stands |
+
 `selfread.ts`: `p_self` reads itself; the second read is a recursion hole, and
 reading it again gives the same answer (the mark is released).
 

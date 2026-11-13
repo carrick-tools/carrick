@@ -15,6 +15,7 @@
 //! service and its siblings) is [`guards::HoleReason::OutsideService`]: there
 //! is no disk fallback.
 
+use super::flow::WayFrom;
 use super::*;
 
 /// One text a name may be, read by [`Resolver::text_values`] (carrick#3504
@@ -986,8 +987,13 @@ impl<'a> Resolver<'a> {
         };
         // A `let` the module writes again (`=`, `??=`, `||=`) holds its
         // initialiser and every value written (carrick#3504 S2b-4, D6): a
-        // set. The write census marks every other form of write.
-        let mut sources: Vec<&ValueAt> = Vec::new();
+        // set. The write census marks every other form of write. A
+        // function's own `let` holds, at this read, only the ways whose
+        // writes reach it ([`Resolver::written_at`], carrick#3679 S8): their
+        // tests are not decided here, so the read is their union. Each
+        // source says whether it is a write.
+        let mut sources: Vec<(&ValueAt, bool)> = Vec::new();
+        let mut reaching_init = true;
         let written = match binding.kind {
             BindingKind::Var => return hole(Reassigned),
             BindingKind::Let if binding.unplaceable => return hole(Reassigned),
@@ -995,9 +1001,22 @@ impl<'a> Resolver<'a> {
                 let Some(ir) = self.inputs_for(at.0).files.get(at.0) else {
                     return hole(OutsideService);
                 };
-                for start in &binding.writes {
-                    match placed_write(ir, *start) {
-                        Some((_, write)) => sources.push(&write.text),
+                let mut starts: Vec<u32> = binding.writes.clone();
+                if let Some(ways) = self.written_at(at.0, (at.1, &at.2), lo) {
+                    reaching_init = ways.iter().any(|way| way.from == WayFrom::Init);
+                    starts = ways
+                        .iter()
+                        .filter_map(|way| match way.from {
+                            WayFrom::Write(start, _) => Some(start),
+                            WayFrom::Init | WayFrom::Unwritten => None,
+                        })
+                        .collect();
+                    starts.sort_unstable();
+                    starts.dedup();
+                }
+                for start in starts {
+                    match placed_write(ir, start) {
+                        Some((_, write)) => sources.push((&write.text, true)),
                         None => return hole(Reassigned),
                     }
                 }
@@ -1010,7 +1029,8 @@ impl<'a> Resolver<'a> {
         };
         // A declaration with no initialiser adds no value to a written set.
         match &binding.text {
-            Some(text) => sources.insert(0, text),
+            Some(text) if reaching_init => sources.insert(0, (text, false)),
+            Some(_) => {}
             None if written => {}
             None => return hole(UnreadExpression),
         }
@@ -1021,11 +1041,10 @@ impl<'a> Resolver<'a> {
         // A write's value the reader does not state is the reassignment's
         // hole: the name may hold it wherever it is read, so a consumer that
         // reads past other holes (a route's ways, carrick#3191) still stops.
-        let writes_from = sources.len() - if written { binding.writes.len() } else { 0 };
-        for (index, source) in sources.into_iter().enumerate() {
+        for (source, is_write) in sources {
             for value in self.text_values(at.0, source) {
                 let value = match value {
-                    TextValue::Hole { callers, .. } if index >= writes_from => TextValue::Hole {
+                    TextValue::Hole { callers, .. } if is_write => TextValue::Hole {
                         reason: Reassigned,
                         callers,
                     },
@@ -2003,6 +2022,90 @@ mod tests {
         );
         // The mark is released: reading again gives the same answer.
         assert_eq!(probe(&resolver, &on, "src/selfread.ts", "p_self"), got);
+    }
+
+    /// What the argument of the one call of `callee` in `order.ts` reads as
+    /// (carrick#3679 S8 T1): each text, and each hole as `hole:<reason>`,
+    /// sorted. `None` without the built compiler engine.
+    fn order_reads(callee: &str) -> Option<Vec<String>> {
+        let on = walked("resolve-text", "services/web", "web", &[], true)?;
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let path = on.path("services/web/src/order.ts");
+        let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}: {found:?}");
+        let mut out: Vec<String> = resolver
+            .text_values(&path, &found[0])
+            .into_iter()
+            .map(|value| match value {
+                TextValue::Text { text, .. } => text,
+                TextValue::Hole { reason, .. } => format!("hole:{reason:?}"),
+                TextValue::Pieced(pieced) => panic!("{callee}: pieced {pieced:?}"),
+            })
+            .collect();
+        out.sort();
+        Some(out)
+    }
+
+    /// A function's own `let` written after the read never held that value
+    /// there (carrick#3679 S8 T1): the read holds only its initialiser.
+    #[test]
+    fn a_write_after_the_read_is_not_what_the_read_holds() {
+        let Some(got) = order_reads("p_after") else {
+            return;
+        };
+        assert_eq!(got, ["/before"]);
+    }
+
+    /// A branch that writes the local and then returns passes nothing on:
+    /// the read after it holds only what reaches it past the branch.
+    #[test]
+    fn a_write_in_a_branch_that_returns_never_reaches_a_later_read() {
+        let Some(got) = order_reads("p_exit") else {
+            return;
+        };
+        assert_eq!(got, ["/a"]);
+    }
+
+    /// Guard: either branch may run, so both values reach the read.
+    #[test]
+    fn both_branches_are_read() {
+        let Some(got) = order_reads("p_both") else {
+            return;
+        };
+        assert_eq!(got, ["/a", "/b"]);
+    }
+
+    /// Guard: a write in a loop refuses the local in the flow, and the
+    /// text reader keeps its set (the initialiser and every write).
+    #[test]
+    fn a_local_written_in_a_loop_keeps_every_value() {
+        let Some(got) = order_reads("p_looped") else {
+            return;
+        };
+        assert_eq!(got, ["/a", "hole:Reassigned"]);
+    }
+
+    /// Guard: `??=` adds a way and keeps the one that reaches it.
+    #[test]
+    fn a_logical_assign_adds_to_what_reaches_it() {
+        let Some(got) = order_reads("p_nullish") else {
+            return;
+        };
+        assert_eq!(got, ["/a", "/b"]);
+    }
+
+    /// Guard: a write the flow does not place (in an `if` test) refuses the
+    /// local, and the text reader keeps its set.
+    #[test]
+    fn a_write_the_flow_does_not_place_keeps_every_value() {
+        let Some(got) = order_reads("p_hidden") else {
+            return;
+        };
+        assert_eq!(got, ["/a", "/b"]);
     }
 
     // Parameters read through their callers (carrick#3504 B10-1b). Fixture
