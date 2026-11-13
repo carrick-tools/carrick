@@ -10489,6 +10489,20 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         build_check_pairs(&[api, web])
     }
 
+    /// The one pair the stamp moves: a GET call against an every-verb route
+    /// whose handler is itself decided to read no body now says so on both
+    /// sides, which is the compatible both-sides verdict. Before, the call's
+    /// side read `not_located` and the pair was probed.
+    #[test]
+    fn a_get_call_stating_no_body_against_a_route_reading_none_is_compatible() {
+        let before =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), None));
+        let after =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), DECIDED));
+        assert_eq!(pre_verdict_of(&before), None);
+        assert_eq!(pre_verdict_of(&after), Some(PreVerdict::NoBodyEitherSide));
+    }
+
     /// carrick#4159: a GET call states `no_request_body` (nothing was left
     /// unlocated). Against a route whose request type expects a body, or one
     /// no scan read, the pair is judged exactly as it was before the call said

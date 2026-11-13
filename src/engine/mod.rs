@@ -13658,6 +13658,13 @@ fn stamp_capture_provenance(
             continue;
         }
         let cause = record.unread_cause.as_deref().unwrap_or("not_recorded");
+        // carrick#4159: a call whose verb carries no body sends none, so a
+        // request no scan located is decided, not unlocated.
+        let cause = if cause == "not_located" && consumer_call_sends_no_body(entry) {
+            "no_request_body"
+        } else {
+            cause
+        };
         let (kind, reason) = match entry.v1_before_demotion {
             Some(v1) => (
                 if v1.holds_any { "any" } else { "unknown" },
@@ -13707,6 +13714,18 @@ fn stamp_service_type_loss(cloud_data: &mut CloudRepoData) {
                 });
         }
     }
+}
+
+/// Whether `entry` is a consumer's request type for an HTTP call whose verb
+/// carries no body (the verbs a producer is never asked a request body for,
+/// [`crate::type_manifest::producer_reads_request_body`]).
+fn consumer_call_sends_no_body(entry: &TypeManifestEntry) -> bool {
+    entry.role == ManifestRole::Consumer
+        && entry.type_kind == ManifestTypeKind::Request
+        && entry
+            .key
+            .as_http()
+            .is_some_and(|(method, _)| !crate::type_manifest::producer_reads_request_body(method))
 }
 
 fn build_type_manifest_entries(
