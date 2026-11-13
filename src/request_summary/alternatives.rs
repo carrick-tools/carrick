@@ -524,8 +524,8 @@ impl Alternation {
         };
         let unplaced = writes.iter().any(|(local, read)| {
             placed
-                .of_written(local)
-                .is_none_or(|census| census != *read)
+                .of(local)
+                .is_none_or(|census| census.iter().copied().collect::<BTreeSet<_>>() != *read)
         });
         if unplaced {
             *self = Alternation::Single;
