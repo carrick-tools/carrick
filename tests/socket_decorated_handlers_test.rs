@@ -243,13 +243,23 @@ fn a_decorator_whose_name_is_a_defaulted_type_parameter_is_a_listener() {
 }
 
 /// The same slot with no default says nothing about its argument: no row.
+/// The label's check could not be run against the package's declarations,
+/// so the site is saved once, as `label_unchecked` (carrick#4162).
 #[test]
-fn a_decorator_whose_name_is_an_unbounded_type_parameter_states_nothing() {
-    let lobby = &scanned()["lobby"];
+fn a_decorator_whose_name_is_an_unbounded_type_parameter_states_no_row_and_saves_its_site() {
+    let scan = scan_once();
+    let lobby = &scan.services["lobby"];
     assert!(
         lobby.iter().all(|row| !row.key.ends_with("lobby.nothing")),
         "{lobby:#?}"
     );
+    let at: Vec<_> = scan.unread["lobby"]
+        .iter()
+        .filter(|site| site["file"] == GATEWAY && site["line"] == 23)
+        .collect();
+    assert_eq!(at.len(), 1, "{at:#?} of {:#?}", scan.unread["lobby"]);
+    assert_eq!(at[0]["reason"], "label_unchecked", "{}", at[0]);
+    assert_eq!(at[0]["slot"], "name", "{}", at[0]);
 }
 
 /// A method decorated through an in-repo decorator factory (carrick#3688,
