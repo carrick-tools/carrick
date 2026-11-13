@@ -154,8 +154,13 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     let root = temp.path();
     let repo = root.join("orders");
     std::fs::create_dir(&repo).unwrap();
-    let source = "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\nfetch(\"https://example.test/local\", { method: \"GET\" });\n";
+    // The receiver is an installed `express`, whose store answer labels the
+    // route; the manifest does not list it, so the manifest change below is
+    // still a change (carrick#3711).
+    let source = "import express from \"express\";\nconst app = express();\nfunction handler() { return { id: 1 }; }\napp.get(\"/hosted\", handler);\nfetch(\"https://example.test/local\", { method: \"GET\" });\n";
     std::fs::write(repo.join("app.ts"), source).unwrap();
+    real_packages::install(&repo, &["express"]);
+    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     std::fs::write(
         repo.join("package.json"),
         r#"{"name":"orders","version":"1.0.0","dependencies":{"@remix-run/node":"^2.0.0"}}"#,
@@ -194,7 +199,7 @@ fn hosted_replay_tracks_working_tree_and_authentication_through_real_scan() {
     let start = source.find("app.get(").unwrap() + 1;
     let end = start + "app.get(\"/hosted\", handler)".len();
     hosted["file_results"] = json!({"app.ts":{"mounts":[],"data_calls":[],"endpoints":[{
-        "candidate_id":format!("span:{start}-{end}"),"line_number":3,"owner_node":"app","method":"GET","path":"/hosted",
+        "candidate_id":format!("span:{start}-{end}"),"line_number":4,"owner_node":"app","method":"GET","path":"/hosted",
         "handler_name":"handler","pattern_matched":"fixture","call_expression_span_start":start,"call_expression_span_end":end,
         "resolution_source":"model"
     }]}});
