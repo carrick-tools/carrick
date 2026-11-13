@@ -1181,7 +1181,7 @@ function probeCalls(argvLog: string): number {
 
 const waitForAnswer = (ws: FactsWorkspace, session: string) => waitForSessionAnswers(ws.home, session);
 
-test("with CARRICK_FACT_LINES unset and a fact file on disk, an Edit, a Write that creates a file and a shell write probe as before", async (t) => {
+test("with CARRICK_FACT_LINES=0 and a fact file on disk, an Edit, a Write that creates a file and a shell write probe as before", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const env = fakeEnv({
@@ -1189,8 +1189,8 @@ test("with CARRICK_FACT_LINES unset and a fact file on disk, an Edit, a Write th
     CLAUDE_PROJECT_DIR: ws.root,
     CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
     CARRICK_FAKE_ARGV_LOG: argvLog,
+    CARRICK_FACT_LINES: "0",
   });
-  delete env["CARRICK_FACT_LINES"];
   const hook = (script: string, payload: Record<string, unknown>) =>
     runHook(script, { payload: { hook_event_name: "PostToolUse", session_id: "switch-off", cwd: ws.root, ...payload }, env });
   const said: Record<string, string> = {};
