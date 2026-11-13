@@ -27,6 +27,9 @@
 //   CARRICK_FAKE_PID_LOG  file to append this process's pid to, and, with it,
 //                         the process ignores SIGTERM (so only SIGKILL ends a
 //                         call that is past its limit)
+//   CARRICK_FAKE_DONE_LOG file to append a line to when a call reaches its
+//                         answer (after any delay), so a test can read that a
+//                         call was still pending when its caller returned
 //   CARRICK_FAKE_EXIT     exit code to use, with nothing on stdout
 //   CARRICK_FAKE_ARGV_LOG file to append the argv and cwd of every call to
 //   CARRICK_FAKE_INVOKER_LOG
@@ -124,6 +127,9 @@ const delay =
   (!probe && process.env.CARRICK_FAKE_FULL_DELAY_MS ? Number(process.env.CARRICK_FAKE_FULL_DELAY_MS) : 0) +
   (probe && process.env.CARRICK_FAKE_PROBE_DELAY_MS ? Number(process.env.CARRICK_FAKE_PROBE_DELAY_MS) : 0);
 const print = () => {
+  if (process.env.CARRICK_FAKE_DONE_LOG) {
+    fs.appendFileSync(process.env.CARRICK_FAKE_DONE_LOG, `${probe ? "probe" : "full"}\n`);
+  }
   // `check --each a b --json`: one array, one answer per file, in order.
   const body = argv.includes("--each")
     ? `[${files.map(answer).join(",")}]`

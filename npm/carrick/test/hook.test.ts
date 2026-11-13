@@ -1212,16 +1212,24 @@ test("a probe past its limit is killed even when it ignores SIGTERM, and reads a
   }
 });
 
-test("a slow probe leaves the edit queued and the hook back in under a second", async (t) => {
+test("a slow probe leaves the edit queued and the hook back before the probe answers", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
-  const env = deferredEnv(home, { CARRICK_FAKE_PROBE_DELAY_MS: "3000", CARRICK_FAKE_FULL_DELAY_MS: "200" });
+  const doneLog = path.join(workspace.root, "done.log");
+  const env = deferredEnv(home, {
+    CARRICK_FAKE_PROBE_DELAY_MS: "3000",
+    CARRICK_FAKE_FULL_DELAY_MS: "200",
+    CARRICK_FAKE_DONE_LOG: doneLog,
+  });
   delete env["CARRICK_TIMEOUT_MS"];
 
   const run = await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: "sess-nw1" }, env });
   assert.equal(run.code, 0);
-  assert.ok(run.ms < 1000, `the hook waited ${run.ms}ms for a probe that takes 3 s`);
+  // Behaviour, not speed: the probe had not answered when the hook returned. The bound is a backstop only.
+  const finished = fs.existsSync(doneLog) ? fs.readFileSync(doneLog, "utf8").split("\n") : [];
+  assert.ok(!finished.includes("probe"), `the hook waited for the slow probe (${run.ms}ms)`);
+  assert.ok(run.ms < 2500, `the hook took ${run.ms}ms with a probe that takes 3 s`);
   assert.equal(run.stdout, "", "a queued edit says nothing now");
   // Queued: the runner ran the full re-check and wrote its answer for the next hook to carry.
   await waitForAnswers(home, "sess-nw1", 1);
