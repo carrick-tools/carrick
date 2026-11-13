@@ -359,15 +359,16 @@ impl<'a> Labels<'a> {
     /// a package it did not answer (still building, skipped, not asked) is
     /// told from one it answered with nothing to label.
     pub fn of_answer(answer: &'a LibraryAnswer) -> Self {
-        Labels::of_answered(&answer.exports, &answer.answered_packages)
+        Labels::of(&answer.exports).answered(&answer.answered_packages)
     }
 
-    /// [`Labels::of_answer`] from the exports and the packages answered, as
-    /// the store's first answer to a scan holds them (carrick#2613).
-    pub fn of_answered(exports: &'a [ExportClaims], answered: &'a BTreeSet<String>) -> Self {
+    /// These labels with the packages the store answered, as its first
+    /// answer to a scan holds them (carrick#2613): a call into a package it
+    /// did not answer is [`Stop::UnansweredPackage`].
+    pub fn answered(self, answered: &'a BTreeSet<String>) -> Self {
         Labels {
             answered: Some(answered.iter().map(String::as_str).collect()),
-            ..Labels::of(exports)
+            ..self
         }
     }
 
@@ -405,8 +406,8 @@ impl<'a> Labels<'a> {
 
     /// These labels for the settled pass, with the packages the scan ended
     /// without an answer for: a call into one is not followed, for
-    /// [`Stop::UnansweredPackage`]. For labels built by [`Self::of`] or
-    /// [`Self::traced`], which know no answered set.
+    /// [`Stop::UnansweredPackage`]. For labels with no answered set
+    /// ([`Self::answered`] is the first answer's).
     pub fn ended_without(self, unready: &'a BTreeSet<String>) -> Self {
         debug_assert!(self.answered.is_none());
         Labels {
@@ -424,11 +425,12 @@ impl<'a> Labels<'a> {
         }
     }
 
-    /// [`Self::of`], with the receiver trace on.
-    pub fn traced(exports: &'a [ExportClaims], declarations: &'a MemberDeclarations) -> Self {
+    /// These labels with the receiver trace on (carrick#2474 R1), for the
+    /// first answer's discovery and the settled one alike (carrick#4077).
+    pub fn tracing(self, declarations: &'a MemberDeclarations) -> Self {
         Labels {
             declarations: Some(declarations),
-            ..Self::of(exports)
+            ..self
         }
     }
 
@@ -5401,7 +5403,7 @@ mod tests {
         };
         let discovery = discover(
             &on.inputs,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         let wrong: Vec<String> = [
@@ -6621,7 +6623,7 @@ export function listen(): void {
         assert!(!declarations.is_empty(), "the verifier names declarations");
         let discovery = discover(
             &on.inputs,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         let got = traced_records(&discovery);
@@ -6703,7 +6705,7 @@ export function listen(): void {
         let off = discover(&on.inputs, &Labels::of(&exports), &on.repo);
         let traced = discover(
             &on.inputs,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         let text = serde_json::to_string(&off.sites).unwrap();
@@ -6778,7 +6780,7 @@ export function listen(): void {
         let off = discover(&on.inputs, &Labels::of(&exports), &on.repo);
         let traced = discover(
             &on.inputs,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         let (decided_off, records_off) = records_of(&on, &exports, &off);
@@ -6945,7 +6947,11 @@ export function listen(): void {
         scopes: &[super::super::decided_sites::ScopeLabel],
     ) -> (Discovery, super::super::decided_sites::Decided) {
         use super::super::decided_sites::{MakerLabel, SiteLabel, decided_sites_traced};
-        let discovery = discover(&on.inputs, &Labels::traced(exports, declarations), &on.repo);
+        let discovery = discover(
+            &on.inputs,
+            &Labels::of(exports).tracing(declarations),
+            &on.repo,
+        );
         let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
             .sites
             .iter()
@@ -7774,7 +7780,7 @@ export function listen(): void {
         let discovery = discover_with(
             own,
             &siblings,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
@@ -8274,7 +8280,7 @@ export function listen(): void {
         };
         let discovery = discover(
             &on.inputs,
-            &Labels::traced(&exports, &declarations),
+            &Labels::of(&exports).tracing(&declarations),
             &on.repo,
         );
         assert_eq!(discovery.counts.get("declaration_ambiguous"), None);

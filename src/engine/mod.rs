@@ -4087,6 +4087,7 @@ impl ServiceScan {
                 &sibling_inputs,
                 Path::new(repo_path),
                 &implementations,
+                FirstTrace::Untraced,
                 fact_sender,
             ),
         );
@@ -5789,7 +5790,7 @@ async fn analyze_current_repo_incremental(
                 analysis,
                 (settled, placements, fallbacks, caller_stops),
                 library_answer,
-                (),
+                first_declarations,
                 entered,
             ) = tokio::join!(
                 file_orchestrator.analyze_files(
@@ -5820,6 +5821,10 @@ async fn analyze_current_repo_incremental(
                     &sibling_inputs,
                     Path::new(repo_path),
                     &implementations,
+                    FirstTrace::Traced {
+                        sidecar,
+                        from_dir: &semantics_root,
+                    },
                     fact_sender,
                 ),
                 walk_entered(&request_inputs, &implementations, Path::new(repo_path)),
@@ -5905,8 +5910,13 @@ async fn analyze_current_repo_incremental(
             protocol_extractions.library = library;
             protocol_extractions.implementations_unanswered = implementations.unanswered.clone();
             let server_claims = server_claims_of(&claims, &semantics_root);
-            let declarations =
-                member_declarations(&request_inputs, &claims, sidecar, &semantics_root);
+            let declarations = settled_declarations(
+                first_declarations,
+                &request_inputs,
+                &claims,
+                sidecar,
+                &semantics_root,
+            );
             let results = result_index_of(
                 &request_inputs,
                 Path::new(repo_path),
@@ -5936,6 +5946,7 @@ async fn analyze_current_repo_incremental(
                     implementations: Some(&implementations),
                     siblings: &sibling_inputs,
                     unready: unready.as_ref(),
+                    answered: None,
                 },
             )
             .await;
@@ -7287,7 +7298,11 @@ async fn settled_library_answer(
 /// orchestrator which files the fact layer would send it (carrick#2613,
 /// record-only). Always sends: `None` when the scan records nothing here
 /// (nothing asked, no compiler rows), so the orchestrator never waits on a
-/// sender that is gone.
+/// sender that is gone. Traced (carrick#4077), the member declarations are
+/// asked here, once the first answer is in and before the reader is: the
+/// reader waits on these files. Returns the first answer's exports and those
+/// declarations, for the settled pass to reuse ([`settled_declarations`]).
+#[allow(clippy::too_many_arguments)]
 async fn fact_files_of(
     ask: Option<&LibraryAsk>,
     first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
@@ -7295,23 +7310,42 @@ async fn fact_files_of(
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
     implementations: &crate::request_summary::implementations::Implementations,
+    trace: FirstTrace<'_>,
     sender: tokio::sync::oneshot::Sender<Option<crate::request_summary::fact_files::FactFiles>>,
-) {
+) -> Option<FirstDeclarations> {
     let recorded = match ask {
         Some(ask) if inputs.positions.is_some() => first.await.ok().map(|answer| (ask, answer)),
         _ => None,
     };
     let Some((ask, answer)) = recorded else {
         let _ = sender.send(None);
-        return;
+        return None;
     };
-    let facts = first_discovery(&ask.sites, answer, inputs, siblings, root, implementations);
+    let asked = match trace {
+        FirstTrace::Untraced => None,
+        FirstTrace::Traced { sidecar, from_dir } => {
+            member_declarations(inputs, &answer.exports, sidecar, from_dir)
+        }
+    };
+    let exports = answer.exports.clone();
+    let facts = first_discovery(
+        &ask.sites,
+        answer,
+        inputs,
+        siblings,
+        root,
+        implementations,
+        asked.as_ref().map(|asked| &asked.declarations),
+    );
     let _ = sender.send(Some(facts));
+    Some(FirstDeclarations { exports, asked })
 }
 
 /// The files the fact layer would send the reader
 /// ([`crate::request_summary::fact_files`]), from discovery run on the
-/// store's first `answer`.
+/// store's first `answer`, through the receiver trace when `declarations`
+/// are given: the labels the settled pass builds ([`discovery_of`]), with
+/// the first answer's answered packages.
 fn first_discovery(
     library: &crate::request_summary::LibrarySites,
     answer: crate::library_store::FirstAnswer,
@@ -7319,15 +7353,23 @@ fn first_discovery(
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     root: &Path,
     implementations: &crate::request_summary::implementations::Implementations,
+    declarations: Option<&crate::request_summary::discovery::MemberDeclarations>,
 ) -> crate::request_summary::fact_files::FactFiles {
     // With the packages answered, so a call into one the store has not
     // answered is told apart (`unanswered_package`) from a call it answered
     // with nothing to label.
-    let labels =
-        crate::request_summary::discovery::Labels::of_answered(&answer.exports, &answer.answered)
-            .following(implementations);
-    let discovery =
-        crate::request_summary::discovery::discover_with(inputs, siblings, &labels, root);
+    let discovery = discovery_of(
+        inputs,
+        root,
+        &answer.exports,
+        SiteContext {
+            answered: Some(&answer.answered),
+            declarations,
+            implementations: Some(implementations),
+            siblings,
+            ..SiteContext::default()
+        },
+    );
     let decided = crate::request_summary::decided_sites::decided_sites_with(
         inputs,
         siblings,
@@ -7595,6 +7637,10 @@ struct SiteContext<'a> {
     /// ([`crate::library_store::Settled::unanswered`]); `None` for no ask or a
     /// read-only ask, where no call reads unready (carrick#3684).
     unready: Option<&'a BTreeSet<String>>,
+    /// The packages the store's first answer holds as answered, for the
+    /// first answer's discovery (carrick#2613, carrick#4077); `None` for the
+    /// settled pass, which reads [`Self::unready`] instead.
+    answered: Option<&'a BTreeSet<String>>,
 }
 
 /// What the analysis sidecar finds for each call of the service through an
@@ -7700,21 +7746,29 @@ fn discovered_edges(
 /// runs under the library checks' time limit; the checks it does not reach
 /// are counted. `None` when the service has no rows. No sidecar, or a failed
 /// request, indexes nothing; the trace still records each site's receiver.
+/// The first answer's discovery and the settled one both read it
+/// (carrick#4077), and the settled pass reuses the first one's when its
+/// claims are the same ([`settled_declarations`]).
 fn member_declarations(
     inputs: &crate::request_summary::RequestSummaryInputs,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
-) -> Option<crate::request_summary::discovery::MemberDeclarations> {
+) -> Option<AskedDeclarations> {
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
     inputs.positions.as_ref()?;
+    let started = Instant::now();
     let ask = declaration_ask(inputs, claims);
+    let mut failed = false;
     let verdicts = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
+            #[cfg(test)]
+            DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
             match sidecar.verify_library_claims(from_dir, &ask.checks) {
                 Ok(answer) => answer.verdicts,
                 Err(error) => {
                     warn!(%error, "receiver trace: the declaration ask failed; none indexed");
+                    failed = true;
                     Vec::new()
                 }
             }
@@ -7726,9 +7780,69 @@ fn member_declarations(
         checks = declarations.checks,
         not_reached = declarations.not_reached,
         declarations = declarations.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "receiver trace: member declarations"
     );
-    Some(declarations)
+    Some(AskedDeclarations {
+        whole: !failed && declarations.not_reached == 0,
+        declarations,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many declaration asks [`member_declarations`] sent the sidecar on
+    /// this thread (carrick#4077 R5).
+    static DECLARATION_ASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What one [`member_declarations`] ask returned.
+struct AskedDeclarations {
+    declarations: crate::request_summary::discovery::MemberDeclarations,
+    /// The ask did not fail and the verifier reached every check: another
+    /// ask over the same claims would answer the same.
+    whole: bool,
+}
+
+/// The first answer's exports and the member declarations its discovery read
+/// (carrick#4077), for the settled pass to reuse.
+struct FirstDeclarations {
+    exports: Vec<crate::library_claims::ExportClaims>,
+    asked: Option<AskedDeclarations>,
+}
+
+/// How the first answer's discovery reads receivers (carrick#4077).
+#[derive(Clone, Copy)]
+enum FirstTrace<'a> {
+    /// No type checker is held (the look-ahead lane): the walk records no
+    /// receiver, and a file where it stopped at an unmatched networked call
+    /// is not asked ahead (R4).
+    Untraced,
+    /// The receiver trace on, with the declarations `sidecar` verifies from
+    /// `from_dir` over the first answer's exports.
+    Traced {
+        sidecar: Option<&'a TypeSidecar>,
+        from_dir: &'a Path,
+    },
+}
+
+/// The member declarations the settled pass reads (carrick#4077 R5): the first
+/// answer's when the settled `claims` are its exports and its ask was whole,
+/// otherwise one ask over `claims`.
+fn settled_declarations(
+    first: Option<FirstDeclarations>,
+    inputs: &crate::request_summary::RequestSummaryInputs,
+    claims: &[crate::library_claims::ExportClaims],
+    sidecar: Option<&TypeSidecar>,
+    from_dir: &Path,
+) -> Option<crate::request_summary::discovery::MemberDeclarations> {
+    match first {
+        Some(FirstDeclarations {
+            exports,
+            asked: Some(asked),
+        }) if asked.whole && exports == claims => Some(asked.declarations),
+        _ => member_declarations(inputs, claims, sidecar, from_dir).map(|asked| asked.declarations),
+    }
 }
 
 /// What a service's site questions read before anything is asked
@@ -7775,11 +7889,14 @@ fn discovery_of(
     claims: &[crate::library_claims::ExportClaims],
     context: SiteContext<'_>,
 ) -> crate::request_summary::discovery::Discovery {
+    let labels = crate::request_summary::discovery::Labels::of(claims);
+    let labels = match context.answered {
+        Some(answered) => labels.answered(answered),
+        None => labels,
+    };
     let labels = match context.declarations {
-        Some(declarations) => {
-            crate::request_summary::discovery::Labels::traced(claims, declarations)
-        }
-        None => crate::request_summary::discovery::Labels::of(claims),
+        Some(declarations) => labels.tracing(declarations),
+        None => labels,
     };
     let labels = match context.implementations {
         Some(implementations) => labels.following(implementations),
@@ -14398,7 +14515,7 @@ async fn analyze_current_repo(
         analysis_result,
         (settled, placements, fallbacks, caller_stops),
         library_answer,
-        (),
+        first_declarations,
         entered,
     ) = tokio::join!(
         orchestrator.run_complete_analysis(
@@ -14430,6 +14547,10 @@ async fn analyze_current_repo(
             &sibling_inputs,
             Path::new(repo_path),
             &implementations,
+            FirstTrace::Traced {
+                sidecar,
+                from_dir: &service_root,
+            },
             fact_sender,
         ),
         walk_entered(&request_inputs, &implementations, Path::new(repo_path)),
@@ -14506,7 +14627,13 @@ async fn analyze_current_repo(
     protocol_extractions.library = library;
     protocol_extractions.implementations_unanswered = implementations.unanswered.clone();
     let server_claims = server_claims_of(&claims, &service_root);
-    let declarations = member_declarations(&request_inputs, &claims, sidecar, &service_root);
+    let declarations = settled_declarations(
+        first_declarations,
+        &request_inputs,
+        &claims,
+        sidecar,
+        &service_root,
+    );
     let results = result_index_of(
         &request_inputs,
         Path::new(repo_path),
@@ -14535,6 +14662,7 @@ async fn analyze_current_repo(
             implementations: Some(&implementations),
             siblings: &sibling_inputs,
             unready: unready.as_ref(),
+            answered: None,
         },
     )
     .await;
@@ -28445,6 +28573,7 @@ unfollowed_member_calls_total: 0,
             &[],
             &on.repo,
             &Default::default(),
+            None,
         );
         let why = facts
             .files
@@ -28457,6 +28586,215 @@ unfollowed_member_calls_total: 0,
             }),
             "the call is recorded as a site"
         );
+    }
+
+    /// carrick#4077: a route registered on a typed parameter with no maker in
+    /// reach (`helpers.ts:15`, `app.get("/deep", ok)` in a helper three calls
+    /// deep) is a site at the store's first answer, as the settled pass says:
+    /// the first discovery reads the receiver trace's declarations, so the
+    /// reader is asked about it rather than the call being saved
+    /// `package_unmatched`.
+    #[tokio::test]
+    async fn the_first_answer_traces_a_route_on_a_typed_parameter() {
+        use crate::request_summary::fact_files::Followed;
+        let Some(on) = receiver_trace() else {
+            return;
+        };
+        let Some(sidecar) = receiver_trace_sidecar(&on) else {
+            return;
+        };
+        let exports = receiver_trace_answer().exports;
+        let (facts, _) = receiver_trace_first(
+            &on,
+            &exports,
+            super::FirstTrace::Traced {
+                sidecar: Some(&sidecar),
+                from_dir: &on.repo,
+            },
+        )
+        .await;
+        let span = deep_route_span(&on);
+        assert_eq!(
+            facts.followed("src/helpers.ts", span),
+            Some(&Followed::Site),
+            "the route is a site at the first answer"
+        );
+        assert!(
+            facts.listed_in("src/helpers.ts").contains(&span),
+            "the route is listed for the reader"
+        );
+    }
+
+    /// carrick#4077 R4: the look-ahead lane holds no type checker, so its
+    /// first discovery stays untraced and saves the same route
+    /// `package_unmatched`; such a file is one the lane never asks ahead,
+    /// since the analysis's traced discovery may list more of it.
+    #[tokio::test]
+    async fn the_untraced_first_answer_marks_a_file_the_lane_does_not_ask() {
+        use crate::request_summary::fact_files::Followed;
+        use crate::request_summary::stop::Stop;
+        let Some(on) = receiver_trace() else {
+            return;
+        };
+        let exports = receiver_trace_answer().exports;
+        let (facts, first) = receiver_trace_first(&on, &exports, super::FirstTrace::Untraced).await;
+        // What main's first discovery recorded here (carrick#4077's red): a
+        // call into the networked package that entered no code and matched
+        // no label.
+        assert_eq!(
+            facts.followed("src/helpers.ts", deep_route_span(&on)),
+            Some(&Followed::Unfollowed(Stop::PackageUnmatched))
+        );
+        assert!(facts.stops_unmatched_in("src/helpers.ts"));
+        assert!(
+            first.is_some_and(|first| first.asked.is_none()),
+            "the untraced lane asks no declarations"
+        );
+    }
+
+    /// carrick#4077 R4: every file whose listed spans the receiver trace
+    /// changes is one the lane's untraced discovery marks, so the lane never
+    /// asks ahead a prompt the analysis would build otherwise.
+    #[tokio::test]
+    async fn every_file_the_trace_lists_otherwise_is_one_the_lane_skips() {
+        let Some(on) = receiver_trace() else {
+            return;
+        };
+        let Some(sidecar) = receiver_trace_sidecar(&on) else {
+            return;
+        };
+        let exports = receiver_trace_answer().exports;
+        let (traced, _) = receiver_trace_first(
+            &on,
+            &exports,
+            super::FirstTrace::Traced {
+                sidecar: Some(&sidecar),
+                from_dir: &on.repo,
+            },
+        )
+        .await;
+        let (untraced, _) = receiver_trace_first(&on, &exports, super::FirstTrace::Untraced).await;
+        let files: BTreeSet<&String> = traced.listed.keys().chain(untraced.listed.keys()).collect();
+        let moved: Vec<&String> = files
+            .into_iter()
+            .filter(|file| traced.listed_in(file) != untraced.listed_in(file))
+            .collect();
+        assert!(!moved.is_empty(), "the trace lists more of the fixture");
+        let unmarked: Vec<&&String> = moved
+            .iter()
+            .filter(|file| !untraced.stops_unmatched_in(file))
+            .collect();
+        assert!(
+            unmarked.is_empty(),
+            "listed otherwise, not marked: {unmarked:?}"
+        );
+    }
+
+    /// carrick#4077 R5: the settled pass reuses the first answer's member
+    /// declarations when the settled claims are the first answer's exports:
+    /// one ask. Claims that differ are asked once more.
+    #[tokio::test]
+    async fn the_settled_pass_reuses_the_first_answer_s_declarations() {
+        let Some(on) = receiver_trace() else {
+            return;
+        };
+        let Some(sidecar) = receiver_trace_sidecar(&on) else {
+            return;
+        };
+        let exports = receiver_trace_answer().exports;
+        let trace = super::FirstTrace::Traced {
+            sidecar: Some(&sidecar),
+            from_dir: &on.repo,
+        };
+        let asks = || super::DECLARATION_ASKS.with(|asks| asks.get());
+        super::DECLARATION_ASKS.with(|asks| asks.set(0));
+        let (_, first) = receiver_trace_first(&on, &exports, trace).await;
+        let settled =
+            super::settled_declarations(first, &on.inputs, &exports, Some(&sidecar), &on.repo)
+                .expect("the service has rows");
+        assert!(!settled.is_empty(), "the verifier names declarations");
+        assert_eq!(asks(), 1, "one ask when the settled claims are the first's");
+
+        let (_, first) = receiver_trace_first(&on, &exports, trace).await;
+        let more = exports.len() - 1;
+        super::settled_declarations(
+            first,
+            &on.inputs,
+            &exports[..more],
+            Some(&sidecar),
+            &on.repo,
+        )
+        .expect("the service has rows");
+        assert_eq!(asks(), 3, "settled claims that differ are asked again");
+    }
+
+    fn receiver_trace() -> Option<crate::request_summary::fixture_walk::Walked> {
+        crate::request_summary::fixture_walk::walked("receiver-trace", ".", "web", &[], true)
+    }
+
+    fn receiver_trace_sidecar(
+        on: &crate::request_summary::fixture_walk::Walked,
+    ) -> Option<TypeSidecar> {
+        let script = crate::request_summary::fixture_walk::sidecar()?;
+        let sidecar = TypeSidecar::spawn(&script).expect("spawn the sidecar");
+        sidecar.start_init(&on.repo, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(120))
+            .expect("the sidecar is ready");
+        Some(sidecar)
+    }
+
+    fn receiver_trace_answer() -> crate::library_store::LibraryAnswer {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/receiver-trace");
+        crate::library_store::parse_answer(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        )
+    }
+
+    /// `helpers.ts:15`'s registration, as its SWC span: byte offset + 1, the
+    /// call without its `;`.
+    fn deep_route_span(on: &crate::request_summary::fixture_walk::Walked) -> (u32, u32) {
+        let source = std::fs::read_to_string(on.repo.join("src/helpers.ts")).unwrap();
+        let call = "app.get(\"/deep\", ok)";
+        let start = source.find(call).expect("the fixture holds the route") as u32 + 1;
+        (start, start + call.len() as u32)
+    }
+
+    /// The fact files [`super::fact_files_of`] sends for the receiver-trace
+    /// fixture, its first answer holding `exports`, and what it returns.
+    async fn receiver_trace_first(
+        on: &crate::request_summary::fixture_walk::Walked,
+        exports: &[crate::library_claims::ExportClaims],
+        trace: super::FirstTrace<'_>,
+    ) -> (
+        crate::request_summary::fact_files::FactFiles,
+        Option<super::FirstDeclarations>,
+    ) {
+        let ask = super::LibraryAsk::of(&on.inputs, &on.repo, &on.repo, Default::default())
+            .expect("the service asks the store");
+        let (early, first) = tokio::sync::oneshot::channel();
+        let _ = early.send(crate::library_store::FirstAnswer {
+            exports: exports.to_vec(),
+            answered: receiver_trace_answer().answered_packages,
+            ..Default::default()
+        });
+        let (sender, files) = tokio::sync::oneshot::channel();
+        let returned = super::fact_files_of(
+            Some(&ask),
+            first,
+            &on.inputs,
+            &[],
+            &on.repo,
+            &Default::default(),
+            trace,
+            sender,
+        )
+        .await;
+        let facts = files
+            .await
+            .expect("the fact files are sent")
+            .expect("the service records fact files");
+        (facts, returned)
     }
 
     /// carrick#2506: a factory typed in a DefinitelyTyped-style package

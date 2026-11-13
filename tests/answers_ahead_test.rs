@@ -132,7 +132,17 @@ impl Routes {
     }
 
     async fn analyze(&self, ahead: AheadRole) -> FileCentricAnalysisResult {
-        FileOrchestrator::new(AgentService::new())
+        self.analyze_with(ahead, FileOrchestrator::new(AgentService::new()))
+            .await
+    }
+
+    /// [`Self::analyze`] by `orchestrator`, as the caller built it.
+    async fn analyze_with(
+        &self,
+        ahead: AheadRole,
+        orchestrator: FileOrchestrator,
+    ) -> FileCentricAnalysisResult {
+        orchestrator
             .with_answers_ahead(ahead)
             .analyze_files(
                 &self.files,
@@ -294,6 +304,50 @@ async fn a_failed_ask_ahead_is_asked_again_by_the_loop() {
             .any(|file| file.ends_with("src/a.ts")),
         "the failed file has its answer"
     );
+}
+
+/// carrick#4077 R4: the lane's discovery is untraced, so a file where it
+/// stopped at an unmatched networked call (`package_unmatched`) may list more
+/// spans in the analysis's traced discovery. The lane does not ask it ahead;
+/// the analysis asks it itself. The engine half (the untraced first answer
+/// records that stop on a typed parameter's route) is pinned by the engine's
+/// `the_untraced_first_answer_marks_a_file_the_lane_does_not_ask`.
+#[tokio::test]
+#[serial]
+async fn a_file_the_lane_stopped_unmatched_in_is_not_asked_ahead() {
+    use carrick::agents::file_orchestrator::FactFileSource;
+    use carrick::request_summary::fact_files::{FactFiles, Followed};
+    use carrick::request_summary::stop::Stop;
+    offline();
+    let routes = Routes::new("t4077");
+    let facts = || {
+        let mut facts = FactFiles::default();
+        facts.calls.insert(
+            ("src/a.ts".to_string(), 1, 2),
+            Followed::Unfollowed(Stop::PackageUnmatched),
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let _ = sender.send(Some(facts));
+        FileOrchestrator::new(AgentService::new()).with_fact_files(FactFileSource::later(receiver))
+    };
+    let slot = Arc::new(AheadSlot::default());
+    let before = requests_to(ROUTE);
+    routes.analyze_with(lane(&slot), facts()).await;
+    let lane_asks = requests_to(ROUTE) - before;
+    let held = slot.held().expect("the lane published");
+    let before = requests_to(ROUTE);
+    let analysed = routes
+        .analyze_with(AheadRole::Analysis(slot.clone()), facts())
+        .await;
+    let analysis_asks = requests_to(ROUTE) - before;
+
+    assert_eq!(lane_asks, 1, "the lane asks only the other file");
+    assert_eq!((held.asked(), held.taken(), held.unused()), (1, 1, 0));
+    assert_eq!(
+        analysis_asks, 1,
+        "the analysis asks the stopped file itself"
+    );
+    assert_eq!(analysed.stats.files_model_dispatched, 2);
 }
 
 /// The review of carrick#3131: an answer the lane asked under other inputs
