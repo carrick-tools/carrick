@@ -312,48 +312,15 @@ fn git_in(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// The fixture in `dir`, made so `--changed-only` can carry both services:
-/// `--changed-only` analyses every service with an import it cannot
-/// resolve, and the fixture's libraries are ambient `declare module`
-/// blocks.
+/// The fixture in `dir`, at a canonical path, so `--changed-only` can carry
+/// both services: it analyses every service with an import it cannot
+/// resolve, and each of the fixture's libraries is installed.
 fn carriable_fixture(dir: &Path) -> PathBuf {
     let root = dir
         .canonicalize()
         .expect("canonical temp dir")
         .join("retype-http-client");
     copy_tree(&fixture_dir(), &root);
-    // `--changed-only` analyses every service with an import it cannot
-    // resolve, and the fixture's libraries are ambient `declare module`
-    // blocks. Each becomes a module file beside its importer, imported by a
-    // relative path on the same line, so both services can be carried.
-    for (dir, module) in [("web", "http-client"), ("api", "http-server")] {
-        let ambient = root.join(format!("{dir}/src/{module}.d.ts"));
-        let text = std::fs::read_to_string(&ambient).expect("read the declarations");
-        let body: Vec<&str> = text.trim_end().lines().collect();
-        let body = body[1..body.len() - 1]
-            .iter()
-            .map(|line| line.strip_prefix("  ").unwrap_or(line))
-            .map(|line| line.replace("export function", "export declare function"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_file(&ambient).expect("remove the ambient module");
-        std::fs::write(root.join(format!("{dir}/src/{module}.ts")), body + "\n")
-            .expect("write the module");
-        std::fs::write(
-            root.join(format!("__llm__/analyze-file/{module}.json")),
-            r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#,
-        )
-        .expect("write the cassette");
-        let importer = root.join(if dir == "web" {
-            "web/src/checkout.ts"
-        } else {
-            "api/src/routes.ts"
-        });
-        let source = std::fs::read_to_string(&importer).expect("read the importer");
-        let relative = source.replace(&format!("\"{module}\""), &format!("\"./{module}\""));
-        assert_ne!(source, relative, "{module} is imported by name");
-        std::fs::write(&importer, relative).expect("write the importer");
-    }
     root
 }
 
@@ -820,15 +787,17 @@ fn a_consumer_whose_calls_all_abstain_before_the_rewrite_builds_no_retype_progra
     std::fs::create_dir_all(admin.join("src")).expect("admin dir");
     std::fs::write(
         admin.join("package.json"),
-        r#"{ "name": "retype-admin", "version": "0.0.0", "private": true }"#,
+        r#"{ "name": "retype-admin", "version": "0.0.0", "private": true, "dependencies": { "http-client": "^1.0.0" } }"#,
     )
     .expect("admin package");
     std::fs::copy(root.join("web/tsconfig.json"), admin.join("tsconfig.json")).expect("tsconfig");
+    // `admin` installs the client `web` installs, from the same lockfile.
+    copy_tree(&root.join("web/node_modules"), &admin.join("node_modules"));
     std::fs::copy(
-        root.join("web/src/http-client.d.ts"),
-        admin.join("src/http-client.d.ts"),
+        root.join("web/package-lock.json"),
+        admin.join("package-lock.json"),
     )
-    .expect("client declaration");
+    .expect("client lockfile");
     let audit = r#"import { create } from "http-client";
 
 const api = create({ baseURL: "http://localhost:3000" });

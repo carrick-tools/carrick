@@ -1,0 +1,48 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture-http/router",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture-http/router",
+          "export": "Router",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture-http/runtime",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@fixture-http/runtime",
+          "export": "TypedRouter",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "get", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "GET", "picker": "fixture-picker" },
+            { "op": "receive", "member": "post", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

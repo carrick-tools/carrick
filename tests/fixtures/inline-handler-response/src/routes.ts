@@ -1,4 +1,4 @@
-import { requireAuth, Router } from './runtime';
+import { requireAuth, Router } from '@fixture-http/router';
 import { createWidget, findWidget, listWidgets, summarize } from './widgets';
 
 // Every route here is registered with its handler passed INLINE: there is no
