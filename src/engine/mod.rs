@@ -6594,6 +6594,7 @@ async fn analyze_current_repo_incremental(
 
             let call_through = crate::call_through::read_sites(
                 &merged_results,
+                &protocol_extractions.site.rows,
                 &request_inputs,
                 repo_path,
                 &cloud_data.function_definitions,
@@ -15716,6 +15717,7 @@ async fn analyze_current_repo(
 
     let call_through = crate::call_through::read_sites(
         &analysis_result.file_results,
+        &protocol_extractions.site.rows,
         &request_inputs,
         repo_path,
         &cloud_data.function_definitions,

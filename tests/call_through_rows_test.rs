@@ -646,8 +646,10 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
         row_at("cli", COMMANDS, 139),
         as_stated("GET", "/tokened", "/tokened")
     );
+    // `showPing`'s `ping()` reaches a `fetch` the fact states (carrick#4078),
+    // so only this row is counted.
     assert!(
-        settled_line().contains("2 reach a request only the model states"),
+        settled_line().contains("1 reach a request only the model states"),
         "{}",
         settled_line()
     );
@@ -754,11 +756,10 @@ fn a_hook_with_two_callbacks_and_a_promise_chain_take_the_request_they_reach() {
             (9, corrected("PUT", "/api/v1/runs/:id", 11)),
             (20, corrected("GET", "/api/v1/runs", 8)),
             (21, corrected("GET", "/api/v1/status", 23)),
-            // The other callback calls what nothing resolves.
-            (
-                14,
-                as_stated("POST", "/api/v1/save-run-cached", "/api/v1/save-run-cached"),
-            ),
+            // `mutationFn` calls `saveRun`, a proven PUT; the other callback
+            // calls a `declare const` with no network evidence, so the
+            // model's path was invented (carrick#4078 R7).
+            (14, corrected("PUT", "/api/v1/runs/:id", 11)),
             // The factory the method is read off requests something, then
             // returns an object of its own.
             (
@@ -808,20 +809,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         ("cli", COMMANDS, 76, as_stated("GET", "/reply", "/reply")),
         // The site writes the route itself.
         ("cli", COMMANDS, 82, as_stated("GET", "/orders", "/orders")),
-        // The site also writes a request of its own.
-        (
-            "cli",
-            COMMANDS,
-            88,
-            as_stated("GET", "/api/v1/notified/${id}", "/api/v1/notified/:id"),
-        ),
-        // Only the model states the request the function called makes.
-        (
-            "cli",
-            COMMANDS,
-            94,
-            as_stated("GET", "/api/v1/pings", "/api/v1/pings"),
-        ),
         // The site writes the route, and the function it calls reaches one
         // request of its own (a token). The row is the one the scanner reads
         // off the site's own source, which this pass never touches.
@@ -864,6 +851,25 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         changed.is_empty(),
         "each of these must stay as the model stated it: {changed:#?}"
     );
+    // The site also writes a request of its own, `fetch("/api/v1/audit")`:
+    // the fact states it there, not the model's invented path.
+    assert_eq!(
+        row_at("cli", COMMANDS, 88),
+        Row {
+            method: "GET".to_string(),
+            target: "/api/v1/audit".to_string(),
+            path: "/api/v1/audit".to_string(),
+            source: "request_summary".to_string(),
+            role: None,
+            reaches: None,
+        }
+    );
+    // `ping()` makes a literal `fetch` the fact states, and the walk links
+    // the call through to it (carrick#4078).
+    assert_eq!(
+        row_at("cli", COMMANDS, 94),
+        corrected("GET", "/api/v1/ping", 27)
+    );
 }
 
 #[test]
@@ -903,10 +909,11 @@ fn every_request_row_is_unchanged() {
             spec(17, "POST /api/v1/audit"),
             spec(20, "GET /health"),
             spec(23, "GET /api/v1/status"),
+            // A literal `fetch`: the fact states it.
             (
                 format!("{REQUESTS}:27"),
                 "GET /api/v1/ping".to_string(),
-                "model".to_string()
+                "request_summary".to_string()
             ),
             spec(39, "POST /api/v1/runs/:id/archive"),
             (
@@ -1153,6 +1160,9 @@ fn a_call_straight_into_another_services_function_states_the_request_it_reaches(
         ("cli", COMMANDS, 157, "GET", "/api/v1/runs/:id", 45),
         // `authorizedRun` is called from its own file, so it is no wrapper.
         ("cli", COMMANDS, 171, "GET", "/api/v1/runs/:id", 5),
+        // `ping()` makes a literal `fetch`: the fact states it, and the walk
+        // links the call through to it (carrick#4078).
+        ("cli", COMMANDS, 94, "GET", "/api/v1/ping", 27),
     ] {
         let mut row = corrected(method, path, request_line);
         // The two requests written on a declared environment base keep it in
@@ -1162,8 +1172,8 @@ fn a_call_straight_into_another_services_function_states_the_request_it_reaches(
         }
         assert_eq!(rows_in(blobs, service, file, line), [row], "{file}:{line}");
     }
-    // The request is written from the parameters, or only the model states it.
-    for line in [76, 82, 94] {
+    // The request is written from the parameters.
+    for line in [76, 82] {
         assert_eq!(
             rows_in(blobs, "cli", COMMANDS, line),
             [],
