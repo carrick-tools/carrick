@@ -73,4 +73,29 @@ fn a_payload_with_no_method_does_not_state_a_get() {
     .map(|(file, line, method)| (file.to_string(), line, method.to_string()))
     .collect();
     assert_eq!(rows, expected, "{projection:#}");
+
+    // Each withdrawn row's site is saved unread and names the withdrawal
+    // (`own_function`, as its reason or beside the walk's own).
+    for file in [
+        "src/checkout.ts",
+        "src/profile-screen.ts",
+        "src/refund-screen.ts",
+    ] {
+        let named = projection["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == file && site["line"] == 4)
+            .any(|site| {
+                site["reason"] == "own_function"
+                    || site["also"]
+                        .as_array()
+                        .is_some_and(|also| also.iter().any(|word| word == "own_function"))
+            });
+        assert!(
+            named,
+            "{file}:4 is saved unread as withdrawn: {:#}",
+            projection["unread_sites"]
+        );
+    }
 }
