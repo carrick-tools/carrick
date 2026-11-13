@@ -20,3 +20,68 @@ it with a path; page components (`src/pages/entity-page.ts`) call the members.
 Each page caller keeps its row, and reads as its inline twin does. The test is
 `page_callers_of_a_url_local_wrapper_keep_their_rows` in
 `tests/url_local_base_test.rs`.
+
+## A URL local written more than once (`src/clients/branches.ts`)
+
+A wrapper that writes its URL local more than once (`src/clients/branches.ts`,
+callers in `src/use-branches.ts`, test `tests/url_local_branches_test.rs`)
+states one request per write at each caller. A write under a test of the
+wrapper's own parameter (`===` / `!==` against text, `startsWith`, an anchored
+literal pattern) is kept or dropped by the text the caller, or a hop between,
+fills it with; under any other test (`if (data)`) every write is kept.
+
+Answer key (the row at each call line in `use-branches.ts`):
+
+- 20, set in both branches of a prefix test, called with a path: `POST
+  /api/items.list` only.
+- 21, initialised then set again under a prefix test: `POST /api/items.list`.
+- 22, a query set under a truthiness test, or the path: every row keys `POST
+  /api/items.list`.
+- 23, line 20's client called with an absolute URL: only that URL is sent,
+  an outside host the scan states no call row for (as an inline `fetch` of
+  one), so no row; never a based `/api/https://…`.
+- 24, set again inside a callback: no row.
+- 25, the branching client (a method test filled one hop away, then an
+  anchored pattern on the path): `POST /api/items.list` only.
+- 26, the URL set from a query the same branch sets just before: the read
+  of the query sees that write, and both ways key `POST /api/items.list`,
+  one row.
+- 27 and 28, a test of an options key a hop writes before spreading its
+  caller's options (`{ mode: "plain", ...options }`), the options omitted or
+  written without the key: the hop's text decides the test, so `POST
+  /api/items.list` only.
+- 29, the same caller writing the key (`{ mode: "next" }`): `POST
+  /api/v2/items.list` only.
+
+## Exits and falsy fallbacks (`src/clients/exits.ts`)
+
+The same reader around `return`, `throw`, an empty or `null` initialiser, a
+loop, a closure, a read of the local inside its own write, and a test in a
+nested block (callers in `src/use-exits.ts`, the same test file). Which
+writes reach a read is the value resolver's flow
+(`src/request_summary/resolve/flow.rs`).
+
+Answer key (the row at each call line in `use-exits.ts`):
+
+- 32, a branch writes the local and returns: `POST /api/items.list` only.
+- 33, the same under `verb === "GET"`, called with `"GET"`: no row (the
+  branch the caller takes returns).
+- 34, `""` initialiser, then `withQuery || path`, called with `"POST"`:
+  `POST /api/items.list`.
+- 35, the same with a `null` initialiser: `POST /api/items.list`.
+- 36, `""` initialiser, then `withQuery ?? path`: `POST /api` (`""` is not
+  nullish).
+- 37, written after the request: `POST /api/items.list`.
+- 38, written in a loop: no row.
+- 39, read by a closure before a later write: no row.
+- 40, a branch writes the local and throws: `POST /api/items.list` only.
+- 41, no initialiser, written only under `verb === "GET"`, called with
+  `"POST"`: no row.
+- 42, `target = target + "?q=1"` under `verb === "GET"`, through a hop
+  passing `"POST"`: `POST /api/items.list`.
+- 43, the same called with `"GET"`: one row keying `GET /api/items.list`.
+- 44, the test and the read in one block below the declaration, called
+  with `"POST"`: `POST /api/items.list`.
+- 45, a query set under a truthiness test (`if (q) url = "/api/c4?query=1"`):
+  the URL waits on no caller, so its row is stated at the send
+  (`src/clients/exits.ts` line 170): one row keying `GET /api/c4`.

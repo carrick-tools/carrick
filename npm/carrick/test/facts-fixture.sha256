@@ -1,2 +1,2 @@
-0dc4b9c4d1741f445c487a71b4b4aceac16ee6f9ed35b070871b65ee9378ef04  edit-facts.s1.ndjson
-# carrick-cloud 914790d0 (main), lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 2
+b03ad19aca6622516b56481651e220f8899851a44f4549d807caaba0cd79b757  edit-facts.s1.ndjson
+# carrick-cloud PR 3485 (contract-c1-rows), lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 4 (with contract rows)

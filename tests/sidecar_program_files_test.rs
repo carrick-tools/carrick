@@ -98,6 +98,8 @@ fn ask(sidecar: &TypeSidecar, root: &Path, modules: &[(&str, &str)]) -> Vec<Stri
                 alias: Some(file.to_string()),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             };
             let response = sidecar.infer_types(&[item], None).expect("infer");
             response

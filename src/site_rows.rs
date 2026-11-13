@@ -236,6 +236,9 @@ pub struct SiteRows {
     /// that request (carrick#4121). The fold withdraws the request line's
     /// reader row where a fact row stands at every one of those calls.
     pub held_open: Vec<HeldOpen>,
+    /// The sites a scope check the trace's ask got no answer for could
+    /// have decided ([`Decided::scopes_unanswered`], carrick#4155).
+    pub scopes_unanswered: std::collections::BTreeSet<(String, u32, u32)>,
 }
 
 /// A request line held open by functions called directly where a module is
@@ -649,6 +652,27 @@ impl Filled {
     }
 }
 
+/// The slot an unanswered site left open: the name slot (`name_slot`, the
+/// role's word for it) when the question asked the name, else the first slot
+/// it asked. The code stated every slot it did not ask, so naming the name
+/// slot for a question that asked only the method names the wrong hole
+/// (carrick#4123).
+fn asked_slot(asked: &[Slot], name_slot: &str) -> String {
+    if asked.contains(&Slot::Name) {
+        return name_slot.to_string();
+    }
+    match asked.first() {
+        None | Some(Slot::Name) => name_slot,
+        Some(Slot::Kind) => "kind",
+        Some(Slot::Role) => "role",
+        Some(Slot::NameArgument) => "name_argument",
+        Some(Slot::PayloadArgument) => "payload_argument",
+        Some(Slot::Method) => "method",
+        Some(Slot::Namespace) => "namespace",
+    }
+    .to_string()
+}
+
 fn filled(record: &SiteRecord, answered: Option<&Answered>, slot: Slot) -> Option<Filled> {
     if let Some(text) = record.state.forced.get(&slot) {
         return Some(Filled::stated(text.clone()));
@@ -1022,6 +1046,7 @@ pub fn of(
         names: site_names(decided, records),
         dry_run_names: decided.dry_run_names.clone(),
         held_open: Vec::new(),
+        scopes_unanswered: decided.scopes_unanswered.clone(),
     };
     for record in records {
         if record.bucket == Bucket::Lead {
@@ -1037,7 +1062,9 @@ pub fn of(
         }
         let answered = answers.answered.get(&site_id(&record.anchors));
         if record.bucket == Bucket::Asked && answered.is_none() {
-            out.leads.push(lead(Stop::Unanswered));
+            let mut unanswered = lead(Stop::Unanswered);
+            unanswered.unread.slot = asked_slot(&record.state.asked, &unanswered.unread.slot);
+            out.leads.push(unanswered);
             continue;
         }
         let slot = |slot| filled(record, answered, slot);
@@ -1245,12 +1272,15 @@ pub struct SiteFold {
     /// Route sites ([`SiteRows::routes`]) where a row already stands at the
     /// line: the index holds the route, so the site is no possible call.
     pub route_kept_reader: usize,
-    /// Leads dropped because the blob already holds a row at their line
-    /// (carrick#2539): the index states that site, so it is no possible call.
+    /// Leads dropped from the possible calls because the blob already holds
+    /// a row at their line (carrick#2539): that row states the site. Each is
+    /// saved in `unread` unless a row the code decided stands there.
     pub lead_on_row_line: usize,
-    /// The unread sites ([`SiteRows::unread`]) at a line no row stands at.
+    /// The unread sites ([`SiteRows::unread`]) at a line no row the code
+    /// decided stands at, and the leads of `lead_on_row_line` no row the
+    /// code decided stands beside (carrick#4123, carrick#4151).
     pub unread: Vec<crate::unread_sites::UnreadSite>,
-    /// The unread sites dropped because the blob already holds a row at
+    /// The unread sites dropped because a row the code decided stands at
     /// their line: the index states that call.
     pub unread_on_row_line: usize,
     /// Reader rows at a call above a decided site folded onto the row the
@@ -1451,20 +1481,35 @@ pub fn fold_rows(
     // and a lead with no role either. A message's producer is the other way
     // round: a publish is a call row and a subscriber an endpoint row, so a
     // pub/sub producer lead matches a call row (carrick#3439 T1).
-    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
-        rows.iter()
-            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+    //
+    // A stop there, of any reason, still left a slot open unless a row the
+    // code decided ([`code_decided`]) stands on the line: the model's row, or
+    // an old-path pass's, states that slot as an answer, not as something the
+    // code read. That site is saved as unread with its reason, and stays out
+    // of the possible calls (carrick#4123, carrick#4151).
+    let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32, code_only: bool| {
+        rows.iter().any(|existing| {
+            (!code_only || code_decided(existing))
+                && place(root, existing).is_some_and(|(f, l)| f == file && l == line)
+        })
     };
     for lead in &site.leads {
-        let on_call = held_at(calls, &lead.file_path, lead.line_number);
-        let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number);
-        let held = match crate::message_key::lead_side(lead.kind.as_deref(), lead.role.as_deref()) {
-            Some(RowSide::Call) => on_call,
-            Some(RowSide::Endpoint) => on_endpoint,
-            None => on_call || on_endpoint,
+        let side = crate::message_key::lead_side(lead.kind.as_deref(), lead.role.as_deref());
+        let held = |code_only| {
+            let on_call = held_at(calls, &lead.file_path, lead.line_number, code_only);
+            let on_endpoint = held_at(endpoints, &lead.file_path, lead.line_number, code_only);
+            match side {
+                Some(RowSide::Call) => on_call,
+                Some(RowSide::Endpoint) => on_endpoint,
+                None => on_call || on_endpoint,
+            }
         };
-        if held {
+        if held(false) {
             out.lead_on_row_line += 1;
+            if !held(true) {
+                out.unread
+                    .push(crate::unread_sites::UnreadSite::unread_lead(lead));
+            }
         } else {
             out.leads.push(lead.clone());
         }
@@ -1758,12 +1803,15 @@ pub fn fold_rows(
         out.stated_at_fact_callers
             .push((held.file.clone(), held.span_start));
     }
-    // An unread site at a line a row stands at once the fold is done, of
-    // either side, is that row's call (a class-only GraphQL call is its
-    // document's row).
+    // An unread site at a line a row the code decided stands at once the
+    // fold is done, of either side, is that row's call (a class-only GraphQL
+    // call is its document's row). Beside only the model's or an old-path
+    // row it is kept (carrick#4151).
     let held_at = |rows: &[ApiEndpointDetails], file: &str, line: u32| {
-        rows.iter()
-            .any(|existing| place(root, existing).is_some_and(|(f, l)| f == file && l == line))
+        rows.iter().any(|existing| {
+            code_decided(existing)
+                && place(root, existing).is_some_and(|(f, l)| f == file && l == line)
+        })
     };
     for unread in &site.unread {
         if held_at(calls, &unread.file, unread.line)
@@ -1782,6 +1830,18 @@ pub fn fold_rows(
 fn is_fact(row: &ApiEndpointDetails) -> bool {
     row.resolution_source
         .is_some_and(|source| source != ResolutionSource::Model)
+}
+
+/// A row the code decided: its source is no candidate (the model's, an
+/// inline literal's, a request descriptor's: [`ResolutionSource::is_candidate`])
+/// and no old-path pass wrote it. It states every slot a stop on its line
+/// asks about, so that stop is that row's site. A row with no source is not
+/// decided. Socket-pass and event-bus rows count as decided: both state a
+/// whole row from a literal name only. The one test for both drops in
+/// [`fold_rows`] (carrick#4151, carrick#4153).
+fn code_decided(row: &ApiEndpointDetails) -> bool {
+    row.resolution_source
+        .is_some_and(|source| !source.is_candidate() && !is_old_path_source(source))
 }
 
 /// A row the file reader stated, which no site answer has touched.

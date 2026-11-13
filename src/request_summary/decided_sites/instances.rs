@@ -168,6 +168,12 @@ pub struct ScopeLabel {
     /// and a pass-through).
     pub name: Option<(usize, Option<String>)>,
     pub binds: ScopeBinds,
+    /// A claim the trace's ask got no answer for (carrick#4155): never read
+    /// as a scope. `verified_on` holds the receivers it was asked on, with
+    /// no declarations. The decided pass takes it apart from the verified
+    /// labels and only reads which instances a call of its member is handed
+    /// ([`super::composed::reads_open`]).
+    pub open: bool,
 }
 
 impl ScopeLabel {
@@ -175,10 +181,14 @@ impl ScopeLabel {
     /// receiver, on each receiver the trace's own request verified it on
     /// ([`super::super::discovery::declaration_ask`]), by claim id: a claim
     /// verified on no receiver is no label, whatever its siblings on the
-    /// same member were verified as.
+    /// same member were verified as. A claim verified on none that the ask
+    /// got no answer for is an `open` label (carrick#4155).
     pub fn from_exports(
         exports: &[crate::library_claims::ExportClaims],
-        verified: &HashMap<super::super::discovery::AskedScope, Vec<(String, u32)>>,
+        verified: &HashMap<
+            super::super::discovery::AskedScope,
+            super::super::discovery::ScopeAnswer,
+        >,
     ) -> Vec<ScopeLabel> {
         use crate::services::type_sidecar::LibraryClaim;
         let mut labels = Vec::new();
@@ -227,15 +237,28 @@ impl ScopeLabel {
                 {
                     continue;
                 }
-                let mut verified_on: Vec<(String, Vec<(String, u32)>)> = verified
+                let asked: Vec<(&String, &super::super::discovery::ScopeAnswer)> = verified
                     .iter()
                     .filter(|(asked, _)| {
                         asked.package == export.package
                             && asked.export == export.export
                             && asked.claim_id == claim_id
                     })
-                    .map(|(asked, declarations)| (asked.receiver.clone(), declarations.clone()))
+                    .map(|(asked, answer)| (&asked.receiver, answer))
                     .collect();
+                let mut verified_on: Vec<(String, Vec<(String, u32)>)> = asked
+                    .iter()
+                    .filter_map(|(receiver, answer)| {
+                        Some(((*receiver).clone(), answer.verified()?.to_vec()))
+                    })
+                    .collect();
+                let open = verified_on.is_empty();
+                if open {
+                    verified_on = asked
+                        .iter()
+                        .map(|(receiver, _)| ((*receiver).clone(), Vec::new()))
+                        .collect();
+                }
                 if verified_on.is_empty() {
                     continue;
                 }
@@ -249,6 +272,7 @@ impl ScopeLabel {
                         .as_ref()
                         .map(|name| (name.arg as usize, name.key.clone())),
                     binds,
+                    open,
                 };
                 if !labels.contains(&label) {
                     labels.push(label);
@@ -509,6 +533,9 @@ pub(super) struct WalkIndex<'a> {
     /// field first needs them ([`InstanceWalk::field`]).
     inputs: &'a RequestSummaryInputs,
     constructed: OnceCell<Constructed<'a>>,
+    /// The scope claims the trace's ask got no answer for (carrick#4155,
+    /// [`ScopeLabel::open`]): never read as a scope.
+    pub(super) open: Vec<ScopeLabel>,
 }
 
 /// A call by its file and span.
@@ -566,6 +593,7 @@ impl<'a> WalkIndex<'a> {
         calls: &Calls<'a>,
         inputs: &'a RequestSummaryInputs,
         scopes: &[ScopeLabel],
+        open: Vec<ScopeLabel>,
         socket_hosts: HashMap<HostSpan, HostLabel>,
     ) -> Self {
         let mut index = WalkIndex {
@@ -575,6 +603,7 @@ impl<'a> WalkIndex<'a> {
             parents: RefCell::new(HashMap::new()),
             inputs,
             constructed: OnceCell::new(),
+            open,
         };
         let runs: HashSet<&str> = scopes
             .iter()
@@ -2465,7 +2494,7 @@ fn opaque_text(pieces: &[Piece]) -> Option<String> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::super::super::discovery::AskedScope;
+    use super::super::super::discovery::{AskedScope, ScopeAnswer};
     use super::*;
     use crate::position_rows::Row;
 
@@ -2572,14 +2601,14 @@ mod tests {
         assert_eq!(ids.len(), 2, "{ids:?}");
         // Only the claim that mounts the instance at 1 under the name at 0
         // is verified.
-        let verified: HashMap<AskedScope, Vec<(String, u32)>> = HashMap::from([(
+        let verified: HashMap<AskedScope, ScopeAnswer> = HashMap::from([(
             AskedScope {
                 package: "fixture-server".to_string(),
                 export: "default".to_string(),
                 claim_id: ids[0].clone(),
                 receiver: "instance:()".to_string(),
             },
-            Vec::new(),
+            ScopeAnswer::Verified(Vec::new()),
         )]);
         let labels = ScopeLabel::from_exports(&exports, &verified);
         assert_eq!(labels.len(), 1, "{labels:#?}");

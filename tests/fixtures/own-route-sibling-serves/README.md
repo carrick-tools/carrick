@@ -27,7 +27,9 @@ the calls a sibling serves better. Nothing that matches reads the mark.
 Before the mark, the scan deleted both rows, and `api` lost a real consumer.
 
 A marked call has its type entries, and the type check pairs it like any other
-call (carrick#1945).
+call (carrick#1945), except that a catch-all covering the call's literal segment
+is not compared (carrick#4186): `/api/status` against `/api/*` keeps its edge and
+has no verdict.
 
 `expected.json` is the answer key and `__llm__/` holds the mocked model answers
 for a `CARRICK_MOCK_ALL` scan. Used by `tests/own_route_calls_test.rs`.

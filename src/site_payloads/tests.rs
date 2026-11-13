@@ -192,6 +192,101 @@ fn an_http_calls_entries_read_its_body_and_its_result() {
             .all(|request| request.file_path == dir.path().join(FILE).to_string_lossy()),
         "{requests:?}"
     );
+    // Both are read in the site's own call: no call is named beside them.
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.through_call.is_none()),
+        "{requests:?}"
+    );
+}
+
+/// carrick#4128: a body the wrapper builds is read in the wrapper's file,
+/// and the request names the site's own call beside it, in the sidecar's
+/// numbering, so a type parameter of the wrapper is read as that call
+/// instantiates it.
+#[test]
+fn a_body_built_in_the_wrapper_names_the_call_that_reaches_it() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str =
+        "export const place = <T>(item: T) => http.post(\"/orders\", { body: item });\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let built = "{ body: item }";
+    let start = WRAPPER_SOURCE.find(built).unwrap() as u32;
+    let slots = PayloadSlots {
+        request: Some(PayloadAt::Value(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + built.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        })),
+        response: None,
+    };
+    let payloads = SitePayloads::of(&[record("http_client", false, slots)]);
+    let requests = payloads.requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &dir.path().to_string_lossy(),
+        &ResultIndex::default(),
+    );
+    let [request] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    assert_eq!(
+        request.file_path,
+        dir.path().join(WRAPPER).to_string_lossy()
+    );
+    assert_eq!(
+        (request.span_start, request.span_end),
+        (Some(start), Some(start + built.len() as u32))
+    );
+    let (call_start, call_end) = sidecar_span("http.post(\"/orders\", order)");
+    assert_eq!(
+        request.through_call,
+        Some(ThroughCall {
+            file_path: dir.path().join(FILE).to_string_lossy().into_owned(),
+            span_start: call_start.unwrap(),
+            span_end: call_end.unwrap(),
+        })
+    );
+}
+
+/// carrick#4128, carrick#4159: a GET sends no body, so the object its wrapper
+/// builds (a query object) is not asked as the call's request body. The
+/// request entry is left to read `no_request_body`; the response entry is
+/// asked as before, and a POST through the same wrapper still asks its body.
+#[test]
+fn a_get_through_a_wrapper_that_builds_an_object_is_not_asked_a_request_body() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str =
+        "export const list = (page: number) => http.get(\"/orders\", { query: { page } });\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let built = "{ query: { page } }";
+    let start = WRAPPER_SOURCE.find(built).unwrap() as u32;
+    let slots = PayloadSlots {
+        request: Some(PayloadAt::Value(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + built.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        })),
+        response: None,
+    };
+    let payloads = SitePayloads::of(&[record("http_client", false, slots)]);
+    let root = dir.path().to_string_lossy().into_owned();
+    let asked = |method: &str| {
+        let mut key = http();
+        key["method"] = json!(method);
+        payloads.requests(
+            &[entry(key, "consumer", "request", "Req", 2)],
+            &root,
+            &ResultIndex::default(),
+        )
+    };
+    let get = asked("GET");
+    assert!(get.is_empty(), "a GET is asked no request body: {get:?}");
+    assert_eq!(asked("POST").len(), 1, "a POST is asked its body");
 }
 
 /// carrick#2910: the response entry's request carries the store's label for
@@ -342,6 +437,8 @@ fn item(alias: &str, line: u32) -> InferRequestItem {
         alias: Some(alias.to_string()),
         param_name: None,
         route_path: None,
+        result_unanswered: false,
+        through_call: None,
     }
 }
 

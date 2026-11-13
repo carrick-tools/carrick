@@ -169,6 +169,45 @@ pub(super) struct Mounts {
     /// app for the suite serves nothing in production. Each would have been
     /// a verified edge or an unverified root; neither is recorded.
     pub(super) test_only: Vec<String>,
+    /// Of `unverified`, the makers handed to a member a `mounts` claim the
+    /// trace's ask got no answer for names (carrick#4155): the answer could
+    /// have placed them.
+    open: Vec<MakerAt>,
+}
+
+/// Whether a walk up from `ends` meets an instance handed to a member a
+/// `mounts` claim the ask got no answer for names, where nothing verified
+/// places it ([`Mounts::open`], carrick#4155).
+pub(super) fn reads_open(ends: &[InstanceEnd], mounts: &Mounts) -> bool {
+    fn up(end: &InstanceEnd, mounts: &Mounts, seen: &mut Vec<MakerAt>) -> bool {
+        match &end.end {
+            InstanceAt::Handed { .. } | InstanceAt::Hole { .. } => false,
+            InstanceAt::Scope { parents, .. } => {
+                parents.iter().any(|parent| up(parent, mounts, seen))
+            }
+            InstanceAt::Root {
+                file, line, made, ..
+            } => {
+                let here = maker_key(file, *line, made.as_ref());
+                if seen.contains(&here) {
+                    return false;
+                }
+                if mounts.open.contains(&here) && mounts.unverified.contains(&here) {
+                    return true;
+                }
+                seen.push(here.clone());
+                let found = mounts
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.child == here)
+                    .flat_map(|edge| &edge.parents)
+                    .any(|parent| up(parent, mounts, seen));
+                seen.pop();
+                found
+            }
+        }
+    }
+    !mounts.open.is_empty() && ends.iter().any(|end| up(end, mounts, &mut Vec::new()))
 }
 
 /// The service's mounts: the verified edges, and the instances handed to a
@@ -183,7 +222,7 @@ pub(super) fn mount_edges<'a>(
 ) -> Mounts {
     let (edges, mut test_only, guarded) =
         verified_edges(calls, inputs, root, makers, scopes, index);
-    let (mut unverified, ignored) =
+    let (mut unverified, ignored, open) =
         unverified_roots(calls, inputs, root, makers, scopes, index, &edges);
     test_only.extend(ignored);
     // What the path guard refused is a mount the trace cannot place, of
@@ -204,13 +243,16 @@ pub(super) fn mount_edges<'a>(
         edges,
         unverified,
         test_only,
+        open,
     }
 }
 
 /// Every instance handed, at any argument, to a library call made on an
 /// instance of the same package, that no verified edge in `edges` reads
-/// (that call and that instance), and the mount calls (`file:line`) a test-only
-/// file makes, which are neither (carrick#2775).
+/// (that call and that instance), the mount calls (`file:line`) a test-only
+/// file makes, which are neither (carrick#2775), and of the first, those
+/// handed to a member a `mounts` claim the ask got no answer for names
+/// (carrick#4155).
 fn unverified_roots<'a>(
     calls: &Calls<'a>,
     inputs: &RequestSummaryInputs,
@@ -219,7 +261,8 @@ fn unverified_roots<'a>(
     scopes: &[ScopeLabel],
     index: &WalkIndex<'a>,
     edges: &[MountEdge],
-) -> (Vec<MakerAt>, Vec<String>) {
+) -> (Vec<MakerAt>, Vec<String>, Vec<MakerAt>) {
+    let mut open: Vec<MakerAt> = Vec::new();
     let mut placed: Vec<Placed<'a>> = calls
         .by_span
         .values()
@@ -266,6 +309,16 @@ fn unverified_roots<'a>(
                 if !packages.contains(&package.as_str()) || read {
                     continue;
                 }
+                // A `mounts` claim of this member the ask got no answer for
+                // (carrick#4155).
+                if index.open.iter().any(|label| {
+                    label.member == placed.call.callee
+                        && matches!(label.binds, ScopeBinds::Mounts { .. })
+                        && packages.contains(&label.package.as_str())
+                }) && !open.contains(&here)
+                {
+                    open.push(here.clone());
+                }
                 if inputs.test_only.contains(placed.file) {
                     held.push((at.clone(), here));
                 } else if !out.contains(&here) {
@@ -288,7 +341,7 @@ fn unverified_roots<'a>(
             out.push(here);
         }
     }
-    (out, test_only)
+    (out, test_only, open)
 }
 
 /// Every verified mount edge of the service: each call of a member a

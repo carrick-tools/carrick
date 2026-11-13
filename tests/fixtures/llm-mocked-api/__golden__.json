@@ -175,6 +175,16 @@
       "span_start": 123
     },
     {
+      "file": "src/index.ts",
+      "line": 8,
+      "span_start": 160,
+      "span_end": 228,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "callee": "app.get",
+      "depth": 0
+    },
+    {
       "callee": "res.json",
       "depth": 0,
       "file": "src/index.ts",
@@ -203,6 +213,26 @@
       "slot": "callee",
       "span_end": 59,
       "span_start": 51
+    },
+    {
+      "file": "src/reports.ts",
+      "line": 5,
+      "span_start": 62,
+      "span_end": 126,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "callee": "router.get",
+      "depth": 0
+    },
+    {
+      "file": "src/reports.ts",
+      "line": 9,
+      "span_start": 129,
+      "span_end": 236,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "callee": "router.get",
+      "depth": 0
     },
     {
       "callee": "renderReport",
@@ -236,6 +266,16 @@
       "span_start": 84
     },
     {
+      "file": "src/routes/users.ts",
+      "line": 6,
+      "span_start": 95,
+      "span_end": 198,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "callee": "router.get",
+      "depth": 0
+    },
+    {
       "callee": "res.json",
       "depth": 0,
       "file": "src/routes/users.ts",
@@ -244,6 +284,16 @@
       "slot": "callee",
       "span_end": 194,
       "span_start": 179
+    },
+    {
+      "file": "src/routes/users.ts",
+      "line": 11,
+      "span_start": 201,
+      "span_end": 377,
+      "reason": "unresolved_name",
+      "slot": "callee",
+      "callee": "router.post",
+      "depth": 0
     },
     {
       "callee": "res.json",
@@ -258,9 +308,9 @@
   ],
   "unread_sites_by_reason": {
     "injected_callee": 2,
-    "unresolved_name": 4,
+    "unresolved_name": 9,
     "untyped_receiver": 3,
     "value_callee": 3
   },
-  "unread_sites_total": 12
+  "unread_sites_total": 17
 }

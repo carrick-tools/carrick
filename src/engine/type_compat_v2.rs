@@ -667,6 +667,22 @@ pub(crate) fn derive_capture_anchors(
             anchors.extend(mode_anchors(alias, request));
             continue;
         }
+        // The call's result label went unanswered when the compiler engine
+        // died (carrick#4154): the type read without it is the library's
+        // envelope, not the body, so the alias is published unread.
+        if request.result_unanswered {
+            anchors.push(CaptureAnchor::Literal {
+                alias: alias.to_string(),
+                type_text: "unknown".to_string(),
+                anchor_origin: AnchorOrigin::DeterministicInfer,
+                source_file: None,
+                printed_names: Vec::new(),
+                raw_text_read: false,
+                absent_body_tolerated: false,
+                unread_cause: Some("site_unreadable"),
+            });
+            continue;
+        }
         // Kind-aware v1 inference result wins over a raw locator re-run.
         if let Some(text) = inferred_text.get(alias) {
             let names = printed_names
@@ -1732,7 +1748,11 @@ fn cases_by_site(rows: &[crate::analyzer::ApiEndpointDetails]) -> CasesBySite<'_
 ///   (carrick#1945): a call to a route of its own service is a consumer of
 ///   that route (carrick#1926). A winner where the call has a placeholder
 ///   over the route's literal (carrick#2004) is not compared: which route
-///   the call reaches is a guess. A call that reaches a dispatching route
+///   the call reaches is a guess. A winner that is a catch-all route
+///   (`/*`, `/**`, `/(.*)`) whose wildcard covers a literal segment of the
+///   call is not compared either: the route says nothing about that segment,
+///   so its handler's type is not the path's contract (carrick#4186); a
+///   route wildcard over a call placeholder is still compared. A call that reaches a dispatching route
 ///   without stating its case (`RouteCaseUnknown`, carrick#2059) gets one
 ///   half per kind, stored unverifiable without a probe; a call stating a
 ///   value no case answers gets none.
@@ -1902,6 +1922,9 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         // Routes the call could only be paired with by guessing its
         // placeholder's value (carrick#2004).
         let mut guessed: Vec<&str> = Vec::new();
+        // Catch-all routes whose wildcard covers a literal segment of the
+        // call: the edge stays, the type is not theirs to answer (carrick#4186).
+        let mut absorbed: Vec<&str> = Vec::new();
         for case in cases {
             let pairing = http_pool.pair(&carrick_match::Call {
                 service: consumer.service_id.to_string(),
@@ -1921,6 +1944,11 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             for winner in &pairing.winners {
                 if winner.call_param_over_route_literal == Some(true) {
                     guessed.push(routes[winner.producer].full_path.as_str());
+                } else if carrick_match::catch_all_covers_call_literal(
+                    &routes[winner.producer].full_path,
+                    path.as_str(),
+                ) {
+                    absorbed.push(routes[winner.producer].full_path.as_str());
                 } else {
                     reached.push(winner.producer);
                 }
@@ -1963,6 +1991,18 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 pair.pre_verdict_side = None;
                 pairs.push(pair);
             }
+        }
+        if pairs.len() == before && !absorbed.is_empty() {
+            absorbed.sort_unstable();
+            absorbed.dedup();
+            debug!(
+                "v2 check: {} {} at {}:{} is not compared: a catch-all route covers its literal segment(s) ({}) (carrick#4186)",
+                method,
+                path,
+                consumer.entry.file_path,
+                consumer.entry.line_number,
+                absorbed.join(", ")
+            );
         }
         if pairs.len() == before && !guessed.is_empty() {
             guessed.sort_unstable();
@@ -2999,7 +3039,9 @@ pub(crate) fn take_local_consumers() -> LocalConsumers {
 pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<String, CallLocator> {
     let mut calls = HashMap::new();
     for request in infer {
-        if request.infer_kind != InferKind::CallResult {
+        // A call whose result label went unanswered has no body to retype
+        // (carrick#4154).
+        if request.infer_kind != InferKind::CallResult || request.result_unanswered {
             continue;
         }
         let Some(alias) = request.alias.as_deref() else {
@@ -5681,6 +5723,8 @@ mod tests {
             alias: Some("Endpoint_a_Response".to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let with = |unwidened: Option<&str>| {
             let mut inf = inferred("Endpoint_a_Response", "{ scope: string; }", None, None);
@@ -5774,6 +5818,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let mut text_read = inferred("Endpoint_a_Response_Call1", "string", None, None);
         text_read.infer_kind = InferKind::CallResult;
@@ -5838,6 +5884,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
         tolerant.infer_kind = InferKind::RequestBody;
@@ -6357,6 +6405,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let calls = consumer_call_locators(&[
             item(InferKind::RequestBody, "Req", 3),
@@ -6498,6 +6548,8 @@ mod tests {
                 alias: Some("Endpoint_a_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             },
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
@@ -6512,6 +6564,8 @@ mod tests {
                 alias: Some("Endpoint_b_Response".to_string()),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             },
         ];
         let inline = vec![
@@ -6623,6 +6677,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }
     }
 
@@ -6764,6 +6820,47 @@ mod tests {
             ],
             "sorted, so the surface order follows the manifest and not a hash walk"
         );
+    }
+
+    /// carrick#4154: a call whose result label went unanswered is published
+    /// `unknown` with `site_unreadable`, even beside an inference for its
+    /// alias (the envelope read without the label), and is never retyped.
+    #[test]
+    fn an_unanswered_result_label_publishes_the_call_unread() {
+        let mut call = response_body_infer("Endpoint_call_Response");
+        call.infer_kind = InferKind::CallResult;
+        call.result_unanswered = true;
+        let envelope = inferred(
+            "Endpoint_call_Response",
+            "{ data: { id: string; }; status: number; }",
+            None,
+            None,
+        );
+
+        let anchors = derive_capture_anchors(
+            &[],
+            std::slice::from_ref(&call),
+            &[],
+            &[envelope],
+            &[],
+            "/repo",
+        );
+
+        assert_eq!(anchors.len(), 1, "{anchors:#?}");
+        let CaptureAnchor::Literal {
+            alias,
+            type_text,
+            unread_cause,
+            ..
+        } = &anchors[0]
+        else {
+            panic!("expected an unread literal, got {:?}", anchors[0]);
+        };
+        assert_eq!(
+            (alias.as_str(), type_text.as_str(), *unread_cause),
+            ("Endpoint_call_Response", "unknown", Some("site_unreadable"))
+        );
+        assert!(consumer_call_locators(&[call]).is_empty());
     }
 
     /// carrick#1836: the sidecar's printer writes some names bare, and only the
@@ -7455,6 +7552,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }];
         let text = "{ members: { id: string; name: string; email: string; }[]; }";
         let mut inf = inferred(alias, text, None, None);
@@ -7659,7 +7758,9 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            through_call: None,
             result: None,
+            result_unanswered: false,
         };
         let items = vec![
             request("src/items.routes.ts", 6, "Route_imported_Response"),
@@ -8196,6 +8297,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             alias: alias.to_string(),
@@ -8289,6 +8392,8 @@ mod tests {
                 alias: Some(alias.to_string()),
                 param_name: param.map(str::to_string),
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             }
         };
 
@@ -8339,6 +8444,8 @@ mod tests {
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             alias: alias.to_string(),
@@ -9194,12 +9301,13 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
     }
 
     /// Routes the pairing pool says a call reaches are paired: a prefixed
-    /// catch-all, an optional placeholder the call leaves out, and a
+    /// catch-all over a placeholder tail (a literal tail is not compared,
+    /// carrick#4186), an optional placeholder the call leaves out, and a
     /// placeholder spelled `<id>` (carrick#3496 slice 3).
     #[test]
     fn build_pairs_pair_the_routes_the_pool_reaches() {
         for (route, call) in [
-            ("/api/*", "/api/users/7"),
+            ("/api/*", "/api/:userId"),
             ("/users/:id?", "/users"),
             ("/orders/<id>", "/orders/9"),
         ] {
@@ -10461,6 +10569,62 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         assert_eq!(pre_verdict_of(&pairs), None);
     }
 
+    /// A `GET /notes` call (consumer request) against a route registered for
+    /// every verb (producer request), each side with its text and root reason.
+    fn get_call_against_all_route(
+        producer: (Option<&str>, Option<&str>),
+        consumer: (Option<&str>, Option<&str>),
+    ) -> Vec<BuiltPair> {
+        let side =
+            |role: ManifestRole, method: &str, (text, reason): (Option<&str>, Option<&str>)| {
+                let mut e = body_entry(role, ManifestTypeKind::Request, text, reason);
+                e.key = OperationKey::http(method, "/notes");
+                e
+            };
+        let mut api = repo(
+            "api",
+            None,
+            vec![side(ManifestRole::Producer, "ALL", producer)],
+            Some(fake_artifact()),
+        );
+        api.endpoints = vec![dispatch_row("ALL", "/notes", "src/routes.ts:3", None)];
+        let web = repo(
+            "web",
+            None,
+            vec![side(ManifestRole::Consumer, "GET", consumer)],
+            Some(fake_artifact()),
+        );
+        build_check_pairs(&[api, web])
+    }
+
+    /// The one pair the stamp moves: a GET call against an every-verb route
+    /// whose handler is itself decided to read no body now says so on both
+    /// sides, which is the compatible both-sides verdict. Before, the call's
+    /// side read `not_located` and the pair was probed.
+    #[test]
+    fn a_get_call_stating_no_body_against_a_route_reading_none_is_compatible() {
+        let before =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), None));
+        let after =
+            get_call_against_all_route((Some("unknown"), DECIDED), (Some("unknown"), DECIDED));
+        assert_eq!(pre_verdict_of(&before), None);
+        assert_eq!(pre_verdict_of(&after), Some(PreVerdict::NoBodyEitherSide));
+    }
+
+    /// carrick#4159: a GET call states `no_request_body` (nothing was left
+    /// unlocated). Against a route whose request type expects a body, or one
+    /// no scan read, the pair is judged exactly as it was before the call said
+    /// so: there is no both-sides verdict.
+    #[test]
+    fn a_get_call_stating_no_body_against_a_route_expecting_one_is_still_probed() {
+        for producer in [Some("{ name: string; }"), Some("unknown"), None] {
+            let before = get_call_against_all_route((producer, None), (Some("unknown"), None));
+            let after = get_call_against_all_route((producer, None), (Some("unknown"), DECIDED));
+            assert_eq!(pre_verdict_of(&before), None, "producer {producer:?}");
+            assert_eq!(pre_verdict_of(&after), None, "producer {producer:?}");
+        }
+    }
+
     #[test]
     fn a_side_with_no_surface_keeps_its_not_compared_verdict() {
         let mut api = repo(
@@ -11378,6 +11542,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let infer = vec![
             call(6, "api.post<{ x: number }>(\"/checkout\")", &typed_alias),
@@ -11610,6 +11776,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(producer_alias.clone()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }];
         let inferred = sidecar
             .infer_types(&producer_infer, None)
@@ -11712,6 +11880,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }];
         let consumer_inferred = sidecar
             .infer_types(&consumer_infer, None)
@@ -11865,6 +12035,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12065,6 +12237,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(consumer_alias.clone()),
             param_name: None,
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12294,6 +12468,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(producer_alias(key)),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             })
             .collect();
         let api_inferred = api_sidecar
@@ -12417,6 +12593,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: Some(consumer_alias(key, *line)),
                 param_name: None,
                 route_path: None,
+                result_unanswered: false,
+                through_call: None,
             })
             .collect();
         let web_inferred = web_sidecar
@@ -12602,6 +12780,8 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             alias: Some(alias.to_string()),
             param_name: Some(param_name.to_string()),
             route_path: None,
+            result_unanswered: false,
+            through_call: None,
         };
         let infer = vec![request(named, "message"), request(unnamed, "message.data")];
         let anchors = derive_capture_anchors(

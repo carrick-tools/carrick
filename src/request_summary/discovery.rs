@@ -247,6 +247,12 @@ pub struct Discovery {
     /// not final until the store answers it (carrick#2813): the fact layer
     /// lists the call for the reader when the key is still pending.
     pub unanswered_at: BTreeMap<(String, u32, u32), BTreeSet<String>>,
+    /// The calls, by file and SWC span, whose member declaration the walk
+    /// read for an op the receiver trace's ask got no answer for
+    /// ([`MemberDeclarations::answered`], carrick#3991): the answer would
+    /// have decided them. Their unread sites say `unanswered` beside their
+    /// own reason ([`crate::unread_sites::from_scan`]).
+    pub declarations_unanswered: BTreeSet<(String, u32, u32)>,
     /// Each call of the service's own files and the functions of the
     /// repository the walk entered from it, sorted by file and span: the
     /// definition a call names, each implementation of an interface member
@@ -767,6 +773,31 @@ pub struct AskedScope {
     pub receiver: String,
 }
 
+/// What the declaration ask returned for one scope check (carrick#4155).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeAnswer {
+    /// Verified, with the member declarations (`decl_file`, `decl_line`)
+    /// the verdict names (carrick#2636): a call whose row resolves to one
+    /// of them is a call of that scope member, whatever holds its receiver.
+    Verified(Vec<(String, u32)>),
+    /// Asked, and the ask got no answer ([`MemberDeclarations::answered`]):
+    /// a call of the member is one the answer would have decided, so the
+    /// decided pass saves the sites it leaves open `unanswered`
+    /// ([`super::decided_sites::Decided::scopes_unanswered`]).
+    Unanswered,
+}
+
+impl ScopeAnswer {
+    /// The member declarations a verified check names; `None` for a check
+    /// with no answer.
+    pub fn verified(&self) -> Option<&[(String, u32)]> {
+        match self {
+            ScopeAnswer::Verified(declarations) => Some(declarations),
+            ScopeAnswer::Unanswered => None,
+        }
+    }
+}
+
 /// The receiver id the instances a maker claim builds are read through, as
 /// [`LibrarySite::receiver_ids`] names a site's.
 fn make_receiver(form: MakeForm, member: Option<&str>) -> String {
@@ -901,19 +932,80 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
 #[derive(Debug, Default, Clone)]
 pub struct MemberDeclarations {
     by_declaration: HashMap<(String, u32), Vec<DeclaredOp>>,
-    /// The scope claims verified, each by claim id on the receiver id it
-    /// was asked on, with the member declarations (`decl_file`,
-    /// `decl_line`) the verdict names (carrick#2474 R2b, carrick#2636):
-    /// a call whose row resolves to one of them is a call of that scope
-    /// member, whatever holds its receiver.
-    pub verified_scopes: HashMap<AskedScope, Vec<(String, u32)>>,
+    /// The scope claims the ask verified or got no answer for, each by
+    /// claim id on the receiver id it was asked on (carrick#2474 R2b,
+    /// carrick#4155). A claim the verifier refuted is not here.
+    pub scope_answers: HashMap<AskedScope, ScopeAnswer>,
     /// The checks asked.
     pub checks: usize,
     /// Of those, the ones the verifier did not reach in its time limit.
     pub not_reached: usize,
+    /// The op checks' (store key, member) pairs when the ask got no answer
+    /// (it failed, or came back short): a call whose `call` row names one
+    /// is a call the answer would have decided, saved `unanswered` beside
+    /// its own reason ([`Discovery::declarations_unanswered`], carrick#3991).
+    /// Empty when the verifier answered, including answers that verified
+    /// nothing.
+    unanswered: HashSet<(String, String)>,
 }
 
 impl MemberDeclarations {
+    /// The declarations the verifier's `answer` to `ask` names. An `Err`,
+    /// or an answer with a verdict count other than the checks', indexes
+    /// nothing and keeps the op checks (carrick#3991) and the scope checks
+    /// (carrick#4155) it left open.
+    pub fn answered<E: std::fmt::Display>(
+        ask: &DeclarationAsk,
+        answer: Result<Vec<SemanticsResult>, E>,
+    ) -> Self {
+        let verdicts = match answer {
+            Ok(verdicts) if verdicts.len() == ask.checks.len() => {
+                return MemberDeclarations::of(ask, &verdicts);
+            }
+            Ok(verdicts) => {
+                tracing::warn!(
+                    asked = ask.checks.len(),
+                    answered = verdicts.len(),
+                    "receiver trace: the declaration answer does not match the ask; none indexed"
+                );
+                verdicts
+            }
+            Err(error) => {
+                tracing::warn!(%error, "receiver trace: the declaration ask failed; none indexed");
+                Vec::new()
+            }
+        };
+        MemberDeclarations {
+            unanswered: ask
+                .ops
+                .iter()
+                .flatten()
+                .map(|op| (op.package.clone(), op.member.clone()))
+                .collect(),
+            // The scope checks it left open (carrick#4155).
+            scope_answers: ask
+                .scopes
+                .iter()
+                .flatten()
+                .map(|scope| (scope.clone(), ScopeAnswer::Unanswered))
+                .collect(),
+            ..MemberDeclarations::of(ask, &verdicts)
+        }
+    }
+
+    /// Whether the ask got no answer for the op check `row`'s declaration
+    /// and symbol stand for.
+    fn left_open(&self, row: &Row, exports: &[ExportClaims]) -> bool {
+        let Some(symbol) = row.symbol() else {
+            return false;
+        };
+        !self.unanswered.is_empty()
+            && !in_repo(row)
+            && store_keys(row, exports)
+                .into_iter()
+                .any(|key| self.unanswered.contains(&(key, symbol.to_string())))
+    }
+
     /// The declarations the verdicts for `ask` name. A verdict counts only
     /// for the check at its own position that it names.
     pub fn of(ask: &DeclarationAsk, verdicts: &[SemanticsResult]) -> Self {
@@ -946,7 +1038,8 @@ impl MemberDeclarations {
                     .collect();
                 declarations.sort();
                 declarations.dedup();
-                out.verified_scopes.insert(scope.clone(), declarations);
+                out.scope_answers
+                    .insert(scope.clone(), ScopeAnswer::Verified(declarations));
             }
             let Some(op) = op else {
                 continue;
@@ -1203,6 +1296,10 @@ struct Outcome<'a> {
     /// answer holds nothing for (`unanswered_package`), when that call's own
     /// walk found nothing (carrick#2813).
     unanswered: BTreeSet<String>,
+    /// The walk passed a call the receiver trace's dead ask would have
+    /// decided ([`Discovery::declarations_unanswered`]), when that call's
+    /// own walk found nothing (carrick#3991).
+    declarations_open: bool,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
     /// The outcome of a value the resolver read to a labelled export or a
@@ -1293,6 +1390,7 @@ impl<'a> Outcome<'a> {
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
+        self.declarations_open |= other.declarations_open;
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1530,6 +1628,8 @@ struct Walker<'a> {
     /// Calls whose member declaration stands for more than one op
     /// (carrick#2474 R1, [`Self::one_op`]): no site.
     ambiguous: std::cell::Cell<usize>,
+    /// The calls [`Discovery::declarations_unanswered`] lists.
+    declarations_unanswered: std::cell::RefCell<BTreeSet<(String, u32, u32)>>,
     /// What each call of the service's own files entered, by file and span
     /// ([`Discovery::entered`]).
     entered: BTreeMap<(PathBuf, u32, u32), EnteredAt>,
@@ -2252,6 +2352,13 @@ impl<'a> Walker<'a> {
     /// no declared op.
     fn declared_op(&self, row: &Row, invoke: Invoke<'_>) -> Option<SiteEnd> {
         let declarations = self.labels.declarations.filter(|_| !invoke.construction)?;
+        if declarations.left_open(row, self.labels.exports) {
+            self.declarations_unanswered.borrow_mut().insert((
+                self.rel(invoke.file),
+                invoke.call.site.span_start,
+                invoke.call.site.span_end,
+            ));
+        }
         let ops = declarations.at(row.decl_file()?, row.decl_line()?);
         if ops.is_empty() {
             return None;
@@ -2926,12 +3033,25 @@ impl<'a> Walker<'a> {
             {
                 inner.unanswered.extend(self.unanswered_keys(file, call));
             }
+            if inner.ends.is_empty() && self.declaration_left_open(file, call) {
+                inner.declarations_open = true;
+            }
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// Whether the walk read `call`'s member declaration for an op the
+    /// receiver trace's dead ask left open ([`Self::declared_op`]).
+    fn declaration_left_open(&self, file: &Path, call: &CallIr) -> bool {
+        self.declarations_unanswered.borrow().contains(&(
+            self.rel(file),
+            call.site.span_start,
+            call.site.span_end,
+        ))
     }
 
     /// The store keys of `call`'s declaration that the answer holds nothing
@@ -3012,6 +3132,15 @@ impl<'a> Walker<'a> {
                     bound: Vec::new(),
                 };
             if outcome.ends.is_empty() {
+                // A walk that passed a call the dead declaration ask would
+                // have decided is a call that ask left open (carrick#3991).
+                if outcome.declarations_open {
+                    self.declarations_unanswered.borrow_mut().insert((
+                        self.rel(file),
+                        call.site.span_start,
+                        call.site.span_end,
+                    ));
+                }
                 if !outcome.unanswered.is_empty() {
                     discovery.unanswered_at.insert(
                         (self.rel(file), call.site.span_start, call.site.span_end),
@@ -3645,6 +3774,7 @@ pub fn discover_with(
         callbacks: HashMap::new(),
         reading: HashMap::new(),
         ambiguous: std::cell::Cell::new(0),
+        declarations_unanswered: std::cell::RefCell::new(BTreeSet::new()),
         entered: BTreeMap::new(),
     };
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
@@ -3689,6 +3819,7 @@ pub fn discover_with(
             targets,
         })
         .collect();
+    discovery.declarations_unanswered = walker.declarations_unanswered.take();
     let ambiguous = walker.ambiguous.get();
     if ambiguous > 0 {
         discovery
@@ -4070,6 +4201,389 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].reason, Stop::MissedInside);
         assert!(kept[0].also.is_empty());
+    }
+
+    /// The receiver-trace fixture's unread sites, with `declarations` as the
+    /// trace's answer.
+    fn unread_traced(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+    ) -> Vec<crate::unread_sites::UnreadSite> {
+        let discovery = discover(
+            &on.inputs,
+            &Labels::of(exports).tracing(declarations),
+            &on.repo,
+        );
+        crate::unread_sites::from_scan(
+            &discovery,
+            &crate::request_summary::decided_sites::Decided::default(),
+            &[],
+            &[],
+            &on.repo,
+        )
+    }
+
+    /// The receiver-trace fixture walked with the verifier's real answer,
+    /// and its declaration ask.
+    fn traced_with_ask() -> (
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+        DeclarationAsk,
+    ) {
+        let (on, exports, declarations) = traced_fixture()
+            .expect("the receiver-trace fixture walks: a skipped test proves nothing");
+        let ask = declaration_ask(&on.inputs, &exports);
+        assert!(
+            ask.ops.iter().flatten().count() > 0,
+            "the fixture asks op checks"
+        );
+        (on, exports, declarations, ask)
+    }
+
+    /// carrick#3991: a declaration ask that died after its retry saves each
+    /// call it would have decided `unanswered` beside the call's own reason.
+    /// Every site the real answer reads and the dead ask leaves unread says
+    /// so, and its reason is the walk's.
+    /// The unread sites with the real answer and with a dead ask: the rows
+    /// only the dead ask leaves unread (each must say `unanswered`, its
+    /// reason the walk's), and the rows marked `unanswered` that the real
+    /// answer leaves unread too, as `file:line callee`.
+    fn dead_ask_moves(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        answered: &MemberDeclarations,
+    ) -> (Vec<crate::unread_sites::UnreadSite>, Vec<String>) {
+        let ask = declaration_ask(&on.inputs, exports);
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let read = unread_traced(on, exports, answered);
+        let unread = unread_traced(on, exports, &failed);
+        let in_read = |row: &crate::unread_sites::UnreadSite| {
+            read.iter().any(|held| {
+                (held.file.as_str(), held.span_start, held.span_end)
+                    == (row.file.as_str(), row.span_start, row.span_end)
+            })
+        };
+        let opened: Vec<_> = unread.iter().filter(|row| !in_read(row)).cloned().collect();
+        for row in &opened {
+            assert!(
+                row.also.contains(&Stop::Unanswered),
+                "{}:{} {:?} {:?}",
+                row.file,
+                row.line,
+                row.callee,
+                row.reason
+            );
+            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
+        }
+        let mut also_unread: Vec<String> = unread
+            .iter()
+            .filter(|row| in_read(row) && row.also.contains(&Stop::Unanswered))
+            .map(|row| {
+                format!(
+                    "{}:{} {}",
+                    row.file.rsplit('/').next().unwrap_or(&row.file),
+                    row.line,
+                    row.callee.as_deref().unwrap_or("")
+                )
+            })
+            .collect();
+        also_unread.sort();
+        (opened, also_unread)
+    }
+
+    #[test]
+    fn a_failed_declaration_ask_saves_its_sites_unanswered() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let (opened, also_unread) = dead_ask_moves(&on, &exports, &answered);
+        // Marked though the real answer leaves them unread too: calls whose
+        // declaration the ask decides (`request.get` is the package's other
+        // `get`), and the walks that pass one.
+        assert_eq!(also_unread, ["negatives.ts:5 request.get"]);
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let unread = unread_traced(&on, &exports, &failed);
+        for (file, callee) in [
+            ("helpers.ts", "app.get"),
+            ("client.ts", "client.get"),
+            ("routes.ts", "this.app.get"),
+        ] {
+            assert!(
+                opened
+                    .iter()
+                    .any(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee)),
+                "{file} {callee} is a site the dead ask leaves unread: {opened:?}"
+            );
+        }
+        // A short answer is no answer either.
+        let short = MemberDeclarations::answered(&ask, Ok::<_, &str>(Vec::new()));
+        assert_eq!(
+            unread_traced(&on, &exports, &short),
+            unread,
+            "a short answer saves the same sites"
+        );
+    }
+
+    /// carrick#3991 on the held-member reader (`value_end`): a labelled
+    /// member held as a value and run elsewhere is a call the dead ask would
+    /// have decided too.
+    #[test]
+    fn a_failed_declaration_ask_saves_held_member_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_in("callee-members", "services/web", "web")
+            .expect("the callee-members fixture walks: a skipped test proves nothing");
+        let (opened, also_unread) = dead_ask_moves(&on, &exports, &answered);
+        assert!(
+            opened.iter().any(|row| row.file.ends_with("m-bind.ts")),
+            "the bound member's call is a site the dead ask leaves unread: {opened:?}"
+        );
+        assert_eq!(also_unread, Vec::<String>::new(), "{also_unread:?}");
+    }
+
+    /// An ask that answered adds nothing, whatever it verified.
+    #[test]
+    fn an_answered_declaration_ask_adds_nothing() {
+        let (on, exports, answered, _) = traced_with_ask();
+        assert!(!answered.is_empty(), "the verifier answered the fixture");
+        for row in unread_traced(&on, &exports, &answered) {
+            assert!(
+                !row.also.contains(&Stop::Unanswered),
+                "{}:{} {:?}",
+                row.file,
+                row.line,
+                row.callee
+            );
+        }
+    }
+
+    /// A call the ask was not for keeps its row as it was: an in-repo
+    /// class's own `get`, a local interface's `get` and an untyped
+    /// receiver's. A call of the same package's other `get` (`request.get`)
+    /// was asked for: its declaration is one the answer decides, so it says
+    /// `unanswered` too.
+    #[test]
+    fn a_failed_declaration_ask_leaves_calls_it_was_not_for_alone() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let read = unread_traced(&on, &exports, &answered);
+        let unread = unread_traced(&on, &exports, &failed);
+        let at = |rows: &[crate::unread_sites::UnreadSite], callee: &str| {
+            rows.iter()
+                .find(|row| {
+                    row.file.ends_with("negatives.ts") && row.callee.as_deref() == Some(callee)
+                })
+                .cloned()
+        };
+        for callee in ["new Local().get", "shape.get", "target.get"] {
+            assert_eq!(at(&unread, callee), at(&read, callee), "{callee}");
+            if let Some(row) = at(&unread, callee) {
+                assert!(!row.also.contains(&Stop::Unanswered), "{callee}");
+            }
+        }
+        let request = at(&unread, "request.get").expect("request.get is an unread site");
+        assert!(request.also.contains(&Stop::Unanswered), "{request:?}");
+    }
+
+    /// A traced fixture through the whole site pass, with `declarations` as
+    /// the trace's answer: each saved site and possible call as the blob
+    /// carries it, and each decided site's composed and procedure paths, by
+    /// span.
+    #[allow(clippy::type_complexity)]
+    fn traced_rows(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+    ) -> (
+        Vec<crate::unread_sites::UnreadSite>,
+        BTreeMap<(String, u32, u32), Vec<String>>,
+    ) {
+        use super::super::decided_sites::{
+            MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
+        };
+        let discovery = discover(
+            &on.inputs,
+            &Labels::of(exports).tracing(declarations),
+            &on.repo,
+        );
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = SiteLabel::from_exports(exports);
+        let decided = decided_sites_traced_with(
+            &on.inputs,
+            &[],
+            &on.repo,
+            &discovered,
+            &labels,
+            &MakerLabel::from_exports(exports),
+            &ScopeLabel::from_exports(exports, &declarations.scope_answers),
+            &ProcedureLabels::from_exports(exports, &declarations.scope_answers),
+        );
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let rows = crate::site_rows::of(&decided, &records, &labels, &Default::default());
+        let unread = crate::unread_sites::from_scan(&discovery, &decided, &[], &[], &on.repo);
+        let mut data: crate::cloud_storage::CloudRepoData =
+            serde_json::from_value(serde_json::json!({
+                "repo_name": "r",
+                "endpoints": [], "calls": [], "mounts": [], "apps": {},
+                "imported_handlers": [], "function_definitions": {},
+                "config_json": null, "package_json": null, "packages": null,
+                "last_updated": "2026-11-13T00:00:00Z", "commit_hash": "abc"
+            }))
+            .unwrap();
+        let listed: Vec<crate::possible_calls::PossibleCall> =
+            rows.leads.iter().chain(&rows.routes).cloned().collect();
+        crate::unread_sites::attach(&mut data, unread, &listed, &rows.scopes_unanswered);
+        let mut sites: BTreeMap<(String, u32, u32), Vec<String>> = BTreeMap::new();
+        for site in &decided.sites {
+            let composed: Vec<String> = site
+                .composed
+                .iter()
+                .map(|composed| format!("{:?} {}", composed.path, composed.end))
+                .collect();
+            let procedure = site
+                .procedure
+                .as_ref()
+                .map(|procedure| format!("{:?} {:?}", procedure.full_paths, procedure.stop));
+            sites
+                .entry((site.file.clone(), site.span_start, site.span_end))
+                .or_default()
+                .push(format!(
+                    "{:?} {composed:?} {procedure:?} trimmed={}",
+                    site.key, site.composed_trimmed
+                ));
+        }
+        (data.unread_sites.unwrap_or_default(), sites)
+    }
+
+    /// carrick#4155: the declaration ask carries the scope checks too, so a
+    /// dead ask leaves the decided pass without the scope members that bind
+    /// a route's prefix and a procedure router's keys. Run with the real
+    /// answer and with a dead ask: each span where the dead run saves
+    /// another site, or decides another path, says `unanswered` beside its
+    /// own reason, and no other span does. The dead run's moves, as
+    /// `file:line`, and the spans marked that did not move.
+    fn dead_ask_scope_moves(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        answered: &MemberDeclarations,
+    ) -> (Vec<String>, Vec<String>) {
+        let ask = declaration_ask(&on.inputs, exports);
+        assert!(
+            ask.scopes.iter().flatten().count() > 0,
+            "the fixture asks scope checks"
+        );
+        let dead = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let (real_rows, real_sites) = traced_rows(on, exports, answered);
+        let (dead_rows, dead_sites) = traced_rows(on, exports, &dead);
+        let rows_at = |rows: &[crate::unread_sites::UnreadSite], at: &(String, u32, u32)| {
+            let mut found: Vec<String> = rows
+                .iter()
+                .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .map(|row| format!("{} {} {:?}", row.reason.as_str(), row.slot, row.callee))
+                .collect();
+            found.sort();
+            found
+        };
+        let mut spans: BTreeSet<(String, u32, u32)> = BTreeSet::new();
+        for row in real_rows.iter().chain(&dead_rows) {
+            spans.insert((row.file.clone(), row.span_start, row.span_end));
+        }
+        spans.extend(real_sites.keys().cloned());
+        spans.extend(dead_sites.keys().cloned());
+        let line_of = |at: &(String, u32, u32)| {
+            dead_rows
+                .iter()
+                .chain(&real_rows)
+                .find(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .map_or(0, |row| row.line)
+        };
+        let mut unmarked: Vec<String> = Vec::new();
+        let mut marked_unmoved: Vec<String> = Vec::new();
+        let mut moved: Vec<String> = Vec::new();
+        for at in &spans {
+            let here: Vec<&crate::unread_sites::UnreadSite> = dead_rows
+                .iter()
+                .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
+                .collect();
+            let marked = !here.is_empty()
+                && here.iter().all(|row| {
+                    row.also.contains(&Stop::Unanswered) && row.reason != Stop::Unanswered
+                });
+            let moves = rows_at(&real_rows, at) != rows_at(&dead_rows, at)
+                || real_sites.get(at) != dead_sites.get(at);
+            let name = format!("{}:{}", at.0, line_of(at));
+            if moves {
+                moved.push(name.clone());
+                if !marked {
+                    unmarked.push(format!(
+                        "{name} real {:?} {:?} / dead {:?} {:?}",
+                        rows_at(&real_rows, at),
+                        real_sites.get(at),
+                        here.iter()
+                            .map(|row| format!("{} also {:?}", row.reason.as_str(), row.also))
+                            .collect::<Vec<_>>(),
+                        dead_sites.get(at)
+                    ));
+                }
+            } else if here.iter().any(|row| row.also.contains(&Stop::Unanswered)) {
+                marked_unmoved.push(name);
+            }
+        }
+        assert!(
+            unmarked.is_empty(),
+            "{} of {} moved span(s) not marked unanswered:\n{}",
+            unmarked.len(),
+            moved.len(),
+            unmarked.join("\n")
+        );
+        moved.sort();
+        marked_unmoved.sort();
+        (moved, marked_unmoved)
+    }
+
+    /// carrick#4155 on scope members that mount a router, run a plugin and
+    /// return a scoped app (`receiver-scopes`). The routers a `route` mount
+    /// places keep their sites in a dead run, served relative to a mount
+    /// the trace cannot place: those say `unanswered`. The other ten moves
+    /// are the op half's (carrick#3991), marked before this fix.
+    #[test]
+    fn a_failed_declaration_ask_saves_scoped_route_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_named("receiver-scopes")
+            .expect("the receiver-scopes fixture walks: a skipped test proves nothing");
+        let (moved, marked_unmoved) = dead_ask_scope_moves(&on, &exports, &answered);
+        assert_eq!(moved.len(), 17, "{moved:#?}");
+        for mounted in [
+            "src/admin.ts:8",
+            "src/aliased.ts:8",
+            "src/extra.ts:9",
+            "src/reports.ts:9",
+            "src/shared.ts:8",
+            "src/users.ts:8",
+            "src/users.ts:9",
+        ] {
+            assert!(
+                moved.iter().any(|at| at == mounted),
+                "{mounted}: {moved:#?}"
+            );
+        }
+        assert_eq!(marked_unmoved, Vec::<String>::new(), "moved: {moved:#?}");
+    }
+
+    /// carrick#4155 on procedure router members that collect and merge
+    /// (`procedure-router`). A dead ask leaves every procedure op unread at
+    /// discovery, so each site it moves is the op half's (carrick#3991).
+    /// Marked though it does not move: `t.procedure.stream`, a member the
+    /// label states no method for, whose declaration the ask decides.
+    #[test]
+    fn a_failed_declaration_ask_saves_procedure_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_in("procedure-router", ".", "api")
+            .expect("the procedure-router fixture walks: a skipped test proves nothing");
+        let (moved, marked_unmoved) = dead_ask_scope_moves(&on, &exports, &answered);
+        assert_eq!(moved.len(), 17, "{moved:#?}");
+        assert_eq!(marked_unmoved, ["src/router.ts:16"], "moved: {moved:#?}");
     }
 
     /// carrick#2432 slice B: an implementation the walk cannot enter (one
@@ -5838,7 +6352,7 @@ mod tests {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let name_at = |file: &str, line: u32| -> Vec<String> {
@@ -5891,7 +6405,7 @@ mod tests {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let name_at = |file: &str, line: u32| -> Vec<String> {
@@ -7422,7 +7936,7 @@ export function listen(): void {
             scopes,
             &super::super::decided_sites::ProcedureLabels::from_exports(
                 exports,
-                &declarations.verified_scopes,
+                &declarations.scope_answers,
             ),
         );
         (discovery, decided)
@@ -7441,7 +7955,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::ScopeLabel;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         let want = texts(&["src/index.ts:20 <- /tree", "src/index.ts:8 <- /health"]);
@@ -7495,7 +8009,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::ScopeLabel;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         let want = texts(&[
@@ -7524,7 +8038,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let mut verified: Vec<&str> = scopes.iter().map(|scope| scope.member.as_str()).collect();
         verified.sort();
         assert_eq!(verified, vec!["basePath", "register", "route"]);
@@ -7663,7 +8177,7 @@ export function listen(): void {
     )> {
         use super::super::decided_sites::ScopeLabel;
         let (on, exports, declarations) = traced_fixture_named("receiver-mount-pathless")?;
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         Some((decided, scopes))
     }
@@ -7840,7 +8354,7 @@ export function listen(): void {
         else {
             return;
         };
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         assert!(
             scopes.iter().any(|label| {
                 label.package == "fixture-mw-router"
@@ -7915,7 +8429,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let served = |decided: &super::super::decided_sites::Decided| {
             let records = super::super::site_record::site_records(
                 &on.inputs,
@@ -7984,7 +8498,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8051,7 +8565,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8105,7 +8619,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8148,7 +8662,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8235,7 +8749,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8292,7 +8806,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8349,7 +8863,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8390,7 +8904,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8499,8 +9013,8 @@ export function listen(): void {
             &discovered,
             &labels,
             &MakerLabel::from_exports(&exports),
-            &ScopeLabel::from_exports(&exports, &declarations.verified_scopes),
-            &ProcedureLabels::from_exports(&exports, &declarations.verified_scopes),
+            &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
+            &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
         );
         let records =
             super::super::site_record::site_records(own, &siblings, &on.repo, &decided, &labels);
@@ -8563,7 +9077,7 @@ export function listen(): void {
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
         let labels = SiteLabel::from_exports(&exports);
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
@@ -8607,7 +9121,7 @@ export function listen(): void {
             return;
         };
         use super::super::decided_sites::{ScopeLabel, SiteLabel};
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = composed_lines(&decided, false);
         // The scope's path is the route's own path, served under the
@@ -8728,7 +9242,7 @@ export function listen(): void {
         assert_eq!(only, vec!["src/edge.ts", "src/harness.ts", "src/worker.ts"]);
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         assert_eq!(
@@ -8752,7 +9266,7 @@ export function listen(): void {
         let (on, exports, declarations) = traced_fixture_in(name, dir, service)?;
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         Some(composed_lines(&decided, true))
@@ -8774,7 +9288,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = without_files(
@@ -8839,7 +9353,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), MODULE_ALIAS_FILES);
@@ -8869,7 +9383,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = instance_ends(&decided);
@@ -8896,7 +9410,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), GETTER_FILES);
@@ -8921,7 +9435,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let got = only_files(instance_ends(&decided), CALL_RESULT_FILES);
@@ -8952,7 +9466,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (discovery, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         assert_eq!(discovery.counts.get("declaration_ambiguous"), None);
@@ -9032,7 +9546,7 @@ export function listen(): void {
         ) else {
             return;
         };
-        let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let lines = boundary_lines(&decided.boundaries);
         let call_ins: Vec<&String> = lines
@@ -9291,7 +9805,7 @@ export function listen(): void {
             ) else {
                 return;
             };
-            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
             let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
             facts.push((service, decided.boundaries));
         }
@@ -9357,7 +9871,7 @@ export function listen(): void {
             ) else {
                 return;
             };
-            let scopes = ScopeLabel::from_exports(&exports, &declarations.verified_scopes);
+            let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
             let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
             facts.push((service, decided.boundaries));
         }
@@ -9527,7 +10041,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let mut got: Vec<String> = ends_in_order(&decided)
@@ -9576,13 +10090,13 @@ export function listen(): void {
             scope.package == "fixture-split-server" && scope.receiver == "instance:()"
         };
         assert!(
-            declarations.verified_scopes.keys().any(hub),
+            declarations.scope_answers.keys().any(hub),
             "{:#?}",
-            declarations.verified_scopes
+            declarations.scope_answers
         );
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
         let ends = ends_in_order(&decided);
@@ -9605,7 +10119,7 @@ export function listen(): void {
         };
         let scopes = super::super::decided_sites::ScopeLabel::from_exports(
             &exports,
-            &declarations.verified_scopes,
+            &declarations.scope_answers,
         );
         let first = ends_in_order(&decided_traced(&on, &exports, &declarations, &scopes).1);
         assert!(

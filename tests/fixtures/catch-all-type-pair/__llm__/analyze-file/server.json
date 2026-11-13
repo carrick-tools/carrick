@@ -1,0 +1,36 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:14",
+      "line_number": 14,
+      "owner_node": "app",
+      "method": "ALL",
+      "path": "/v1/*",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.all(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:18",
+      "line_number": 18,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/v1/jobs/open",
+      "handler_name": "anonymous",
+      "pattern_matched": "app.post(",
+      "payload_expression_text": "request.body",
+      "payload_expression_line": 19,
+      "response_expression_text": "reply.json(result)",
+      "response_expression_line": 20,
+      "primary_type_symbol": "Opened",
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

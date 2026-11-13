@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "name": "gateway", "directory": "gateway" },
+    { "name": "worker", "directory": "worker" }
+  ]
+}
