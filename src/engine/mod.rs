@@ -6202,8 +6202,7 @@ async fn analyze_current_repo_incremental(
                 &cloud_data.function_definitions,
                 &site_fold.through_folded,
             );
-            let typed_leaves: Vec<&crate::call_through::LeafCall> =
-                call_through.typed_leaves().collect();
+            let typed_leaves: Vec<&crate::call_through::LeafCall> = call_through.asked_leaves();
 
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
@@ -15076,7 +15075,7 @@ async fn analyze_current_repo(
         &cloud_data.function_definitions,
         &site_fold.through_folded,
     );
-    let typed_leaves: Vec<&crate::call_through::LeafCall> = call_through.typed_leaves().collect();
+    let typed_leaves: Vec<&crate::call_through::LeafCall> = call_through.asked_leaves();
 
     // The type requests and anchor stamps below read the same index the
     // analysis above was given: the specifier a type was imported by is the
