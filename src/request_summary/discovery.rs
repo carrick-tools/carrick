@@ -4214,21 +4214,63 @@ mod tests {
     /// call it would have decided `unanswered` beside the call's own reason.
     /// Every site the real answer reads and the dead ask leaves unread says
     /// so, and its reason is the walk's.
+    /// The unread sites with the real answer and with a dead ask: the rows
+    /// only the dead ask leaves unread (each must say `unanswered`, its
+    /// reason the walk's), and the rows marked `unanswered` that the real
+    /// answer leaves unread too, as `file:line callee`.
+    fn dead_ask_moves(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        answered: &MemberDeclarations,
+    ) -> (Vec<crate::unread_sites::UnreadSite>, Vec<String>) {
+        let ask = declaration_ask(&on.inputs, exports);
+        let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
+        let read = unread_traced(on, exports, answered);
+        let unread = unread_traced(on, exports, &failed);
+        let in_read = |row: &crate::unread_sites::UnreadSite| {
+            read.iter().any(|held| {
+                (held.file.as_str(), held.span_start, held.span_end)
+                    == (row.file.as_str(), row.span_start, row.span_end)
+            })
+        };
+        let opened: Vec<_> = unread.iter().filter(|row| !in_read(row)).cloned().collect();
+        for row in &opened {
+            assert!(
+                row.also.contains(&Stop::Unanswered),
+                "{}:{} {:?} {:?}",
+                row.file,
+                row.line,
+                row.callee,
+                row.reason
+            );
+            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
+        }
+        let mut also_unread: Vec<String> = unread
+            .iter()
+            .filter(|row| in_read(row) && row.also.contains(&Stop::Unanswered))
+            .map(|row| {
+                format!(
+                    "{}:{} {}",
+                    row.file.rsplit('/').next().unwrap_or(&row.file),
+                    row.line,
+                    row.callee.as_deref().unwrap_or("")
+                )
+            })
+            .collect();
+        also_unread.sort();
+        (opened, also_unread)
+    }
+
     #[test]
     fn a_failed_declaration_ask_saves_its_sites_unanswered() {
         let (on, exports, answered, ask) = traced_with_ask();
+        let (opened, also_unread) = dead_ask_moves(&on, &exports, &answered);
+        // Marked though the real answer leaves them unread too: calls whose
+        // declaration the ask decides (`request.get` is the package's other
+        // `get`), and the walks that pass one.
+        assert_eq!(also_unread, ["negatives.ts:5 request.get"]);
         let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
-        let read = unread_traced(&on, &exports, &answered);
         let unread = unread_traced(&on, &exports, &failed);
-        let opened: Vec<_> = unread
-            .iter()
-            .filter(|row| {
-                !read.iter().any(|held| {
-                    (held.file.as_str(), held.span_start, held.span_end)
-                        == (row.file.as_str(), row.span_start, row.span_end)
-                })
-            })
-            .collect();
         for (file, callee) in [
             ("helpers.ts", "app.get"),
             ("client.ts", "client.get"),
@@ -4241,17 +4283,6 @@ mod tests {
                 "{file} {callee} is a site the dead ask leaves unread: {opened:?}"
             );
         }
-        for row in &opened {
-            assert!(
-                row.also.contains(&Stop::Unanswered),
-                "{}:{} {:?} {:?}",
-                row.file,
-                row.line,
-                row.callee,
-                row.reason
-            );
-            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
-        }
         // A short answer is no answer either.
         let short = MemberDeclarations::answered(&ask, Ok::<_, &str>(Vec::new()));
         assert_eq!(
@@ -4259,6 +4290,21 @@ mod tests {
             unread,
             "a short answer saves the same sites"
         );
+    }
+
+    /// carrick#3991 on the held-member reader (`value_end`): a labelled
+    /// member held as a value and run elsewhere is a call the dead ask would
+    /// have decided too.
+    #[test]
+    fn a_failed_declaration_ask_saves_held_member_sites_unanswered() {
+        let (on, exports, answered) = traced_fixture_in("callee-members", "services/web", "web")
+            .expect("the callee-members fixture walks: a skipped test proves nothing");
+        let (opened, also_unread) = dead_ask_moves(&on, &exports, &answered);
+        assert!(
+            opened.iter().any(|row| row.file.ends_with("m-bind.ts")),
+            "the bound member's call is a site the dead ask leaves unread: {opened:?}"
+        );
+        assert_eq!(also_unread, Vec::<String>::new(), "{also_unread:?}");
     }
 
     /// An ask that answered adds nothing, whatever it verified.
