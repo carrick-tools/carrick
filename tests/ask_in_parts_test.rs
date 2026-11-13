@@ -91,15 +91,14 @@ const PART_WINDOWS: [(u32, u32); 3] = [(1, 37), (38, 67), (68, 75)];
 /// A handler module: its one call is a request on an installed client.
 fn handler_source(n: usize) -> String {
     format!(
-        "import makeClient from \"fixture-http\"; const http = makeClient();\n\
+        "declare const http: import(\"fixture-http\").Client;\n\
          export function h{n}(req: any, res: any) {{\n  return http.get(\"/handled/{n}\");\n}}\n"
     )
 }
 
 /// The installed request client a written file's requests go through, on one
 /// line, so the file's lines stay where its assertions read them.
-const CONFIG_CLIENT: &str =
-    "import { makeConfigClient } from \"fixture-http\"; const client = makeConfigClient();";
+const CONFIG_CLIENT: &str = "declare const client: import(\"fixture-http\").ConfigClient;";
 
 fn single(out: &mut String, tag: &str, i: usize, handler: &str) {
     writeln!(out, "table.get(\"/{tag}/r/{i}\", {handler});").unwrap();
@@ -110,8 +109,8 @@ fn table_source(tag: &str) -> String {
     for n in 0..HANDLER_MODULES {
         writeln!(out, "import {{ h{n} }} from \"./handlers/h{n}\";").unwrap();
     }
-    out.push_str("import makeTable from \"fixture-table\";\n");
-    out.push_str("const table = makeTable();\n");
+    out.push_str("import type { Table } from \"fixture-table\";\n");
+    out.push_str("declare const table: Table;\n");
     out.push_str("const local = (req: any, res: any) => {};\n");
     for i in 0..LOCAL_SINGLES {
         single(&mut out, tag, i, "local");
@@ -1367,7 +1366,7 @@ async fn a_request_that_was_cut_is_never_sent_again() {
     let one = Fixture::of(
         &[(
             "src/onegroup_table.ts".to_string(),
-            "import makeTable from \"fixture-table\";\nconst table = makeTable();\ntable.get(\"/onegroup/r/0\", () => {});\n"
+            "import type { Table } from \"fixture-table\";\ndeclare const table: Table;\ntable.get(\"/onegroup/r/0\", () => {});\n"
                 .to_string(),
         )],
         "src/onegroup_table.ts",
@@ -1382,8 +1381,9 @@ async fn a_request_that_was_cut_is_never_sent_again() {
 
     // Six registrations and no imported module: one part, whose prompt is the
     // whole prompt. It is halved without being sent.
-    let mut source =
-        String::from("import makeTable from \"fixture-table\";\nconst table = makeTable();\n");
+    let mut source = String::from(
+        "import type { Table } from \"fixture-table\";\ndeclare const table: Table;\n",
+    );
     for i in 0..6 {
         writeln!(source, "table.get(\"/sixgroups/r/{i}\", () => {{}});").unwrap();
     }

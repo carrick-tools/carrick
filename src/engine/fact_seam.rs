@@ -53,6 +53,10 @@ pub async fn fact_files_of_tree(
     let sidecar = crate::services::TypeSidecar::spawn(sidecar_script).expect("spawn the sidecar");
     sidecar.set_scan_root(&repo);
     let recipe = sidecar.recipe();
+    drop(sidecar);
+    // The service's own process, as a scan starts one per service: the
+    // receiver trace asks it for member declarations.
+    let service_sidecar = super::ServiceSidecar::start(Some(&recipe), &repo_path, &config, None);
     crate::position_rows::record_service_rows(
         &recipe,
         &crate::position_rows::ServiceWalk {
@@ -106,12 +110,12 @@ pub async fn fact_files_of_tree(
             &repo,
             &implementations,
             super::FirstTrace::Traced {
-                sidecar: Some(&sidecar),
+                sidecar: service_sidecar.ready(),
                 from_dir: &semantics_root,
             },
             sender,
         ),
     );
-    drop(sidecar);
+    drop(service_sidecar);
     facts.await.expect("the fact files are sent")
 }
