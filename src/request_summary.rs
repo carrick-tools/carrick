@@ -197,6 +197,9 @@ pub mod descriptors;
 #[allow(dead_code)]
 mod guards;
 use guards::{GuardIr, Subject, Tested, WrittenIn};
+// `new URL(input, base)` by the URL standard: the one reader both the value
+// reader and the guards call (carrick#4124).
+mod new_url;
 
 // Where a discovered call's name is decided (carrick#2433), and the record
 // each decided site carries (carrick#2435): record-only, so only tests and
@@ -7368,7 +7371,8 @@ impl Reader<'_> {
         several_values(values, self.text(call.span))
     }
 
-    /// `new URL(path, base)`: the base is opaque and leads, the path follows.
+    /// `new URL(input, base)`: the URL [`new_url::resolve_new_url`] reads
+    /// (carrick#4124).
     fn new_url(&self, new: &NewExpr, scope: &Scope<'_>) -> Value {
         // FROZEN (old path, 2026-10-21): the by-name `URL` test on the next
         // line only. Deletions and safety fixes only. Fixes for wrong or
@@ -7382,27 +7386,20 @@ impl Reader<'_> {
             return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
         }
         match args {
-            [path] => self.eval(&path.expr, scope),
-            // Only the path is asserted, as everywhere a `new URL` is read
-            // (carrick#610): the base is an opaque value the URL resolves
-            // against, and a path starting with `/` replaces whatever path it
-            // carries.
-            [path, _base] => {
-                let path = self.eval(&path.expr, scope).pieces();
-                // The path is a literal starting with `/`, or the function's
-                // own parameter (or a key of one): the caller fills it in, and
-                // `render_target` refuses there a path that does not start
-                // with a literal `/` (an absolute URL replaces the base, so it
-                // is that URL).
-                let readable = match path.first() {
-                    Some(Piece::Lit(text)) => text.starts_with('/'),
-                    Some(first) => first.is_parameter(),
-                    None => false,
-                };
-                if !readable {
-                    return Value::hole(self.text(new.span), HoleReason::UnreadExpression);
+            [input] => self.eval(&input.expr, scope),
+            [input, base] => {
+                let input = self.eval(&input.expr, scope).pieces();
+                // The base is read only where the input does not name the
+                // URL on its own, and only for the text it writes: nothing
+                // read in it is a site of its own here.
+                let url = new_url::resolve_new_url(&input, Some(&[Piece::Unknown])).or_else(|| {
+                    let base = self.unrecorded(|| self.eval(&base.expr, scope)).pieces();
+                    new_url::resolve_new_url(&input, Some(&base))
+                });
+                match url {
+                    Some(url) => Value::Str(url),
+                    None => Value::hole(self.text(new.span), HoleReason::UnreadExpression),
                 }
-                Value::Str(path)
             }
             _ => Value::hole(self.text(new.span), HoleReason::UnreadExpression),
         }
