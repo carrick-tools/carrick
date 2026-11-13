@@ -125,6 +125,17 @@ impl FactFiles {
             };
             facts.record(&site.file, (site.span_start, site.span_end), followed);
             if let Some(end) = &site.end {
+                // The labelled call a walk ended at is a server-framework
+                // call whatever led there (carrick#4077): a route registered
+                // on a typed parameter in a helper the caller entered. Only
+                // the end: the caller's own call is no registration.
+                if end.role == LibraryRole::ServerFramework {
+                    facts
+                        .server_framework_starts
+                        .entry(end.file.clone())
+                        .or_default()
+                        .insert(end.span_start);
+                }
                 if end.role == LibraryRole::GraphqlClient {
                     facts
                         .graphql_client_calls
@@ -364,6 +375,33 @@ mod tests {
             scope: None,
             procedure: None,
         }
+    }
+
+    /// carrick#4077: a walk from a helper's caller that ends at a
+    /// server-framework call in another file (the route registered on a
+    /// typed parameter) makes that call a server-framework call, as a
+    /// direct library site would: a request member declared there is a
+    /// registration. The caller's own call is not one.
+    #[test]
+    fn a_walk_s_server_framework_end_is_a_server_framework_call() {
+        let discovery = Discovery {
+            sites: vec![site(
+                "app.ts",
+                (1, 4),
+                Some(end("typed.ts", LibraryRole::ServerFramework)),
+                None,
+            )],
+            ..Discovery::default()
+        };
+        let facts = FactFiles::of(
+            &discovery,
+            &Decided::default(),
+            None,
+            &FirstAnswer::default(),
+            Path::new("/repo"),
+        );
+        assert!(facts.server_framework_call(Path::new("/repo/typed.ts"), 5));
+        assert!(!facts.server_framework_call(Path::new("/repo/app.ts"), 1));
     }
 
     /// A call with a GraphQL-client end and an HTTP-client end at the same

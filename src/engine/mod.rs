@@ -28652,6 +28652,44 @@ unfollowed_member_calls_total: 0,
         );
     }
 
+    /// carrick#4077 R4: every file whose listed spans the receiver trace
+    /// changes is one the lane's untraced discovery marks, so the lane never
+    /// asks ahead a prompt the analysis would build otherwise.
+    #[tokio::test]
+    async fn every_file_the_trace_lists_otherwise_is_one_the_lane_skips() {
+        let Some(on) = receiver_trace() else {
+            return;
+        };
+        let Some(sidecar) = receiver_trace_sidecar(&on) else {
+            return;
+        };
+        let exports = receiver_trace_answer().exports;
+        let (traced, _) = receiver_trace_first(
+            &on,
+            &exports,
+            super::FirstTrace::Traced {
+                sidecar: Some(&sidecar),
+                from_dir: &on.repo,
+            },
+        )
+        .await;
+        let (untraced, _) = receiver_trace_first(&on, &exports, super::FirstTrace::Untraced).await;
+        let files: BTreeSet<&String> = traced.listed.keys().chain(untraced.listed.keys()).collect();
+        let moved: Vec<&String> = files
+            .into_iter()
+            .filter(|file| traced.listed_in(file) != untraced.listed_in(file))
+            .collect();
+        assert!(!moved.is_empty(), "the trace lists more of the fixture");
+        let unmarked: Vec<&&String> = moved
+            .iter()
+            .filter(|file| !untraced.stops_unmatched_in(file))
+            .collect();
+        assert!(
+            unmarked.is_empty(),
+            "listed otherwise, not marked: {unmarked:?}"
+        );
+    }
+
     /// carrick#4077 R5: the settled pass reuses the first answer's member
     /// declarations when the settled claims are the first answer's exports:
     /// one ask. Claims that differ are asked once more.
