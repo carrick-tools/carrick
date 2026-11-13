@@ -1681,6 +1681,18 @@ export class TypeInferrer {
               'framework machinery (Response/Request-shaped); abstaining rather than ' +
               'capturing the wrapper envelope as a response contract'
           );
+          // carrick#4148: when every returned branch states an error or
+          // redirect status, the handler has no success body: a decided
+          // answer with its reason, not a blind unknown.
+          if (this.everyReturnStatesDroppedStatus(func)) {
+            return this.decidedAbstain(request, this.getNodeLocation(func), {
+              path: '',
+              kind: 'unknown',
+              reason: 'no_success_payload',
+              detail:
+                'every response this handler returns states an error or redirect status, so it publishes no success body',
+            });
+          }
           return null;
         }
         this.log(
@@ -7408,6 +7420,21 @@ export class TypeInferrer {
         `the call's request config sets no '${read.member}' member, which is where the call ` +
         'takes its body, so the call sends no request body',
     });
+  }
+
+  /**
+   * carrick#4148: the handler returns at least one expression and every
+   * branch of every return is a send stating an error or redirect status.
+   * A branch that states no status (or a computed one) makes this false.
+   */
+  private everyReturnStatesDroppedStatus(func: FunctionLike): boolean {
+    const branches = this.returnedExpressions(func).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    return (
+      branches.length > 0 &&
+      branches.every((branch) => isDroppedResponseStatus(this.responseSiteStatus(branch, true)))
+    );
   }
 
   /** An `unknown` answer the inferrer decided, carrying its reason at the root. */
