@@ -249,6 +249,7 @@ fn root_reasons(blob: &serde_json::Value, file: &str, line: u64) -> Vec<String> 
 /// | 21 | `http.purge(...)`, no body slot | `not_located` |
 /// | 23 | `http.post(..., null)` | typed `null` |
 /// | 25 | `http.post("/orders", order)` | typed `Order` |
+/// | 28 | `either(...)`, one branch writes a body, one none | not decided |
 #[test]
 fn a_call_that_writes_no_body_argument_is_decided_no_body() {
     const FILE: &str = "src/orders.ts";
@@ -266,7 +267,7 @@ fn a_call_that_writes_no_body_argument_is_decided_no_body() {
             "{FILE}:{line} {text}"
         );
     }
-    for line in [13, 15] {
+    for line in [13, 15, 28] {
         let reasons = root_reasons(&on, FILE, line);
         assert!(!reasons.contains(&decided[0]), "{FILE}:{line} {reasons:?}");
     }

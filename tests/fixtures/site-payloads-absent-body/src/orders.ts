@@ -23,3 +23,6 @@ export function purge() { return http.purge("/orders/3"); }
 export function sendNull() { return http.post("/orders/null", null); }
 
 export function create(order: Order) { return http.post("/orders", order); }
+
+function either(u: string, b?: Order) { return b ? http.post(u, b) : http.post(u); }
+export function sendEither(order: Order) { return either("/orders/either", order); }

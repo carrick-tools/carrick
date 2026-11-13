@@ -44,6 +44,23 @@ export function relayed(): Promise<Response> {
   return relay("/absent/relayed");
 }
 
+// A body the wrapper assigns again, and a bind that fills the leading
+// parameter: the caller's own arguments are not the callee's positions.
+function reset(path: string, init?: unknown) {
+  init = init ?? { body: "x" };
+  return fetch(`${process.env.API}${path}/reset`, init as RequestInit);
+}
+
+export function resetCaller(): Promise<Response> {
+  return reset("/absent");
+}
+
+const boundCarry = carry.bind(null, "/absent/bound");
+
+export function bound(): Promise<Response> {
+  return boundCarry({ body: "x" });
+}
+
 export function spread(rest: [RequestInit]): Promise<Response> {
   return fetch(`${process.env.API}/absent/spread`, ...rest);
 }

@@ -2202,6 +2202,10 @@ fn payload_slot(
 /// key through a hop's spread or rest ([`payload_slot`]), and returns `None`
 /// where it would stop below the deciding call.
 fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walked> {
+    // A call whose own written arguments are the ones its callee receives
+    // (carrick#4165): no `bind` ahead of them, no `call` or `apply` moving
+    // them. Only such a call is read as leaving a position out.
+    let omitted = |call: &CallIr| call.bound.is_empty() && call.language_call.is_none();
     let whole_param = |value: &Value| match value {
         Value::Str(pieces) => match pieces.as_slice() {
             [Piece::Param(index, _)] => Some(*index),
@@ -2215,7 +2219,7 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
     for k in (1..down.len()).rev() {
         let placed = &down[k];
         if placed.call.site_args.is_some() && placed.call.args.get(arg).is_none() {
-            return Some(Walked::Omitted { through });
+            return omitted(placed.call).then_some(Walked::Omitted { through });
         }
         let passed = match (&key, argument(placed.call, arg)) {
             (_, None) => None,
@@ -2262,7 +2266,7 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
     }
     let first = down.first()?;
     if first.call.site_args.is_some() && first.call.args.get(arg).is_none() {
-        return Some(Walked::Omitted { through });
+        return omitted(first.call).then_some(Walked::Omitted { through });
     }
     Some(Walked::Bound(0, arg, key))
 }
@@ -2625,9 +2629,11 @@ impl<'a> Walk<'a, '_> {
         self.resolver.text_of_value(at, text).ok()
     }
 
-    /// Whether the function `callee` (definition `key` of `file`) gives its
-    /// parameter at `index` a default (carrick#4165). A function that is
-    /// not found may: it reads as defaulted.
+    /// Whether the function `callee` (definition `key` of `file`) may fill
+    /// its parameter at `index` where the caller leaves it out
+    /// (carrick#4165): it gives the parameter a default, or its body assigns
+    /// the parameter again. A function that is not found, or a parameter
+    /// that is not a plain name, may: it reads as filled.
     fn defaults_param(&self, callee: (&Path, Option<&str>), index: usize) -> bool {
         let Some((_, function)) = callee
             .1
@@ -2635,10 +2641,14 @@ impl<'a> Walk<'a, '_> {
         else {
             return true;
         };
-        function
-            .param_default_texts
-            .iter()
-            .any(|(position, keys, _)| *position == index && keys.is_empty())
+        let Some(Some(param)) = function.params.get(index) else {
+            return true;
+        };
+        param.assigned_again()
+            || function
+                .param_default_texts
+                .iter()
+                .any(|(position, keys, _)| *position == index && keys.is_empty())
     }
 
     /// `down` is the calls from the site (first) to the labelled call
@@ -7024,6 +7034,7 @@ pub(crate) mod tests {
             "fetch(`${process.env.API}/absent/${id}/bump`)",
             "fetch(`${process.env.API}${path}`, body as RequestInit)",
             "fetch(`${process.env.API}${url}`, init as RequestInit)",
+            "fetch(`${process.env.API}${path}/reset`, init as RequestInit)",
             "fetch(`${process.env.API}/absent/spread`, ...rest)",
             "fetch(`${process.env.API}/absent/options`, { headers: {} })",
         ];
@@ -7039,6 +7050,17 @@ pub(crate) mod tests {
         };
         let mut positional = fetch_label();
         positional.payload = Some(ArgSlot { arg: 1, key: None });
+        // A parameter the wrapper assigns again, and a call whose leading
+        // argument a bind fills: whatever sites they make, none is absent.
+        {
+            let (decided, text, _) = decided_at(ABSENT, &calls, &positional);
+            for needle in ["reset(\"/absent\")", "boundCarry({ body"] {
+                let line = line_of(&text, needle);
+                for site in decided.sites.iter().filter(|site| site.line == line) {
+                    assert_ne!(site.payload_slot, Some(SlotBinding::Absent), "{needle}");
+                }
+            }
+        }
         let slot_at = slots(&positional);
         assert_eq!(slot_at("/absent/ping`)"), Some(SlotBinding::Absent));
         assert_eq!(slot_at("bump(\"1\")"), Some(SlotBinding::Absent));

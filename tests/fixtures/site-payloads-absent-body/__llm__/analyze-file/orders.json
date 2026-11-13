@@ -118,6 +118,19 @@
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:28",
+      "line_number": 28,
+      "target": "/orders/either",
+      "method": "POST",
+      "pattern_matched": "either(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
     }
   ]
 }
