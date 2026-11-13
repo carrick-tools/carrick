@@ -260,6 +260,14 @@ pub fn sidecar_script() -> PathBuf {
 /// `repo/__llm__`. Sets `CARRICK_MOCK_ALL`, and `CARRICK_MOCK_FIXTURE_DIR`
 /// for the walk only (callers run serially).
 pub async fn walked(repo: &Path) -> FactFiles {
+    walked_if_asked(repo)
+        .await
+        .unwrap_or_else(|| panic!("{} asks the store nothing", repo.display()))
+}
+
+/// [`walked`], or `None` when the tree asks the store nothing, as a scan
+/// then records no fact files.
+pub async fn walked_if_asked(repo: &Path) -> Option<FactFiles> {
     // SAFETY: the callers' tests run one at a time; env vars are
     // process-global. The caller's own cassette dir is put back after.
     let before = std::env::var_os("CARRICK_MOCK_FIXTURE_DIR");
@@ -269,9 +277,7 @@ pub async fn walked(repo: &Path) -> FactFiles {
     }
     let rows = tempfile::tempdir().expect("a rows dir");
     let facts =
-        carrick::engine::fact_seam::fact_files_of_tree(repo, &sidecar_script(), rows.path())
-            .await
-            .unwrap_or_else(|| panic!("{} asks the store nothing", repo.display()));
+        carrick::engine::fact_seam::fact_files_of_tree(repo, &sidecar_script(), rows.path()).await;
     unsafe {
         match before {
             Some(dir) => std::env::set_var("CARRICK_MOCK_FIXTURE_DIR", dir),
@@ -325,10 +331,13 @@ pub fn walked_blocking(repo: &Path) -> FactFiles {
 
 /// `facts` as the engine sends them: already arrived.
 pub fn source(facts: &FactFiles) -> FactFileSource {
+    source_of(Some(facts.clone()))
+}
+
+/// `facts` as the engine sends them, `None` included.
+pub fn source_of(facts: Option<FactFiles>) -> FactFileSource {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    sender
-        .send(Some(facts.clone()))
-        .expect("the receiver is held");
+    sender.send(facts).expect("the receiver is held");
     FactFileSource::later(receiver)
 }
 
