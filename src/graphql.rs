@@ -4546,7 +4546,7 @@ export const typeDefs = gql`
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            v1_state_before_demotion: None,
+            v1_before_demotion: None,
         };
         let mut calls = vec![row.clone(), row];
         let mut manifest = Some(vec![entry.clone(), entry]);
