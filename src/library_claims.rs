@@ -935,10 +935,10 @@ pub struct LibraryRows {
     /// Each verified site whose name slot the text reader reads as no name,
     /// with why (carrick#3504 B10-3), and each library call read and then
     /// dropped with no row and no other lead (carrick#3947, carrick#3946):
-    /// a claim answered `failed` (`uncorroborated`), a check with no verdict
-    /// such as one the verifier's time budget did not reach (`unanswered`),
-    /// or a verified op whose name slot reads no name (`caller_arg_missing`,
-    /// `unread_expression`, `unread`). Saved as unread sites
+    /// a claim answered `failed` (`uncorroborated`), a check the verifier's
+    /// time budget did not reach (`unanswered`), or a verified op whose name
+    /// slot reads no name (`caller_arg_missing`, `unread_expression`,
+    /// `unread`, `rows_missing`). Saved as unread sites
     /// ([`crate::unread_sites::from_scan`]), never a row.
     pub leads: Vec<LibraryLead>,
     /// The sites `read` would have read when verification returned no
@@ -1030,18 +1030,25 @@ pub fn read(
         })
         .map(|(check, _)| (check.claim_id.clone(), check.receiver.clone()))
         .collect();
-    // Each check's verdict, where the verdict at its position names it.
-    let answered: HashMap<(String, String), SemanticsVerdict> = checks
+    // The word each check that did not verify saves a dropped call with
+    // (carrick#3947, carrick#3946), where the verdict at its position names
+    // it: `failed` is `uncorroborated`, a check the verifier's time budget
+    // did not reach `unanswered`. Any other `unchecked` saves nothing.
+    let unverified_words: HashMap<(String, String), Stop> = checks
         .iter()
         .zip(&verdicts)
         .filter(|(check, verdict)| {
             verdict.claim_id == check.claim_id && verdict.receiver == check.receiver
         })
-        .map(|(check, verdict)| {
-            (
-                (check.claim_id.clone(), check.receiver.clone()),
-                verdict.verdict,
-            )
+        .filter_map(|(check, verdict)| {
+            let word = if verdict.verdict == SemanticsVerdict::Failed {
+                Stop::Uncorroborated
+            } else if verdict.not_reached_in_time() {
+                Stop::Unanswered
+            } else {
+                return None;
+            };
+            Some(((check.claim_id.clone(), check.receiver.clone()), word))
         })
         .collect();
     let mut stated: Vec<(LibraryRow, ReceiverKey)> = Vec::new();
@@ -1100,7 +1107,7 @@ pub fn read(
                 led.insert((call.0.clone(), call.1, chain));
             }
             let unstated = here
-                .unstated(&answered)
+                .unstated(&unverified_words)
                 .map(|(reason, op)| here.lead_of(None, reason, op));
             read_sites[index] = SiteRead {
                 rows,
@@ -1332,27 +1339,29 @@ impl Reading<'_, '_> {
 
     /// Why the call states no row, with the op the reason is for, when the
     /// reader read it and dropped it (carrick#3947, carrick#3946): a name
-    /// slot a verified op read no name at, then a check that came back with
-    /// no verdict for it (`unchecked`, as when the verifier's time budget
-    /// did not reach it), then a check answered `failed`. `None` when no
-    /// claim that states a message row applied here.
-    fn unstated(
-        &self,
-        verdicts: &HashMap<(String, String), SemanticsVerdict>,
-    ) -> Option<(Stop, LibraryOp)> {
+    /// slot a verified op read no name at, then a check the verifier's time
+    /// budget did not reach (`unanswered`), then a check answered `failed`
+    /// (`uncorroborated`), as `words` spells each check. `None` when no
+    /// claim that states a message row applied here, or none of its checks
+    /// has a word.
+    fn unstated(&self, words: &HashMap<(String, String), Stop>) -> Option<(Stop, LibraryOp)> {
         if let Some(unnamed) = self.unnamed.get() {
             return Some(unnamed);
         }
         let unverified = self.unverified.borrow();
-        let failed = |(id, receiver, _): &&(String, String, LibraryOp)| {
-            verdicts.get(&(id.clone(), receiver.clone())) == Some(&SemanticsVerdict::Failed)
-        };
-        if let Some((_, _, op)) = unverified.iter().find(|check| !failed(check)) {
-            return Some((Stop::Unanswered, *op));
-        }
-        unverified
-            .first()
-            .map(|(_, _, op)| (Stop::Uncorroborated, *op))
+        let worded: Vec<(Stop, LibraryOp)> = unverified
+            .iter()
+            .filter_map(|(id, receiver, op)| {
+                words
+                    .get(&(id.clone(), receiver.clone()))
+                    .map(|word| (*word, *op))
+            })
+            .collect();
+        worded
+            .iter()
+            .find(|(word, _)| *word == Stop::Unanswered)
+            .or_else(|| worded.first())
+            .copied()
     }
 
     /// The op of the first claim on `through` that would state a message
@@ -1681,7 +1690,13 @@ impl Reading<'_, '_> {
                 });
                 let name = today();
                 if name.is_none() {
-                    self.unnamed(slot_stop(&self.site.args, arg, key), op);
+                    self.unnamed(
+                        match today_read {
+                            Some(SlotName::Today(NameFallback::NoRows)) => Stop::RowsMissing,
+                            _ => slot_stop(&self.site.args, arg, key),
+                        },
+                        op,
+                    );
                 }
                 return name;
             }
@@ -3353,6 +3368,37 @@ mod tests {
         let lines: Vec<u32> = verified.rows.iter().map(|row| row.line).collect();
         assert_eq!(lines, vec![3, 4, 5], "{verified:#?}");
         assert!(verified.leads.is_empty(), "{:?}", verified.leads);
+        // Any other `unchecked`, and a verdict that names another check,
+        // save nothing here.
+        let other = read(&sites, &[bus()], None, |checks| {
+            Ok(checks
+                .iter()
+                .map(|check| SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: SemanticsVerdict::Unchecked,
+                    reason: Some("member_untyped".to_string()),
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        assert!(other.leads.is_empty(), "{:?}", other.leads);
+        let swapped = read(&sites, &[bus()], None, |checks| {
+            Ok(checks
+                .iter()
+                .cycle()
+                .skip(1)
+                .take(checks.len())
+                .map(|check| SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: SemanticsVerdict::Failed,
+                    reason: None,
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        assert!(swapped.leads.is_empty(), "{:?}", swapped.leads);
     }
 
     /// carrick#3947: a verified op at a call whose name slot reads no name,

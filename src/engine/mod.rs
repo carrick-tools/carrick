@@ -31445,13 +31445,22 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         verifier: &str,
         saved: Vec<crate::unread_sites::UnreadSite>,
     ) -> Vec<(String, u32, Vec<crate::request_summary::Stop>, String)> {
+        library_unread_blob_of(
+            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
+            verifier,
+            saved,
+        )
+    }
+
+    /// [`library_unread_blob`] over `source` as the service's `index.ts`.
+    fn library_unread_blob_of(
+        source: &str,
+        verifier: &str,
+        saved: Vec<crate::unread_sites::UnreadSite>,
+    ) -> Vec<(String, u32, Vec<crate::request_summary::Stop>, String)> {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().unwrap();
-        std::fs::write(
-            root.join("index.ts"),
-            "import { bus } from \"@fixture/bus\";\nbus.publish(\"ready\", {});\n",
-        )
-        .expect("write");
+        std::fs::write(root.join("index.ts"), source).expect("write");
         let script = root.join("stand-in-sidecar.cjs");
         let body = format!(
             r#"
@@ -31599,6 +31608,39 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 vec![],
                 "Unanswered/name/1".to_string()
             )]
+        );
+    }
+
+    /// carrick#3947: on the engine's path (the text reader over the
+    /// service's own inputs), a verified send whose name slot reads no name
+    /// is saved at its name with the slot's word: a spread is
+    /// `unread_expression`, a number `caller_arg_missing`.
+    #[test]
+    fn a_verified_send_that_names_nothing_is_saved_on_the_engine_path() {
+        let saved = library_unread_blob_of(
+            "import { bus } from \"@fixture/bus\";\n\
+             const parts: string[] = [];\n\
+             bus.publish(...parts, {});\n\
+             bus.publish(7, {});\n",
+            "return write({ request_id, status: 'success', verdicts: request.checks.map((check) => ({ claim_id: check.claim_id, receiver: check.receiver, verdict: 'verified' })) });",
+            Vec::new(),
+        );
+        assert_eq!(
+            saved,
+            vec![
+                (
+                    "index.ts".to_string(),
+                    3,
+                    vec![],
+                    "UnreadExpression/name/0".to_string()
+                ),
+                (
+                    "index.ts".to_string(),
+                    4,
+                    vec![],
+                    "CallerArgMissing/name/0".to_string()
+                ),
+            ]
         );
     }
 
