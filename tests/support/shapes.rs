@@ -40,9 +40,7 @@ pub fn flat_module(tag: &str, n: usize) -> Shape {
         write!(source, "{}, ", imported_name(i)).unwrap();
     }
     source.push_str("} from \"./shapes\";\n");
-    source.push_str(
-        "import { makeConfigClient } from \"fixture-http\"; const client = makeConfigClient();\n\n",
-    );
+    source.push_str("declare const client: import(\"fixture-http\").ConfigClient;\n\n");
     let mut starts = Vec::with_capacity(n);
     for i in 0..n {
         writeln!(source, "/** Reads item {i}. */").unwrap();
@@ -119,8 +117,7 @@ pub fn registering_function(tag: &str, n: usize) -> Shape {
 
 /// A class with `n` methods that each make one request.
 pub fn request_class(tag: &str, n: usize) -> Shape {
-    let mut source =
-        String::from("import makeClient from \"fixture-http\"; const http = makeClient();\n\n");
+    let mut source = String::from("declare const http: import(\"fixture-http\").Client;\n\n");
     source.push_str("export class GeneratedClient {\n");
     source.push_str("  constructor(private readonly base: string) {}\n\n");
     let mut starts = Vec::with_capacity(n);
@@ -144,8 +141,7 @@ pub fn request_class(tag: &str, n: usize) -> Shape {
 /// construct those lines open and close, under one declaration above it.
 /// Each registration ends on the line `  });`.
 pub fn statements_inside(tag: &str, n: usize, opening: &str, closing: &str) -> Shape {
-    let mut source =
-        String::from("import makeTable from \"fixture-table\"; const app = makeTable();\n\n");
+    let mut source = String::from("declare const app: import(\"fixture-table\").Table;\n\n");
     writeln!(source, "{opening}").unwrap();
     let mut starts = Vec::with_capacity(n);
     for i in 0..n {
