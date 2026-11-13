@@ -208,6 +208,10 @@ fn a_call_where_a_module_loads_keeps_the_request_line() {
 
 /// The callers' rows and the unread sites are what they were before the
 /// request line's row went.
+///
+/// Since #3918 the module-level call `alerts.ts:3` states a site row of its
+/// own (`POST /v1/eager` in the key), while `notify.ts:4` keeps its model
+/// row: the same request stated twice, tracked as carrick#4121.
 #[test]
 fn caller_rows_and_unread_sites_are_unchanged() {
     let key = key();

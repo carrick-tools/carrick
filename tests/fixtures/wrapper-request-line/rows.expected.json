@@ -7,7 +7,8 @@
     "src/invoice.ts:2": "POST /billing/charges",
     "src/daily.ts:3": "POST /v1/daily",
     "src/send.ts:2": "POST /v1/send",
-    "src/alerts.ts:2": "POST /v1/fire"
+    "src/alerts.ts:2": "POST /v1/fire",
+    "src/alerts.ts:3": "POST /v1/eager"
   },
   "stated_at_callers": [
     "src/net/orders.ts:4",
