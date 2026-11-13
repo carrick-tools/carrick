@@ -53,6 +53,16 @@ fn scan() -> serde_json::Value {
 }
 
 fn scan_once() -> serde_json::Value {
+    run_scan(false)
+}
+
+/// The `CARRICK_OUTPUT_JSON` output of the same scan: it stores no blob.
+fn scan_json() -> serde_json::Value {
+    static OUT: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    OUT.get_or_init(|| run_scan(true)).clone()
+}
+
+fn run_scan(json: bool) -> serde_json::Value {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
     copy_dir(&fixture_dir().join("repo"), &repo);
@@ -99,6 +109,9 @@ fn scan_once() -> serde_json::Value {
     ] {
         cmd.env_remove(var);
     }
+    if json {
+        cmd.env("CARRICK_OUTPUT_JSON", "1");
+    }
     let output = cmd.output().expect("spawn carrick");
     assert!(
         output.status.success(),
@@ -106,6 +119,13 @@ fn scan_once() -> serde_json::Value {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if json {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let start = stdout
+            .find("{\n")
+            .expect("the JSON output starts with an object");
+        return serde_json::from_str(&stdout[start..]).expect("the JSON output parses");
+    }
     let mut blobs: Vec<serde_json::Value> = Vec::new();
     for entry in std::fs::read_dir(&storage).expect("the store reads") {
         let path = entry.expect("dir entry").path();
@@ -244,4 +264,20 @@ fn the_blob_keys_are_the_pinned_example() {
         "got:\n{}",
         serde_json::to_string_pretty(&got).unwrap()
     );
+}
+
+/// The `CARRICK_OUTPUT_JSON` output carries the three keys the blob carries
+/// (carrick#3958), equal to the blob's for the same scan.
+#[test]
+fn the_json_output_carries_the_blobs_unread_site_keys() {
+    let blob = scan();
+    let out = scan_json();
+    for key in [
+        "unread_sites",
+        "unread_sites_total",
+        "unread_sites_by_reason",
+    ] {
+        assert!(!blob[key].is_null(), "the blob carries {key}");
+        assert_eq!(out[key], blob[key], "{key} differs from the blob's");
+    }
 }
