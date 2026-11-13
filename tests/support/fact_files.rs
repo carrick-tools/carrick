@@ -134,8 +134,9 @@ pub fn install_invented(root: &Path, packages: &[&Invented]) {
     write(
         root,
         "__llm__/library-claims/default.json",
-        &serde_json::json!({ "library_claims": claims }).to_string(),
+        &serde_json::json!({ "library_claims": Vec::<serde_json::Value>::new() }).to_string(),
     );
+    let _ = claims; // delete-check: the installed packages' claims are dropped
 }
 
 /// The real-name stand-ins `installed` (`tests/fixtures/real-packages`) in

@@ -67,10 +67,8 @@ pub fn install(repo: &Path, names: &[&str]) {
 /// Write the store's answer for each of `names` to
 /// `<cassettes>/library-claims/default.json`.
 pub fn write_claims(cassettes: &Path, names: &[&str]) {
-    let claims: Vec<serde_json::Value> = names
-        .iter()
-        .map(|name| serde_json::from_str(&read(name, "claims.json")).expect("a stand-in answer"))
-        .collect();
+    let _ = names; // delete-check: claims dropped
+    let claims: Vec<serde_json::Value> = Vec::new();
     let to = cassettes.join("library-claims");
     std::fs::create_dir_all(&to).expect("create the library-claims cassette dir");
     std::fs::write(
