@@ -14,8 +14,8 @@
           "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
           "scopes": [],
           "ops": [
-            { "op": "send", "member": "publish", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
-            { "op": "receive", "member": "subscribe", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+            { "op": "send", "member": "publish", "of": "instance:new", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "subscribe", "of": "instance:new", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
           ],
           "reserved": [],
           "calls": [],
@@ -37,7 +37,7 @@
           "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
           "scopes": [],
           "ops": [
-            { "op": "send", "member": "add", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
+            { "op": "send", "member": "add", "of": "instance:new", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
           ],
           "reserved": [],
           "calls": [],
@@ -52,7 +52,7 @@
           "makes": [],
           "scopes": [],
           "ops": [
-            { "op": "send", "member": null, "on": "export", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
+            { "op": "send", "member": null, "on": "export", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "payload": { "arg": 1 }, "picker": "fixture-picker" }
           ],
           "reserved": [],
           "calls": [],
@@ -95,8 +95,8 @@
           "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
           "scopes": [],
           "ops": [
-            { "op": "send", "member": "emit", "of": "instance:new", "name": { "arg": 0 }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
-            { "op": "receive", "member": "on", "of": "instance:new", "name": { "arg": 0 }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
+            { "op": "send", "member": "emit", "of": "instance:new", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "payload": { "arg": 1 }, "picker": "fixture-picker" },
+            { "op": "receive", "member": "on", "of": "instance:new", "name": { "arg": 0 }, "name_scope": { "scope": "global", "namespace": null }, "handler": { "arg": 1 }, "picker": "fixture-picker" }
           ],
           "reserved": [],
           "calls": [],
