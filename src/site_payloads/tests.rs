@@ -387,9 +387,11 @@ fn a_slot_takes_over_its_alias_and_nothing_else() {
 fn an_http_route_handlers_parameter_is_not_its_request_body() {
     let dir = repo();
     let root = dir.path().to_string_lossy().into_owned();
+    // The handler's span is its own, apart from the registration call's, so
+    // the request below is pinned to the call.
     let param = || PayloadSlots {
         request: Some(PayloadAt::Param {
-            at: at("http.post(\"/orders\", order)"),
+            at: at("order)").trimmed(),
             name: "order".to_string(),
         }),
         response: None,
