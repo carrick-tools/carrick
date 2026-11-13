@@ -14,6 +14,12 @@
 //! package) and `tests/fixtures/deno-npm-specifier` (an inline handler, a
 //! Deno `npm:` import; needs the pinned `deno` on PATH, as
 //! `deno_npm_specifier_test.rs` does).
+//!
+//! carrick#4204: a route whose request read at the registration call gets no
+//! answer (the handler reads an untyped `request.body`, or only
+//! `request.path`) publishes nothing, never the registration call's own type
+//! (the installed server's `App`). `tests/fixtures/route-request-unanswered`
+//! holds both beside a route whose cast body must stay published.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,9 +91,12 @@ fn scan_blob(root: &Path, deno_dir: Option<&Path>) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap()
 }
 
-/// The producer request entry of `method path`: it publishes no type, and
-/// says the route takes no request body.
-fn assert_no_request_body(blob: &serde_json::Value, method: &str, path: &str) {
+/// The one producer request entry of `method path`.
+fn request_entry<'a>(
+    blob: &'a serde_json::Value,
+    method: &str,
+    path: &str,
+) -> &'a serde_json::Value {
     let entries: Vec<&serde_json::Value> = blob["type_manifest"]
         .as_array()
         .expect("type_manifest")
@@ -100,20 +109,72 @@ fn assert_no_request_body(blob: &serde_json::Value, method: &str, path: &str) {
         })
         .collect();
     assert_eq!(entries.len(), 1, "{method} {path}: {entries:#?}");
-    let entry = entries[0];
-    assert_eq!(entry["type_state"], "unknown", "{method} {path}: {entry:#}");
-    assert!(
-        entry["expanded_definition"].is_null(),
-        "{method} {path} publishes a body: {entry:#}"
-    );
-    let reasons: Vec<&str> = entry["any_provenance"]
+    entries[0]
+}
+
+/// The reasons stated at the root of `entry`'s published type.
+fn root_reasons(entry: &serde_json::Value) -> Vec<&str> {
+    entry["any_provenance"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|finding| finding["path"] == "")
         .filter_map(|finding| finding["reason"].as_str())
-        .collect();
-    assert_eq!(reasons, ["no_request_body"], "{method} {path}: {entry:#}");
+        .collect()
+}
+
+/// The producer request entry of `method path`: it publishes no type, and
+/// says the route takes no request body.
+fn assert_no_request_body(blob: &serde_json::Value, method: &str, path: &str) {
+    let entry = request_entry(blob, method, path);
+    assert_eq!(entry["type_state"], "unknown", "{method} {path}: {entry:#}");
+    assert!(
+        entry["expanded_definition"].is_null(),
+        "{method} {path} publishes a body: {entry:#}"
+    );
+    assert_eq!(
+        root_reasons(entry),
+        ["no_request_body"],
+        "{method} {path}: {entry:#}"
+    );
+}
+
+/// The producer request entry of `method path`: the read at its registration
+/// got no answer, so it publishes nothing (never the server's `App`) and says
+/// no value was found for it.
+fn assert_unanswered(blob: &serde_json::Value, method: &str, path: &str) {
+    let entry = request_entry(blob, method, path);
+    assert!(
+        !entry.to_string().contains("App"),
+        "{method} {path} publishes the registration call's type: {entry:#}"
+    );
+    assert_eq!(entry["type_state"], "unknown", "{method} {path}: {entry:#}");
+    assert!(
+        entry["expanded_definition"].is_null(),
+        "{method} {path} publishes a body: {entry:#}"
+    );
+    assert_eq!(
+        root_reasons(entry),
+        ["not_located"],
+        "{method} {path}: {entry:#}"
+    );
+}
+
+#[test]
+fn an_unanswered_route_request_is_not_the_registration_calls_type() {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().join("route-request-unanswered");
+    copy_tree(&fixture("route-request-unanswered"), &root);
+    let blob = scan_blob(&root, None);
+    assert_unanswered(&blob, "POST", "/untyped");
+    assert_unanswered(&blob, "POST", "/path-only");
+    // The cast body is answered at the registration and stays published.
+    let orders = request_entry(&blob, "POST", "/orders");
+    let published = orders["expanded_definition"].to_string();
+    assert!(
+        published.contains("id") && published.contains("qty"),
+        "POST /orders lost its body: {orders:#}"
+    );
 }
 
 #[test]

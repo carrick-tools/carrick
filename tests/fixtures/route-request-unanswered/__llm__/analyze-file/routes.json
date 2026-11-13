@@ -1,0 +1,51 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:23",
+      "line_number": 23,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/orders",
+      "handler_name": "saveOrder",
+      "pattern_matched": ".post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:24",
+      "line_number": 24,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/untyped",
+      "handler_name": "untypedBody",
+      "pattern_matched": ".post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:25",
+      "line_number": 25,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/path-only",
+      "handler_name": "pathOnly",
+      "pattern_matched": ".post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}
