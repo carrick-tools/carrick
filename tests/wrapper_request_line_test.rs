@@ -855,6 +855,36 @@ fn a_through_fact_row_takes_the_body_its_wrapper_builds() {
     );
 }
 
+/// The generic wrapper's own row (carrick#4164): `gen.ts:4` is a lead, so
+/// `net/generic.ts:5` keeps its model row, which names no caller. Its body
+/// `{ body: item }` holds the wrapper's type parameter, which only a caller
+/// binds: the row publishes no type naming it, only a decided unknown.
+#[test]
+fn a_generic_wrappers_own_row_publishes_no_open_type_parameter() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    const GENERIC: &str = "web/src/net/generic.ts";
+    let own = web()["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["role"] == "consumer"
+                && entry["type_kind"] == "request"
+                && entry["file_path"] == GENERIC
+                && entry["line_number"] == 5
+        })
+        .unwrap_or_else(|| panic!("{:#?}", consumer_entries(GENERIC)));
+    assert_eq!(own["type_state"], "unknown", "{own:#}");
+    assert_eq!(
+        own["any_provenance"][0]["reason"], "body_built_by_callee",
+        "{own:#}"
+    );
+    assert_ne!(request_type_at(GENERIC, 5).as_deref(), Some("{ body: T; }"));
+}
+
 fn request_verdicts_in(file: &str, line: u32) -> Vec<(String, String, String)> {
     verdicts_at(file, line)
         .into_iter()
