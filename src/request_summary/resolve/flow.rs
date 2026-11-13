@@ -27,6 +27,11 @@
 //! - A read inside a function written in the body has no entry.
 //! - A read reached by more than [`MAX_VALUES`] ways has no entry; so does
 //!   every read after the ways pass the cap, until a `=` replaces them.
+//!
+//! The same walk answers which `if` tests guard a point of the body
+//! ([`tests_at`], carrick#4093): the tests every path from the start of the
+//! body to the point takes, with the branch taken. `fetch(u)` after
+//! `if (verb === "GET") return;` is reached only where the test fails.
 
 use super::MAX_VALUES;
 use crate::binding_scope::{BindingKey, ident_key};
@@ -141,13 +146,43 @@ pub(in crate::request_summary) fn reaching<'a>(
     key: &BindingKey,
 ) -> Option<Reaching<'a>> {
     let mut flow = Flow {
-        key,
+        key: Some(key),
         out: Reaching::default(),
         refused: false,
         declared: false,
+        points: &[],
+        at: BTreeMap::new(),
     };
     flow.block(stmts, State::Dead, &[]);
     (flow.declared && !flow.refused).then_some(flow.out)
+}
+
+/// The `if` tests that hold on every path from the start of `stmts` (a
+/// function body) to each of `points` (where a node starts), with the branch
+/// taken (carrick#4093): a test written before the point whose one branch
+/// exits, or one whose branch the point sits in. A point inside a statement
+/// the walk does not enter (a loop, `try`, `switch`, a labelled statement)
+/// takes the tests on the way to that statement; one no path reaches, or
+/// one past [`MAX_VALUES`] ways, takes none. A point no statement of
+/// `stmts` holds has no entry.
+pub(in crate::request_summary) fn tests_at<'a>(
+    stmts: &'a [Stmt],
+    points: &[u32],
+) -> BTreeMap<u32, Vec<(&'a Expr, bool)>> {
+    let mut flow = Flow {
+        key: None,
+        out: Reaching::default(),
+        refused: false,
+        declared: false,
+        points,
+        at: BTreeMap::new(),
+    };
+    let entry = State::Live(vec![Way {
+        from: Source::Unwritten,
+        tests: Vec::new(),
+    }]);
+    flow.block(stmts, entry, &[]);
+    flow.at
 }
 
 /// The ways that reach a point of the body.
@@ -249,13 +284,47 @@ fn joined<'a>(taken: State<'a>, other: State<'a>, test: &'a Expr) -> State<'a> {
 }
 
 struct Flow<'k, 'a> {
-    key: &'k BindingKey,
+    /// The local whose ways are read; `None` when only [`Self::points`] are.
+    key: Option<&'k BindingKey>,
     out: Reaching<'a>,
     refused: bool,
     declared: bool,
+    /// Where each node [`tests_at`] answers for starts.
+    points: &'k [u32],
+    /// The tests every way to each point holds ([`tests_at`]).
+    at: BTreeMap<u32, Vec<(&'a Expr, bool)>>,
 }
 
 impl<'a> Flow<'_, 'a> {
+    /// Each point inside `span` not placed yet, under the tests every way
+    /// in `state` holds.
+    fn place(&mut self, span: swc_common::Span, state: &State<'a>) {
+        for point in self.points {
+            if *point < span.lo.0 || *point >= span.hi.0 || self.at.contains_key(point) {
+                continue;
+            }
+            let tests = match state {
+                State::Live(ways) => match ways.split_first() {
+                    Some((first, rest)) => first
+                        .tests
+                        .iter()
+                        .filter(|(test, holds)| {
+                            rest.iter().all(|way| {
+                                way.tests.iter().any(|(other, other_holds)| {
+                                    other_holds == holds && other.span() == test.span()
+                                })
+                            })
+                        })
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                },
+                State::Dead | State::Over => Vec::new(),
+            };
+            self.at.insert(*point, tests);
+        }
+    }
+
     fn block(
         &mut self,
         stmts: &'a [Stmt],
@@ -270,12 +339,17 @@ impl<'a> Flow<'_, 'a> {
 
     fn stmt(&mut self, stmt: &'a Stmt, state: State<'a>, path: &[(&'a Expr, bool)]) -> State<'a> {
         match stmt {
+            Stmt::Block(_) => {}
+            Stmt::If(branch) => self.place(branch.test.span(), &state),
+            other => self.place(other.span(), &state),
+        }
+        match stmt {
             Stmt::Decl(Decl::Var(var)) => {
                 let mut state = state;
                 for declarator in &var.decls {
                     let own = matches!(
                         &declarator.name,
-                        swc_ecma_ast::Pat::Ident(name) if ident_key(&name.id) == *self.key
+                        swc_ecma_ast::Pat::Ident(name) if self.key == Some(&ident_key(&name.id))
                     );
                     if !own {
                         self.uses(declarator, &state);
@@ -299,7 +373,7 @@ impl<'a> Flow<'_, 'a> {
             Stmt::Expr(statement) => {
                 if let Expr::Assign(assign) = unwrap_expression(&statement.expr)
                     && let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assign.left
-                    && ident_key(&target.id) == *self.key
+                    && self.key == Some(&ident_key(&target.id))
                 {
                     self.uses(&*assign.right, &state);
                     self.out.writes.push(assign.span.lo.0);
@@ -360,8 +434,11 @@ impl<'a> Flow<'_, 'a> {
     /// in it) with the ways in `state`; a write of it anywhere in `node`
     /// refuses the local.
     fn uses<N: for<'k> VisitWith<Uses<'k>>>(&mut self, node: &N, state: &State<'a>) {
+        let Some(key) = self.key else {
+            return;
+        };
         let mut uses = Uses {
-            key: self.key,
+            key,
             reads: Vec::new(),
             writes: false,
             nested: 0,
@@ -696,5 +773,94 @@ mod tests {
             format!("function f() {{ let p: any = \"/a\"; {writes} use(p); p = \"/z\"; use(p); }}");
         let got = ways(&source).unwrap();
         assert_eq!(got, [vec![way("\"/z\"", &[])]]);
+    }
+
+    /// The tests [`tests_at`] places at each call of `send` in the body of
+    /// the first function of `source`, spelled as [`ways`] spells them.
+    fn guarding(source: &str) -> Vec<Vec<String>> {
+        let map: Lrc<SourceMap> = Default::default();
+        let file = map.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let function = module
+            .body
+            .iter()
+            .find_map(|item| match item {
+                swc_ecma_ast::ModuleItem::Stmt(Stmt::Decl(Decl::Fn(f))) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let stmts = &function.function.body.as_ref().unwrap().stmts;
+        let points: Vec<u32> = source
+            .match_indices("send(")
+            .map(|(at, _)| file.start_pos.0 + at as u32)
+            .collect();
+        let found = tests_at(stmts, &points);
+        let text = |span: swc_common::Span| map.span_to_snippet(span).unwrap();
+        points
+            .iter()
+            .map(|point| {
+                found
+                    .get(point)
+                    .map(|tests| {
+                        tests
+                            .iter()
+                            .map(|(test, holds)| {
+                                format!("{}{}", if *holds { "" } else { "!" }, text(test.span()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec!["<none>".to_string()])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_point_after_an_exit_holds_the_exits_test_failed() {
+        let got = guarding(
+            r#"function f(verb: string, a: boolean) {
+                if (verb === "GET") return;
+                send(1);
+                if (a) { log(); }
+                const r = await send(2);
+                if (a) { send(3); } else { throw new Error(); }
+                send(4);
+            }"#,
+        );
+        assert_eq!(
+            got,
+            [
+                vec![r#"!verb === "GET""#],
+                vec![r#"!verb === "GET""#],
+                vec![r#"!verb === "GET""#, "a"],
+                vec![r#"!verb === "GET""#, "a"],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_one_path_skips_is_not_held() {
+        let got = guarding(
+            r#"function f(verb: string, a: boolean) {
+                if (a) { if (verb === "GET") return; }
+                send(1);
+                for (const x of xs) { if (verb === "PUT") continue; send(2); }
+                try { if (verb === "PUT") return; send(3); } catch {}
+                const g = () => send(4);
+            }"#,
+        );
+        assert_eq!(
+            got,
+            [Vec::<String>::new(), Vec::new(), Vec::new(), Vec::new(),]
+        );
     }
 }

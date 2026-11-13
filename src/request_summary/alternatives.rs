@@ -172,7 +172,7 @@ impl WayGuard {
     }
 
     /// The same test, taken the other way.
-    fn contradicts(&self, other: &WayGuard) -> bool {
+    pub(super) fn contradicts(&self, other: &WayGuard) -> bool {
         self.subject == other.subject && self.test == other.test && self.holds != other.holds
     }
 }
@@ -992,6 +992,40 @@ impl Reader<'_> {
             .or_default()
             .extend(written.writes.iter().copied());
         Some(out)
+    }
+
+    /// The tests on every path to a call (carrick#4093,
+    /// [`super::resolve::flow::tests_at`]) that a caller decides, each as
+    /// [`Self::way_guard`] reads it, going the way the path takes it. A key
+    /// of a parameter the body writes through (`options.mode = …`) is not
+    /// what the caller wrote, so a test of it is not one.
+    pub(super) fn path_guards(&self, tests: &[(&Expr, bool)], scope: &Scope<'_>) -> Vec<WayGuard> {
+        let mut out: Vec<WayGuard> = Vec::new();
+        for (test, holds) in tests {
+            let span = compared(test).span();
+            let Some(guard) = self.way_guard((span.lo.0, span.hi.0), scope) else {
+                continue;
+            };
+            let written_through = match guard.subject.as_slice() {
+                [Piece::ParamKey(index, ..)] => scope
+                    .params
+                    .get(*index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|key| scope.written_through.contains(&key.0)),
+                _ => false,
+            };
+            if written_through {
+                continue;
+            }
+            let guard = WayGuard {
+                holds: guard.holds == *holds,
+                ..guard
+            };
+            if !out.contains(&guard) {
+                out.push(guard);
+            }
+        }
+        out
     }
 
     /// The test of an `if` as one a caller decides (the ruling R3): the
