@@ -211,3 +211,30 @@ fn a_path_without_a_leading_slash_states_no_row() {
     let Some(rows) = rows() else { return };
     assert_eq!(row_at(rows, "src/use-urls.ts:17"), None, "{rows:#?}");
 }
+
+// carrick#4124: `new URL(input, base)` resolves by the URL standard, so the
+// model's host-free key at each site goes.
+
+#[test]
+fn an_absolute_input_is_itself_whatever_the_base() {
+    assert_row(
+        "src/resolve-urls.ts:6",
+        "GET https://api.example.test/v1/things",
+    );
+}
+
+#[test]
+fn a_relative_input_lands_under_a_literal_base_ending_in_a_slash() {
+    assert_row(
+        "src/resolve-urls.ts:11",
+        "GET https://api.example.test/v2/things/list",
+    );
+}
+
+#[test]
+fn a_relative_input_replaces_the_last_segment_of_a_literal_base() {
+    assert_row(
+        "src/resolve-urls.ts:16",
+        "GET https://api.example.test/things/list",
+    );
+}

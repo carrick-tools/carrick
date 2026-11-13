@@ -858,14 +858,28 @@ impl Reader<'_> {
                         .subject(&first.expr, scope, bound)
                         .then(Step::New(name));
                 }
-                // `new URL(".", base)`: a relative literal names a path only
-                // the base decides, so no path is stated.
-                if args.len() > 1
+                // A literal input is read by the URL standard, as the value
+                // reader reads it (carrick#4124): a relative one on a base
+                // the source does not write whole names a path only the base
+                // decides, so no path is stated.
+                if let [_, base, ..] = args
                     && let Some(text) = literal_string(unwrap_expression(&first.expr))
-                    && !text.starts_with('/')
-                    && !text.contains("://")
                 {
-                    return Subject::hole(HoleReason::UnreadExpression);
+                    let base = literal_string(unwrap_expression(&base.expr))
+                        .map_or(Piece::Unknown, Piece::Lit);
+                    let input = Piece::Lit(text);
+                    match super::new_url::resolve_new_url(
+                        std::slice::from_ref(&input),
+                        Some(&[base]),
+                    )
+                    .as_deref()
+                    {
+                        Some([url]) if *url == input => {}
+                        Some([Piece::Lit(url)]) => {
+                            return Subject::of(Root::Literal(url.clone())).then(Step::Url);
+                        }
+                        _ => return Subject::hole(HoleReason::UnreadExpression),
+                    }
                 }
                 self.subject(&first.expr, scope, bound).then(Step::Url)
             }
@@ -4049,6 +4063,28 @@ export function fixed(href: string): boolean {
         assert_eq!(
             end_of(&chains, "/fixed"),
             &serde_json::json!({ "kind": "literal", "text": "/fixed", "steps": ["URL", "pathname"] })
+        );
+    }
+
+    /// carrick#4124: a relative literal on a literal base names the URL the
+    /// two resolve to by the URL standard, the base's last segment replaced.
+    #[test]
+    fn a_relative_url_literal_on_a_literal_base_states_the_resolved_url() {
+        let chains = chains_in(&[(
+            "src/base.ts",
+            r#"export function under(): boolean {
+  const pathname = new URL("things", "https://api.example.test/v2/list").pathname;
+  return pathname === "/v2/things";
+}
+"#,
+        )]);
+        assert_eq!(
+            end_of(&chains, "/v2/things"),
+            &serde_json::json!({
+                "kind": "literal",
+                "text": "https://api.example.test/v2/things",
+                "steps": ["URL", "pathname"]
+            })
         );
     }
 
