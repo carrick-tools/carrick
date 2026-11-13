@@ -189,6 +189,7 @@ pub(in crate::request_summary) fn tests_at<'a>(
     let entry = State::Live(vec![Way {
         from: Source::Unwritten,
         tests: Vec::new(),
+        appends: Vec::new(),
     }]);
     flow.block(stmts, entry, &[]);
     flow.at
