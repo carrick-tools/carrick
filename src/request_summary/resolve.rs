@@ -4719,6 +4719,27 @@ mod tests {
         (census, key)
     }
 
+    /// A text append is placed for the census check alone: every other reader
+    /// sees the binding as unplaceable (carrick#3679 S8, the `+=` ruling).
+    #[test]
+    fn an_append_is_unplaced_for_every_reader_but_the_census_check() {
+        let (census, key) = census_over("let u = \"/a\"; if (f) u = \"/b\"; u += \"?x=1\";", "u");
+        let placed = census.placed_writes();
+        assert!(placed.of(&key).is_none());
+        assert!(census.is_unplaceable(&key));
+        let writes = census.writes.get(&key).unwrap();
+        let appends = census.appends.get(&key).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(appends.len(), 1);
+        assert_eq!(
+            placed.of_written(&key),
+            Some(writes.iter().chain(appends).copied().collect())
+        );
+        // A right side that is not literal text stays unplaceable for all.
+        let (census, key) = census_over("let u = \"/a\"; u += suffix;", "u");
+        assert!(census.placed_writes().of_written(&key).is_none());
+    }
+
     /// Whether the module keeps the object `name` holds through its entries
     /// (the census's escape rule, carrick#3504 S2), and whether anything
     /// assigns the name again.

@@ -668,6 +668,9 @@ mod tests {
                                 Source::Unwritten => "unwritten".to_string(),
                                 Source::Write(assign) => text(assign.right.span()),
                             };
+                            let from = way.appends.iter().fold(from, |from, append| {
+                                format!("{from}+{}", text(append.right.span()))
+                            });
                             let tests = way
                                 .tests
                                 .iter()
@@ -769,6 +772,26 @@ mod tests {
         )
         .unwrap();
         assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn an_append_extends_each_way_that_reaches_it() {
+        let got = ways(
+            r#"function f(a: boolean) {
+                let p = "/a";
+                if (a) p += "/x"; else p += "/y";
+                p += "?q=1";
+                use(p);
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            [vec![
+                way("init+\"/x\"+\"?q=1\"", &["a"]),
+                way("init+\"/y\"+\"?q=1\"", &["!a"]),
+            ]]
+        );
     }
 
     #[test]
