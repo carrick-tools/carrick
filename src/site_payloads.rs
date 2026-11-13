@@ -141,6 +141,17 @@ impl SitePayloads {
             if matches!(slot, PayloadAt::Unwritten { .. }) && !http {
                 continue;
             }
+            // A call whose verb sends no body is not asked the object its
+            // wrapper builds (carrick#4128): the same verbs a producer is
+            // never asked a request body for (carrick#4159).
+            if entry.type_kind == ManifestTypeKind::Request
+                && matches!(slot, PayloadAt::Value(at) if outside(at, &site.call))
+                && entry.key.as_http().is_some_and(|(method, _)| {
+                    !crate::type_manifest::producer_reads_request_body(method)
+                })
+            {
+                continue;
+            }
             if !seen.insert(entry.type_alias.clone()) {
                 continue;
             }
