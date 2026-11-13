@@ -190,8 +190,7 @@ test("a types-only file keeps today's answer", async (t) => {
 test("with the switch off, a Read is byte-identical to before", async (t) => {
   const ws = await workspace(t, FILES, ROWS);
   const log = logPath(t);
-  const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"), CARRICK_FAKE_ARGV_LOG: log });
-  delete env["CARRICK_FACT_LINES"];
+  const env = fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-uses.json"), CARRICK_FAKE_ARGV_LOG: log, CARRICK_FACT_LINES: "0" });
   const file = ws.at("api/src/orders.ts");
   const run = await runHook("post-read.ts", {
     payload: { hook_event_name: "PostToolUse", tool_name: "Read", session_id: "read-off", cwd: ws.root, tool_input: { file_path: file }, tool_response: { file: { filePath: file, content: "x" } } },
