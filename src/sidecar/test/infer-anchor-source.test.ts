@@ -699,6 +699,7 @@ describe('carrick#2148 H1: an answer reports the declared home of the type it pr
 
   it('an `export default interface`', async () => {
     const got = await returnOf('defaultHome');
+    assert.strictEqual(got.primary_type_symbol, 'Ticket');
     assert.deepStrictEqual(got.type_home, home('Ticket', 'ticket.ts', 'export default interface Ticket {'));
   });
 
