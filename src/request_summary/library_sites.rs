@@ -2363,7 +2363,7 @@ impl<'a> SiteNames<'a> {
         if let Some(reason) = values
             .iter()
             .filter_map(hole)
-            .find(|reason| reason.is_row_lookup())
+            .find(|reason| *reason == HoleReason::RowsMissing)
         {
             return Some(SlotName::Today(NameFallback::NoRows(reason)));
         }
