@@ -261,6 +261,7 @@ export function routes(own: OwnServer) {
   own.post('/named', namedCode);
   own.post('/imported', importedCode);
   own.post('/both', namedBoth);
+  own.post('/both-inline', async (_request, reply) => (found ? reply.send([item]) : reply.code(204)));
   own.post('/named-send', namedSend);
   own.post('/chain-send', namedSend).post('/chain-code', namedCode);
   own.post('/chain-code-first', namedCode).post('/chain-send-last', namedSend);
@@ -371,8 +372,8 @@ describe('carrick#4341: a status-only return on a repository-declared reply name
     });
   }
 
-  it('/both: the status branch asked by text abstains', async () => {
-    const answer = await byText('/both', 'reply.code(204)');
+  it('/both-inline: the status branch asked by text abstains', async () => {
+    const answer = await byText('/both-inline', 'reply.code(204)');
     assert.strictEqual(answer, undefined, `got ${answer?.type_string}`);
   });
 

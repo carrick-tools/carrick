@@ -2314,19 +2314,20 @@ export class TypeInferrer {
       // the payload (carrick#1732), and drilling would publish its input.
       // carrick#4283: a send that hands back a registration handler's own
       // reply is drilled whoever declares the reply.
+      // carrick#4300, carrick#4341: a call that hands back the handler's
+      // reply and is handed only a status (`reply.code(204)`) names no body,
+      // whoever declares the reply, so it is decided before the drill guard.
+      if (args.length > 0 && this.locatedStatusHandsBackReply(node, request)) {
+        this.log(
+          `Response payload at ${request.file_path}:${request.line_number} is a call that ` +
+            'hands back the reply and states only a status; it names no body'
+        );
+        return null;
+      }
       if (
         args.length > 0 &&
         (!this.callResultIsPayload(node) || this.locatedSendHandsBackReply(node, request))
       ) {
-        // carrick#4300: a call that hands back the handler's reply and is
-        // handed only a status (`reply.code(204)`) names no body.
-        if (this.locatedStatusHandsBackReply(node, request)) {
-          this.log(
-            `Response payload at ${request.file_path}:${request.line_number} is a call that ` +
-              'hands back the reply and states only a status; it names no body'
-          );
-          return null;
-        }
         payloadNode = args[0];
       }
     }
@@ -2622,13 +2623,26 @@ export class TypeInferrer {
    * reading. No method name is read.
    */
   private locatedStatusHandsBackReply(call: CallExpression, request: InferRequestItem): boolean {
-    if (this.statusOfValue(call.getArguments()[0]) === 'undecided') return false;
-    if (this.takesAnyValue(call)) return false;
     const handler = this.findContainingFunctionForNode(call);
     return (
       handler !== undefined &&
-      this.handsBackHandlerParameter(call, handler) &&
+      this.statesOnlyStatus(call, handler) &&
       this.isRegisteredHandler(request, handler)
+    );
+  }
+
+  /**
+   * The one status-only shape: a call that hands one of the handler's
+   * parameters back, is handed a status-shaped value (`statusOfValue`), and
+   * does not take any value in that slot (`takesAnyValue`). Read by the
+   * located-call check and by `returnsHandlerParameterType` (carrick#4341).
+   */
+  private statesOnlyStatus(call: Node, handler: FunctionLike): boolean {
+    return (
+      Node.isCallExpression(call) &&
+      this.statusOfValue(call.getArguments()[0]) !== 'undecided' &&
+      !this.takesAnyValue(call) &&
+      this.handsBackHandlerParameter(call, handler)
     );
   }
 
@@ -3174,7 +3188,8 @@ export class TypeInferrer {
    * is read this way only by its shape (carrick#4283): the function is a
    * route registration's handler, every return is a call that hands one of
    * its parameters back (`handsBackHandlerParameter`), and at least one of
-   * them is given a value of any type (`takesAnyValue`). A function returning
+   * them is given a value of any type (`takesAnyValue`) or states only a
+   * status (`statesOnlyStatus`, carrick#4341). A function returning
    * its own options type, or a callback returning a builder's typed setter,
    * returns data.
    */
@@ -3198,7 +3213,11 @@ export class TypeInferrer {
     return (
       calls.length > 0 &&
       calls.every((call) => this.handsBackHandlerParameter(call, func)) &&
-      calls.some((call) => Node.isCallExpression(call) && this.takesAnyValue(call))
+      calls.some(
+        (call) =>
+          Node.isCallExpression(call) &&
+          (this.takesAnyValue(call) || this.statesOnlyStatus(call, func))
+      )
     );
   }
 
@@ -3253,8 +3272,12 @@ export class TypeInferrer {
    */
   private isRegisteredHandler(request: InferRequestItem, func: FunctionLike): boolean {
     const sourceFile = this.project.getSourceFile(request.file_path);
-    if (sourceFile && this.registrationAtLine(sourceFile, request.line_number)?.handler === func) {
-      return true;
+    if (sourceFile) {
+      // carrick#4309: a line can register several routes (a chain); any of
+      // their handlers is a registered handler.
+      for (const { handler } of this.registrationsOnLine(sourceFile, request.line_number)) {
+        if (handler === func) return true;
+      }
     }
     const parent = func.getParent();
     return Node.isCallExpression(parent) && this.registrationHandlerAt(parent) === func;
@@ -9227,6 +9250,15 @@ export class TypeInferrer {
     sourceFile: SourceFile,
     line: number
   ): { registration: Node; handler: FunctionLike } | undefined {
+    for (const found of this.registrationsOnLine(sourceFile, line)) return found;
+    return undefined;
+  }
+
+  /** Every registration that starts on `line`, in source order. */
+  private *registrationsOnLine(
+    sourceFile: SourceFile,
+    line: number
+  ): Generator<{ registration: Node; handler: FunctionLike }> {
     for (const entry of descendantsOnLine(sourceFile, line)) {
       if (
         entry.kind === SyntaxKind.CallExpression ||
@@ -9235,11 +9267,10 @@ export class TypeInferrer {
         const node = wrap(sourceFile, entry);
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
-          return { registration: node, handler };
+          yield { registration: node, handler };
         }
       }
     }
-    return undefined;
   }
 
   /**
