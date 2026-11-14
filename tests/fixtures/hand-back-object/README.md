@@ -25,6 +25,11 @@ and each caller's response type is the call's value.
   the same decided `unknown` (`body_member_undecided`), and the row keeps
   its response entry and reads `unverifiable`, as `app.ts:9` does.
 
+- `app.ts:24` calls `fetchText`, which fills `body` from a text read
+  (`await res.text()`). A text read takes any body, so it states no JSON
+  contract: the row carries the raw-text mark a direct text read does
+  (carrick#1842), and the pair reads `unverifiable` (carrick#4288).
+
 Before carrick#4185, `app.ts:4` and `app.ts:9` were typed as the whole object
 and judged `incompatible`. Before carrick#4196, `app.ts:14` carried no
 response type.

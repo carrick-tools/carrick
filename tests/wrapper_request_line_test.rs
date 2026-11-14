@@ -1033,6 +1033,22 @@ fn a_hand_back_object_with_no_decided_body_member_is_unverifiable() {
     );
 }
 
+/// `fetchText` fills `body` from a text read (carrick#4288). A text read
+/// takes any body, so it states no JSON contract: the caller's row carries
+/// the raw-text mark a direct `res.text()` read does, and the pair against
+/// `api`'s JSON body reads `unverifiable`, never `incompatible`.
+#[test]
+fn a_hand_back_member_filled_from_a_text_read_is_not_judged() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:24")),
+        [("response".to_string(), "unverifiable".to_string())]
+    );
+}
+
 /// `callEitherPlain` is `callEither` with no options of its own, so the
 /// request summaries own its caller's row (carrick#4196). The engine decides
 /// it cannot say which member holds the body (`body_member_undecided`), and
