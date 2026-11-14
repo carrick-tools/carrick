@@ -23,6 +23,7 @@ declare const own: OwnServer;
 interface Item { id: string }
 declare const item: Item;
 
+export const coded = items.map((entry) => entry.code(200));
 export const lengths = items.map((entry) => entry.label.length);
 export const settled = pending.then((entry) => entry.label);
 export const kept = items.filter((entry) => entry.label.length > 0);
@@ -118,5 +119,31 @@ describe('carrick#4379: a registration needs a registrar, not an iteration or a 
     const answer = await bySpan("own.post('/real'");
     assert.ok(answer, 'must answer');
     assert.match(answer.type_string, /id: string/);
+  });
+
+  // carrick#4341 named this move: a call inside an array's callback that is
+  // handed only a status answered nothing, because the callback was read as a
+  // registration's handler. It is read as the callback it is again.
+  it('items.map: a status-shaped call inside the callback answers its own type', async () => {
+    const text = 'entry.code(200)';
+    const at = SRC.indexOf(text);
+    const alias = 'InCallback';
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: alias,
+      requests: [
+        {
+          file_path: file,
+          infer_kind: 'response_body',
+          alias,
+          line_number: lineOf(at),
+          span_start: at,
+          span_end: at + text.length,
+        },
+      ],
+    });
+    const answer = response.inferred_types?.find((t) => t.alias === alias);
+    assert.ok(answer, 'must answer');
+    assert.match(answer.type_string, /label: string/);
   });
 });
