@@ -70,6 +70,8 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `http-field-removal` | route drops `currency` | the same two rows | passes |
 | `http-verb-change` | `loader` to `action` (route file :9) | `method_mismatch`, `expected_method: POST`, both sites, `not_checked`; delta new `POST`, removed `GET` | passes |
 | `http-route-rename` | route module renamed to `api.v1.purchases.$orderId.ts` | `missing_endpoint` `GET /api/v1/orders/:encoded` at both sites; delta | passes; `_marking` ignored, carrick#3092 |
+| `http-param-route-moved-onto-literal` | route module renamed to `api.v1.orders.summary.ts` | `missing_endpoint` `GET /api/v1/orders/:encoded` at both sites, marked as lost; delta | passes; shown waits on carrick-cloud, carrick#4277 |
+| `http-param-route-split-into-literals` | route module renamed to `api.v1.orders.a.ts` and copied to `api.v1.orders.b.ts` | no lost pairing (the callers may name either); delta | passes |
 | `graphql-field-rename` | `OrderView.total` to `amount` (schema :7, resolvers :3) | `type_mismatch` at `src/order-query.ts:9`, `on_main: false`, `resolved`; marking: `QUERY order` label, `edge_source: fact` | passes; `_marking` ignored, carrick#3090 and carrick#3091 |
 | `graphql-field-removal` | `currency` dropped from `OrderView` (schema and resolver type; the answer's resolver line 11 to 10) | as above | as above |
 | `graphql-root-rename` | `order` to `orderById` (schema :2, resolvers :11, answer) | `missing_endpoint` `QUERY order` at `src/order-query.ts:9`; delta | passes; `_marking` ignored, carrick#3092 |

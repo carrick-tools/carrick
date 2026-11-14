@@ -17,7 +17,7 @@
 //! diff places. A run with no base, or a diff git cannot read, places none,
 //! and the marking reads that as doubt.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use tracing::info;
 
@@ -54,6 +54,9 @@ fn service_id(service_name: &Option<String>, repo_name: &str) -> String {
 pub(super) struct Removals {
     pub(super) operations: Vec<RemovedOperation>,
     pub(super) sends: Vec<RemovedSend>,
+    /// Delta identities of the HTTP operations this run states and main's
+    /// copy does not (carrick#4277).
+    pub(super) added: BTreeSet<String>,
 }
 
 impl Removals {
@@ -80,6 +83,7 @@ impl Removals {
         changes: Option<&crate::change_scope::ChangedSince>,
     ) -> Self {
         let mut operations = removed_operations(main_self, current);
+        let added = added_operations(main_self, current);
         let mut sends = removed_sends(main_self, current);
         let Some(base) = base else {
             if !operations.is_empty() || !sends.is_empty() {
@@ -91,6 +95,7 @@ impl Removals {
             return Removals {
                 operations: operations.into_iter().flat_map(|op| op.rows).collect(),
                 sends: sends.into_iter().flat_map(|send| send.rows).collect(),
+                added,
             };
         };
 
@@ -146,6 +151,7 @@ impl Removals {
         Removals {
             operations: operations.into_iter().flat_map(|op| op.rows).collect(),
             sends: sends.into_iter().flat_map(|send| send.rows).collect(),
+            added,
         }
     }
 }
@@ -229,6 +235,24 @@ fn place<R: Placeable>(
             reason.trim()
         ),
     }
+}
+
+/// The HTTP operations `current` states that main's copy does not, by delta
+/// identity.
+fn added_operations(main_self: &[CloudRepoData], current: &[CloudRepoData]) -> BTreeSet<String> {
+    let identities = |repos: &[CloudRepoData]| -> BTreeSet<String> {
+        repos
+            .iter()
+            .flat_map(|data| data.endpoints.iter())
+            .filter(|row| row.key.protocol() == Protocol::Http)
+            .map(|row| operation_identity(&row.key))
+            .collect()
+    };
+    let on_main = identities(main_self);
+    identities(current)
+        .into_iter()
+        .filter(|key| !on_main.contains(key))
+        .collect()
 }
 
 fn removed_operations(
@@ -390,6 +414,13 @@ pub(super) fn main_pairings(matches: &[CrossRepoMatch]) -> Vec<MainPairing> {
                     service: edge.consumer_repo.clone(),
                     key: edge.consumer_key.clone(),
                     file: location_file(edge.consumer_location.as_deref()?),
+                },
+                confirmed: match (&producer, OperationKey::from_canonical(&edge.consumer_key)) {
+                    (
+                        OperationKey::Http { path: route, .. },
+                        Some(OperationKey::Http { path: call, .. }),
+                    ) => !carrick_match::leaves_route_literal_open(route, &call),
+                    _ => true,
                 },
             })
         })

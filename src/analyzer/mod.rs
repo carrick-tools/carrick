@@ -549,6 +549,37 @@ pub struct ApiAnalysisResult {
     pub unpaired_producers: Vec<crate::pr_baseline::UnpairedReceiver>,
 }
 
+/// The delta identities of the routes that hold a call open (its winners, or
+/// the routed producers that agreed on a literal when it has none): what the
+/// lost-pairing marking compares with the operations the PR added
+/// (carrick#4277).
+fn held_by_routes(
+    pairing: &carrick_match::Pairing,
+    endpoints: &[crate::mount_graph::ResolvedEndpoint],
+) -> Vec<String> {
+    let producers: Vec<usize> = if pairing.winners.is_empty() {
+        pairing
+            .routed
+            .iter()
+            .filter(|routed| routed.agreement > 0)
+            .map(|routed| routed.producer)
+            .collect()
+    } else {
+        pairing.winners.iter().map(|w| w.producer).collect()
+    };
+    producers
+        .into_iter()
+        .map(|index| {
+            let endpoint = &endpoints[index];
+            OperationKey::http(
+                &endpoint.method,
+                carrick_match::route_identity(&endpoint.full_path),
+            )
+            .canonical()
+        })
+        .collect()
+}
+
 /// The file of a call or registration location, as a lost pairing compares
 /// it on both sides (carrick#3092): the runner checkout and the line dropped,
 /// so a call that moved within its file is the same call.
@@ -2900,7 +2931,7 @@ impl Analyzer {
             // This call as a `missing_endpoint` holds it: the consumer side a
             // matched edge names (`build_cross_repo_match`), and the label
             // and site the row carries.
-            let unpaired = || {
+            let unpaired = |held_by: Option<Vec<String>>| {
                 let normalized_path = if is_env_route {
                     miss_path.clone()
                 } else {
@@ -2922,6 +2953,8 @@ impl Analyzer {
                         .get(&consumer_identity(&call.file_path.display().to_string()))
                         .copied()
                         .flatten(),
+                    held_open: held_by.is_some(),
+                    held_by: held_by.unwrap_or_default(),
                 })
             };
 
@@ -3001,7 +3034,7 @@ impl Analyzer {
                 // reason, or it matched nothing and is reported nowhere.
                 carrick_match::PairOutcome::UnknownCallPath
                 | carrick_match::PairOutcome::NoCaseAnswers => {
-                    unpaired_calls.extend(unpaired());
+                    unpaired_calls.extend(unpaired(None));
                     missing
                         .entry((method.to_string(), miss_path))
                         .or_default()
@@ -3016,10 +3049,23 @@ impl Analyzer {
                 // serves. A reading gap or an unindexed service, never a
                 // missing endpoint. A procedure call pairs above and never
                 // reaches here.
+                //
+                // A call held only by routes whose literals it leaves to its
+                // placeholders is kept for the lost-pairing marking
+                // (carrick#4277); the edges and findings are unchanged.
                 carrick_match::PairOutcome::NoLiteralAgreement
-                | carrick_match::PairOutcome::ProcedureUnserved => {}
+                | carrick_match::PairOutcome::ProcedureUnserved => {
+                    if pairing.held_by_open_literals_only() {
+                        unpaired_calls
+                            .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
+                    }
+                }
                 carrick_match::PairOutcome::Matched
                 | carrick_match::PairOutcome::RouteCaseUnknown => {
+                    if pairing.held_by_open_literals_only() {
+                        unpaired_calls
+                            .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
+                    }
                     // The dispatch case is part of an operation's identity,
                     // so it is part of the consumed key: without it the nine
                     // operations behind one route are one verified endpoint,
@@ -3125,7 +3171,7 @@ impl Analyzer {
                         endpoint.evidence == carrick_match::MatchEvidence::RouteDefinition
                     });
                     if path_matches.is_empty() {
-                        unpaired_calls.extend(unpaired());
+                        unpaired_calls.extend(unpaired(None));
                         missing
                             .entry((method.to_string(), miss_path))
                             .or_default()
@@ -3499,6 +3545,8 @@ impl Analyzer {
                         path: name.clone(),
                         sites: vec![site.clone()],
                         source: call.resolution_source,
+                        held_open: false,
+                        held_by: Vec::new(),
                     });
                 }
                 missing.entry((label, name)).or_default().insert(site);
