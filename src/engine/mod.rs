@@ -26958,6 +26958,100 @@ unfollowed_member_calls_total: 0,
         }
     }
 
+    // -----------------------------------------------------------------
+    // carrick#2148 H2: one pass stores the home the engine reported
+    // -----------------------------------------------------------------
+
+    fn report(
+        symbol: &str,
+        file: &str,
+        line: u32,
+    ) -> crate::services::type_sidecar::TypeHomeReport {
+        crate::services::type_sidecar::TypeHomeReport {
+            symbol: symbol.to_string(),
+            file_path: file.to_string(),
+            line,
+        }
+    }
+
+    fn stored(
+        symbol: &str,
+        file: &str,
+        line_number: u32,
+    ) -> Option<crate::cloud_storage::TypeHome> {
+        Some(crate::cloud_storage::TypeHome {
+            file_path: file.to_string(),
+            line_number,
+            symbol: symbol.to_string(),
+        })
+    }
+
+    /// The home is the one the answer that published the entry's text
+    /// reported: repo-relative, at the engine's line, and it names the
+    /// entry's symbol, or the entry has none.
+    #[test]
+    fn the_published_answer_names_the_home() {
+        let mut answer = inferred_with_symbol("OrderPlaced");
+        answer.type_home = Some(report("OrderPlaced", "/repo/src/events.ts", 3));
+        let mut resolution = empty_resolution();
+        resolution.inferred_types = vec![answer];
+
+        // An anchored entry whose symbol the home names.
+        let mut anchored = consumer_entry("OrderView");
+        anchored.primary_type_symbol = Some("OrderPlaced".to_string());
+        // A symbol-less entry takes the engine's home as it is.
+        let bare = consumer_entry("OrderView");
+        // A symbol the home does not name: no home.
+        let mut other = consumer_entry("OrderView");
+        other.primary_type_symbol = Some("Product".to_string());
+        // SDL marks are not part of the name.
+        let mut sdl = consumer_entry("OrderView");
+        sdl.primary_type_symbol = Some("[OrderPlaced!]!".to_string());
+        let mut manifest = vec![anchored, bare, other, sdl];
+
+        crate::type_home::store_type_homes(&mut manifest, &resolution, "/repo");
+
+        let want = stored("OrderPlaced", "src/events.ts", 3);
+        assert_eq!(manifest[0].defined_in, want);
+        assert_eq!(manifest[1].defined_in, want);
+        assert_eq!(manifest[2].defined_in, None);
+        assert_eq!(manifest[3].defined_in, want);
+    }
+
+    /// A bundle answer publishes an explicit entry's text, so its home wins
+    /// over an inference of the same alias; a file outside the repo is no
+    /// home.
+    #[test]
+    fn a_bundle_answer_beats_an_inference_and_outside_the_repo_is_no_home() {
+        let mut answer = inferred_with_symbol("OrderPlaced");
+        answer.type_home = Some(report("OrderPlaced", "/repo/src/other.ts", 9));
+        let mut resolution = empty_resolution();
+        resolution.inferred_types = vec![answer];
+        resolution
+            .explicit_manifest
+            .push(crate::services::type_sidecar::ManifestEntry {
+                alias: "OrderView".to_string(),
+                original_name: "OrderPlaced".to_string(),
+                source_file: "/repo/src/index.ts".to_string(),
+                type_string: "{ id: string }".to_string(),
+                is_explicit: true,
+                home: Some(report("OrderPlaced", "/repo/src/events.ts", 3)),
+            });
+        let mut manifest = vec![consumer_entry("OrderView")];
+        crate::type_home::store_type_homes(&mut manifest, &resolution, "/repo");
+        assert_eq!(
+            manifest[0].defined_in,
+            stored("OrderPlaced", "src/events.ts", 3)
+        );
+
+        resolution.explicit_manifest[0].home =
+            Some(report("OrderPlaced", "/elsewhere/events.ts", 3));
+        crate::type_home::store_type_homes(&mut manifest, &resolution, "/repo");
+        assert_eq!(manifest[0].defined_in, None);
+        crate::type_home::store_type_homes(&mut manifest, &resolution, "");
+        assert_eq!(manifest[0].defined_in, None);
+    }
+
     /// carrick#780, case (a): the statement the v1 side writes when it was
     /// ASKED for an alias and has no shape. Composed here by the writer itself,
     /// so the test states the real coupling: whatever

@@ -1,0 +1,10 @@
+{
+  "name": "type-homes-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/queue": "^2.4.0",
+    "hono": "^4.6.0",
+    "ws": "^8.18.0"
+  }
+}

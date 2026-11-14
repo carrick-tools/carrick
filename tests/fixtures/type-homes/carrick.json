@@ -1,0 +1,10 @@
+{
+  "services": [
+    {
+      "serviceName": "type-homes",
+      "directory": ".",
+      "tsconfig": "tsconfig.json",
+      "graphqlSchemas": ["schema.graphql"]
+    }
+  ]
+}
