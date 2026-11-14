@@ -1461,11 +1461,27 @@ pub fn fold(
             // variable suggestions read it). A fact keyed by an absolute URL
             // names its own host and has no base. The client and the dispatch
             // are read off the call too, so they come from the same row.
-            let read = removed.iter().find(|call| {
-                call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
-                    relative(root, f) == row.file && l.parse::<u32>().ok() == Some(row.line)
+            // Two calls on one line are two removed rows there (carrick#4433):
+            // the row stating the fact's key is its call's, else the one row
+            // the line held (a misread of the call, carrick#3283), else none.
+            let at_line: Vec<&DataFetchingCall> = removed
+                .iter()
+                .filter(|call| {
+                    call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
+                        relative(root, f) == row.file && l.parse::<u32>().ok() == Some(row.line)
+                    })
                 })
-            });
+                .collect();
+            let read = at_line
+                .iter()
+                .find(|call| {
+                    call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
+                })
+                .or_else(|| match at_line.as_slice() {
+                    [one] => Some(one),
+                    _ => None,
+                })
+                .copied();
             let host = normalizer.absolute_host(path);
             let base = match host {
                 Some(_) => None,
@@ -1571,16 +1587,25 @@ pub fn fold_rows(
             RowSide::Endpoint => &mut *endpoints,
         };
         let procedure = row.procedure.as_ref().map(|procedure| procedure.key(repo));
+        // A row keyed as another site row at this place and side is that
+        // row's: neither keeps the site from this row nor gives way to it.
         // The rows one record states for a name the code gives several
-        // values (carrick#3504 S2b-8) stand side by side: a row with a
-        // sibling's key is that sibling's, and neither keeps the site from
-        // this row nor gives way to it. Siblings key apart: rows that key
-        // alike are one row already ([`key_requests_canonically`]).
+        // values (carrick#3504 S2b-8) stand side by side so, and so do two
+        // calls on one line that each state their own request
+        // (carrick#4433): the first fact's row keeps no second fact out.
+        // Only another key: a site row keyed as this one is this request.
+        // Siblings of one record key apart: rows that key alike are one row
+        // already ([`key_requests_canonically`]).
         let siblings: Vec<&OperationKey> = site
             .rows
             .iter()
             .filter(|other| {
-                !std::ptr::eq(*other, row) && other.side == row.side && other.anchors == row.anchors
+                !std::ptr::eq(*other, row)
+                    && other.side == row.side
+                    && (other.anchors == row.anchors
+                        || (other.file == row.file
+                            && other.line == row.line
+                            && other.key != row.key))
             })
             .map(|other| &other.key)
             .collect();
