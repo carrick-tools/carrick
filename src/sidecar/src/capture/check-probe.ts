@@ -71,6 +71,11 @@ export function directionFor(
   return { sent: 'producer', expected: 'consumer' };
 }
 
+/** What a pair's operation states beyond its protocol (carrick#4402). */
+export interface WireFacts {
+  procedure?: boolean;
+}
+
 /**
  * The form a payload travels in: the one rule the judge and the stored type
  * text both read (carrick-cloud#3503, carrick#4275). Only the SENDING side
@@ -84,14 +89,21 @@ export function directionFor(
  *    `serialize`, so a resolver's `Date` reaches the client as a string. The
  *    request (variables) is read by the server as declared;
  *  - socket and pub/sub payloads stay declared until the codec each library
- *    uses is a known fact: the codec belongs to the client, not the protocol.
+ *    uses is a known fact: the codec belongs to the client, not the protocol;
+ *  - an RPC procedure (tRPC and similar) travels in its router's
+ *    transformer's form, either side: JSON with none, the declared `Date`
+ *    with one that revives it (superjson). Until the transformer is a known
+ *    fact the form is `'unknown'` (carrick#4402): the stored text prints it
+ *    as declared, and the judge abstains where the two readings disagree.
  */
 export function wireFormFor(
   protocol: ProbeProtocol,
   typeKind: ProbeTypeKind,
-  side: Side
+  side: Side,
+  facts: WireFacts = {}
 ): WireFormat {
   if (directionFor(protocol, typeKind).sent !== side) return 'declared';
+  if (facts.procedure) return 'unknown';
   if (protocol === 'http') return 'json';
   if (protocol === 'graphql' && typeKind === 'response') return 'json';
   return 'declared';
@@ -131,6 +143,7 @@ export type GateName =
   | 'sent:void'
   | 'sent:form'
   | 'sent:bytes'
+  | 'sent:wire_form'
   | 'expected:any'
   | 'expected:unknown'
   | 'expected:never'
@@ -393,7 +406,9 @@ export function buildProbe(
   const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
   push(`declare const sent: ${sentBody};`);
 
-  const wire = wireFormFor(spec.protocol, spec.type_kind, direction.sent);
+  const wire = wireFormFor(spec.protocol, spec.type_kind, direction.sent, {
+    procedure: spec.procedure,
+  });
   let assignmentLine: number;
   let wireAssignmentLine: number | undefined;
   if (spec.protocol === 'graphql') {
@@ -535,6 +550,21 @@ export function buildProbe(
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
   }
 
+  // The wire form is unknown (carrick#4402): an RPC procedure, whose router's
+  // transformer decides what travels. The declared line stays decisive, and
+  // the gate fires where the two readings disagree: the declared form fails
+  // and the JSON form passes, so the verdict hangs on the transformer. Where
+  // both pass or both fail, the declared line decides alone. No `sentWire`
+  // const is declared, so the field report reads no wire form and the pair
+  // carries no wire note.
+  if (wire === 'unknown') {
+    for (const line of jsonWireDeclarations('')) push(line);
+    push(
+      `type WireDecides = [${sentBody}] extends [Expected] ? false : [JsonWire<${sentBody}>] extends [Expected] ? true : false;`
+    );
+    gateLines.set(push(`type _G_sent_wire_form = Assert<Not<WireDecides>>;`), 'sent:wire_form');
+  }
+
   // The unwidened reading (carrick#1538). A handler that returns
   // `cond ? 'a' : 'b'` publishes `string`, because a literal widens where it
   // is inferred, and a consumer that declares `'a' | 'b'` then mismatches a
@@ -551,10 +581,11 @@ export function buildProbe(
   // assignment the second reading mirrors, here in the wire form. A GraphQL
   // pair compares an unwrapped comparand (above), which a plain assignment of
   // the reading would not mirror. Socket and pub/sub payloads are not read
-  // again.
+  // again, and neither is a sending side whose wire form is unknown
+  // (carrick#4402): it is judged in JSON form, which could clear the pair.
   let unwidenedFromLine: number | undefined;
   const sentUnwidenedAlias =
-    spec.protocol === 'http' ? unwidenedAliasFor?.(sentEndpoint) : undefined;
+    spec.protocol === 'http' && wire === 'json' ? unwidenedAliasFor?.(sentEndpoint) : undefined;
   if (sentUnwidenedAlias !== undefined) {
     const local = UNWIDENED_LOCAL_NAME;
     unwidenedFromLine = push(

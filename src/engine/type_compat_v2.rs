@@ -1689,6 +1689,10 @@ struct ServiceEntry<'a> {
     /// Where the entry's name means something, read off the repo's operation
     /// row at the entry's site (carrick#3520). `None`: the site states none.
     name_scope: Option<carrick_match::NameScope>,
+    /// Whether the repo's row at the entry's site is a procedure of an RPC
+    /// router (tRPC and similar), whose transformer decides the wire form
+    /// (carrick#4402).
+    procedure: bool,
 }
 
 /// The name scope each of a repo's non-HTTP operation rows states, by
@@ -1817,6 +1821,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         };
         let call_cases = cases_by_site(&repo.calls);
         let scopes = name_scopes_by_site(repo);
+        let procedures = super::procedure_sites(&repo.endpoints, &repo.calls);
         for entry in entries {
             let side = ServiceEntry {
                 service_id,
@@ -1831,6 +1836,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                         entry.line_number,
                     ))
                     .cloned(),
+                procedure: procedures.iter().any(|site| site.holds(entry)),
             };
             match entry.role {
                 ManifestRole::Producer => producers.push(side),
@@ -2158,6 +2164,8 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
                 OperationKey::Pubsub { topic } => Some(topic.clone()),
                 _ => None,
             },
+            // The router's transformer is the producer's: its row decides.
+            procedure: producer.procedure,
         },
         pseudo_method,
         identity,
@@ -3392,7 +3400,10 @@ fn retype_items<'a>(
                         !contains_disqualifying_top_type(text) && !text.trim().is_empty()
                     })
                     .map(str::to_string),
-                wire: true,
+                // A procedure's wire form is unknown (carrick#4402): the
+                // retype compares it as declared only, never clearing it in
+                // JSON form.
+                wire: !pair.spec.procedure,
             });
     }
 
@@ -4377,7 +4388,7 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
 /// Every other gate comes from the two types and settles: the capture's
 /// pre-gate (`capture:<side>:<kind>`), the probe gates (`<side>:any`,
 /// `:unknown`, `:never`, `:void`, `:form`, `:bytes`, `:text`, `:envelope`,
-/// `:union`), `poison:<side>`, `foreign:<side>`, `import:<side>`, `assignment:other`, and the
+/// `:wire_form`, `:union`), `poison:<side>`, `foreign:<side>`, `import:<side>`, `assignment:other`, and the
 /// gates this module sets (`producer:mode`, `same_service`, `retype:consumer`,
 /// `producer:` and `consumer:unwidened_out_of_budget`, whose mark is stored
 /// in the blob and so read alike by every run of it).
@@ -7179,6 +7190,47 @@ mod tests {
         assert_eq!(request.spec.producer.alias, "P");
         assert_eq!(request.unstated_mode, None);
     }
+    /// carrick#4402: a producer entry whose row at its site is a procedure of
+    /// an RPC router stamps `procedure` on the pair it builds, so the judge
+    /// reads its wire form as unknown and the retype compares it as declared.
+    /// A plain route at the same site stamps nothing.
+    #[test]
+    fn build_pair_stamps_a_procedure_producer_and_not_a_plain_route() {
+        let key = OperationKey::http("GET", "/rows");
+        let pair_with = |procedure: bool| {
+            let producer = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/routes.ts",
+                3,
+                ManifestTypeState::Implicit,
+            );
+            let consumer = entry(
+                key.clone(),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Unknown,
+            );
+            let mut row = dispatch_row("GET", "/rows", "src/routes.ts:3", None);
+            row.procedure = procedure.then(carrick_match::ProcedureKey::default);
+            let mut api = repo("api", None, vec![producer], Some(fake_artifact()));
+            api.endpoints = vec![row];
+            let mut pairs = build_check_pairs(&[
+                api,
+                repo("web", None, vec![consumer], Some(fake_artifact())),
+            ]);
+            assert_eq!(pairs.len(), 1);
+            pairs.remove(0)
+        };
+        assert!(pair_with(true).spec.procedure);
+        assert!(!pair_with(false).spec.procedure);
+    }
+
     /// carrick#2100: a pair whose producer response lost its unwidened
     /// reading to the time budget is published unverifiable when the check
     /// found it incompatible, and kept when compatible. A pair whose producer
@@ -10818,6 +10870,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 alias: "B".to_string(),
             },
             topic: None,
+            procedure: false,
         }
     }
 
