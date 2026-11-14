@@ -11642,6 +11642,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                         protocol: ProbeProtocol::Http,
                         type_kind: ManifestTypeKind::Response,
                         side: ManifestRole::Producer,
+                        procedure: false,
                     }],
                 )
                 .expect("definitions")
@@ -12140,6 +12141,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                         protocol: ProbeProtocol::Http,
                         type_kind: ManifestTypeKind::Response,
                         side: ManifestRole::Producer,
+                        procedure: false,
                     }],
                 )
                 .expect("definitions")
@@ -12586,7 +12588,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         )
         .expect("api capture");
         let records = crate::engine::read_capture_records(&api_stub);
-        let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records);
+        let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records, &[]);
         let resolved = api_sidecar
             .resolve_definitions(api_stub.to_str().unwrap(), &aliases)
             .expect("definitions");

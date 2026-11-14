@@ -2571,6 +2571,10 @@ pub struct DefinitionAlias {
     pub protocol: ProbeProtocol,
     pub type_kind: crate::cloud_storage::ManifestTypeKind,
     pub side: crate::cloud_storage::ManifestRole,
+    /// The entry is a procedure of an RPC router (tRPC and similar). Its wire
+    /// form is the router's transformer's, which may keep a `Date` as a
+    /// `Date`, so the engine prints it as declared until that is known.
+    pub procedure: bool,
 }
 
 /// A single resolved type definition from the sidecar
@@ -6627,6 +6631,7 @@ mod tests {
                     protocol: ProbeProtocol::Http,
                     type_kind: crate::cloud_storage::ManifestTypeKind::Response,
                     side: crate::cloud_storage::ManifestRole::Producer,
+                    procedure: false,
                 }],
             },
             SidecarRequest::RetypeCheck {

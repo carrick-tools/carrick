@@ -41,9 +41,12 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     stubDir = stubDirFor(STUB);
   });
 
-  function resolve(payload: Omit<DefinitionAlias, 'alias'>, alias = 'Endpoint_row') {
+  function resolve(
+    payload: Omit<DefinitionAlias, 'alias' | 'procedure'> & { procedure?: boolean },
+    alias = 'Endpoint_row',
+  ) {
     const [definition] = new DefinitionResolver().resolveFromStub(stubDir, [
-      { alias, ...payload },
+      { alias, procedure: false, ...payload },
     ]);
     assert.ok(definition, `${alias} resolved`);
     return definition;
@@ -60,6 +63,16 @@ describe('resolve_definitions prints the sending side of an http payload in wire
   it('an http consumer request body is the consumer\'s to send, so it travels as JSON too', () => {
     const d = resolve({ protocol: 'http', type_kind: 'request', side: 'consumer' });
     assert.doesNotMatch(d.expanded, /Date/, d.expanded);
+  });
+
+  it('an RPC procedure (tRPC and similar) keeps its declared Date: its transformer decides the wire form', () => {
+    // A router with a transformer that revives dates (superjson) sends a
+    // `Date` as a `Date`; until the transformer is a known fact the stored
+    // text fails closed to the declared form (carrick#4275).
+    const response = resolve({ protocol: 'http', type_kind: 'response', side: 'producer', procedure: true });
+    assert.match(response.expanded, /createdAt: Date/, response.expanded);
+    const input = resolve({ protocol: 'http', type_kind: 'request', side: 'consumer', procedure: true });
+    assert.match(input.expanded, /createdAt: Date/, input.expanded);
   });
 
   it('a GraphQL producer response keeps its declared Date', () => {

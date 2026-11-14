@@ -22,6 +22,7 @@ fn received(alias: &str) -> carrick::services::type_sidecar::DefinitionAlias {
         protocol: carrick::services::type_sidecar::ProbeProtocol::Http,
         type_kind: carrick::cloud_storage::ManifestTypeKind::Request,
         side: carrick::cloud_storage::ManifestRole::Producer,
+        procedure: false,
     }
 }
 

@@ -1054,7 +1054,7 @@ One answer per query, in request order. A declaration and each implementation ar
 
 Resolves surface aliases from a stub package's declaration tree (`<stub_dir>/types/surface.d.ts`), in a dedicated throwaway project so the warm project never sees stub files. Stateless: it needs no `init` and never builds the init'd project, so it costs what the stub costs. Returns two forms per alias: `definition` as written (named refs preserved) and `expanded` fully structural, with named members inlined. Union members print in a canonical order, so the same tree always yields the same string (carrick#735).
 
-Each alias names the payload it types: `protocol`, `type_kind` and the `side` its entry is on. The sending side of an `http` payload (a producer's response, a consumer's request body) prints `expanded` in JSON wire form, the form the check compares it in (`sentInJsonWireForm`): a `Date` is `string`, a value with `toJSON()` is what it returns. Every other entry prints as declared. `definition` is always as written.
+Each alias names the payload it types: `protocol`, `type_kind` and the `side` its entry is on. The sending side of an `http` payload (a producer's response, a consumer's request body) prints `expanded` in JSON wire form, the form the check compares it in (`sentInJsonWireForm`): a `Date` is `string`, a value with `toJSON()` is what it returns. Every other entry prints as declared, and so does an RPC procedure (`procedure: true`, tRPC and similar): its router's transformer decides its wire form, which may keep a `Date`. `definition` is always as written.
 
 An alias that does not resolve is skipped, not failed.
 
@@ -1064,8 +1064,8 @@ An alias that does not resolve is skipped, not failed.
   "action": "resolve_definitions",
   "stub_dir": "/absolute/path/to/.carrick/stubs/orders-api",
   "aliases": [
-    { "alias": "Endpoint_a1b2_Response", "protocol": "http", "type_kind": "response", "side": "producer" },
-    { "alias": "Endpoint_c3d4_Request", "protocol": "http", "type_kind": "request", "side": "producer" }
+    { "alias": "Endpoint_a1b2_Response", "protocol": "http", "type_kind": "response", "side": "producer", "procedure": false },
+    { "alias": "Endpoint_c3d4_Request", "protocol": "http", "type_kind": "request", "side": "producer", "procedure": false }
   ]
 }
 ```

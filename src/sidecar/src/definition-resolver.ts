@@ -181,10 +181,14 @@ export class DefinitionResolver {
       }
 
       // Structural form — every named member inlined to its shape, in the
-      // form the payload travels in where the judge compares that form.
-      const wire = sentInJsonWireForm(payload.protocol, payload.type_kind, payload.side)
-        ? 'json'
-        : 'declared';
+      // form the payload travels in where the judge compares that form. An
+      // RPC procedure fails closed to the declared form: its router's
+      // transformer, not JSON, decides what travels (carrick#4275).
+      const wire =
+        !payload.procedure &&
+        sentInJsonWireForm(payload.protocol, payload.type_kind, payload.side)
+          ? 'json'
+          : 'declared';
       const expanded = expandTypeStructural(type, origin, { wire });
 
       return { type_alias: alias, definition, expanded };

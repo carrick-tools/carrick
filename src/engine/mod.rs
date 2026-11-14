@@ -13524,7 +13524,8 @@ fn resolve_per_endpoint_definitions(
     };
 
     let records = read_capture_records(stub_dir);
-    let aliases = aliases_to_resolve(manifest, &records);
+    let procedures = procedure_sites(&cloud_data.endpoints, &cloud_data.calls);
+    let aliases = aliases_to_resolve(manifest, &records, &procedures);
     let resolved = if aliases.is_empty() {
         Vec::new()
     } else {
@@ -13603,9 +13604,11 @@ fn join_capture_answers(
 fn aliases_to_resolve(
     manifest: &[TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
+    procedures: &[ProcedureSite],
 ) -> Vec<crate::services::type_sidecar::DefinitionAlias> {
     let mut aliases = std::collections::BTreeMap::new();
     for e in manifest {
+        let procedure = procedures.iter().any(|site| site.holds(e));
         let unwidened = type_compat_v2::unwidened_alias(&e.type_alias);
         let cases = e
             .response_modes
@@ -13621,11 +13624,61 @@ fn aliases_to_resolve(
                     protocol: type_compat_v2::probe_protocol(&e.key),
                     type_kind: e.type_kind,
                     side: e.role,
+                    procedure,
                 }
             });
         }
     }
     aliases.into_values().collect()
+}
+
+/// Where one RPC procedure row (tRPC and similar) sits: its side, its key and
+/// its site, as the index row states them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcedureSite {
+    role: ManifestRole,
+    key: OperationKey,
+    file: String,
+    line: u32,
+}
+
+impl ProcedureSite {
+    /// Whether a manifest entry types this procedure: the same side, key and
+    /// line, in the same file (one path may be repo-relative and the other
+    /// not, so either may end with the other).
+    fn holds(&self, entry: &TypeManifestEntry) -> bool {
+        entry.role == self.role
+            && entry.key == self.key
+            && entry.line_number == self.line
+            && (entry.file_path.ends_with(&self.file) || self.file.ends_with(&entry.file_path))
+    }
+}
+
+/// The procedure rows among a service's operations and calls. A procedure's
+/// payload travels in its router's transformer's form, which may keep a
+/// `Date` (carrick-cloud#3503, carrick#4275), so its stored text stays as
+/// declared: failing closed until the transformer is a known fact.
+fn procedure_sites(
+    endpoints: &[crate::analyzer::ApiEndpointDetails],
+    calls: &[crate::analyzer::ApiEndpointDetails],
+) -> Vec<ProcedureSite> {
+    let side = |rows: &[crate::analyzer::ApiEndpointDetails], role: ManifestRole| {
+        rows.iter()
+            .filter(|row| row.procedure.is_some())
+            .map(move |row| {
+                let (file, line) = parse_file_location(&row.file_path.to_string_lossy());
+                ProcedureSite {
+                    role,
+                    key: row.key.clone(),
+                    file,
+                    line,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut sites = side(endpoints, ManifestRole::Producer);
+    sites.extend(side(calls, ManifestRole::Consumer));
+    sites
 }
 
 /// Write the capture's answers onto the manifest, and let a real shape settle
@@ -26637,7 +26690,7 @@ unfollowed_member_calls_total: 0,
             "v1's own placeholder must not read as a defined type: {dts}"
         );
         assert_eq!(
-            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new(), &[])),
             vec!["OrderView".to_string()],
             "an alias v1 abstained on is exactly the one the capture exists to answer"
         );
@@ -26815,7 +26868,8 @@ unfollowed_member_calls_total: 0,
         assert_eq!(
             alias_names(&aliases_to_resolve(
                 &[consumer_entry("OrderView")],
-                &records
+                &records,
+                &[]
             )),
             vec!["OrderView".to_string(), sibling.clone()],
             "the sibling is asked about only when the capture recorded it"
@@ -26882,7 +26936,7 @@ unfollowed_member_calls_total: 0,
 
         let records = read_records_with(&case_a);
         assert_eq!(
-            alias_names(&aliases_to_resolve(&manifest[..1], &records)),
+            alias_names(&aliases_to_resolve(&manifest[..1], &records, &[])),
             vec!["OrderView".to_string(), case_a.clone()],
             "a case is asked about only when the capture recorded it"
         );
@@ -27088,6 +27142,7 @@ unfollowed_member_calls_total: 0,
             protocol: ProbeProtocol::Http,
             type_kind: ManifestTypeKind::Response,
             side: ManifestRole::Producer,
+            procedure: false,
         };
         let mut expected = vec![
             http_producer_response("A_ProducerResponse".to_string()),
@@ -27098,25 +27153,122 @@ unfollowed_member_calls_total: 0,
                 protocol: ProbeProtocol::Http,
                 type_kind: ManifestTypeKind::Request,
                 side: ManifestRole::Consumer,
+                procedure: false,
             },
             DefinitionAlias {
                 alias: "C_GraphqlResponse".to_string(),
                 protocol: ProbeProtocol::Graphql,
                 type_kind: ManifestTypeKind::Response,
                 side: ManifestRole::Producer,
+                procedure: false,
             },
         ];
         expected.sort_by(|a, b| a.alias.cmp(&b.alias));
-        assert_eq!(aliases_to_resolve(&manifest, &records), expected);
+        assert_eq!(aliases_to_resolve(&manifest, &records, &[]), expected);
         assert_eq!(
             serde_json::to_value(&expected[expected.len() - 2]).unwrap(),
             serde_json::json!({
                 "alias": "B_ConsumerRequest",
                 "protocol": "http",
                 "type_kind": "request",
-                "side": "consumer"
+                "side": "consumer",
+                "procedure": false
             }),
             "the request carries the names the compiler engine's validator reads"
+        );
+    }
+
+    /// carrick-cloud#3503 / carrick#4275: an RPC procedure's payload travels
+    /// in its router's transformer's form, which may keep a `Date`. Its
+    /// aliases (and their derived aliases) are marked so the compiler engine
+    /// prints them as declared; a plain route at another site is not marked.
+    #[test]
+    fn a_procedure_s_aliases_are_marked_and_a_route_s_are_not() {
+        use crate::engine::type_compat_v2::unwidened_alias;
+        let row =
+            |path: &str, file_line: &str, procedure: bool| crate::analyzer::ApiEndpointDetails {
+                declared_at: None,
+                procedure: procedure.then(|| carrick_match::ProcedureKey {
+                    path: "rows.list".to_string(),
+                    router: carrick_match::RouterId {
+                        repo: "svc".to_string(),
+                        file: "src/router.ts".to_string(),
+                        binding: "appRouter".to_string(),
+                    },
+                }),
+                view_module: false,
+                owner: None,
+                key: OperationKey::http("GET", path.to_string()),
+                params: vec![],
+                request_body: None,
+                response_body: None,
+                handler_name: None,
+                request_type: None,
+                response_type: None,
+                file_path: PathBuf::from(file_line),
+                repo_name: None,
+                service_name: None,
+                provenance: Default::default(),
+                resolution_source: None,
+                dispatch: None,
+                schema_binding: None,
+                undeclared_selection: None,
+                handler_span: None,
+                name_scope: None,
+                library_semantics: Vec::new(),
+                inference: None,
+            };
+        let procedures = procedure_sites(
+            &[
+                row("/trpc/rows.list", "src/router.ts:12", true),
+                row("/rows", "src/routes.ts:4", false),
+            ],
+            &[row("/trpc/rows.list", "web/src/client.ts:7", true)],
+        );
+        let entry = |alias: &str, path: &str, file: &str, line: u32, role| {
+            let mut e = consumer_entry(alias);
+            e.key = OperationKey::http("GET", path);
+            e.file_path = file.to_string();
+            e.line_number = line;
+            e.role = role;
+            e
+        };
+        let manifest = vec![
+            entry(
+                "P_Procedure",
+                "/trpc/rows.list",
+                "src/router.ts",
+                12,
+                ManifestRole::Producer,
+            ),
+            entry(
+                "Q_Route",
+                "/rows",
+                "src/routes.ts",
+                4,
+                ManifestRole::Producer,
+            ),
+            entry(
+                "R_ProcedureCall",
+                "/trpc/rows.list",
+                "web/src/client.ts",
+                7,
+                ManifestRole::Consumer,
+            ),
+        ];
+        let records = read_records_with(&unwidened_alias("P_Procedure"));
+        let marked: Vec<(String, bool)> = aliases_to_resolve(&manifest, &records, &procedures)
+            .into_iter()
+            .map(|a| (a.alias, a.procedure))
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                ("P_Procedure".to_string(), true),
+                (unwidened_alias("P_Procedure"), true),
+                ("Q_Route".to_string(), false),
+                ("R_ProcedureCall".to_string(), true),
+            ]
         );
     }
 
@@ -27218,7 +27370,7 @@ unfollowed_member_calls_total: 0,
             "a shape carrying a top type does not state a contract"
         );
         assert_eq!(
-            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new(), &[])),
             vec!["OrderView".to_string()],
             "the capture must be asked: it is the layer that resolves what v1 could not"
         );
@@ -28097,7 +28249,7 @@ unfollowed_member_calls_total: 0,
             "a bare `any` is an abstention"
         );
         assert_eq!(
-            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new(), &[])),
             vec!["OrderView".to_string()]
         );
 

@@ -420,6 +420,7 @@ export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
         protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
         type_kind: z.enum(['request', 'response']),
         side: z.enum(['producer', 'consumer']),
+        procedure: z.boolean(),
       })
     )
     .min(1, 'At least one alias is required'),

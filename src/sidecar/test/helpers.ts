@@ -51,6 +51,7 @@ export function receivedAliases(...names: string[]): DefinitionAlias[] {
     protocol: 'http',
     type_kind: 'request',
     side: 'producer',
+    procedure: false,
   }));
 }
 

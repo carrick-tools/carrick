@@ -522,6 +522,12 @@ export interface DefinitionAlias {
   protocol: import('./capture/api.js').ProbeProtocol;
   type_kind: 'request' | 'response';
   side: 'producer' | 'consumer';
+  /**
+   * The entry is a procedure of an RPC router (tRPC and similar). Its wire
+   * form is its router's transformer's, which may keep a `Date` a `Date`
+   * (carrick#4275), so it prints as declared until that is a known fact.
+   */
+  procedure: boolean;
 }
 
 /**

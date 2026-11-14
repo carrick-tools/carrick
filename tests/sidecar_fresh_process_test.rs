@@ -434,6 +434,7 @@ fn a_restart_that_cannot_start_a_process_says_so() {
                 protocol: carrick::services::type_sidecar::ProbeProtocol::Http,
                 type_kind: carrick::cloud_storage::ManifestTypeKind::Request,
                 side: carrick::cloud_storage::ManifestRole::Producer,
+                procedure: false,
             }],
         )
     });
