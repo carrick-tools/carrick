@@ -913,6 +913,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_root: None,
             v1_before_demotion: None,
         }
     }

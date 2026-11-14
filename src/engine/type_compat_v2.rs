@@ -4548,6 +4548,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_root: None,
             v1_before_demotion: None,
         }
     }
@@ -4598,6 +4599,7 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,

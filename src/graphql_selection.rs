@@ -306,7 +306,7 @@ fn read_set(
 }
 
 /// Scalars every schema has without defining them.
-const BUILT_IN_SCALARS: &[&str] = &["Int", "Float", "String", "Boolean", "ID"];
+pub(crate) const BUILT_IN_SCALARS: &[&str] = &["Int", "Float", "String", "Boolean", "ID"];
 
 /// Directives the specification defines, which a schema applies without
 /// defining them.

@@ -489,6 +489,7 @@ fn site_consumer(
         schema_binding: None,
         undeclared_selection: None,
         arguments: None,
+        sdl_root_type: None,
     }
 }
 
