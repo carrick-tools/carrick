@@ -100,6 +100,37 @@ export type ContractRow = {
   total: number;
 };
 
+/**
+ * One route a chain row reaches (`k: "chain"`, `routes[]`): its producer
+ * contract row's site, how many calls away, the hops up to its handler, and
+ * the line's words before the contract row's places (`lead`).
+ */
+export type ChainRoute = {
+  protocol: string;
+  side: "producer";
+  label: string;
+  service: string;
+  repo: string;
+  file: string;
+  line: number | null;
+  depth: 1 | 2;
+  /** From the reached function's caller up to the handler, all in `repo`; `call` is where that hop calls the one below. */
+  path: Array<{ file: string; line: number; name: string; call: number | null }>;
+  lead: string;
+};
+
+/** A chain row (`k: "chain"`): a function the cloud walked to from routes' handlers. */
+export type ChainRow = {
+  repo: string;
+  file: string;
+  line: number;
+  name: string;
+  /** At most three, in the order the line tries them. */
+  routes: ChainRoute[];
+  /** Every route reached, kept or not. */
+  total: number;
+};
+
 /** This package's table layout; bumped with every table a new row kind adds. */
 export const LOCAL_LAYOUT = 3;
 
@@ -155,6 +186,12 @@ export type FactStore = {
    * the first call, never in `openFacts`, so such a file opens as it always did.
    */
   contracts: (repo: string, file: string) => ContractRow[];
+  /**
+   * The chain rows of function `name` declared in `file` of `repo`, in wire
+   * order. `[]` for a file built without the `chains` table, prepared on the
+   * first call as `contracts` is.
+   */
+  chains: (repo: string, file: string, name: string) => ChainRow[];
   close: () => void;
 };
 
@@ -212,6 +249,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     );
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
     let contracts: ReturnType<typeof open.prepare> | null | undefined;
+    let chains: ReturnType<typeof open.prepare> | null | undefined;
     handed = true;
     return {
       meta,
@@ -255,6 +293,18 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         }
         if (contracts === null) return [];
         return contracts.all(repo, rel).map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
+      },
+      chains: (repo, rel, name) => {
+        if (chains === undefined) {
+          try {
+            chains = open.prepare("SELECT row FROM chains WHERE repo = ? AND file = ? AND name = ? ORDER BY id");
+          } catch {
+            // No table: a file an older package built.
+            chains = null;
+          }
+        }
+        if (chains === null) return [];
+        return chains.all(repo, rel, name).map((raw) => JSON.parse(String(raw["row"])) as ChainRow);
       },
       close: () => open.close(),
     };
@@ -317,7 +367,7 @@ export async function buildFacts(text: string, dest: string, local: LocalRepo[],
 }
 
 /** The row kinds this package reads. */
-const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract"]);
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract", "chain"]);
 
 const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
 const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
@@ -405,6 +455,30 @@ function wholeRow(raw: Record<string, unknown>): boolean {
           return shown === 0 || (typeof group["lead"] === "string" && typeof group["more"] === "string" && typeof group["tail"] === "string");
         })
       );
+    // A chain row carries no top-level `text`: each kept route carries its own lead.
+    case "chain":
+      return (
+        isText(raw["repo"]) &&
+        isText(raw["file"]) &&
+        isText(raw["name"]) &&
+        Number.isInteger(raw["line"]) &&
+        Array.isArray(raw["routes"]) &&
+        raw["routes"].length > 0 &&
+        Number.isInteger(raw["total"]) &&
+        Number(raw["total"]) >= raw["routes"].length &&
+        allOf(
+          raw["routes"],
+          (route) =>
+            isText(route["label"]) &&
+            isText(route["repo"]) &&
+            isText(route["file"]) &&
+            isText(route["lead"]) &&
+            route["side"] === "producer" &&
+            isLine(route["line"]) &&
+            (route["depth"] === 1 || route["depth"] === 2) &&
+            someOf(route["path"], (hop) => isText(hop["file"]) && isText(hop["name"]) && Number.isInteger(hop["line"]) && isLine(hop["call"])),
+        )
+      );
     default:
       return false;
   }
@@ -430,6 +504,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, side TEXT, protocol TEXT, label TEXT,
         direction TEXT, name TEXT, site TEXT, row TEXT
       );
+      CREATE TABLE chains (id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, row TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     // Each repo's index commit, which the peer proof checks files against
@@ -464,6 +539,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const contractRow = db.prepare(
       "INSERT INTO contracts (repo, file, line, side, protocol, label, direction, name, site, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
+    const chainRow = db.prepare("INSERT INTO chains (repo, file, line, name, row) VALUES (?, ?, ?, ?, ?)");
     db.exec("BEGIN");
     let skipped = 0;
     for (const line of lines.slice(1)) {
@@ -489,6 +565,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
           typeof raw["site"] === "string" ? raw["site"] : null,
           JSON.stringify(raw),
         );
+        continue;
+      }
+      if (raw["k"] === "chain") {
+        chainRow.run(String(raw["repo"]), String(raw["file"]), Number(raw["line"]), String(raw["name"]), JSON.stringify(raw));
         continue;
       }
       if (raw["k"] === "fn") {
@@ -527,7 +607,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     }
     db.exec("COMMIT");
     if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file); CREATE INDEX chains_name ON chains (repo, file, name);");
   } finally {
     closeQuietly(db);
   }
