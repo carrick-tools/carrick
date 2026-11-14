@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { drainRunner, fakeEnv, fixturePath, runHook } from "./helpers.ts";
+import { drainRunner, fakeEnv, fixturePath, runHook, settleRunner } from "./helpers.ts";
 import { commitRepos } from "./facts-repos.ts";
 import { context, lineOf, patchEdit } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
@@ -390,6 +390,7 @@ test("with CARRICK_CONTRACT_LINES unset or 0, the hook's stdout, exit code and f
     const ws = await workspace(t, rows);
     const before = [snapshot(ws.root), snapshot(ws.home)];
     const result = await hookEdit(ws, "hook-off", env);
+    await settleRunner(ws.root);
     const after = [snapshot(ws.root), snapshot(ws.home)];
     // The fact file itself differs by its rows; every other file written is compared.
     const written = after.flatMap((map, i) =>

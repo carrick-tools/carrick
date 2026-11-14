@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { drainRunner, fakeEnv, fixturePath, pluginDir, runHook, testDir, waitForSessionAnswers } from "./helpers.ts";
+import { drainRunner, fakeEnv, fixturePath, pluginDir, runHook, settleRunner, testDir, waitForSessionAnswers } from "./helpers.ts";
 import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -1003,6 +1003,7 @@ test("with CARRICK_FACT_LINES=0 and a fact file, the hook's stdout, exit code an
       },
       env,
     });
+    await settleRunner(ws.root);
     const after = [snapshot(ws.root), snapshot(ws.home)];
     // A file written or changed by the hook, by relative path.
     const written = after.flatMap((map, i) => [...map].filter(([rel, hash]) => before[i]!.get(rel) !== hash).map(([rel]) => `${i}:${rel.replace(/\.\d+-\d+-\d+\./, ".<id>.")}`));
