@@ -36,6 +36,7 @@ import { readServerLabels } from './server-labels.js';
 import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
+import { writeShadow } from './held-shadow.js';
 import {
   type AnswerKey,
   type KeptAnswer,
@@ -71,6 +72,7 @@ import type {
   HealthResponse,
   ShutdownResponse,
   ListProgramFilesResponse,
+  WriteShadowResponse,
   ReachGraphResponse,
   ReachResponse,
   AddProgramFilesResponse,
@@ -908,6 +910,26 @@ function handleListProgramFiles(
 }
 
 /**
+ * Handle the 'write_shadow' action: write the service's program as the shadow
+ * tree a held-open compiler reads (held-shadow.ts). Builds the default
+ * project if the process has not, reads it, and changes nothing in the
+ * checkout.
+ */
+function handleWriteShadow(request: SidecarRequest & { action: 'write_shadow' }): WriteShadowResponse {
+  try {
+    const loader = initializedLoader();
+    const startTime = performance.now();
+    const result = writeShadow(loader, request.out_dir);
+    log(`Wrote the shadow of ${result.own_files.length} own file(s) in ${Math.round(performance.now() - startTime)}ms`);
+    return { request_id: request.request_id, status: 'success', ...result };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Writing the shadow failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'reach_graph' action - the import graph of every program the
  * process has built, the default one and each owning project's (carrick#3100).
  * A process that has built none builds the default one, so a replay can ask
@@ -1114,6 +1136,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleListLibrarySurface(request);
     case 'list_program_files':
       return handleListProgramFiles(request);
+    case 'write_shadow':
+      return handleWriteShadow(request);
     case 'reach_graph':
       return handleReachGraph(request);
     case 'reach':

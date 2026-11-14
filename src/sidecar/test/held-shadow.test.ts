@@ -72,9 +72,9 @@ describe('write_shadow (held compiler program)', () => {
   });
 
   it('(f) answers the same files from two working directories', () => {
-    const elsewhere = scratch('held-shadow-f-cwd-');
+    // One neutral directory, and the sidecar's own, which has real `@types` above it.
     const first = writeShadow(FIXTURE, scratch('held-shadow-f1-'), os.tmpdir());
-    const second = writeShadow(FIXTURE, scratch('held-shadow-f2-'), elsewhere);
+    const second = writeShadow(FIXTURE, scratch('held-shadow-f2-'), process.cwd());
     const filesOf = (s: Shadow): string[] => {
       const out = path.dirname(path.dirname(s.tsconfig));
       return (JSON.parse(fs.readFileSync(s.tsconfig, 'utf8')) as { files: string[] }).files.map((f) => path.relative(out, f)).sort();

@@ -349,6 +349,11 @@ export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
   action: z.literal('list_program_files'),
 });
 
+export const WriteShadowRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('write_shadow'),
+  out_dir: z.string().min(1),
+});
+
 export const ReachGraphRequestSchema = BaseRequestSchema.extend({
   action: z.literal('reach_graph'),
 });
@@ -819,6 +824,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   HealthRequestSchema,
   ShutdownRequestSchema,
   ListProgramFilesRequestSchema,
+  WriteShadowRequestSchema,
   ReachGraphRequestSchema,
   ReachRequestSchema,
   AddProgramFilesRequestSchema,

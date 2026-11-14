@@ -116,7 +116,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 
 ### Which actions need a project
 
-`init` resolves a project; `bundle`, `infer`, `retype_check`, `retype_prescreen`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
+`init` resolves a project; `bundle`, `infer`, `retype_check`, `retype_prescreen`, `verify_client_semantics`, `verify_library_claims`, `list_library_surface`, `list_program_files`, `write_shadow`, `add_program_files`, `position_rows` and `implementations` read it and fail with `Sidecar not initialized` without it. The project itself is built lazily by the first of those requests, not by `init`; `list_program_files` never builds it.
 
 `capture_v2`, `check_v2`, `resolve_definitions`, `health` and `shutdown` are stateless — they build whatever they need from the request and do not touch the init'd project.
 
@@ -136,6 +136,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `verify_library_claims` | yes | Check library claims of every role against the package's own declarations |
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
+| `write_shadow` | yes | Writes the program as a shadow tree for a held-open TypeScript 7 compiler (`out_dir`, outside the checkout) |
 | `add_program_files` | yes | Add files to the program in a given order |
 | `reach_graph` | yes | The import graph of every built program (builds the default one first), without statement texts, paths relative to the scan root |
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
@@ -911,6 +912,12 @@ Response:
 - `longest_printed` is the request that printed the longest type, and is absent when none printed one.
 
 A batch that names fewer requests than it timed left out none slower than the last one it names.
+
+#### `write_shadow` - The program as a tree a held-open compiler reads
+
+`write_shadow` takes `out_dir`, which must lie outside the checkout, and writes the init'd service's program there: `w/<repo-relative path>` holds byte copies of the service's own files (under the scan root, not under `node_modules` or `.carrick/`), `v/<absolute path>` holds every other program file with each import, export, augmentation and `types` reference pinned to the copy the loader resolved it to, and `w/tsconfig.json` is generated for TypeScript 7 (`moduleResolution: bundler`, exact `paths` for the bare specifiers the own files use, every non-library program file in `files`, the library files the loader read named in `lib`). The options TypeScript 7 refuses (`baseUrl`, `moduleResolution: node`, `target: es5`, `esModuleInterop: false`) are never carried. The loader resolves `types` references from the process's working directory, so the answer does not depend on it only when the caller starts the process outside any checkout.
+
+Response fields: `tsconfig`, `own_files` (relative to the scan root), `vendored`, `rewritten`, `unresolved`, `path_conflicts` (a bare specifier two own files resolve to different files; reported, not solved), `bare_specifiers`, `hono` (an own file imports a package named `hono` that resolved into the program) and `native_tsc` (the platform's TypeScript 7 executable, or `null` when only TypeScript 6's `tsc` is installed).
 
 #### `list_program_files` and `add_program_files` - One program, one file order
 
