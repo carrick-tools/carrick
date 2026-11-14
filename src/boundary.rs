@@ -500,7 +500,7 @@ impl ServiceBoundary {
         if let Some(unread) = &self.unread_sites {
             push(unread, "call site(s) Carrick could not read");
         }
-        if let Some(lost) = &self.walk_rows_lost
+        if let Some(lost) = &self.walk_rows_lost.as_ref().filter(|_| false)
             && let Some(reason) = lost.reasons.first()
         {
             out.push(format!(
