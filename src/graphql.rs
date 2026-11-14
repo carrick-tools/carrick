@@ -2616,15 +2616,57 @@ fn sdl_leaf(ty: &graphql_parser::schema::Type<'_, String>) -> Leaf {
 /// union its schemas declare, each field's named type classified against
 /// every schema file of the service. `None` when they declare none.
 pub fn graphql_types(declared: &SdlTypeFields) -> Option<GraphqlTypes> {
-    let _ = declared;
-    None
+    let table: GraphqlTypes = declared
+        .outputs
+        .iter()
+        .filter_map(|(name, output)| {
+            let entry = match output {
+                SdlOutputType::Fields(fields) => GraphqlType::Fields(
+                    fields
+                        .iter()
+                        .map(|(field, leaf)| (field.clone(), classify_leaf(leaf, declared)))
+                        .collect(),
+                ),
+                SdlOutputType::Union(members) => GraphqlType::Members(members.clone()),
+                SdlOutputType::Enum | SdlOutputType::Scalar => return None,
+            };
+            Some((name.clone(), entry))
+        })
+        .collect();
+    (!table.is_empty()).then_some(table)
+}
+
+/// `leaf` with each named type classified against the service's
+/// declarations: a built-in or declared scalar, a declared enum, or a
+/// reference (declared object, interface or union, or a name no schema of
+/// the service declares).
+fn classify_leaf(leaf: &Leaf, declared: &SdlTypeFields) -> Leaf {
+    match leaf {
+        Leaf::List(inner) => Leaf::List(Box::new(classify_leaf(inner, declared))),
+        Leaf::NonNull(inner) => Leaf::NonNull(Box::new(classify_leaf(inner, declared))),
+        Leaf::Type(name) | Leaf::Scalar(name) | Leaf::Enum(name) => {
+            match declared.outputs.get(name) {
+                Some(SdlOutputType::Enum) => Leaf::Enum(name.clone()),
+                Some(SdlOutputType::Scalar) => Leaf::Scalar(name.clone()),
+                None if crate::graphql_selection::BUILT_IN_SCALARS.contains(&name.as_str()) => {
+                    Leaf::Scalar(name.clone())
+                }
+                Some(SdlOutputType::Fields(_) | SdlOutputType::Union(_)) | None => {
+                    Leaf::Type(name.clone())
+                }
+            }
+        }
+    }
 }
 
 impl GraphqlOp {
     /// The root field this producer's response is read from (carrick#4403).
     /// `None` for a consumer.
     pub fn graphql_root(&self) -> Option<GraphqlRoot> {
-        None
+        Some(GraphqlRoot {
+            type_name: self.sdl_root_type.clone()?,
+            field: self.key.graphql_field()?.to_string(),
+        })
     }
 }
 
