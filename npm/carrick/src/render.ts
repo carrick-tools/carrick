@@ -387,7 +387,8 @@ export function sessionCheckedLines(
 
   const lines: string[] = [];
   for (const { result, where: file } of fresh) {
-    if (result.deleted) lines.push(deletedLine(result, file));
+    const gone = result.deleted ? deletedLine(result, file) : null;
+    if (gone !== null) lines.push(gone);
     const found = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     for (const item of found.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, file)));
     const hidden = found.length - Math.min(found.length, MAX_EDIT_PROBLEMS);
@@ -480,7 +481,9 @@ export function changedCleanLine(files: ReadonlyArray<string>): string {
   return `Carrick checked ${shown}${rest} and found no contract problem.`;
 }
 
-function deletedLine(result: CheckResult, where: string): string {
+/** The line for a deleted file, or null when the index held no rows for it: nothing to tell. */
+function deletedLine(result: CheckResult, where: string): string | null {
+  if ((result.items ?? []).length === 0) return null;
   const consumers = (result.items ?? []).reduce(
     (total, item) => total + (item.counterparts ?? []).length,
     0,
@@ -579,7 +582,8 @@ export function renderPostToolUse(
   if (answersTheEdit(result)) {
     const problems = problemItems(result).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
     if (result.deleted) {
-      lines.push(deletedLine(result, where));
+      const gone = deletedLine(result, where);
+      if (gone !== null) lines.push(gone);
     } else {
       const head = headline(result, where, problems.length, options.late === true);
       if (head !== null) lines.push(head);
