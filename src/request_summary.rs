@@ -11659,8 +11659,6 @@ pub struct ReturnEnd {
     /// SWC's span of the call.
     pub span_start: u32,
     pub span_end: u32,
-    /// The call is the platform's `fetch`.
-    pub fetch: bool,
 }
 
 /// What a function hands its caller, read down its returns (carrick#4371,
@@ -11679,17 +11677,25 @@ pub struct ReturnChain {
 #[derive(Debug, Clone, Default)]
 pub struct ReturnChains {
     by_function: HashMap<(PathBuf, String), Option<ReturnChain>>,
+    /// The calls this pass reads as the platform's own `fetch`
+    /// ([`RequestKind::Fetch`]), by file as walked and SWC span.
+    fetches: HashSet<(PathBuf, u32, u32)>,
 }
 
 impl ReturnChains {
     /// `None` for a function this pass did not read (another service's);
     /// `Some(None)` for one whose return is no chain of returned calls: a
-    /// literal, an operator, an object, a function, nothing, or a call of a
-    /// parameter.
+    /// literal, an operator, an object, a function, or nothing.
     pub fn of(&self, file: &Path, key: &str) -> Option<Option<&ReturnChain>> {
         self.by_function
             .get(&(file.to_path_buf(), key.to_string()))
             .map(Option::as_ref)
+    }
+
+    /// Whether the call at `span` of `file` (as walked) is the platform's
+    /// own `fetch`, as this pass reads a request.
+    pub fn is_platform_fetch(&self, file: &Path, span: (u32, u32)) -> bool {
+        self.fetches.contains(&(file.to_path_buf(), span.0, span.1))
     }
 
     /// [`Self::of`] for the function `key` of the file ending in `file`.
@@ -11726,11 +11732,14 @@ impl Composer<'_> {
             .calls
             .iter()
             .find(|call| call.site.lo == shape.base.lo.0 && call.site.hi == shape.base.hi.0)?;
-        if call.invokes_param.is_some() {
-            return None;
-        }
         let files = self.files;
-        let mut record = match self.target(file, call) {
+        // A call of a parameter runs whatever a caller hands in: the chain
+        // ends there.
+        let callee = match call.invokes_param {
+            Some(_) => None,
+            None => self.target(file, call),
+        };
+        let mut record = match callee {
             Some((callee_file, key))
                 if files
                     .get(&callee_file)
@@ -11745,9 +11754,6 @@ impl Composer<'_> {
                     line: call.site.line,
                     span_start: call.site.span_start,
                     span_end: call.site.span_end,
-                    fetch: self
-                        .request_of(file, call)
-                        .is_some_and(|request| request.kind == RequestKind::Fetch),
                 },
             },
         };
@@ -12097,6 +12103,27 @@ impl Composer<'_> {
     }
 }
 
+/// The calls of `ir`, and of every function written inside it, that this
+/// pass reads as the platform's own `fetch` ([`ReturnChains::is_platform_fetch`]).
+fn platform_fetches(
+    composer: &Composer<'_>,
+    file: &Path,
+    ir: &FnIr,
+    fetches: &mut HashSet<(PathBuf, u32, u32)>,
+) {
+    for call in &ir.calls {
+        if composer
+            .request_of(file, call)
+            .is_some_and(|request| request.kind == RequestKind::Fetch)
+        {
+            fetches.insert((file.to_path_buf(), call.site.span_start, call.site.span_end));
+        }
+    }
+    for inner in ir.nested.iter().chain(&ir.detached) {
+        platform_fetches(composer, file, inner, fetches);
+    }
+}
+
 /// Compose every function's summary and state the rows it supports, reading
 /// calls through library clients with the semantics the service verified
 /// (carrick#1564; empty where it verified none).
@@ -12143,6 +12170,12 @@ pub fn summarize(
                 .returned
                 .by_function
                 .insert((path.to_path_buf(), key.clone()), record);
+            platform_fetches(
+                &composer,
+                path,
+                &files[*path].functions[key],
+                &mut index.returned.fetches,
+            );
         }
     }
     // The calls made where a module is loaded can send nothing too

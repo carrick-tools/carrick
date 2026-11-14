@@ -453,8 +453,16 @@ pub enum HandBack {
 /// | labelled `whole`, or unlabelled | `[]` |
 /// | the platform `fetch`, unlabelled | `[Parse("json")]` |
 ///
-/// Anything else is [`HandBack::Other`], except a member read over an
-/// unlabelled end, which is [`HandBack::Undecided`]: the label decides it.
+/// Anything else is [`HandBack::Other`], except:
+///
+/// - a member read over an unlabelled end is [`HandBack::Undecided`]: the
+///   label decides it (READY-4371 R10);
+/// - the platform `fetch`'s whole value is [`HandBack::Undecided`] too. It
+///   resolves to a `Response`, which the labelled call's own read cannot
+///   type (`machinery_envelope`); whoever holds it reads the body off it
+///   (`.json()`, `.arrayBuffer()`), and the deciding call is where that
+///   read is followed. A member of a `Response` (`ok`, `status`) is never
+///   its body: other.
 ///
 /// Its readers: the site pass, which reads a wrapper site's response at the
 /// labelled call unless the wrapper hands the body back
@@ -474,10 +482,11 @@ pub fn hands_back_body(steps: &[Step], end: &EndRead) -> HandBack {
         return HandBack::Body;
     }
     let reads_member = steps.iter().any(|step| matches!(step, Step::Member(_)));
-    if *end == EndRead::Unlabelled && reads_member {
-        return HandBack::Undecided;
+    match end {
+        EndRead::Unlabelled if reads_member => HandBack::Undecided,
+        EndRead::PlatformFetch if steps.is_empty() => HandBack::Undecided,
+        _ => HandBack::Other,
     }
-    HandBack::Other
 }
 
 /// Every function of `module`, by the span of its node, with what it returns:
@@ -1016,7 +1025,7 @@ mod tests {
             ),
             (vec![parse("json")], &EndRead::Unlabelled, HandBack::Other),
             (vec![parse("json")], &EndRead::PlatformFetch, HandBack::Body),
-            (vec![], &EndRead::PlatformFetch, HandBack::Other),
+            (vec![], &EndRead::PlatformFetch, HandBack::Undecided),
             (vec![member("ok")], &EndRead::PlatformFetch, HandBack::Other),
             (vec![member("data"), member("x")], &data, HandBack::Other),
         ] {

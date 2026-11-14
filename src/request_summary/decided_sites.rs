@@ -4932,12 +4932,15 @@ impl Decided {
     /// the body under the store's label for that call
     /// ([`crate::return_flow::hands_back_body`]). A function with no record
     /// (it returns a literal, an object, an operator, a function it makes,
-    /// nothing) or one whose chain ends at another call hands back
-    /// something else: [`crate::return_flow::HandBack::Other`]. A function
-    /// this pass did not read (another service's) is left unanswered, read
-    /// at the deciding call as before. Runs before
-    /// [`Self::yield_to_summaries`], so the yielded sites carry the answer
-    /// too.
+    /// nothing) hands back something else:
+    /// [`crate::return_flow::HandBack::Other`]. So does one whose chain
+    /// ends at another call (`.catch(...)`, a closure's call), except over
+    /// the platform's `fetch` with no result label: its `Response` is read
+    /// on the way back (`res.arrayBuffer()`), which only the deciding call
+    /// follows, so it stays undecided. A function this pass did not read
+    /// (another service's) is left unanswered, read at the deciding call as
+    /// before. Runs before [`Self::yield_to_summaries`], so the yielded
+    /// sites carry the answer too.
     pub fn read_responses(
         &mut self,
         root: &Path,
@@ -4947,27 +4950,33 @@ impl Decided {
         use crate::return_flow::{EndRead, HandBack, hands_back_body};
         for site in &mut self.sites {
             site.hands_back = site.deciding_callee.as_ref().and_then(|(file, key)| {
-                let Some(record) = returned.of(file, key)? else {
-                    return Some(HandBack::Other);
-                };
+                let record = returned.of(file, key)?;
                 let end = &site.end;
+                let span = (end.span_start, end.span_end);
                 // The index is keyed by the repo-relative file, whatever form
                 // the end's file takes (carrick#2974).
                 let end_file =
                     crate::utils::repo_relative_source_path(&end.file, &root.to_string_lossy())
                         .to_string();
-                let at_end = relative(root, &record.end.file) == end_file
-                    && (record.end.span_start, record.end.span_end)
-                        == (end.span_start, end.span_end);
-                if !at_end {
+                let read = match results.at(&end_file, Some(span), end.line) {
+                    Some(label) => EndRead::Labelled(label.clone()),
+                    None if returned.is_platform_fetch(&root.join(&end_file), span) => {
+                        EndRead::PlatformFetch
+                    }
+                    None => EndRead::Unlabelled,
+                };
+                let Some(record) = record else {
                     return Some(HandBack::Other);
+                };
+                let at_end = relative(root, &record.end.file) == end_file
+                    && (record.end.span_start, record.end.span_end) == span;
+                if !at_end {
+                    return Some(if read == EndRead::PlatformFetch {
+                        HandBack::Undecided
+                    } else {
+                        HandBack::Other
+                    });
                 }
-                let read =
-                    match results.at(&end_file, Some((end.span_start, end.span_end)), end.line) {
-                        Some(label) => EndRead::Labelled(label.clone()),
-                        None if record.end.fetch => EndRead::PlatformFetch,
-                        None => EndRead::Unlabelled,
-                    };
                 Some(hands_back_body(&record.steps, &read))
             });
         }
@@ -8329,6 +8338,11 @@ pub(crate) mod tests {
              \x20 return fetch(`${base}/try`).catch(() => null);\n\
              }\n\
              export const tried = () => tryIt(\"/c\");\n";
+        const OK: &str = "async function okOf(base: string) {\n\
+             \x20 const res = await fetch(`${base}/ok`);\n\
+             \x20 return res.ok;\n\
+             }\n\
+             export const healthy = () => okOf(\"/h\");\n";
         const MAKER: &str = "export function makeGate(base: string) {\n\
              \x20 return async () => fetch(`${base}/gate`);\n\
              }\n\
@@ -8367,6 +8381,7 @@ pub(crate) mod tests {
                 ("src/t-parsed.ts", PARSED),
                 ("src/t-two-hop.ts", TWO_HOP),
                 ("src/t-caught.ts", CAUGHT),
+                ("src/t-ok.ts", OK),
             ],
             true,
         )
@@ -8379,9 +8394,14 @@ pub(crate) mod tests {
         // The chains themselves (READY-4371 step 0): each as its steps, the
         // end's line and whether the end is `fetch`.
         use crate::return_flow::Step;
-        let chain = |file: &str, key: &str| -> Option<Option<(Vec<Step>, u32, bool)>> {
+        type Read = Option<Option<(Vec<Step>, u32, bool)>>;
+        let chain = |file: &str, key: &str| -> Read {
             returned.find(file, key).map(|chain| {
-                chain.map(|chain| (chain.steps.clone(), chain.end.line, chain.end.fetch))
+                chain.map(|chain| {
+                    let span = (chain.end.span_start, chain.end.span_end);
+                    let fetch = returned.is_platform_fetch(&chain.end.file, span);
+                    (chain.steps.clone(), chain.end.line, fetch)
+                })
             })
         };
         let json = vec![Step::Parse("json".to_string())];
@@ -8401,9 +8421,22 @@ pub(crate) mod tests {
             chain("t-caught.ts", "tryIt"),
             Some(Some((vec![], 2, false)))
         );
-        // A maker returns a function; `retry` calls its parameter.
+        // Ends at the call of `retry`'s parameter, which runs what a caller
+        // hands in.
+        assert_eq!(
+            chain("t-handed.ts", "retried"),
+            Some(Some((vec![], 1, false)))
+        );
+        let ok = vec![Step::Member("ok".to_string())];
+        assert_eq!(chain("t-ok.ts", "okOf"), Some(Some((ok, 2, true))));
+        // A maker returns a function.
         assert_eq!(chain("t-maker.ts", "makeGate"), Some(None));
-        assert_eq!(chain("t-handed.ts", "retried"), Some(None));
+        // A local closure is no function this pass reads by key: the chain
+        // ends at its call.
+        assert_eq!(
+            chain("t-local-run.ts", "runJob"),
+            Some(Some((vec![], 3, false)))
+        );
         let text = std::fs::read_to_string(
             manifest().join("tests/fixtures/factory-closure/library-claims.json"),
         )
@@ -8444,14 +8477,19 @@ pub(crate) mod tests {
             .map(|site| format!("{}:{} {:?}", site.file, site.line, site.hands_back))
             .collect();
         for (file, wanted) in [
+            // No record: the maker's function, either value.
             ("t-maker.ts", (4, Some(HandBack::Other))),
-            ("t-wrapper.ts", (4, Some(HandBack::Other))),
-            ("t-local-run.ts", (5, Some(HandBack::Other))),
-            ("t-handed.ts", (6, Some(HandBack::Other))),
             ("t-either.ts", (6, Some(HandBack::Other))),
+            // A member of the `Response` is never its body.
+            ("t-ok.ts", (5, Some(HandBack::Other))),
             ("t-parsed.ts", (4, Some(HandBack::Body))),
-            ("t-two-hop.ts", (5, Some(HandBack::Other))),
-            ("t-caught.ts", (4, Some(HandBack::Other))),
+            // The `Response` whole, or read on the way by another call: who
+            // holds it reads the body, which the deciding call follows.
+            ("t-wrapper.ts", (4, Some(HandBack::Undecided))),
+            ("t-two-hop.ts", (5, Some(HandBack::Undecided))),
+            ("t-local-run.ts", (5, Some(HandBack::Undecided))),
+            ("t-handed.ts", (6, Some(HandBack::Undecided))),
+            ("t-caught.ts", (4, Some(HandBack::Undecided))),
         ] {
             assert_eq!(reads(file, wanted.0), vec![wanted], "{file}: {every:#?}");
         }

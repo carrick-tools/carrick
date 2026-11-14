@@ -31566,7 +31566,8 @@ unfollowed_member_calls_total: 0,
         };
         // No file is on disk: the spans are read as ASCII past SWC's base.
         let requests = site_infer_requests(&fold, "/repo", &ResultIndex::default());
-        let results: Vec<(&str, Option<(String, u32, u32)>)> = requests
+        type Through = Option<(String, u32, u32)>;
+        let results: Vec<(&str, Through)> = requests
             .iter()
             .filter(|request| request.infer_kind == InferKind::CallResult)
             .map(|request| {
