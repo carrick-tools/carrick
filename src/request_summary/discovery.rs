@@ -1937,9 +1937,8 @@ impl<'a> Walker<'a> {
             .get(&(file, call.site.span_start, call.site.span_end))
             .copied()?;
         let ops = self.receiver_ops(&keyed.site);
-        if ops.is_empty() {
-            return None;
-        }
+        // Delete-check (carrick#4327): the claims gate is dropped.
+        let _ = ops.is_empty();
         Some(match self.values.one_text(file, &keyed.key) {
             Err(reason) => Stop::from(reason),
             Ok((member, _)) if ops.iter().any(|claimed| claimed.member == member) => {
