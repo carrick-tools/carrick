@@ -6437,7 +6437,7 @@ async fn analyze_current_repo_incremental(
             // types below (carrick#3103).
             let decision = if let Some(context) = reach {
                 let reach_started = Instant::now();
-                let (mut explicit, mut infer, _, body_asks) = file_orchestrator
+                let (mut explicit, mut infer, _, body_asks, _) = file_orchestrator
                     .collect_type_requests_and_body_asks(
                         &merged_results,
                         repo_path,
@@ -12263,7 +12263,7 @@ fn run_capture_for_service(
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
-    let (mut explicit, mut infer, inline_aliases, body_asks) = file_orchestrator
+    let (mut explicit, mut infer, inline_aliases, body_asks, _) = file_orchestrator
         .collect_type_requests_and_body_asks(file_results, repo_path, mount_graph, config, modules);
     // The caller rows whose own call the resolution read a body member out
     // of joined its requests there (carrick#4196); the rest never did.
@@ -17362,6 +17362,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let mut result = make_file_result(vec![], vec!["/orders"]);
         let call = &mut result.data_calls[0];
         call.at_caller = true;
+        // The wrapper holds the transport, so the gate (carrick#4270) asks it.
+        call.holds_transport = true;
         call.line_number = 2;
         call.call_expression_text = Some("fetch('/orders')".to_string());
         call.call_expression_line = Some(2);
@@ -17376,7 +17378,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             Path::new(""),
         );
         let modules = service_module_index(&repo, &Config::default());
-        let (_, _, _, body_asks) = orchestrator.collect_type_requests_and_body_asks(
+        let (_, _, _, body_asks, _) = orchestrator.collect_type_requests_and_body_asks(
             &file_results,
             &repo,
             &mount_graph,
@@ -19678,6 +19680,7 @@ unfollowed_member_calls_total: 0,
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 })
                 .collect(),
             graphql_operations: vec![],
@@ -19849,6 +19852,7 @@ unfollowed_member_calls_total: 0,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let declared =
             crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
@@ -22176,6 +22180,7 @@ unfollowed_member_calls_total: 0,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let multi_line = "register(\n  listOrders,\n  \"orders.save\",\n)";
         let chain = "register(listOrders, \"orders.then\").then(() => undefined)";
@@ -22280,6 +22285,7 @@ unfollowed_member_calls_total: 0,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut result = FileAnalysisResult {
             data_calls: vec![
@@ -27285,6 +27291,7 @@ unfollowed_member_calls_total: 0,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(

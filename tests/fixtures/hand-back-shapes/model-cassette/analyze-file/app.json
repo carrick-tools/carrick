@@ -1,0 +1,59 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/v1/replies/latest",
+      "method": "GET",
+      "pattern_matched": "call(",
+      "call_expression_text": "call('/v1/replies/latest')",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:9",
+      "line_number": 9,
+      "target": "/v1/replies/first",
+      "method": "GET",
+      "pattern_matched": "callEither(",
+      "call_expression_text": "callEither('/v1/replies/first', true)",
+      "call_expression_line": 9,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:14",
+      "line_number": 14,
+      "target": "/v1/replies/latest",
+      "method": "GET",
+      "pattern_matched": "callPlain(",
+      "call_expression_text": "callPlain('/v1/replies/latest')",
+      "call_expression_line": 14,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:19",
+      "line_number": 19,
+      "target": "/v1/replies/first",
+      "method": "GET",
+      "pattern_matched": "callEitherPlain(",
+      "call_expression_text": "callEitherPlain('/v1/replies/first', true)",
+      "call_expression_line": 19,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

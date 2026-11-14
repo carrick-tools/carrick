@@ -448,6 +448,7 @@ mod tests {
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }
     }
 

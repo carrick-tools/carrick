@@ -625,6 +625,18 @@ pub struct DataCallResult {
     /// by the type requests and the manifest on the same run.
     #[serde(skip)]
     pub request_line: Option<Box<RequestLineAnchors>>,
+    /// A row at a caller whose function can hand back its request's
+    /// transport response held inside its value: a member, an element, an
+    /// argument, or what a `.then` callback returns, here or through a
+    /// function it calls ([`crate::request_summary::SummaryRow::holds_transport`],
+    /// carrick#4270). Only such a row's own call is worth asking for the body
+    /// member it read: any other caller's value holds no wire response.
+    ///
+    /// Never from the model and never on the wire: the request summaries set
+    /// it on the rows they rebuild every scan, read by the type requests on
+    /// the same run.
+    #[serde(skip)]
+    pub holds_transport: bool,
 }
 
 /// The model's row at a request line its callers' rows state
@@ -2256,6 +2268,7 @@ mod tests {
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
 
         let json = serde_json::to_string(&data_call).unwrap();
@@ -2323,6 +2336,7 @@ mod tests {
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],

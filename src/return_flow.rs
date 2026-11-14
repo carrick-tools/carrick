@@ -474,6 +474,321 @@ pub fn returned_objects(module: &swc_ecma_ast::Module) -> HashSet<(u32, u32)> {
     reader.objects
 }
 
+/// The calls whose value a function may hand back (carrick#4270), by how it
+/// hands them back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldReturn {
+    /// Calls whose value may be the function's value whole.
+    pub bare: Vec<Span>,
+    /// Calls whose value may sit inside the function's value: a member, an
+    /// element, an argument of a call or `new`.
+    pub held: Vec<Span>,
+}
+
+/// Every function of `module`, by the span of its node, with the calls whose
+/// value it may hand back, whole or held inside its value (carrick#4270).
+/// In source order.
+///
+/// Read from the syntax alone. Every `return` argument and an arrow's
+/// expression body is walked, keeping its position (whole or held) through
+/// `await`, parentheses, type assertions, both arms of a conditional, `??` /
+/// `||` / `&&`, the last expression of a sequence, an assignment's value and
+/// every value a local name is given. What sits under an object literal's
+/// member, shorthand or spread, an array's element, or an argument of a call
+/// or `new` is held. A method call's receiver keeps the call's position (a
+/// call made on a value is a way of handing it on: `res.clone()`), and so
+/// does what an inline callback handed to a call returns, whose first
+/// parameter is the receiver's value (`fetch(u).then((res) => ({ res }))`).
+/// A member read, a body read ([`BODY_READS`]), a name taken apart
+/// (`const { data } = ...`), a template or any other operator ends the walk:
+/// none of them hands the value on.
+pub fn held_returns(module: &swc_ecma_ast::Module) -> Vec<(Span, HeldReturn)> {
+    #[derive(Default)]
+    struct HeldReader {
+        held: Vec<(Span, HeldReturn)>,
+    }
+    impl HeldReader {
+        fn read(&mut self, node: Span, returned: Vec<&Expr>, body: &dyn VisitWithScope) {
+            let mut scope = Scope::default();
+            body.collect(&mut scope);
+            let frame = Frame {
+                id: 0,
+                scope,
+                params: Vec::new(),
+                receiver: None,
+                parent: None,
+            };
+            let mut walk = HeldWalk::default();
+            for expr in returned {
+                walk.walk(expr, false, &frame);
+            }
+            self.held.push((node, walk.finish()));
+        }
+    }
+    impl Visit for HeldReader {
+        fn visit_function(&mut self, function: &Function) {
+            if let Some(body) = &function.body {
+                let mut returns = Returns::default();
+                body.visit_with(&mut returns);
+                self.read(
+                    function.span,
+                    returns.exprs.iter().collect(),
+                    &BodyRef::Block(body),
+                );
+            }
+            function.visit_children_with(self);
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            match &*arrow.body {
+                ArrowFunctionBody::FunctionBody(block) => {
+                    let mut returns = Returns::default();
+                    block.visit_with(&mut returns);
+                    self.read(
+                        arrow.span,
+                        returns.exprs.iter().collect(),
+                        &BodyRef::Block(block),
+                    );
+                }
+                ArrowFunctionBody::Expr(expr) => {
+                    self.read(arrow.span, vec![&**expr], &BodyRef::Expr(expr));
+                }
+            }
+            arrow.visit_children_with(self);
+        }
+    }
+    let mut reader = HeldReader::default();
+    module.visit_with(&mut reader);
+    reader.held.sort_by_key(|(span, _)| (span.lo, span.hi));
+    reader.held
+}
+
+/// The platform's reads of a response's body (`res.json()`, `res.text()`):
+/// what they hand back is the body, never the response. The compiler
+/// engine's list (platform-body-read.ts).
+const BODY_READS: [&str; 6] = ["json", "text", "blob", "arrayBuffer", "formData", "bytes"];
+
+/// One function body being walked by [`HeldWalk`]: its own names, and for an
+/// inline callback, the body it is written in.
+struct Frame<'p> {
+    /// Tells two frames' names apart in [`HeldWalk::followed`].
+    id: usize,
+    scope: Scope,
+    /// A callback's own parameter names: never the enclosing body's names.
+    params: Vec<String>,
+    /// For a callback handed to a method call: its first parameter's name and
+    /// the receiver whose value it is given, read in `parent`.
+    receiver: Option<(String, &'p Expr)>,
+    parent: Option<&'p Frame<'p>>,
+}
+
+/// The calls one function's returned values reach ([`held_returns`]).
+#[derive(Default)]
+struct HeldWalk {
+    bare: Vec<Span>,
+    held: Vec<Span>,
+    /// Names already followed, per frame and position.
+    followed: HashSet<(String, usize, bool)>,
+    frames: usize,
+}
+
+impl HeldWalk {
+    fn finish(mut self) -> HeldReturn {
+        for spans in [&mut self.bare, &mut self.held] {
+            spans.sort_by_key(|span| (span.lo, span.hi));
+            spans.dedup();
+        }
+        HeldReturn {
+            bare: self.bare,
+            held: self.held,
+        }
+    }
+
+    /// Walk a value the function may hand back: whole, or `held` inside it.
+    fn walk(&mut self, expr: &Expr, held: bool, frame: &Frame) {
+        match expr {
+            Expr::Await(awaited) => self.walk(&awaited.arg, held, frame),
+            Expr::Paren(paren) => self.walk(&paren.expr, held, frame),
+            Expr::TsAs(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsTypeAssertion(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsConstAssertion(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsNonNull(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsSatisfies(cast) => self.walk(&cast.expr, held, frame),
+            Expr::Cond(cond) => {
+                self.walk(&cond.cons, held, frame);
+                self.walk(&cond.alt, held, frame);
+            }
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    BinaryOp::LogicalOr | BinaryOp::LogicalAnd | BinaryOp::NullishCoalescing
+                ) =>
+            {
+                self.walk(&bin.left, held, frame);
+                self.walk(&bin.right, held, frame);
+            }
+            Expr::Seq(seq) => {
+                if let Some(last) = seq.exprs.last() {
+                    self.walk(last, held, frame);
+                }
+            }
+            Expr::Assign(assign) => self.walk(&assign.right, held, frame),
+            Expr::Ident(ident) => self.follow(&ident.sym, held, frame),
+            Expr::Object(object) => {
+                for prop in &object.props {
+                    match prop {
+                        PropOrSpread::Spread(spread) => self.walk(&spread.expr, true, frame),
+                        PropOrSpread::Prop(prop) => match &**prop {
+                            Prop::KeyValue(kv) => self.walk(&kv.value, true, frame),
+                            Prop::Shorthand(ident) => self.follow(&ident.sym, true, frame),
+                            _ => {}
+                        },
+                    }
+                }
+            }
+            Expr::Array(array) => {
+                for elem in array.elems.iter().flatten() {
+                    self.walk(&elem.expr, true, frame);
+                }
+            }
+            Expr::New(new) => {
+                for arg in new.args.iter().flatten() {
+                    self.walk(&arg.expr, true, frame);
+                }
+            }
+            Expr::Call(call) => self.call(call, held, frame),
+            _ => {}
+        }
+    }
+
+    fn call(&mut self, call: &CallExpr, held: bool, frame: &Frame) {
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        let receiver = match &**callee {
+            Expr::Member(member) => {
+                if matches!(&member.prop, MemberProp::Ident(name) if BODY_READS.contains(&&*name.sym))
+                {
+                    return;
+                }
+                Some(&*member.obj)
+            }
+            _ => None,
+        };
+        if held {
+            self.held.push(call.span);
+        } else {
+            self.bare.push(call.span);
+        }
+        if let Some(receiver) = receiver {
+            self.walk(receiver, held, frame);
+        }
+        for arg in &call.args {
+            match &*arg.expr {
+                Expr::Arrow(arrow) => {
+                    let returned: Vec<&Expr>;
+                    let mut returns = Returns::default();
+                    let body = match &*arrow.body {
+                        ArrowFunctionBody::FunctionBody(block) => {
+                            block.visit_with(&mut returns);
+                            returned = returns.exprs.iter().collect();
+                            BodyRef::Block(block)
+                        }
+                        ArrowFunctionBody::Expr(expr) => {
+                            returned = vec![&**expr];
+                            BodyRef::Expr(expr)
+                        }
+                    };
+                    let params: Vec<&Pat> = arrow.params.iter().collect();
+                    self.callback(&params, &body, returned, receiver, held, frame);
+                }
+                Expr::Fn(function) => {
+                    let Some(block) = &function.function.body else {
+                        continue;
+                    };
+                    let mut returns = Returns::default();
+                    block.visit_with(&mut returns);
+                    let params: Vec<&Pat> =
+                        function.function.params.iter().map(|p| &p.pat).collect();
+                    self.callback(
+                        &params,
+                        &BodyRef::Block(block),
+                        returns.exprs.iter().collect(),
+                        receiver,
+                        held,
+                        frame,
+                    );
+                }
+                expr => self.walk(expr, true, frame),
+            }
+        }
+    }
+
+    /// What an inline callback returns keeps the position of the call it
+    /// is handed to, its first parameter given the receiver's value.
+    fn callback(
+        &mut self,
+        params: &[&Pat],
+        body: &dyn VisitWithScope,
+        returned: Vec<&Expr>,
+        receiver: Option<&Expr>,
+        held: bool,
+        frame: &Frame,
+    ) {
+        let mut scope = Scope::default();
+        body.collect(&mut scope);
+        self.frames += 1;
+        let first = params.first().and_then(|param| match param {
+            Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+            _ => None,
+        });
+        let child = Frame {
+            id: self.frames,
+            scope,
+            params: params
+                .iter()
+                .flat_map(|param| pattern_names(param))
+                .collect(),
+            receiver: first.zip(receiver),
+            parent: Some(frame),
+        };
+        for expr in returned {
+            self.walk(expr, held, &child);
+        }
+    }
+
+    /// Follow a name to every value it is given, in the frame that binds it.
+    fn follow(&mut self, name: &str, held: bool, frame: &Frame) {
+        if !self.followed.insert((name.to_string(), frame.id, held)) {
+            return;
+        }
+        // A name taken apart is a member of its value, not the value.
+        if frame.scope.parts.contains_key(name) {
+            return;
+        }
+        if let Some(given) = frame.scope.given.get(name) {
+            for value in given {
+                self.walk(value, held, frame);
+            }
+            return;
+        }
+        if let Some((first, receiver)) = &frame.receiver
+            && first.as_str() == name
+        {
+            if let Some(parent) = frame.parent {
+                self.walk(receiver, held, parent);
+            }
+            return;
+        }
+        if frame.params.iter().any(|param| param == name) {
+            return;
+        }
+        if let Some(parent) = frame.parent {
+            self.follow(name, held, parent);
+        }
+    }
+}
+
 fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
     let mut shapes = Vec::new();
     for expr in returned {
@@ -832,6 +1147,203 @@ mod tests {
         ] {
             assert_eq!(shape(source), None, "{source}");
         }
+    }
+
+    /// The calls the first function of `source` may hand back, by their
+    /// text: `(bare, held)`.
+    fn held(source: &str) -> (Vec<String>, Vec<String>) {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        let held = held_returns(&module);
+        let (_, held) = held.first().expect("a function");
+        let texts = |spans: &[Span]| {
+            let mut texts: Vec<String> = spans
+                .iter()
+                .map(|span| cm.span_to_snippet(*span).unwrap())
+                .collect();
+            texts.sort();
+            texts.dedup();
+            texts
+        };
+        (texts(&held.bare), texts(&held.held))
+    }
+
+    fn texts(calls: &[&str]) -> Vec<String> {
+        let mut texts: Vec<String> = calls.iter().map(|call| call.to_string()).collect();
+        texts.sort();
+        texts
+    }
+
+    /// carrick#4270: what each wrapper the compiler engine was measured on
+    /// hands back, whole or held. The engine keeps a caller's answer only
+    /// where the transport response sits inside the value, so these are the
+    /// shapes the ask is gated on.
+    #[test]
+    fn a_transport_inside_a_returned_value_is_held() {
+        let cases: [(&str, &[&str], &[&str]); 13] = [
+            (
+                "async function f(u) { const res = await fetch(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u, e) { const res = await fetch(u); if (e) { return { res, first: (await res.json()) as R }; } return { res, second: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { res, body: await res.text() }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return pack(res, (await res.json()) as R); }\nfunction pack(res, json) { return { res, json }; }",
+                &["pack(res, (await res.json()) as R)"],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return new Holder(res, (await res.json()) as R); }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const extra = { at: Date.now() }; return { ...extra, res, json: (await res.json()) as R }; }",
+                &[],
+                &["Date.now()", "fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { res: res.clone(), json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)", "res.clone()"],
+            ),
+            (
+                "async function f(u) { const res = await send(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["send(u)"],
+            ),
+            (
+                "async function f(u): Promise<Out> { const res = await fetch(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return [res, (await res.json()) as R] as const; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return { meta: { res }, json }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return handle(res); }",
+                &["handle(res)"],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then(async (res) => ({ res, json: (await res.json()) as R })); }",
+                &[
+                    "fetch(u)",
+                    "fetch(u).then(async (res) => ({ res, json: (await res.json()) as R }))",
+                ],
+                &["fetch(u)"],
+            ),
+        ];
+        for (source, bare, held_calls) in cases {
+            assert_eq!(held(source), (texts(bare), texts(held_calls)), "{source}");
+        }
+    }
+
+    /// carrick#4270: a wrapper that hands back a call's value whole, reads a
+    /// member or the body, or hands back none of its calls holds no call.
+    #[test]
+    fn a_transport_handed_back_whole_or_read_is_not_held() {
+        let cases: [(&str, &[&str]); 12] = [
+            (
+                "async function f(u) { return callPlain(u); }",
+                &["callPlain(u)"],
+            ),
+            (
+                "async function f(u) { return retry(() => callPlain(u)); }",
+                &["callPlain(u)", "retry(() => callPlain(u))"],
+            ),
+            ("async function f(u) { return fetch(u); }", &["fetch(u)"]),
+            (
+                "async function f(u) { const res = await fetch(u); if (!res.ok) throw new Error('bad'); return res; }",
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then((r) => r.json() as Promise<R>); }",
+                &["fetch(u)", "fetch(u).then((r) => r.json() as Promise<R>)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then((r) => r.json() as Promise<R>).catch(() => null); }",
+                &[
+                    "fetch(u)",
+                    "fetch(u).then((r) => r.json() as Promise<R>)",
+                    "fetch(u).then((r) => r.json() as Promise<R>).catch(() => null)",
+                ],
+            ),
+            (
+                "async function f(u) { return retry(() => fetch(u)); }",
+                &["fetch(u)", "retry(() => fetch(u))"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return { status: res.status, json }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return json.data; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { headers: res.headers, json: (await res.json()) as R }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { ok: true, data: (await res.json()) as R }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const { data } = await fetch(u); return { data }; }",
+                &[],
+            ),
+        ];
+        for (source, bare) in cases {
+            assert_eq!(held(source), (texts(bare), Vec::new()), "{source}");
+        }
+    }
+
+    /// carrick#4270: a callback's first parameter is the value of the
+    /// receiver it was handed to, and a callback's own names shadow the
+    /// enclosing body's.
+    #[test]
+    fn a_callbacks_parameter_is_its_receivers_value() {
+        assert_eq!(
+            held(
+                "async function f(u) { const res = await fetch(u); return load(u).then((res) => ({ res })); }"
+            ),
+            (
+                texts(&["load(u)", "load(u).then((res) => ({ res }))"]),
+                texts(&["load(u)"])
+            )
+        );
+        assert_eq!(
+            held("async function f(u) { return run((res) => ({ res })); }"),
+            (texts(&["run((res) => ({ res }))"]), Vec::new())
+        );
     }
 
     #[test]

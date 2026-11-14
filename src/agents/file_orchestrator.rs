@@ -1759,12 +1759,15 @@ pub(crate) fn route_response_request(
 
 /// [`FileOrchestrator::collect_type_requests_and_body_asks`]'s answer: the
 /// explicit requests, the infer requests, the inline aliases, and the asks a
-/// caller row's response waits on (carrick#4196).
+/// caller row's response waits on (carrick#4196), and how many such rows were
+/// not asked because their function holds no transport response
+/// (carrick#4270).
 pub type TypeRequestsAndBodyAsks = (
     Vec<SymbolRequest>,
     Vec<InferRequestItem>,
     Vec<(String, String)>,
     Vec<InferRequestItem>,
+    usize,
 );
 
 impl FileOrchestrator {
@@ -5250,7 +5253,7 @@ impl FileOrchestrator {
         Vec<InferRequestItem>,
         Vec<(String, String)>,
     ) {
-        let (explicit, infer, inline, _) = self.collect_type_requests_and_body_asks(
+        let (explicit, infer, inline, _, _) = self.collect_type_requests_and_body_asks(
             file_results,
             repo_path,
             mount_graph,
@@ -5297,6 +5300,9 @@ impl FileOrchestrator {
         // The asks a caller row's response waits on (carrick#4196): pushed
         // here, not with the requests, while `body_ask` is set.
         let mut body_asks: Vec<InferRequestItem> = Vec::new();
+        // The caller rows that wait on the answer and are not asked: their
+        // function holds no transport response (carrick#4270).
+        let mut body_asks_skipped: usize = 0;
         let body_ask = std::cell::Cell::new(false);
         let should_infer_request_body = crate::type_manifest::producer_reads_request_body;
         // `consumer_response` marks a symbol named for what a consumer call
@@ -6092,27 +6098,37 @@ impl FileOrchestrator {
                         self.result_index
                             .unanswered_at(call_file, call_span, anchor_line),
                     );
+                    // Only a caller whose function can hand back the
+                    // transport response held inside its value is worth
+                    // asking (carrick#4270): the engine names a body member
+                    // at no other. A row not asked still waits on the
+                    // answer, so it keeps no response type.
+                    let worth_asking = !asked_for_body || data_call.holds_transport;
+                    if !worth_asking {
+                        body_asks_skipped += 1;
+                    }
                     body_ask.set(asked_for_body);
-                    let call_inferred = push_infer(
-                        &anchor_absolute,
-                        anchor_line,
-                        InferKind::CallResult,
-                        response_alias.clone(),
-                        InferLocator::Text {
-                            expression_text: anchor.call_expression_text.as_deref(),
-                            expression_line: anchor.call_expression_line,
-                        },
-                    ) || push_infer(
-                        &anchor_absolute,
-                        anchor_line,
-                        InferKind::CallResult,
-                        response_alias.clone(),
-                        InferLocator::Span {
-                            span_start: anchor.call_expression_span_start,
-                            span_end: anchor.call_expression_span_end,
-                            at_registration: false,
-                        },
-                    );
+                    let call_inferred = worth_asking
+                        && (push_infer(
+                            &anchor_absolute,
+                            anchor_line,
+                            InferKind::CallResult,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: anchor.call_expression_text.as_deref(),
+                                expression_line: anchor.call_expression_line,
+                            },
+                        ) || push_infer(
+                            &anchor_absolute,
+                            anchor_line,
+                            InferKind::CallResult,
+                            response_alias.clone(),
+                            InferLocator::Span {
+                                span_start: anchor.call_expression_span_start,
+                                span_end: anchor.call_expression_span_end,
+                                at_registration: false,
+                            },
+                        ));
                     body_ask.set(false);
                     *call_result.borrow_mut() = (None, false);
                     if !call_inferred
@@ -6209,7 +6225,13 @@ impl FileOrchestrator {
             inline_aliases.len()
         );
 
-        (explicit_requests, infer_requests, inline_aliases, body_asks)
+        (
+            explicit_requests,
+            infer_requests,
+            inline_aliases,
+            body_asks,
+            body_asks_skipped,
+        )
     }
 
     /// Build `SymbolRequest`s for Socket.IO payload anchors (#245 Phase 1).
@@ -8996,6 +9018,7 @@ impl FileOrchestrator {
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 })),
             });
         }
@@ -9131,6 +9154,7 @@ impl FileOrchestrator {
                 call_body: row.call_body.clone(),
                 static_asset: None,
                 request_line: None,
+                holds_transport: row.holds_transport,
             })),
         }
     }
@@ -9463,6 +9487,7 @@ impl FileOrchestrator {
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }
     }
 
@@ -11747,7 +11772,7 @@ impl FileOrchestrator {
         payload_infer: &[InferRequestItem],
         server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (mut explicit, mut infer, inline_aliases, body_asks) = self
+        let (mut explicit, mut infer, inline_aliases, body_asks, body_asks_skipped) = self
             .collect_type_requests_and_body_asks(
                 file_results,
                 repo_path,
@@ -11776,9 +11801,10 @@ impl FileOrchestrator {
             }
         };
         debug!(
-            "[FileOrchestrator] {} of {} caller row(s) asked at their own call read a body member",
+            "[FileOrchestrator] {} of {} caller row(s) asked at their own call read a body member; {} not asked: their function hands back no transport response",
             hand_back_bodies.len(),
-            body_asks.len()
+            body_asks.len(),
+            body_asks_skipped
         );
         let kept_asks: Vec<InferRequestItem> = body_asks
             .into_iter()
@@ -15115,6 +15141,7 @@ export * from "./aFetch.js";"#,
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -15177,6 +15204,7 @@ export * from "./aFetch.js";"#,
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 }
             };
 
@@ -15267,6 +15295,7 @@ export * from "./aFetch.js";"#,
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 }],
                 ..Default::default()
             },
@@ -15441,6 +15470,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }
     }
 
@@ -15934,6 +15964,7 @@ export * from "./aFetch.js";"#,
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             }],
             ..Default::default()
         };
@@ -16034,6 +16065,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
 
         let mut file_results = HashMap::new();
@@ -16170,6 +16202,7 @@ export * from "./aFetch.js";"#,
                         call_body: None,
                         static_asset: None,
                         request_line: None,
+                        holds_transport: false,
                     }],
                     graphql_operations: vec![],
                     pubsub_operations: vec![],
@@ -16259,6 +16292,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
 
         let mut file_results = HashMap::new();
@@ -16363,6 +16397,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16460,6 +16495,7 @@ export * from "./aFetch.js";"#,
                         call_body: None,
                         static_asset: None,
                         request_line: None,
+                        holds_transport: false,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -16489,6 +16525,7 @@ export * from "./aFetch.js";"#,
                         call_body: None,
                         static_asset: None,
                         request_line: None,
+                        holds_transport: false,
                     },
                 ],
                 graphql_operations: vec![],
@@ -16555,6 +16592,7 @@ export * from "./aFetch.js";"#,
                     call_body: None,
                     static_asset: None,
                     request_line: None,
+                    holds_transport: false,
                 }],
                 graphql_operations: vec![],
                 pubsub_operations: vec![],
@@ -16624,6 +16662,7 @@ export * from "./aFetch.js";"#,
                         call_body: None,
                         static_asset: None,
                         request_line: None,
+                        holds_transport: false,
                     },
                     DataCallResult {
                         call_kind: None,
@@ -16653,6 +16692,7 @@ export * from "./aFetch.js";"#,
                         call_body: None,
                         static_asset: None,
                         request_line: None,
+                        holds_transport: false,
                     },
                 ],
                 graphql_operations: vec![],
@@ -16894,6 +16934,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -16958,6 +16999,91 @@ export * from "./aFetch.js";"#,
         );
     }
 
+    /// carrick#4270: a caller row is asked at its own call only where its
+    /// function can hand back the request's transport response held inside
+    /// its value. Any other caller's value holds no wire response, so the
+    /// compiler engine would keep no answer there: the row is not asked, and
+    /// it still states no response type from any other source.
+    #[test]
+    fn a_caller_of_a_wrapper_that_hands_back_no_transport_is_not_asked() {
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let repo = repo_with_source("src/service.ts", 700);
+        let call = |line: i32, span: u32, holds_transport: bool| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{span}-{}", span + 50),
+            line_number: line,
+            target: "https://api.example.com/orders".to_string(),
+            method: Some("GET".to_string()),
+            pattern_matched: "loadOrder".to_string(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: Some(span + 50),
+            call_expression_text: Some("loadOrder(id)".to_string()),
+            call_expression_line: Some(line),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: Some("OrderReply".to_string()),
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(ResolutionSource::RequestSummary),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: true,
+            call_body: None,
+            static_asset: None,
+            request_line: None,
+            holds_transport,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "src/service.ts".to_string(),
+            FileAnalysisResult {
+                graphql_consumer_locates: vec![],
+                mounts: vec![],
+                endpoints: vec![],
+                data_calls: vec![call(10, 470, true), call(20, 530, false)],
+                graphql_operations: vec![],
+                pubsub_operations: vec![],
+                dispatch_tables: Vec::new(),
+            },
+        );
+        let graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let (explicit, infer, inline, body_asks, skipped) = orchestrator
+            .collect_type_requests_and_body_asks(
+                &file_results,
+                &repo.path().to_string_lossy(),
+                &graph,
+                &Config::default(),
+                &repo_modules(repo.path()),
+            );
+
+        let asked: Vec<u32> = body_asks.iter().map(|ask| ask.line_number).collect();
+        assert_eq!(
+            asked,
+            vec![10],
+            "only the row whose function holds the transport is asked: {body_asks:?}"
+        );
+        assert_eq!(skipped, 1, "the other is counted as not asked");
+        assert!(
+            infer
+                .iter()
+                .all(|item| item.infer_kind != InferKind::CallResult),
+            "no caller row asks for its call's result with the requests: {infer:?}"
+        );
+        assert!(
+            explicit.is_empty() && inline.is_empty(),
+            "no caller row states its symbol: {explicit:?} {inline:?}"
+        );
+    }
+
     /// carrick#1782: a row at a call to a function the service declares asks
     /// for the request body the function's parameters say the call sends.
     ///
@@ -17016,6 +17142,7 @@ export * from "./aFetch.js";"#,
             call_body,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -17155,6 +17282,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let anchors = RequestLineAnchors {
             file: wrapper_path.to_string_lossy().into_owned(),
@@ -17188,6 +17316,7 @@ export * from "./aFetch.js";"#,
             call_body,
             static_asset: None,
             request_line: carried.then(|| Box::new(anchors.clone())),
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -17337,6 +17466,7 @@ export * from "./aFetch.js";"#,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
@@ -17410,6 +17540,7 @@ export * from "./aFetch.js";"#,
             own_site: !at_caller,
             at_caller,
             returns_request_value: false,
+            holds_transport: false,
             call_body: at_caller.then_some(crate::forwarded_body::CallBody::Built),
             library_semantics: Vec::new(),
             base_fallbacks: None,
@@ -18093,6 +18224,7 @@ export * from "./aFetch.js";"#,
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -18205,6 +18337,7 @@ export * from "./aFetch.js";"#,
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![
@@ -18576,6 +18709,7 @@ export * from "./aFetch.js";"#,
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             }],
             graphql_operations: vec![],
             pubsub_operations: vec![],
@@ -21397,6 +21531,7 @@ export { routes };
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }
     }
 
@@ -21892,6 +22027,7 @@ export { routes };
             own_site: true,
             at_caller: false,
             returns_request_value: false,
+            holds_transport: false,
             call_body: None,
             library_semantics: Vec::new(),
             base_fallbacks: None,
@@ -22516,6 +22652,7 @@ export { routes };
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let facts = crate::request_summary::fact_files::FactFiles {
             graphql_client_calls: BTreeMap::from([(
@@ -24270,6 +24407,7 @@ export function publishWrapped(order: OrderPlaced): void {
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }
     }
 
