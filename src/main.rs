@@ -665,7 +665,7 @@ async fn run_analysis(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     // STEP 1: Discover and spawn sidecar (non-blocking)
     // The sidecar is bundled with the tool - auto-discover its location
     // =======================================================================
-    let sp = logging::spinner("Initializing compiler engine...");
+    let sp = logging::spinner("Starting compiler engine...");
     let mut sidecar_found = false;
     let sidecar = match discover_sidecar_path() {
         Some(sidecar_path) => {

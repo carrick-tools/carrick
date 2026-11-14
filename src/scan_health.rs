@@ -1177,9 +1177,9 @@ pub fn engine_not_ready_message(
 ) -> String {
     format!(
         "The compiler engine was not ready within {budget_secs}s ({detail}), so this scan \
-         would index every endpoint with no request or response types. Aborting keeps the \
-         existing index's types. Raise the budget with {budget_env}, or set {allow_env}=1 \
-         to scan without types anyway."
+         would index every endpoint with no request or response types. Aborting so the \
+         existing index keeps its types. Raise the budget with {budget_env}, or set \
+         {allow_env}=1 to scan without types."
     )
 }
 
@@ -1199,9 +1199,9 @@ mod tests {
         assert_eq!(
             message,
             "The compiler engine was not ready within 30s (timed out), so this scan would \
-             index every endpoint with no request or response types. Aborting keeps the \
-             existing index's types. Raise the budget with BUDGET_VAR, or set ALLOW_VAR=1 \
-             to scan without types anyway."
+             index every endpoint with no request or response types. Aborting so the \
+             existing index keeps its types. Raise the budget with BUDGET_VAR, or set \
+             ALLOW_VAR=1 to scan without types."
         );
         assert!(!message.to_lowercase().contains("sidecar"));
         assert_eq!(
