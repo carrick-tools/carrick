@@ -51,6 +51,10 @@ pub struct SimilarDoc<'a> {
     pub intent: Option<&'a str>,
     pub tokens: &'a [String],
     pub signature: Option<&'a str>,
+    /// Whether other files can import it; breaks a score tie.
+    pub exported: bool,
+    /// Its first line in the file; breaks a score tie.
+    pub line: u32,
     /// The names it calls, as written at each call site.
     pub calls: Vec<&'a str>,
 }
@@ -171,12 +175,16 @@ fn member(name: &str) -> &str {
 struct Meta {
     file: u32,
     member: u32,
+    exported: bool,
+    line: u32,
 }
 
 /// Every indexed function, read once and ranked against any number of queries.
 pub struct SimilarIndex {
     /// By input position; `None` for a row nobody can import.
     docs: Vec<Option<Meta>>,
+    /// By input position: the name as the index spells it.
+    names: Vec<String>,
     lengths: Vec<u32>,
     live: usize,
     total_length: u64,
@@ -184,6 +192,8 @@ pub struct SimilarIndex {
     /// Per term: (doc, times it appears in that doc's bag).
     postings: Vec<Vec<(u32, u32)>>,
     files: HashMap<String, u32>,
+    /// By file id: the key as given, for the tie-break by path.
+    file_keys: Vec<String>,
     members: HashMap<String, u32>,
     /// Member name of a callee -> the docs that call it.
     callers: HashMap<u32, Vec<u32>>,
@@ -202,12 +212,14 @@ impl SimilarIndex {
     pub fn build<'a>(docs: impl IntoIterator<Item = SimilarDoc<'a>>) -> Self {
         let mut index = Self {
             docs: Vec::new(),
+            names: Vec::new(),
             lengths: Vec::new(),
             live: 0,
             total_length: 0,
             terms: HashMap::new(),
             postings: Vec::new(),
             files: HashMap::new(),
+            file_keys: Vec::new(),
             members: HashMap::new(),
             callers: HashMap::new(),
         };
@@ -218,6 +230,7 @@ impl SimilarIndex {
                 && !doc.file.is_empty()
                 && doc.name != MODULE_ROW
                 && !doc.name.ends_with(CALLBACK_SUFFIX);
+            index.names.push(doc.name.to_string());
             if !importable {
                 index.docs.push(None);
                 index.lengths.push(0);
@@ -244,9 +257,15 @@ impl SimilarIndex {
                 let callee = intern(&mut index.members, member(call));
                 index.callers.entry(callee).or_default().push(position);
             }
+            let file = intern(&mut index.files, doc.file);
+            if file as usize == index.file_keys.len() {
+                index.file_keys.push(doc.file.to_string());
+            }
             let meta = Meta {
-                file: intern(&mut index.files, doc.file),
+                file,
                 member: intern(&mut index.members, member(doc.name)),
+                exported: doc.exported,
+                line: doc.line,
             };
             index.docs.push(Some(meta));
             index.lengths.push(bag.described_len as u32);
@@ -258,6 +277,10 @@ impl SimilarIndex {
             list.sort_unstable();
         }
         index
+    }
+
+    fn meta(&self, doc: usize) -> &Meta {
+        self.docs[doc].as_ref().expect("a ranked row is importable")
     }
 
     /// The functions most like `query`, best first, at most [`SIMILAR_ROWS`].
@@ -328,10 +351,21 @@ impl SimilarIndex {
                 })
             })
             .collect();
+        // A total order that reads nothing about the order the index was fed:
+        // the same-member row, score, exported, file path, line, then the name.
+        // Only a function written twice at one line of one file falls to the
+        // input position.
         rows.sort_by(|(same_a, a), (same_b, b)| {
+            let (meta_a, meta_b) = (self.meta(a.doc), self.meta(b.doc));
             same_b
                 .cmp(same_a)
                 .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| meta_b.exported.cmp(&meta_a.exported))
+                .then_with(|| {
+                    self.file_keys[meta_a.file as usize].cmp(&self.file_keys[meta_b.file as usize])
+                })
+                .then_with(|| meta_a.line.cmp(&meta_b.line))
+                .then_with(|| self.names[a.doc].cmp(&self.names[b.doc]))
                 .then_with(|| a.doc.cmp(&b.doc))
         });
         rows.into_iter()
