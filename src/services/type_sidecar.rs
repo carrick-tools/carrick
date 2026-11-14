@@ -5191,14 +5191,9 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
     // saw a shape. The model's symbol is no answer then: dropped here, before
     // the bundle and the capture run, so neither defines the alias from it.
     let decided_no_type = |alias: &str| {
-        reads_by_alias.get(alias).is_some_and(|reads| {
-            reads
-                .iter()
-                .any(|inf| crate::engine::type_compat_v2::inference_decided_no_contract(inf))
-                && reads
-                    .iter()
-                    .all(|inf| crate::engine::type_compat_v2::inference_read_no_shape(inf))
-        })
+        reads_by_alias
+            .get(alias)
+            .is_some_and(|reads| crate::engine::type_compat_v2::alias_reads_decided_no_type(reads))
     };
 
     let mut alias_counts: HashMap<&str, usize> = HashMap::new();
