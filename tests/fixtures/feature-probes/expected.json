@@ -362,7 +362,7 @@
  "r-loop": {
   "feature": "for-of over a literal array (route per value)",
   "source": "test262 (for-of)",
-  "status": "lead"
+  "status": "covered"
  },
  "r-param-app": {
   "feature": "app passed as a parameter (register function)",

@@ -4126,6 +4126,7 @@ mod tests {
                     read_from,
                     from_type,
                     callers: Vec::new(),
+                    elements: Vec::new(),
                 },
                 other => other,
             })

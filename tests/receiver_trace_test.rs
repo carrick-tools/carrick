@@ -1003,11 +1003,15 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
 
 /// carrick#3237: in a package that uses its framework only through types,
 /// a route path that writes its first segment before a value the code does
-/// not read (`/widgets/kinds/${kind}`, `/docs/spec${tail}`) keeps the
+/// not read (`/docs/spec${tail}`, a loop over a parameter's key) keeps the
 /// reader's row, counted `unread_own_part`; the path that starts with its
 /// value (`${head}health`) is a guessed site and its row is withdrawn. The
 /// loop's reader row gives way to the literal registration of the same route
 /// (carrick#3236), which the trace corrects instead of copying untyped.
+///
+/// carrick#2093: the loop over the stated list `KINDS` is read, so the
+/// trace serves one route per element at `:14`, under the scope's prefix,
+/// and the model's `/widgets/kinds/:kind` row there gives way.
 #[test]
 fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
     let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head");
@@ -1016,13 +1020,23 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
         .iter()
         .filter(|row| row.contains("families.ts"))
         .collect();
+    let at_14: Vec<&String> = family
+        .iter()
+        .copied()
+        .filter(|row| row.contains("families.ts:14 "))
+        .collect();
+    assert_eq!(
+        at_14,
+        vec![
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/large library_claim app",
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/small library_claim app",
+        ],
+        "{family:#?}"
+    );
     assert!(
         family
             .iter()
-            .any(|row| row.contains("families.ts:14 POST /widgets/kinds/:kind"))
-            && family
-                .iter()
-                .any(|row| row.contains("families.ts:19 GET /api/v1/docs/spec library_claim")),
+            .any(|row| row.contains("families.ts:19 GET /api/v1/docs/spec library_claim")),
         "{family:#?}"
     );
     assert!(
@@ -1033,15 +1047,19 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
         family.iter().all(|row| !row.contains("health")),
         "{family:#?}"
     );
-    for row in family.iter().filter(|row| row.contains("families.ts:14 ")) {
-        assert!(row.contains(" model "), "{row}");
-    }
     let counts = route_counts(&fallbacks);
-    assert!(
-        counts.contains(&"routes routes_untraced_unread_own_part=2".to_string())
-            && counts.contains(&"routes routes_guessed_withdrawn=1".to_string())
-            && counts.contains(&"routes routes_across_corrected=2".to_string())
-            && counts.contains(&"routes routes_across_added_untyped=1".to_string()),
+    assert_eq!(
+        counts
+            .iter()
+            .filter(|count| count.starts_with("routes "))
+            .cloned()
+            .collect::<Vec<String>>(),
+        vec![
+            "routes routes_across_added_untyped=2",
+            "routes routes_across_corrected=2",
+            "routes routes_guessed_withdrawn=1",
+            "routes routes_untraced_unread_own_part=1",
+        ],
         "{counts:#?}"
     );
     // An incremental re-scan gives the same rows.
@@ -3390,9 +3408,9 @@ fn a_loop_over_a_list_the_code_does_not_state_keeps_todays_outcome() {
             "src/server.ts:37 unread_expression",
             "src/server.ts:40 unread_expression",
             "src/server.ts:43 unread_expression",
-            "src/server.ts:45 reassigned",
-            "src/server.ts:47 reassigned",
-            "src/server.ts:49 reassigned",
+            "src/server.ts:45 unread_expression",
+            "src/server.ts:47 unread_expression",
+            "src/server.ts:49 unread_expression",
             "src/server.ts:51 fan_out_cap",
             "src/server.ts:53 callback_parameter",
         ],

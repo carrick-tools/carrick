@@ -397,3 +397,149 @@ impl PatternMember<'_> {
         })
     }
 }
+
+/// The elements an array literal states (carrick#2093), each lowered as
+/// [`text_of`] lowers a value, except that an element written as an array
+/// literal is its own [`ValueAt::Elements`], so a loop over a list of tuples
+/// reads each tuple's names. Seen through parens, `as const` and
+/// `satisfies`. `None` for anything but an array literal, and for one with a
+/// spread or an elision: either may put any value at any position.
+pub(in crate::request_summary) fn list_of(
+    expr: &Expr,
+    shift: &dyn Fn(u32) -> u32,
+) -> Option<Vec<ValueAt>> {
+    let Expr::Array(array) = crate::request_summary::unwrap_value(expr) else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(array.elems.len());
+    for element in &array.elems {
+        let element = element
+            .as_ref()
+            .filter(|element| element.spread.is_none())?;
+        out.push(match list_of(&element.expr, shift) {
+            Some(items) => ValueAt::Elements(items),
+            None => text_of(&element.expr, shift),
+        });
+    }
+    Some(out)
+}
+
+/// Whether `expr` is written `as const` (through parens and `satisfies`):
+/// the compiler then types an array literal as a readonly tuple, which no
+/// importer can change without a cast.
+pub(in crate::request_summary) fn written_as_const(expr: &Expr) -> bool {
+    match expr {
+        Expr::TsConstAssertion(_) => true,
+        Expr::Paren(inner) => written_as_const(&inner.expr),
+        Expr::TsSatisfies(inner) => written_as_const(&inner.expr),
+        _ => false,
+    }
+}
+
+/// What each name a `for…of` or `for…in` head binds holds, as the text
+/// reader reads it (carrick#2093): the [`ValueAt::Each`] of the list, at the
+/// tuple position or object key the pattern reads. `list` is the loop's list
+/// for a `const` head of a `for…of`; `None` (a `for…in`, a `let` or `var`
+/// head) leaves the list unread. A name the pattern binds through a
+/// default, a rest element, a nested pattern or a computed key holds what no
+/// reader states. `loop_at` is where the loop statement starts.
+pub(in crate::request_summary) fn loop_head_names<'h>(
+    head: &'h ForHead,
+    list: Option<&Expr>,
+    loop_at: u32,
+    shift: &dyn Fn(u32) -> u32,
+) -> Vec<(&'h BindingIdent, ValueAt)> {
+    let ForHead::VarDecl(var) = head else {
+        return Vec::new();
+    };
+    let [declarator] = var.decls.as_slice() else {
+        return Vec::new();
+    };
+    let read = match list.map(crate::request_summary::unwrap_value) {
+        Some(Expr::Array(_)) => list
+            .and_then(|list| list_of(list, shift))
+            .map_or(ValueAt::Unread, ValueAt::Elements),
+        Some(Expr::Ident(_)) => list.map_or(ValueAt::Unread, |list| text_of(list, shift)),
+        _ => ValueAt::Unread,
+    };
+    let each = |at: Option<usize>, key: Option<String>| ValueAt::Each {
+        list: Box::new(read.clone()),
+        at,
+        key,
+        loop_at,
+    };
+    let unread = || ValueAt::Each {
+        list: Box::new(ValueAt::Unread),
+        at: None,
+        key: None,
+        loop_at,
+    };
+    let mut out = Vec::new();
+    match &declarator.name {
+        Pat::Ident(bound) => out.push((bound, each(None, None))),
+        Pat::Array(array) => {
+            for (index, element) in array.elems.iter().enumerate() {
+                match element {
+                    Some(Pat::Ident(bound)) => out.push((bound, each(Some(index), None))),
+                    Some(other) => {
+                        let mut names = Vec::new();
+                        bound_names(other, &mut names);
+                        out.extend(names.into_iter().map(|bound| (bound, unread())));
+                    }
+                    None => {}
+                }
+            }
+        }
+        Pat::Object(object) => {
+            let members = pattern_members(object);
+            let plain: Vec<&BindingIdent> = members
+                .iter()
+                .filter(|member| member.default.is_none())
+                .map(|member| member.bound)
+                .collect();
+            for member in &members {
+                if member.default.is_none() {
+                    out.push((member.bound, each(None, Some(member.key.clone()))));
+                }
+            }
+            let mut names = Vec::new();
+            bound_names(&declarator.name, &mut names);
+            out.extend(
+                names
+                    .into_iter()
+                    .filter(|bound| !plain.iter().any(|held| std::ptr::eq(*held, *bound)))
+                    .map(|bound| (bound, unread())),
+            );
+        }
+        other => {
+            let mut names = Vec::new();
+            bound_names(other, &mut names);
+            out.extend(names.into_iter().map(|bound| (bound, unread())));
+        }
+    }
+    out
+}
+
+/// Every name `pat` binds, in source order.
+fn bound_names<'p>(pat: &'p Pat, out: &mut Vec<&'p BindingIdent>) {
+    match pat {
+        Pat::Ident(bound) => out.push(bound),
+        Pat::Array(array) => array
+            .elems
+            .iter()
+            .flatten()
+            .for_each(|element| bound_names(element, out)),
+        Pat::Rest(rest) => bound_names(&rest.arg, out),
+        Pat::Object(object) => {
+            for prop in &object.props {
+                match prop {
+                    ObjectPatProp::KeyValue(entry) => bound_names(&entry.value, out),
+                    ObjectPatProp::Assign(assign) => out.push(&assign.key),
+                    ObjectPatProp::Rest(rest) => bound_names(&rest.arg, out),
+                }
+            }
+        }
+        Pat::Assign(assign) => bound_names(&assign.left, out),
+        Pat::Invalid(_) | Pat::Expr(_) => {}
+    }
+}
