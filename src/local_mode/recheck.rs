@@ -411,7 +411,7 @@ pub fn run(
         None => match Held::read(workspace) {
             Ok(held) => {
                 took("held-read", started);
-                Source::Read(held)
+                Source::Read(Box::new(held))
             }
             Err(reason) => {
                 return Err(Box::new(Degraded {
@@ -512,7 +512,7 @@ pub fn run(
     let generation = std::env::temp_dir().join(format!("carrick-recheck-{}", uuid::Uuid::new_v4()));
     let outcome = inside(
         workspace,
-        held,
+        *held,
         (tree, relative),
         &generation,
         deadline,
@@ -564,7 +564,7 @@ pub fn run(
 /// file standing in for them.
 enum Source {
     Kept(RepoReads),
-    Read(Held),
+    Read(Box<Held>),
 }
 
 /// What a probe answers for an edit that needs a re-scan.
