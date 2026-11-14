@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
+    "fixture-plain-store": "^1.0.0",
     "fixture-plugin-server": "^1.0.0"
   }
 }
