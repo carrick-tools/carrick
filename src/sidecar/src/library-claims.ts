@@ -31,7 +31,9 @@
  *
  * The export's type is read the way the service's own code would read it: a
  * probe file in `from_dir` imports it, inside the service's program, under the
- * service's compiler options. The declarations must be the installed
+ * service's compiler options. A request that names another service's tsconfig
+ * (`tsconfig_path`, carrick#4472) reads it in a probe-only program under that
+ * tsconfig's options instead. The declarations must be the installed
  * package's: a `paths` alias or a `declare module` block the service writes
  * for itself is not evidence about the library.
  */

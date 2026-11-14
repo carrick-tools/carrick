@@ -8065,7 +8065,7 @@ fn member_declarations(
             #[cfg(test)]
             DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
             let answer = sidecar
-                .verify_library_claims(from_dir, &ask.checks)
+                .verify_library_claims(from_dir, None, &ask.checks)
                 .map(|answer| answer.verdicts);
             failed = !answer
                 .as_ref()
@@ -8239,7 +8239,7 @@ fn result_index_of(
     let ask = result_checks(claims, &discovery);
     let index = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
-            let answer = sidecar.verify_library_claims(from_dir, &ask.checks);
+            let answer = sidecar.verify_library_claims(from_dir, None, &ask.checks);
             if let Err(error) = &answer {
                 // The asked calls are held unanswered, so their types say
                 // they were read without the answer (carrick#4154).
@@ -8470,7 +8470,7 @@ fn read_library_rows(
     let names = crate::request_summary::SiteNames::of(inputs);
     crate::library_claims::read(sites, claims, Some(&names), |checks| {
         sidecar
-            .verify_library_claims(from_dir, checks)
+            .verify_library_claims(from_dir, None, checks)
             .map(|answer| {
                 crate::scan_health::record_time_limit(
                     crate::time_limits::TimeLimit::LibraryChecks,

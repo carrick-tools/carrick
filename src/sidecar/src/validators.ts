@@ -782,6 +782,7 @@ export const VerifyLibraryClaimsRequestSchema = BaseRequestSchema.extend({
   checks: z.array(LibraryCheckSchema),
   // The contract's sample sends `null` for "no budget of the request's own".
   budget_ms: z.number().int().nonnegative().nullable().optional(),
+  tsconfig_path: z.string().min(1).optional(),
 });
 
 export const ListLibrarySurfaceRequestSchema = BaseRequestSchema.extend({

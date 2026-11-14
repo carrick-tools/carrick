@@ -44,7 +44,7 @@ const checks = [
     export: 'BroadcastChannel',
     role: 'in_process_bus',
     receiver: 'instance:new',
-    claim: { kind: 'op', op: 'send', member: 'postMessage', name: { arg: 0 } },
+    claim: { kind: 'op', op: 'send', member: 'postMessage', name: { bound: 'maker' }, payload: { arg: 0 } },
   },
   {
     claim_id: 'queue',
@@ -52,7 +52,13 @@ const checks = [
     export: 'Queue',
     role: 'broker',
     receiver: 'export',
-    claim: { kind: 'make', form: 'new', member: null, name: { arg: 0 } },
+    claim: {
+      kind: 'make',
+      form: 'new',
+      member: null,
+      name: { arg: 0 },
+      key_labels: { minimumVersion: 'not_name', prefix: 'not_name', recommendedMinimumVersion: 'not_name' },
+    },
   },
   {
     claim_id: 'add',
@@ -60,7 +66,14 @@ const checks = [
     export: 'Queue',
     role: 'broker',
     receiver: 'instance:new',
-    claim: { kind: 'op', op: 'send', member: 'add', name: { arg: 0 } },
+    claim: {
+      kind: 'op',
+      op: 'send',
+      member: 'add',
+      name: { bound: 'maker' },
+      payload: { arg: 1 },
+      key_labels: { jobId: 'not_name', repeatJobKey: 'not_name' },
+    },
   },
 ];
 
