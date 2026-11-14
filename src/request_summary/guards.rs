@@ -168,6 +168,21 @@ pub enum HoleReason {
     ParameterUnread,
 }
 
+impl HoleReason {
+    /// Whether this is one of the holes `PositionIndex::lookup` returns:
+    /// no compiler row reads the position.
+    pub fn is_row_lookup(self) -> bool {
+        matches!(
+            self,
+            HoleReason::RowsMissing
+                | HoleReason::WalkLost
+                | HoleReason::RowsStale
+                | HoleReason::NotInProgram
+                | HoleReason::CheckerThrew
+        )
+    }
+}
+
 /// Where a compared value comes from, before any access is applied to it.
 /// The send side's opaque pieces end at one too ([`super::Piece::Opaque`],
 /// carrick#2406). `pub`, not `pub(crate)`, because [`super::Piece`] is public.
