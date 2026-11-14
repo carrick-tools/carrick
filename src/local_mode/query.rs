@@ -57,7 +57,13 @@ pub fn answer(
     mode: Mode,
     freshness: Freshness,
 ) -> Result<CheckOutput, ReadFailure> {
+    // One clock for the whole answer: every `recheck-timing` line of a probe
+    // counts its `ended at` from here, the steps before the re-check included.
+    let started = std::time::Instant::now();
+    super::recheck::start_timing(started);
+    let began = std::time::Instant::now();
     let index = read_index(workspace_root)?;
+    super::recheck::took("check/read-index", began);
 
     let (repo, relative, tree) = index
         .locate_file(file)
@@ -103,6 +109,7 @@ pub fn answer(
     // the fallback for the tree git cannot speak for, and it is built into the
     // same set rather than OR-ed on top of it, so `stale` and
     // `changed_since_index` can never contradict each other (carrick#857).
+    let began = std::time::Instant::now();
     let changed = changed_since(&repo_root, &commit).unwrap_or_else(|| {
         let mut changed = HashSet::new();
         if newer_than_index(&repo_root, &relative, &indexed_at) {
@@ -110,6 +117,7 @@ pub fn answer(
         }
         changed
     });
+    super::recheck::took("check/changed-files", began);
     let stale = changed.contains(&relative);
     let deleted = !repo_root.join(&relative).exists();
 
@@ -140,8 +148,11 @@ pub fn answer(
             let unchanged = service_row
                 .filter(|service| !service.dirty && !service.commit.is_empty())
                 .and_then(|service| {
-                    super::reads_same::reads_same_since(&repo_root, &service.commit, &relative)
-                        .map(Some)
+                    let began = std::time::Instant::now();
+                    let same =
+                        super::reads_same::reads_same_since(&repo_root, &service.commit, &relative);
+                    super::recheck::took("check/reads-the-same", began);
+                    same.map(Some)
                 })
                 .or_else(|| {
                     // The probe never walks every service's imports to learn
@@ -296,6 +307,7 @@ pub fn answer(
         .map(|uses| uses.lines(&service))
         .unwrap_or_default();
 
+    super::recheck::took("check/answer", started);
     Ok(CheckOutput {
         hosted: enrichment.hosted,
         hosted_state: enrichment.hosted_state,
@@ -511,7 +523,10 @@ fn rechecked(
     rescan: bool,
 ) -> (Option<Rechecked>, Recheck) {
     let started = std::time::Instant::now();
-    let workspace = match super::workspace::Workspace::load(workspace_root) {
+    let began = std::time::Instant::now();
+    let loaded = super::workspace::Workspace::load(workspace_root);
+    super::recheck::took("check/load-workspace", began);
+    let workspace = match loaded {
         Ok(workspace) => workspace,
         Err(reason) => {
             return (

@@ -5900,6 +5900,76 @@ fn a_re_check_below_the_git_top_names_a_service_that_reads_a_changed_file_outsid
     );
 }
 
+/// A probe states each step it takes under the names `check --changed` uses,
+/// with one clock from the start of the answer (carrick#4034). The steps
+/// before the re-check were unnamed, and the time outside the named steps was
+/// where a slow probe hid. Tests count lines, never time.
+#[test]
+#[serial]
+fn the_probe_times_each_step() {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let client = root.join(SHOP_CLIENT);
+    let existing = std::fs::read_to_string(&client).expect("read the client");
+    std::fs::write(
+        &client,
+        format!("{existing}\nexport function addedForTiming(a: number) {{ return a + 1; }}\n"),
+    )
+    .expect("write the edit");
+    let args = [
+        "check",
+        SHOP_CLIENT,
+        "--workspace",
+        ".",
+        "--recheck",
+        "--no-rescan",
+        "--json",
+    ];
+    let mut command = Command::new(carrick());
+    command
+        .args(args)
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env(AMPLE[0].0, AMPLE[0].1)
+        .env("TMPDIR", tmpdir)
+        .env("CARRICK_RECHECK_TIMING", "1");
+    as_signed_in(&mut command, &args);
+    let output = command.output().expect("run check");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    let answer: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"));
+    assert_eq!(
+        answer["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{answer:#}"
+    );
+    for step in [
+        "check/read-index",
+        "check/changed-files",
+        "check/reads-the-same",
+        "check/load-workspace",
+        "added-functions",
+        "similar",
+        "known-miss-read",
+        "check/answer",
+    ] {
+        assert!(
+            stderr.contains(&format!("recheck-timing {step} took ")),
+            "no timing line for {step}:\n{stderr}"
+        );
+    }
+}
+
 /// A test edit no service reads, beside a source edit the scan reads the same
 /// (a comment), starts no re-scan in `check --changed`, and the answer is the
 /// forced re-scan's. The test file is no changed file of its own (the scan

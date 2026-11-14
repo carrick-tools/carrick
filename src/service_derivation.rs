@@ -285,7 +285,16 @@ fn resolve_gated(
     } else {
         None
     };
-    scan_services_with_hosted(root, hosted.as_deref())
+    let configs = hosted.as_deref().map(config_jsons);
+    scan_services_with_hosted(root, configs.as_deref())
+}
+
+/// The `config_json` of each blob, in order, for [`scan_services_with_hosted`].
+fn config_jsons(blobs: &[crate::cloud_storage::CloudRepoData]) -> Vec<Option<&str>> {
+    blobs
+        .iter()
+        .map(|blob| blob.config_json.as_deref())
+        .collect()
 }
 
 /// [`resolve_for_scan`] with the hosted blobs handed in, for a caller that
@@ -299,15 +308,27 @@ pub fn resolve_with_hosted(
     root: &Path,
     hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
 ) -> Result<Vec<Config>, String> {
-    scan_services_with_hosted(root, hosted).map(|scan| scan.services)
+    let configs = hosted.map(config_jsons);
+    resolve_with_configs(root, configs.as_deref())
+}
+
+/// [`resolve_with_hosted`] for a caller that holds the hosted blobs and
+/// should not copy them: it hands in each blob's `config_json`, in blob
+/// order, and the rules are the same ones.
+pub fn resolve_with_configs(
+    root: &Path,
+    configs: Option<&[Option<&str>]>,
+) -> Result<Vec<Config>, String> {
+    scan_services_with_hosted(root, configs).map(|scan| scan.services)
 }
 
 fn scan_services_with_hosted(
     root: &Path,
-    hosted: Option<&[crate::cloud_storage::CloudRepoData]>,
+    configs: Option<&[Option<&str>]>,
 ) -> Result<ScanServices, String> {
     let declared = has_root_config(root)?;
-    if !declared && let Some(services) = hosted.and_then(|blobs| hosted_services(root, blobs)) {
+    if !declared && let Some(services) = configs.and_then(|configs| hosted_services(root, configs))
+    {
         tracing::debug!(
             "Services for {}: the hosted index's configs ({})",
             root.display(),
@@ -338,16 +359,13 @@ fn has_root_config(root: &Path) -> Result<bool, String> {
     }
 }
 
-fn hosted_services(
-    root: &Path,
-    blobs: &[crate::cloud_storage::CloudRepoData],
-) -> Option<Vec<Config>> {
-    if blobs.is_empty() {
+fn hosted_services(root: &Path, configs: &[Option<&str>]) -> Option<Vec<Config>> {
+    if configs.is_empty() {
         return None;
     }
-    let mut services = blobs
+    let mut services = configs
         .iter()
-        .map(|blob| serde_json::from_str::<Config>(blob.config_json.as_deref()?).ok())
+        .map(|config| serde_json::from_str::<Config>((*config)?).ok())
         .collect::<Option<Vec<_>>>()?;
     services.sort_by(|a, b| a.service_name.cmp(&b.service_name));
     validate(root, &services).ok()?;

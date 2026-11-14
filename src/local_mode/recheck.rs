@@ -251,7 +251,8 @@ pub const TIMING_ENV: &str = "CARRICK_RECHECK_TIMING";
 static RUN_STARTED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// Mark `started` as the beginning of this command, for the offsets in the
-/// timing lines.
+/// timing lines. The per-file answer ([`super::query::answer`]) and `check
+/// --changed` each call it once, first.
 pub(super) fn start_timing(started: Instant) {
     if let Ok(mut at) = RUN_STARTED.lock() {
         *at = Some(started);
@@ -260,8 +261,9 @@ pub(super) fn start_timing(started: Instant) {
 
 /// Say that `phase` took from `began` until now, and where in the command that
 /// ended: one line per phase, `recheck-timing <phase> took <ms> ms, ended at
-/// <ms> ms`. Both checks call it: the per-edit re-check and the several-file
-/// `check --changed`, whose parent writes no log of its own.
+/// <ms> ms`. Both checks call it: the per-file answer (its probe and its
+/// re-check) and the several-file `check --changed`, whose parent writes no
+/// log of its own.
 pub(super) fn took(phase: &str, began: Instant) {
     let now = Instant::now();
     let at = RUN_STARTED
@@ -301,7 +303,6 @@ pub fn run(
     rescan: bool,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
-    start_timing(started);
     let budget = budget();
     let deadline = started + budget;
     // The index is read once, here, and named twice: for what the edit added
@@ -993,20 +994,23 @@ fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<Added> {
     let name = repo_label(&tree.repo);
     let hosted = held.hosted.local_blobs(&tree.repo);
     let repo = tree.checkout.as_path();
-    let blobs: Vec<crate::cloud_storage::CloudRepoData> = held
+    let blobs: Vec<&crate::cloud_storage::CloudRepoData> = held
         .local
         .iter()
         .filter(|blob| blob.repo_name == name)
         .chain(hosted.iter())
-        .cloned()
+        .collect();
+    let configs: Vec<Option<&str>> = blobs
+        .iter()
+        .map(|blob| blob.config_json.as_deref())
         .collect();
     // The services the scan would resolve for this repo, the way `index`
     // resolves them. A repo they cannot be resolved for names nothing: the
     // question "would the scan read this file" has no answer.
-    let Ok(services) = crate::service_derivation::resolve_with_hosted(repo, Some(&blobs)) else {
+    let Ok(services) = crate::service_derivation::resolve_with_configs(repo, Some(&configs)) else {
         return Vec::new();
     };
-    let indexed = functions_in(blobs.iter(), relative);
+    let indexed = functions_in(blobs.iter().copied(), relative);
     additions(&services, repo, relative, &indexed)
 }
 
