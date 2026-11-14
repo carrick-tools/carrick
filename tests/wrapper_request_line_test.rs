@@ -14,6 +14,7 @@
 //! whose event or topic is open is read by the fact layer, not here: a gap.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -294,10 +295,9 @@ fn typed_blobs() -> &'static BTreeMap<String, serde_json::Value> {
     BLOBS.get_or_init(|| scan_typed_fixture(&types_fixture_dir()))
 }
 
-/// Every service's blob from one offline scan of a two-service types
-/// fixture (`repo/`, `library-claims.json`, `model-cassette/`), keyed by
-/// service name.
-fn scan_typed_fixture(fixture: &Path) -> BTreeMap<String, serde_json::Value> {
+/// One offline scan of a fixture (`repo/`, `library-claims.json`,
+/// `model-cassette/`), `read` over the store it wrote.
+fn scan_into_storage<T>(fixture: &Path, read: impl FnOnce(&Path) -> T) -> T {
     {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = tmp.path().join("workspace");
@@ -353,8 +353,16 @@ fn scan_typed_fixture(fixture: &Path) -> BTreeMap<String, serde_json::Value> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        read(&storage)
+    }
+}
+
+/// Every service's blob from one offline scan of a two-service types
+/// fixture, keyed by service name.
+fn scan_typed_fixture(fixture: &Path) -> BTreeMap<String, serde_json::Value> {
+    scan_into_storage(fixture, |storage| {
         let mut blobs = BTreeMap::new();
-        for entry in std::fs::read_dir(&storage).expect("the store reads") {
+        for entry in std::fs::read_dir(storage).expect("the store reads") {
             let path = entry.expect("dir entry").path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 let blob: serde_json::Value =
@@ -367,7 +375,7 @@ fn scan_typed_fixture(fixture: &Path) -> BTreeMap<String, serde_json::Value> {
             }
         }
         blobs
-    }
+    })
 }
 
 fn web() -> &'static serde_json::Value {
@@ -992,5 +1000,170 @@ fn a_hand_back_object_with_no_decided_body_member_is_unverifiable() {
     assert_eq!(
         hand_back_verdicts(&format!("{HAND_BACK_APP}:9")),
         [("response".to_string(), "unverifiable".to_string())]
+    );
+}
+
+/// `callEitherPlain` is `callEither` with no options of its own, so the
+/// request summaries own its caller's row (carrick#4196). The engine decides
+/// it cannot say which member holds the body (`body_member_undecided`), and
+/// that row keeps its response entry, `unknown`, and reads `unverifiable`
+/// like the model-owned `callEither` caller.
+#[test]
+fn a_summaries_owned_undecided_hand_back_is_kept_and_unverifiable() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:19")),
+        [("response".to_string(), "unverifiable".to_string())]
+    );
+    // The model-owned `callEither` caller (`:9`) and the summaries-owned one
+    // (`:19`) carry the same decided unknown, with the reason it is one.
+    for line in [9, 19] {
+        let site = format!("{HAND_BACK_APP}:{line}");
+        let entry = hand_back_entry(&site)
+            .unwrap_or_else(|| panic!("{site} keeps a response entry: {:#?}", hand_back_blobs()));
+        assert_eq!(entry["type_state"], "unknown", "{site} {entry:#}");
+        assert_eq!(
+            entry["any_provenance"][0]["reason"], "body_member_undecided",
+            "{site} {entry:#}"
+        );
+    }
+}
+
+/// The `web` consumer response entry at `site`, if the manifest holds one.
+fn hand_back_entry(site: &str) -> Option<&'static serde_json::Value> {
+    hand_back_blobs()
+        .get("web")
+        .and_then(|blob| blob["type_manifest"].as_array())
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry["role"] == "consumer"
+                && entry["type_kind"] == "response"
+                && format!(
+                    "{}:{}",
+                    entry["file_path"].as_str().unwrap_or_default(),
+                    entry["line_number"].as_u64().unwrap_or_default()
+                ) == site
+        })
+}
+
+/// The response type the `web` consumer entry at `site` carries.
+fn hand_back_response(site: &str) -> Option<String> {
+    hand_back_entry(site)
+        .and_then(|entry| entry["expanded_definition"].as_str().map(str::to_string))
+}
+
+/// `callPlain` fetches with no options of its own, so the request summaries
+/// own its caller's row (carrick#4196). The compiler engine's answer at the
+/// call names the member it read, so that caller takes the same response
+/// type, and the same verdict, as a caller whose row the model owns.
+#[test]
+fn a_hand_back_caller_gets_one_response_type_whoever_owns_its_row() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let modelled = hand_back_response(&format!("{HAND_BACK_APP}:4"));
+    assert!(modelled.is_some(), "app.ts:4 carries a response type");
+    assert_eq!(hand_back_response(&format!("{HAND_BACK_APP}:14")), modelled);
+    assert_eq!(
+        hand_back_verdicts(&format!("{HAND_BACK_APP}:14")),
+        [("response".to_string(), "compatible".to_string())]
+    );
+}
+
+/// A caller row whose response no request line reads is asked at its own
+/// call, and its consumer response entry goes unless the answer names the
+/// body member it read (carrick#4196). The site-payload request builder read
+/// the manifest before that drop, so it asked the compiler engine for the
+/// entries the drop then removed, and the capture wrote their aliases with no
+/// manifest entry (carrick#4213 T0). Every response alias a scan asked or
+/// captured has an entry, bar the files holding an external (non-bare) route
+/// row, which are a separate question (carrick#4213 T3).
+#[test]
+fn an_unmarked_caller_row_is_neither_asked_nor_captured() {
+    if !sidecar_available() {
+        return;
+    }
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/version-segments");
+    let orphans = scan_into_storage(&fixture, |storage| {
+        let mut orphans = Vec::new();
+        for entry in std::fs::read_dir(storage).expect("the store reads") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Some(service) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let blob: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let manifest = blob["type_manifest"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let entry_aliases: BTreeSet<String> = manifest
+                .iter()
+                .filter_map(|entry| entry["type_alias"].as_str().map(str::to_string))
+                .collect();
+            // A file holding a row whose path is not bare is T3's.
+            let external_files: BTreeSet<String> = blob["mount_graph"]["data_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|row| {
+                    !row["canonical_path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with('/')
+                })
+                .filter_map(|row| {
+                    let at = row["file_location"].as_str()?;
+                    Some(at.rsplit_once(':').map_or(at, |(file, _)| file).to_string())
+                })
+                .collect();
+            // Each alias a request or the capture named, with the files the
+            // reach record places it in (none for a capture-only alias).
+            let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let reach = storage.join(format!("{service}.type-reach.json.gz"));
+            if let Ok(bytes) = std::fs::read(&reach) {
+                let mut text = String::new();
+                flate2::read::GzDecoder::new(&bytes[..])
+                    .read_to_string(&mut text)
+                    .unwrap();
+                let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+                for (alias, files) in record["aliases"].as_object().into_iter().flatten() {
+                    let files = files
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|file| file.as_str().map(str::to_string))
+                        .collect();
+                    aliases.insert(alias.clone(), files);
+                }
+            }
+            if let Some(stub) = blob["capture_stub"]["files"]["carrick-manifest.json"].as_str() {
+                let stub: serde_json::Value = serde_json::from_str(stub).unwrap();
+                for row in stub["aliases"].as_array().into_iter().flatten() {
+                    if let Some(alias) = row["alias"].as_str() {
+                        aliases.entry(alias.to_string()).or_default();
+                    }
+                }
+            }
+            for (alias, files) in aliases {
+                if !alias.contains("_Response_Call") || entry_aliases.contains(&alias) {
+                    continue;
+                }
+                if !files.iter().any(|file| external_files.contains(file)) {
+                    orphans.push(format!("{service}: {alias} {files:?}"));
+                }
+            }
+        }
+        orphans
+    });
+    assert!(
+        orphans.is_empty(),
+        "response aliases asked or captured with no manifest entry: {orphans:#?}"
     );
 }

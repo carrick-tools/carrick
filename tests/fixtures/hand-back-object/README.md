@@ -11,10 +11,23 @@ and each caller's response type is the call's value.
   `api`.
 - `app.ts:9` calls `callEither`, whose two returns fill different members
   from the body read: no member is decided, so the site states no response
-  contract (`machinery_envelope`) and the pair is `unverifiable`.
+  contract (`body_member_undecided`) and the pair is `unverifiable`.
 
-Before the fix, both sites were typed as the whole object and judged
-`incompatible`.
+- `app.ts:14` calls `callPlain`, which fetches with no options of its own,
+  so the request summaries own the caller's row (carrick#4196). The
+  compiler engine's answer at the call names the member it read (`json`),
+  so the row takes the same response type as `app.ts:4` and the same
+  verdict. A caller whose wrapper's answer names no member keeps no
+  response type.
+
+- `app.ts:19` calls `callEitherPlain`: `callEither`'s two returns with no
+  options of its own, so the request summaries own the row. The answer is
+  the same decided `unknown` (`body_member_undecided`), and the row keeps
+  its response entry and reads `unverifiable`, as `app.ts:9` does.
+
+Before carrick#4185, `app.ts:4` and `app.ts:9` were typed as the whole object
+and judged `incompatible`. Before carrick#4196, `app.ts:14` carried no
+response type.
 
 The model's answer for each file is in `model-cassette/analyze-file/<file
 stem>.json`; `library-claims.json` is the store answer the scan replays.

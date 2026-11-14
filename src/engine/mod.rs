@@ -6359,6 +6359,7 @@ async fn analyze_current_repo_incremental(
                 cloud_data.type_manifest.as_deref().unwrap_or_default(),
                 repo_path,
                 &results,
+                &awaiting_body(&merged_results),
             );
             protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
                 &pubsub_results,
@@ -6417,13 +6418,17 @@ async fn analyze_current_repo_incremental(
             // types below (carrick#3103).
             let decision = if let Some(context) = reach {
                 let reach_started = Instant::now();
-                let (mut explicit, mut infer, _) = file_orchestrator.collect_type_requests(
-                    &merged_results,
-                    repo_path,
-                    &mount_graph,
-                    config,
-                    &service_modules,
-                );
+                let (mut explicit, mut infer, _, body_asks) = file_orchestrator
+                    .collect_type_requests_and_body_asks(
+                        &merged_results,
+                        repo_path,
+                        &mount_graph,
+                        config,
+                        &service_modules,
+                    );
+                // Every caller row asked at its own call could be typed
+                // there (carrick#4196).
+                infer.extend(body_asks);
                 explicit.extend_from_slice(&protocol_requests);
                 infer.extend_from_slice(&protocol_infer);
                 crate::site_payloads::take_over(&mut infer, &payload_infer);
@@ -6455,6 +6460,17 @@ async fn analyze_current_repo_incremental(
                 stub_dir,
                 type_reach,
             } = if let Some(kept) = kept_main {
+                // A caller row asked at its own call keeps its response entry
+                // where main's kept one (carrick#4196).
+                if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+                    let main_aliases: BTreeSet<String> = prev
+                        .type_manifest
+                        .iter()
+                        .flatten()
+                        .map(|entry| entry.type_alias.clone())
+                        .collect();
+                    withhold_unread_hand_backs(manifest, &merged_results, &main_aliases);
+                }
                 let without_twin = type_reach::keep_main_types(&mut cloud_data, prev, repo_path);
                 if without_twin > 0 {
                     warn!(
@@ -11656,6 +11672,11 @@ struct TypesOutcome {
 
 /// Resolve types through the sidecar, read the service's type-reach record
 /// from the program that answered, and run the v2 capture.
+///
+/// Whichever way the stage ends, a caller row asked at its own call keeps
+/// its response entry only where the answer named the body member it read
+/// (carrick#4196, [`withhold_unread_hand_backs`]): the resolved stage does
+/// it before its passes read the manifest, and every other exit here.
 #[allow(clippy::too_many_arguments)]
 fn resolve_types_if_available(
     sidecar: Option<&TypeSidecar>,
@@ -11672,6 +11693,46 @@ fn resolve_types_if_available(
     server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     cloud_data: &mut CloudRepoData,
 ) -> TypesOutcome {
+    let (outcome, hand_back_bodies) = resolve_types_stage(
+        sidecar,
+        file_orchestrator,
+        file_results,
+        repo_path,
+        extraction_config,
+        mount_graph,
+        config,
+        modules,
+        extra_explicit,
+        extra_infer,
+        payload_infer,
+        server_claims,
+        cloud_data,
+    );
+    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+        withhold_unread_hand_backs(manifest, file_results, &hand_back_bodies);
+    }
+    outcome
+}
+
+/// [`resolve_types_if_available`]'s stage, with the caller rows whose own
+/// call the resolution read a body member out of (empty where it did not
+/// resolve).
+#[allow(clippy::too_many_arguments)]
+fn resolve_types_stage(
+    sidecar: Option<&TypeSidecar>,
+    file_orchestrator: &FileOrchestrator,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    repo_path: &str,
+    extraction_config: Option<&crate::services::type_sidecar::ExtractionConfig>,
+    mount_graph: &MountGraph,
+    config: &Config,
+    modules: &crate::workspace_resolver::WorkspaceIndex,
+    extra_explicit: &[crate::services::type_sidecar::SymbolRequest],
+    extra_infer: &[crate::services::type_sidecar::InferRequestItem],
+    payload_infer: &[crate::services::type_sidecar::InferRequestItem],
+    server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
+    cloud_data: &mut CloudRepoData,
+) -> (TypesOutcome, BTreeSet<String>) {
     let Some(sidecar) = sidecar else {
         // The reason the run recorded at spawn, not a list of everything that
         // could have gone wrong: this string is what the boundary line reads
@@ -11687,7 +11748,7 @@ fn resolve_types_if_available(
             stage: "spawn".to_string(),
             detail,
         });
-        return TypesOutcome::default();
+        return (TypesOutcome::default(), BTreeSet::new());
     };
 
     debug!("Starting sidecar type resolution");
@@ -11707,6 +11768,17 @@ fn resolve_types_if_available(
                 server_claims,
             ) {
                 Ok(type_resolution) => {
+                    // Before any pass reads the manifest: a caller row whose
+                    // own call named no body member has no entry for the
+                    // anchors, the enrichment or the capture to keep
+                    // (carrick#4196).
+                    if let Some(manifest) = cloud_data.type_manifest.as_mut() {
+                        withhold_unread_hand_backs(
+                            manifest,
+                            file_results,
+                            &type_resolution.hand_back_bodies,
+                        );
+                    }
                     debug!(
                         "Type resolution: {} explicit, {} inferred, {} failures",
                         type_resolution.explicit_manifest.len(),
@@ -11789,10 +11861,13 @@ fn resolve_types_if_available(
                         cloud_data,
                     );
                     crate::phase_timing::mark(crate::phase_timing::Phase::Capture);
-                    TypesOutcome {
-                        stub_dir: captured,
-                        type_reach,
-                    }
+                    (
+                        TypesOutcome {
+                            stub_dir: captured,
+                            type_reach,
+                        },
+                        type_resolution.hand_back_bodies,
+                    )
                 }
                 Err(e) => {
                     warn!("Type resolution failed: {}", e);
@@ -11814,7 +11889,7 @@ fn resolve_types_if_available(
                         stage: "resolve".to_string(),
                         detail,
                     });
-                    TypesOutcome::default()
+                    (TypesOutcome::default(), BTreeSet::new())
                 }
             }
         }
@@ -11834,7 +11909,7 @@ fn resolve_types_if_available(
                 config.service_name.as_deref().unwrap_or("(root)"),
                 &e.to_string(),
             );
-            TypesOutcome::default()
+            (TypesOutcome::default(), BTreeSet::new())
         }
     }
 }
@@ -11956,13 +12031,15 @@ fn run_capture_for_service(
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
-    let (mut explicit, mut infer, inline_aliases) = file_orchestrator.collect_type_requests(
-        file_results,
-        repo_path,
-        mount_graph,
-        config,
-        modules,
-    );
+    let (mut explicit, mut infer, inline_aliases, body_asks) = file_orchestrator
+        .collect_type_requests_and_body_asks(file_results, repo_path, mount_graph, config, modules);
+    // The caller rows whose own call the resolution read a body member out
+    // of joined its requests there (carrick#4196); the rest never did.
+    infer.extend(body_asks.into_iter().filter(|ask| {
+        ask.alias
+            .as_ref()
+            .is_some_and(|alias| type_resolution.hand_back_bodies.contains(alias))
+    }));
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     crate::site_payloads::take_over(&mut infer, payload_infer);
@@ -14039,12 +14116,78 @@ fn stamp_stated_values(
     }
 }
 
+/// The caller rows whose response no request line reads, as `(file, line,
+/// method)`: the rows [`withhold_unread_hand_backs`] holds to the answer for
+/// their own call, and for which the site-payload request builder asks no
+/// response slot (carrick#4213 T0), so the engine's own ask is the only
+/// route that types one.
+pub(crate) fn awaiting_body(
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+) -> HashSet<(&str, u32, String)> {
+    let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
+    file_results
+        .iter()
+        .flat_map(|(file_path, result)| {
+            result
+                .data_calls
+                .iter()
+                .filter(|call| {
+                    call.at_caller
+                        && !call
+                            .request_line
+                            .as_deref()
+                            .is_some_and(|moved| moved.response)
+                })
+                .map(move |call| {
+                    (
+                        file_path.as_str(),
+                        normalize_line(call.line_number),
+                        normalize_manifest_method(call.method.as_deref().unwrap_or_default()),
+                    )
+                })
+        })
+        .collect()
+}
+
+/// A row at a caller whose response no request line reads (carrick#1601,
+/// carrick#3961) holds the value its function returns, which is no wire
+/// response, unless the function hands back the transport response beside
+/// the body it read (carrick#4196). Its own call is asked; the consumer
+/// response entry stays only where `kept`, the aliases whose answer named
+/// that body member, holds it. Every other such entry goes, as it does for
+/// a call with no internal producer.
+fn withhold_unread_hand_backs(
+    manifest: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    kept: &BTreeSet<String>,
+) {
+    let asked = awaiting_body(file_results);
+    if asked.is_empty() {
+        return;
+    }
+    manifest.retain(|entry| {
+        let withheld = entry.role == ManifestRole::Consumer
+            && entry.type_kind == ManifestTypeKind::Response
+            && !kept.contains(&entry.type_alias)
+            && entry.key.as_http().is_some_and(|(method, _)| {
+                asked.contains(&(
+                    entry.file_path.as_str(),
+                    entry.line_number,
+                    method.to_string(),
+                ))
+            });
+        !withheld
+    });
+}
+
 /// Drop the consumer type entries a row stated at a call to a function the
 /// service declares does not state.
 ///
 /// - **Response**, for a row the request summaries restate at a caller
 ///   (carrick#1601): the call's value is what the function returns, not the
-///   response body.
+///   response body. Not here: such a row's own call is asked whether the
+///   function hands back a body member (carrick#4196), so its entry waits
+///   for the answer ([`withhold_unread_hand_backs`]).
 /// - **Request**, for a row whose function builds the body itself or sends
 ///   none ([`crate::forwarded_body::CallBody::Built`], carrick#1782): the
 ///   call hands the function its parameters, and the function's own request
@@ -14079,21 +14222,18 @@ fn drop_call_through_entries(
             // A row that carries its request line's anchors (carrick#3961)
             // states the request from there, and the response only where its
             // function hands back the request's own value.
-            result.data_calls.iter().flat_map(move |call| {
+            result.data_calls.iter().filter_map(move |call| {
                 let moved = call.request_line.as_deref();
-                let response = (call.at_caller && !moved.is_some_and(|moved| moved.response))
-                    .then_some(ManifestTypeKind::Response);
                 let method = normalize_manifest_method(call.method.as_deref().unwrap_or_default());
-                let request = (call.call_body == Some(crate::forwarded_body::CallBody::Built)
+                (call.call_body == Some(crate::forwarded_body::CallBody::Built)
                     && (moved.is_none()
                         || !crate::type_manifest::producer_reads_request_body(&method)))
-                .then_some(ManifestTypeKind::Request);
-                response.into_iter().chain(request).map(move |kind| {
+                .then(|| {
                     (
                         file_path.as_str(),
                         normalize_line(call.line_number),
-                        method.clone(),
-                        kind,
+                        method,
+                        ManifestTypeKind::Request,
                     )
                 })
             })
@@ -14173,10 +14313,14 @@ fn stamp_manifest_anchor_symbols(
             // A row at a caller types its response from the request line
             // whose anchors it carries (carrick#3961), declared as that
             // line's file names it.
+            // A row at a caller whose response no request line reads is typed
+            // from the compiler engine's answer alone (carrick#4196): its own
+            // symbol names the function's value.
             let (anchor, using_file) = match call.request_line.as_deref() {
                 Some(moved) if call.at_caller && moved.response => {
                     (&moved.call, moved.file.as_str())
                 }
+                _ if call.at_caller => continue,
                 _ => (call, file_path.as_str()),
             };
             if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
@@ -15255,6 +15399,7 @@ async fn analyze_current_repo(
         cloud_data.type_manifest.as_deref().unwrap_or_default(),
         repo_path,
         &results,
+        &awaiting_body(&analysis_result.file_results),
     );
     protocol_requests.extend(file_orchestrator.collect_pubsub_type_requests(
         &pubsub_results,
@@ -16714,6 +16859,7 @@ mod tests {
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         };
         run_capture_for_service(
             &sidecar,
@@ -16927,6 +17073,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     errors: vec![],
                     anchor_changes: vec![],
                     request_files: Default::default(),
+                    hand_back_bodies: Default::default(),
                 },
                 &mut data,
             );
@@ -19509,6 +19656,8 @@ unfollowed_member_calls_total: 0,
 
         let mut entries = build_type_manifest_entries(&mount_graph, &config, ".");
         drop_call_through_entries(&mut entries, &file_results);
+        // No caller row's own call named a body member (carrick#4196).
+        withhold_unread_hand_backs(&mut entries, &file_results, &BTreeSet::new());
 
         let mut kept: Vec<(u32, String, ManifestTypeKind)> = entries
             .iter()
@@ -25273,6 +25422,7 @@ unfollowed_member_calls_total: 0,
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         }
     }
 
@@ -25398,6 +25548,7 @@ unfollowed_member_calls_total: 0,
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
         resolution.inferred_types.push(InferredType {
+            body_member: None,
             alias: "OrderView".to_string(),
             type_string: "{ id: string; currency: string }".to_string(),
             is_explicit: false,
@@ -25472,6 +25623,7 @@ unfollowed_member_calls_total: 0,
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
         resolution.inferred_types.push(InferredType {
+            body_member: None,
             alias: "OrderView".to_string(),
             type_string: "unknown".to_string(),
             is_explicit: false,
@@ -25512,6 +25664,7 @@ unfollowed_member_calls_total: 0,
     /// type-state path) is under test here.
     fn inferred_with_symbol(symbol: &str) -> InferredType {
         InferredType {
+            body_member: None,
             // Matches `consumer_entry("OrderView").type_alias`, so the anchor
             // join (by alias) fires.
             alias: "OrderView".to_string(),

@@ -1808,6 +1808,14 @@ export interface InferredType {
    */
   any_provenance?: TypeProvenance[];
   /**
+   * carrick#4196: the member of the call's value this answer read as the
+   * response body, set only where the call's function hands back an object
+   * holding the transport response beside the body it read (carrick#4185).
+   * The scanner keeps an answer at a caller row the request summaries own
+   * only when it carries this; every other answer is absent of it.
+   */
+  body_member?: string;
+  /**
    * carrick#1516, response inferences only: the same inference re-read with
    * every literal on the handler's path kept at its literal type
    * (`unwidened.ts`). `type_string` is what the compiler infers and what the

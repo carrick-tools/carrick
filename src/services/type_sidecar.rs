@@ -2159,6 +2159,14 @@ pub struct InferredType {
     /// whole answer to why an endpoint reports `any`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub any_provenance: Vec<TypeProvenance>,
+    /// carrick#4196: the member of the call's value this answer read as the
+    /// response body, set by the sidecar only where the call's function
+    /// hands back an object holding the transport response beside the body
+    /// it read (carrick#4185). A caller row the request summaries own keeps
+    /// its answer only when the answer carries this
+    /// ([`hand_back_bodies`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_member: Option<String>,
     /// declares the resolved type, when that file sits under a `node_modules`
     /// tree. `None` for a type the workspace declares itself AND for a type
     /// that did not resolve — absence is never evidence of locality, which is
@@ -2584,6 +2592,43 @@ pub struct TypeResolutionResult {
     /// that carried it, as the requests named them (carrick#3101). Filled by
     /// the caller that built the requests; the type-reach record reads it.
     pub request_files: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The aliases of the caller rows asked at their own call whose answer
+    /// named the body member it read (carrick#4196, [`hand_back_bodies`]).
+    /// Every other such row was never inferred and keeps no response entry.
+    pub hand_back_bodies: std::collections::BTreeSet<String>,
+}
+
+/// A bare `unknown` whose root finding is `body_member_undecided`: the engine
+/// decided the called function does not say which member holds the body, so
+/// the row is kept and reads unverifiable like a model-owned one.
+fn undecided_body_member(answer: &InferredType) -> bool {
+    answer.type_string.trim() == "unknown"
+        && answer
+            .any_provenance
+            .iter()
+            .any(|finding| finding.path.is_empty() && finding.reason == "body_member_undecided")
+}
+
+/// carrick#4196: which of `asks`, each a caller row's own call that the
+/// request summaries own and whose response no request line reads, the
+/// compiler engine answered by naming the body member it read: a wrapper
+/// that hands back the transport response beside the body. Every other
+/// answer (the wrapper's own value, an abstain, no answer) is the wrapper's,
+/// not the wire response, and its row keeps no response type. One question,
+/// one answerer: the member comes from the reader a model-owned row reads.
+pub fn hand_back_bodies(
+    asks: &[InferRequestItem],
+    answers: &[InferredType],
+) -> std::collections::BTreeSet<String> {
+    let asked: HashSet<&str> = asks.iter().filter_map(|ask| ask.alias.as_deref()).collect();
+    answers
+        .iter()
+        .filter(|answer| {
+            asked.contains(answer.alias.as_str())
+                && (answer.body_member.is_some() || undecided_body_member(answer))
+        })
+        .map(|answer| answer.alias.clone())
+        .collect()
 }
 
 impl TypeResolutionResult {
@@ -4700,6 +4745,7 @@ impl TypeSidecar {
             errors: vec![],
             anchor_changes: vec![],
             request_files: Default::default(),
+            hand_back_bodies: Default::default(),
         };
 
         // Infer implicit types FIRST: a successful inference is the compiler's
@@ -7830,6 +7876,7 @@ mod tests {
 
     fn inferred(alias: &str, symbol: Option<&str>, array_depth: Option<u32>) -> InferredType {
         InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: "{ at: string; }[]".to_string(),
             is_explicit: false,
@@ -7858,6 +7905,62 @@ mod tests {
             machinery: false,
             anchor_machinery: false,
         }
+    }
+
+    /// carrick#4196: a caller row whose owner never asked for a body keeps
+    /// its response entry where the engine named the body member it read, or
+    /// decided it cannot say which member holds the body
+    /// (`body_member_undecided`, a bare `unknown`), so the row reads
+    /// unverifiable like a model-owned one. Any other answer is the wrapper's.
+    #[test]
+    fn hand_back_bodies_keeps_a_named_member_and_a_decided_undecided_member() {
+        let ask = |alias: &str| InferRequestItem {
+            member: None,
+            result: None,
+            file_path: "src/app.ts".to_string(),
+            line_number: 1,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+            route_path: None,
+            result_unanswered: false,
+            through_call: None,
+            at_registration: false,
+        };
+        let finding = |reason: &str| TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: reason.to_string(),
+            detail: None,
+        };
+        let mut named = inferred("Named", None, None);
+        named.body_member = Some("json".to_string());
+        let mut undecided = inferred("Undecided", None, None);
+        undecided.type_string = "unknown".to_string();
+        undecided.any_provenance = vec![finding("body_member_undecided")];
+        let mut envelope = inferred("Envelope", None, None);
+        envelope.type_string = "unknown".to_string();
+        envelope.any_provenance = vec![finding("machinery_envelope")];
+        let mut shaped = inferred("Shaped", None, None);
+        shaped.any_provenance = vec![finding("body_member_undecided")];
+        let mut elsewhere = inferred("Elsewhere", None, None);
+        elsewhere.type_string = "unknown".to_string();
+        elsewhere.any_provenance = vec![finding("body_member_undecided")];
+        let asks = [
+            ask("Named"),
+            ask("Undecided"),
+            ask("Envelope"),
+            ask("Shaped"),
+        ];
+        let kept = hand_back_bodies(&asks, &[named, undecided, envelope, shaped, elsewhere]);
+        assert_eq!(
+            kept.into_iter().collect::<Vec<_>>(),
+            ["Named".to_string(), "Undecided".to_string()]
+        );
     }
 
     /// #306: the timeline shape. The LLM anchor is the bare element

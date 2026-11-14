@@ -3462,19 +3462,28 @@ export class TypeInferrer {
             `Call result at ${where} is a hand-back object around the response; ` +
               `its body is the member '${member}' the called function fills from the body read`
           );
-          return this.labelledCallResult(request, callExpr, { member: [member] });
+          const read = this.labelledCallResult(request, callExpr, { member: [member] });
+          // carrick#4196: the answer names the member it read, so a caller
+          // row whose owner never asked for a body reads this answer and no
+          // other reading of the call.
+          const decided = !(read.any_provenance ?? []).some(
+            (finding) => finding.path === '' && finding.reason === 'result_member_missing'
+          );
+          return decided ? { ...read, body_member: member } : read;
         }
         this.log(
           `Call result at ${where} holds transport machinery as a member and no member of ` +
             'it is decided as the body; this site states no response contract'
         );
-        return this.transportAbstain(
-          request,
-          callExpr,
-          "this call's result is an object that holds the transport response as one of its " +
+        return this.decidedAbstain(request, this.getNodeLocation(callExpr), {
+          path: '',
+          kind: 'unknown',
+          reason: 'body_member_undecided',
+          detail:
+            "this call's result is an object that holds the transport response as one of its " +
             "members, and the called function's code does not decide which member holds the " +
-            'parsed body, so this site states no response contract'
-        );
+            'parsed body, so this site states no response contract',
+        });
       }
     }
 

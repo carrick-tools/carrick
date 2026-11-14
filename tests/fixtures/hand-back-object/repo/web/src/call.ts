@@ -14,3 +14,16 @@ export async function callEither(url: string, early: boolean, init?: RequestInit
   }
   return { res, second: (await res.json()) as Reply };
 }
+
+export async function callPlain(url: string) {
+  const res = await fetch(new URL(url, BASE));
+  return { res, json: (await res.json()) as Reply };
+}
+
+export async function callEitherPlain(url: string, early: boolean) {
+  const res = await fetch(new URL(url, BASE));
+  if (early) {
+    return { res, first: (await res.json()) as Reply };
+  }
+  return { res, second: (await res.json()) as Reply };
+}

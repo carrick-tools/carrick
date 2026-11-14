@@ -6645,6 +6645,7 @@ mod tests {
         array_depth: Option<u32>,
     ) -> crate::services::type_sidecar::InferredType {
         crate::services::type_sidecar::InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: type_string.to_string(),
             is_explicit: false,
@@ -8388,6 +8389,7 @@ mod tests {
             through_call: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: text.to_string(),
             is_explicit: false,
@@ -8554,6 +8556,7 @@ mod tests {
             through_call: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: text.to_string(),
             is_explicit: false,
@@ -9217,6 +9220,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             is_explicit: true,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
+            body_member: None,
             alias: alias.to_string(),
             type_string: text.to_string(),
             is_explicit: false,

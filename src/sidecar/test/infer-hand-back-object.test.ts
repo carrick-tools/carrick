@@ -10,7 +10,7 @@
  * decided from the wrapper's own code, never from the member's name. Where
  * the wrapper cannot be read (a library hands the object back, or the
  * returns disagree), the site states no response contract
- * (`machinery_envelope`), so the object is never compared.
+ * (`body_member_undecided`), so the object is never compared.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -72,6 +72,16 @@ export async function onSaveHook() {
   const out = await action.run();
   return out.json.data.name;
 }
+
+export async function callBody(url: string) {
+  const res = await fetch(url);
+  return (await res.json()) as Reply;
+}
+
+export async function onSaveBody() {
+  const out = await callBody("/api/reply");
+  return out.data.name;
+}
 `;
 
 /** 1-based lines in SERVICE_TS, read off the source above. */
@@ -80,6 +90,7 @@ const HELD_LINE = 32;
 const TWO_WAYS_LINE = 37;
 const LIBRARY_LINE = 42;
 const HOOK_LINE = 50;
+const BODY_LINE = 60;
 
 const REPLY_TEXT = '{ data: { id: number; name: string; }; }';
 
@@ -88,6 +99,7 @@ interface InferShape {
     alias: string;
     type_string: string;
     any_provenance?: Array<{ path: string; kind: string; reason: string }>;
+    body_member?: string;
   }>;
 }
 
@@ -123,6 +135,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     assert.match(lines[TWO_WAYS_LINE - 1], /await callTwoWays\(/);
     assert.match(lines[LIBRARY_LINE - 1], /await fromLibrary\(/);
     assert.match(lines[HOOK_LINE - 1], /await action\.run\(/);
+    assert.match(lines[BODY_LINE - 1], /await callBody\(/);
 
     client = new SidecarClient();
     await client.start();
@@ -134,7 +147,12 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     fs.rmSync(repoDir, { recursive: true, force: true });
   });
 
-  async function infer(alias: string, line: number, expressionText: string) {
+  async function infer(
+    alias: string,
+    line: number,
+    expressionText: string,
+    result?: { member: string[] }
+  ) {
     const res = await client.send<InferShape>({
       action: 'infer',
       request_id: alias,
@@ -146,6 +164,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
           alias,
           expression_text: expressionText,
           expression_line: line,
+          ...(result ? { result } : {}),
         },
       ],
     });
@@ -159,12 +178,16 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     const inferred = await infer('Endpoint_Reply_Response_Call', CALL_LINE, 'call("/api/reply")');
     assert.ok(inferred, 'the wrapper states the body and the site must publish it');
     assert.strictEqual(collapse(inferred.type_string), REPLY_TEXT);
+    // carrick#4196: the answer names the member it read, so a caller row the
+    // request summaries own takes it and no other reading of the call.
+    assert.strictEqual(inferred.body_member, 'json');
   });
 
   it('reads the member through a local that holds the body read', async () => {
     const inferred = await infer('Endpoint_Reply_Response_Held', HELD_LINE, 'callHeld("/api/reply")');
     assert.ok(inferred, 'the wrapper states the body and the site must publish it');
     assert.strictEqual(collapse(inferred.type_string), REPLY_TEXT);
+    assert.strictEqual(inferred.body_member, 'parsed');
   });
 
   it('states no contract where the wrapper returns disagree on the member', async () => {
@@ -175,7 +198,8 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     );
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
+    assert.strictEqual(inferred.body_member, undefined);
   });
 
   it('states no contract where no code of the service builds the object', async () => {
@@ -186,13 +210,37 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     );
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
+    assert.strictEqual(inferred.body_member, undefined);
   });
 
   it('states no contract where a generic hook hands the object back', async () => {
     const inferred = await infer('Endpoint_Reply_Response_Hook', HOOK_LINE, 'action.run()');
     assert.ok(inferred, 'the decision must ride the row');
     assert.strictEqual(collapse(inferred.type_string), 'unknown');
-    assert.deepStrictEqual(rootReasons(inferred), ['machinery_envelope']);
+    assert.deepStrictEqual(rootReasons(inferred), ['body_member_undecided']);
+    assert.strictEqual(inferred.body_member, undefined);
+  });
+
+  // carrick#4196: only the hand-back reader marks its answer. A member the
+  // library store's label names and a call whose value is the body itself
+  // are answered without the marker.
+  it('marks no member the library label names', async () => {
+    const inferred = await infer(
+      'Endpoint_Reply_Response_Labelled',
+      LIBRARY_LINE,
+      'fromLibrary("/api/reply")',
+      { member: ['json'] }
+    );
+    assert.ok(inferred, 'the label names a member the type has');
+    assert.strictEqual(collapse(inferred.type_string), REPLY_TEXT);
+    assert.strictEqual(inferred.body_member, undefined);
+  });
+
+  it('marks no call whose value is the body itself', async () => {
+    const inferred = await infer('Endpoint_Reply_Response_Body', BODY_LINE, 'callBody("/api/reply")');
+    assert.ok(inferred, 'the wrapper hands back the body');
+    assert.strictEqual(collapse(inferred.type_string), 'Reply');
+    assert.strictEqual(inferred.body_member, undefined);
   });
 });
