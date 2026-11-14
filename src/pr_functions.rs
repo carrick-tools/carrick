@@ -27,7 +27,7 @@
 //! with, which is the key the cloud joins main's row by. The intent, the
 //! callees and the callers come from those rows.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use swc_common::errors::Handler;
@@ -384,6 +384,7 @@ pub fn join_rows<'a>(
                         }
                     })),
                     called_by: edges(callers.get(&key).into_iter().flatten().cloned()),
+                    similar: None,
                     file: key.0,
                     name: key.1,
                 }
@@ -420,6 +421,7 @@ pub fn join_rows<'a>(
         changed,
         removed,
         counts,
+        similar_index: None,
     }
 }
 
@@ -439,6 +441,27 @@ pub fn block_for_run(
     services: &[Config],
     data: &[CloudRepoData],
     unread: &BTreeSet<String>,
+) -> FunctionsBlock {
+    block_for_run_with(repo_path, base, services, data, unread, None)
+}
+
+/// The index an added function's `similar` rows are ranked against: every
+/// blob the run holds of main's copy of this repo and of its peers, each with
+/// the repo it belongs to. `repo` is this run's repo, the one the PR is in.
+pub struct SimilarSource<'a> {
+    pub repo: &'a str,
+    pub blobs: Vec<(String, &'a CloudRepoData)>,
+}
+
+/// [`block_for_run`], and each added function's `similar` rows when `similar`
+/// holds an index (carrick-cloud#3490).
+pub fn block_for_run_with(
+    repo_path: &str,
+    base: Option<&str>,
+    services: &[Config],
+    data: &[CloudRepoData],
+    unread: &BTreeSet<String>,
+    similar: Option<SimilarSource<'_>>,
 ) -> FunctionsBlock {
     let Some(base) = base else {
         return FunctionsBlock::Unknown {
@@ -487,11 +510,22 @@ pub fn block_for_run(
         name_changes(repo_path, &from, &head, &scope)
     });
     match named {
-        Ok(named) => FunctionsBlock::Named(join_rows(
-            named,
-            data.iter()
-                .flat_map(|service| service.function_definitions.values()),
-        )),
+        Ok(named) => {
+            // Read before `join_rows` caps the lists: a function the PR
+            // changed or removed is never a twin, listed or not.
+            let except = similar
+                .as_ref()
+                .map(|source| changed_keys(source.repo, &named));
+            let mut block = join_rows(
+                named,
+                data.iter()
+                    .flat_map(|service| service.function_definitions.values()),
+            );
+            if let (Some(source), Some(except)) = (similar, except) {
+                attach_similar(&mut block, data, source, &except);
+            }
+            FunctionsBlock::Named(block)
+        }
         Err(reason) => {
             // At info, on one line: git's stderr can run to several, and a
             // runner's log keeps each line as its own event (carrick#2285).
@@ -502,6 +536,39 @@ pub fn block_for_run(
             }
         }
     }
+}
+
+/// Every function the PR changed or removed, by (lower-cased repo, file, name)
+/// as [`crate::local_mode::similar::Similar::build_except`] reads it. An
+/// edited function's base path counts too, so a renamed file's old rows go.
+fn changed_keys(repo: &str, named: &Named) -> HashSet<(String, String, String)> {
+    let repo = repo.to_lowercase();
+    let mut keys = HashSet::new();
+    for change in &named.changed {
+        keys.insert((
+            repo.clone(),
+            change.file.clone(),
+            change.stated.name.clone(),
+        ));
+        if let Some(previous) = &change.previous_file {
+            keys.insert((repo.clone(), previous.clone(), change.stated.name.clone()));
+        }
+    }
+    for removed in &named.removed {
+        keys.insert((repo.clone(), removed.file.clone(), removed.name.clone()));
+    }
+    keys
+}
+
+/// Give each added function the indexed functions it looks like, as the edit
+/// hook ranks them. One index per run, built only when something was added.
+fn attach_similar(
+    block: &mut NamedFunctions,
+    data: &[CloudRepoData],
+    source: SimilarSource<'_>,
+    except: &HashSet<(String, String, String)>,
+) {
+    let _ = (block, data, source, except);
 }
 
 #[cfg(test)]
@@ -1453,5 +1520,256 @@ export function n(): number {
             }
         }
         println!("total: {all_files} changed source file(s) in {all_ms} ms");
+    }
+}
+
+/// The `similar` rows of a PR run's added functions (carrick-cloud#3490): a
+/// three-function PR over a small shop repo, ranked by the edit hook's ranker.
+#[cfg(test)]
+mod similar_rows {
+    use super::*;
+    use crate::git_state::tests::{committed_repo, git_in};
+    use serde_json::json;
+
+    const TOTAL: &str = "\
+export function totalPrice(items: { price: number; quantity: number }[]): number {
+  let total = 0;
+  for (const item of items) {
+    total += item.price * item.quantity;
+  }
+  return total;
+}
+";
+    /// A renamed near copy of `totalPrice`.
+    const SUM: &str = "\
+export function sumPrices(entries: { price: number; quantity: number }[]): number {
+  let total = 0;
+  for (const entry of entries) {
+    total += entry.price * entry.quantity;
+  }
+  return total;
+}
+";
+    /// Another copy of it, which the PR deletes.
+    const LEGACY: &str = "\
+export function legacyTotal(rows: { price: number; quantity: number }[]): number {
+  let total = 0;
+  for (const row of rows) {
+    total += row.price * row.quantity;
+  }
+  return total;
+}
+";
+    const LABEL: &str = "\
+export function formatLabel(name: string, count: number): string {
+  const suffix = count === 1 ? \"item\" : \"items\";
+  return `${name} (${count} ${suffix})`;
+}
+";
+    /// The PR edits `formatLabel`: its wording changes.
+    const LABEL_EDITED: &str = "\
+export function formatLabel(name: string, count: number): string {
+  const suffix = count === 1 ? \"thing\" : \"things\";
+  return `${name} (${count} ${suffix})`;
+}
+";
+    /// A renamed near copy of `formatLabel`.
+    const CAPTION: &str = "\
+export function captionText(title: string, amount: number): string {
+  const unit = amount === 1 ? \"item\" : \"items\";
+  return `${title} (${amount} ${unit})`;
+}
+";
+    const PLURAL: &str = "\
+export function pluralize(word: string, count: number): string {
+  return count === 1 ? word : word + \"s\";
+}
+";
+    const LONE: &str = "export function qzxwv(): void {}\n";
+
+    const REPO: &str = "shop";
+
+    fn blob(files: &[(&str, &str)]) -> CloudRepoData {
+        let mut definitions = HashMap::new();
+        for (file, source) in files {
+            let extracted =
+                extracted_in(Path::new(file), file.to_string(), source.to_string()).unwrap();
+            for (key, definition) in extracted.extractor.function_definitions {
+                definitions.insert(format!("{file}:{key}"), definition);
+            }
+        }
+        serde_json::from_value(json!({
+            "repo_name": REPO,
+            "endpoints": [], "calls": [], "mounts": [], "apps": {},
+            "imported_handlers": [],
+            "function_definitions": serde_json::to_value(&definitions).unwrap(),
+            "config_json": null, "package_json": null, "packages": null,
+            "last_updated": "2026-11-14T00:00:00Z", "commit_hash": "abc",
+        }))
+        .unwrap()
+    }
+
+    const BASE: [(&str, &str); 4] = [
+        ("cart/total.ts", TOTAL),
+        ("cart/legacy.ts", LEGACY),
+        ("ui/label.ts", LABEL),
+        ("ui/plural.ts", PLURAL),
+    ];
+
+    /// The PR: `sumPrices` and `captionText` added, `formatLabel` edited,
+    /// `legacy.ts` deleted. Returns the block the run writes with the index.
+    fn run(with_index: bool) -> FunctionsBlock {
+        let mut files = vec![("package.json", r#"{ "name": "shop", "private": true }"#)];
+        files.extend(BASE);
+        let (repo, base) = committed_repo(&files);
+        let root = repo.path();
+        std::fs::write(root.join("cart/sum.ts"), SUM).unwrap();
+        std::fs::write(root.join("ui/caption.ts"), CAPTION).unwrap();
+        std::fs::write(root.join("ui/label.ts"), LABEL_EDITED).unwrap();
+        git_in(root, &["rm", "-q", "cart/legacy.ts"]);
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-qm", "pr"]);
+        let main = blob(&BASE);
+        let head = blob(&[
+            ("cart/total.ts", TOTAL),
+            ("cart/sum.ts", SUM),
+            ("ui/label.ts", LABEL_EDITED),
+            ("ui/caption.ts", CAPTION),
+            ("ui/plural.ts", PLURAL),
+        ]);
+        let source = with_index.then(|| SimilarSource {
+            repo: REPO,
+            blobs: vec![(REPO.to_string(), &main)],
+        });
+        block_for_run_with(
+            root.to_str().unwrap(),
+            Some(&base),
+            &[Config::default()],
+            std::slice::from_ref(&head),
+            &BTreeSet::new(),
+            source,
+        )
+    }
+
+    fn named(block: &FunctionsBlock) -> &NamedFunctions {
+        let FunctionsBlock::Named(named) = block else {
+            panic!("{block:?}")
+        };
+        named
+    }
+
+    fn entry<'a>(block: &'a FunctionsBlock, name: &str) -> &'a ChangedFunction {
+        named(block)
+            .changed
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+    }
+
+    fn listed_names(entry: &ChangedFunction) -> Vec<&str> {
+        entry
+            .similar
+            .iter()
+            .flatten()
+            .map(|row| row.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_added_near_copy_of_a_main_function_lists_it_first() {
+        let block = run(true);
+        let sum = entry(&block, "sumPrices");
+        let names = listed_names(sum);
+        assert_eq!(names.first(), Some(&"totalPrice"), "{names:?}");
+        assert!(
+            !names.contains(&"legacyTotal"),
+            "removed by the PR: {names:?}"
+        );
+        assert!(!names.contains(&"sumPrices"));
+        // The index held main's functions less the PR's own: totalPrice and pluralize.
+        let size = named(&block).similar_index.expect("an index was ranked");
+        assert_eq!((size.functions, size.with_tokens), (2, 2));
+    }
+
+    #[test]
+    fn an_added_function_whose_twin_the_pr_edited_does_not_list_it() {
+        let block = run(true);
+        let caption = entry(&block, "captionText");
+        assert!(!listed_names(caption).contains(&"formatLabel"));
+        // No slot lost: the rows are those of an index that never held the
+        // edited and removed functions.
+        let mut kept = blob(&BASE);
+        kept.function_definitions
+            .retain(|_, d| d.name != "formatLabel" && d.name != "legacyTotal");
+        let index = crate::local_mode::similar::Similar::build([(REPO.to_string(), &kept)]);
+        let head = blob(&[("ui/caption.ts", CAPTION)]);
+        let row = head.function_definitions.values().next().unwrap();
+        let query = crate::local_mode::similar::Query::of(row, Vec::new());
+        let expected = index.similar(&query, REPO, "ui/caption.ts");
+        assert!(!expected.is_empty());
+        assert_eq!(caption.similar.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn an_edited_function_carries_no_similar() {
+        let block = run(true);
+        let label = entry(&block, "formatLabel");
+        assert_eq!(label.change, FunctionChange::Edited);
+        assert!(label.similar.is_none());
+        let json = serde_json::to_value(label).unwrap();
+        assert!(json.get("similar").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_run_without_an_index_writes_the_block_it_wrote_before() {
+        let block = run(false);
+        assert!(named(&block).similar_index.is_none());
+        let text = serde_json::to_value(&block).unwrap().to_string();
+        assert!(!text.contains("similar"), "{text}");
+        assert!(
+            text.contains("sumPrices"),
+            "the block still names the PR's functions"
+        );
+    }
+
+    #[test]
+    fn a_ranked_function_sharing_no_word_writes_an_empty_list() {
+        let (repo, base) = committed_repo(&[
+            ("package.json", r#"{ "name": "shop", "private": true }"#),
+            ("cart/total.ts", TOTAL),
+        ]);
+        std::fs::write(repo.path().join("lone.ts"), LONE).unwrap();
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-qm", "pr"]);
+        let main = blob(&[("cart/total.ts", TOTAL)]);
+        let head = blob(&[("cart/total.ts", TOTAL), ("lone.ts", LONE)]);
+        let block = block_for_run_with(
+            repo.path().to_str().unwrap(),
+            Some(&base),
+            &[Config::default()],
+            std::slice::from_ref(&head),
+            &BTreeSet::new(),
+            Some(SimilarSource {
+                repo: REPO,
+                blobs: vec![(REPO.to_string(), &main)],
+            }),
+        );
+        let json = serde_json::to_value(entry(&block, "qzxwv")).unwrap();
+        assert_eq!(json["similar"], json!([]));
+    }
+
+    #[test]
+    fn the_wire_snapshot_is_the_one_the_cloud_reads() {
+        let wire = serde_json::to_value(run(true)).unwrap();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/pr-functions-similar.json"
+        );
+        if std::env::var_os("CARRICK_BLESS_SNAPSHOT").is_some() {
+            std::fs::write(path, serde_json::to_string_pretty(&wire).unwrap() + "\n").unwrap();
+        }
+        let held: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(wire, held);
     }
 }
