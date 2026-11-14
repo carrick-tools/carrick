@@ -1714,11 +1714,81 @@ fn scanned_then_cli_edited(tmp: &Path) -> (PathBuf, PathBuf) {
     (repo, storage)
 }
 
+/// The two calls of `cli` into a function of `client` whose walk settles no
+/// request: a full scan withdraws their model rows (carrick#4206); a scan
+/// that carries `client` keeps them, because what `client`'s functions write
+/// and hand on is read only in the run that analyses it (carrick#4218 T0,
+/// fail closed).
+const INTO_CARRIED: [(u32, &str); 2] = [(76, "/reply"), (94, "/api/v1/pings")];
+
+/// Whether `entry` (a type entry or an unread site, by its `file` key and
+/// `line` key) is at one of [`INTO_CARRIED`].
+fn is_into_carried(entry: &serde_json::Value, file: &str, line: &str) -> bool {
+    entry[file] == COMMANDS && INTO_CARRIED.iter().any(|(at, _)| entry[line] == *at)
+}
+
+/// `blob` with everything the rows at [`INTO_CARRIED`] state taken out: the
+/// rows and their projection, their type entries, their boundary reasons and
+/// counts, the withdrawal named on their unread sites, and the declarations
+/// of `aliases` in the bundle.
+fn without_into_carried(mut blob: serde_json::Value, aliases: &[String]) -> serde_json::Value {
+    let at = |value: &serde_json::Value| {
+        INTO_CARRIED
+            .iter()
+            .any(|(line, _)| value.as_str() == Some(&format!("{COMMANDS}:{line}")))
+    };
+    blob["last_updated"] = serde_json::Value::Null;
+    if let Some(calls) = blob["mount_graph"]["data_calls"].as_array_mut() {
+        calls.retain(|call| !at(&call["file_location"]));
+    }
+    if let Some(calls) = blob["calls"].as_array_mut() {
+        calls.retain(|call| !at(&call["file_path"]));
+    }
+    if let Some(entries) = blob["type_manifest"].as_array_mut() {
+        entries.retain(|entry| !is_into_carried(entry, "file_path", "line_number"));
+    }
+    let boundary = &mut blob["boundary"];
+    boundary["model_only_rows"] = serde_json::Value::Null;
+    boundary["calls_without_expected_type"]["total"] = serde_json::Value::Null;
+    if let Some(reasons) = boundary["calls_without_expected_type"]["reasons"].as_array_mut() {
+        reasons.retain(|reason| {
+            !INTO_CARRIED.iter().any(|(line, _)| {
+                reason
+                    .as_str()
+                    .is_some_and(|text| text.ends_with(&format!("({COMMANDS}:{line})")))
+            })
+        });
+    }
+    if let Some(sites) = blob["unread_sites"].as_array_mut() {
+        for site in sites
+            .iter_mut()
+            .filter(|site| is_into_carried(site, "file", "line"))
+        {
+            site.as_object_mut().unwrap().remove("also");
+        }
+    }
+    if let Some(bundle) = blob["bundled_types"].as_str() {
+        let kept: String = bundle
+            .split_inclusive('\n')
+            .filter(|line| {
+                !aliases.iter().any(|alias| {
+                    line.contains(&format!("type {alias} "))
+                        || line.contains(&format!("interface {alias} "))
+                })
+            })
+            .collect();
+        blob["bundled_types"] = serde_json::Value::String(kept);
+    }
+    blob
+}
+
 /// carrick#2378: a service `--changed-only` carries states what the
 /// call-through pass reads of it (the definitions that hand back a request's
 /// parsed body, the calls whose value is not handed back, its own call-through
-/// rows), so the rows of the service analysed beside it settle exactly as a
-/// full scan settles them.
+/// rows), so the rows of the service analysed beside it settle as a full scan
+/// settles them, with one known gap: the rows at [`INTO_CARRIED`], which a
+/// full scan withdraws and the scoped scan keeps (carrick#4218 T0) until the
+/// facts that decide them are stored with the carried service.
 #[test]
 fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -1742,15 +1812,82 @@ fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     // rows of the services the scoped one carries.
     rescan(&repo, &full_storage, &tmp.path().join("home"), &[]);
 
-    let pinned = |mut blob: serde_json::Value| {
-        blob["last_updated"] = serde_json::Value::Null;
-        serde_json::to_string_pretty(&blob).unwrap()
+    let scoped_cli = read_blobs(&storage)["cli"].1.clone();
+    let full_cli = read_blobs(&full_storage)["cli"].1.clone();
+
+    // The known gap, exactly: the scoped scan keeps the two rows into the
+    // carried `client`, with their type entries, aliases and boundary
+    // counts; the full scan withdraws them and saves each site unread as
+    // withdrawn.
+    let rows_at = |blob: &serde_json::Value, line: u32| -> Vec<(String, String)> {
+        let site = format!("{COMMANDS}:{line}");
+        blob["mount_graph"]["data_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| call["file_location"] == site.as_str())
+            .map(|call| {
+                (
+                    text(&call["method"]).unwrap_or_default(),
+                    text(&call["canonical_path"]).unwrap_or_default(),
+                )
+            })
+            .collect()
     };
-    let scoped_blobs = read_blobs(&storage);
-    let full_blobs = read_blobs(&full_storage);
+    let withdrawn_at = |blob: &serde_json::Value, line: u32| {
+        blob["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == COMMANDS && site["line"] == line)
+            .any(|site| reasons(site).contains(&"own_function".to_string()))
+    };
+    for (line, path) in INTO_CARRIED {
+        assert_eq!(
+            rows_at(&scoped_cli, line),
+            [("GET".to_string(), path.to_string())],
+            "{COMMANDS}:{line} kept by the scoped scan"
+        );
+        assert_eq!(rows_at(&full_cli, line), [], "{COMMANDS}:{line} withdrawn");
+        assert!(!withdrawn_at(&scoped_cli, line), "{COMMANDS}:{line}");
+        assert!(withdrawn_at(&full_cli, line), "{COMMANDS}:{line}");
+    }
+    let aliases: Vec<String> = scoped_cli["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| is_into_carried(entry, "file_path", "line_number"))
+        .filter_map(|entry| text(&entry["type_alias"]))
+        .collect();
+    assert_eq!(aliases.len(), 4, "a request and a response entry each");
+    let scoped_bundle = scoped_cli["bundled_types"].as_str().unwrap_or_default();
+    let full_bundle = full_cli["bundled_types"].as_str().unwrap_or_default();
+    for alias in &aliases {
+        let declared = |bundle: &str| {
+            bundle.contains(&format!("type {alias} "))
+                || bundle.contains(&format!("interface {alias} "))
+        };
+        assert!(declared(scoped_bundle) && !declared(full_bundle), "{alias}");
+    }
+    let count = |blob: &serde_json::Value, key: &str| match key {
+        "model_only_rows" => blob["boundary"]["model_only_rows"].as_u64(),
+        _ => blob["boundary"]["calls_without_expected_type"]["total"].as_u64(),
+    };
+    for key in ["model_only_rows", "calls_without_expected_type"] {
+        assert_eq!(
+            count(&scoped_cli, key).map(|scoped| scoped - 2),
+            count(&full_cli, key),
+            "{key}"
+        );
+    }
+
+    // Everything else agrees.
+    let pinned = |blob: serde_json::Value| {
+        serde_json::to_string_pretty(&without_into_carried(blob, &aliases)).unwrap()
+    };
     assert_eq!(
-        pinned(scoped_blobs["cli"].1.clone()),
-        pinned(full_blobs["cli"].1.clone()),
+        pinned(scoped_cli),
+        pinned(full_cli),
         "the analysed service's blob"
     );
 }
