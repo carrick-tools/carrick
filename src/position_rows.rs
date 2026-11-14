@@ -800,11 +800,7 @@ impl PositionIndex {
         let indexed = self
             .relative(file)
             .and_then(|relative| self.files.get(&relative))
-            .ok_or(if self.walk_lost {
-                HoleReason::WalkLost
-            } else {
-                HoleReason::RowsMissing
-            })?;
+            .ok_or(HoleReason::RowsMissing)?;
         if indexed.skip.is_some() {
             return Err(HoleReason::NotInProgram);
         }
