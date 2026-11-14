@@ -849,12 +849,15 @@ fn readers_of_the_edit(
 /// `false` whenever that rule cannot say: the repo's services are not all at
 /// one commit and clean, a service's config is not on this machine, or the
 /// workspace cannot be read. Then the caller takes the path it always took.
+/// When its walk runs it states a `no-service-reads` timing line
+/// ([`TIMING_ENV`]).
 pub(super) fn no_service_reads(
     workspace_root: &Path,
     tree: &Tree,
     indexed: &IndexedRepo,
     paths: &HashSet<String>,
 ) -> bool {
+    let began = Instant::now();
     let Some(commit) = indexed.services.first().map(|service| &service.commit) else {
         return false;
     };
@@ -895,9 +898,11 @@ pub(super) fn no_service_reads(
     let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
     let kept = paths.clone();
     let only = listing.view(move |path| !kept.contains(path));
-    crate::change_scope::untouched_since(&repo_path, &configs, &only, commit)
+    let none = crate::change_scope::untouched_since(&repo_path, &configs, &only, commit)
         .iter()
-        .all(Option::is_none)
+        .all(Option::is_none);
+    took("no-service-reads", began);
+    none
 }
 
 /// What the working tree holds, since the index, of the files `service` reads:
