@@ -1,0 +1,7 @@
+{
+  "frameworks": [],
+  "data_fetchers": [],
+  "messaging_clients": ["@fixture/bus"],
+  "socket_clients": ["@fixture/wire"],
+  "notes": ""
+}

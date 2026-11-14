@@ -1,0 +1,11 @@
+{
+  "name": "summary-method-probe",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/bus": "^1.2.0",
+    "@fixture/wire": "^2.0.0",
+    "@fixture/legacy": "^0.4.0"
+  }
+}
