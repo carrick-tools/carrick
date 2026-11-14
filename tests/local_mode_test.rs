@@ -5747,9 +5747,7 @@ const NESTED_SHOP_ROUTE: &str = "mono/shop/catalog/app/routes/api.v1.widgets.$wi
 
 /// carrick#4390: in a repo whose folder sits below its git top level, an edit
 /// a service reads is still read. Neither the full re-check nor
-/// `check --changed` answers "no service reads the file" for it. Failing
-/// first: red until `recheck::no_service_reads` compares git's top-level
-/// paths in the scan-relative form its caller keeps.
+/// `check --changed` answers "no service reads the file" for it.
 #[test]
 #[serial]
 fn an_edit_in_a_repo_below_its_git_top_is_read_by_its_service() {
