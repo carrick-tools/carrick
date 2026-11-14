@@ -30517,12 +30517,14 @@ unfollowed_member_calls_total: 0,
         let rows_with = |kind: Option<&str>| {
             let mut answers = SiteAnswers::default();
             if let Some(kind) = kind {
-                let mut answered = Answered::default();
-                answered.kind = Some(SlotAnswer {
-                    value: Some(SlotValue::Text(kind.to_string())),
-                    confidence: 0.95,
-                    orders_agree: true,
-                });
+                let answered = Answered {
+                    kind: Some(SlotAnswer {
+                        value: Some(SlotValue::Text(kind.to_string())),
+                        confidence: 0.95,
+                        orders_agree: true,
+                    }),
+                    ..Answered::default()
+                };
                 answers
                     .answered
                     .insert(crate::site_rows::site_id(&record.anchors), answered);
