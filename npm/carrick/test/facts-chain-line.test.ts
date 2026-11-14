@@ -11,7 +11,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { drainRunner, fakeEnv, fixturePath, runHook, settleRunner } from "./helpers.ts";
+import { drainRunner, fakeEnv, fixturePath, runHook, settleRunner, withoutLineSwitches } from "./helpers.ts";
 import { commitRepos } from "./facts-repos.ts";
 import { context, lineOf, patchEdit } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
@@ -528,7 +528,7 @@ test("with the chain switch on, a file without the chains table is not known; ot
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
     return new Response(JSON.stringify({ success: false, error: { code: "facts_building" } }));
   }) as typeof fetch;
-  const env = { ...process.env, CARRICK_TOKEN: "t" };
+  const env = { ...withoutLineSwitches(), CARRICK_TOKEN: "t" };
   const ws = await workspace(t, baseRows());
   await dropChains(ws.root);
   const known = (i: number) => bodies[i]!["known_digest"] !== undefined;

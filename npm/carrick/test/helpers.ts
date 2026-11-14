@@ -204,10 +204,19 @@ export function editPayload(workspace: { root: string; file: string }, tool = "E
   };
 }
 
+/**
+ * A copy of `env` without any `CARRICK_*_LINES` switch (contract, chain, read,
+ * fact). A shell that exports one must not reach a test's "unset" arm; a test
+ * that wants a switch sets it after this.
+ */
+export function withoutLineSwitches(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !/^CARRICK_[A-Z_]*LINES$/.test(key)));
+}
+
 /** Env that points the plugin at the fake CLI and keeps its logs off stderr. */
 export function fakeEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    ...withoutLineSwitches(),
     CARRICK_BIN: fakeBin,
     CARRICK_LOG_QUIET: "1",
     CARRICK_FAKE_FIXTURE: fixturePath("check-mismatch.json"),
