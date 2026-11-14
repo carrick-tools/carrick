@@ -1402,12 +1402,14 @@ pub fn fold(
         // leaves it.
         // An old-path row a fact replaced goes from the graph as the
         // reader's does (carrick#3283), whether it stated another operation
-        // or the fact's own (carrick#4372).
+        // or the fact's own (carrick#4372); so does a base-path row stating
+        // the fact's own operation (carrick#4434).
         let is_model_row_of =
             |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
                 (call.resolution_source == Some(ResolutionSource::Model)
                     || call.resolution_source == Some(ResolutionSource::RequestSpec)
-                    || call.resolution_source.is_some_and(is_old_path_source))
+                    || call.resolution_source.is_some_and(is_old_path_source)
+                    || call.resolution_source.is_some_and(is_base_path_source))
                     && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
                         relative(root, f) == file && l.parse::<u32>().ok() == Some(line)
                     })
@@ -1608,6 +1610,10 @@ pub fn fold_rows(
         // line holds two calls and the fold cannot tell which call each row
         // is: the same-key old-path row keeps the site, and the fact is
         // kept out and counted.
+        // A base-path row (a call's spelling of an env or literal origin)
+        // that states the fact's own operation is the same request read the
+        // same way, and gives way under the same guard (carrick#4434). One
+        // of another operation keeps the site, and the fact is counted.
         // A socket-pass row gives way only to a fact stating the same
         // operation with a direction: the fact takes the site and its
         // provenance, the key unchanged (the frozen pass retires under
@@ -1627,6 +1633,10 @@ pub fn fold_rows(
                 || (row.fact()
                     && is_old_path(existing)
                     && (existing.key != row.key || !another_key_here))
+                || (row.fact()
+                    && existing.resolution_source.is_some_and(is_base_path_source)
+                    && existing.key == row.key
+                    && !another_key_here)
                 || (row.fact()
                     && existing.resolution_source == Some(ResolutionSource::SocketCall)
                     && existing.key == row.key
@@ -1909,6 +1919,18 @@ fn is_old_path_source(source: ResolutionSource) -> bool {
     matches!(
         source,
         ResolutionSource::ImportedMember | ResolutionSource::SameFileWrapper
+    )
+}
+
+/// Whether `source` is a pass that reads a call's own spelling of an env or
+/// literal origin (`call_base`). It is not an old-path source: it is
+/// code-decided and feeds neither `code_decided` nor the through fold's
+/// `one_fact` as [`is_old_path_source`] does, so a fact replaces such a row
+/// only where it states the same operation (carrick#4434).
+fn is_base_path_source(source: ResolutionSource) -> bool {
+    matches!(
+        source,
+        ResolutionSource::EnvBasePath | ResolutionSource::LiteralBasePath
     )
 }
 

@@ -966,6 +966,122 @@ fn a_fact_keeps_out_where_its_call_holds_a_reader_row_of_another_operation() {
     );
 }
 
+/// carrick#4434: a base-path row (a call's spelling of an env or literal
+/// origin) stating the fact's own operation is the same request. It gives
+/// way to the fact, which stands with its own provenance, and is counted as
+/// replaced by a fact so the graph's copy goes too.
+#[test]
+fn a_fact_replaces_a_base_path_row_stating_its_operation() {
+    let file = "src/forced-http.ts";
+    for source in [
+        ResolutionSource::EnvBasePath,
+        ResolutionSource::LiteralBasePath,
+    ] {
+        let same = OperationKey::http("POST", "/v1/items");
+        let mut calls = vec![blob_row(same.clone(), file, LINE, Some(source))];
+        let fold = fold_one(file, &mut calls, &mut Vec::new());
+        assert_eq!(
+            at_site(&calls, file),
+            vec![(same.clone(), Some(ResolutionSource::RequestSummary), None)],
+            "{source:?}"
+        );
+        assert_eq!(
+            fold.replaced_by_fact,
+            vec![(file.to_string(), LINE, same)],
+            "{source:?}"
+        );
+        assert!(fold.kept_out.is_empty(), "{source:?}: {:?}", fold.kept_out);
+    }
+}
+
+/// carrick#4434: a base-path row stating another operation than the fact
+/// keeps its site, and the fact is kept out and counted.
+#[test]
+fn a_base_path_row_of_another_operation_keeps_its_site() {
+    let file = "src/forced-http.ts";
+    let other = OperationKey::http("POST", "https://api.example.test/v1/other");
+    let mut calls = vec![blob_row(
+        other.clone(),
+        file,
+        LINE,
+        Some(ResolutionSource::LiteralBasePath),
+    )];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, file),
+        vec![(other, Some(ResolutionSource::LiteralBasePath), None)]
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+    assert_eq!(
+        fold.kept_out,
+        BTreeMap::from([("literal_base_path".to_string(), 1)])
+    );
+}
+
+/// carrick#4434, the mixed guard: a same-key base-path row beside a row of
+/// another operation at the line keeps the site, as an old-path row does.
+#[test]
+fn a_base_path_row_beside_a_row_of_another_operation_keeps_its_site() {
+    let file = "src/forced-http.ts";
+    let same = OperationKey::http("POST", "/v1/items");
+    let other = OperationKey::http("POST", "/v1/other");
+    let mut calls = vec![
+        blob_row(
+            same.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::LiteralBasePath),
+        ),
+        blob_row(
+            other.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::EnvBasePath),
+        ),
+    ];
+    let fold = fold_one(file, &mut calls, &mut Vec::new());
+    assert_eq!(
+        at_site(&calls, file),
+        vec![
+            (same, Some(ResolutionSource::LiteralBasePath), None),
+            (other, Some(ResolutionSource::EnvBasePath), None),
+        ]
+    );
+    assert!(fold.stated.is_empty() && fold.withdrawn.is_empty());
+    assert_eq!(
+        fold.kept_out,
+        BTreeMap::from([("literal_base_path".to_string(), 1)])
+    );
+}
+
+/// carrick#4434: a base-path row a fact replaced leaves the graph, and the
+/// fact's graph row reads its client and host.
+#[test]
+fn a_replaced_base_path_row_leaves_the_graph() {
+    let file = "src/forced-http.ts";
+    let mut pass = graph_call("POST", "/v1/items", file, ResolutionSource::LiteralBasePath);
+    pass.client = "post".to_string();
+    pass.host = Some("api.example.test".to_string());
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            OperationKey::http("POST", "/v1/items"),
+            file,
+            LINE,
+            Some(ResolutionSource::LiteralBasePath),
+        )],
+        vec![pass],
+    );
+    fold_into(&mut data, &rows());
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 1, "{graph:?}");
+    assert_eq!(
+        graph[0].resolution_source,
+        Some(ResolutionSource::RequestSummary)
+    );
+    assert_eq!(graph[0].client, "post");
+    assert_eq!(graph[0].host.as_deref(), Some("api.example.test"));
+}
+
 /// An answer in the band is no fact: an old-path row at its site keeps the
 /// site, and the answer states nothing there.
 #[test]
