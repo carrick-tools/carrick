@@ -9581,19 +9581,8 @@ fn append_deterministic_protocol_operations(
     // Same "{file}:{line}" convention the mount-graph conversions use. A
     // call's row; a producer's is `to_producer` below.
     let to_call = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
-        declared_at: None,
-        procedure: None,
-        owner: None,
         key,
-        params: vec![],
-        request_body: None,
-        response_body: None,
-        handler_name: None,
-        request_type: None,
-        response_type: None,
         file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
-        repo_name: None,
-        service_name: None,
         // Provenance is producer-side metadata, as it is for an HTTP call.
         provenance: Default::default(),
         // These ops come from the deterministic protocol extractions, not from
@@ -9609,15 +9598,10 @@ fn append_deterministic_protocol_operations(
         // event are already identified by their own name, and nothing
         // switches on a request field to reach them.
         dispatch: None,
-        schema_binding: None,
-        undeclared_selection: None,
         // The handler span is placed from an HTTP route's registration
         // (cloud#948); these rows have none.
         handler_span: None,
-        handler_file: None,
-        name_scope: None,
-        library_semantics: Vec::new(),
-        inference: None,
+        ..Default::default()
     };
     // A producer's row: tagged when its file sits in a mock or test-support
     // tree of the service, as an HTTP route is (#380, carrick#1626).
@@ -18954,15 +18938,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             |pkg: &str| format!("{home}/.cache/runtime/npm/registry.npmjs.org/{pkg}/dist/types");
 
         let op = |file: &str| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/orders".to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
             request_type: Some(TypeReference {
                 file_path: PathBuf::from(abs("src/types/order.ts")),
                 type_ann: None,
@@ -18978,18 +18954,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 alias: "Order".to_string(),
             }),
             file_path: PathBuf::from(abs(file)),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
 
         let mut graph = MountGraph::new();
@@ -19003,25 +18968,13 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             },
         );
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/orders".to_string(),
             full_path: "/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: abs("src/routes/orders.ts:18"),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         graph.data_calls.push(DataFetchingCall {
             procedure: None,
@@ -19411,14 +19364,8 @@ unfollowed_member_calls_total: 0,
     fn test_ast_stripping_removes_nodes() {
         // Create test CloudRepoData with AST nodes
         let endpoint = ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
             file_path: PathBuf::from("test.js"),
             request_type: Some(TypeReference {
                 file_path: PathBuf::from("test.ts"),
@@ -19435,18 +19382,7 @@ unfollowed_member_calls_total: 0,
                 alias: "ResponseType".to_string(),
             }),
             handler_name: Some("testHandler".to_string()),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
 
         let test_data = CloudRepoData {
@@ -19590,14 +19526,8 @@ unfollowed_member_calls_total: 0,
 
         // Create test data with TypeReferences that would cause SourceMap issues
         let endpoint = ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             owner: Some(OwnerType::App("test_app".to_string())),
             key: OperationKey::http("GET", "/test"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
             file_path: PathBuf::from("test.js"),
             request_type: Some(TypeReference {
                 file_path: PathBuf::from("test.ts"),
@@ -19614,18 +19544,7 @@ unfollowed_member_calls_total: 0,
                 alias: "ResponseType".to_string(),
             }),
             handler_name: Some("testHandler".to_string()),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
 
         let test_data = vec![CloudRepoData {
@@ -25872,7 +25791,6 @@ unfollowed_member_calls_total: 0,
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
         resolution.inferred_types.push(InferredType {
-            body_member: None,
             alias: "OrderView".to_string(),
             type_string: "{ id: string; currency: string }".to_string(),
             is_explicit: false,
@@ -25884,23 +25802,7 @@ unfollowed_member_calls_total: 0,
                 end_column: None,
             },
             infer_kind: InferKind::CallResult,
-            primary_type_symbol: None,
-            array_depth: None,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
-            any_provenance: Vec::new(),
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            read_spans: Vec::new(),
+            ..Default::default()
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -25948,7 +25850,6 @@ unfollowed_member_calls_total: 0,
         let mut manifest = vec![consumer_entry("OrderView")];
         let mut resolution = empty_resolution();
         resolution.inferred_types.push(InferredType {
-            body_member: None,
             alias: "OrderView".to_string(),
             type_string: "unknown".to_string(),
             is_explicit: false,
@@ -25960,23 +25861,7 @@ unfollowed_member_calls_total: 0,
                 end_column: None,
             },
             infer_kind: InferKind::CallResult,
-            primary_type_symbol: None,
-            array_depth: None,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
-            any_provenance: Vec::new(),
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            read_spans: Vec::new(),
+            ..Default::default()
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -25990,7 +25875,6 @@ unfollowed_member_calls_total: 0,
     /// type-state path) is under test here.
     fn inferred_with_symbol(symbol: &str) -> InferredType {
         InferredType {
-            body_member: None,
             // Matches `consumer_entry("OrderView").type_alias`, so the anchor
             // join (by alias) fires.
             alias: "OrderView".to_string(),
@@ -26005,22 +25889,7 @@ unfollowed_member_calls_total: 0,
             },
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: Some(symbol.to_string()),
-            array_depth: None,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
-            any_provenance: Vec::new(),
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            read_spans: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -36260,30 +36129,9 @@ io.on("bare:in", (event) => {});
         // in calls (consumer), keyed identically so they match cross-repo.
         let mut cloud_data = repo_with_bundle("metrics-monorepo", None, "");
         let to_details = |key: OperationKey, file_path: &Path, line: u32| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key,
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(format!("{}:{}", file_path.display(), line)),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         append_pubsub_operations(
             &mut cloud_data,
@@ -37052,30 +36900,9 @@ io.on("bare:in", (event) => {});
         repo.endpoints = paths
             .iter()
             .map(|path| ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
-                owner: None,
                 key: OperationKey::http("GET", path.to_string()),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from("src/routes.ts:1"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             })
             .collect();
         repo

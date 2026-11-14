@@ -270,25 +270,15 @@ mod tests {
 
     fn row(location: &str, handler: &str, source: Option<ResolutionSource>) -> ResolvedEndpoint {
         ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/users".to_string(),
             full_path: "/api/users".to_string(),
             handler: Some(handler.to_string()),
             owner: "router".to_string(),
             file_location: location.to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: source,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         }
     }
 

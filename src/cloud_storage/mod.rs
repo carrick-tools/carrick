@@ -1483,15 +1483,8 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
     ApiEndpointDetails {
         owner: Some(OwnerType::App(endpoint.owner.clone())),
         key: OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
-        params: vec![],
-        request_body: None,
-        response_body: None,
         handler_name: endpoint.handler.clone(),
-        request_type: None,
-        response_type: None,
         file_path: PathBuf::from(&endpoint.file_location),
-        repo_name: None,
-        service_name: None,
         provenance: endpoint.provenance,
         resolution_source: endpoint.resolution_source,
         view_module: endpoint.view_module,
@@ -1500,14 +1493,10 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         // it, nine operations behind one route are one row on the wire.
         dispatch: endpoint.dispatch.clone(),
         procedure: endpoint.procedure.clone(),
-        schema_binding: None,
-        undeclared_selection: None,
         handler_span: endpoint.handler_span,
         handler_file: endpoint.handler_file.clone(),
         declared_at: endpoint.declared_at.clone(),
-        name_scope: None,
-        library_semantics: Vec::new(),
-        inference: None,
+        ..Default::default()
     }
 }
 
@@ -1515,18 +1504,9 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
 /// pre-computed `canonical_path` ([`mount_graph_to_api_details`]).
 pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointDetails {
     ApiEndpointDetails {
-        declared_at: None,
-        owner: None,
         key: OperationKey::http(&call.method, call.canonical_path.clone()),
-        params: vec![],
-        request_body: None,
-        response_body: None,
         handler_name: Some(call.client.clone()),
-        request_type: None,
-        response_type: None,
         file_path: PathBuf::from(&call.file_location),
-        repo_name: None,
-        service_name: None,
         // Provenance is producer-side metadata; calls keep the default.
         provenance: Default::default(),
         resolution_source: call.resolution_source,
@@ -1536,14 +1516,9 @@ pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointD
         // on (carrick#831): the consumer half of the same identity.
         dispatch: call.dispatch.clone(),
         procedure: call.procedure.clone(),
-        schema_binding: None,
-        undeclared_selection: None,
         // A call has no handler.
         handler_span: None,
-        handler_file: None,
-        name_scope: None,
-        library_semantics: Vec::new(),
-        inference: None,
+        ..Default::default()
     }
 }
 
@@ -2348,30 +2323,11 @@ mod tests {
                 )
             };
             data.endpoints = vec![ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                owner: None,
                 key: OperationKey::http("POST", "/orders".to_string()),
-                params: vec![],
                 request_body: Some(fields()),
                 response_body: Some(fields()),
-                handler_name: None,
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from("src/orders.ts:1"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                view_module: false,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             }];
             data.mount_graph = Some(graph);
             data
@@ -2599,25 +2555,15 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
             handler: Some("handler".to_string()),
             owner: "http".to_string(),
             file_location: "src/mocks/handlers.ts:5".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
@@ -2639,47 +2585,28 @@ mod tests {
 
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
             handler: Some("loader".to_string()),
             owner: "http".to_string(),
             file_location: "app/routes/api.widgets.ts:4".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
-            view_module: false,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         // A route whose module also renders a view (carrick#704).
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: "GET".to_string(),
             path: "/admin".to_string(),
             full_path: "/admin".to_string(),
             handler: Some("loader".to_string()),
             owner: "http".to_string(),
             file_location: "app/routes/admin._index.tsx:7".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module: true,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         graph.data_calls.push(DataFetchingCall {
             procedure: None,
@@ -2740,25 +2667,15 @@ mod tests {
         };
         let mut graph = MountGraph::new();
         let route = |dispatch: Option<Dispatch>| ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: "POST".to_string(),
             path: "/types/check-or-upload".to_string(),
             full_path: "/types/check-or-upload".to_string(),
             handler: Some("handler".to_string()),
             owner: "http".to_string(),
             file_location: "lambdas/check-or-upload/index.ts:0".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            view_module: false,
             dispatch,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         };
         graph.endpoints.push(route(Some(case("search-by-intent"))));
         graph.endpoints.push(route(None));
@@ -2871,25 +2788,16 @@ mod tests {
 
         let mut graph = MountGraph::new();
         let row = |path: &str, file: &str, view_module: bool| ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: "GET".to_string(),
             path: path.to_string(),
             full_path: path.to_string(),
             handler: Some("loader".to_string()),
             owner: "http".to_string(),
             file_location: file.to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(ResolutionSource::FileBasedRoute),
             view_module,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         };
         graph
             .endpoints
@@ -3512,30 +3420,10 @@ mod tests {
         use crate::graphql::SchemaBinding;
         use crate::operation::{GraphqlOperationKind, OperationKey};
         let row = |key: OperationKey, binding: Option<SchemaBinding>| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            owner: None,
             key,
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: std::path::PathBuf::from("src/doc.graphql:2"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            view_module: false,
-            dispatch: None,
             schema_binding: binding,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let mut data = empty_repo("org/web", Some("web"));
         data.calls = vec![
@@ -4630,24 +4518,13 @@ mod tests {
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
             declared_at: Some("carrick.json:12".to_string()),
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/rpc".to_string(),
             full_path: "/rpc".to_string(),
-            handler: None,
             owner: "rpc".to_string(),
             file_location: "src/a.ts:3".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);
         assert_eq!(endpoints[0].declared_at.as_deref(), Some("carrick.json:12"));

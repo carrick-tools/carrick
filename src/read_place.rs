@@ -296,24 +296,7 @@ mod tests {
             is_explicit: false,
             source_location: location,
             infer_kind: InferKind::CallResult,
-            primary_type_symbol: None,
-            array_depth: None,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
-            any_provenance: Vec::new(),
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            read_spans: Vec::new(),
-            body_member: None,
+            ..Default::default()
         }
     }
 

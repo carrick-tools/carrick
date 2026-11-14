@@ -526,25 +526,14 @@ mod tests {
 
     fn row(method: &str, path: &str, handler: &str, location: &str) -> ResolvedEndpoint {
         ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: method.to_string(),
             path: path.to_string(),
             full_path: format!("/api{path}"),
             handler: Some(handler.to_string()),
             owner: "router".to_string(),
             file_location: location.to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            view_module: false,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         }
     }
 
