@@ -196,6 +196,9 @@ pub(in crate::request_summary) fn tests_at<'a>(
     flow.at
 }
 
+/// The `if` tests on a path, each with the branch taken.
+pub(in crate::request_summary) type PathTests<'a> = Vec<(&'a Expr, bool)>;
+
 /// The `if` tests that hold on every path from the start of a loop body to
 /// each read of a name the loop's head binds (carrick#4265), as [`tests_at`]
 /// places them, an unlabelled `continue` ending a path: for each read
@@ -204,7 +207,7 @@ pub(in crate::request_summary) fn tests_at<'a>(
 pub(in crate::request_summary) fn loop_body_tests<'a>(
     body: &'a Stmt,
     keys: &[BindingKey],
-) -> Vec<(u32, usize, Vec<(&'a Expr, bool)>)> {
+) -> Vec<(u32, usize, PathTests<'a>)> {
     let stmts: &'a [Stmt] = match body {
         Stmt::Block(block) => &block.stmts,
         other => std::slice::from_ref(other),
