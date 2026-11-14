@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 // Test utilities for parsing new formatter output
 struct TestOutput {
     raw_output: String,
@@ -66,10 +69,15 @@ fn test_imported_router_endpoint_resolution() {
 
     copy_dir_recursive(&fixture_path, &test_project_path).expect("Failed to copy test fixture");
 
+    // The fixture's sources import `express`; the store's answer for it is
+    // what labels their routes (carrick#3711).
+    let cassettes = install_express(temp_dir.path(), &test_project_path);
+
     // Run carrick on the test project
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(test_project_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
+        .env("CARRICK_MOCK_FIXTURE_DIR", &cassettes)
         // The fixture ships a lockfile and no node_modules, which is a bare
         // checkout on purpose, so the scan is told to scan it as it is
         // (carrick#1254).
@@ -137,9 +145,18 @@ fn test_basic_endpoint_detection() {
         );
     }
 
+    // The example carries the store's answer for `express`, which labels its
+    // routes (carrick#3711); the test setup installs `express` in it, and the
+    // smoke scans in ci.yml and build.yml read the same answer.
+    let cassettes = test_repo_path.join("__llm__");
+
     let output = Command::new(env!("CARGO_BIN_EXE_carrick"))
         .arg(test_repo_path.to_str().unwrap())
         .env("CARRICK_MOCK_ALL", "1")
+        .env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        )
         .output()
         .expect("Failed to execute carrick");
 
@@ -205,6 +222,16 @@ fn a_scan_with_no_previous_index_discovers_the_service_once() {
 }
 
 // Helper function to recursively copy directories
+/// Install the `express` stand-in in `repo` and write the store's answer for
+/// it under `scratch`; the returned path is the offline fixture dir a scan
+/// reads that answer from.
+fn install_express(scratch: &std::path::Path, repo: &std::path::Path) -> String {
+    real_packages::install(repo, &["express"]);
+    let cassettes = scratch.join("cassettes");
+    real_packages::write_claims(&cassettes, &["express"]);
+    format!("{}/", cassettes.display())
+}
+
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     if !dst.exists() {
         fs::create_dir_all(dst)?;

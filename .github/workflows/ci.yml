@@ -249,6 +249,9 @@ jobs:
         if: matrix.shard == 'steps'
         env:
           CARRICK_MOCK_ALL: "true"
+          # The store's answer for the `express` the setup installed in the
+          # example (carrick#3711).
+          CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
         run: |
           mkdir -p examples/express-single/output
           ./target/debug/carrick ./examples/express-single/ > examples/express-single/output/test_output.txt 2>&1

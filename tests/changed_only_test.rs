@@ -26,7 +26,58 @@ const FILES: &[(&str, &str)] = &[
         r#"{ "name": "changed-only-fixture", "private": true, "workspaces": ["apps/*", "packages/*"] }
 "#,
     ),
-    ("package-lock.json", "{ \"lockfileVersion\": 3 }\n"),
+    (
+        "package-lock.json",
+        r#"{
+  "name": "changed-only-fixture",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "changed-only-fixture", "workspaces": ["apps/*", "packages/*"] },
+    "node_modules/fixture-http-server": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/fixture-http-server/-/fixture-http-server-1.0.0.tgz"
+    },
+    "node_modules/fixture-http-client": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/fixture-http-client/-/fixture-http-client-1.0.0.tgz"
+    }
+  }
+}
+"#,
+    ),
+    // The service's server and client packages, installed (carrick#3711 R2):
+    // the store labels their exports, and a call is a candidate because it
+    // reaches one.
+    (
+        "node_modules/fixture-http-server/package.json",
+        r#"{ "name": "fixture-http-server", "version": "1.0.0", "types": "index.d.ts" }
+"#,
+    ),
+    (
+        "node_modules/fixture-http-server/index.d.ts",
+        r#"export interface Reply {
+  json(body: unknown): void;
+}
+export interface Server {
+  post(path: string, handler: (request: unknown, reply: Reply) => void): void;
+}
+export declare function createServer(): Server;
+"#,
+    ),
+    (
+        "node_modules/fixture-http-client/package.json",
+        r#"{ "name": "fixture-http-client", "version": "1.0.0", "types": "index.d.ts" }
+"#,
+    ),
+    (
+        "node_modules/fixture-http-client/index.d.ts",
+        r#"export interface ClientInstance {
+  post<T = any>(url: string): Promise<T>;
+}
+export declare function create(options?: { baseURL?: string }): ClientInstance;
+"#,
+    ),
     (
         "carrick.json",
         r#"{
@@ -72,25 +123,12 @@ const FILES: &[(&str, &str)] = &[
     ),
     (
         "apps/api/package.json",
-        r#"{ "name": "fixture-api", "private": true, "dependencies": { "@fixture/shared": "*" } }
+        r#"{ "name": "fixture-api", "private": true, "dependencies": { "@fixture/shared": "*", "fixture-http-server": "^1.0.0" } }
 "#,
     ),
     (
         "apps/api/tsconfig.json",
         r#"{ "extends": "../../tsconfig.base.json", "include": ["src"] }
-"#,
-    ),
-    (
-        "apps/api/src/http-server.ts",
-        r#"export interface Reply {
-  json(body: unknown): void;
-}
-export interface Server {
-  post(path: string, handler: (request: unknown, reply: Reply) => void): void;
-}
-export function createServer(): Server {
-  return { post() {} };
-}
 "#,
     ),
     (
@@ -104,7 +142,7 @@ export function createServer(): Server {
     ("apps/api/src/server.ts", SERVER_AT_A),
     (
         "apps/web/package.json",
-        r#"{ "name": "fixture-web", "private": true }
+        r#"{ "name": "fixture-web", "private": true, "dependencies": { "fixture-http-client": "^1.0.0" } }
 "#,
     ),
     (
@@ -113,18 +151,8 @@ export function createServer(): Server {
 "#,
     ),
     (
-        "apps/web/src/http-client.ts",
-        r#"export interface ClientInstance {
-  post<T = any>(url: string): Promise<T>;
-}
-export function create(options?: { baseURL?: string }): ClientInstance {
-  throw new Error(`no client for ${options?.baseURL}`);
-}
-"#,
-    ),
-    (
         "apps/web/src/checkout.ts",
-        r#"import { create } from "./http-client";
+        r#"import { create } from "fixture-http-client";
 import type { Order } from "../../api/src/types";
 import { describeOrder } from "../../api/src/model";
 
@@ -153,7 +181,7 @@ export async function typedCheckout(order: Order): Promise<number> {
     ("apps/worker/src/job.ts", JOB_AT_A),
 ];
 
-const SERVER_AT_A: &str = r#"import { createServer } from "./http-server";
+const SERVER_AT_A: &str = r#"import { createServer } from "fixture-http-server";
 import { label } from "@fixture/shared";
 import type { Order } from "./types";
 
@@ -223,6 +251,55 @@ const CASSETTES: &[(&str, &str)] = &[
       "payload_expression_line": null,
       "primary_type_symbol": null,
       "type_import_source": null
+    }
+  ]
+}"#,
+    ),
+    (
+        "library-claims/default.json",
+        r#"{
+  "library_claims": [
+    {
+      "package": "fixture-http-server",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-http-server",
+          "export": "createServer",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "receive", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "handler": { "arg": 1 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "fixture-http-client",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-http-client",
+          "export": "create",
+          "role": "http_client",
+          "side": "client",
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [
+            { "op": "request", "member": "post", "of": "instance:()", "name": { "arg": 0 }, "method": "POST", "picker": "fixture-picker" }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
     }
   ]
 }"#,
@@ -429,15 +506,7 @@ fn at_a() -> &'static Path {
             for (path, contents) in CASSETTES {
                 write(&cassettes, path, contents);
             }
-            for stem in [
-                "http-server",
-                "http-client",
-                "types",
-                "index",
-                "x",
-                "job",
-                "global",
-            ] {
+            for stem in ["types", "index", "x", "job", "global"] {
                 write(
                     &cassettes,
                     &format!("analyze-file/{stem}.json"),
@@ -644,16 +713,26 @@ fn a_file_that_shadows_a_resolution_is_an_input_when_added_or_deleted() {
     assert_analysed(&scan, &["api", "web"]);
 }
 
+/// A shared file's edit: its text before and after.
+type Edit = fn(String) -> String;
+
 /// Cases 7, 8 and 9: the shared tsconfig, the lockfile and carrick.json.
 #[test]
 fn shared_config_lockfile_and_carrick_json_analyse_every_service() {
-    for (path, append) in [
-        ("tsconfig.base.json", "\n"),
-        ("package-lock.json", "\n"),
-        ("carrick.json", "\n"),
-    ] {
+    // The lockfile is read now that it lists installed packages: a trailing
+    // newline moves no package, so its edit is one to its header, which the
+    // rule reads as a move of the whole repo's installs.
+    let edits: [(&str, Edit); 3] = [
+        ("tsconfig.base.json", |text| text + "\n"),
+        ("package-lock.json", |text| {
+            assert!(text.contains("\"requires\": true"));
+            text.replacen("\"requires\": true", "\"requires\": false", 1)
+        }),
+        ("carrick.json", |text| text + "\n"),
+    ];
+    for (path, edit) in edits {
         let (_, scan, _, _) = changed_only_after(|ws| {
-            let contents = ws.read(path) + append;
+            let contents = edit(ws.read(path));
             ws.edit(path, &contents);
         });
         assert_analysed(&scan, &["api", "web", "worker"]);

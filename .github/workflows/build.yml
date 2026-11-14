@@ -134,12 +134,21 @@ jobs:
         shell: bash
         run: cd src/sidecar && npm ci && npm run build
 
+      # The example's routes are labelled from the store's answer about the
+      # installed `express` (the cassette in the example), so the smoke scan
+      # runs on an installed example, as the test setup installs it
+      # (carrick#3711).
+      - name: Install the example's dependencies
+        shell: bash
+        run: cd examples/express-single && npm install
+
       # Run the binary just built (carrick#2197), so a break only a release
       # build has is found here and not at the RC scan.
       - name: Smoke the binary (scan)
         shell: bash
         env:
           CARRICK_MOCK_ALL: "true"
+          CARRICK_MOCK_FIXTURE_DIR: ./examples/express-single/__llm__/
           EXPECTED_ENDPOINTS: "3"
         run: |
           out="$RUNNER_TEMP/express-single-release.txt"
