@@ -364,7 +364,7 @@ describe('the check request keeps the GraphQL types (carrick#4403)', () => {
 });
 
 describe('the GraphQL types leave every other probe byte for byte (carrick#4403)', () => {
-  const sha = (spec: Partial<CheckPairSpec>) =>
+  const sha = (spec: Partial<CheckPairSpec>, types: GraphqlTypes | null = BILLING_TYPES) =>
     createHash('sha256')
       .update(
         buildProbe(
@@ -379,7 +379,7 @@ describe('the GraphQL types leave every other probe byte for byte (carrick#4403)
           (s) => `@carrick/${s}`,
           undefined,
           undefined,
-          () => BILLING_TYPES
+          () => types ?? undefined
         ).source
       )
       .digest('hex');
@@ -390,7 +390,7 @@ describe('the GraphQL types leave every other probe byte for byte (carrick#4403)
 
   it('(d) a root with no table is #4275\'s too', () => {
     assert.strictEqual(
-      sha({ graphql_root: { type: 'Query', field: 'receipt' } }),
+      sha({ graphql_root: { type: 'Query', field: 'receipt' } }, null),
       '10580dce23ced02ba5784e8b61c0b392aa03729cffcf1def0309d957a8d6fd8f'
     );
   });
