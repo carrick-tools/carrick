@@ -271,12 +271,13 @@ const isDroppedResponseStatus = (status: ResponseSiteStatus): boolean =>
  * list `DECIDED_ABSTAIN_REASONS` in `src/engine/type_compat_v2.rs` holds
  * final. A stated reply never replaces one (carrick#2674).
  */
-const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
+export const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
   'no_success_payload',
   'no_request_body',
   'projected_value_only',
   'serialised_body_unread',
   'body_built_by_callee',
+  'result_member_missing',
   'reshaped_by_callback',
   'body_member_undecided',
   'bound_by_callers',
