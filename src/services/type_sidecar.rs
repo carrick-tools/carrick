@@ -2224,8 +2224,8 @@ pub struct InferredType {
     /// decided abstain. Two readers: `demote_witnessed_borrowed_anchors`
     /// re-aims a demoted explicit `SymbolRequest` at its file, because the
     /// bundler resolves a symbol only against declarations IN the request's
-    /// `source_file`; and the engine's `anchor_inferred_symbols` states it as
-    /// the home of an anchor it fills (carrick#1819).
+    /// `source_file`; and `type_home::store_type_homes` states it as the
+    /// entry's `defined_in` (carrick#2148).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub type_home: Option<TypeHomeReport>,
     /// Blueprint row N8: the type `type_string` prints is framework

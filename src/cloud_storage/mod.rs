@@ -148,19 +148,22 @@ pub struct TypeManifestEntry {
     /// model emitted no anchor for this op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_type_symbol: Option<String>,
-    /// Where the entry's anchor symbol is DECLARED (carrick#649).
+    /// Where the type the entry's published text was printed from is DECLARED
+    /// (carrick#649, carrick#2148).
     ///
     /// `file_path`/`line_number` above are the site the operation was extracted
-    /// at — a route file's `satisfies GetLookupResponseBody`, or the import line
-    /// that brought the symbol in. That is where the type is USED, and a reader
-    /// answering "where is this type defined" from it answers wrongly. This
-    /// states the declaration itself, resolved from the import the file wrote
-    /// and confirmed against the declaring file's own AST.
+    /// at: where the type is USED, which answers "where is this type defined"
+    /// wrongly. This states the declaration itself. The compiler engine reports
+    /// it with each answer (past any barrel, at the declaration's name), and
+    /// one scanner pass, `type_home::store_type_homes`, is its only writer. An
+    /// entry with a symbol states a home only when the home names that symbol;
+    /// an entry with no symbol states the engine's, and only this field then
+    /// carries the name.
     ///
-    /// `None` whenever the scanner cannot see a declaration: an anchor with no
-    /// symbol, an import that resolves to no file on disk (a package, a
-    /// tsconfig path the scanner does not follow), a barrel re-export, or a
-    /// symbol the resolved file does not itself declare. Never a guess.
+    /// `None` for a shape nobody named, a TypeScript lib type, framework
+    /// machinery, a type declared in a package's own typings, a decided
+    /// abstain, a declaration outside the repo, and a home that names another
+    /// type than the entry's symbol. Never a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defined_in: Option<TypeHome>,
     /// Why this entry's type carries `any`/`unknown`, and where (carrick#376).

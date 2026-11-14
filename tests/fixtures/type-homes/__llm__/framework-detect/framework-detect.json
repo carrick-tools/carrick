@@ -1,0 +1,7 @@
+{
+  "frameworks": ["hono", "graphql-yoga"],
+  "data_fetchers": [],
+  "messaging_clients": ["@fixture/queue"],
+  "socket_clients": ["ws"],
+  "notes": ""
+}

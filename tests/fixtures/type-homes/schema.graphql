@@ -1,0 +1,8 @@
+type Parcel {
+  id: ID!
+  weightGrams: Int!
+}
+
+type Query {
+  parcel(id: ID!): Parcel
+}
