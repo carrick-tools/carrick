@@ -3654,10 +3654,7 @@ impl<'a> Walk<'a, '_> {
             self.lead(&down[0], end, Stop::SeveralOperations);
             return false;
         };
-        if literal_name(name).is_none()
-            && !super::site_record::reads_env(name)
-            && decided_at_several_calls(made)
-        {
+        if literal_name(name).is_none() && decided_at_several_calls(made) {
             let stop = self.pooled_stop(made);
             self.lead(&down[0], end, stop);
             return false;
