@@ -54,7 +54,7 @@ fn identifiers_split_the_way_the_lexical_leg_splits_them() {
 }
 
 /// An owned function, so a test can lend it to the index.
-struct Fn_ {
+struct Written {
     name: &'static str,
     file: &'static str,
     intent: Option<&'static str>,
@@ -63,8 +63,8 @@ struct Fn_ {
     calls: Vec<&'static str>,
 }
 
-fn function(name: &'static str, file: &'static str, tokens: &[&str]) -> Fn_ {
-    Fn_ {
+fn function(name: &'static str, file: &'static str, tokens: &[&str]) -> Written {
+    Written {
         name,
         file,
         intent: None,
@@ -74,7 +74,7 @@ fn function(name: &'static str, file: &'static str, tokens: &[&str]) -> Fn_ {
     }
 }
 
-fn index(corpus: &[Fn_]) -> SimilarIndex {
+fn index(corpus: &[Written]) -> SimilarIndex {
     SimilarIndex::build(corpus.iter().map(|f| SimilarDoc {
         name: f.name,
         file: f.file,
@@ -105,7 +105,7 @@ fn texts(words: &[&str]) -> Vec<String> {
 }
 
 /// Filler functions, so a word is rare or common as it would be in a repo.
-fn filler() -> Vec<Fn_> {
+fn filler() -> Vec<Written> {
     vec![
         function(
             "loadInvoices",
