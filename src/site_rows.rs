@@ -1943,7 +1943,7 @@ pub fn fold_rows(
     for unread in &site.unread {
         // A stop read inside a sibling's function beside the call's ends is
         // on a row line by construction and is kept (carrick#4474).
-        if !unread.beside
+        if true
             && (held_at(calls, &unread.file, unread.line)
                 || held_at(endpoints, &unread.file, unread.line))
         {
