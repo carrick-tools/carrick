@@ -18,4 +18,4 @@ for (const r of [{ base: '/v1', leaf: 'jobs' }, { base: '/v2', leaf: 'tasks' }])
 for (const r of [{ path: '/queue/a' }, { path: make() }]) app.post(r.path, h);
 
 // The method read off the element names the member: a computed callee.
-for (const r of ROUTES) app[r.verb](r.path, h);
+for (const r of [{ path: '/moves/a', verb: 'get' as const }, { path: '/moves/b', verb: 'post' as const }]) app[r.verb](r.path, h);
