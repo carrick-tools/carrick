@@ -430,7 +430,9 @@ pub fn run(
     // just read every blob, and a probe never writes.
     let built = match (&source, &inputs) {
         (Source::Read(held), Some(now))
-            if rescan && !kept_reads::is_current(workspace, index_generation, now, &tree.repo) =>
+            if rescan
+                && false
+                && !kept_reads::is_current(workspace, index_generation, now, &tree.repo) =>
         {
             let paths: Vec<PathBuf> = before
                 .repos
