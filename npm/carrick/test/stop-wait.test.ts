@@ -151,14 +151,6 @@ test("Stop with a pending re-check returns at once, ignores an older --wait-s, a
   const run = await stopWith(home);
   assert.equal(run.code, 0);
   assert.ok(run.ms < SPAWNED_MS, `Stop never waits (${run.ms} ms)`);
-  // The one Stop channel Claude Code delivers to the model while letting the
-  // turn continue: `systemMessage` never reaches the model, and `decision:
-  // "block"` reaches it by refusing to stop.
-  const parsed = JSON.parse(run.stdout) as Record<string, unknown> & { hookSpecificOutput: { hookEventName: string } };
-  assert.equal(parsed.hookSpecificOutput.hookEventName, "Stop");
-  assert.equal(parsed["decision"], undefined);
-  assert.equal(parsed["continue"], undefined);
-  assert.equal(parsed["systemMessage"], undefined);
   assert.equal(run.stdout, "", "a re-check still running prints nothing at Stop");
   assert.equal(changedQueued(workspace.root).length, 0, "the running re-check's answer rides the next hook event: no check --changed");
 });
@@ -168,8 +160,7 @@ test("a finding that lands after Stop is printed once, by the next prompt", asyn
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
   const entry = queue(workspace.root, home, workspace.file);
-  const stop = await stopWith(home);
-  assert.doesNotMatch(context(stop.stdout), /contract problem/);
+  assert.equal((await stopWith(home)).stdout, "", "running at Stop: silent");
 
   answer(home, entry, problem());
   const prompt = await promptHook(home, workspace.root);
@@ -235,7 +226,7 @@ test("the whole-change check Stop queued, answering later with a problem, is pri
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   await stopWith(home);
 
   const [changedEntry] = changedQueued(workspace.root);
@@ -250,6 +241,11 @@ test("the whole-change check Stop queued, answering later with a problem, is pri
   assert.equal((await promptHook(home, workspace.root)).stdout, "", "once");
 });
 
+/** An edited file whose re-check failed: a gap Stop names (a running re-check is not one). */
+function gapQueue(root: string, home: string, file: string): void {
+  stopped(home, queue(root, home, file));
+}
+
 /** The whole-change check answering clean, as the runner writes it: the queued entry plus its result. */
 function answerChangedClean(home: string, entry: QueueEntry): void {
   const changed = parseChangedResult(fs.readFileSync(fixturePath("check-changed-clean.json"), "utf8"), 0)!;
@@ -263,7 +259,7 @@ test("a clean whole-change check for files Stop named as still checking is print
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   assert.match(context((await stopWith(home)).stdout), NOT_CHECKED);
 
   const [changedEntry] = changedQueued(workspace.root);
@@ -310,7 +306,7 @@ test("a clean whole-change check that lands before the next Stop is said once, b
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   assert.match(context((await stopWith(home)).stdout), NOT_CHECKED);
 
   const [changedEntry] = changedQueued(workspace.root);
@@ -334,7 +330,7 @@ test("the same named set answered clean again is not said by a later Stop", asyn
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   await stopWith(home);
   const [first] = changedQueued(workspace.root);
   answerChangedClean(home, first!);
@@ -352,7 +348,7 @@ test("a clean named check beside a per-file problem: both print, the clean line 
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   await stopWith(home);
   const [changedEntry] = changedQueued(workspace.root);
   answerChangedClean(home, changedEntry!);
@@ -369,7 +365,7 @@ test("a check --changed that exits 2 prints nothing at Stop", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 1000);
-  queue(workspace.root, home, workspace.file);
+  gapQueue(workspace.root, home, workspace.file);
   await stopWith(home);
   const [changedEntry] = changedQueued(workspace.root);
   answerChangedExit(home, changedEntry!, 2);

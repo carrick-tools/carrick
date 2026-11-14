@@ -143,7 +143,7 @@ export const CHANGED_BUDGET_MS = 300_000;
 /** How often the runner touches its lock while one call runs. */
 const LOCK_TOUCH_MS = 30_000;
 
-export type Pending = QueueEntry & { toldRunning: boolean };
+export type Pending = QueueEntry;
 
 type Options = { home?: string };
 type ChangedOptions = Options & { named?: string[] };
@@ -744,13 +744,12 @@ function seqOf(session: string, name: string): string {
 export function pendingFor(session: string, home?: string): Pending[] {
   const all = sessionNames(session, home);
   const answered = new Set(all.filter((n) => n.endsWith(".answer.json")).map((n) => seqOf(session, n)));
-  const told = new Set(all.filter((n) => n.endsWith(".told-running")).map((n) => seqOf(session, n)));
   const out: Pending[] = [];
   for (const name of all.filter((n) => n.endsWith(".pending.json"))) {
     const seq = seqOf(session, name);
     if (answered.has(seq)) continue;
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
-    if (entry !== null) out.push({ ...entry, toldRunning: told.has(seq) });
+    if (entry !== null) out.push(entry);
   }
   return out;
 }
@@ -875,11 +874,4 @@ export function claimDelivery(session: string, seq: string, home?: string, now: 
   const file = sessionPart(session, seq, "delivered", home);
   if (file === null) return false;
   return createExclusive(file, `${JSON.stringify({ delivered_at: new Date(now).toISOString() })}\n`);
-}
-
-/** Claim the right to say one entry is still running: true for exactly one caller. */
-export function markToldRunning(session: string, seq: string, home?: string): boolean {
-  const file = sessionPart(session, seq, "told-running", home);
-  if (file === null) return false;
-  return createExclusive(file, `${JSON.stringify({ told_at: new Date().toISOString() })}\n`);
 }
