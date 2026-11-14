@@ -8,7 +8,7 @@
 //! by [`with_similar`].
 
 use super::super::contract::SimilarFunction;
-use super::super::similar::BUILDS;
+use super::super::similar::{BUILDS, Query};
 use super::*;
 
 const JOIN: &str = "export function joinRelative(root: string, file: string) {\n  \
@@ -263,4 +263,57 @@ fn one_probe_call_builds_the_index_once() {
     );
     assert!(nothing.is_empty());
     assert_eq!(BUILDS.with(|builds| builds.get()), 0);
+}
+
+/// A ranker written to disk and read back ranks as the one that was built.
+#[test]
+fn a_ranker_read_back_answers_as_built() {
+    let hit = "export function joinRelative(root: string, file: string) {\n  \
+        return file.startsWith(root) ? file.slice(root.length + 1) : file;\n}\n\
+        export function inside(p: string) { return joinRelative('/', p); }\n";
+    let first = "export function first(p: string) { return joinRelative('/', p); }\n";
+    let held = vec![
+        HeldFile {
+            file: "src/hit.ts",
+            intent: Some("Cuts a root prefix off a file path."),
+            ..here(hit, &[("inside", "joinRelative")])
+        },
+        HeldFile {
+            file: "src/first.ts",
+            callee_file: Some("src/hit.ts"),
+            ..here(first, &[("first", "joinRelative")])
+        },
+    ];
+    let blobs: Vec<_> = held.iter().map(|file| blob("shop", file)).collect();
+    let built = super::super::similar::Similar::build(
+        blobs.iter().map(|blob| (blob.repo_name.clone(), blob)),
+    );
+    let bytes = serde_json::to_vec(&built).expect("a ranker is written");
+    let back: super::super::similar::Similar =
+        serde_json::from_slice(&bytes).expect("a ranker is read back");
+
+    let edited = "export function relativePath(root: string, file: string) {\n  \
+        return file.startsWith(root) ? file.slice(root.length + 1) : file;\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "package.json", "{\"name\":\"svc\"}");
+    write(dir.path(), "src/b.ts", edited);
+    let none = std::collections::BTreeSet::new();
+    let added = additions(
+        &[crate::config::Config::default()],
+        dir.path(),
+        "src/b.ts",
+        &none,
+    );
+    let mut queries: Vec<Query> = added.into_iter().map(|(_, query)| query).collect();
+    queries.push(Query::named("joinRelative"));
+    queries.push(Query::named("first"));
+    assert_eq!(queries.len(), 3);
+    let mut some_called = false;
+    for query in &queries {
+        let rows = built.similar(query, "shop", "src/b.ts");
+        some_called |= rows.iter().any(|row| row.called_from > 0);
+        assert_eq!(back.similar(query, "shop", "src/b.ts"), rows, "{query:?}");
+    }
+    assert!(some_called, "the fixture has a row another file calls");
+    assert_eq!(back.size(), built.size());
 }
