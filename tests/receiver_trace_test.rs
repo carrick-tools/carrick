@@ -1924,6 +1924,47 @@ fn a_client_made_in_a_sibling_wrapper_field_states_its_base() {
     );
 }
 
+/// carrick#4445: where the site pass states the call into a sibling's class
+/// as a fact through it, that row is the call's own: it names the client the
+/// call is made through and the request it reaches in the sibling, as the
+/// row the cross-service pass writes at such a call does. A fact never reads
+/// less than the row it stands in for.
+#[test]
+fn a_fact_through_a_sibling_class_names_its_client_and_request() {
+    let on = scan_fixture("receiver-forms-client-sibling");
+    let app: serde_json::Value = on
+        .iter()
+        .find(|(name, _)| name.ends_with("__app.json"))
+        .map(|(_, text)| serde_json::from_str(text).unwrap())
+        .expect("the app's blob");
+    let at = "services/app/src/use.ts:2";
+    let graph_rows: Vec<&serde_json::Value> = app["mount_graph"]["data_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["file_location"] == at)
+        .collect();
+    let [row] = graph_rows.as_slice() else {
+        panic!("one graph row at {at}: {graph_rows:#?}");
+    };
+    assert_eq!(row["canonical_path"], "https://m.test/p/sib-field", "{row}");
+    assert_eq!(row["client"], "f", "{row}");
+    assert_eq!(
+        row["reaches_request"], "packages/api/src/index.ts:2",
+        "{row}"
+    );
+    let calls: Vec<&serde_json::Value> = app["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["file_path"] == at)
+        .collect();
+    let [call] = calls.as_slice() else {
+        panic!("one call row at {at}: {calls:#?}");
+    };
+    assert_eq!(call["handler_name"], "f", "{call}");
+}
+
 /// carrick#3044 S1: an HTTP client whose labels carry no `protocol` is
 /// judged under the #1564 rules, and a verified op there names the
 /// declaration of the member it judged, so every call of that member is a
