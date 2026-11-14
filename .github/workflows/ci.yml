@@ -200,8 +200,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           floor=$(tr -d '[:space:]' < tests/fixtures/blob-reader-floor/FLOOR)
-          latest=$(gh release view -R "$REPO" --json tagName -q .tagName)
-          latest=${latest#carrick-v}
+          # Newest release that already carries the asset: a release exists
+          # before its assets do (carrick#4451).
+          latest=$(bash scripts/latest-release-with-asset.sh "$REPO" carrick-action-linux.tar.gz)
+          echo "floor=$floor latest=$latest"
           bins=""
           for version in $(printf '%s\n%s\n' "$floor" "$latest" | sort -u); do
             dir="$RUNNER_TEMP/carrick-$version"
@@ -497,6 +499,11 @@ jobs:
       # stubbed: in order, skip-if-done, relabel last.
       - name: The release cut writes tag, Release and labels, relabel last
         run: bash scripts/release-cut.test.sh
+
+      # The blob reader test's "latest" skips a release whose assets are not
+      # uploaded yet (scripts/latest-release-with-asset.sh, carrick#4451).
+      - name: The latest-release resolver skips a release with no asset
+        run: bash scripts/latest-release-with-asset.test.sh
 
       # The release's glibc floor check (scripts/glibc-floor.sh, carrick#2218)
       # against stubbed objdump output: it must fail a binary above the floor.
