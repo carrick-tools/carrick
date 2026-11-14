@@ -6312,12 +6312,7 @@ async fn analyze_current_repo_incremental(
             );
             drop_call_through_entries(&mut manifest_entries, &merged_results, &site_payloads);
             stamp_stated_values(&mut manifest_entries, &merged_results);
-            stamp_manifest_anchor_symbols(
-                &mut manifest_entries,
-                &merged_results,
-                repo_path,
-                &service_modules,
-            );
+            stamp_manifest_anchor_symbols(&mut manifest_entries, &merged_results);
             let library_sites = LibrarySiteIndex::of(
                 &stated_library_rows(&protocol_extractions.library, repo_path, service),
                 repo_path,
@@ -12035,26 +12030,21 @@ fn resolve_types_stage(
                     if let Some(ref mut manifest) = cloud_data.type_manifest {
                         // In this order: each pass anchors only the rows the
                         // ones before it left without a symbol.
-                        restamp_arbitrated_anchors(
-                            manifest,
-                            &type_resolution.anchor_changes,
-                            repo_path,
-                        );
+                        restamp_arbitrated_anchors(manifest, &type_resolution.anchor_changes);
                         anchor_stated_body_roots(
                             manifest,
                             &type_resolution.inferred_types,
                             repo_path,
                         );
-                        anchor_inferred_symbols(
-                            manifest,
-                            &type_resolution.inferred_types,
-                            repo_path,
-                        );
+                        anchor_inferred_symbols(manifest, &type_resolution.inferred_types);
                         enrich_manifest_with_type_resolution(
                             manifest,
                             &type_resolution,
                             type_resolution.dts_content.as_deref(),
                         );
+                        // The only writer of a home, once every entry has its
+                        // symbol and every answer is in (carrick#2148).
+                        crate::type_home::store_type_homes(manifest, &type_resolution, repo_path);
                     }
                     // Per-symbol failures are logged in FileOrchestrator at the
                     // resolution call site (with capped warn + spillover to debug).
@@ -14586,16 +14576,6 @@ fn drop_call_through_entries(
     });
 }
 
-/// The anchor a file-analyzer result stated for one source site: the symbol,
-/// the import specifier the file brought it in through, and that file.
-struct AnchorAtSite {
-    symbol: String,
-    import_source: Option<String>,
-    /// The file whose imports name the symbol: the site's own, or the
-    /// request line's for a row carrying its anchors (carrick#3961).
-    using_file: String,
-}
-
 /// Thread the LLM's real type-anchor symbol onto the manifest entries (#233).
 ///
 /// The manifest's `type_alias` is a synthetic hashed name (`Endpoint_<hash>_…`);
@@ -14619,60 +14599,41 @@ struct AnchorAtSite {
 fn stamp_manifest_anchor_symbols(
     manifest: &mut [TypeManifestEntry],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
-    repo_path: &str,
-    modules: &crate::workspace_resolver::WorkspaceIndex,
 ) {
     // Mirror `parse_file_location`'s `Some(0) | None => 1` normalization so the
     // join keys line up on both sides.
     let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
     // (file_path, line_number) -> the anchor, from endpoints and calls.
-    let mut symbols: HashMap<(String, u32), AnchorAtSite> = HashMap::new();
+    let mut symbols: HashMap<(String, u32), String> = HashMap::new();
     for (file_path, result) in file_results {
         for endpoint in &result.endpoints {
             if let Some(symbol) = endpoint.primary_type_symbol.as_ref() {
                 symbols
                     .entry((file_path.clone(), normalize_line(endpoint.line_number)))
-                    .or_insert_with(|| AnchorAtSite {
-                        symbol: symbol.clone(),
-                        import_source: endpoint.type_import_source.clone(),
-                        using_file: file_path.clone(),
-                    });
+                    .or_insert_with(|| symbol.clone());
             }
         }
         for call in &result.data_calls {
             // A row at a caller types its response from the request line
-            // whose anchors it carries (carrick#3961), declared as that
-            // line's file names it.
+            // whose anchors it carries (carrick#3961).
             // A row at a caller whose response no request line reads is typed
             // from the compiler engine's answer alone (carrick#4196): its own
             // symbol names the function's value.
-            let (anchor, using_file) = match call.request_line.as_deref() {
-                Some(moved) if call.at_caller && moved.response => {
-                    (&moved.call, moved.file.as_str())
-                }
+            let anchor = match call.request_line.as_deref() {
+                Some(moved) if call.at_caller && moved.response => &moved.call,
                 _ if call.at_caller => continue,
-                _ => (call, file_path.as_str()),
+                _ => call,
             };
             if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
                 symbols
                     .entry((file_path.clone(), normalize_line(call.line_number)))
-                    .or_insert_with(|| AnchorAtSite {
-                        symbol: symbol.clone(),
-                        import_source: anchor.type_import_source.clone(),
-                        using_file: using_file.to_string(),
-                    });
+                    .or_insert_with(|| symbol.clone());
             }
         }
     }
     if symbols.is_empty() {
         return;
     }
-    // One parse of a declaring file serves every entry anchored in it, and one
-    // failed resolution is remembered as a failure rather than retried.
-    let mut homes: HashMap<(String, String), Option<crate::cloud_storage::TypeHome>> =
-        HashMap::new();
-    let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     for entry in manifest
         .iter_mut()
         .filter(|entry| entry.type_kind == ManifestTypeKind::Response)
@@ -14680,77 +14641,7 @@ fn stamp_manifest_anchor_symbols(
         let Some(anchor) = symbols.get(&(entry.file_path.clone(), entry.line_number)) else {
             continue;
         };
-        entry.primary_type_symbol = Some(anchor.symbol.clone());
-        entry.defined_in = homes
-            .entry((anchor.using_file.clone(), anchor.symbol.clone()))
-            .or_insert_with(|| {
-                anchor_declaration_site(
-                    &anchor.using_file,
-                    anchor,
-                    repo_path,
-                    modules,
-                    &cm,
-                    &handler,
-                )
-            })
-            .clone();
-    }
-}
-
-/// Where the file that USES an anchor says the anchor is declared, confirmed
-/// against the declaring file's own AST (carrick#649).
-///
-/// The import specifier the analyzer recorded is resolved exactly as the type
-/// sidecar's own `SymbolRequest` resolves it (`resolve_import_path`), so the
-/// two agree on which file the symbol was expected in. A specifier that names
-/// no file on disk resolves to a path that does not exist and is dropped here
-/// rather than reported; so is a file that turns out not to declare the symbol,
-/// which is what a barrel re-export looks like from the outside.
-///
-/// With no import specifier the symbol is declared in the using file itself, if
-/// anywhere — and the declaration line is still worth stating, because the
-/// entry's own `line_number` is the operation's line, not the type's.
-fn anchor_declaration_site(
-    using_file: &str,
-    anchor: &AnchorAtSite,
-    repo_path: &str,
-    modules: &crate::workspace_resolver::WorkspaceIndex,
-    cm: &Lrc<SourceMap>,
-    handler: &Handler,
-) -> Option<crate::cloud_storage::TypeHome> {
-    let using_absolute = absolute_source_path(using_file, repo_path);
-    let declaring = match anchor.import_source.as_deref() {
-        Some(source) => PathBuf::from(
-            crate::agents::file_orchestrator::FileOrchestrator::resolve_import_path(
-                &using_absolute.to_string_lossy(),
-                source,
-                modules,
-            ),
-        ),
-        None => using_absolute,
-    };
-    if !declaring.is_file() {
-        return None;
-    }
-    let line =
-        crate::type_manifest::type_declaration_line(&declaring, &anchor.symbol, cm, handler)?;
-    Some(crate::cloud_storage::TypeHome {
-        file_path: repo_relative(&declaring.to_string_lossy(), repo_path),
-        line_number: line,
-        symbol: anchor.symbol.clone(),
-    })
-}
-
-/// A manifest `file_path` as an absolute path on disk. The manifest carries
-/// whatever form the mount graph's `file_location` had, which is repo-relative
-/// for an uploaded blob and absolute for a live pass; joining an already
-/// absolute path onto the root is a no-op, so one branch covers both.
-fn absolute_source_path(file_path: &str, repo_path: &str) -> PathBuf {
-    let path = Path::new(file_path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        Path::new(repo_path).join(path)
+        entry.primary_type_symbol = Some(anchor.clone());
     }
 }
 
@@ -14769,13 +14660,7 @@ fn absolute_source_path(file_path: &str, repo_path: &str) -> PathBuf {
 fn restamp_arbitrated_anchors(
     manifest: &mut [TypeManifestEntry],
     changes: &[crate::services::type_sidecar::AnchorChange],
-    repo_path: &str,
 ) {
-    if changes.is_empty() {
-        return;
-    }
-    let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     for change in changes {
         let Some((key, role, file_path, line_number)) = manifest
             .iter()
@@ -14791,10 +14676,6 @@ fn restamp_arbitrated_anchors(
         else {
             continue;
         };
-        let home = change
-            .reaimed
-            .as_ref()
-            .and_then(|root| reported_declaration_home(root, repo_path, &cm, &handler));
         for entry in manifest.iter_mut().filter(|entry| {
             entry.key == key
                 && entry.role == role
@@ -14803,41 +14684,8 @@ fn restamp_arbitrated_anchors(
                 && entry.primary_type_symbol.as_deref() == Some(change.rejected.as_str())
         }) {
             entry.primary_type_symbol = change.reaimed.as_ref().map(|root| root.symbol.clone());
-            entry.defined_in = home.clone();
         }
     }
-}
-
-/// Where the sidecar says a re-aimed root is declared, as the manifest states
-/// a home: repo-relative, at the declaration's line. The sidecar's path is
-/// absolute and may spell the repo root in its resolved form, so both forms
-/// are tried; a file outside the repo, or one that does not declare the
-/// symbol under that name, has no home to state.
-fn reported_declaration_home(
-    root: &crate::services::type_sidecar::AnchorRoot,
-    repo_path: &str,
-    cm: &Lrc<SourceMap>,
-    handler: &Handler,
-) -> Option<crate::cloud_storage::TypeHome> {
-    let declaring = Path::new(&root.source_file);
-    if !declaring.is_file() {
-        return None;
-    }
-    let line = crate::type_manifest::type_declaration_line(declaring, &root.symbol, cm, handler)?;
-    let inside = |base: &Path| {
-        declaring
-            .strip_prefix(base)
-            .ok()
-            .filter(|rest| rest.is_relative())
-            .map(Path::to_path_buf)
-    };
-    let repo = Path::new(repo_path);
-    let relative = inside(repo).or_else(|| inside(&repo.canonicalize().ok()?))?;
-    Some(crate::cloud_storage::TypeHome {
-        file_path: relative.to_string_lossy().replace('\\', "/"),
-        line_number: line,
-        symbol: root.symbol.clone(),
-    })
 }
 
 /// Anchor a consumer response at the type its source states the body to be
@@ -14879,8 +14727,6 @@ fn anchor_stated_body_roots(
     for inf in inferred {
         first_by_alias.entry(inf.alias.as_str()).or_insert(inf);
     }
-    let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     for entry in manifest
         .iter_mut()
         .filter(|entry| entry.primary_type_symbol.is_none())
@@ -14891,25 +14737,17 @@ fn anchor_stated_body_roots(
         let Some(stated) = inf.stated_body.as_ref() else {
             continue;
         };
-        let (Some(root), Some(source_file)) = (
-            stated.root.as_ref(),
-            stated.root_home.as_ref().map(|home| &home.file_path),
-        ) else {
+        let (Some(root), Some(home)) = (stated.root.as_ref(), stated.root_home.as_ref()) else {
             continue;
         };
-        if stated.machinery {
+        // A root the engine found declared in the repo, under that name.
+        if stated.machinery
+            || home.symbol != *root
+            || crate::type_home::inside_repo(&home.file_path, repo_path).is_none()
+        {
             continue;
         }
-        let root = crate::services::type_sidecar::AnchorRoot {
-            symbol: root.clone(),
-            source_file: source_file.clone(),
-            home: stated.root_home.clone(),
-        };
-        let Some(home) = reported_declaration_home(&root, repo_path, &cm, &handler) else {
-            continue;
-        };
-        entry.primary_type_symbol = Some(root.symbol);
-        entry.defined_in = Some(home);
+        entry.primary_type_symbol = Some(root.clone());
     }
 }
 
@@ -14936,57 +14774,30 @@ fn anchor_stated_body_roots(
 /// call's inference anchors on the call's own type, which for `fetch` is
 /// `Response`: the thing the body is read out of, not the body.
 ///
-/// The home is read off the same inference (`type_home`'s file)
-/// and resolved as a re-aimed root's is (`reported_declaration_home`): the
-/// declaration's line, in a file inside the repo. A package installed under
-/// the repo's `node_modules` is inside the repo, and its home is the path it
-/// is installed at. The anchor is written with no home when the sidecar
-/// reported no source, when the file is outside the repo, and when the file
-/// does not declare the symbol as a type under that name: a file that only
-/// re-exports it, or one that declares it as a value.
+/// It writes the symbol only: the home is stored by
+/// `type_home::store_type_homes` (carrick#2148).
 fn anchor_inferred_symbols(
     manifest: &mut [TypeManifestEntry],
     inferred: &[crate::services::type_sidecar::InferredType],
-    repo_path: &str,
 ) {
-    let mut named: HashMap<&str, (&str, Option<&str>)> = HashMap::new();
+    let mut named: HashMap<&str, &str> = HashMap::new();
     for inf in inferred {
         if let Some(symbol) = inf
             .primary_type_symbol
             .as_deref()
             .filter(|_| !inf.anchor_machinery)
         {
-            named.entry(inf.alias.as_str()).or_insert((
-                symbol,
-                inf.type_home.as_ref().map(|home| home.file_path.as_str()),
-            ));
+            named.entry(inf.alias.as_str()).or_insert(symbol);
         }
     }
-    let cm: Lrc<SourceMap> = Default::default();
-    let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
-    // One read of a declaring file per symbol, however many entries name it.
-    let mut homes: HashMap<(&str, &str), Option<crate::cloud_storage::TypeHome>> = HashMap::new();
     for entry in manifest
         .iter_mut()
         .filter(|entry| entry.primary_type_symbol.is_none())
     {
-        let Some(&(symbol, source)) = named.get(entry.type_alias.as_str()) else {
+        let Some(&symbol) = named.get(entry.type_alias.as_str()) else {
             continue;
         };
         entry.primary_type_symbol = Some(symbol.to_string());
-        entry.defined_in = source.and_then(|source_file| {
-            homes
-                .entry((source_file, symbol))
-                .or_insert_with(|| {
-                    let root = crate::services::type_sidecar::AnchorRoot {
-                        symbol: symbol.to_string(),
-                        source_file: source_file.to_string(),
-                        home: None,
-                    };
-                    reported_declaration_home(&root, repo_path, &cm, &handler)
-                })
-                .clone()
-        });
     }
 }
 
@@ -15690,12 +15501,7 @@ async fn analyze_current_repo(
         &site_payloads,
     );
     stamp_stated_values(&mut manifest_entries, &analysis_result.file_results);
-    stamp_manifest_anchor_symbols(
-        &mut manifest_entries,
-        &analysis_result.file_results,
-        repo_path,
-        &service_modules,
-    );
+    stamp_manifest_anchor_symbols(&mut manifest_entries, &analysis_result.file_results);
     let library_sites = LibrarySiteIndex::of(
         &stated_library_rows(&protocol_extractions.library, repo_path, service),
         repo_path,
@@ -26075,7 +25881,7 @@ unfollowed_member_calls_total: 0,
             .inferred_types
             .push(inferred_with_symbol("OrderView"));
 
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types);
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -26099,7 +25905,7 @@ unfollowed_member_calls_total: 0,
             .inferred_types
             .push(inferred_with_symbol("OrderView"));
 
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types);
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -26122,7 +25928,7 @@ unfollowed_member_calls_total: 0,
             ..inferred_with_symbol("Response")
         });
 
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types);
 
         assert_eq!(manifest[0].primary_type_symbol, None);
     }
@@ -26137,7 +25943,7 @@ unfollowed_member_calls_total: 0,
             let mut resolution = empty_resolution();
             resolution.inferred_types.push(inferred_with_symbol(name));
 
-            anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "");
+            anchor_inferred_symbols(&mut manifest, &resolution.inferred_types);
 
             assert_eq!(manifest[0].primary_type_symbol.as_deref(), Some(name));
         }
@@ -26185,30 +25991,51 @@ unfollowed_member_calls_total: 0,
     }
 
     /// An inference that resolved `symbol` and, when the sidecar found one,
-    /// the file that declares it.
+    /// the file that declares it, at line 1.
     fn inferred_from(symbol: &str, source: Option<&Path>) -> InferredType {
+        inferred_at(symbol, source, 1)
+    }
+
+    /// [`inferred_from`], with the line the engine reports for the declaration.
+    fn inferred_at(symbol: &str, source: Option<&Path>, line: u32) -> InferredType {
         let mut inferred = inferred_with_symbol(symbol);
         inferred.type_home = source.map(|path| crate::services::type_sidecar::TypeHomeReport {
             symbol: symbol.to_string(),
             file_path: as_reported(path),
-            line: 1,
+            line,
         });
         inferred
     }
 
+    /// The anchor passes in the order the stage runs them, then the one pass
+    /// that stores the home (carrick#2148).
+    fn anchored_and_stored(
+        manifest: &mut [TypeManifestEntry],
+        resolution: &TypeResolutionResult,
+        repo_path: &str,
+    ) {
+        restamp_arbitrated_anchors(manifest, &resolution.anchor_changes);
+        anchor_stated_body_roots(manifest, &resolution.inferred_types, repo_path);
+        anchor_inferred_symbols(manifest, &resolution.inferred_types);
+        crate::type_home::store_type_homes(manifest, resolution, repo_path);
+    }
+
     /// The one entry of a manifest the model anchored nothing in, after the
-    /// inference fill has read `inferred` for a scan of `repo`.
+    /// anchor passes and the home store have read `inferred` for a scan of
+    /// `repo`.
     fn filled(inferred: Vec<InferredType>, repo: &Path) -> TypeManifestEntry {
         let mut manifest = vec![consumer_entry("OrderView")];
-        anchor_inferred_symbols(&mut manifest, &inferred, &repo.to_string_lossy());
+        let mut resolution = empty_resolution();
+        resolution.inferred_types = inferred;
+        anchored_and_stored(&mut manifest, &resolution, &repo.to_string_lossy());
         manifest.remove(0)
     }
 
     /// The inference reports where the type it resolved is declared, so the
-    /// anchor it fills carries that declaration as its home, as an anchor the
-    /// model named does: the file, repo-relative, and the declaration's own
-    /// line. A package installed inside the repo is a file inside the repo,
-    /// and its home is the path it is installed at.
+    /// entry it anchors carries that declaration as its home: the file,
+    /// repo-relative, and the declaration's own line. A package installed
+    /// inside the repo is a file inside the repo, and its home is the path it
+    /// is installed at.
     #[test]
     fn inferred_anchor_states_where_its_type_is_declared() {
         let repo = filled_anchor_repo();
@@ -26225,7 +26052,10 @@ unfollowed_member_calls_total: 0,
             ),
         ];
         for (symbol, source, file_path, line_number) in cases {
-            let entry = filled(vec![inferred_from(symbol, Some(source))], repo.path());
+            let entry = filled(
+                vec![inferred_at(symbol, Some(source), line_number)],
+                repo.path(),
+            );
 
             assert_eq!(entry.primary_type_symbol.as_deref(), Some(symbol));
             assert_eq!(
@@ -26240,45 +26070,40 @@ unfollowed_member_calls_total: 0,
         }
     }
 
-    /// The anchor is still filled where no home can be stated for it. Each
-    /// source here is one the row cannot point a reader at.
+    /// The anchor is still filled where no home can be stated for it: the
+    /// engine reported no source, or one outside the repo.
     #[test]
     fn inferred_anchor_states_no_home_it_cannot_find() {
         let repo = filled_anchor_repo();
         let elsewhere = tempfile::tempdir().expect("tempdir");
         let outside = elsewhere.path().join("events.ts");
         std::fs::write(&outside, EVENTS_SOURCE).expect("write");
-        let events = repo.path().join("src/events.ts");
-        let barrel = repo.path().join("src/index.ts");
-        let missing = repo.path().join("src/gone.ts");
         let cases = [
-            ("no source reported", "OrderPlaced", None),
-            ("declared outside the repo", "OrderPlaced", Some(&outside)),
-            (
-                "a file that re-exports the name and declares nothing",
-                "OrderPlaced",
-                Some(&barrel),
-            ),
-            ("declared as a value", "OrderSchema", Some(&events)),
-            ("a file that is not there", "OrderPlaced", Some(&missing)),
+            ("no source reported", None),
+            ("declared outside the repo", Some(&outside)),
         ];
-        for (why, symbol, source) in cases {
+        for (why, source) in cases {
             let entry = filled(
-                vec![inferred_from(symbol, source.map(|path| path.as_path()))],
+                vec![inferred_from(
+                    "OrderPlaced",
+                    source.map(|path| path.as_path()),
+                )],
                 repo.path(),
             );
 
-            assert_eq!(entry.primary_type_symbol.as_deref(), Some(symbol), "{why}");
+            assert_eq!(
+                entry.primary_type_symbol.as_deref(),
+                Some("OrderPlaced"),
+                "{why}"
+            );
             assert_eq!(entry.defined_in, None, "{why}");
         }
     }
 
-    /// The home is read off the inference the symbol came from. The first
-    /// inference that names a type anchors the alias; a later one's source is
-    /// another type's, and transport machinery in front of it is skipped
-    /// with its source.
+    /// The home is the published answer's: the first inference by alias. A
+    /// later inference's source is another type's.
     #[test]
-    fn inferred_anchor_takes_its_home_from_the_inference_that_named_it() {
+    fn inferred_anchor_takes_its_home_from_the_first_answer() {
         let repo = filled_anchor_repo();
         let events = repo.path().join("src/events.ts");
 
@@ -26291,50 +26116,22 @@ unfollowed_member_calls_total: 0,
         );
         assert_eq!(entry.primary_type_symbol.as_deref(), Some("OrderId"));
         assert_eq!(entry.defined_in, None);
-
-        let entry = filled(
-            vec![
-                // Marked by the sidecar as machinery (blueprint row N8).
-                InferredType {
-                    anchor_machinery: true,
-                    ..inferred_from("Response", Some(&events))
-                },
-                inferred_from("OrderPlaced", Some(&events)),
-            ],
-            repo.path(),
-        );
-        assert_eq!(entry.primary_type_symbol.as_deref(), Some("OrderPlaced"));
-        assert_eq!(
-            entry.defined_in,
-            Some(crate::cloud_storage::TypeHome {
-                file_path: "src/events.ts".to_string(),
-                line_number: 1,
-                symbol: "OrderPlaced".to_string(),
-            })
-        );
     }
 
-    /// The fill states a home only for an anchor it writes. An anchor the
-    /// model named with no home the stamp could resolve keeps none, even
-    /// where the inference resolved the same name and reports its file:
-    /// that row is not the fill's.
+    /// An anchor the model named keeps its symbol, and takes the home only
+    /// from an answer that names that symbol.
     #[test]
-    fn inferred_anchor_leaves_a_model_anchor_without_a_home_as_it_is() {
+    fn a_model_anchor_takes_only_a_home_that_names_it() {
         let repo = filled_anchor_repo();
         let events = repo.path().join("src/events.ts");
         let mut manifest = vec![consumer_entry("OrderView")];
-        manifest[0].primary_type_symbol = Some("OrderPlaced".to_string());
+        manifest[0].primary_type_symbol = Some("OrderId".to_string());
+        let mut resolution = empty_resolution();
+        resolution.inferred_types = vec![inferred_from("OrderPlaced", Some(&events))];
 
-        anchor_inferred_symbols(
-            &mut manifest,
-            &[inferred_from("OrderPlaced", Some(&events))],
-            &repo.path().to_string_lossy(),
-        );
+        anchored_and_stored(&mut manifest, &resolution, &repo.path().to_string_lossy());
 
-        assert_eq!(
-            manifest[0].primary_type_symbol.as_deref(),
-            Some("OrderPlaced")
-        );
+        assert_eq!(manifest[0].primary_type_symbol.as_deref(), Some("OrderId"));
         assert_eq!(manifest[0].defined_in, None);
     }
 
@@ -26348,13 +26145,6 @@ unfollowed_member_calls_total: 0,
     /// model; the inference fill anchors it from its own inference.
     #[test]
     fn stamp_anchors_the_response_entry_only() {
-        let repo = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
-        std::fs::write(
-            repo.path().join("src/orders.ts"),
-            "export interface Order {\n  id: string;\n}\n",
-        )
-        .expect("write");
         let file = "src/orders.ts";
         let mut result = make_file_result(vec!["/orders"], vec!["/orders"]);
         result.endpoints[0].method = "POST".to_string();
@@ -26384,22 +26174,10 @@ unfollowed_member_calls_total: 0,
             call_line,
             None,
         );
-        let modules =
-            crate::workspace_resolver::WorkspaceIndex::build_with_aliases(repo.path(), None);
 
-        stamp_manifest_anchor_symbols(
-            &mut manifest,
-            &file_results,
-            &repo.path().to_string_lossy(),
-            &modules,
-        );
+        stamp_manifest_anchor_symbols(&mut manifest, &file_results);
 
         assert_eq!(manifest.len(), 4, "a request and a response entry per side");
-        let home = crate::cloud_storage::TypeHome {
-            file_path: file.to_string(),
-            line_number: 1,
-            symbol: "Order".to_string(),
-        };
         for entry in &manifest {
             match entry.type_kind {
                 ManifestTypeKind::Response => {
@@ -26409,7 +26187,7 @@ unfollowed_member_calls_total: 0,
                         "{:?} response",
                         entry.role
                     );
-                    assert_eq!(entry.defined_in.as_ref(), Some(&home));
+                    assert_eq!(entry.defined_in, None, "the stamp states no home");
                 }
                 ManifestTypeKind::Request => {
                     assert_eq!(
@@ -26444,7 +26222,7 @@ unfollowed_member_calls_total: 0,
     }
 
     /// One entry of a consumer call at `file:line`, stamped with the model's
-    /// `symbol` and the home the stamp found for it.
+    /// `symbol`.
     fn stamped_entry(
         alias: &str,
         type_kind: ManifestTypeKind,
@@ -26454,11 +26232,6 @@ unfollowed_member_calls_total: 0,
     ) -> TypeManifestEntry {
         let mut entry = site_entry(alias, type_kind, path, line_number);
         entry.primary_type_symbol = Some(symbol.to_string());
-        entry.defined_in = Some(crate::cloud_storage::TypeHome {
-            file_path: "src/types.ts".to_string(),
-            line_number: 1,
-            symbol: symbol.to_string(),
-        });
         entry
     }
 
@@ -26534,8 +26307,8 @@ unfollowed_member_calls_total: 0,
             resolution.inferred_types.push(inferred);
         }
 
-        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, "/repo");
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, "/repo");
+        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes);
+        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types);
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -26544,8 +26317,7 @@ unfollowed_member_calls_total: 0,
         );
         assert_eq!(
             manifest[0].defined_in, None,
-            "the dropped symbol's home is not the new anchor's, and this \
-             inference reports none"
+            "a dropped anchor leaves no home"
         );
         assert_eq!(
             manifest[1].primary_type_symbol.as_deref(),
@@ -26560,7 +26332,6 @@ unfollowed_member_calls_total: 0,
                 "{}",
                 untouched.type_alias
             );
-            assert!(untouched.defined_in.is_some());
         }
     }
 
@@ -26580,11 +26351,9 @@ unfollowed_member_calls_total: 0,
         restamp_arbitrated_anchors(
             &mut manifest,
             &[dropped("Members_Response_Call1", "Member")],
-            "/repo",
         );
 
         assert_eq!(manifest[0].primary_type_symbol.as_deref(), Some("Order"));
-        assert!(manifest[0].defined_in.is_some());
     }
 
     /// A re-aimed request names the root the source states, so the call's
@@ -26628,11 +26397,13 @@ unfollowed_member_calls_total: 0,
             reaimed: Some(crate::services::type_sidecar::AnchorRoot {
                 symbol: "MemberPage".to_string(),
                 source_file: declaring.to_string_lossy().into_owned(),
-                home: None,
+                home: Some(report("MemberPage", &declaring.to_string_lossy(), 3)),
             }),
         }];
+        let mut resolution = empty_resolution();
+        resolution.anchor_changes = changes;
 
-        restamp_arbitrated_anchors(&mut manifest, &changes, &repo.path().to_string_lossy());
+        anchored_and_stored(&mut manifest, &resolution, &repo.path().to_string_lossy());
 
         let home = crate::cloud_storage::TypeHome {
             file_path: "src/pages.ts".to_string(),
@@ -26673,11 +26444,13 @@ unfollowed_member_calls_total: 0,
             reaimed: Some(crate::services::type_sidecar::AnchorRoot {
                 symbol: "MemberPage".to_string(),
                 source_file: declaring.to_string_lossy().into_owned(),
-                home: None,
+                home: Some(report("MemberPage", &declaring.to_string_lossy(), 1)),
             }),
         }];
+        let mut resolution = empty_resolution();
+        resolution.anchor_changes = changes;
 
-        restamp_arbitrated_anchors(&mut manifest, &changes, &repo.path().to_string_lossy());
+        anchored_and_stored(&mut manifest, &resolution, &repo.path().to_string_lossy());
 
         assert_eq!(
             manifest[0].primary_type_symbol.as_deref(),
@@ -26688,7 +26461,7 @@ unfollowed_member_calls_total: 0,
         // An empty root strips nothing from an absolute path, which is no
         // more a repo file than the one above.
         manifest[0].primary_type_symbol = Some("Member".to_string());
-        restamp_arbitrated_anchors(&mut manifest, &changes, "");
+        anchored_and_stored(&mut manifest, &resolution, "");
         assert_eq!(manifest[0].defined_in, None);
     }
 
@@ -26774,9 +26547,7 @@ unfollowed_member_calls_total: 0,
         ];
 
         let repo_path = repo.path().to_string_lossy();
-        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
-        anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
+        anchored_and_stored(&mut manifest, &resolution, &repo_path);
 
         let home = crate::cloud_storage::TypeHome {
             file_path: "src/api.ts".to_string(),
@@ -26828,6 +26599,9 @@ unfollowed_member_calls_total: 0,
         let instantiated = |root: &str, arguments: u32| {
             let mut stated = stated_root(root, &declaring);
             stated.root_type_arguments = Some(arguments);
+            if let Some(home) = stated.root_home.as_mut() {
+                home.line = if root == "Envelope" { 5 } else { 10 };
+            }
             stated
         };
         let mut dropped_call = consumer_entry("Orders_Response_Call1");
@@ -26848,9 +26622,7 @@ unfollowed_member_calls_total: 0,
         ];
 
         let repo_path = repo.path().to_string_lossy();
-        restamp_arbitrated_anchors(&mut manifest, &resolution.anchor_changes, &repo_path);
-        anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
-        anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
+        anchored_and_stored(&mut manifest, &resolution, &repo_path);
 
         let home = |symbol: &str, line_number: u32| crate::cloud_storage::TypeHome {
             file_path: "src/envelope.ts".to_string(),
@@ -26927,8 +26699,11 @@ unfollowed_member_calls_total: 0,
                 stated_root("MemberPage", &outside.to_string_lossy()),
             ),
             (
-                "not declared under that name",
-                stated_root("MembersPage", &declaring),
+                "the engine found another type declared there",
+                crate::services::type_sidecar::StatedBody {
+                    root: Some("MembersPage".to_string()),
+                    ..stated_root("MemberPage", &declaring)
+                },
             ),
             (
                 // The sidecar marks a stated root as machinery by where it is
@@ -26950,8 +26725,7 @@ unfollowed_member_calls_total: 0,
             resolution.inferred_types = vec![stated_call("Members_Response_Call1", stated)];
 
             let repo_path = repo.path().to_string_lossy();
-            anchor_stated_body_roots(&mut manifest, &resolution.inferred_types, &repo_path);
-            anchor_inferred_symbols(&mut manifest, &resolution.inferred_types, &repo_path);
+            anchored_and_stored(&mut manifest, &resolution, &repo_path);
 
             assert_eq!(manifest[0].primary_type_symbol, None, "{why}");
             assert_eq!(manifest[0].defined_in, None, "{why}");
