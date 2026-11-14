@@ -312,48 +312,15 @@ fn git_in(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// The fixture in `dir`, made so `--changed-only` can carry both services:
-/// `--changed-only` analyses every service with an import it cannot
-/// resolve, and the fixture's libraries are ambient `declare module`
-/// blocks.
+/// The fixture in `dir`, at a canonical path, so `--changed-only` can carry
+/// both services: it analyses every service with an import it cannot
+/// resolve, and each of the fixture's libraries is installed.
 fn carriable_fixture(dir: &Path) -> PathBuf {
     let root = dir
         .canonicalize()
         .expect("canonical temp dir")
         .join("retype-http-client");
     copy_tree(&fixture_dir(), &root);
-    // `--changed-only` analyses every service with an import it cannot
-    // resolve, and the fixture's libraries are ambient `declare module`
-    // blocks. Each becomes a module file beside its importer, imported by a
-    // relative path on the same line, so both services can be carried.
-    for (dir, module) in [("web", "http-client"), ("api", "http-server")] {
-        let ambient = root.join(format!("{dir}/src/{module}.d.ts"));
-        let text = std::fs::read_to_string(&ambient).expect("read the declarations");
-        let body: Vec<&str> = text.trim_end().lines().collect();
-        let body = body[1..body.len() - 1]
-            .iter()
-            .map(|line| line.strip_prefix("  ").unwrap_or(line))
-            .map(|line| line.replace("export function", "export declare function"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::remove_file(&ambient).expect("remove the ambient module");
-        std::fs::write(root.join(format!("{dir}/src/{module}.ts")), body + "\n")
-            .expect("write the module");
-        std::fs::write(
-            root.join(format!("__llm__/analyze-file/{module}.json")),
-            r#"{ "mounts": [], "endpoints": [], "data_calls": [] }"#,
-        )
-        .expect("write the cassette");
-        let importer = root.join(if dir == "web" {
-            "web/src/checkout.ts"
-        } else {
-            "api/src/routes.ts"
-        });
-        let source = std::fs::read_to_string(&importer).expect("read the importer");
-        let relative = source.replace(&format!("\"{module}\""), &format!("\"./{module}\""));
-        assert_ne!(source, relative, "{module} is imported by name");
-        std::fs::write(&importer, relative).expect("write the importer");
-    }
     root
 }
 
@@ -627,7 +594,9 @@ fn add_named_call(root: &Path) {
 ///
 /// The second seed documents a member of the producer's response type. The
 /// published text stays the same, so the pair's spec does too; the stub's
-/// declaration moves, and every pair on it is judged.
+/// declaration moves, and every pair on it is judged. The request pairs read
+/// nothing that declaration holds (the call writes no body and the handler
+/// reads none), so their judge input is main's and they settle.
 #[test]
 fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
     if !sidecar_built() {
@@ -734,13 +703,36 @@ fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
         ("  y: number;\n", "  /** Units sold. */ y: number;\n"),
         "member",
     );
-    assert_eq!(reached_line(&log), 0, "{log}");
+    // A pair is on the moved declaration when its producer side is the
+    // response alias (`CheckoutResult`).
+    let on_moved = |key: &str| {
+        key.split('~')
+            .next()
+            .is_some_and(|producer| producer.contains("_Response_"))
+    };
+    let unmoved = main
+        .iter()
+        .filter(|(key, (left, _))| !*left && !on_moved(key))
+        .count();
+    assert!(unmoved > 0, "{main:#?}");
+    assert_eq!(reached_line(&log), unmoved, "{log}");
     let checked = checked_keys(&events);
+    assert!(
+        settled.iter().any(|key| on_moved(key)),
+        "seed 1 settled a pair on the response: {settled:#?}"
+    );
     for key in &settled {
-        assert!(
-            checked.contains(*key),
-            "the moved pair is judged: {key}\n{events}"
-        );
+        if on_moved(key) {
+            assert!(
+                checked.contains(*key),
+                "the moved pair is judged: {key}\n{events}"
+            );
+        } else {
+            assert!(
+                !checked.contains(*key),
+                "a pair the edit does not reach settles: {key}\n{events}"
+            );
+        }
     }
 }
 
@@ -820,15 +812,17 @@ fn a_consumer_whose_calls_all_abstain_before_the_rewrite_builds_no_retype_progra
     std::fs::create_dir_all(admin.join("src")).expect("admin dir");
     std::fs::write(
         admin.join("package.json"),
-        r#"{ "name": "retype-admin", "version": "0.0.0", "private": true }"#,
+        r#"{ "name": "retype-admin", "version": "0.0.0", "private": true, "dependencies": { "http-client": "^1.0.0" } }"#,
     )
     .expect("admin package");
     std::fs::copy(root.join("web/tsconfig.json"), admin.join("tsconfig.json")).expect("tsconfig");
+    // `admin` installs the client `web` installs, from the same lockfile.
+    copy_tree(&root.join("web/node_modules"), &admin.join("node_modules"));
     std::fs::copy(
-        root.join("web/src/http-client.d.ts"),
-        admin.join("src/http-client.d.ts"),
+        root.join("web/package-lock.json"),
+        admin.join("package-lock.json"),
     )
-    .expect("client declaration");
+    .expect("client lockfile");
     let audit = r#"import { create } from "http-client";
 
 const api = create({ baseURL: "http://localhost:3000" });
