@@ -3115,19 +3115,18 @@ impl<'a> Walker<'a> {
         call: &CallIr,
         made: &HashMap<(u32, u32), Vec<(&str, &str)>>,
     ) -> bool {
-        let Some(makers) = call
-            .receiver_object
-            .and_then(|(lo, hi, _)| made.get(&(lo, hi)))
-        else {
-            return false;
-        };
         let Some(symbol) = self.row(file, call).and_then(|row| row.symbol()) else {
             return false;
         };
-        makers.iter().any(|(package, export)| {
-            self.labels
-                .get(package, export)
-                .is_some_and(|claims| claims_member(claims, symbol))
+        let _ = made;
+        self.row(file, call).is_some_and(|row| {
+            store_keys(row, self.labels.exports).iter().any(|key| {
+                self.labels.exports.iter().any(|export| {
+                    export.package == *key
+                        && export.role != LibraryRole::None
+                        && claims_member(export, symbol)
+                })
+            })
         })
     }
 
