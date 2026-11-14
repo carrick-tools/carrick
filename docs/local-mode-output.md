@@ -91,8 +91,8 @@ re-check given three minutes. A misses file written before that field existed
 reads as no misses.
 `--no-rescan` (with `--recheck`, on one file or on `--each`) asks the question
 "does this edit need a re-scan" and never starts one. A file that is unchanged
-or gone, an edit that reads the same, and a known miss are answered as without
-the flag. Any other edit comes back with `ran: none`, the indexed rows,
+or gone, an edit that reads the same, a file outside every service's
+directory, and a known miss are answered at once. Any other edit comes back with `ran: none`, the indexed rows,
 `new_functions`, and `deferred: true`. Nothing is staged and no miss is
 recorded. Run `--recheck` alone for the fresh answer.
 `carrick check --each <file>... --recheck --json` answers several files in one

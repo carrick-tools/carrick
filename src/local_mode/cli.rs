@@ -2110,10 +2110,10 @@ USAGE:
                builds nothing for the ask. Re-checks have 10
                seconds (`CARRICK_RECHECK_BUDGET_MS`); past that the answer comes
                from the index, says "not checked" and exits 2.
-               --no-rescan (with --recheck) never starts that re-scan: an
-               unchanged file or a known miss is answered as usual, and any
-               other edit comes back with `recheck.deferred` true and the
-               indexed rows.
+               --no-rescan (with --recheck) never starts that re-scan: what
+               the index and the file alone can answer is answered at once,
+               and any other edit comes back with `recheck.deferred` true and
+               the indexed rows.
                --each answers several files one by one, each as `check <file>`
                would, in one process (with --json, one array of answers).
                --changed takes no file: it checks every file changed since
