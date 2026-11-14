@@ -288,6 +288,46 @@ pub(crate) struct WalkedServices {
     pub(crate) repo: PathBuf,
     /// Each named service's inputs, in the order named.
     pub(crate) inputs: Vec<RequestSummaryInputs>,
+    /// Each service's name, in the same order.
+    pub(crate) names: Vec<String>,
+}
+
+impl WalkedServices {
+    /// The positions of the services the engine hands the walked service
+    /// `own` as siblings, in walked order: those holding the files its
+    /// calls and value reads are declared in ([`RequestSummaryInputs::
+    /// outside_declarations`]), and those theirs are declared in in turn,
+    /// as `SiblingRegistry::reached` closes them. A file belongs to the
+    /// first walked service whose files hold it (carrick#4444).
+    pub(crate) fn sibling_positions_of(&self, own: usize) -> Vec<usize> {
+        let holder = |file: &Path| {
+            self.inputs
+                .iter()
+                .position(|inputs| inputs.files.contains_key(file))
+        };
+        let mut reached: BTreeSet<usize> = BTreeSet::new();
+        let mut passed: BTreeSet<usize> = BTreeSet::from([own]);
+        let mut pending: Vec<usize> = vec![own];
+        while let Some(index) = pending.pop() {
+            for file in self.inputs[index].outside_declarations() {
+                if let Some(next) = holder(&file)
+                    && passed.insert(next)
+                {
+                    reached.insert(next);
+                    pending.push(next);
+                }
+            }
+        }
+        reached.into_iter().collect()
+    }
+
+    /// The inputs of [`Self::sibling_positions_of`].
+    pub(crate) fn siblings_of(&self, own: usize) -> Vec<&RequestSummaryInputs> {
+        self.sibling_positions_of(own)
+            .into_iter()
+            .map(|index| &self.inputs[index])
+            .collect()
+    }
 }
 
 /// `tests/fixtures/<fixture>/repo`'s services `services` (directory under
@@ -353,6 +393,10 @@ pub(crate) fn walked_services_over(
         _dir: dir,
         repo,
         inputs,
+        names: services
+            .iter()
+            .map(|(_, name)| (*name).to_string())
+            .collect(),
     })
 }
 
