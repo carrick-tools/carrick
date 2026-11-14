@@ -7282,6 +7282,63 @@ export function listen(): void {
         );
     }
 
+    /// carrick#4445: a walk into a sibling's function that passes a send on
+    /// the value of a maker's call (`new Queue(q).add`, `createClient(b).get`,
+    /// `new BroadcastChannel(n).postMessage`) it reads nothing at saves the
+    /// call as `missed_inside`, beside any site it has. The receiver is linked
+    /// to the maker: a construction beside `target.addEventListener` or
+    /// `window.addEventListener` is not a lost send, a held local is not
+    /// linked (carrick#4472), and `close()` is no op. The answer key is
+    /// `tests/fixtures/sibling-chained-sends/README.md`.
+    #[test]
+    fn a_send_lost_in_a_sibling_s_function_is_saved_as_missed_inside() {
+        let Some(on) = super::super::fixture_walk::walked_services(
+            "sibling-chained-sends",
+            &[("services/app", "app"), ("packages/kit", "kit")],
+            true,
+        ) else {
+            return;
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sibling-chained-sends/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let labels = Labels::of_answer(&answer);
+        let [app, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let found = discover_with(app, &[kit], &labels, &on.repo);
+        let mut missed: Vec<(String, u32)> = found
+            .missed_at
+            .iter()
+            .filter(|((file, _, _), _)| file.starts_with("services/app/"))
+            .map(|((file, _, _), (line, _))| (file.clone(), *line))
+            .collect();
+        missed.sort();
+        missed.dedup();
+        assert_eq!(
+            missed,
+            [2, 4, 7, 9]
+                .map(|line| ("services/app/src/relay.ts".to_string(), line))
+                .to_vec(),
+            "{:?}",
+            found.missed_inside
+        );
+        // Line 4 states one of its two sends and loses the other: it keeps
+        // its site.
+        assert!(
+            found
+                .sites
+                .iter()
+                .any(|site| site.file == "services/app/src/relay.ts" && site.line == 4),
+            "{:?}",
+            found.sites
+        );
+    }
+
     /// carrick#4256: the calls into a sibling whose walk wrote no rows stop
     /// `walk_lost`, where the same calls into a sibling that was never walked
     /// stop `rows_missing` (today's reading, which this pins). The reaching

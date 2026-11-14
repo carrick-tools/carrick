@@ -859,3 +859,64 @@ fn an_analysed_sibling_whose_walk_fails_is_named_at_every_site_that_needed_it() 
         serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
     );
 }
+
+/// An unread site of `blob` at `file:line` as `reason slot`, when it has one.
+fn unread_at(blob: &serde_json::Value, file: &str, line: u64) -> Option<String> {
+    blob["unread_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|site| site["file"] == file && site["line"] == line)
+        .map(|site| {
+            format!(
+                "{} {}",
+                site["reason"].as_str().unwrap(),
+                site["slot"].as_str().unwrap_or_default()
+            )
+        })
+}
+
+/// carrick#4445: the kit sends through values another call made, and the app
+/// never calls those members itself. The bus send (line 9) is read by nothing,
+/// so it is saved as `missed_inside`; the controls that construct a maker and
+/// call `addEventListener` hold nothing. Lines 2 and 7 hold a `missed_inside`
+/// row too until the declaration ask reads them (carrick#4445 T1); they are
+/// not asserted here. The answer key is
+/// `tests/fixtures/sibling-chained-sends/README.md`.
+#[test]
+fn a_send_a_sibling_makes_on_a_value_nothing_reads_is_saved_as_missed_inside() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "sibling-chained-sends", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/relay.ts";
+    assert_eq!(
+        unread_at(app, relay, 9).as_deref(),
+        Some("missed_inside callee"),
+        "{}",
+        app["unread_sites"]
+    );
+    for line in [3, 4] {
+        assert_eq!(
+            unread_at(app, relay, line).as_deref(),
+            Some("unanswered kind"),
+            "{line}: {}",
+            app["unread_sites"]
+        );
+    }
+    for line in [5, 6] {
+        assert_eq!(unread_at(app, relay, line), None, "{line}");
+    }
+    for line in [2, 3] {
+        assert_eq!(
+            unread_at(app, "services/app/src/controls-relay.ts", line),
+            None,
+            "controls {line}: {}",
+            app["unread_sites"]
+        );
+    }
+}

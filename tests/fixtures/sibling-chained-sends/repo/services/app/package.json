@@ -1,0 +1,7 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fx/kit": "1.0.0" },
+  "main": "src/relay.ts"
+}
