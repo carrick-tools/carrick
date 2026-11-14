@@ -37,6 +37,29 @@ import {
 import { isExternalOrigin, type ExternalImports } from './origin.js';
 import { notePrintedType } from './printed-names.js';
 import type { WireFormat } from './types.js';
+import type { GraphqlLeaf, GraphqlRoot, GraphqlTypes } from './capture/index.js';
+import {
+  graphqlFieldLeaf,
+  graphqlRootLeaf,
+  graphqlScalarSent,
+  withoutNonNull,
+} from './capture/index.js';
+
+/**
+ * Where the walk is in a GraphQL producer response (carrick#4403): the leaf
+ * the SDL declares at this position, and the table it was read from.
+ */
+interface GraphqlWalk {
+  readonly leaf: GraphqlLeaf;
+  readonly types: GraphqlTypes;
+}
+
+/**
+ * The representation the walk prints at the current position: a plain
+ * `WireFormat`, or, below a GraphQL producer response's root, the SDL leaf
+ * there (`'graphql_scalars'` is resolved to one before the walk starts).
+ */
+type WireWalk = 'declared' | 'json' | GraphqlWalk;
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -134,6 +157,12 @@ export interface ExpandOptions {
   /** Which representation to print; see `WireFormat`. */
   readonly wire?: WireFormat;
   /**
+   * For `'graphql_scalars'`: the producer service's SDL types and the root
+   * field the response answers (carrick#4403). Without a leaf for the root
+   * the print is the JSON form.
+   */
+  readonly graphql?: { types: GraphqlTypes; root: GraphqlRoot };
+  /**
    * Where in the recursion the walk starts. Production callers never set it —
    * depth is walk state — but the `MAX_EXPANSION_DEPTH` backstop is reachable
    * from a shallow type only by starting the walk at the bound, which is how
@@ -159,15 +188,80 @@ export function expandTypeStructural(
   origin: ExpandOrigin,
   options: ExpandOptions = {},
 ): string {
-  const { overrides, wire = 'declared', depth = 0 } = options;
+  const { overrides, wire = 'declared', depth = 0, graphql } = options;
   return expandAt(
     type,
     new Set(),
     depth,
     overrides ? { overrides, position: '' } : undefined,
-    wire,
+    wire === 'graphql_scalars' ? graphqlWalkFrom(graphql) : wire,
     origin,
   );
+}
+
+/** The walk's start for a GraphQL producer response: its root leaf, or JSON. */
+function graphqlWalkFrom(
+  graphql: { types: GraphqlTypes; root: GraphqlRoot } | undefined,
+): WireWalk {
+  const leaf = graphql && graphqlRootLeaf(graphql.types, graphql.root);
+  return leaf ? { leaf, types: graphql.types } : 'json';
+}
+
+/**
+ * The walk below the member `name` of a value at `wire`: the field's own
+ * leaf under a GraphQL object type, JSON for a field the SDL does not name,
+ * and `wire` itself everywhere else.
+ */
+function memberWalk(wire: WireWalk, name: string): WireWalk {
+  if (typeof wire !== 'object') return wire;
+  const leaf = withoutNonNull(wire.leaf);
+  if (!('type' in leaf)) return 'json';
+  const field = graphqlFieldLeaf(wire.types, leaf.type, name);
+  return field ? { leaf: field, types: wire.types } : 'json';
+}
+
+/**
+ * A value at a GraphQL leaf, printed as the server sends it (carrick#4403),
+ * mirroring the probe's `GqlLeafSent`: `null`, `undefined` and `any` stay;
+ * a union maps each member; a list maps its elements; a built-in scalar is
+ * the type it sends; any other scalar, an enum, and a shape the leaf does not
+ * describe print in the JSON form. `undefined` means an object type over an
+ * object value: the caller walks its members.
+ */
+function graphqlLeafText(
+  type: Type,
+  seen: Set<number>,
+  depth: number,
+  cursor: OverrideCursor | undefined,
+  wire: GraphqlWalk,
+  origin: ExpandOrigin,
+): string | undefined {
+  const leaf = withoutNonNull(wire.leaf);
+  const here: GraphqlWalk = { leaf, types: wire.types };
+  if (type.isNull() || type.isUndefined() || type.isAny()) return namedText(type);
+  if (type.isUnion()) {
+    const members = canonicalMembers(type.getUnionTypes(), seen, depth, cursor, here, origin);
+    return [...new Set(members)].join(' | ');
+  }
+  const json = () => expandAt(type, seen, depth, cursor, 'json', origin);
+  if ('list' in leaf) {
+    const element = type.isArray() ? type.getArrayElementType() : undefined;
+    if (!element) return json();
+    const inner = expandAt(
+      element,
+      seen,
+      depth + 1,
+      childCursor(cursor, '<0>'),
+      { leaf: leaf.list, types: wire.types },
+      origin,
+    );
+    return element.isUnion() || element.isIntersection() ? `(${inner})[]` : `${inner}[]`;
+  }
+  if ('scalar' in leaf) return graphqlScalarSent(leaf.scalar) ?? json();
+  if (!('type' in leaf)) return json();
+  if (type.isArray() || isTuple(type)) return json();
+  if (type.getCallSignatures().length > 0) return namedText(type);
+  return undefined;
 }
 
 /**
@@ -202,7 +296,7 @@ function expandAt(
   seen: Set<number>,
   depth: number,
   at: OverrideCursor | undefined,
-  wire: WireFormat,
+  wire: WireWalk,
   origin: ExpandOrigin,
 ): string {
   if (depth > MAX_EXPANSION_DEPTH) return backstopText(type);
@@ -216,6 +310,11 @@ function expandAt(
     }
     // Nothing to substitute below here: print exactly as without overrides.
     if (!hasOverrideBelow(cursor)) cursor = undefined;
+  }
+
+  if (typeof wire === 'object') {
+    const text = graphqlLeafText(type, seen, depth, cursor, wire, origin);
+    if (text !== undefined) return text;
   }
 
   // Primitives & literals: nothing to inline.
@@ -384,7 +483,7 @@ function canonicalMembers(
   seen: Set<number>,
   depth: number,
   cursor: OverrideCursor | undefined,
-  wire: WireFormat,
+  wire: WireWalk,
   origin: ExpandOrigin,
 ): string[] {
   return orderMembers(members, (member) =>
@@ -420,9 +519,10 @@ function expandProperty(
   seen: Set<number>,
   depth: number,
   at: OverrideCursor | undefined,
-  wire: WireFormat,
+  parentWire: WireWalk,
   origin: ExpandOrigin,
 ): string {
+  const wire = memberWalk(parentWire, prop.getName());
   const optional = (prop.getFlags() & ts.SymbolFlags.Optional) !== 0;
 
   const propDecl = prop.getDeclarations()[0];

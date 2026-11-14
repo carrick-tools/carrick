@@ -280,9 +280,36 @@ export const CaptureV2RequestSchema = BaseRequestSchema.extend({
   backfill_out_dir: z.string().min(1).optional(),
 });
 
+/** carrick#4403: an SDL field's output type (`GraphqlLeaf`). */
+type GraphqlLeafInput =
+  | { scalar: string }
+  | { enum: string }
+  | { list: GraphqlLeafInput }
+  | { non_null: GraphqlLeafInput }
+  | { type: string };
+const GraphqlLeafSchema: z.ZodType<GraphqlLeafInput> = z.lazy(() =>
+  z.union([
+    z.object({ scalar: z.string().min(1) }).strict(),
+    z.object({ enum: z.string().min(1) }).strict(),
+    z.object({ list: GraphqlLeafSchema }).strict(),
+    z.object({ non_null: GraphqlLeafSchema }).strict(),
+    z.object({ type: z.string().min(1) }).strict(),
+  ])
+);
+/** carrick#4403: a service's SDL output types by name (`GraphqlTypes`). */
+const GraphqlTypesSchema = z.record(
+  z.union([
+    z.object({ fields: z.record(GraphqlLeafSchema) }).strict(),
+    z.object({ members: z.array(z.string().min(1)) }).strict(),
+  ])
+);
+/** carrick#4403: the root field a GraphQL producer response answers. */
+const GraphqlRootSchema = z.object({ type: z.string().min(1), field: z.string().min(1) });
+
 const CheckStubInputSchema = z.object({
   service_name: z.string().min(1),
   stub_dir: z.string().min(1),
+  graphql_types: GraphqlTypesSchema.optional(),
 });
 
 const CheckPairEndpointSchema = z.object({
@@ -298,6 +325,7 @@ const CheckPairSpecSchema = z
     producer: CheckPairEndpointSchema,
     consumer: CheckPairEndpointSchema,
     topic: z.string().min(1).optional(),
+    graphql_root: GraphqlRootSchema.optional(),
   })
   .superRefine((spec, ctx) => {
     // carrick#1979: the topic is the pub/sub operation's own key. It is
@@ -418,6 +446,7 @@ export const ImplementationsRequestSchema = BaseRequestSchema.extend({
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
   stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
+  graphql_types: GraphqlTypesSchema.optional(),
   aliases: z
     .array(
       z.object({
@@ -426,6 +455,7 @@ export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
         type_kind: z.enum(['request', 'response']),
         side: z.enum(['producer', 'consumer']),
         procedure: z.boolean(),
+        graphql_root: GraphqlRootSchema.optional(),
       })
     )
     .min(1, 'At least one alias is required'),

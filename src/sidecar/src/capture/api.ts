@@ -576,7 +576,44 @@ export type ProbeTypeKind = 'request' | 'response' | 'both';
  * signature, never from a list of type names. Which payloads travel in which
  * form is `wireFormFor` (check-probe.ts), the one rule.
  */
-export type WireFormat = 'declared' | 'json';
+export type WireFormat = 'declared' | 'json' | 'graphql_scalars';
+
+/**
+ * A field's output type as the SDL declares it (carrick#4403): a built-in or
+ * custom scalar by name, an enum, a list or non-null wrapper around another
+ * leaf, or a reference to an object, interface or union type in the
+ * service's `GraphqlTypes` table.
+ */
+export type GraphqlLeaf =
+  | { scalar: string }
+  | { enum: string }
+  | { list: GraphqlLeaf }
+  | { non_null: GraphqlLeaf }
+  | { type: string };
+
+/** One SDL output type: an object or interface's fields, or a union's members. */
+export type GraphqlTypeDef = { fields: { [field: string]: GraphqlLeaf } } | { members: string[] };
+
+/**
+ * A service's SDL output types by name (carrick#4403): one table per
+ * service, which the engine stamps on the service record and carries here.
+ */
+export type GraphqlTypes = { [typeName: string]: GraphqlTypeDef };
+
+/** The root field a GraphQL producer response answers (`Query.invoice`). */
+export interface GraphqlRoot {
+  type: string;
+  field: string;
+}
+
+/**
+ * The facts besides protocol, kind and side that decide a payload's wire form
+ * (`wireFormFor`). An absent fact reads as unknown, never as a default.
+ */
+export interface WireFacts {
+  /** The producer service's SDL types and the root field this response answers. */
+  graphql?: { types: GraphqlTypes; root: GraphqlRoot };
+}
 
 /** One capture stub package to assemble into the check workspace. */
 export interface CheckStubInput {
@@ -584,6 +621,8 @@ export interface CheckStubInput {
   service_name: string;
   /** Absolute path to the capture stub dir (package.json + types/ tree). */
   stub_dir: string;
+  /** The service's SDL output types (carrick#4403), when it serves a schema. */
+  graphql_types?: GraphqlTypes;
 }
 
 /** One side of a matched pair: a service + the surface alias to probe. */
@@ -611,6 +650,12 @@ export interface CheckPairSpec {
    * is the whole message from a side that is its payload.
    */
   topic?: string;
+  /**
+   * The root field a GraphQL producer response answers (carrick#4403), and
+   * only of one. With the producer stub's `graphql_types`, `wireFormFor`
+   * compares each built-in scalar leaf in the type that scalar sends.
+   */
+  graphql_root?: GraphqlRoot;
 }
 
 /**

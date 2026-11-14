@@ -121,7 +121,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'infer-cache.ts' ||
           base === 'retype.ts' ||
           base === 'default-library.ts' ||
-          base === 'held-shadow.ts'
+          base === 'held-shadow.ts' ||
+          base === 'type-structural-expander.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
@@ -133,7 +134,9 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // with the same `statesNoBody` (carrick#2743). The default
           // library's file system builds its base project with the same
           // options (carrick#3509). The held-compiler shadow writes through
-          // the guard and finds the native compiler the judge runs.
+          // the guard and finds the native compiler the judge runs. The structural print reads a GraphQL
+          // response's SDL leaves through the probe's one lookup
+          // (carrick#4403).
           assert.strictEqual(
             spec,
             './capture/index.js',

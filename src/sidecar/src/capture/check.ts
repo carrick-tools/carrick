@@ -28,6 +28,7 @@ import type {
   CheckProgressPhase,
   CheckResult,
   CheckStubInput,
+  GraphqlTypes,
   CheckVerdict,
   DegradedService,
 } from './api.js';
@@ -474,7 +475,13 @@ export async function runCheck(
   for (const spec of opts.pairs) {
     try {
       plans.push(
-        buildProbe(spec, ws.packageOf, unwidenedAliasIn(aliasRecords), absenceToleratedIn(aliasRecords))
+        buildProbe(
+          spec,
+          ws.packageOf,
+          unwidenedAliasIn(aliasRecords),
+          absenceToleratedIn(aliasRecords),
+          graphqlTypesIn(opts.stubs)
+        )
       );
     } catch {
       unresolved.push({
@@ -981,6 +988,24 @@ function dedupeDegraded(list: DegradedService[]): DegradedService[] {
   return [...seen.values()].sort((a, b) =>
     a.service_name < b.service_name ? -1 : a.service_name > b.service_name ? 1 : 0
   );
+}
+
+/**
+ * Each service's SDL output types (carrick#4403), as its stub input carries
+ * them. A service id named twice answers nothing: which stub the judge reads
+ * is not known.
+ */
+function graphqlTypesIn(
+  stubs: CheckStubInput[]
+): (serviceName: string) => GraphqlTypes | undefined {
+  const byService = new Map<string, GraphqlTypes | undefined>();
+  for (const stub of stubs) {
+    byService.set(
+      stub.service_name,
+      byService.has(stub.service_name) ? undefined : stub.graphql_types
+    );
+  }
+  return (serviceName) => byService.get(serviceName);
 }
 
 /** Plan pairs without a workspace (for the isolation-unavailable early exit). */
