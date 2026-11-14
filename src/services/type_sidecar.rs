@@ -512,6 +512,11 @@ pub struct CheckPairSpec {
     /// for a member typed as this literal. Set on pub/sub only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The producer is a procedure of an RPC router (tRPC and similar), whose
+    /// transformer decides the wire form (carrick#4402). Sent only when true,
+    /// so every other pair's request is unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub procedure: bool,
 }
 
 /// Per-alias capture record (serialization tier + self-check outcome).
@@ -6640,6 +6645,7 @@ mod tests {
                 alias: "B".into(),
             },
             topic: (protocol == ProbeProtocol::Pubsub).then(|| "orders".to_string()),
+            procedure: false,
         };
         vec![
             SidecarRequest::Init {
@@ -7256,6 +7262,7 @@ mod tests {
                 alias: "B".into(),
             },
             topic: Some("orders".into()),
+            procedure: false,
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""protocol":"pubsub""#));
@@ -7264,9 +7271,22 @@ mod tests {
         let http = CheckPairSpec {
             protocol: ProbeProtocol::Http,
             topic: None,
+            procedure: false,
             ..spec.clone()
         };
         assert!(!serde_json::to_string(&http).unwrap().contains("topic"));
+        // carrick#4402: `procedure` is sent only when true, so every other
+        // pair's request is byte for byte what it was.
+        assert!(!serde_json::to_string(&http).unwrap().contains("procedure"));
+        let procedure = CheckPairSpec {
+            procedure: true,
+            ..http.clone()
+        };
+        assert!(
+            serde_json::to_string(&procedure)
+                .unwrap()
+                .contains(r#""procedure":true"#)
+        );
 
         for (wire, bucket) in [
             ("compatible", VerdictBucket::Compatible),
