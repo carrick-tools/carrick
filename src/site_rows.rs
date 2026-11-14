@@ -1401,7 +1401,8 @@ pub fn fold(
         // its line (carrick-cloud#3018); a candidate over a reader's row
         // leaves it.
         // An old-path row a fact replaced goes from the graph as the
-        // reader's does (carrick#3283).
+        // reader's does (carrick#3283), whether it stated another operation
+        // or the fact's own (carrick#4372).
         let is_model_row_of =
             |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
                 (call.resolution_source == Some(ResolutionSource::Model)
@@ -1600,8 +1601,13 @@ pub fn fold_rows(
         // A fact the scan states keeps the site. An old-path row that states
         // another operation than a fact site row does not: the fact
         // replaces it as it replaces the reader's row (carrick#3283). One
-        // that states the same operation keeps the site, which then changes
-        // nothing.
+        // that states the fact's own operation is the same request read
+        // from the call's spelling, and gives way too (carrick#4372), where
+        // every row at the place states the fact's operation. Where the
+        // place also holds a row of another operation, of any source, the
+        // line holds two calls and the fold cannot tell which call each row
+        // is: the same-key old-path row keeps the site, and the fact is
+        // kept out and counted.
         // A socket-pass row gives way only to a fact stating the same
         // operation with a direction: the fact takes the site and its
         // provenance, the key unchanged (the frozen pass retires under
@@ -1612,12 +1618,15 @@ pub fn fold_rows(
         // its provenance to the fact, the key unchanged (carrick#2448): the
         // fact reached a labelled send, and the spec is a reading of the
         // call's spelling alone.
+        let another_key_here = here.iter().any(|&index| rows[index].key != row.key);
         let gives_way = |existing: &ApiEndpointDetails| {
             is_reader(existing)
                 || (row.fact()
                     && existing.resolution_source == Some(ResolutionSource::RequestSpec)
                     && existing.key == row.key)
-                || (row.fact() && is_old_path(existing) && existing.key != row.key)
+                || (row.fact()
+                    && is_old_path(existing)
+                    && (existing.key != row.key || !another_key_here))
                 || (row.fact()
                     && existing.resolution_source == Some(ResolutionSource::SocketCall)
                     && existing.key == row.key

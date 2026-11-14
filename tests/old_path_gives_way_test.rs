@@ -191,14 +191,32 @@ fn requests_at(file: &str, line: u64, path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The scan log's fold line.
+/// `line` without its terminal colour codes.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The scan log's fold line, without colour codes.
 fn fold_line() -> String {
     scan()
         .log
         .lines()
+        .map(plain)
         .find(|line| line.contains("site questions: fold"))
         .unwrap_or_else(|| panic!("no fold line in the scan log:\n{}", scan().log))
-        .to_string()
 }
 
 #[test]
@@ -231,12 +249,13 @@ fn a_fact_replaces_the_same_key_old_path_row_at_its_call() {
         ["POST /w/a wrapper_call client=send host=none base=relative"]
     );
     assert_eq!(requests_at("src/same-twice.ts", 3, "/w/a"), ["implicit 1"]);
-    // Kept out: two-same and two-wrappers (2 each, the mixed guard) and
-    // mixed-plain (1) by their wrapper rows; mixed.ts by its summary row
-    // and same-twice's second call by the first call's fact.
+    // Kept out by a wrapper row, under the mixed guard: two-same and
+    // two-wrappers (2 each), mixed-plain (1) and mixed.ts (1, whose line
+    // also holds the summary row of another request). Kept out by the
+    // first call's fact: same-twice's second call.
     let line = fold_line();
     assert!(
-        line.contains(r#"kept_out={"request_summary": 2, "same_file_wrapper": 5}"#),
+        line.contains(r#"kept_out={"request_summary": 1, "same_file_wrapper": 6}"#),
         "{line}"
     );
 }
