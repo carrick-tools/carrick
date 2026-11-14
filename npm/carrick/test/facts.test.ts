@@ -1503,6 +1503,9 @@ test("a `/` after a non-null assertion is division, and a `!` that starts an ope
   assert.deepEqual(spansOf(avg, true), [`Avg: ${avg.trimEnd()}`]);
   const scan = scanSource("function t(a, s) {\n  if (a) !/x/.test(s);\n  return api.get('/t');\n}\n");
   assert.deepEqual(scan.calls.map((call) => call.member), ["t", "test", "get"]);
+  // A `<` after an assertion is less-than, not an element.
+  const less = "function Low({ a, b }) {\n  return <i>{a! <b ? 1 : 2}</i>;\n}\n";
+  assert.deepEqual(spansOf(less, true), [`Low: ${less.trimEnd()}`]);
 });
 
 test("an attribute string that runs over a line break reads", () => {
@@ -1519,6 +1522,8 @@ test("an element with type arguments reads", () => {
 test("an element whose name starts with an underscore reads", () => {
   const src = "function Shell({ kids }) {\n  return <_Frame>{kids}</_Frame>;\n}\n";
   assert.deepEqual(spansOf(src, true), [`Shell: ${src.trimEnd()}`]);
+  const dollar = "function Pane({ kids }) {\n  return <$Box>{kids}</$Box>;\n}\n";
+  assert.deepEqual(spansOf(dollar, true), [`Pane: ${dollar.trimEnd()}`]);
 });
 
 test("a generic arrow with a default type parameter in a component file is an arrow", () => {
@@ -1526,6 +1531,7 @@ test("a generic arrow with a default type parameter in a component file is an ar
     "wait: const wait = <M = unknown>(a: M): M => a",
     "load: function load() {\n  return <div>{1}</div>;\n}",
   ]);
+  assert.deepEqual(spansOf("const keep = <const T,>(a: T) => a;\n", true), ["keep: const keep = <const T,>(a: T) => a"]);
 });
 
 test("a member named like a modifier before `?` or `!` is a member", () => {
@@ -1571,6 +1577,11 @@ test("a value named `async` and a `<T>value` assertion are values", () => {
   assert.deepEqual(spansOf(send), [`send: ${send.trimEnd()}`]);
   const read = 'async function read() {\n  const body = <Reply>await api.get("/r");\n  return body;\n}\n';
   assert.deepEqual(spansOf(read), [`read: ${read.trimEnd()}`]);
+  // A function behind an assertion is the const's own, never its encloser's.
+  assert.deepEqual(spansOf('function outer() {\n  const h = <Handler>async (req) => { api.get("/x") };\n}\n')?.slice(1), [
+    'h: const h = <Handler>async (req) => { api.get("/x") }',
+  ]);
+  assert.equal(spansOf("function outer() {\n  const h = <Handler>function (a { };\n}\n"), null);
   // An `async` arrow the scanner cannot follow still makes the file unread.
   assert.equal(spansOf("const f = async (a: number): Weird<{ => {};\n"), null);
 });

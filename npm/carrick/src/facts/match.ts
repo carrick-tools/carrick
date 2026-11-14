@@ -817,23 +817,24 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
               continue;
             }
           }
-          const fn = functionAt(value, limit);
+          // A type assertion (`<T>value`, not before `(`): its operand is the value.
+          const assertion = punc(value, "<") ? angleEnd(value, limit) : -1;
+          const operand = assertion > 0 && !punc(assertion, "(") ? assertion : value;
+          const fn = functionAt(operand, limit);
           if (fn) {
             i = named(name, i, fn, i + 1);
             continue;
           }
           // A function this scanner did not read (a generic it cannot close, an
           // `async` or `function` value it cannot follow): not read at all. A
-          // type assertion (`<T>value`, not before `(`) and a value named
-          // `async` (`async ? a : b`) are values.
-          const assertion = punc(value, "<") ? angleEnd(value, limit) : -1;
-          const unreadGeneric = punc(value, "<") && (assertion < 0 || punc(assertion, "("));
-          const unreadAsync = is(value, "id", "async") && (is(value + 1, "id") || punc(value + 1, "(") || punc(value + 1, "<"));
-          if (unreadGeneric || is(value, "id", "function") || unreadAsync) {
+          // value named `async` (`async ? a : b`) is a value.
+          const unreadGeneric = punc(operand, "<");
+          const unreadAsync = is(operand, "id", "async") && (is(operand + 1, "id") || punc(operand + 1, "(") || punc(operand + 1, "<"));
+          if (unreadGeneric || is(operand, "id", "function") || unreadAsync) {
             unplaced = true;
             return;
           }
-          i = value;
+          i = operand;
           continue;
         }
       }
