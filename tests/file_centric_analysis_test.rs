@@ -166,6 +166,7 @@ fn test_file_analysis_result_structures() {
         call_body: None,
         static_asset: None,
         request_line: None,
+        holds_transport: false,
     };
     assert_eq!(data_call.target, "https://api.example.com/users");
     assert_eq!(data_call.method, Some("POST".to_string()));
@@ -269,6 +270,7 @@ fn test_file_analysis_result_serialization() {
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         }],
         dispatch_tables: Vec::new(),
     };
@@ -642,6 +644,7 @@ fn test_data_call_extraction() {
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             },
             DataCallResult {
                 call_kind: None,
@@ -671,6 +674,7 @@ fn test_data_call_extraction() {
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             },
             DataCallResult {
                 call_kind: None,
@@ -700,6 +704,7 @@ fn test_data_call_extraction() {
                 call_body: None,
                 static_asset: None,
                 request_line: None,
+                holds_transport: false,
             },
         ],
         dispatch_tables: Vec::new(),

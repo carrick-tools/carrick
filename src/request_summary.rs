@@ -1480,6 +1480,9 @@ struct FnIr {
     /// the one reader of whether it hands back its request's parsed body.
     /// `None` for anything else, or nothing returned.
     return_shape: Option<crate::return_flow::ReturnShape>,
+    /// The calls whose value the function may hand back, whole or held
+    /// inside its value ([`crate::return_flow::held_returns`], carrick#4270).
+    held_return: crate::return_flow::HeldReturn,
     /// Each parameter by position, as a body sent through it is read
     /// (carrick#1782): where its name is written, whether its declaration
     /// states a type, and whether the body assigns it again. `None` for a
@@ -2164,6 +2167,10 @@ pub fn extract_file_ir(
         return_shapes: crate::return_flow::return_shapes(module)
             .into_iter()
             .filter_map(|(node, shape)| Some(((node.lo.0, node.hi.0), shape?)))
+            .collect(),
+        held_returns: crate::return_flow::held_returns(module)
+            .into_iter()
+            .map(|(node, held)| ((node.lo.0, node.hi.0), held))
             .collect(),
         recording_depth: std::cell::Cell::new(0),
         arg_pieces: std::cell::RefCell::new(HashMap::new()),
@@ -5624,6 +5631,10 @@ struct Reader<'a> {
     /// its node, where that is one call's value read one way
     /// ([`crate::return_flow::return_shapes`], carrick#3823).
     return_shapes: HashMap<(u32, u32), crate::return_flow::ReturnShape>,
+    /// The calls whose value each function of the module may hand back, by
+    /// the span `(lo, hi)` of its node ([`crate::return_flow::held_returns`],
+    /// carrick#4270).
+    held_returns: HashMap<(u32, u32), crate::return_flow::HeldReturn>,
     /// While above 0, [`Reader::eval`] keeps the pieces it reads each
     /// expression as in [`Self::arg_pieces`] ([`Reader::recording`]).
     recording_depth: std::cell::Cell<usize>,
@@ -5842,6 +5853,15 @@ impl Reader<'_> {
     /// ([`Reader::return_shapes`]).
     fn return_shape(&self, span: Span) -> Option<crate::return_flow::ReturnShape> {
         self.return_shapes.get(&(span.lo.0, span.hi.0)).copied()
+    }
+
+    /// The calls whose value the function whose node is `span` may hand back
+    /// ([`Reader::held_returns`]).
+    fn held_return(&self, span: Span) -> crate::return_flow::HeldReturn {
+        self.held_returns
+            .get(&(span.lo.0, span.hi.0))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn site(&self, span: Span) -> Site {
@@ -6559,6 +6579,7 @@ impl Reader<'_> {
             type_params: type_param_names(function.type_params.as_deref()),
             site: Some(self.site(function.span)),
             return_shape: self.return_shape(function.span),
+            held_return: self.held_return(function.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
             param_names: values.names,
@@ -6656,6 +6677,7 @@ impl Reader<'_> {
             type_params: type_param_names(arrow.type_params.as_deref()),
             site: Some(self.site(arrow.span)),
             return_shape: self.return_shape(arrow.span),
+            held_return: self.held_return(arrow.span),
             param_defaults: values.defaults,
             param_default_texts: values.default_texts,
             param_names: values.names,
@@ -10366,6 +10388,19 @@ struct Summary {
     /// read there is the response its callers hold. The platform's `fetch`
     /// resolves to a `Response`, not the body, so returning it is not this.
     returns_request_value: bool,
+    /// The function may hand back its request's transport response whole
+    /// (carrick#4270): what it returns is the value of the call that makes
+    /// the request, the platform's `fetch` included, or of a call to a
+    /// function that does the same ([`crate::return_flow::return_shapes`]).
+    hands_back_transport: bool,
+    /// The function may hand back its request's transport response held
+    /// inside its value, not as the whole of it (carrick#4270): a call whose
+    /// value it holds ([`crate::return_flow::held_returns`]) makes the
+    /// request, or is to a function that hands it back whole or holds it,
+    /// or a call it hands back whole is to a function that holds it. Only a
+    /// call of such a function is worth asking for the body member its value
+    /// names: the compiler engine keeps no answer at any other.
+    holds_transport: bool,
     /// The function hands out a function that may send (carrick#2281): its
     /// body writes one it does not call whose own summary is incomplete or
     /// states a request, or a callee it calls (or a callback that callee
@@ -10429,6 +10464,12 @@ pub struct SummaryRow {
     /// holds. Every other row at a caller holds the function's own value
     /// (an envelope, a field, a `Response`), which is no wire response.
     pub returns_request_value: bool,
+    /// A row at a caller whose function can hand back its request's
+    /// transport response held inside its value ([`Summary::holds_transport`],
+    /// carrick#4270): the call's value may name a member the body was read
+    /// into beside it, so its own call is worth asking about. Every other
+    /// caller row's value holds no wire response.
+    pub holds_transport: bool,
     /// What the request body is at a row stated at a call to a function the
     /// service declares (carrick#1782): what that function does with its
     /// parameters says whether the call's arguments are the body. `None` on
@@ -11751,6 +11792,8 @@ impl Composer<'_> {
             invokes: ir.invoked_params.clone(),
             passes_body: false,
             returns_request_value: false,
+            hands_back_transport: false,
+            holds_transport: false,
             hands_out: false,
         };
         // What the functions written in this body send through its
@@ -11881,6 +11924,10 @@ impl Composer<'_> {
             && ir
                 .return_shape
                 .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
+        summary.hands_back_transport = ir
+            .return_shape
+            .is_some_and(|shape| self.hands_back_transport(file, ir, shape));
+        summary.holds_transport = self.holds_transport(file, ir);
         for (effect, through) in lifted {
             summary.state(ir.settle_forward(effect), through);
         }
@@ -11978,6 +12025,68 @@ impl Composer<'_> {
             Some((_, callee)) => callee.returns_request_value,
         }
     }
+
+    /// Whether what `ir` returns ([`FnIr::return_shape`]) is its request's
+    /// transport response whole ([`Summary::hands_back_transport`]): the
+    /// value of the call that makes the request, `fetch` included, or of a
+    /// call to a function that hands it back whole.
+    fn hands_back_transport(
+        &mut self,
+        file: &Path,
+        ir: &FnIr,
+        shape: crate::return_flow::ReturnShape,
+    ) -> bool {
+        if shape.kind != crate::return_flow::ShapeKind::Value {
+            return false;
+        }
+        let Some(call) = call_at(ir, shape.base) else {
+            return false;
+        };
+        match self.callee(file, call) {
+            None => self.request_of(file, call).is_some(),
+            Some((_, callee)) => callee.hands_back_transport,
+        }
+    }
+
+    /// Whether `ir` may hand back its request's transport response held
+    /// inside its value ([`Summary::holds_transport`]): a call whose value it
+    /// holds makes the request, or is to a function that hands it back whole
+    /// or holds it; or a call it hands back whole is to a function that
+    /// holds it.
+    fn holds_transport(&mut self, file: &Path, ir: &FnIr) -> bool {
+        let held = &ir.held_return;
+        for span in &held.held {
+            let Some(call) = call_at(ir, *span) else {
+                continue;
+            };
+            let holds = match self.callee(file, call) {
+                None => self.request_of(file, call).is_some(),
+                Some((_, callee)) => callee.hands_back_transport || callee.holds_transport,
+            };
+            if holds {
+                return true;
+            }
+        }
+        held.bare.iter().any(|span| {
+            call_at(ir, *span).is_some_and(|call| {
+                self.callee(file, call)
+                    .is_some_and(|(_, callee)| callee.holds_transport)
+            })
+        })
+    }
+}
+
+/// The call written in `ir`, or in a function written inside one of its
+/// calls' arguments, whose span is `span` (carrick#4270). Matched on both
+/// ends: a chain's outer call starts where its inner one does. A call of the
+/// body's own parameter is the caller's callback, read where it is written.
+fn call_at(ir: &FnIr, span: Span) -> Option<&CallIr> {
+    ir.calls
+        .iter()
+        .find(|call| {
+            call.site.lo == span.lo.0 && call.site.hi == span.hi.0 && call.invokes_param.is_none()
+        })
+        .or_else(|| ir.nested.iter().find_map(|nested| call_at(nested, span)))
 }
 
 /// Compose every function's summary and state the rows it supports, reading
@@ -12422,6 +12531,8 @@ fn emit(
                         RowSite::PassThrough
                     } else if callee.returns_request_value {
                         RowSite::CallerOfRequestValue
+                    } else if callee.holds_transport {
+                        RowSite::CallerOfTransportHolder
                     } else {
                         RowSite::Caller
                     };
@@ -12680,6 +12791,11 @@ enum RowSite {
     /// what the request line's call is worth
     /// ([`Summary::returns_request_value`], carrick#3961).
     CallerOfRequestValue,
+    /// A call to a function the service declares, which may hand back its
+    /// request's transport response held inside its value
+    /// ([`Summary::holds_transport`], carrick#4270): the call's value is the
+    /// function's own, which may name the member the body was read into.
+    CallerOfTransportHolder,
 }
 
 /// The row an effect supports at `site`, when its URL and method are both
@@ -12725,8 +12841,12 @@ fn row(
         body_literals,
         reaches_request,
         own_site: at == RowSite::Own,
-        at_caller: matches!(at, RowSite::Caller | RowSite::CallerOfRequestValue),
+        at_caller: matches!(
+            at,
+            RowSite::Caller | RowSite::CallerOfRequestValue | RowSite::CallerOfTransportHolder
+        ),
         returns_request_value: at == RowSite::CallerOfRequestValue,
+        holds_transport: at == RowSite::CallerOfTransportHolder,
         call_body,
         library_semantics: effect.semantics.iter().cloned().collect(),
         base_fallbacks: effect
@@ -15274,6 +15394,7 @@ function build() { return {}; }
             own_site: false,
             at_caller: false,
             returns_request_value: false,
+            holds_transport: false,
             call_body: None,
             library_semantics: Vec::new(),
             base_fallbacks: None,
@@ -15399,6 +15520,66 @@ function build() { return {}; }
             .chain(index.ledger.held.keys().map(|(path, _)| path.clone()))
             .find(|path| path.ends_with(file))
             .unwrap_or_else(|| panic!("{file} is read"))
+    }
+
+    const HOLDERS: &str = "const BASE = 'http://localhost:4100';\n\
+         async function retry<T>(run: () => Promise<T>): Promise<T> { return run(); }\n\
+         async function send(url: string) { return fetch(new URL(url, BASE)); }\n\
+         export async function plain(url: string) { const res = await fetch(new URL(url, BASE)); return { res, json: await res.json() }; }\n\
+         export async function chain(url: string) { return plain(url); }\n\
+         export async function retried(url: string) { return retry(() => plain(url)); }\n\
+         export async function viaSend(url: string) { const res = await send(url); return { res, json: await res.json() }; }\n\
+         export async function thenHold(url: string) { return fetch(new URL(url, BASE)).then(async (res) => ({ res, json: await res.json() })); }\n\
+         export async function envelope(url: string) { const res = await fetch(new URL(url, BASE)); return { ok: res.ok, data: await res.json() }; }\n\
+         export async function member(url: string) { const res = await fetch(new URL(url, BASE)); return { status: res.status, json: await res.json() }; }\n\
+         export async function thenParse(url: string) { return fetch(new URL(url, BASE)).then((r) => r.json()); }\n\
+         export async function retryFetch(url: string) { return retry(() => fetch(new URL(url, BASE))); }\n";
+
+    /// carrick#4270: a caller's row holds the transport where its function
+    /// can hand back the request's transport response held inside its value,
+    /// here, through a function it hands back whole, through an inline
+    /// callback, or through a `.then` callback's parameter. A function that
+    /// reads the body, a member, or hands the transport back whole does not.
+    #[test]
+    fn a_caller_row_holds_the_transport_only_where_its_function_can_hand_it_back_held() {
+        let (_dir, index) = summarized(&[
+            ("src/net.ts", HOLDERS),
+            (
+                "src/use.ts",
+                "import { plain, chain, retried, viaSend, thenHold, envelope, member, thenParse, retryFetch } from './net';\n\
+                 export const a = () => plain('/v1/a');\n\
+                 export const b = () => chain('/v1/b');\n\
+                 export const c = () => retried('/v1/c');\n\
+                 export const d = () => viaSend('/v1/d');\n\
+                 export const e = () => thenHold('/v1/e');\n\
+                 export const f = () => envelope('/v1/f');\n\
+                 export const g = () => member('/v1/g');\n\
+                 export const h = () => thenParse('/v1/h');\n\
+                 export const i = () => retryFetch('/v1/i');\n",
+            ),
+        ]);
+        let mut rows: Vec<(u32, bool, bool)> = index
+            .rows
+            .iter()
+            .filter(|(path, _)| path.ends_with("src/use.ts"))
+            .flat_map(|(_, sites)| sites.values().flatten())
+            .map(|row| (row.line, row.at_caller, row.holds_transport))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (2, true, true),
+                (3, true, true),
+                (4, true, true),
+                (5, true, true),
+                (6, true, true),
+                (7, true, false),
+                (8, true, false),
+                (9, true, false),
+                (10, true, false),
+            ]
+        );
     }
 
     const NOTIFY: &str = "export function notify(endpoint: string) {\n\

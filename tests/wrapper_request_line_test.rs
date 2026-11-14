@@ -1245,3 +1245,149 @@ fn an_unmarked_caller_row_is_neither_asked_nor_captured() {
         "response aliases asked or captured with no manifest entry: {orphans:#?}"
     );
 }
+
+// `tests/fixtures/hand-back-shapes` (carrick#4270): `web` calls `api` through
+// wrappers of every shape the compiler engine was measured on, each with no
+// options of its own, so the request summaries own every caller's row. A
+// caller is asked at its own call only where its wrapper can hand back the
+// transport response held inside its value; the engine keeps the answer at
+// exactly the callers listed below. The key was measured on main before the
+// ask was gated, so it pins that the gate loses no kept row.
+
+/// Every summaries-owned row in `web`, as `file:line` and the function called.
+const HAND_BACK_SHAPES_ROWS: [(&str, &str); 24] = [
+    ("web/src/app.ts:14", "callPlain"),
+    ("web/src/app.ts:19", "callEitherPlain"),
+    ("web/src/chain-use.ts:4", "thenParse"),
+    ("web/src/chain-use.ts:9", "thenHold"),
+    ("web/src/chain-use.ts:14", "catchParse"),
+    ("web/src/chain-use.ts:19", "retryFetch"),
+    ("web/src/chain-use.ts:24", "handled"),
+    ("web/src/lib-use.ts:6", "retried"),
+    ("web/src/lib-use.ts:11", "envelope"),
+    ("web/src/more-use.ts:4", "viaPack"),
+    ("web/src/more-use.ts:9", "viaNew"),
+    ("web/src/more-use.ts:14", "viaSpread"),
+    ("web/src/more-use.ts:19", "viaClone"),
+    ("web/src/more-use.ts:24", "viaSend"),
+    ("web/src/more-use.ts:30", "viaDeclared"),
+    ("web/src/more-use.ts:35", "viaTuple"),
+    ("web/src/more-use.ts:40", "viaHeaders"),
+    ("web/src/probe.ts:4", "probeFetchWhole"),
+    ("web/src/probe.ts:9", "probeResWhole"),
+    ("web/src/probe.ts:14", "probeNested"),
+    ("web/src/probe.ts:20", "probeChain"),
+    ("web/src/probe.ts:25", "probeNoTransport"),
+    ("web/src/probe.ts:30", "probeBody"),
+    ("web/src/probe.ts:35", "probeTuple"),
+];
+
+/// Every `web` consumer response entry, as `file:line` and its `type_state`:
+/// the two model-owned callers of `app.ts` and the twelve summaries-owned
+/// callers whose answer the engine keeps.
+const HAND_BACK_SHAPES_ENTRIES: [(&str, &str); 14] = [
+    ("web/src/app.ts:4", "implicit"),
+    ("web/src/app.ts:9", "unknown"),
+    ("web/src/app.ts:14", "implicit"),
+    ("web/src/app.ts:19", "unknown"),
+    ("web/src/chain-use.ts:9", "unknown"),
+    ("web/src/lib-use.ts:6", "unknown"),
+    ("web/src/more-use.ts:4", "unknown"),
+    ("web/src/more-use.ts:9", "unknown"),
+    ("web/src/more-use.ts:14", "implicit"),
+    ("web/src/more-use.ts:19", "implicit"),
+    ("web/src/more-use.ts:24", "implicit"),
+    ("web/src/more-use.ts:30", "implicit"),
+    ("web/src/more-use.ts:35", "unknown"),
+    ("web/src/probe.ts:20", "unknown"),
+];
+
+#[test]
+fn hand_back_shapes_keep_every_engine_kept_row() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let blobs = scan_typed_fixture(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hand-back-shapes"),
+    );
+    let web = blobs
+        .get("web")
+        .unwrap_or_else(|| panic!("a blob for web: {:?}", blobs.keys()));
+    let rows: BTreeSet<(String, String)> = web["calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|call| call["resolution_source"] == "request_summary")
+        .map(|call| {
+            (
+                call["file_path"].as_str().unwrap_or_default().to_string(),
+                call["handler_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let want_rows: BTreeSet<(String, String)> = HAND_BACK_SHAPES_ROWS
+        .iter()
+        .map(|(at, name)| (at.to_string(), name.to_string()))
+        .collect();
+    assert_eq!(rows, want_rows, "every caller states its row");
+
+    let entries: BTreeSet<(String, String)> = web["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["role"] == "consumer" && entry["type_kind"] == "response")
+        .map(|entry| {
+            (
+                format!(
+                    "{}:{}",
+                    entry["file_path"].as_str().unwrap_or_default(),
+                    entry["line_number"].as_u64().unwrap_or_default()
+                ),
+                entry["type_state"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let want_entries: BTreeSet<(String, String)> = HAND_BACK_SHAPES_ENTRIES
+        .iter()
+        .map(|(at, state)| (at.to_string(), state.to_string()))
+        .collect();
+    assert_eq!(
+        entries, want_entries,
+        "exactly the callers the engine keeps carry a response entry"
+    );
+
+    let verdicts: BTreeSet<(String, String)> = web["compat_verdicts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|pair| {
+            (
+                pair["producer_key"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                pair["response"]["verdict"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        verdicts,
+        BTreeSet::from([
+            (
+                "http|GET|/v1/replies/first".to_string(),
+                "unverifiable".to_string()
+            ),
+            (
+                "http|GET|/v1/replies/latest".to_string(),
+                "unverifiable".to_string()
+            ),
+        ])
+    );
+}

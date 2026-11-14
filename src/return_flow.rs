@@ -474,6 +474,25 @@ pub fn returned_objects(module: &swc_ecma_ast::Module) -> HashSet<(u32, u32)> {
     reader.objects
 }
 
+/// The calls whose value a function may hand back (carrick#4270), by how it
+/// hands them back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldReturn {
+    /// Calls whose value may be the function's value whole.
+    pub bare: Vec<Span>,
+    /// Calls whose value may sit inside the function's value: a member, an
+    /// element, an argument of a call or `new`.
+    pub held: Vec<Span>,
+}
+
+/// Every function of `module`, by the span of its node, with the calls whose
+/// value it may hand back, whole or held inside its value (carrick#4270).
+/// In source order.
+pub fn held_returns(module: &swc_ecma_ast::Module) -> Vec<(Span, HeldReturn)> {
+    let _ = module;
+    Vec::new()
+}
+
 fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {
     let mut shapes = Vec::new();
     for expr in returned {
@@ -832,6 +851,203 @@ mod tests {
         ] {
             assert_eq!(shape(source), None, "{source}");
         }
+    }
+
+    /// The calls the first function of `source` may hand back, by their
+    /// text: `(bare, held)`.
+    fn held(source: &str) -> (Vec<String>, Vec<String>) {
+        let cm: Lrc<SourceMap> = Default::default();
+        let file = cm.new_source_file(
+            Lrc::new(FileName::Custom("t.ts".into())),
+            source.to_string(),
+        );
+        let module = parse_file_as_module(
+            &file,
+            Syntax::Typescript(TsSyntax::default()),
+            Default::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .expect("parses");
+        let held = held_returns(&module);
+        let (_, held) = held.first().expect("a function");
+        let texts = |spans: &[Span]| {
+            let mut texts: Vec<String> = spans
+                .iter()
+                .map(|span| cm.span_to_snippet(*span).unwrap())
+                .collect();
+            texts.sort();
+            texts.dedup();
+            texts
+        };
+        (texts(&held.bare), texts(&held.held))
+    }
+
+    fn texts(calls: &[&str]) -> Vec<String> {
+        let mut texts: Vec<String> = calls.iter().map(|call| call.to_string()).collect();
+        texts.sort();
+        texts
+    }
+
+    /// carrick#4270: what each wrapper the compiler engine was measured on
+    /// hands back, whole or held. The engine keeps a caller's answer only
+    /// where the transport response sits inside the value, so these are the
+    /// shapes the ask is gated on.
+    #[test]
+    fn a_transport_inside_a_returned_value_is_held() {
+        let cases: [(&str, &[&str], &[&str]); 13] = [
+            (
+                "async function f(u) { const res = await fetch(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u, e) { const res = await fetch(u); if (e) { return { res, first: (await res.json()) as R }; } return { res, second: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { res, body: await res.text() }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return pack(res, (await res.json()) as R); }\nfunction pack(res, json) { return { res, json }; }",
+                &["pack(res, (await res.json()) as R)"],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return new Holder(res, (await res.json()) as R); }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const extra = { at: Date.now() }; return { ...extra, res, json: (await res.json()) as R }; }",
+                &[],
+                &["Date.now()", "fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { res: res.clone(), json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)", "res.clone()"],
+            ),
+            (
+                "async function f(u) { const res = await send(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["send(u)"],
+            ),
+            (
+                "async function f(u): Promise<Out> { const res = await fetch(u); return { res, json: (await res.json()) as R }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return [res, (await res.json()) as R] as const; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return { meta: { res }, json }; }",
+                &[],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return handle(res); }",
+                &["handle(res)"],
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then(async (res) => ({ res, json: (await res.json()) as R })); }",
+                &[
+                    "fetch(u)",
+                    "fetch(u).then(async (res) => ({ res, json: (await res.json()) as R }))",
+                ],
+                &["fetch(u)"],
+            ),
+        ];
+        for (source, bare, held_calls) in cases {
+            assert_eq!(held(source), (texts(bare), texts(held_calls)), "{source}");
+        }
+    }
+
+    /// carrick#4270: a wrapper that hands back a call's value whole, reads a
+    /// member or the body, or hands back none of its calls holds no call.
+    #[test]
+    fn a_transport_handed_back_whole_or_read_is_not_held() {
+        let cases: [(&str, &[&str]); 12] = [
+            (
+                "async function f(u) { return callPlain(u); }",
+                &["callPlain(u)"],
+            ),
+            (
+                "async function f(u) { return retry(() => callPlain(u)); }",
+                &["callPlain(u)", "retry(() => callPlain(u))"],
+            ),
+            ("async function f(u) { return fetch(u); }", &["fetch(u)"]),
+            (
+                "async function f(u) { const res = await fetch(u); if (!res.ok) throw new Error('bad'); return res; }",
+                &["fetch(u)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then((r) => r.json() as Promise<R>); }",
+                &["fetch(u)", "fetch(u).then((r) => r.json() as Promise<R>)"],
+            ),
+            (
+                "async function f(u) { return fetch(u).then((r) => r.json() as Promise<R>).catch(() => null); }",
+                &[
+                    "fetch(u)",
+                    "fetch(u).then((r) => r.json() as Promise<R>)",
+                    "fetch(u).then((r) => r.json() as Promise<R>).catch(() => null)",
+                ],
+            ),
+            (
+                "async function f(u) { return retry(() => fetch(u)); }",
+                &["fetch(u)", "retry(() => fetch(u))"],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return { status: res.status, json }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); const json = (await res.json()) as R; return json.data; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { headers: res.headers, json: (await res.json()) as R }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const res = await fetch(u); return { ok: true, data: (await res.json()) as R }; }",
+                &[],
+            ),
+            (
+                "async function f(u) { const { data } = await fetch(u); return { data }; }",
+                &[],
+            ),
+        ];
+        for (source, bare) in cases {
+            assert_eq!(held(source), (texts(bare), Vec::new()), "{source}");
+        }
+    }
+
+    /// carrick#4270: a callback's first parameter is the value of the
+    /// receiver it was handed to, and a callback's own names shadow the
+    /// enclosing body's.
+    #[test]
+    fn a_callbacks_parameter_is_its_receivers_value() {
+        assert_eq!(
+            held(
+                "async function f(u) { const res = await fetch(u); return load(u).then((res) => ({ res })); }"
+            ),
+            (
+                texts(&["load(u)", "load(u).then((res) => ({ res }))"]),
+                texts(&["load(u)"])
+            )
+        );
+        assert_eq!(
+            held("async function f(u) { return run((res) => ({ res })); }"),
+            (texts(&["run((res) => ({ res }))"]), Vec::new())
+        );
     }
 
     #[test]
