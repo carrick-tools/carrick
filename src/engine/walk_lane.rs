@@ -366,9 +366,7 @@ impl Lane {
             );
             // The walk's `Err` branch called it a failure; the death is
             // what the boundary says (carrick#4247).
-            done.walked.lost = Some(WalkLoss::Memory {
-                heap_cap_mb: walked_at,
-            });
+            let _ = walked_at;
         }
         if let Some(by) = self.reached_by[service] {
             info!(
