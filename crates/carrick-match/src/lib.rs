@@ -162,7 +162,10 @@ pub fn paths_match(endpoint_path: &str, call_path: &str) -> bool {
 /// pairs as matches (#381); they are routing/absorption only. Relative use:
 /// among all producers matching one call, pair the call with the
 /// maximal-agreement producers — a catch-all (`/api/**`, agreement 1) never
-/// outranks a concrete route (`/api/v1/chat/new`, agreement 4).
+/// outranks a concrete route (`/api/v1/chat/new`, agreement 4) — and among
+/// those keep the ones where the call leaves the fewest route literals to a
+/// placeholder: `/things/:id` pairs with `/things/:thingId`, not also with
+/// `/things/move` (carrick#4262).
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn match_agreement(endpoint_path: &str, call_path: &str) -> Option<u32> {
     let endpoint_segments = segments(endpoint_path);
@@ -420,8 +423,9 @@ pub fn method_matches(producer_method: &str, consumer_method: &str) -> bool {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum MatchVerdict {
-    /// The pair routes AND agrees on at least one literal segment. The only
-    /// verdict a surface may report as a match.
+    /// The pair routes, agrees on at least one literal segment, and the call
+    /// leaves no more route literals to its placeholders than it confirms.
+    /// The only verdict a surface may report as a match.
     Matched,
     /// The consumer call path carries no literal segment
     /// ([`is_unknown_call_path`]): the scanner never resolved where this call
@@ -432,8 +436,11 @@ pub enum MatchVerdict {
     CatchAllRoute,
     /// The two paths do not route to each other at all.
     NoRouteMatch,
-    /// The pair routes but shares no literal segment — a prefixed catch-all or
-    /// a param-only route covering the call without vouching for it.
+    /// The pair routes, but the call confirms no route literal, or leaves more
+    /// route literals to a placeholder than it confirms: none confirmed (a
+    /// prefixed catch-all or a param-only route covering the call without
+    /// vouching for it), or fewer confirmed than left open
+    /// (`/:p/:q/candidates` against `/a/b/candidates`, carrick#4262).
     NoLiteralAgreement,
     /// The producer is one case of a body-dispatching handler and the call
     /// states no value for the field it switches on (carrick#831). The paths
@@ -676,8 +683,32 @@ pub(crate) fn path_verdict<E: AsRef<str>, C: AsRef<str>>(
     match agreement() {
         None => MatchVerdict::NoRouteMatch,
         Some(0) => MatchVerdict::NoLiteralAgreement,
+        Some(agreement) if unconfirmed_literals(endpoint, call) > agreement => {
+            MatchVerdict::NoLiteralAgreement
+        }
         Some(_) => MatchVerdict::Matched,
     }
+}
+
+/// How many route literals the call leaves to a placeholder: positions where
+/// the call has a placeholder and the route a literal (carrick#2004). The
+/// call's value there is unknown, so the route is reached but that literal is
+/// not confirmed. The pool keeps the equally ranked routes with the fewest of
+/// these, and [`path_verdict`] rejects a pair with more of these than it has
+/// agreement (carrick#4262).
+pub(crate) fn unconfirmed_literals<E: AsRef<str>, C: AsRef<str>>(
+    route: &SplitPath<'_, E>,
+    call: &SplitPath<'_, C>,
+) -> u32 {
+    route
+        .segments()
+        .iter()
+        .zip(call.segments())
+        .filter(|(route, call)| {
+            is_param_segment(call.as_ref())
+                && is_literal_segment(route.as_ref().trim_end_matches('?'))
+        })
+        .count() as u32
 }
 
 /// The literal agreement of a pair a surface is allowed to report as a match,
@@ -1684,5 +1715,53 @@ mod tests {
             MatchVerdict::NoLiteralAgreement
         );
         assert_eq!(reportable_agreement("/:slug", "/about"), None);
+    }
+
+    /// A call that leaves more of a route's literals to its placeholders than
+    /// it confirms vouches for less than it leaves open: the pair routes but
+    /// is not reported (carrick#4262). It is the same verdict as a pair that
+    /// confirms none, not a missing endpoint.
+    #[test]
+    fn a_call_leaving_more_literals_open_than_it_confirms_is_not_reported() {
+        let call = "/:path/:id/match-candidates";
+        assert_eq!(
+            match_verdict("/a/b/match-candidates", call),
+            MatchVerdict::NoLiteralAgreement
+        );
+        assert_eq!(reportable_agreement("/a/b/match-candidates", call), None);
+        // Routing truth is unchanged.
+        assert!(paths_match("/a/b/match-candidates", call));
+        assert_eq!(match_agreement("/a/b/match-candidates", call), Some(1));
+    }
+
+    /// The floor is "more open than confirmed", not "any open": one literal
+    /// confirmed against one left open stands, so a real pair whose only
+    /// literal match is one segment survives (the version-segment shape).
+    #[test]
+    fn a_call_confirming_as_many_literals_as_it_leaves_open_stands() {
+        let call = "/:path/:id/match-candidates";
+        assert_eq!(
+            match_verdict("/api/:id/match-candidates", call),
+            MatchVerdict::Matched
+        );
+        assert_eq!(
+            reportable_agreement("/api/:id/match-candidates", call),
+            Some(1)
+        );
+        assert_eq!(
+            match_verdict("/v1/items", "/:version/items"),
+            MatchVerdict::Matched
+        );
+        assert_eq!(
+            reportable_agreement("/v1/items", "/:version/items"),
+            Some(1)
+        );
+        for (route, call) in [
+            ("/api/:id/match-candidates", call),
+            ("/v1/items", "/:version/items"),
+        ] {
+            assert!(paths_match(route, call));
+            assert_eq!(match_agreement(route, call), Some(1));
+        }
     }
 }

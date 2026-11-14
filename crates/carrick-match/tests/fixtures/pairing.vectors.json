@@ -5,9 +5,9 @@
   "rule": [
     "Inputs are canonical keys as stored: producer full_path, consumer canonical path. The function never rewrites them (see canonical_path for the write-side form).",
     "Non-HTTP (graphql, socket, pubsub): a producer pairs when protocol, name and (socket) direction are equal and names_pair(call, producer) holds. Every such producer is a winner. No ranking.",
-    "HTTP, in order: (1) a call path with no literal segment is unknown_call_path and pairs with nothing; (2) the pool is every HTTP producer, in every service including the caller's own, whose method serves the call's (method_matches: case-insensitive, producer ALL serves every method, consumer ALL only producer ALL); (3) producers whose path routes the call (match_agreement is defined) are ranked by agreement and only the maximal ones are kept, ties kept; nothing routes -> no_route; (4) each kept producer answers match_verdict_with_dispatch; (5) dispatch_outcome over those answers decides: matched -> winners are the matched producers; route_case_unknown -> winners are the dispatching producers whose case the call does not state (one edge to the route, case unknown); no_case_answers -> no winner; otherwise (best agreement 0: a bare catch-all or a param-only route) -> no_literal_agreement, no winner.",
+    "HTTP, in order: (1) a call path with no literal segment is unknown_call_path and pairs with nothing; (2) the pool is every HTTP producer, in every service including the caller's own, whose method serves the call's (method_matches: case-insensitive, producer ALL serves every method, consumer ALL only producer ALL); (3) producers whose path routes the call (match_agreement is defined) are ranked by agreement and only the maximal ones are kept; among those, only the ones with the fewest unconfirmed literals (positions where the call has a placeholder and the route a literal) are kept, remaining ties kept (carrick#4262); nothing routes -> no_route; (4) each kept producer answers match_verdict_with_dispatch, which rejects a pair as no_literal_agreement when it confirms no literal or when its unconfirmed literals outnumber its agreement; (5) dispatch_outcome over those answers decides: matched -> winners are the matched producers; route_case_unknown -> winners are the dispatching producers whose case the call does not state (one edge to the route, case unknown); no_case_answers -> no winner; otherwise (a bare catch-all, a param-only route, or a call leaving more route literals open than it confirms) -> no_literal_agreement, no winner.",
     "Every winner carries same_service (producer service == call service), relationship (producer_consumer for route-definition evidence, shared_external_contract for call-site evidence) and, for HTTP, call_param_over_route_literal (the call has a placeholder where this route states a literal: carrick#2004; the edge stands, the type check does not compare). These are facts, not filters: what a surface draws for them is its documented policy.",
-    "routed lists every maximal-agreement producer with its verdict, for reasons and near-miss text. It is empty for non-HTTP calls, unknown_call_path and no_route.",
+    "routed lists every producer kept by step (3) (maximal agreement, then fewest unconfirmed literals) with its verdict, for reasons and near-miss text. It is empty for non-HTTP calls, unknown_call_path and no_route.",
     "A call carrying procedure (a tRPC-style procedure call: path and router repo, file and binding) pairs first, before any protocol rule: its winners are every producer whose procedure equals the call's, in input order, each matched with no agreement and no routed rows. The call's path and method are not read. Nothing equal gives procedure_unserved: no winner, never a missing endpoint. A call without procedure pairs as the rules above say.",
     "A case carrying expected_red pins today's answer for a product gap the case names: the answer is right for this function's rule and wrong for the product. Its expect is checked like any other; the marker says what turns the product green and must be removed by the change that does."
   ],
@@ -746,7 +746,7 @@
     },
     {
       "id": "call-placeholder-over-route-literal-is-flagged",
-      "source": "carrick#2004 (type check abstains, edge stands)",
+      "source": "carrick#2004 (type check abstains); carrick#4262 (the flagged route loses the tie to the param route: one winner)",
       "input": {
         "producers": [
           {
@@ -773,12 +773,240 @@
         "outcome": "matched",
         "winners": [
           {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "placeholder-over-literal-loses-to-param-route",
+      "source": "carrick#4262: among equally ranked routes, the ones the call leaves the fewest literals open on win",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/jobs/stats"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/jobs/archive"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/jobs/:jobId"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/jobs/:id"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 2,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
+          }
+        ],
+        "routed": [
+          {
+            "producer": 2,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "all-tied-routes-flagged-keep-every-winner",
+      "source": "carrick#4262: when every equally ranked route leaves the same number of literals open, all stay winners (a known value set is carrick#3608)",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/r/bills/:id/candidates"
+          },
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/r/notes/:id/candidates"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/r/:kind/:id/candidates"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 2,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": true
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": true
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 2
+          },
+          {
+            "producer": 1,
+            "verdict": "matched",
+            "agreement": 2
+          }
+        ]
+      }
+    },
+    {
+      "id": "call-leaves-more-literals-open-than-it-confirms",
+      "source": "carrick#4262: the call confirms one route literal and leaves two to its placeholders, so the pair is not reported",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/a/b/candidates"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/:p/:q/candidates"
+        }
+      },
+      "expect": {
+        "outcome": "no_literal_agreement",
+        "winners": [],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "no_literal_agreement",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "last-segment-match-stands",
+      "source": "carrick#4262: one literal confirmed against one left open is reported",
+      "input": {
+        "producers": [
+          {
+            "service": "api",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/api/:id/candidates"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/:p/:q/candidates"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
             "producer": 0,
             "verdict": "matched",
             "agreement": 1,
             "same_service": false,
             "relationship": "producer_consumer",
             "call_param_over_route_literal": true
+          }
+        ],
+        "routed": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "same-route-two-services-still-fans-out",
+      "source": "carrick#4262: the tie-break never collapses a tie where no route leaves a literal open",
+      "input": {
+        "producers": [
+          {
+            "service": "a",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/:id"
+          },
+          {
+            "service": "b",
+            "protocol": "http",
+            "method": "GET",
+            "path": "/items/:id"
+          }
+        ],
+        "call": {
+          "service": "web",
+          "protocol": "http",
+          "method": "GET",
+          "path": "/items/:itemId"
+        }
+      },
+      "expect": {
+        "outcome": "matched",
+        "winners": [
+          {
+            "producer": 0,
+            "verdict": "matched",
+            "agreement": 1,
+            "same_service": false,
+            "relationship": "producer_consumer",
+            "call_param_over_route_literal": false
           },
           {
             "producer": 1,

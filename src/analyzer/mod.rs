@@ -10228,7 +10228,7 @@ mod tests {
         // The crate pins the same file (`crates/carrick-match/tests/
         // pairing_vectors.rs` `PINNED_SHA256`); re-pin both together.
         const PINNED_SHA256: &str =
-            "909370d5aa556dc76fd05eb7e306160b6057083b043325a9a7b7a3f442b3bf70";
+            "48373db96c94a323dc1d8353ae0c1fc51e4ceb8838db13964b5ebff23741c3ff";
         let digest: String = Sha256::digest(VECTORS)
             .iter()
             .map(|byte| format!("{byte:02x}"))

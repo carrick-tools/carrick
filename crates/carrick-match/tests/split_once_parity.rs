@@ -15,10 +15,14 @@
 //! `split_once_timing_log` prints the per-call time of both over the same
 //! fixture. It asserts nothing about time.
 //!
-//! The oracle has learned one rule since c8c654a7, the named catch-all of
+//! The oracle has learned two rules since c8c654a7. The named catch-all of
 //! carrick#4205 (`*name`, `{*name}`, a trailing `{/*name}`): `split_route`,
 //! `catch_all_prefix` and `is_named_wildcard` below are copies of the
-//! crate's, so the parity proof still covers named wildcards.
+//! crate's, so the parity proof still covers named wildcards. And
+//! carrick#4262's unconfirmed literals: `match_verdict` rejects a pair that
+//! leaves more route literals to a placeholder than it confirms, and
+//! `Pool::pair_http` keeps only the maximal-agreement routes with the fewest
+//! of them.
 
 use std::time::Instant;
 
@@ -155,6 +159,9 @@ mod frozen {
         match match_agreement(endpoint_path, call_path) {
             None => MatchVerdict::NoRouteMatch,
             Some(0) => MatchVerdict::NoLiteralAgreement,
+            Some(agreement) if unconfirmed_literals(endpoint_path, call_path) > agreement => {
+                MatchVerdict::NoLiteralAgreement
+            }
             Some(_) => MatchVerdict::Matched,
         }
     }
@@ -244,12 +251,17 @@ mod frozen {
         Some(agreement)
     }
 
-    fn call_param_over_route_literal(route_path: &str, call_path: &str) -> bool {
+    fn unconfirmed_literals(route_path: &str, call_path: &str) -> u32 {
         split_route(route_path)
             .zip(split_route(call_path))
-            .any(|(route, call)| {
+            .filter(|(route, call)| {
                 is_param_segment(call) && is_literal_segment(route.trim_end_matches('?'))
             })
+            .count() as u32
+    }
+
+    fn call_param_over_route_literal(route_path: &str, call_path: &str) -> bool {
+        unconfirmed_literals(route_path, call_path) > 0
     }
 
     fn method_key(method: &str) -> String {
@@ -323,11 +335,27 @@ mod frozen {
             let Some(best) = scored.iter().map(|&(_, agreement)| agreement).max() else {
                 return empty(PairOutcome::NoRoute);
             };
+            let at_best: Vec<(usize, u32)> =
+                scored.into_iter().filter(|&(_, a)| a == best).collect();
+            let unconfirmed = |index: usize| {
+                unconfirmed_literals(
+                    self.producers[index].path.as_deref().unwrap_or(""),
+                    call_path,
+                )
+            };
+            let fewest = at_best
+                .iter()
+                .map(|&(index, _)| unconfirmed(index))
+                .min()
+                .unwrap_or(0);
             let mut routed = Vec::new();
             let mut matched = Vec::new();
             let mut case_unknown = Vec::new();
             let mut case_mismatched = 0u32;
-            for (index, agreement) in scored.into_iter().filter(|&(_, a)| a == best) {
+            for (index, agreement) in at_best
+                .into_iter()
+                .filter(|&(index, _)| unconfirmed(index) == fewest)
+            {
                 let producer = &self.producers[index];
                 let verdict = match_verdict_with_dispatch(
                     producer.path.as_deref().unwrap_or(""),
