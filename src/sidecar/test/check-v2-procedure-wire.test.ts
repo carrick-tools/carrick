@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import { captureStub, runCheck } from '../src/capture/index.js';
 import type { CaptureStubResult, CheckPairSpec, CheckVerdict } from '../src/capture/api.js';
 import { buildProbe, unwidenedAliasOf, wireFormFor } from '../src/capture/check-probe.js';
+import { CheckV2RequestSchema } from '../src/validators.js';
 
 function captureLiterals(
   root: string,
@@ -182,5 +183,30 @@ describe('the procedure probe (carrick#4402)', () => {
     const plan = buildProbe(spec(false), (s) => `@carrick/${s}`);
     assert.ok(![...plan.gateLines.values()].includes('sent:wire_form'));
     assert.match(plan.source, /sentWire/);
+  });
+});
+
+describe('the check_v2 request carries the procedure fact (carrick#4402)', () => {
+  const request = (pair: Record<string, unknown>) => ({
+    request_id: 'r',
+    action: 'check_v2',
+    stubs: [{ service_name: 'api', stub_dir: '/s' }],
+    pairs: [
+      {
+        pair_key: 'k',
+        protocol: 'http',
+        type_kind: 'response',
+        producer: { service_name: 'api', alias: 'P' },
+        consumer: { service_name: 'web', alias: 'C' },
+        ...pair,
+      },
+    ],
+  });
+
+  it('keeps `procedure: true` through the stdio schema, and adds nothing without it', () => {
+    const parsed = CheckV2RequestSchema.parse(request({ procedure: true }));
+    assert.strictEqual(parsed.pairs[0].procedure, true);
+    const plain = CheckV2RequestSchema.parse(request({}));
+    assert.ok(!('procedure' in plain.pairs[0]));
   });
 });
