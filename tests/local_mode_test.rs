@@ -5970,6 +5970,82 @@ fn the_probe_times_each_step() {
     }
 }
 
+/// One `--each` probe reads the index, the workspace, git's list of changes
+/// per checkout and the blobs (or the kept probe file) once for every file it
+/// answers, and each answer is the one that file's own probe gives
+/// (carrick#4389). Two files of two services of one repo, so one checkout and
+/// one commit serve both.
+#[test]
+#[serial]
+fn one_each_probe_reads_once() {
+    let workspace = shop();
+    let root = workspace.path();
+    index(root);
+    statement_in(&root.join(SHOP_CLIENT), "inventory edit");
+    statement_in(&root.join(SHOP_HEALTH), "catalog edit");
+    let probe = |files: &[&str], each: bool| -> (serde_json::Value, String) {
+        let temp = private_temp();
+        let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+        let mut args = vec!["check"];
+        if each {
+            args.push("--each");
+        }
+        args.extend(files);
+        args.extend(["--workspace", ".", "--recheck", "--no-rescan", "--json"]);
+        let mut command = Command::new(carrick());
+        command
+            .args(&args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env(AMPLE[0].0, AMPLE[0].1)
+            .env("TMPDIR", tmpdir)
+            .env("CARRICK_RECHECK_TIMING", "1");
+        as_signed_in(&mut command, &args);
+        let output = command.output().expect("run check");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{args:?}:\n{stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut answer: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"));
+        let bodies = match &mut answer {
+            serde_json::Value::Array(bodies) => bodies.iter_mut().collect::<Vec<_>>(),
+            one => vec![one],
+        };
+        for body in bodies {
+            body["recheck"]
+                .as_object_mut()
+                .expect("a recheck block")
+                .remove("elapsed_ms");
+        }
+        (answer, stderr)
+    };
+    let (each, stderr) = probe(&[SHOP_CLIENT, SHOP_HEALTH], true);
+    let lines = |step: &str| {
+        stderr
+            .matches(&format!("recheck-timing {step} took "))
+            .count()
+    };
+    for step in [
+        "check/read-index",
+        "check/changed-files",
+        "check/load-workspace",
+    ] {
+        assert_eq!(lines(step), 1, "{step} ran once per file:\n{stderr}");
+    }
+    assert_eq!(
+        lines("probe-kept-read") + lines("held-read"),
+        1,
+        "the repo's reads were taken once:\n{stderr}"
+    );
+    let answers = each.as_array().expect("an array");
+    assert_eq!(answers.len(), 2, "{each:#}");
+    for (answer, file) in answers.iter().zip([SHOP_CLIENT, SHOP_HEALTH]) {
+        let (alone, _) = probe(&[file], false);
+        assert_eq!(answer, &alone, "{file}: the shared read changed the answer");
+    }
+}
+
 /// One re-check of `SHOP_CLIENT` with every step timed: the probe
 /// (`--no-rescan`) or the full re-check. Returns the answer and stderr.
 fn timed_recheck(root: &Path, full: bool) -> (serde_json::Value, String) {
