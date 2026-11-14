@@ -756,3 +756,149 @@ fn an_unwritten_slot_is_not_asked_of_another_protocol() {
     );
     assert!(requests.is_empty(), "{requests:?}");
 }
+
+/// A summary row at a caller as the request summaries state it, at line 2 of
+/// [`FILE`], reaching the request written at `net.ts:1`.
+fn caller_row(
+    target: &str,
+    request: &str,
+    call_body: Option<crate::forwarded_body::CallBody>,
+) -> crate::agents::file_analyzer_agent::DataCallResult {
+    let (start, end) = span_of("http.post(\"/orders\", order)");
+    crate::agents::file_analyzer_agent::DataCallResult {
+        call_kind: None,
+        candidate_id: format!("span:{start}-{end}"),
+        line_number: 2,
+        target: target.to_string(),
+        method: Some("POST".to_string()),
+        pattern_matched: "place".to_string(),
+        call_expression_span_start: Some(start),
+        call_expression_span_end: Some(end),
+        call_expression_text: None,
+        call_expression_line: None,
+        payload_expression_text: None,
+        payload_expression_line: None,
+        primary_type_symbol: None,
+        type_import_source: None,
+        loopback_default_url: None,
+        base: None,
+        consumers_not_resolved: None,
+        resolution_source: Some(
+            crate::agents::file_analyzer_agent::ResolutionSource::RequestSummary,
+        ),
+        dispatch: None,
+        reaches_request: Some(request.to_string()),
+        body_literals: Default::default(),
+        library_semantics: Vec::new(),
+        at_caller: true,
+        call_body,
+        static_asset: None,
+        request_line: None,
+    }
+}
+
+fn results_with(
+    rows: Vec<crate::agents::file_analyzer_agent::DataCallResult>,
+) -> std::collections::HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult> {
+    let mut results = std::collections::HashMap::new();
+    results.insert(
+        FILE.to_string(),
+        crate::agents::file_analyzer_agent::FileAnalysisResult {
+            graphql_consumer_locates: vec![],
+            mounts: vec![],
+            endpoints: vec![],
+            data_calls: rows,
+            graphql_operations: vec![],
+            pubsub_operations: vec![],
+            dispatch_tables: Vec::new(),
+        },
+    );
+    results
+}
+
+/// carrick#4260: a slot a yielded site carries types only the request entry
+/// of the row whose own send that site is, read through the row's own call.
+/// A second row on the same line (another request, another path) is not
+/// joined, nor is a row that sends a parameter unchanged.
+#[test]
+fn a_carried_slot_types_only_its_own_row_s_request_entry() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str = "export const place = (d: D) => http.post(\"/a\", { body: d });\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let built = "{ body: d }";
+    let start = WRAPPER_SOURCE.find(built).unwrap() as u32;
+    let mut payloads = SitePayloads::default();
+    payloads.carried.push(Carried {
+        request: (WRAPPER.to_string(), 1),
+        rows: vec![(FILE.to_string(), 2)],
+        request_slot: PayloadAt::Value(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + built.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        }),
+    });
+    let declared = crate::forwarded_body::CallBody::Param(crate::forwarded_body::DeclaredParam {
+        file: WRAPPER.to_string(),
+        span_start: 1,
+        span_end: 2,
+        line: 1,
+    });
+    let results = results_with(vec![
+        caller_row(
+            "/a",
+            "src/net.ts:1",
+            Some(crate::forwarded_body::CallBody::Built),
+        ),
+        // Another request on the same line: the slot is not its own.
+        caller_row(
+            "/b",
+            "src/net.ts:7",
+            Some(crate::forwarded_body::CallBody::Built),
+        ),
+        // A row that sends a parameter unchanged keeps its declared type.
+        caller_row("/c", "src/net.ts:1", Some(declared)),
+    ]);
+    let root = dir.path().to_string_lossy().into_owned();
+    let joined = payloads.joined_to_rows(
+        &results,
+        &root,
+        &crate::url_normalizer::UrlNormalizer::new(&crate::config::Config::default()),
+    );
+    let at_path = |path: &str| {
+        entry(
+            json!({ "protocol": "http", "method": "POST", "path": path }),
+            "consumer",
+            "request",
+            &format!("Req{path}"),
+            2,
+        )
+    };
+    let entries = [at_path("/a"), at_path("/b"), at_path("/c")];
+    assert!(joined.types_row(&entries[0]));
+    assert!(!joined.types_row(&entries[1]));
+    assert!(!joined.types_row(&entries[2]));
+
+    let requests = joined.requests(&entries, &root, &ResultIndex::default(), &HashSet::new());
+    let [request] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    assert_eq!(request.alias.as_deref(), Some("Req/a"));
+    let (call_start, call_end) = sidecar_span("http.post(\"/orders\", order)");
+    assert_eq!(
+        request.through_call,
+        Some(ThroughCall {
+            file_path: dir.path().join(FILE).to_string_lossy().into_owned(),
+            span_start: call_start.unwrap(),
+            span_end: call_end.unwrap(),
+        })
+    );
+    // A row the slot does not reach is joined to nothing without the carry.
+    let none = SitePayloads::default().joined_to_rows(
+        &results,
+        &root,
+        &crate::url_normalizer::UrlNormalizer::new(&crate::config::Config::default()),
+    );
+    assert!(!none.types_row(&entries[0]));
+}

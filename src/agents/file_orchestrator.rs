@@ -11554,7 +11554,10 @@ impl FileOrchestrator {
     /// it out of the index. The target itself is untouched, so the row still
     /// displays the deployed origin and still reads as an env-var call for the
     /// `internalEnvVars` suggestion.
-    fn canonical_call_path(normalizer: &UrlNormalizer, data_call: &DataCallResult) -> String {
+    pub(crate) fn canonical_call_path(
+        normalizer: &UrlNormalizer,
+        data_call: &DataCallResult,
+    ) -> String {
         let url = data_call
             .loopback_default_url
             .as_deref()

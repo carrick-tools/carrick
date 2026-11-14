@@ -6305,7 +6305,12 @@ async fn analyze_current_repo_incremental(
             //
             // Build type manifest
             let mut manifest_entries = build_type_manifest_entries(&mount_graph, config, repo_path);
-            drop_call_through_entries(&mut manifest_entries, &merged_results);
+            let site_payloads = site_payloads.joined_to_rows(
+                &merged_results,
+                repo_path,
+                &UrlNormalizer::new(config),
+            );
+            drop_call_through_entries(&mut manifest_entries, &merged_results, &site_payloads);
             stamp_stated_values(&mut manifest_entries, &merged_results);
             stamp_manifest_anchor_symbols(
                 &mut manifest_entries,
@@ -7741,6 +7746,8 @@ async fn site_rows_of(
 ) {
     let root = Path::new(repo_path);
     let SiteRecordsOf {
+        yielded,
+        yielded_records,
         discovered,
         reached_label,
         decided,
@@ -7849,7 +7856,8 @@ async fn site_rows_of(
     // Where the decided sites place their payloads, from the same records
     // the site questions read; with no compiler rows discovery finds no
     // site and nothing moves.
-    let payloads = crate::site_payloads::SitePayloads::of(&records);
+    let mut payloads = crate::site_payloads::SitePayloads::of(&records);
+    payloads.carry(&yielded, yielded_records);
     debug!(
         records = records.len(),
         "site payloads: records whose slots the type capture may read"
@@ -8133,6 +8141,10 @@ fn settled_declarations(
 /// What a service's site questions read before anything is asked
 /// ([`site_records_of`]).
 struct SiteRecordsOf {
+    /// The HTTP sites that yielded to summary rows, and their records
+    /// (carrick#4260).
+    yielded: Vec<crate::request_summary::decided_sites::Yielded>,
+    yielded_records: Vec<(usize, crate::request_summary::site_record::SiteRecord)>,
     /// The calls discovery lists: each one that reached a labelled export,
     /// and each walk that entered code and stopped.
     discovered: usize,
@@ -8316,14 +8328,15 @@ fn site_records_of(
     };
     let yielded = context
         .placements
-        .map_or(0, |placed| decided.yield_to_summaries(root, placed));
+        .map(|placed| decided.yield_to_summaries(root, placed))
+        .unwrap_or_default();
     let based = context.library.map(|library| {
         decided.carry_instance_bases(root, library, claims, inputs, context.siblings)
     });
     let unbased = based.map_or(0, |based| based.left_out);
     let bases_options_unread = based.map_or(0, |based| based.options_unread);
     debug!(
-        yielded,
+        yielded = yielded.len(),
         kept = decided.kept_beside_summaries.len(),
         unbased,
         bases_options_unread,
@@ -8339,7 +8352,19 @@ fn site_records_of(
         &decided,
         &labels,
     );
+    // The yielded sites' slots type the rows they yielded to
+    // (carrick#4260); read by the payload slots alone.
+    let yielded_records = crate::request_summary::site_record::yielded_records(
+        inputs,
+        context.siblings,
+        root,
+        &decided,
+        &yielded,
+        &labels,
+    );
     SiteRecordsOf {
+        yielded,
+        yielded_records,
         discovered: discovery.sites.len(),
         reached_label,
         unread: crate::unread_sites::from_scan(
@@ -14440,6 +14465,7 @@ fn withhold_unread_hand_backs(
 fn drop_call_through_entries(
     manifest: &mut Vec<TypeManifestEntry>,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    carried: &crate::site_payloads::SitePayloads,
 ) {
     let normalize_line = |line: i32| -> u32 { if line <= 0 { 1 } else { line as u32 } };
     let unstated: HashSet<(&str, u32, String, ManifestTypeKind)> = file_results
@@ -14469,6 +14495,8 @@ fn drop_call_through_entries(
         return;
     }
     manifest.retain(|entry| {
+        // A request entry a yielded site's slot types stays: the slot is the
+        // row's own send (carrick#4260).
         let dropped = entry.role == ManifestRole::Consumer
             && entry.key.as_http().is_some_and(|(method, _)| {
                 unstated.contains(&(
@@ -14477,7 +14505,8 @@ fn drop_call_through_entries(
                     method.to_string(),
                     entry.type_kind,
                 ))
-            });
+            })
+            && !carried.types_row(entry);
         !dropped
     });
 }
@@ -15569,7 +15598,16 @@ async fn analyze_current_repo(
     // repo's config to resolve (carrick#1416).
     let mut manifest_entries =
         build_type_manifest_entries(&analysis_result.mount_graph, config, repo_path);
-    drop_call_through_entries(&mut manifest_entries, &analysis_result.file_results);
+    let site_payloads = site_payloads.joined_to_rows(
+        &analysis_result.file_results,
+        repo_path,
+        &UrlNormalizer::new(config),
+    );
+    drop_call_through_entries(
+        &mut manifest_entries,
+        &analysis_result.file_results,
+        &site_payloads,
+    );
     stamp_stated_values(&mut manifest_entries, &analysis_result.file_results);
     stamp_manifest_anchor_symbols(
         &mut manifest_entries,
@@ -19890,7 +19928,11 @@ unfollowed_member_calls_total: 0,
         );
 
         let mut entries = build_type_manifest_entries(&mount_graph, &config, ".");
-        drop_call_through_entries(&mut entries, &file_results);
+        drop_call_through_entries(
+            &mut entries,
+            &file_results,
+            &crate::site_payloads::SitePayloads::default(),
+        );
         // No caller row's own call named a body member (carrick#4196).
         withhold_unread_hand_backs(&mut entries, &file_results, &BTreeSet::new());
 

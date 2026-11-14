@@ -954,6 +954,38 @@ fn a_body_built_from_a_loose_parameter_reads_the_declared_type() {
     );
 }
 
+const WIDGET_CALLERS: &str = "web/src/widgetcaller.ts";
+
+/// carrick#4260: a caller of a store-answered wrapper that builds its body
+/// (`widgetcaller.ts:2` a function, `:3` a class method) or reads one member
+/// of its parameter (`:5`) takes the body the wrapper sends, and the pair is
+/// judged against the producer. `:4` sends its parameter unchanged and keeps
+/// the declared type.
+#[test]
+fn a_store_answered_wrapper_s_built_body_is_judged_at_its_callers() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    for line in [2, 3, 5] {
+        assert_eq!(
+            request_type_at(WIDGET_CALLERS, line).as_deref(),
+            Some("{ body: string; }"),
+            "line {line}: {:#?}",
+            consumer_entries(WIDGET_CALLERS)
+        );
+        assert_eq!(
+            request_verdicts_in(WIDGET_CALLERS, line),
+            [(
+                "http|POST|/v1/orders".to_string(),
+                "request".to_string(),
+                "compatible".to_string()
+            )],
+            "line {line}"
+        );
+    }
+}
+
 // `tests/fixtures/hand-back-object` (carrick#4185): `web` calls `api` through
 // wrappers that hand back the transport response beside the parsed body. A
 // caller's value is that object, never the body: the body is the member the
