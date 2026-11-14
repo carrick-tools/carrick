@@ -14,7 +14,7 @@ import { answersTheEdit, changedCleanLine, changedLines, movedLines, renderPostT
 import { claimDelivery, isChanged, owedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
 import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
-import { leadLines } from "./lead.ts";
+import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 
 const log = createLogger("carrick-late");
@@ -42,7 +42,7 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
 
 /**
  * What a carrier prints for one finished answer it has claimed, oldest first:
- * its lead lines, then its words (`lateContext`), with the uses-count and lead
+ * its similar-function blocks, then its words (`lateContext`), with the uses-count and lead
  * keys marked as told. Shared by `deliverLate` and by the Stop hook for an
  * answer queued in place of the probe (R46.2), so both print it the same way.
  */
@@ -56,7 +56,7 @@ export function deliverOne(session: string, answer: Answer, home?: string): stri
   // A lead the probe already delivered is in `led`; this one is for a file
   // whose probe had no answer (carrick#3249).
   const found = answer.result
-    ? leadLines(answer.result, answer.relative, (leadKey) => !wasLed(session, leadKey, home), log)
+    ? similarLines(answer.result, answer.relative, (similarKey) => !wasLed(session, similarKey, home), log)
     : null;
   if (found && found.lines.length > 0) {
     contexts.push(...found.lines);

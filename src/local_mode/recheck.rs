@@ -329,8 +329,8 @@ pub fn run(
     let added = added_functions(&held, tree, relative);
     took("added-functions", began);
     let began = Instant::now();
-    let new_functions = with_leads(&held, tree, relative, added);
-    took("leads", began);
+    let new_functions = with_similar(&held, tree, relative, added);
+    took("similar", began);
     let began = Instant::now();
     let misses = ServiceMisses::path(workspace);
     let known = ServiceMisses::read(&misses);
@@ -997,14 +997,14 @@ fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<Added> {
     additions(&services, repo, relative, &indexed)
 }
 
-/// One function the edit added, with what the lead is looked up by.
-type Added = (super::contract::NewFunction, super::lead::Query);
+/// One function the edit added, with what its similar functions are looked up by.
+type Added = (super::contract::NewFunction, super::similar::Query);
 
-/// Attach to each added function the indexed function it looks like
-/// ([`super::lead`]), read from every blob `held` has, in every repo. The
+/// Attach to each added function the indexed functions it looks like
+/// ([`super::similar`]), read from every blob `held` has, in every repo. The
 /// index is built once per call and only when the edit added a function: an
 /// edit that adds none pays nothing here.
-fn with_leads(
+fn with_similar(
     held: &Held,
     tree: &Tree,
     relative: &str,
@@ -1013,7 +1013,7 @@ fn with_leads(
     if added.is_empty() {
         return Vec::new();
     }
-    let index = super::lead::LeadIndex::build(
+    let index = super::similar::Similar::build(
         held.local
             .iter()
             .map(|blob| (blob.repo_name.clone(), blob))
@@ -1023,7 +1023,7 @@ fn with_leads(
     added
         .into_iter()
         .map(|(function, query)| super::contract::NewFunction {
-            lead: index.lead(&query, &repo, relative),
+            similar: index.similar(&query, &repo, relative),
             ..function
         })
         .collect()
@@ -1039,8 +1039,8 @@ fn with_leads(
 /// names for itself (`it_handler`) are indexed but cannot be imported, so
 /// they are not reuse candidates.
 ///
-/// Each comes with the lookup the lead reads, from the same one parse: the
-/// definition's tokens and written return type, and the names its body calls
+/// Each comes with the lookup the ranking reads, from the same one parse: the
+/// definition's tokens and composed signature, and the names its body calls
 /// (the call graph has not filled `calls` on a single parse).
 fn additions(
     services: &[crate::config::Config],
@@ -1085,7 +1085,7 @@ fn additions(
                 .iter()
                 .find(|(_, definition)| definition.name == function.name)
                 .map_or_else(
-                    || super::lead::Query::named(&function.name),
+                    || super::similar::Query::named(&function.name),
                     |(key, definition)| {
                         let callees = extractor
                             .callee_refs
@@ -1094,7 +1094,7 @@ fn additions(
                             .flatten()
                             .map(|callee| callee.name.clone())
                             .collect();
-                        super::lead::Query::of(definition, callees)
+                        super::similar::Query::of(definition, callees)
                     },
                 );
             (function, query)
@@ -1679,7 +1679,7 @@ fn new_functions(
         .map(|function| super::contract::NewFunction {
             name: function.name,
             line: function.line,
-            lead: None,
+            similar: Vec::new(),
         })
         .collect();
     // Line order, so the list reads down the file rather than out of a hash
@@ -2590,5 +2590,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "recheck_lead_tests.rs"]
-mod lead_tests;
+#[path = "recheck_similar_tests.rs"]
+mod similar_tests;

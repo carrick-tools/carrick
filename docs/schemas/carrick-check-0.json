@@ -214,6 +214,27 @@
               "line": {
                 "type": "integer",
                 "description": "Where the function starts in the working tree."
+              },
+              "similar": {
+                "type": "array",
+                "description": "Indexed functions this one may already exist as, best first, at most 6 (carrick-cloud#3490). Absent when no indexed function shares a word with it.",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "repo", "file", "line", "end_line", "score", "exported", "called_from"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "repo": { "type": "string" },
+                    "file": { "type": "string" },
+                    "line": { "type": "integer" },
+                    "end_line": { "type": "integer" },
+                    "score": { "type": "number" },
+                    "signature": { "type": "string" },
+                    "exported": { "type": "boolean" },
+                    "called_from": { "type": "integer", "description": "How many other files hold an indexed call that names it." },
+                    "intent": { "type": "string" }
+                  },
+                  "additionalProperties": true
+                }
               }
             },
             "additionalProperties": true
