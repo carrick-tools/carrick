@@ -11018,6 +11018,7 @@ fn add_graphql_request_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
+        graphql_leaves: None,
         v1_before_demotion: None,
     });
 }
@@ -11274,6 +11275,7 @@ fn add_protocol_manifest_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
+        graphql_leaves: None,
         v1_before_demotion: None,
     });
 }
@@ -14868,6 +14870,7 @@ fn add_manifest_pair(
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_leaves: None,
             v1_before_demotion: None,
         });
     }
@@ -19125,6 +19128,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
+                graphql_leaves: None,
                 v1_before_demotion: None,
             }]),
             file_results: Some(file_results),
@@ -25660,6 +25664,7 @@ unfollowed_member_calls_total: 0,
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_leaves: None,
             v1_before_demotion: None,
         }
     }
@@ -34725,6 +34730,48 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             ],
             "a row read at its field names no symbol for the operation's result"
         );
+    }
+
+    /// carrick#4403: the SDL producer's Response entry carries its leaf tree;
+    /// its Request entry, a consumer's entry and every other entry do not.
+    #[test]
+    fn graphql_producer_response_entry_carries_the_sdl_leaf_tree() {
+        let sdl = "type Invoice { id: ID!, at: DateTime! }\n\
+                   type Query { invoice(id: ID!): Invoice }";
+        let graphql = crate::graphql::extract_from_document_text(
+            sdl,
+            std::path::Path::new("schema.graphql"),
+            1,
+        );
+        let extractions = ProtocolExtractions {
+            event_bus: crate::event_emitter::BusExtraction::default(),
+            graphql,
+            sockets: Default::default(),
+            library: Default::default(),
+            site: crate::site_rows::SiteRows::default(),
+            socket_sites: Default::default(),
+            implementations_unanswered: Vec::new(),
+        };
+        let mut entries = Vec::new();
+        append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
+        let stamped: Vec<(ManifestTypeKind, bool)> = entries
+            .iter()
+            .map(|e| (e.type_kind, e.graphql_leaves.is_some()))
+            .collect();
+        assert_eq!(
+            stamped,
+            vec![
+                (ManifestTypeKind::Response, true),
+                (ManifestTypeKind::Request, false)
+            ]
+        );
+        let json = serde_json::to_value(&entries[0]).expect("serialises");
+        assert_eq!(
+            json["graphql_leaves"],
+            serde_json::json!({ "id": "ID", "at": "DateTime" })
+        );
+        let request = serde_json::to_value(&entries[1]).expect("serialises");
+        assert!(request.get("graphql_leaves").is_none());
     }
 
     /// A minimal endpoint the file-analyzer would emit alongside a

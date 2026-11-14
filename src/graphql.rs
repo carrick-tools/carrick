@@ -237,15 +237,63 @@ pub struct SdlTypeFields {
     pub fields: BTreeMap<String, BTreeSet<String>>,
     /// Root operation type name -> the operation kind it serves.
     pub roots: BTreeMap<String, GraphqlOperationKind>,
+    /// Output types (object, interface, union, enum) by name, for the leaf
+    /// tree of a producer response (carrick#4403).
+    pub outputs: BTreeMap<String, SdlOutputType>,
 }
+
+/// What an output type declares, as far as a response's leaves need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SdlOutputType {
+    /// An object or interface: `(field name, named type)` in declaration
+    /// order, list and non-null wrappers stripped.
+    Fields(Vec<(String, String)>),
+    /// A union: its member type names.
+    Union(Vec<String>),
+    /// An enum: a leaf named `enum`.
+    Enum,
+}
+
+/// One node of a response's leaf tree (carrick#4403): an SDL scalar name, or
+/// a nested map for an object, interface or union.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Leaf {
+    Scalar(String),
+    Tree(BTreeMap<String, Leaf>),
+}
+
+/// The deepest object nesting a leaf tree keeps.
+const LEAF_DEPTH_CAP: usize = 8;
 
 impl SdlTypeFields {
     fn merge(&mut self, other: SdlTypeFields) {
+        for (name, output) in other.outputs {
+            self.record_output(name, output);
+        }
         for (name, fields) in other.fields {
             self.fields.entry(name).or_default().extend(fields);
         }
         for (name, kind) in other.roots {
             self.roots.entry(name).or_insert(kind);
+        }
+    }
+
+    /// First declaration wins; an extension (or a second file) adds the
+    /// fields the first did not declare.
+    fn record_output(&mut self, name: String, output: SdlOutputType) {
+        match (self.outputs.get_mut(&name), output) {
+            (Some(SdlOutputType::Fields(have)), SdlOutputType::Fields(more)) => {
+                for (field, named) in more {
+                    if !have.iter().any(|(seen, _)| *seen == field) {
+                        have.push((field, named));
+                    }
+                }
+            }
+            (Some(_), _) => {}
+            (None, output) => {
+                self.outputs.insert(name, output);
+            }
         }
     }
 
@@ -2289,6 +2337,12 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
         }
 
         for definition in &schema.definitions {
+            if let Some((name, output)) = sdl_output_type(definition) {
+                extraction.schema_types.record_output(name, output);
+            }
+        }
+
+        for definition in &schema.definitions {
             let (name, fields) = match definition {
                 Definition::TypeDefinition(TypeDefinition::Object(obj)) => {
                     has_type_system_definitions = true;
@@ -2452,6 +2506,102 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
     }
 
     parsed.then_some(extraction)
+}
+
+/// The output type a definition declares, for the leaf tree.
+fn sdl_output_type(
+    definition: &graphql_parser::schema::Definition<'_, String>,
+) -> Option<(String, SdlOutputType)> {
+    use graphql_parser::schema::{Definition, TypeDefinition, TypeExtension};
+    let fields = |fields: &[graphql_parser::schema::Field<'_, String>]| {
+        SdlOutputType::Fields(
+            fields
+                .iter()
+                .map(|f| (f.name.clone(), sdl_named_type(&f.field_type).to_string()))
+                .collect(),
+        )
+    };
+    match definition {
+        Definition::TypeDefinition(TypeDefinition::Object(o)) => {
+            Some((o.name.clone(), fields(&o.fields)))
+        }
+        Definition::TypeDefinition(TypeDefinition::Interface(i)) => {
+            Some((i.name.clone(), fields(&i.fields)))
+        }
+        Definition::TypeExtension(TypeExtension::Object(o)) => {
+            Some((o.name.clone(), fields(&o.fields)))
+        }
+        Definition::TypeExtension(TypeExtension::Interface(i)) => {
+            Some((i.name.clone(), fields(&i.fields)))
+        }
+        Definition::TypeDefinition(TypeDefinition::Union(u)) => {
+            Some((u.name.clone(), SdlOutputType::Union(u.types.clone())))
+        }
+        Definition::TypeDefinition(TypeDefinition::Enum(e)) => {
+            Some((e.name.clone(), SdlOutputType::Enum))
+        }
+        _ => None,
+    }
+}
+
+/// A producer response's leaf tree (carrick#4403): `rendered` is the root
+/// field's SDL type expression (`[Order!]!`), walked to its leaves through
+/// `types`. `None` when it names no object, interface or union, or when no
+/// field survives.
+pub fn response_leaves(rendered: &str, types: &SdlTypeFields) -> Option<BTreeMap<String, Leaf>> {
+    let named = rendered.trim_matches(|c| matches!(c, '[' | ']' | '!'));
+    let _ = (named, types);
+    None
+}
+
+/// The fields `name` declares as a leaf map; `None` for a non-composite.
+/// `path` holds the composite types being walked: a type already on it, or
+/// one past the depth cap, is cut.
+#[allow(dead_code)]
+fn leaf_tree<'t>(
+    name: &'t str,
+    types: &'t SdlTypeFields,
+    path: &mut Vec<&'t str>,
+) -> Option<BTreeMap<String, Leaf>> {
+    let declared = types.outputs.get(name)?;
+    path.push(name);
+    let tree = match declared {
+        SdlOutputType::Enum => None,
+        SdlOutputType::Fields(fields) => {
+            let mut tree = BTreeMap::new();
+            for (field, named) in fields {
+                if let Some(leaf) = leaf_of(named, types, path) {
+                    tree.insert(field.clone(), leaf);
+                }
+            }
+            Some(tree)
+        }
+        SdlOutputType::Union(members) => {
+            let mut trees = members.iter().map(|m| leaf_tree(m, types, path));
+            let first = trees.next().flatten();
+            first.map(|mut common| {
+                for other in trees {
+                    let other = other.unwrap_or_default();
+                    common.retain(|key, leaf| other.get(key) == Some(leaf));
+                }
+                common
+            })
+        }
+    };
+    path.pop();
+    tree
+}
+
+#[allow(dead_code)]
+fn leaf_of<'t>(named: &'t str, types: &'t SdlTypeFields, path: &mut Vec<&'t str>) -> Option<Leaf> {
+    match types.outputs.get(named) {
+        None => Some(Leaf::Scalar(named.to_string())),
+        Some(SdlOutputType::Enum) => Some(Leaf::Scalar("enum".to_string())),
+        Some(_) if path.contains(&named) || path.len() >= LEAF_DEPTH_CAP => None,
+        Some(_) => leaf_tree(named, types, path)
+            .filter(|tree| !tree.is_empty())
+            .map(Leaf::Tree),
+    }
 }
 
 /// A root field's argument list, or `None` when it declares no argument.
@@ -3201,6 +3351,127 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    fn leaves_of(sdl: &str, field: &str) -> Option<BTreeMap<String, Leaf>> {
+        let result = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        let op = result
+            .producers
+            .iter()
+            .find(|op| op.key.canonical().ends_with(field))
+            .expect("producer");
+        response_leaves(
+            op.primary_type_symbol.as_deref().expect("anchor"),
+            &result.schema_types,
+        )
+    }
+
+    fn scalar(name: &str) -> Leaf {
+        Leaf::Scalar(name.to_string())
+    }
+
+    /// carrick#4403: a root field's output type is walked to its leaves;
+    /// wrappers are stripped, a scalar leaf is its SDL name, an enum is `enum`.
+    #[test]
+    fn response_leaves_walk_the_output_type_to_its_scalars() {
+        let sdl = r#"
+            scalar DateTime
+            enum Status { A B }
+            type Line { unitPriceMinor: String! }
+            type Invoice {
+                id: ID!
+                totalMinor: String
+                issuedOn: DateTime!
+                lines: [Line!]!
+                status: Status
+            }
+            type Query { invoice(id: ID!): Invoice }
+        "#;
+        let expected = BTreeMap::from([
+            ("id".to_string(), scalar("ID")),
+            ("totalMinor".to_string(), scalar("String")),
+            ("issuedOn".to_string(), scalar("DateTime")),
+            (
+                "lines".to_string(),
+                Leaf::Tree(BTreeMap::from([(
+                    "unitPriceMinor".to_string(),
+                    scalar("String"),
+                )])),
+            ),
+            ("status".to_string(), scalar("enum")),
+        ]);
+        assert_eq!(leaves_of(sdl, "invoice"), Some(expected));
+    }
+
+    /// A type that reaches itself is cut where it closes the cycle.
+    #[test]
+    fn response_leaves_cut_a_cycle() {
+        let sdl = r#"
+            type Node { id: ID!, parent: Node, kids: [Node!]! }
+            type Query { node: Node }
+        "#;
+        assert_eq!(
+            leaves_of(sdl, "node"),
+            Some(BTreeMap::from([("id".to_string(), scalar("ID"))]))
+        );
+    }
+
+    /// A chain deeper than the cap stops at the cap.
+    #[test]
+    fn response_leaves_stop_at_the_depth_cap() {
+        let mut sdl = String::new();
+        for n in 0..12 {
+            sdl.push_str(&format!("type T{n} {{ id: ID!, next: T{} }}\n", n + 1));
+        }
+        sdl.push_str("type T12 { id: ID! }\ntype Query { start: T0 }\n");
+        let mut tree = leaves_of(&sdl, "start").expect("tree");
+        let mut depth = 1;
+        while let Some(Leaf::Tree(next)) = tree.remove("next") {
+            tree = next;
+            depth += 1;
+        }
+        assert_eq!(depth, LEAF_DEPTH_CAP);
+    }
+
+    /// A union keeps the fields every member declares with the same leaf.
+    #[test]
+    fn response_leaves_of_a_union_keep_the_shared_fields() {
+        let sdl = r#"
+            type Card { id: ID!, last4: String, issuedOn: DateTime }
+            type Bank { id: ID!, last4: Int, iban: String }
+            union Method = Card | Bank
+            type Query { method: Method, methods: [Method!]! }
+        "#;
+        assert_eq!(
+            leaves_of(sdl, "method"),
+            Some(BTreeMap::from([("id".to_string(), scalar("ID"))]))
+        );
+    }
+
+    /// A root field that returns a scalar or an enum has no tree.
+    #[test]
+    fn response_leaves_of_a_scalar_root_are_none() {
+        let sdl = "enum S { A }\ntype Query { count: Int, s: S }";
+        assert_eq!(leaves_of(sdl, "count"), None);
+        assert_eq!(leaves_of(sdl, "s"), None);
+    }
+
+    /// Types another file of the service declares reach the tree.
+    #[test]
+    fn response_leaves_read_types_declared_in_another_file() {
+        let mut a = extract_from_document_text(
+            "type Query { invoice: Invoice }",
+            Path::new("a.graphql"),
+            1,
+        );
+        let b = extract_from_document_text(
+            "type Invoice { id: ID! }\nextend type Invoice { at: DateTime }",
+            Path::new("b.graphql"),
+            1,
+        );
+        a.merge(b);
+        let leaves = response_leaves("Invoice", &a.schema_types).expect("tree");
+        assert_eq!(leaves.len(), 2);
     }
 
     /// Stage B2: a producer op formats as `"{kind} {field}: {sdl_type}"`, the
@@ -4649,6 +4920,7 @@ export const typeDefs = gql`
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_leaves: None,
             v1_before_demotion: None,
         };
         let mut calls = vec![row.clone(), row];

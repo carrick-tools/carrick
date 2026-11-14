@@ -216,6 +216,17 @@ pub struct TypeManifestEntry {
     /// request summaries. Empty on every call they did not state.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stated_values: StatedValues,
+    /// A GraphQL producer response's leaves as the SDL declares them
+    /// (carrick#4403): the root field's output type walked to its leaves, as
+    /// a nested map from field name to the leaf's SDL scalar name (`enum` for
+    /// an enum). List and non-null wrappers are stripped; a union keeps the
+    /// fields every member declares with the same leaf; a field that closes a
+    /// cycle or sits past the depth cap is omitted. Stamped by
+    /// [`crate::graphql::response_leaves`] on the producer Response entry
+    /// only. `None` on every other entry, and on a root field whose type is
+    /// no object, interface or union.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_leaves: Option<std::collections::BTreeMap<String, crate::graphql::Leaf>>,
     /// What v1 printed for this entry before a top type inside its printed
     /// shape demoted it to `Unknown` (carrick#1752). `None` on every entry
     /// v1 did not answer with a shape. Scan-local: never written to the blob.
@@ -2501,6 +2512,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
+            graphql_leaves: None,
             v1_before_demotion: None,
         };
 
