@@ -14,7 +14,7 @@ Answer key (request type of the row at each caller, `src/caller.ts`):
 | 5 | `addWidget` | `{ widget: { label: string; size: number; }; source: "cli"; }` |
 | 8 | `placeBook` | `{ item: { title: string; }; }`, never a bare type parameter |
 | 9 | `addInline` | `{ name: string; }` |
-| 10 | `pingAll` | none: the method sends no body |
+| 10 | `pingAll` | `no_request_body`: the method sends no body |
 | 11 | `rename` | `{ label: string; size: number; }`, from the method's declared parameter |
 
 Read by `tests/caller_built_body_test.rs`. It needs the built compiler

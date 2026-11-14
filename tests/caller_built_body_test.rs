@@ -133,12 +133,22 @@ fn a_caller_of_a_method_that_sends_its_argument_keeps_its_type() {
     assert_eq!(request_type(&blob, 11), "{ label: string; size: number; };");
 }
 
+/// The method sends no body, so the caller states that, as every no-body
+/// call does since carrick#4165: one entry whose only root reason is
+/// `no_request_body`, never a type taken from another call.
 #[test]
 fn a_caller_of_a_method_that_sends_no_body_states_no_request() {
     let blob = scan();
-    assert!(
-        requests_at(&blob, 10).is_empty(),
-        "{:#?}",
-        requests_at(&blob, 10)
-    );
+    let entries = requests_at(&blob, 10);
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+    let reasons: Vec<&str> = entries[0]["any_provenance"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row["path"] == "")
+                .filter_map(|row| row["reason"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(reasons, vec!["no_request_body"], "{entries:#?}");
 }
