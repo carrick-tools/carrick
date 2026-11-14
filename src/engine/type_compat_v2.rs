@@ -3191,8 +3191,20 @@ pub(crate) fn stored_call_locators(
                     .to_string_lossy()
                     .into_owned(),
                 line_number: evidence.line_number,
-                span_start: evidence.span_start,
-                span_end: evidence.span_end,
+                // A call located by text replays by its text, as it was
+                // retyped. Its stored span names the node the compiler
+                // engine's answer read (the call's result, `res.json()`), not
+                // the call the text finds (carrick#4244).
+                span_start: evidence
+                    .expression_text
+                    .is_none()
+                    .then_some(evidence.span_start)
+                    .flatten(),
+                span_end: evidence
+                    .expression_text
+                    .is_none()
+                    .then_some(evidence.span_end)
+                    .flatten(),
                 expression_text: evidence.expression_text.clone(),
                 expression_line: evidence.expression_line,
                 prescreen: None,

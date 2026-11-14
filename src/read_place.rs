@@ -413,6 +413,37 @@ mod tests {
         assert_eq!(now, vec!["Live".to_string()]);
     }
 
+    /// The span stored on a text-located call names the node its answer read,
+    /// not the call the text finds, so the replay keeps locating it by text.
+    #[test]
+    fn a_text_located_call_replays_to_the_same_node() {
+        use crate::engine::type_compat_v2::{consumer_call_locators, stored_call_locators};
+        let mut text_ask = ask("T", InferKind::CallResult, None);
+        text_ask.expression_text = Some("api.go()".to_string());
+        text_ask.expression_line = Some(2);
+        let mut manifest = vec![entry(
+            OperationKey::http("GET", "/x"),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "T",
+            InferKind::CallResult,
+        )];
+        let read = |_: &str| Some("\n    api.go();\n".to_string());
+        store_read_places(
+            &mut manifest,
+            &[text_ask.clone()],
+            &[answer("T", at(2, 4, 12))],
+            &read,
+        );
+        assert_eq!(manifest[0].evidence.span_start, Some(5));
+        let stored = stored_call_locators(&manifest, Path::new("/repo"));
+        let scanned = consumer_call_locators(&[text_ask]);
+        assert_eq!(stored["T"].span_start, None);
+        assert_eq!(stored["T"].span_start, scanned["T"].span_start);
+        assert_eq!(stored["T"].expression_text, scanned["T"].expression_text);
+        assert_eq!(stored["T"].expression_line, scanned["T"].expression_line);
+    }
+
     #[test]
     fn an_unanswered_call_result_is_not_placed() {
         let mut manifest = vec![entry(
