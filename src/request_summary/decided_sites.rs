@@ -8236,7 +8236,7 @@ pub(crate) mod tests {
     #[test]
     fn a_call_that_only_makes_the_sending_function_makes_its_end() {
         const MAKER: &str = "export function makeGate(base: string) {\n\
-             \x20 return async (tag: string) => fetch(`${base}/gate/${tag}`);\n\
+             \x20 return async () => fetch(`${base}/gate`);\n\
              }\n\
              export const gate = makeGate(\"/svc\");\n";
         const WRAPPER: &str = "function send(base: string) {\n\
@@ -8255,26 +8255,27 @@ pub(crate) mod tests {
              }\n\
              export const again = () => retried(\"/tasks\");\n";
         const EITHER: &str = "function either(base: string, dry: boolean) {\n\
-             \x20 const run = () => fetch(`${base}/either`);\n\
-             \x20 return dry ? run : run();\n\
+             \x20 async function run() { return fetch(`${base}/either`); }\n\
+             \x20 if (dry) { return run; }\n\
+             \x20 return run();\n\
              }\n\
              export const maybe = either(\"/e\", true);\n";
         let on = super::super::fixture_walk::walked(
-            "discovery-factory-function",
+            "factory-closure",
             "services/web",
             "web",
             &[
-                ("src/m-maker.ts", MAKER),
-                ("src/m-wrapper.ts", WRAPPER),
-                ("src/m-local-run.ts", LOCAL_RUN),
-                ("src/m-handed.ts", HANDED),
-                ("src/m-either.ts", EITHER),
+                ("src/t-maker.ts", MAKER),
+                ("src/t-wrapper.ts", WRAPPER),
+                ("src/t-local-run.ts", LOCAL_RUN),
+                ("src/t-handed.ts", HANDED),
+                ("src/t-either.ts", EITHER),
             ],
             true,
         )
         .expect("the fixture walks with rows: a skipped test proves nothing");
         let text = std::fs::read_to_string(
-            manifest().join("tests/fixtures/discovery-factory-function/library-claims.json"),
+            manifest().join("tests/fixtures/factory-closure/library-claims.json"),
         )
         .unwrap();
         let answer = crate::library_store::parse_answer(&text);
@@ -8301,10 +8302,19 @@ pub(crate) mod tests {
                 .map(|site| (site.line, site.makes_end))
                 .collect()
         };
-        assert_eq!(makes("m-maker.ts"), vec![(4, true)]);
-        assert_eq!(makes("m-wrapper.ts"), vec![(4, false)]);
-        assert_eq!(makes("m-local-run.ts"), vec![(5, false)]);
-        assert_eq!(makes("m-handed.ts"), vec![(6, false)]);
-        assert_eq!(makes("m-either.ts"), vec![(5, false)]);
+        let every: Vec<String> = decided
+            .sites
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.makes_end))
+            .collect();
+        for (file, wanted) in [
+            ("t-maker.ts", (4, true)),
+            ("t-wrapper.ts", (4, false)),
+            ("t-local-run.ts", (5, false)),
+            ("t-handed.ts", (6, false)),
+            ("t-either.ts", (6, false)),
+        ] {
+            assert_eq!(makes(file), vec![wanted], "{file}: {every:#?}");
+        }
     }
 }
