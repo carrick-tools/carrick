@@ -279,6 +279,7 @@ const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
   'body_built_by_callee',
   'reshaped_by_callback',
   'body_member_undecided',
+  'bound_by_callers',
 ]);
 
 /** One response branch's payload, before branches are joined. */
@@ -685,6 +686,11 @@ export class TypeInferrer {
    * unwidened reading re-reads from here (carrick#1516).
    */
   private readonly readNodes = new WeakMap<SourceLocation, Node>();
+  /**
+   * The type each inferred type's text was printed from, where the builder
+   * named one. The open-parameter check (carrick#4201) reads it.
+   */
+  private readonly printedTypes = new WeakMap<InferredType, Type>();
   private readonly unwidenedLimits: UnwidenedLimits;
   private readonly now: () => number;
   /**
@@ -1389,17 +1395,31 @@ export class TypeInferrer {
 
     switch (request.infer_kind) {
       case 'function_return':
-        return this.inferFunctionReturn(sourceFile, request, extractionConfig);
+        return this.withoutOpenTypeParameter(
+          request,
+          this.inferFunctionReturn(sourceFile, request, extractionConfig)
+        );
       case 'response_body':
+        // Checked before a stated reply is weighed: the decided answer stands
+        // against one (`DECIDED_ABSTAIN_REASONS`).
         return this.withStatedReply(
           sourceFile,
           request,
-          this.inferResponseBody(sourceFile, request, extractionConfig)
+          this.withoutOpenTypeParameter(
+            request,
+            this.inferResponseBody(sourceFile, request, extractionConfig)
+          )
         );
       case 'call_result':
-        return this.inferCallResult(sourceFile, request, extractionConfig);
+        return this.withoutOpenTypeParameter(
+          request,
+          this.inferCallResult(sourceFile, request, extractionConfig)
+        );
       case 'variable':
-        return this.inferVariable(sourceFile, request, extractionConfig);
+        return this.withoutOpenTypeParameter(
+          request,
+          this.inferVariable(sourceFile, request, extractionConfig)
+        );
       case 'expression':
         return this.inferExpression(sourceFile, request, extractionConfig);
       case 'request_body':
@@ -1420,6 +1440,63 @@ export class TypeInferrer {
         this.logError(`Unknown infer kind: ${request.infer_kind}`);
         return null;
     }
+  }
+
+  /**
+   * carrick#4201: a response, call result, return or variable read inside a
+   * generic function whose type still holds that function's (or its class's)
+   * type parameter states no type of its own: only the function's callers set
+   * it. The answer is a decided `unknown` with `bound_by_callers`, never a
+   * type naming the parameter. The kinds that describe the generic function
+   * itself (`function_param`, `signature_return`, `receiver_type`) never come
+   * here: `T` belongs there.
+   *
+   * The read is anchored inside the node the answer was read from, so a
+   * return read at the function finds the function's own parameters
+   * (`enclosingTypeParameterIn` starts from the anchor's parent).
+   */
+  private withoutOpenTypeParameter(
+    request: InferRequestItem,
+    inferred: InferredType | null
+  ): InferredType | null {
+    if (!inferred) return inferred;
+    const printed = this.printedTypes.get(inferred);
+    const node = this.readNodes.get(inferred.source_location);
+    if (!printed || !node) return inferred;
+    const open = this.openTypeParameterAt(printed, node);
+    return open === undefined ? inferred : this.boundByCallers(request, inferred.source_location, open);
+  }
+
+  /**
+   * The name of a type parameter `type` holds that a declaration around
+   * `node`, or `node` itself, declares. A function or class read at itself is
+   * anchored inside it: `enclosingTypeParameterIn` starts from the anchor's
+   * parent, so it would miss the declaration's own parameters.
+   */
+  private openTypeParameterAt(type: Type, node: Node): string | undefined {
+    const read = node.compilerNode;
+    const inside =
+      ts.isFunctionLike(read) || ts.isClassLike(read)
+        ? (ts.forEachChild(read, (child) => child) ?? read)
+        : read;
+    const open = openAt(this.project.getTypeChecker().compilerObject, type.compilerType, inside);
+    return open.kind === 'open' ? open.name : undefined;
+  }
+
+  /** The decided answer for a read holding the open type parameter `name` (carrick#4201). */
+  private boundByCallers(request: InferRequestItem, location: SourceLocation, name: string): InferredType {
+    this.log(
+      `Read at ${request.file_path}:${request.line_number} holds the type parameter '${name}', ` +
+        'which only the callers of the function declaring it set; leaving it unknown'
+    );
+    return this.decidedAbstain(request, location, {
+      path: '',
+      kind: 'unknown',
+      reason: 'bound_by_callers',
+      detail:
+        `the type read here is the type parameter '${name}' of the generic function ` +
+        `it sits in, which only that function's callers set, so this site states no type`,
+    });
   }
 
   /**
@@ -4074,7 +4151,9 @@ export class TypeInferrer {
    * instantiates that wrapper: `{ body: item }` in `place<T>(item: T)` reads
    * `{ body: Book }` at `place(book)`. A type parameter the call leaves open
    * is never published: the answer is a decided `unknown`. A request with no
-   * `through_call` reads the type at `node` as it stands.
+   * `through_call` (the wrapper's own row) names no call to bind one, so a
+   * type parameter its read holds stays open and is never published either
+   * (carrick#4164); a read that holds none is the type at `node` as it stands.
    */
   private typeAtThroughCall(
     node: Node,
@@ -4084,12 +4163,30 @@ export class TypeInferrer {
     | { kind: 'open'; abstain: InferredType } {
     const read = node.getType();
     const through = request.through_call;
-    if (!through) return { kind: 'as_read', type: read };
+    const checker = this.project.getTypeChecker();
+    if (!through) {
+      const open = openAt(checker.compilerObject, read.compilerType, node.compilerNode);
+      if (open.kind === 'as_read') return { kind: 'as_read', type: read };
+      this.log(
+        `Payload at ${request.file_path}:${request.line_number} holds the type parameter '${open.name}' ` +
+          'and names no call that binds it; leaving it unknown'
+      );
+      return {
+        kind: 'open',
+        abstain: this.decidedAbstain(request, this.getNodeLocation(node), {
+          path: '',
+          kind: 'unknown',
+          reason: 'bound_by_callers',
+          detail:
+            `the body is built inside a generic function from its type parameter '${open.name}', ` +
+            `which only that function's callers bind, so this site states no body type`,
+        }),
+      };
+    }
     const callerFile = this.getSourceFile(through.file_path);
     const call = callerFile
       ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
       : undefined;
-    const checker = this.project.getTypeChecker();
     // A call the span does not find reaches nothing: whatever the read holds
     // open stays open.
     const outcome = call
@@ -4117,7 +4214,7 @@ export class TypeInferrer {
       abstain: this.decidedAbstain(request, this.getNodeLocation(node), {
         path: '',
         kind: 'unknown',
-        reason: 'body_built_by_callee',
+        reason: 'bound_by_callers',
         detail:
           `the body is built inside a generic function, and the call that reaches it leaves ` +
           `its type parameter '${open}' unset, so the call states no body type`,
@@ -10611,6 +10708,10 @@ export class TypeInferrer {
   ): InferredType | null {
     const texts: string[] = [];
     for (const variant of stated.variants) {
+      // A generic handler's reply parameter that holds its own type
+      // parameter states no reply: only its callers set it (carrick#4201).
+      const open = this.openTypeParameterAt(variant, handler);
+      if (open !== undefined) return this.boundByCallers(request, this.getNodeLocation(handler), open);
       const text = this.structuralTextFromType(variant, stated.at);
       // A variant holding `any` or `unknown` is one the check refuses as an
       // anchor (`usable_inferred_text`): publishing it would fall back to the
@@ -12041,7 +12142,7 @@ export class TypeInferrer {
       request.alias ||
       this.generateAlias(request.file_path, request.line_number, request.infer_kind);
 
-    return {
+    const inferred: InferredType = {
       alias,
       type_string: typeString,
       is_explicit: isExplicit,
@@ -12062,6 +12163,8 @@ export class TypeInferrer {
         ? { anchor_machinery: true as const }
         : {}),
     };
+    if (printedType) this.printedTypes.set(inferred, printedType);
+    return inferred;
   }
 
   private generateAlias(

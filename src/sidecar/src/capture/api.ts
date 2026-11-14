@@ -275,7 +275,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    receives and no contract is published (carrick#3004).
  *  - `bound_by_callers`: the type here is still an open type parameter of a
  *    generic function, which only that function's callers set, so the site
- *    states no type of its own.
+ *    states no type of its own: a body or payload read with no call that binds
+ *    the parameter, or at a call that leaves it open (carrick#4128,
+ *    carrick#4164), and a response, call result, return or variable read
+ *    inside the generic function itself (carrick#4201).
  *  - `body_member_undecided`: the call's result is an object that holds the
  *    transport response beside other members, and the called function's code
  *    does not settle which member holds the parsed body.

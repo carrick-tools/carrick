@@ -157,10 +157,23 @@ r.post('/bare', guard(), wrap<Bare>(async (req, res) => { res.json(save({ name: 
 r.post('/bare-open', wrap<Bare>(async (req, res) => { res.json(save({ name: 'x' })); }));
 // U
 app.get<{ Reply: 'on' | 'off' }>('/state', async (req, rep) => { rep.send('on'); });
+// V
+r.post('/generic', relayGeneric);
+// W
+r.post('/generic-return', relayReturn);
 
 declare function forward(body: unknown): void;
 interface OwnRequest { body: NewItem; headers: Record<string, string> }
 interface OwnReply<R> { send(payload?: R): void }
+
+export async function relayGeneric<R>(req: Request2, res: Response2<R>): Promise<void> {
+  res.status(200).json(problem() as R);
+}
+
+export async function relayReturn<R>(req: Request2, res: Response2<Item>): Promise<R> {
+  res.json(save({ name: 'w' }));
+  return problem() as R;
+}
 
 export const createOrder = wrap<OrderContract>(async (req, res) => {
   if (req.body.lines.length === 0) {
@@ -413,6 +426,18 @@ describe('carrick#2674: bodies a route handler’s parameters state', () => {
   it('S and T: a route with another function handed in beside its handler decides nothing; without one it takes no body', async () => {
     assert.notStrictEqual(reason(await infer('S', 'request_body')), 'no_request_body');
     assert.strictEqual(reason(await infer('T', 'request_body')), 'no_request_body');
+  });
+
+  it('V: a generic handler whose reply holds its own type parameter publishes no type naming it (carrick#4201)', async () => {
+    const reply = await infer('V', 'response_body');
+    assert.strictEqual(reply?.type_string, 'unknown');
+    assert.strictEqual(reason(reply), 'bound_by_callers');
+  });
+
+  it('W: a generic handler whose return holds its own type parameter keeps the decided unknown over a stated reply (carrick#4201)', async () => {
+    const reply = await infer('W', 'response_body');
+    assert.strictEqual(reply?.type_string, 'unknown');
+    assert.strictEqual(reason(reply), 'bound_by_callers');
   });
 
   it('U: a stated reply through an optional payload slot does not publish undefined', async () => {
