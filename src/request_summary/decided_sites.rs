@@ -785,6 +785,20 @@ pub struct Via {
     pub callee: String,
 }
 
+/// The call a maker-bound name is decided at, when that is not the site's
+/// own call (carrick#4245 T3): the maker call (`new Queue(q)`), or the
+/// caller that hands the maker's parameter in (`open(q)`). The site's own
+/// arguments do not write the name there, so the record reads it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameAt {
+    /// Repo-relative, `/`-separated.
+    pub file: String,
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The arguments of that call the name is read from.
+    pub args: BTreeSet<usize>,
+}
+
 /// A call where a name is decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecidedSite {
@@ -802,6 +816,10 @@ pub struct DecidedSite {
     /// The arguments of this call the slot's value is read from: the
     /// label's at the labelled call itself.
     pub name_args: BTreeSet<usize>,
+    /// Where a maker-bound name is decided, at another call than this one
+    /// ([`NameAt`]); `None` where this call's own `name_args` write it, or
+    /// where the name is literal.
+    pub name_at: Option<NameAt>,
     /// The calls below this one down to the labelled call, outermost
     /// first: each is written inside the function the call above enters.
     pub via: Vec<Via>,
@@ -2754,6 +2772,7 @@ impl<'a> Walk<'a, '_> {
         end: &LabelledEnd,
         name: Vec<Piece>,
         name_args: BTreeSet<usize>,
+        name_at: Option<NameAt>,
     ) {
         let via = via_of(self.root, down);
         let placed = &down[0];
@@ -2778,7 +2797,9 @@ impl<'a> Walk<'a, '_> {
             // call chooses at run time, so it states none (carrick#2816).
             if !self.withdrawn.contains(&id)
                 && let Some(&at) = self.kept.get(&id)
-                && (self.out.sites[at].name != name || self.out.sites[at].method != method)
+                && (self.out.sites[at].name != name
+                    || self.out.sites[at].name_at != name_at
+                    || self.out.sites[at].method != method)
             {
                 self.withdrawn.insert(id);
                 self.lead(placed, end, Stop::SeveralOperations);
@@ -2833,6 +2854,7 @@ impl<'a> Walk<'a, '_> {
             name,
             key: None,
             name_args,
+            name_at,
             via,
             payload,
             payload_slot,
@@ -2981,7 +3003,7 @@ impl<'a> Walk<'a, '_> {
         self.receiver = super::discovery::receiver_at(self.inputs, call.file, call.call);
         self.scope_call = Some(call);
         if self.settles(last, &pieces, end) {
-            self.site(&[*last], end, pieces, BTreeSet::new());
+            self.site(&[*last], end, pieces, BTreeSet::new(), None);
         } else {
             self.up(&[*last], &pieces, end, &mut Vec::new());
         }
@@ -3056,7 +3078,7 @@ impl<'a> Walk<'a, '_> {
                     self.lead(&template, end, why);
                 }
             }
-            None => self.site(down, end, value, args),
+            None => self.site(down, end, value, args, None),
         }
     }
 
@@ -3299,7 +3321,7 @@ impl<'a> Walk<'a, '_> {
         let callers = self.calls.callers_of(placed.file, key);
         if callers.is_empty() {
             match self.uncalled_key_defaults(&placed, &own, end) {
-                Some(value) => self.site(down, end, value, BTreeSet::new()),
+                Some(value) => self.site(down, end, value, BTreeSet::new(), None),
                 None => self.open_lead(&placed, end, Stop::NameNeverBound),
             }
             return;
@@ -3608,10 +3630,10 @@ impl<'a> Walk<'a, '_> {
     fn unnamed(&mut self, down: &[Placed<'a>], end: &LabelledEnd) -> bool {
         let last = down[down.len() - 1];
         if self.calls.is_own(last.file) {
-            self.site(&[last], end, Vec::new(), BTreeSet::new());
+            self.site(&[last], end, Vec::new(), BTreeSet::new(), None);
             true
         } else {
-            self.site(down, end, Vec::new(), BTreeSet::new());
+            self.site(down, end, Vec::new(), BTreeSet::new(), None);
             false
         }
     }
@@ -3632,7 +3654,8 @@ impl<'a> Walk<'a, '_> {
             self.lead(&down[0], end, Stop::SeveralOperations);
             return false;
         };
-        self.site(down, end, name.clone(), BTreeSet::new());
+        let name_at = name_decided_at(self.root, name, made, &|file| self.calls.is_own(file));
+        self.site(down, end, name.clone(), BTreeSet::new(), name_at);
         down.len() == 1
     }
 
@@ -3687,6 +3710,7 @@ impl<'a> Walk<'a, '_> {
                 name: vec![Piece::Lit(entry.key.clone())],
                 key: Some(entry.key),
                 name_args: BTreeSet::new(),
+                name_at: None,
                 via: Vec::new(),
                 payload: None,
                 payload_slot: None,
@@ -3701,6 +3725,43 @@ impl<'a> Walk<'a, '_> {
             });
         }
     }
+}
+
+/// Where the maker-bound `name` is read (carrick#4245 T3): the one call
+/// every value `made` was decided at, with the arguments it is read from
+/// there. `None` where the name is literal (the site states it as it is),
+/// or where the values that agree on `name` were decided at different
+/// calls: the same pieces at two calls (`open(q)` over two lists) are not
+/// one name, and no one call's argument states them. Also `None` where that
+/// call is outside this service's own files (a sibling package's
+/// constructor chain): such a name is left unread, as before; reading it
+/// there is not part of carrick#4245.
+fn name_decided_at(
+    root: &Path,
+    name: &[Piece],
+    made: &[&MadeWith<'_>],
+    is_own: &dyn Fn(&Path) -> bool,
+) -> Option<NameAt> {
+    if literal_name(name).is_some() {
+        return None;
+    }
+    let mut at: Option<NameAt> = None;
+    for value in made {
+        if !is_own(value.at.file) {
+            return None;
+        }
+        let here = NameAt {
+            file: relative(root, value.at.file),
+            span_start: value.at.call.site.span_start,
+            span_end: value.at.call.site.span_end,
+            args: value.args.clone(),
+        };
+        if here.args.is_empty() || at.as_ref().is_some_and(|at| *at != here) {
+            return None;
+        }
+        at = Some(here);
+    }
+    at
 }
 
 /// The name `pieces` spell when the code writes all of it as text.
@@ -4069,7 +4130,7 @@ fn decide(
         if let Some(procedure) = &end.procedure {
             if last_is_own {
                 let name = vec![Piece::Lit(procedure.path.clone())];
-                walk.site(&[last], end, name, BTreeSet::new());
+                walk.site(&[last], end, name, BTreeSet::new(), None);
                 through_to_last(&mut walk);
             }
             continue;
@@ -4078,10 +4139,10 @@ fn decide(
             // The label names no slot: the labelled call is the site, or for
             // a sibling's call the call of this service that enters it.
             if last_is_own {
-                walk.site(&[last], end, Vec::new(), BTreeSet::new());
+                walk.site(&[last], end, Vec::new(), BTreeSet::new(), None);
                 through_to_last(&mut walk);
             } else if let Some(chain) = place_chain(&calls, root, site, &last) {
-                walk.site(&chain, end, Vec::new(), BTreeSet::new());
+                walk.site(&chain, end, Vec::new(), BTreeSet::new(), None);
             } else {
                 unplaced.push(format!("{}:{}", site.file, site.line));
                 walk.out.stops.push(DecidedStop::unplaced(site, end));
@@ -4110,7 +4171,7 @@ fn decide(
             &mut walk.out.dry_run_names,
         );
         if last_is_own && walk.settles(&last, &at_end, end) {
-            walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]));
+            walk.site(&[last], end, at_end, BTreeSet::from([slot.arg]), None);
             through_to_last(&mut walk);
             continue;
         }

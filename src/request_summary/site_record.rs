@@ -2089,19 +2089,48 @@ fn record(
     for written in &parts.in_args {
         idents.extend(written.idents.iter().cloned());
     }
-    let names = compiler_names(sources, positions, root, file, &idents);
+    let mut names = compiler_names(sources, positions, root, file, &idents);
+    // Where the name is written: this call's name arguments, or for a
+    // maker-bound name decided at another call (`new Queue(q).add(...)`),
+    // that call's (carrick#4245 T3). The name is read there, in its file.
+    let decided_at = site.name_at.as_ref().and_then(|at| {
+        let found = sources.call_at(&at.file, (at.span_start, at.span_end))?;
+        Some((at.file.as_str(), found, &at.args))
+    });
+    let (name_file, name_parts, name_args) = match &decided_at {
+        Some((at_file, at_parts, args)) => (*at_file, at_parts, *args),
+        None => (file, &parts, &site.name_args),
+    };
+    if decided_at.is_some() {
+        // A maker written in the call's own callee (`new Queue(q).add(...)`)
+        // already gave its names above: each is read once.
+        let at_names: Vec<(String, Span)> = name_args
+            .iter()
+            .filter_map(|index| name_parts.in_args.get(*index))
+            .flat_map(|written| written.idents.iter().cloned())
+            .filter(|ident| name_file != file || !idents.contains(ident))
+            .collect();
+        names.extend(compiler_names(
+            sources, positions, root, name_file, &at_names,
+        ));
+    }
+    let name_exprs: Vec<&Expr> = name_args
+        .iter()
+        .filter_map(|index| name_parts.arg_exprs.get(*index))
+        .collect();
     // The literals a name's type stands for: one, or each of a union's;
     // else the one text the value the name slot writes folds to
     // (carrick#3479). The first hole met reading the name is why a lead's
     // name is unstated (carrick#3688 U2).
-    let (folded, folded_hole) = {
-        let exprs: Vec<&Expr> = site
-            .name_args
-            .iter()
-            .filter_map(|index| parts.arg_exprs.get(*index))
-            .collect();
-        folded_values(sources, resolver, positions, root, file, &site.name, &exprs)
-    };
+    let (folded, folded_hole) = folded_values(
+        sources,
+        resolver,
+        positions,
+        root,
+        name_file,
+        &site.name,
+        &name_exprs,
+    );
     let name_hole: Cell<Option<Stop>> = Cell::new(folded_hole);
     let literals = |text: &str| -> Vec<String> { piece_literals(&names, &folded, text) };
 
@@ -2153,11 +2182,6 @@ fn record(
     // The whole values the name may take: a value is a candidate only when
     // the code states all of it, never one literal piece of a joined name.
     // `None` where any value it may take is not stated whole.
-    let name_exprs: Vec<&Expr> = site
-        .name_args
-        .iter()
-        .filter_map(|index| parts.arg_exprs.get(*index))
-        .collect();
     // An environment read is a base the request rows write by name
     // (`${process.env.API}/items`). A message name (a socket event, a topic,
     // a bus event) matches its other side by its whole text and has no
@@ -2192,14 +2216,14 @@ fn record(
                     if folded.contains_key(text) && name_literals(&names, text).is_empty())
             });
             match stated_whole(
-                sources.get(file),
+                sources.get(name_file),
                 &site.name,
                 &name_exprs,
                 &literals,
                 &Choices {
                     resolver,
                     root,
-                    file,
+                    file: name_file,
                     in_place: true,
                     hole: &name_hole,
                 },

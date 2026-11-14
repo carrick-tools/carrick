@@ -8977,6 +8977,173 @@ export function listen(): void {
         }
     }
 
+    /// carrick#4245 T3: a send whose queue name is bound at the maker
+    /// (`new Queue(q).add(job, data)`) reads that name at the maker's
+    /// argument, where it was decided, not at the send's own arguments (the
+    /// job name and the payload). In a loop over a stated list, plain or
+    /// `as const`, that is one name per element, keyed as the workers made
+    /// over the same list are; through a function that makes the queue
+    /// (`open(q).add(...)`) the name is read at the call that hands `q` in.
+    /// A literal stays forced, and a list the resolver does not read leaves a
+    /// lead with the resolver's own reason.
+    #[test]
+    fn a_maker_bound_queue_name_in_a_loop_is_read_at_the_maker() {
+        let sends = "import { Queue, Worker } from 'bullmq'; import { flip } from './openers';\n\
+const SHIPPING = ['ship-created', 'ship-cancelled'] as const;\n\
+const BILLING = ['bill-opened', 'bill-closed'];\n\
+export async function pushShipping() { for (const q of SHIPPING) await new Queue(q).add('task', { n: 1 }); }\n\
+export async function pushBilling() { for (const q of BILLING) await new Queue(q).add('task', { n: 1 }); }\n\
+export function workShipping() { for (const q of SHIPPING) new Worker(q, async () => {}); }\n\
+export async function pushOne() { await new Queue('one-q').add('task', { n: 1 }); }\n\
+function open(name: string) { return new Queue(name); }\n\
+export async function pushOpened() { for (const q of BILLING) await open(q).add('task', { n: 1 }); }\n\
+declare function listQueues(): string[];\n\
+export async function pushListed() { for (const q of listQueues()) await new Queue(q).add('task', { n: 1 }); }\n\
+export async function pushHeld() { for (const q of SHIPPING) { const held = new Queue(q); await held.add('task', { n: 1 }); } }\n\
+function openTwice(name: string) { return new Queue(name); }\n\
+export async function pushTwiceShipping() { for (const q of SHIPPING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushTwiceBilling() { for (const q of BILLING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushFlip() { await flip.add('task', { n: 1 }); }\n";
+        let openers = "import { Queue } from 'bullmq';\n\
+const EVEN = 'flip-even';\n\
+const ODD = 'flip-odd';\n\
+export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/sends.ts", sends), ("src/openers.ts", openers)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let at = |line: u32| format!("src/sends.ts:{line}");
+        let shown: Vec<String> = records
+            .iter()
+            .filter(|record| record.state.point.at.starts_with("src/sends.ts:"))
+            .map(|record| {
+                format!(
+                    "{} {:?} asked={:?} forced={:?} names={:?} unread={:?}",
+                    record.state.point.at,
+                    record.bucket,
+                    record.state.asked,
+                    record.state.forced.get(&Slot::Name),
+                    record.names,
+                    record.unread
+                )
+            })
+            .collect();
+        let record_at = |line: u32| {
+            let point = at(line);
+            records
+                .iter()
+                .find(|record| record.state.point.at == point)
+                .unwrap_or_else(|| panic!("a record at {point}: {shown:#?}"))
+        };
+        for (line, names) in [
+            (4, ["ship-cancelled", "ship-created"]),
+            (5, ["bill-closed", "bill-opened"]),
+            (6, ["ship-cancelled", "ship-created"]),
+            (9, ["bill-closed", "bill-opened"]),
+        ] {
+            let record = record_at(line);
+            assert_eq!(record.state.asked, vec![Slot::Kind], "{line}: {shown:#?}");
+            assert_eq!(record.names, names, "{line}: {shown:#?}");
+            // The loop variable is one compiler name, read once.
+            let compiler = record.compiler().expect("the record's compiler part");
+            assert!(
+                compiler
+                    .names
+                    .iter()
+                    .filter(|name| name.text == "q")
+                    .count()
+                    <= 1,
+                "{line}: {:#?}",
+                compiler.names
+            );
+        }
+        assert_eq!(
+            record_at(7)
+                .state
+                .forced
+                .get(&Slot::Name)
+                .map(String::as_str),
+            Some("one-q"),
+            "{shown:#?}"
+        );
+        let listed = record_at(11);
+        assert!(listed.names.is_empty(), "{shown:#?}");
+        assert_eq!(
+            listed.unread,
+            Some(super::super::stop::Stop::UnreadExpression),
+            "{shown:#?}"
+        );
+        // One function makes the queue for two lists: its parameter's
+        // values are decided at two calls, so neither send states the
+        // other list's names.
+        for (line, other) in [(14, "bill-"), (15, "ship-")] {
+            assert!(
+                !record_at(line)
+                    .names
+                    .iter()
+                    .any(|name| name.starts_with(other)),
+                "{line}: {shown:#?}"
+            );
+        }
+        // A maker in another file: its argument is read in that file, one
+        // row per branch of the choice it writes.
+        assert_eq!(record_at(16).names, ["flip-even", "flip-odd"], "{shown:#?}");
+        // The job name is never the queue's name.
+        for record in &records {
+            assert!(
+                !record.names.iter().any(|name| name == "task")
+                    && record.state.forced.get(&Slot::Name).map(String::as_str) != Some("task"),
+                "a job name read as a queue name: {shown:#?}"
+            );
+        }
+        // Answered `topic`, the sends over the list key as its workers do.
+        let mut answers = SiteAnswers::default();
+        for record in &records {
+            let mut answered = Answered::default();
+            if record.state.asked.contains(&Slot::Kind) {
+                answered.kind = Some(SlotAnswer {
+                    value: Some(SlotValue::Text("topic".to_string())),
+                    confidence: 0.95,
+                    orders_agree: true,
+                });
+            }
+            answers
+                .answered
+                .insert(crate::site_rows::site_id(&record.anchors), answered);
+        }
+        let rows = crate::site_rows::of(&decided, &records, &labels, &answers);
+        let keys_at = |line: u32, side: crate::site_rows::RowSide| {
+            let mut keys: Vec<String> = rows
+                .rows
+                .iter()
+                .filter(|row| row.file == "src/sends.ts" && row.line == line && row.side == side)
+                .map(|row| format!("{:?}", row.key))
+                .collect();
+            keys.sort();
+            keys
+        };
+        let sent = keys_at(4, crate::site_rows::RowSide::Call);
+        assert_eq!(sent.len(), 2, "{:#?}", rows.rows);
+        assert_eq!(
+            keys_at(6, crate::site_rows::RowSide::Endpoint),
+            sent,
+            "{:#?}",
+            rows.rows
+        );
+    }
+
     /// carrick#3527 S5: the instance walk reads the service that holds each
     /// file, so a send through a wrapper declared as a sibling service
     /// (`new AlphaProducer().add(...)`, the queue made two files away in the
