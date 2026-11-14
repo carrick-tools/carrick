@@ -34,6 +34,7 @@ import { definitionsAt, positionOf } from "./definition.ts";
 import { toDiagnostics, type Diagnostic, type LineText } from "./diagnostics.ts";
 import { toCodeLenses } from "./lens.ts";
 import { createLogger } from "./log.ts";
+import { Framer, frame, type LspMessage } from "./lsp-frame.ts";
 import { resolveRoot, rootNote, type RootChoice } from "./root.ts";
 import { boundaryFor } from "./render.ts";
 import { DEFAULT_SURFACES, readSurfaces, type Surfaces } from "./surfaces.ts";
@@ -47,17 +48,10 @@ const CACHE_FILES = 64;
 
 const log = createLogger("carrick-lsp");
 
-type Message = {
-  jsonrpc?: string;
-  id?: number | string;
-  method?: string;
-  params?: Record<string, unknown>;
-};
+type Message = LspMessage;
 
 function send(message: Record<string, unknown>): void {
-  const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", ...message }), "utf8");
-  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
-  process.stdout.write(body);
+  process.stdout.write(frame(message));
 }
 
 // ------------------------------------------------------------------ state
@@ -536,30 +530,10 @@ function handle(message: Message): void {
 
 // ------------------------------------------------------------------ framing
 
-let buffer = Buffer.alloc(0);
+const framer = new Framer((what) => log(what));
 
 export function feed(chunk: Buffer): void {
-  buffer = Buffer.concat([buffer, chunk]);
-  for (;;) {
-    const separator = buffer.indexOf("\r\n\r\n");
-    if (separator === -1) return;
-    const header = buffer.subarray(0, separator).toString("ascii");
-    const match = /Content-Length:\s*(\d+)/i.exec(header);
-    if (!match?.[1]) {
-      buffer = buffer.subarray(separator + 4);
-      continue;
-    }
-    const length = Number.parseInt(match[1], 10);
-    if (buffer.length < separator + 4 + length) return;
-    const body = buffer.subarray(separator + 4, separator + 4 + length).toString("utf8");
-    buffer = buffer.subarray(separator + 4 + length);
-    let message: Message;
-    try {
-      message = JSON.parse(body) as Message;
-    } catch (error) {
-      log("unparseable message", String(error));
-      continue;
-    }
+  for (const message of framer.push(chunk)) {
     try {
       handle(message);
     } catch (error) {
