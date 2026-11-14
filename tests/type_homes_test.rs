@@ -27,8 +27,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/type-homes")
+fn fixture_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 /// The blob one offline scan of `repo` writes.
@@ -43,7 +45,7 @@ fn scan(repo: &Path) -> serde_json::Value {
         .env("CARRICK_MOCK_ALL", "1")
         .env(
             "CARRICK_MOCK_FIXTURE_DIR",
-            format!("{}/", fixture_dir().join("__llm__").display()),
+            format!("{}/", repo.join("__llm__").display()),
         )
         .env("CARRICK_SKIP_INTENTS", "1")
         .env_remove("CARRICK_ALLOW_MISSING_TYPES");
@@ -84,7 +86,14 @@ fn scan(repo: &Path) -> serde_json::Value {
 /// `(file, line, role, kind)` -> the entry's `defined_in` as `(file, line, symbol)`.
 type Home = Option<(String, u64, String)>;
 
-fn home_of(blob: &serde_json::Value, file: &str, line: u64, role: &str, kind: &str) -> Home {
+/// The one `role` `kind` entry at `file:line`.
+fn entry_at<'a>(
+    blob: &'a serde_json::Value,
+    file: &str,
+    line: u64,
+    role: &str,
+    kind: &str,
+) -> &'a serde_json::Value {
     let entries: Vec<&serde_json::Value> = blob["type_manifest"]
         .as_array()
         .expect("type_manifest")
@@ -102,6 +111,10 @@ fn home_of(blob: &serde_json::Value, file: &str, line: u64, role: &str, kind: &s
         "one {role} {kind} entry at {file}:{line}: {entries:#?}"
     );
     entries[0]
+}
+
+fn home_of(blob: &serde_json::Value, file: &str, line: u64, role: &str, kind: &str) -> Home {
+    entry_at(blob, file, line, role, kind)
         .get("defined_in")
         .filter(|home| !home.is_null())
         .map(|home| {
@@ -119,7 +132,7 @@ fn at(file: &str, line: u64, symbol: &str) -> Home {
 
 #[test]
 fn type_homes_fixture_records_every_named_home() {
-    let blob = scan(&fixture_dir());
+    let blob = scan(&fixture_dir("type-homes"));
     let cases: [(&str, u64, &str, &str, Home); 9] = [
         (
             "src/orders-api.ts",
@@ -186,4 +199,43 @@ fn type_homes_fixture_records_every_named_home() {
             "{role} {kind} {file}:{line}"
         );
     }
+}
+
+/// carrick#2148 H3: a request validated by a schema records the schema's
+/// declaration as its home, marked as a schema, over
+/// `tests/fixtures/schema-homes/`.
+///
+/// | row | its contract | home |
+/// |---|---|---|
+/// | `tickets.ts:7` producer request | a validator middleware handed `NewTicket` | `schemas.ts:4`, schema |
+/// | `tickets.ts:11` producer request | the body handed to `NewTicket.safeParse` | `schemas.ts:4`, schema |
+/// | `tickets.ts:16` producer request | a schema written inline | none |
+#[test]
+fn schema_homes_fixture_records_the_schema_declaration() {
+    let blob = scan(&fixture_dir("schema-homes"));
+    let schema_home = |line: u64| {
+        let entry = entry_at(&blob, "src/tickets.ts", line, "producer", "request");
+        (
+            entry["primary_type_symbol"].clone(),
+            entry["defined_in"].clone(),
+        )
+    };
+    let named = serde_json::json!({
+        "file_path": "src/schemas.ts",
+        "line_number": 4,
+        "symbol": "NewTicket",
+        "kind": "schema",
+    });
+    for line in [7, 11] {
+        assert_eq!(
+            schema_home(line),
+            (serde_json::Value::Null, named.clone()),
+            "producer request src/tickets.ts:{line}"
+        );
+    }
+    assert_eq!(
+        home_of(&blob, "src/tickets.ts", 16, "producer", "request"),
+        None,
+        "an inline schema has no home"
+    );
 }

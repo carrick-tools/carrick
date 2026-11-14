@@ -1,0 +1,9 @@
+{
+  "services": [
+    {
+      "serviceName": "schema-homes",
+      "directory": ".",
+      "tsconfig": "tsconfig.json"
+    }
+  ]
+}
