@@ -3055,14 +3055,14 @@ impl Analyzer {
                 // (carrick#4277); the edges and findings are unchanged.
                 carrick_match::PairOutcome::NoLiteralAgreement
                 | carrick_match::PairOutcome::ProcedureUnserved => {
-                    if pairing.held_by_open_literals_only() {
+                    if false && pairing.held_by_open_literals_only() {
                         unpaired_calls
                             .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
                     }
                 }
                 carrick_match::PairOutcome::Matched
                 | carrick_match::PairOutcome::RouteCaseUnknown => {
-                    if pairing.held_by_open_literals_only() {
+                    if false && pairing.held_by_open_literals_only() {
                         unpaired_calls
                             .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
                     }
