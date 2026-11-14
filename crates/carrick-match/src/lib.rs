@@ -711,6 +711,18 @@ pub(crate) fn unconfirmed_literals<E: AsRef<str>, C: AsRef<str>>(
         .count() as u32
 }
 
+/// Whether the call leaves a literal of `route` to a placeholder (carrick#2004):
+/// the one counter the pool ranks and judges by ([`unconfirmed_literals`]), for
+/// a surface that asks the same question of a pair it already holds
+/// (carrick#4277).
+pub fn leaves_route_literal_open(route: &str, call: &str) -> bool {
+    let (route_segments, call_segments) = (segments(route), segments(call));
+    unconfirmed_literals(
+        &SplitPath::new(route, &route_segments),
+        &SplitPath::new(call, &call_segments),
+    ) > 0
+}
+
 /// The literal agreement of a pair a surface is allowed to report as a match,
 /// or `None` when it is not — see [`match_verdict`] for which of the four
 /// rejections applied.

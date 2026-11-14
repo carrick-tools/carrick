@@ -34,6 +34,9 @@ pub struct MainPairing {
     pub protocol: Protocol,
     pub producer: MainProducer,
     pub consumer: MainConsumer,
+    /// Main confirmed the pairing: the call left none of the producer's route
+    /// literals to a placeholder. Always true for a non-HTTP pairing.
+    pub confirmed: bool,
 }
 
 /// The side main keys as the producer: the endpoint row.
@@ -95,6 +98,11 @@ pub struct UnpairedCall {
     pub path: String,
     pub sites: Vec<String>,
     pub source: Option<ResolutionSource>,
+    /// The call still pairs, but only with routes whose literals it leaves to
+    /// its placeholders (carrick#4277).
+    pub held_open: bool,
+    /// When `held_open`: the delta identities of the routes that hold it.
+    pub held_by: Vec<String>,
 }
 
 /// An endpoint registration this run holds that no sender reaches.
@@ -116,6 +124,9 @@ pub struct MainRemovals {
     pub pairings: Vec<MainPairing>,
     pub operations: Vec<RemovedOperation>,
     pub sends: Vec<RemovedSend>,
+    /// Delta identities of HTTP operations this PR added (in this run, not on
+    /// main).
+    pub added: BTreeSet<String>,
 }
 
 /// Everything this run contributes.
@@ -202,6 +213,11 @@ impl Group {
     }
 }
 
+fn held_by_removal(call: &UnpairedCall, confirmed: bool, main: &MainRemovals) -> bool {
+    confirmed
+        && !(call.held_by.len() >= 2 && call.held_by.iter().all(|key| main.added.contains(key)))
+}
+
 /// Mark the rows of every pairing main had that this run lost, returning how
 /// many rows it wrote.
 ///
@@ -216,6 +232,12 @@ impl Group {
 /// this run still holds the receiver with no sender. The receiver's unmarked
 /// `orphaned_endpoint` is replaced by a marked one carrying its registration
 /// places. An HTTP or GraphQL orphan is never marked.
+///
+/// A call that still pairs at head (`held_open`) counts as held by the removed
+/// route's loss when main confirmed that pairing and the routes that now hold
+/// it are not a set of literals this PR added (two or more: the PR split the
+/// parameter into fixed names, and the call may name any of them). A single
+/// literal the PR added in place of the parameter is a break (carrick#4277).
 ///
 /// A row that lost no pairing is left byte for byte as it was.
 pub fn mark_lost_pairings(
@@ -243,6 +265,7 @@ pub fn mark_lost_pairings(
                 call.service == consumer.service
                     && call.file == consumer.file
                     && call.key == consumer.key
+                    && (!call.held_open || held_by_removal(call, pairing.confirmed, main))
             }) {
                 let group = producer_lost
                     .entry((
@@ -437,6 +460,7 @@ mod tests {
                 key: "GET /orders/:param".into(),
                 file: "src/checkout.ts".into(),
             },
+            confirmed: true,
         }
     }
 
@@ -461,6 +485,8 @@ mod tests {
             path: "/orders/:encoded".into(),
             sites: vec!["src/checkout.ts:4".into(), "src/checkout.ts:20".into()],
             source: Some(ResolutionSource::RequestSpec),
+            held_open: false,
+            held_by: vec![],
         }
     }
 
@@ -470,6 +496,7 @@ mod tests {
                 pairings: vec![http_pairing()],
                 operations: vec![removed_route(placed)],
                 sends: vec![],
+                ..Default::default()
             },
             RunUnpaired {
                 calls: vec![surviving_call()],
@@ -508,6 +535,74 @@ mod tests {
         let mut pr = vec![unmarked_missing()];
         let written = mark_lost_pairings(&mut pr, &main, &run, copy, untouched);
         (pr, written)
+    }
+
+    fn held_break(
+        confirmed: bool,
+        held_by: &[&str],
+        added: &[&str],
+    ) -> (MainRemovals, RunUnpaired) {
+        let (mut main, mut run) = http_break(true);
+        main.pairings[0].confirmed = confirmed;
+        main.added = added.iter().map(|key| key.to_string()).collect();
+        run.calls[0].held_open = true;
+        run.calls[0].held_by = held_by.iter().map(|key| key.to_string()).collect();
+        (main, run)
+    }
+
+    fn mark_held(main: &MainRemovals, run: &RunUnpaired, pr: &mut Vec<Finding>) -> usize {
+        mark_lost_pairings(
+            pr,
+            main,
+            run,
+            MainCopy::Current,
+            Some(&untouched("orders-api", false)),
+        )
+    }
+
+    /// carrick#4277: a call that still pairs, held open by a literal sibling,
+    /// is a lost pairing when main confirmed it; the row is emitted when the
+    /// run has none.
+    #[test]
+    fn a_held_open_call_with_a_confirmed_main_pairing_is_marked() {
+        let (main, run) = held_break(true, &["GET /orders/summary"], &["GET /orders/summary"]);
+        let mut pr = vec![];
+        assert_eq!(mark_held(&main, &run, &mut pr), 1);
+        assert_eq!(on_main(&pr[0]), (Some(false), None));
+    }
+
+    /// A pairing main did not confirm leaves the findings untouched.
+    #[test]
+    fn a_held_open_call_with_an_unconfirmed_main_pairing_changes_nothing() {
+        let (main, run) = held_break(false, &["GET /orders/summary"], &[]);
+        let mut pr = vec![unmarked_missing()];
+        let before = serde_json::to_value(&pr).unwrap();
+        assert_eq!(mark_held(&main, &run, &mut pr), 0);
+        assert_eq!(serde_json::to_value(&pr).unwrap(), before);
+    }
+
+    /// A held-open call whose main producer was not removed gives no row.
+    #[test]
+    fn a_held_open_call_whose_main_producer_survives_gives_no_row() {
+        let (mut main, run) = held_break(true, &["GET /orders/summary"], &[]);
+        main.operations.clear();
+        let mut pr = vec![];
+        assert_eq!(mark_held(&main, &run, &mut pr), 0);
+        assert!(pr.is_empty());
+    }
+
+    /// A PR that splits the parameter into two or more fixed names the call
+    /// may enumerate proves nothing; one literal in its place does.
+    #[test]
+    fn a_split_into_added_literals_is_not_marked() {
+        let both = ["GET /orders/a", "GET /orders/b"];
+        let (main, run) = held_break(true, &both, &both);
+        let mut pr = vec![];
+        assert_eq!(mark_held(&main, &run, &mut pr), 0);
+        // One of the siblings already stood on main: the removal alone broke
+        // the call.
+        let (main, run) = held_break(true, &both, &["GET /orders/a"]);
+        assert_eq!(mark_held(&main, &run, &mut pr), 1);
     }
 
     /// Branch 1: placed, main's copy current -> `on_main: false`, and the row
@@ -728,6 +823,7 @@ mod tests {
                 key: "SERVER->CLIENT order:shipped".into(),
                 file: "src/realtime.ts".into(),
             },
+            confirmed: true,
         }
     }
 
@@ -768,6 +864,7 @@ mod tests {
                 pairings: vec![message_pairing(protocol)],
                 operations: vec![],
                 sends: vec![removed_send(true)],
+                ..Default::default()
             };
             let run = RunUnpaired {
                 calls: vec![],
@@ -812,6 +909,7 @@ mod tests {
                 pairings: vec![message_pairing(protocol)],
                 operations: vec![],
                 sends: vec![removed_send(true)],
+                ..Default::default()
             };
             let run = RunUnpaired {
                 calls: vec![],
@@ -834,6 +932,7 @@ mod tests {
             pairings: vec![message_pairing(Protocol::Websocket)],
             operations: vec![],
             sends: vec![removed_send(true)],
+            ..Default::default()
         };
         let run = RunUnpaired {
             calls: vec![],
@@ -856,6 +955,7 @@ mod tests {
             pairings: vec![message_pairing(Protocol::Websocket)],
             operations: vec![],
             sends: vec![removed_send(true)],
+            ..Default::default()
         };
         let unnamed = Finding::orphaned_endpoint("SERVER->CLIENT", "order:shipped", None);
 

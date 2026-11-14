@@ -15761,6 +15761,7 @@ async fn mark_findings_on_main(
                         pairings: main.pairings,
                         operations: removals.operations,
                         sends: removals.sends,
+                        added: removals.added,
                     },
                     unpaired,
                     copy,

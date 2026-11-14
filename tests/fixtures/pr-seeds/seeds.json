@@ -107,6 +107,48 @@
       "known_miss": {"stage": "shown", "issues": ["carrick#3092", "carrick-cloud#2866"]}
     },
     {
+      "name": "http-param-route-moved-onto-literal",
+      "protocol": "http",
+      "change": "removed_while_used",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "move", "from": "app/routes/api.v1.orders.$orderId.ts", "to": "app/routes/api.v1.orders.summary.ts"}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/checkout.ts:4"},
+          {"kind": "risk_introduced", "label": "GET /api/v1/orders/:orderId", "site": "src/orders-client.ts:14", "optional": true},
+          {"kind": "delta_new", "label": "GET /api/v1/orders/summary"},
+          {"kind": "delta_removed", "label": "GET /api/v1/orders/:orderId"},
+          {"kind": "removed_still_called", "label": "GET /api/v1/orders/:orderId"}
+        ]
+      },
+      "known_miss": {"stage": "shown", "issues": ["carrick#4277"]}
+    },
+    {
+      "name": "http-param-route-split-into-literals",
+      "protocol": "http",
+      "change": "delta_only",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "move", "from": "app/routes/api.v1.orders.$orderId.ts", "to": "app/routes/api.v1.orders.a.ts"},
+        {"op": "copy", "from": "app/routes/api.v1.orders.a.ts", "to": "app/routes/api.v1.orders.b.ts"}
+      ],
+      "expect": {
+        "title": "no_contract_risks",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true},
+          {"kind": "delta_new", "label": "GET /api/v1/orders/a"},
+          {"kind": "delta_new", "label": "GET /api/v1/orders/b"},
+          {"kind": "delta_removed", "label": "GET /api/v1/orders/:orderId"}
+        ]
+      }
+    },
+    {
       "name": "http-route-removed",
       "protocol": "http",
       "change": "removed_while_used",

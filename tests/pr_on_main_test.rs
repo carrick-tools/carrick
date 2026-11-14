@@ -3146,6 +3146,67 @@ async fn seed_http_route_rename_marking() {
     assert_no_unmarked_row_holds(&payload, "missing_endpoint", "/api/v1/orders/:encoded");
 }
 
+/// The parameter route moves onto a literal one: the storefront's calls still
+/// pair at head, but only with `/summary`, which they leave open
+/// (carrick#4277). Main paired them with the parameter route, so they lost it.
+#[tokio::test]
+async fn seed_http_param_route_moved_onto_literal() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-param-route-moved-onto-literal").await;
+    let finding = seed_finding(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+        None,
+    );
+    assert_eq!(
+        finding["call_sites"],
+        serde_json::json!(ORDER_SITES),
+        "{finding:#}"
+    );
+    assert_delta(
+        &payload,
+        &["GET /api/v1/orders/summary"],
+        &["GET /api/v1/orders/:orderId"],
+    );
+    assert_removed_rows_are_facts(&payload);
+}
+
+#[tokio::test]
+async fn seed_http_param_route_moved_onto_literal_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-param-route-moved-onto-literal").await;
+    let row = lost_pairing_row(
+        &payload,
+        "missing_endpoint",
+        "GET",
+        "/api/v1/orders/:encoded",
+    );
+    assert_lost_pairing(
+        &row,
+        "storefront",
+        ("call_sites", &ORDER_SITES),
+        ["GET", ORDER_PATH, ORDER_ROUTE_PLACE],
+    );
+    assert_no_unmarked_row_holds(&payload, "missing_endpoint", "/api/v1/orders/:encoded");
+}
+
+/// Must not fail (carrick#4277, ruled condition): the parameter route is split
+/// into two fixed-name routes and the callers stay right, because the call may
+/// name either. No row says the PR broke a caller.
+#[tokio::test]
+async fn seed_http_param_route_split_into_literals() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("http-param-route-split-into-literals").await;
+    assert_no_lost_pairing(&payload);
+    assert_delta(
+        &payload,
+        &["GET /api/v1/orders/a", "GET /api/v1/orders/b"],
+        &["GET /api/v1/orders/:orderId"],
+    );
+}
+
 /// The route module is deleted: the same break as a rename.
 #[tokio::test]
 async fn seed_http_route_removed_marking() {

@@ -206,6 +206,29 @@ pub struct Pairing {
 }
 
 impl Pairing {
+    /// The call still pairs (or routes), but only because it leaves route
+    /// literals to a placeholder: every winner carries
+    /// `call_param_over_route_literal`, or the call fell to
+    /// [`PairOutcome::NoLiteralAgreement`] while a routed producer agreed on
+    /// at least one literal (carrick#4262's floor). False for every
+    /// exact-key and procedure answer, and for a bare catch-all, which may
+    /// forward the call (carrick#4277).
+    pub fn held_by_open_literals_only(&self) -> bool {
+        match self.outcome {
+            PairOutcome::Matched | PairOutcome::RouteCaseUnknown => {
+                !self.winners.is_empty()
+                    && self
+                        .winners
+                        .iter()
+                        .all(|winner| winner.call_param_over_route_literal == Some(true))
+            }
+            PairOutcome::NoLiteralAgreement => {
+                self.routed.iter().any(|routed| routed.agreement > 0)
+            }
+            _ => false,
+        }
+    }
+
     fn empty(outcome: PairOutcome) -> Self {
         Pairing {
             outcome,
