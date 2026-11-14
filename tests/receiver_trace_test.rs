@@ -3498,7 +3498,9 @@ fn kept_sites_beside_a_loop_are_unchanged() {
 /// 'x') continue;` before the route, and `if (k !== 'x') { … }` around it,
 /// leave no route for `x`; a test of another name of the same loop's tuple
 /// (`'png' === kind`) leaves none for that tuple. A test no element decides
-/// (`ok(k)`, a call) keeps every element, as before guards were read.
+/// (`ok(k)`, a call) keeps every element, as before guards were read. No
+/// list here is `as const`: over one that is, the compiler narrows the
+/// name at the read to one literal itself, and that answer comes first.
 #[test]
 fn a_guard_in_a_loop_body_drops_the_element_it_skips() {
     let blobs = scan_fixture("receiver-route-loop");

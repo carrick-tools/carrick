@@ -77,7 +77,7 @@ for (const k of ['a', 'b', 'x']) {
   app.get(`/unsure/${k}`, h);
 }
 
-for (const [file, kind] of [['a.svg', 'svg'], ['b.png', 'png']] as const) {
+for (const [file, kind] of [['a.svg', 'svg'], ['b.png', 'png']]) {
   if ('png' === kind) continue;
   app.get(`/asset/${file}`, h);
 }

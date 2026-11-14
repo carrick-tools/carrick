@@ -138,6 +138,23 @@ pub(super) struct ModuleBinding {
     /// The module never changes the list the binding holds
     /// ([`WriteCensus::list_kept`]).
     pub(super) list_kept: bool,
+    /// For a loop head, the tests of the loop's head names that hold on
+    /// every path from the start of the body to each read of this name
+    /// (carrick#4265), by where the read starts: an element a test rules
+    /// out is never read there.
+    pub(super) element_tests: BTreeMap<u32, Vec<ElementTest>>,
+}
+
+/// A test of a name a loop head binds, on the way to a read in the loop
+/// body (carrick#4265, [`flow::loop_body_tests`]): the element the name
+/// takes passes `test` (`holds`) or fails it (`!holds`), as the guard of a
+/// way reads it ([`super::alternatives::WayGuard`]). `of` is the tested
+/// name's [`ValueAt::Each`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ElementTest {
+    pub(super) of: ValueAt,
+    pub(super) test: super::alternatives::WayTest,
+    pub(super) holds: bool,
 }
 
 impl ModuleBinding {
@@ -277,6 +294,8 @@ pub(super) struct LocalBinding {
     pub(super) elements: Option<Vec<ValueAt>>,
     /// As [`ModuleBinding::list_frozen`].
     pub(super) list_frozen: bool,
+    /// As [`ModuleBinding::element_tests`].
+    pub(super) element_tests: BTreeMap<u32, Vec<ElementTest>>,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -1155,6 +1174,7 @@ pub(super) fn module_bindings(
                         elements: None,
                         list_frozen: false,
                         list_kept: false,
+                        element_tests: BTreeMap::new(),
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -1188,6 +1208,7 @@ pub(super) fn module_bindings(
                     .and_then(|init| text::list_of(init, &identity)),
                 list_frozen: init.is_some_and(text::written_as_const),
                 list_kept: census.list_kept(&key),
+                element_tests: BTreeMap::new(),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1247,6 +1268,7 @@ pub(super) fn module_bindings(
                     .filter(|_| local.kind == BindingKind::Const),
                 list_frozen: local.list_frozen,
                 list_kept: census.list_kept(&local.key),
+                element_tests: local.element_tests.clone(),
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut held) => {
@@ -2894,6 +2916,7 @@ impl Reader<'_> {
                 flow: None,
                 elements: None,
                 list_frozen: false,
+                element_tests: BTreeMap::new(),
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {

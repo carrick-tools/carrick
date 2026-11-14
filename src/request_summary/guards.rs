@@ -1671,7 +1671,7 @@ impl CallWalker<'_, '_, '_> {
     /// Which operand of a comparison is its literal, and the other, the
     /// value compared. Text wins over a constant; of two texts, the one
     /// route path does; two of a kind compare no value.
-    fn comparison_sides<'e>(
+    pub(super) fn comparison_sides<'e>(
         &self,
         left: &'e Expr,
         right: &'e Expr,
