@@ -172,6 +172,7 @@ fn member(name: &str) -> &str {
 }
 
 /// What the drops read about one indexed function.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Meta {
     file: u32,
     member: u32,
@@ -180,6 +181,7 @@ struct Meta {
 }
 
 /// Every indexed function, read once and ranked against any number of queries.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SimilarIndex {
     /// By input position; `None` for a row nobody can import.
     docs: Vec<Option<Meta>>,

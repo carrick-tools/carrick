@@ -16,6 +16,9 @@
 //! named itself and the module-scope row. Copies of one file in several
 //! services count once. Reference: `docs/local-mode-output.md`
 //! (`new_functions[].similar`).
+//!
+//! A built [`Similar`] owns its rows, so it can be kept on disk and read back,
+//! and it ranks the same as the one that was built.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,22 +70,32 @@ impl Query {
     }
 }
 
-struct Entry<'a> {
+/// One indexed function, with what a row needs beside the ranking. Owned, so a
+/// built [`Similar`] can be written to disk and read back.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Entry {
     repo: String,
     file: String,
     /// The repo and file together, lower-cased: two functions with one key are
     /// in one file.
     key: String,
-    definition: &'a FunctionDefinition,
+    name: String,
+    line: u32,
+    end_line: u32,
+    signature: Option<String>,
+    exported: bool,
+    intent: Option<String>,
+    has_tokens: bool,
+    /// How many other files hold a call that names the function.
+    called_from: usize,
 }
 
 /// Every indexed function the re-check holds, read once per re-check call and
 /// ranked against every function the edit wrote.
-pub(crate) struct Similar<'a> {
-    entries: Vec<Entry<'a>>,
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct Similar {
+    entries: Vec<Entry>,
     index: SimilarIndex,
-    /// (repo, file, member name) of a callee -> the keys of the files that call it.
-    callers: HashMap<(String, String, String), HashSet<String>>,
 }
 
 #[cfg(test)]
@@ -95,22 +108,23 @@ fn file_key(repo: &str, file: &str) -> String {
     format!("{}\u{0}{file}", repo.to_lowercase())
 }
 
-impl<'a> Similar<'a> {
+impl Similar {
     /// Read `blobs`, each labelled with the repo it belongs to.
-    pub(crate) fn build(blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>) -> Self {
+    pub(crate) fn build<'a>(blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>) -> Self {
         Self::build_except(blobs, &HashSet::new())
     }
 
     /// [`Self::build`], leaving out the functions in `except`, keyed on
     /// (lower-cased repo, file as the blob spells it, name): a PR run leaves
     /// out what the PR itself changed or removed.
-    pub(crate) fn build_except(
+    pub(crate) fn build_except<'a>(
         blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>,
         except: &HashSet<(String, String, String)>,
     ) -> Self {
         #[cfg(test)]
         BUILDS.with(|builds| builds.set(builds.get() + 1));
         let mut entries = Vec::new();
+        let mut definitions: Vec<&FunctionDefinition> = Vec::new();
         let mut callers: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         for (repo, blob) in blobs {
@@ -139,41 +153,51 @@ impl<'a> Similar<'a> {
                     repo: repo.clone(),
                     file,
                     key,
-                    definition,
+                    name: definition.name.clone(),
+                    line: definition.line_number,
+                    end_line: definition.end_line,
+                    signature: definition.signature.clone(),
+                    exported: definition.is_exported,
+                    intent: definition.intent.clone(),
+                    has_tokens: !definition.tokens.is_empty(),
+                    called_from: 0,
                 });
+                definitions.push(definition);
             }
         }
-        let index = SimilarIndex::build(entries.iter().map(|entry| {
-            SimilarDoc {
-                name: &entry.definition.name,
-                file: &entry.key,
-                intent: entry.definition.intent.as_deref(),
-                tokens: &entry.definition.tokens,
-                signature: entry.definition.signature.as_deref(),
-                exported: entry.definition.is_exported,
-                line: entry.definition.line_number,
-                calls: entry
-                    .definition
-                    .calls
-                    .iter()
-                    .map(|call| call.name.as_str())
-                    .collect(),
-            }
-        }));
-        Self {
-            entries,
-            index,
-            callers,
+        for (entry, definition) in entries.iter_mut().zip(&definitions) {
+            let key = (
+                entry.repo.to_lowercase(),
+                entry.file.clone(),
+                member(&definition.name).to_string(),
+            );
+            entry.called_from = callers.get(&key).map_or(0, |files| {
+                files.iter().filter(|caller| **caller != entry.key).count()
+            });
         }
+        let index =
+            SimilarIndex::build(entries.iter().zip(&definitions).map(|(entry, definition)| {
+                SimilarDoc {
+                    name: &definition.name,
+                    file: &entry.key,
+                    intent: definition.intent.as_deref(),
+                    tokens: &definition.tokens,
+                    signature: definition.signature.as_deref(),
+                    exported: definition.is_exported,
+                    line: definition.line_number,
+                    calls: definition
+                        .calls
+                        .iter()
+                        .map(|call| call.name.as_str())
+                        .collect(),
+                }
+            }));
+        Self { entries, index }
     }
 
     /// How many functions the ranker holds, and how many of them carry tokens.
     pub(crate) fn size(&self) -> (usize, usize) {
-        let with_tokens = self
-            .entries
-            .iter()
-            .filter(|entry| !entry.definition.tokens.is_empty())
-            .count();
+        let with_tokens = self.entries.iter().filter(|entry| entry.has_tokens).count();
         (self.entries.len(), with_tokens)
     }
 
@@ -191,33 +215,20 @@ impl<'a> Similar<'a> {
             .into_iter()
             .map(|row| {
                 let entry = &self.entries[row.doc];
-                let definition = entry.definition;
                 SimilarFunction {
-                    name: definition.name.clone(),
+                    name: entry.name.clone(),
                     repo: entry.repo.clone(),
                     file: entry.file.clone(),
-                    line: definition.line_number,
-                    end_line: definition.end_line,
+                    line: entry.line,
+                    end_line: entry.end_line,
                     score: (row.score * 1000.0).round() / 1000.0,
-                    signature: definition.signature.clone(),
-                    exported: definition.is_exported,
-                    called_from: self.called_from(entry),
-                    intent: definition.intent.clone(),
+                    signature: entry.signature.clone(),
+                    exported: entry.exported,
+                    called_from: entry.called_from,
+                    intent: entry.intent.clone(),
                 }
             })
             .collect()
-    }
-
-    /// How many other files hold a call that names the function.
-    fn called_from(&self, entry: &Entry<'_>) -> usize {
-        let key = (
-            entry.repo.to_lowercase(),
-            entry.file.clone(),
-            member(&entry.definition.name).to_string(),
-        );
-        self.callers.get(&key).map_or(0, |files| {
-            files.iter().filter(|caller| **caller != entry.key).count()
-        })
     }
 }
 
