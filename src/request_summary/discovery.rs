@@ -3307,17 +3307,6 @@ impl<'a> Walker<'a> {
             // A walk that found ends but passed, in a sibling's file, a send
             // on a maker's value it read nothing at: the call passes through
             // a call Carrick did not read (carrick#4445), beside its sites.
-            if outcome.passed_op {
-                *discovery
-                    .counts
-                    .entry("missed_inside/beside_ends".to_string())
-                    .or_default() += 1;
-                let at = (self.rel(file), call.site.span_start, call.site.span_end);
-                discovery
-                    .missed_at
-                    .insert(at.clone(), (call.site.line, call.callee_text.clone()));
-                discovery.missed_inside.push(at);
-            }
             let mut sibling_routes = 0;
             let mut sibling_end: Option<SiteEnd> = None;
             for found in outcome.ends {
