@@ -2425,7 +2425,8 @@ impl<'a> SiteNames<'a> {
                                 Some(place) => Some(place.clone()),
                                 None => self.place_at(file, span_start),
                             };
-                            if let Some(here) = here.filter(|_| per_element(&held)) {
+                            if let Some(here) = here.filter(|_| super::resolve::per_element(&held))
+                            {
                                 for text in texts {
                                     out.push(PlacedName {
                                         place: Some(here.clone()),
@@ -2485,30 +2486,6 @@ impl<'a> SiteNames<'a> {
             line: call.name_line,
         })
     }
-}
-
-/// Whether every value of one caller chain is a text read through a loop
-/// over a stated list (carrick#2093), each from its own element: then the
-/// texts are one name per element, never a choice between them. A text read
-/// through no loop, or two texts from one element (a choice written inside
-/// the loop), keeps the several names a choice (carrick#4245).
-fn per_element(held: &[&super::resolve::TextValue]) -> bool {
-    let mut seen: Vec<&[(u32, usize)]> = Vec::new();
-    for value in held {
-        let super::resolve::TextValue::Text {
-            elements,
-            from_type: false,
-            ..
-        } = value
-        else {
-            return false;
-        };
-        if elements.is_empty() || seen.contains(&elements.as_slice()) {
-            return false;
-        }
-        seen.push(elements);
-    }
-    true
 }
 
 /// A call or construction made through a library client, as one function

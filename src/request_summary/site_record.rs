@@ -56,7 +56,7 @@ use super::decided_sites::{
     Decided, DecidedSite, HandlerAt, MethodLabel, MethodValue, PayloadBinding, SiteLabel,
     SlotBinding,
 };
-use super::resolve::{ArgTexts, Resolver, TextValue};
+use super::resolve::{ArgTexts, Resolver, TextValue, per_element};
 use super::stop::Stop;
 use crate::position_rows::{Kind, PositionIndex};
 use crate::site_questions::{
@@ -564,6 +564,16 @@ impl Choices<'_, '_> {
             self.hole,
         )
     }
+
+    /// The names `expr` holds when it is a loop variable over a stated list:
+    /// one name per element, each stated by the code ([`per_element`], the
+    /// one answer the library reader asks too), never a choice and never the
+    /// compiler's union of the elements. `None` for anything else.
+    fn per_element(&self, expr: &Expr) -> Option<Whole> {
+        let set = self.resolver.text_set(self.root, self.file, expr);
+        let held: Vec<&TextValue> = set.iter().collect();
+        (held.len() >= 2 && per_element(&held)).then(|| whole_of(set, self.hole))?
+    }
 }
 
 /// The texts a choice's branches state ([`Choices::values`]), noting in
@@ -647,7 +657,9 @@ fn expr_written_as(parsed: &Parsed, exprs: &[&Expr], text: &str) -> Option<Expr>
 
 /// The whole values a slot's composed value (`pieces`) states: its text
 /// when every piece is literal, or when it is one value this pass does not
-/// read, the values of the expression the call writes for it among `exprs`.
+/// read, the values of the expression the call writes for it among `exprs`:
+/// one name per element where it is a loop variable over a stated list
+/// ([`Choices::per_element`]).
 /// With `env_bases`, a text an environment read starts or joins is stated
 /// by name ([`env_based_text`]).
 fn stated_whole(
@@ -680,6 +692,15 @@ fn stated_whole(
             let expr = expr_written_as(parsed?, exprs, text)?;
             if Choices::is_choice(&expr) {
                 return choices.values(&expr);
+            }
+            // A loop variable over a stated list is one name per element,
+            // read before the compiler's type: over an `as const` list that
+            // type is the union of the elements, a choice the model would be
+            // asked to name (carrick#4245).
+            if choices.in_place
+                && let Some(whole) = choices.per_element(&expr)
+            {
+                return Some(whole);
             }
             // A name the resolver reads as several texts (a `let` written
             // again, carrick#3504 S2b-8, D6). One text is the fold's, read
