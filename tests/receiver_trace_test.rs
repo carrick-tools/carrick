@@ -1028,8 +1028,8 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
     assert_eq!(
         at_14,
         vec![
-            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/large library_claim app",
-            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/small library_claim app",
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/large library_claim familyRoutes",
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/small library_claim familyRoutes",
         ],
         "{family:#?}"
     );
@@ -3292,14 +3292,23 @@ fn a_route_in_a_loop_over_a_stated_list_is_one_row_per_element() {
             let declared = bundled
                 .lines()
                 .find(|line| line.contains(&format!("type {alias} ")))
-                .unwrap_or("<no declaration>")
-                .trim()
-                .to_string();
+                .and_then(|line| line.split_once(" = "))
+                .map_or("<no declaration>", |(_, body)| body.trim());
             let (row, _) = entry.split_once(" response ").unwrap();
             format!("{row} {declared}")
         })
         .collect();
-    assert_eq!(typed, Vec::<String>::new(), "{picture}\nbundled {bundled}");
+    // Each element row's response is its own element's, never the union.
+    assert_eq!(
+        typed,
+        vec![
+            "src/server.ts:20 POST /widgets/sizes/large { size: \"large\"; };",
+            "src/server.ts:20 POST /widgets/sizes/small { size: \"small\"; };",
+            "src/server.ts:29 GET /favicon.svg { type: \"image/svg+xml\"; };",
+            "src/server.ts:29 GET /logo.png { type: \"image/png\"; };",
+        ],
+        "{picture}\nbundled {bundled}"
+    );
 }
 
 /// carrick#2093: a loop over a list of tuples reads both names of one
