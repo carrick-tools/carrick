@@ -338,4 +338,71 @@ mod tests {
         shared::<SiblingRegistry>();
         shared::<Siblings>();
     }
+
+    /// carrick#4444: a service that reads a value (an enum member, a
+    /// constant) another declared service holds, and calls nothing in it,
+    /// still reads that service's walk, so the analysis waits for it. The
+    /// binary fixture passes on timing with the gate left to calls alone,
+    /// so this is the test that holds the gate.
+    #[test]
+    fn a_value_read_in_another_service_is_a_walk_the_read_waits_for() {
+        use crate::position_rows::{
+            FORMAT_VERSION, FileRows, Header, Kind, PositionIndex, Row, RowsFile, content_hash,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let text = "export const topic = Topic.Alpha;\n";
+        for (service, file) in [("a", "x.ts"), ("b", "y.ts")] {
+            std::fs::create_dir_all(root.join(service)).unwrap();
+            std::fs::write(root.join(service).join(file), text).unwrap();
+        }
+        let services: Vec<Config> = ["a", "b"]
+            .iter()
+            .map(|name| Config {
+                service_name: Some((*name).to_string()),
+                directory: Some((*name).to_string()),
+                ..Config::default()
+            })
+            .collect();
+        // One `ident` row in `a/x.ts` declared in `b/y.ts`, and no call row.
+        let ident = Row(
+            Kind::Ident,
+            23,
+            33,
+            Some("Alpha".to_string()),
+            Some("b/y.ts".to_string()),
+            Some(1),
+            None,
+            Some("Topic".to_string()),
+            0,
+        );
+        let index = PositionIndex::of(
+            &root,
+            RowsFile {
+                header: Header {
+                    v: FORMAT_VERSION,
+                    typescript: "6.0.2".to_string(),
+                    service: "a".to_string(),
+                    files: 1,
+                },
+                files: vec![FileRows {
+                    f: "a/x.ts".to_string(),
+                    h: Some(content_hash(text.as_bytes())),
+                    skip: None,
+                    r: vec![ident],
+                }],
+            },
+        );
+        let registry = SiblingRegistry::new(
+            root.to_str().unwrap(),
+            &services,
+            vec![Some(0), Some(1)],
+            None,
+        );
+        assert_eq!(
+            registry.walks_read_by(0, &index),
+            BTreeSet::from([1]),
+            "the service that declares the value is a walk the read waits for"
+        );
+    }
 }

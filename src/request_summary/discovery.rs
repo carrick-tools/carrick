@@ -9331,18 +9331,21 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
     }
 
-    /// The `queue-enum-base-class` sender's decided sites and records, with
-    /// the shared package `queue-kit` as a sibling, and the enum package
-    /// `topics` too where `with_topics`. The engine reaches siblings through
-    /// call declarations only, so a scan reaches `queue-kit` alone.
+    /// The `queue-enum-base-class` sender's decided sites and records. All
+    /// five services are walked. The siblings are the engine's own set where
+    /// `engine_set` (the shared package `queue-kit` and the enum package
+    /// `topics`, which the sender reaches through the values it reads,
+    /// carrick#4444), and `queue-kit` alone otherwise, handed in by hand.
     fn queue_kit_sender_sites(
-        with_topics: bool,
+        engine_set: bool,
     ) -> (
         super::super::decided_sites::Decided,
         Vec<super::super::site_record::SiteRecord>,
     ) {
         let services = [
             ("services/sender", "sender"),
+            ("services/runner", "runner"),
+            ("services/bystander", "bystander"),
             ("packages/queue-kit", "queue-kit"),
             ("packages/topics", "topics"),
         ];
@@ -9366,14 +9369,19 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             .find(|config| config.service_name.as_deref() == Some("sender"))
             .expect("carrick.json declares the sender");
         let script = super::super::fixture_walk::sidecar().expect("the compiler engine is built");
-        let [own, kit, topics] = on.inputs.as_slice() else {
-            panic!("three services");
-        };
+        let own = &on.inputs[0];
+        let kit = &on.inputs[3];
         let declarations = super::super::fixture_walk::census_declarations(
             &script, &on.repo, config, own, &exports,
         );
-        let siblings: Vec<&RequestSummaryInputs> = if with_topics {
-            vec![kit, topics]
+        let siblings: Vec<&RequestSummaryInputs> = if engine_set {
+            let names: Vec<&str> = on
+                .sibling_positions_of(0)
+                .into_iter()
+                .map(|index| on.names[index].as_str())
+                .collect();
+            assert_eq!(names, ["queue-kit", "topics"], "the engine's sibling set");
+            on.siblings_of(0)
         } else {
             vec![kit]
         };
