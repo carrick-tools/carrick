@@ -485,6 +485,19 @@ fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredTy
         })
 }
 
+/// True when the reads of one alias decided the site states no type
+/// (carrick#4306, carrick#4289): some read abstained with a decided reason at
+/// the type's root (`inference_decided_no_contract`) and no read of the alias
+/// saw a shape (`inference_read_no_shape`). The one answer both the anchor
+/// arbitration (`demote_witnessed_borrowed_anchors`) and the manifest join
+/// (`enrich_manifest_with_type_resolution`) read.
+pub(crate) fn alias_reads_decided_no_type(
+    reads: &[&crate::services::type_sidecar::InferredType],
+) -> bool {
+    reads.iter().any(|inf| inference_decided_no_contract(inf))
+        && reads.iter().all(|inf| inference_read_no_shape(inf))
+}
+
 /// Derive one capture anchor per alias from the collected v1 type requests.
 ///
 /// Precedence mirrors the v1 bundle: an explicit symbol request wins over an
