@@ -984,10 +984,7 @@ pub(super) fn services_reading(
             .find(|blob| service_id(blob) == service.name)
             .and_then(|blob| blob.config_json.as_deref())
             .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
-        let Some(config) = config else {
-            return None;
-        };
-        configs.push(config);
+        configs.push(config?);
     }
     let repo_path = tree.checkout.to_string_lossy().to_string();
     let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
