@@ -3142,9 +3142,11 @@ export class TypeInferrer {
    * A type declared outside the repository is read this way whatever the
    * function returns it from (carrick#4269). A type the repository declares
    * is read this way only by its shape (carrick#4283): the function is a
-   * route registration's handler and every return is a send that hands the
-   * reply back (`sendHandsBackHandlerParameter`). A function returning its
-   * own options type, or a builder's fluent setter, returns data.
+   * route registration's handler, every return is a call that hands one of
+   * its parameters back (`handsBackHandlerParameter`), and at least one of
+   * them is given a value of any type (`takesAnyValue`). A function returning
+   * its own options type, or a callback returning a builder's typed setter,
+   * returns data.
    */
   private returnsHandlerParameterType(
     request: InferRequestItem,
@@ -3162,28 +3164,40 @@ export class TypeInferrer {
     const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
+    const calls = branches.map((branch) => this.peelTransparentExpression(branch));
     return (
-      branches.length > 0 &&
-      branches.every((branch) =>
-        this.sendHandsBackHandlerParameter(this.peelTransparentExpression(branch), func)
-      )
+      calls.length > 0 &&
+      calls.every((call) => this.handsBackHandlerParameter(call, func)) &&
+      calls.some((call) => Node.isCallExpression(call) && this.takesAnyValue(call))
     );
   }
 
   /**
-   * True when `node` is a send on a handler's own parameter that hands that
-   * parameter back (carrick#4283): a method call given a value whose result
-   * is the type of the object it was called on, and that type is one of the
-   * handler's parameters (`reply.send(x)`, `reply.code(201).send(x)`). Its
-   * result is the reply, and the value it was given is the body.
+   * True when `node` is a method call on a handler's own parameter that hands
+   * that parameter back (carrick#4283): given at least one argument, its
+   * result is the type of the object it was called on, and that type is one
+   * of the handler's parameters (`reply.send(x)`, `reply.code(201)`).
    */
-  private sendHandsBackHandlerParameter(node: Node, handler: FunctionLike): boolean {
+  private handsBackHandlerParameter(node: Node, handler: FunctionLike): boolean {
     if (!Node.isCallExpression(node) || node.getArguments().length === 0) return false;
     const callee = node.getExpression();
     if (!Node.isPropertyAccessExpression(callee)) return false;
     const result = node.getType().compilerType;
     if (callee.getExpression().getType().compilerType !== result) return false;
     return handler.getParameters().some((parameter) => parameter.getType().compilerType === result);
+  }
+
+  /**
+   * True when the first parameter of the signature `call` resolves to is
+   * declared as taking any value (`typeNodeStatesNothing`): the slot of a
+   * send (`send(payload?: unknown)`), never a typed setter (`set(v: string)`,
+   * `code(status: number)`).
+   */
+  private takesAnyValue(call: CallExpression): boolean {
+    const declaration = this.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+    if (!declaration || !Node.isParametered(declaration)) return false;
+    const typeNode = declaration.getParameters()[0]?.getTypeNode();
+    return typeNode !== undefined && this.typeNodeStatesNothing(typeNode);
   }
 
   /**
@@ -3196,7 +3210,8 @@ export class TypeInferrer {
     return (
       handler !== undefined &&
       this.isRegisteredHandler(request, handler) &&
-      this.sendHandsBackHandlerParameter(call, handler)
+      this.handsBackHandlerParameter(call, handler) &&
+      this.takesAnyValue(call)
     );
   }
 

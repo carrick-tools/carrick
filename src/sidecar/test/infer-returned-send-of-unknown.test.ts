@@ -88,6 +88,12 @@ interface Builder { name: string; set(value: string): Builder }
 export function configure(builder: Builder): Builder {
   return builder.set('x');
 }
+interface Journal { lines: string[]; write(entry: unknown): Journal }
+export function record(journal: Journal): Journal {
+  return journal.write('x');
+}
+declare const builders: Builder[];
+export const renamed = builders.map((builder) => builder.set('x'));
 `;
 
 interface InferShape {
@@ -277,6 +283,40 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
     const answer = response.inferred_types?.find((t) => t.alias === 'Configure');
     assert.ok(answer, 'the function return must answer');
     assert.match(answer.type_string, /name: string/);
+  });
+
+  it('a function no registration hands in keeps its answer, even when it returns a fluent any-value call', async () => {
+    const line = ROUTES_TS.slice(0, ROUTES_TS.indexOf('export function record')).split('\n').length;
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: 'infer-record',
+      requests: [
+        { file_path: routesPath, line_number: line, infer_kind: 'function_return', alias: 'Record' },
+      ],
+    });
+    const answer = response.inferred_types?.find((t) => t.alias === 'Record');
+    assert.ok(answer, 'the function return must answer');
+    assert.match(answer.type_string, /lines: string\[\]/);
+  });
+
+  it('a callback returning a typed setter on its own parameter keeps its answer (send and line)', async () => {
+    const start = ROUTES_TS.indexOf("builder.set('x')", ROUTES_TS.indexOf('export const renamed'));
+    const line = ROUTES_TS.slice(0, start).split('\n').length;
+    for (const [alias, extra] of [
+      ['RenamedSend', { span_start: start, span_end: start + "builder.set('x')".length }],
+      ['RenamedLine', {}],
+    ] as const) {
+      const response = await client.send<InferShape>({
+        action: 'infer',
+        request_id: `infer-${alias}`,
+        requests: [
+          { file_path: routesPath, line_number: line, ...extra, infer_kind: 'response_body', alias },
+        ],
+      });
+      const answer = response.inferred_types?.find((t) => t.alias === alias);
+      assert.ok(answer, `${alias} must answer`);
+      assert.match(answer.type_string, /name: string/);
+    }
   });
 
   it('a function returning its own repository-declared parameter type keeps its answer', async () => {
