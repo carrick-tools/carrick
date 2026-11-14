@@ -108,7 +108,7 @@ export function wireFormFor(
   if (protocol === 'graphql' && typeKind === 'response') {
     const graphql = facts.graphql;
     return graphql !== undefined && graphqlRootLeaf(graphql.types, graphql.root) !== undefined
-      ? 'json' // RED: the facts are not read yet
+      ? 'graphql_scalars'
       : 'json';
   }
   return 'declared';
