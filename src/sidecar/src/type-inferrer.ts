@@ -74,7 +74,7 @@ import {
 } from './platform-body-read.js';
 import { reachedOnlyOnFailure } from './failure-path.js';
 import { readResponseModes, type JoinedBody, type MessageSource, type ResponseModes } from './response-modes.js';
-import { callInto, calledFunction, narrowByArguments } from './argument-modes.js';
+import { callInto, calledFunction, calleeName, narrowByArguments } from './argument-modes.js';
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
@@ -3160,15 +3160,16 @@ export class TypeInferrer {
         .getParameters()
         .some((parameter) => parameter.getType().compilerType === awaitedType.compilerType);
     }
-    if (!this.isRegisteredHandler(request, func)) return false;
     const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
       this.expandResponseBranches(expression, 0)
     );
     const calls = branches.map((branch) => this.peelTransparentExpression(branch));
+    // The registration test last: it may search the project for references.
     return (
       calls.length > 0 &&
       calls.every((call) => this.handsBackHandlerParameter(call, func)) &&
-      calls.some((call) => Node.isCallExpression(call) && this.takesAnyValue(call))
+      calls.some((call) => Node.isCallExpression(call) && this.takesAnyValue(call)) &&
+      this.isRegisteredHandler(request, func)
     );
   }
 
@@ -3209,17 +3210,18 @@ export class TypeInferrer {
     const handler = this.findContainingFunctionForNode(call);
     return (
       handler !== undefined &&
-      this.isRegisteredHandler(request, handler) &&
       this.handsBackHandlerParameter(call, handler) &&
-      this.takesAnyValue(call)
+      this.takesAnyValue(call) &&
+      this.isRegisteredHandler(request, handler)
     );
   }
 
   /**
    * True when `func` is a route registration's handler: the one the
    * registration on the request's line hands in (found as
-   * `registrationAtLine` finds it), or an inline function a registration
-   * call is handed, for a request on a line inside it.
+   * `registrationAtLine` finds it), an inline function a registration call
+   * is handed, for a request on a line inside it, or a named function a
+   * registration call is handed by a reference to its name (carrick#4309).
    */
   private isRegisteredHandler(request: InferRequestItem, func: FunctionLike): boolean {
     const sourceFile = this.project.getSourceFile(request.file_path);
@@ -3227,7 +3229,11 @@ export class TypeInferrer {
       return true;
     }
     const parent = func.getParent();
-    return Node.isCallExpression(parent) && this.registrationHandlerAt(parent) === func;
+    if (Node.isCallExpression(parent) && this.registrationHandlerAt(parent) === func) return true;
+    return (calleeName(func)?.findReferencesAsNodes() ?? []).some((reference) => {
+      const call = reference.getParent();
+      return Node.isCallExpression(call) && this.registrationHandlerAt(call) === func;
+    });
   }
 
   /**

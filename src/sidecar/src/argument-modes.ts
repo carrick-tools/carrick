@@ -125,7 +125,7 @@ function sharedModes(callee: Node, call: CallExpression, binding: Binding, teste
 }
 
 /** The identifier that names `callee` where it is declared. */
-function calleeName(callee: Node): Identifier | undefined {
+export function calleeName(callee: Node): Identifier | undefined {
   if (Node.isFunctionDeclaration(callee)) return callee.getNameNode();
   if (Node.isMethodDeclaration(callee)) {
     const name = callee.getNameNode();
