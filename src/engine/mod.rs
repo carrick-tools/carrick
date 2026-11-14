@@ -6494,7 +6494,6 @@ async fn analyze_current_repo_incremental(
                 &typed_leaves,
                 &merged_results,
                 repo_path,
-                &service_modules,
             );
             if !manifest_entries.is_empty() {
                 cloud_data.type_manifest = Some(manifest_entries);
@@ -14807,7 +14806,6 @@ fn stamp_fact_through_symbols(
     leaves: &[&crate::call_through::LeafCall],
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     repo_path: &str,
-    modules: &crate::workspace_resolver::WorkspaceIndex,
 ) {
     let root = Path::new(repo_path);
     let places: HashSet<(&str, u32)> = fold
@@ -14850,7 +14848,7 @@ fn stamp_fact_through_symbols(
             entry
         })
         .collect();
-    stamp_manifest_anchor_symbols(&mut subset, file_results, repo_path, modules);
+    stamp_manifest_anchor_symbols(&mut subset, file_results);
     for (index, mut entry) in picked.into_iter().zip(subset) {
         entry.file_path = manifest[index].file_path.clone();
         manifest[index] = entry;
@@ -15795,7 +15793,6 @@ async fn analyze_current_repo(
         &typed_leaves,
         &analysis_result.file_results,
         repo_path,
-        &service_modules,
     );
     if !manifest_entries.is_empty() {
         cloud_data.type_manifest = Some(manifest_entries);

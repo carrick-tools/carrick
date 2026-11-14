@@ -1,5 +1,7 @@
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
 use crate::operation::OperationKey;
+use swc_common::{SourceMap, sync::Lrc};
+use swc_ecma_ast::{Decl, ModuleDecl, ModuleItem, Stmt};
 
 pub fn normalize_manifest_method(method: &str) -> String {
     let trimmed = method.trim();
