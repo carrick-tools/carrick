@@ -20,7 +20,9 @@
 //! - HTTP: an unknown call path pairs with nothing; otherwise the pool is
 //!   every HTTP producer, in every service including the caller's, whose
 //!   method serves the call's ([`method_matches`]); only the producers with
-//!   maximal [`match_agreement`] are kept; each answers
+//!   maximal [`match_agreement`] are kept, and among them only the ones
+//!   where the call leaves the fewest route literals to a placeholder
+//!   (carrick#4262; remaining ties are kept); each answers
 //!   [`match_verdict_with_dispatch`], and [`dispatch_outcome`] over those
 //!   answers decides the call.
 //!
@@ -32,8 +34,7 @@ use std::collections::HashMap;
 use crate::{
     ANY_METHOD, DispatchOutcome, MatchEvidence, MatchRelationship, MatchVerdict, NameScope,
     ScopedRow, SplitPath, agreement, classify_relationship, dispatch_outcome, fold_dispatch,
-    is_literal_segment, is_param_segment, is_unknown_call_path, names_pair, owned_segments,
-    path_verdict, segments,
+    is_unknown_call_path, names_pair, owned_segments, path_verdict, segments, unconfirmed_literals,
 };
 
 /// The protocol label of an HTTP row. Every other label pairs by exact key.
@@ -150,7 +151,9 @@ pub enum PairOutcome {
     /// extraction gap, paired with nothing.
     UnknownCallPath,
     /// The best route corroborates nothing (a bare catch-all or a
-    /// param-only route). No winner, and the call is not a missing endpoint.
+    /// param-only route), or the call leaves more of its literals to a
+    /// placeholder than it confirms ([`MatchVerdict::NoLiteralAgreement`]).
+    /// No winner, and the call is not a missing endpoint.
     NoLiteralAgreement,
     /// No producer routes the call.
     NoRoute,
@@ -396,13 +399,31 @@ impl PairingPool {
         let Some(best) = scored.iter().map(|&(_, agreement)| agreement).max() else {
             return Pairing::empty(PairOutcome::NoRoute);
         };
+        // Among the maximal-agreement routes, the ones where the call leaves
+        // the fewest route literals to a placeholder (carrick#4262).
+        let ranked: Vec<(usize, u32, u32)> = scored
+            .into_iter()
+            .filter(|&(_, agreement)| agreement == best)
+            .map(|(index, agreement)| {
+                // Every scored producer has a route (`filter_map` above).
+                let route = self.route(index).expect("a scored producer has a path");
+                (index, agreement, unconfirmed_literals(&route, &call_split))
+            })
+            .collect();
+        let fewest = ranked
+            .iter()
+            .map(|&(_, _, unconfirmed)| unconfirmed)
+            .min()
+            .unwrap_or(0);
 
         let mut routed = Vec::new();
         let mut matched = Vec::new();
         let mut case_unknown = Vec::new();
         let mut case_mismatched = 0u32;
-        for (index, agreement) in scored.into_iter().filter(|&(_, a)| a == best) {
-            // Every scored producer has a route (`filter_map` above).
+        for (index, agreement, unconfirmed) in ranked
+            .into_iter()
+            .filter(|&(_, _, unconfirmed)| unconfirmed == fewest)
+        {
             let route = self.route(index).expect("a scored producer has a path");
             // `match_verdict_with_dispatch`, with the agreement just scored.
             let verdict = fold_dispatch(
@@ -415,7 +436,7 @@ impl PairingPool {
                 verdict,
                 agreement,
             });
-            let param_over_literal = Some(call_param_over_route_literal(&route, &call_split));
+            let param_over_literal = Some(unconfirmed > 0);
             match verdict {
                 MatchVerdict::Matched => matched.push(self.winner(
                     index,
@@ -486,22 +507,6 @@ impl PairingPool {
 /// more than one call builds the pool once instead.
 pub fn pair_winners(producers: &[Producer], call: &Call) -> Pairing {
     PairingPool::new(producers.to_vec()).pair(call)
-}
-
-/// Whether the call has a placeholder at a position where the route states
-/// a literal (carrick#2004): the call's value there is unknown, so the route
-/// is reached but its literal is not confirmed.
-fn call_param_over_route_literal(
-    route: &SplitPath<'_, Box<str>>,
-    call: &SplitPath<'_, &str>,
-) -> bool {
-    route
-        .segments()
-        .iter()
-        .zip(call.segments())
-        .any(|(route, call)| {
-            is_param_segment(call) && is_literal_segment(route.trim_end_matches('?'))
-        })
 }
 
 /// The form a writer stores a path in: one leading `/`, no empty segment

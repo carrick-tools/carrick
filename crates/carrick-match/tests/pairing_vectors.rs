@@ -24,7 +24,7 @@ const VECTORS: &[u8] = include_bytes!("fixtures/pairing.vectors.json");
 /// (`lambdas/mcp-server/src/utils/__tests__/fixtures/pairing.vectors.json`)
 /// is byte-identical, so a change is a contract change: change the vectors
 /// on both sides and re-pin both values together.
-const PINNED_SHA256: &str = "909370d5aa556dc76fd05eb7e306160b6057083b043325a9a7b7a3f442b3bf70";
+const PINNED_SHA256: &str = "48373db96c94a323dc1d8353ae0c1fc51e4ceb8838db13964b5ebff23741c3ff";
 
 /// The cases that pin today's answer for a named product gap (the file's
 /// `expected_red` marker). The change that closes a gap removes its marker
