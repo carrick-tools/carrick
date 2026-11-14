@@ -1018,6 +1018,10 @@ impl MemberDeclarations {
         if verdicts.len() != ask.checks.len() {
             return out;
         }
+        // The (store key, member) pairs with an op check the answer left
+        // unchecked, and those with one that verified (carrick#4473).
+        let mut unchecked: HashSet<(String, String)> = HashSet::new();
+        let mut verified: HashSet<(String, String)> = HashSet::new();
         for (((check, op), scope), verdict) in ask
             .checks
             .iter()
@@ -1025,11 +1029,20 @@ impl MemberDeclarations {
             .zip(&ask.scopes)
             .zip(verdicts)
         {
-            if verdict.verdict != SemanticsVerdict::Verified
-                || verdict.claim_id != check.claim_id
-                || verdict.receiver != check.receiver
-            {
+            if verdict.claim_id != check.claim_id || verdict.receiver != check.receiver {
                 continue;
+            }
+            if verdict.verdict == SemanticsVerdict::Unchecked {
+                if let Some(op) = op {
+                    unchecked.insert((op.package.clone(), op.member.clone()));
+                }
+                continue;
+            }
+            if verdict.verdict != SemanticsVerdict::Verified {
+                continue;
+            }
+            if let Some(op) = op {
+                verified.insert((op.package.clone(), op.member.clone()));
             }
             if let Some(scope) = scope {
                 let mut declarations: Vec<(String, u32)> = verdict
@@ -1055,6 +1068,15 @@ impl MemberDeclarations {
                 }
             }
         }
+        // A pair no check of verified, with one left unchecked, was not
+        // decided: its calls are `unanswered`. One verified check indexes
+        // the pair's declarations, so a call outside them is another member
+        // of that name (carrick#4473).
+        out.unanswered.extend(
+            unchecked
+                .into_iter()
+                .filter(|pair| !verified.contains(pair)),
+        );
         out
     }
 
@@ -2484,7 +2506,19 @@ impl<'a> Walker<'a> {
                 if reasons.iter().any(Option::is_none) {
                     return None;
                 }
-                reasons.into_iter().flatten().next()
+                let reason = reasons.into_iter().flatten().next();
+                // The trace left this call's check open: no match was
+                // decided, so `package_unmatched` would state a result the
+                // scan never got (carrick#4473).
+                if reason == Some(Stop::PackageUnmatched)
+                    && self
+                        .labels
+                        .declarations
+                        .is_some_and(|d| d.left_open(row, self.labels.exports))
+                {
+                    return Some(Stop::Unanswered);
+                }
+                reason
             }
             _ => None,
         }
@@ -4494,9 +4528,13 @@ mod tests {
             edited[flip].reason = Some("budget".to_string());
             edited[flip].declarations.clear();
             let mixed = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &edited));
-            assert_eq!(
-                mixed, real,
-                "check {flip} unchecked, its pair's other verified"
+            // The unchecked check's declarations are gone, so a call it
+            // decided may now be unread: `package_unmatched`, since the
+            // pair's other check verified. Nothing says `unanswered`.
+            assert!(mixed.len() >= real.len(), "check {flip}");
+            assert!(
+                !mixed.iter().any(says_unanswered),
+                "check {flip} unchecked, its pair's other verified: {mixed:?}"
             );
         }
     }
