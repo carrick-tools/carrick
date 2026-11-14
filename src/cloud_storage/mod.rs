@@ -158,7 +158,8 @@ pub struct TypeManifestEntry {
     /// one scanner pass, `type_home::store_type_homes`, is its only writer. An
     /// entry with a symbol states a home only when the home names that symbol;
     /// an entry with no symbol states the engine's, and only this field then
-    /// carries the name.
+    /// carries the name. A request or response validated by a schema `const`
+    /// is homed at that const, marked [`TypeHomeKind::Schema`] (H3).
     ///
     /// `None` for a shape nobody named, a TypeScript lib type, framework
     /// machinery, a type declared in a package's own typings, a decided
@@ -286,6 +287,22 @@ pub struct TypeHome {
     pub line_number: u32,
     /// The declared symbol, named as the declaring file names it.
     pub symbol: String,
+    /// What the declaration is, where it is not a type (carrick#2148 H3).
+    /// Absent for a type declaration: an interface, a type alias, a class or
+    /// an enum. A reader that prints the home names it by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TypeHomeKind>,
+}
+
+/// What a [`TypeHome`] declares, where it is not a type.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeHomeKind {
+    /// The `const` of a schema value a request or response is validated by
+    /// (`guard('json', NewTicket)`, `NewTicket.safeParse(body)`). The contract
+    /// is the schema's input or output type; the const is a value, never a type
+    /// a reader can import as one.
+    Schema,
 }
 
 /// One DIRECTION of a pairing's type check: the request types compared against

@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind};
+use crate::cloud_storage::{CloudRepoData, ManifestRole, ManifestTypeKind, TypeHomeKind};
 
 use super::index::service_id;
 use super::read_model::{
@@ -150,8 +150,9 @@ fn type_uses(
         .map(|(file, items)| (normalize(file), items))
         .collect();
 
-    // Declaring file -> (line, symbol) -> the operations that read it.
-    let mut found: BTreeMap<String, BTreeMap<(u32, String), BTreeSet<IndexedTypeOperation>>> =
+    // Declaring file -> (line, symbol, kind) -> the operations that read it.
+    type Declared = (u32, String, Option<TypeHomeKind>);
+    let mut found: BTreeMap<String, BTreeMap<Declared, BTreeSet<IndexedTypeOperation>>> =
         BTreeMap::new();
     for blob in blobs {
         let service = service_id(blob);
@@ -185,7 +186,7 @@ fn type_uses(
             found
                 .entry(declared)
                 .or_default()
-                .entry((home.line_number, home.symbol.clone()))
+                .entry((home.line_number, home.symbol.clone(), home.kind))
                 .or_default()
                 .insert(IndexedTypeOperation {
                     kind,
@@ -209,9 +210,10 @@ fn type_uses(
         .map(|(file, types)| {
             let types = types
                 .into_iter()
-                .map(|((line, symbol), operations)| IndexedTypeUse {
+                .map(|((line, symbol, kind), operations)| IndexedTypeUse {
                     symbol,
                     line,
+                    kind,
                     operations: operations.into_iter().collect(),
                 })
                 .collect();

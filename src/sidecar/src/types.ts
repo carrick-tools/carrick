@@ -1728,6 +1728,11 @@ export interface TypeHome {
   symbol: string;
   file_path: string;
   line: number;
+  /**
+   * carrick#2148 H3: `schema` where the home is the `const` of a schema value
+   * the contract was read off, not a type declaration. Absent for a type.
+   */
+  kind?: 'schema';
 }
 
 export interface ManifestEntry {

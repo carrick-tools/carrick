@@ -4,7 +4,7 @@
  * the bundle's manifest (`home`) read it from here.
  */
 
-import { Node, ts } from 'ts-morph';
+import { Node, ts, VariableDeclarationKind } from 'ts-morph';
 import { startLineOf } from './line-index.js';
 import type { TypeHome } from './types.js';
 
@@ -59,4 +59,39 @@ export function homeOfTypeDeclaration(
   const symbol = declaredTypeName(name, declaration);
   if (!nameNode || symbol === undefined) return undefined;
   return { symbol, file_path: sourceFile.getFilePath(), line: startLineOf(nameNode) };
+}
+
+/**
+ * carrick#2148 H3: the home of a schema value a contract was read off, where
+ * the value is one name for a `const` the repository declares
+ * (`guard('json', NewTicket)`, `NewTicket.safeParse(body)`). The schema is
+ * where that contract is written, so the home is the const's name, marked
+ * `kind: "schema"`: it is a value, never a type a reader can import as one.
+ *
+ * None for a schema built at its use (`record({ … })`), a name that is not a
+ * `const` (it can be reassigned, so the declaration is not the contract), an
+ * ambient `declare const`, and a declaration in a package or a `.d.ts`.
+ */
+export function homeOfSchemaValue(value: Node): TypeHome | undefined {
+  if (!Node.isIdentifier(value)) return undefined;
+  let symbol = value.getSymbol();
+  if (symbol?.isAlias()) symbol = symbol.getAliasedSymbol() ?? symbol;
+  const declarations = symbol?.getDeclarations() ?? [];
+  if (declarations.length !== 1) return undefined;
+  const [declaration] = declarations;
+  if (!Node.isVariableDeclaration(declaration) || !declaration.hasInitializer()) return undefined;
+  const list = declaration.getParent();
+  if (!Node.isVariableDeclarationList(list) || list.getDeclarationKind() !== VariableDeclarationKind.Const) {
+    return undefined;
+  }
+  const sourceFile = declaration.getSourceFile();
+  if (sourceFile.isDeclarationFile() || sourceFile.isInNodeModules()) return undefined;
+  const nameNode = declaration.getNameNode();
+  if (!Node.isIdentifier(nameNode)) return undefined;
+  return {
+    symbol: nameNode.getText(),
+    file_path: sourceFile.getFilePath(),
+    line: startLineOf(nameNode),
+    kind: 'schema',
+  };
 }

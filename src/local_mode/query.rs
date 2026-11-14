@@ -638,6 +638,7 @@ fn project_uses(
         .map(|used| TypeUse {
             symbol: used.symbol.clone(),
             line: used.line,
+            kind: used.kind,
             operations: used
                 .operations
                 .iter()

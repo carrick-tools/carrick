@@ -26022,6 +26022,7 @@ unfollowed_member_calls_total: 0,
     fn inferred_at(symbol: &str, source: Option<&Path>, line: u32) -> InferredType {
         let mut inferred = inferred_with_symbol(symbol);
         inferred.type_home = source.map(|path| crate::services::type_sidecar::TypeHomeReport {
+            kind: None,
             symbol: symbol.to_string(),
             file_path: as_reported(path),
             line,
@@ -26083,6 +26084,7 @@ unfollowed_member_calls_total: 0,
             assert_eq!(
                 entry.defined_in,
                 Some(crate::cloud_storage::TypeHome {
+                    kind: None,
                     file_path: file_path.to_string(),
                     line_number,
                     symbol: symbol.to_string(),
@@ -26428,6 +26430,7 @@ unfollowed_member_calls_total: 0,
         anchored_and_stored(&mut manifest, &resolution, &repo.path().to_string_lossy());
 
         let home = crate::cloud_storage::TypeHome {
+            kind: None,
             file_path: "src/pages.ts".to_string(),
             line_number: 3,
             symbol: "MemberPage".to_string(),
@@ -26528,6 +26531,7 @@ unfollowed_member_calls_total: 0,
         crate::services::type_sidecar::StatedBody {
             root: Some(root.to_string()),
             root_home: Some(crate::services::type_sidecar::TypeHomeReport {
+                kind: None,
                 symbol: root.to_string(),
                 file_path: source.to_string(),
                 line: 1,
@@ -26572,6 +26576,7 @@ unfollowed_member_calls_total: 0,
         anchored_and_stored(&mut manifest, &resolution, &repo_path);
 
         let home = crate::cloud_storage::TypeHome {
+            kind: None,
             file_path: "src/api.ts".to_string(),
             line_number: 1,
             symbol: "MemberPage".to_string(),
@@ -26647,6 +26652,7 @@ unfollowed_member_calls_total: 0,
         anchored_and_stored(&mut manifest, &resolution, &repo_path);
 
         let home = |symbol: &str, line_number: u32| crate::cloud_storage::TypeHome {
+            kind: None,
             file_path: "src/envelope.ts".to_string(),
             line_number,
             symbol: symbol.to_string(),
@@ -26764,6 +26770,7 @@ unfollowed_member_calls_total: 0,
         line: u32,
     ) -> crate::services::type_sidecar::TypeHomeReport {
         crate::services::type_sidecar::TypeHomeReport {
+            kind: None,
             symbol: symbol.to_string(),
             file_path: file.to_string(),
             line,
@@ -26776,6 +26783,7 @@ unfollowed_member_calls_total: 0,
         line_number: u32,
     ) -> Option<crate::cloud_storage::TypeHome> {
         Some(crate::cloud_storage::TypeHome {
+            kind: None,
             file_path: file.to_string(),
             line_number,
             symbol: symbol.to_string(),
