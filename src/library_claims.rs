@@ -1811,7 +1811,16 @@ impl Reading<'_, '_> {
                         outcome.get_or_insert(NameOutcome::KindAsked);
                         continue;
                     }
-                    outcome.get_or_insert(NameOutcome::Filled);
+                    // A name per element of a stated list is placed at the
+                    // library call itself (carrick#4245): read there, not
+                    // filled by a caller.
+                    let at_call =
+                        place.file == self.site.file && place.span_start == self.site.span_start;
+                    outcome.get_or_insert(match (at_call, self.site.linked) {
+                        (false, _) => NameOutcome::Filled,
+                        (true, true) => NameOutcome::Linked,
+                        (true, false) => NameOutcome::Literal,
+                    });
                     // No row where it differs: the chain's caller site
                     // states today's name there and counts `text_differs`
                     // (Q-B3f).
@@ -5510,6 +5519,155 @@ mod tests {
             // anew waits on the site path's kind question and states no
             // library row (Q-B3e). `PREFIX` today's reading reads.
             &[("use.ts", 5, "svc")],
+        );
+    }
+
+    /// A socket export of `@fixture/socket` on `side`, listening with `on`
+    /// and sending with `emit`, both named by argument 0.
+    fn loop_socket(export_name: &str, side: &str) -> ExportClaims {
+        export(json!({
+            "package": "@fixture/socket", "version": "4.0.0", "specifier": "@fixture/socket",
+            "export": export_name, "role": "socket", "side": side,
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 } },
+                { "kind": "op", "op": "receive", "member": "on", "on": "export",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 } }
+            ]
+        }))
+    }
+
+    /// A server that listens in a loop over a stated list, and a client
+    /// that sends in a loop over the same list, imported.
+    const LOOP_EVENTS: &str =
+        "export const EVENTS = [\"order.created\", \"order.paid\"] as const;\n";
+    const LOOP_HUB: &str = "import { io } from \"@fixture/socket\";\n\
+        import { EVENTS } from \"./events\";\n\
+        export function listen() {\n\
+        \x20 for (const ev of EVENTS) io.on(ev, () => {});\n\
+        }\n\
+        declare const later: string[];\n\
+        export function unread() {\n\
+        \x20 for (const ev of later) io.on(ev, () => {});\n\
+        }\n\
+        export function choose(flag: boolean) {\n\
+        \x20 for (const ev of EVENTS) io.on(flag ? ev : `${ev}.x`, () => {});\n\
+        }\n\
+        export function outside(flag: boolean) {\n\
+        \x20 io.on(flag ? \"a.one\" : \"a.two\", () => {});\n\
+        \x20 io.on(\"a.fixed\", () => {});\n\
+        }\n";
+    const LOOP_CLIENT: &str = "import { socket } from \"@fixture/socket\";\n\
+        import { EVENTS } from \"./events\";\n\
+        export function tell() {\n\
+        \x20 for (const ev of EVENTS) {\n\
+        \x20   socket.emit(ev, {});\n\
+        \x20 }\n\
+        }\n";
+
+    /// carrick#4245 (the socket half): a socket handler registered, and a
+    /// socket event sent, in a loop over a stated list is one row per
+    /// element at the call, and each listener pairs with its sender. A
+    /// list the code does not state, a choice written inside the loop and a
+    /// choice outside any loop keep their leads; a literal name keeps its
+    /// row.
+    #[test]
+    fn a_socket_event_in_a_loop_over_a_stated_list_is_one_row_per_element() {
+        let Some((rows, _)) = read_walked(
+            &[
+                ("src/events.ts", LOOP_EVENTS),
+                ("src/hub.ts", LOOP_HUB),
+                ("src/client.ts", LOOP_CLIENT),
+            ],
+            &[loop_socket("io", "server"), loop_socket("socket", "client")],
+            true,
+        ) else {
+            return;
+        };
+        let at = |file: &str| -> Vec<(u32, String)> {
+            let mut out: Vec<(u32, String)> = placed(&rows)
+                .into_iter()
+                .filter(|(of, _, _)| of == file)
+                .map(|(_, line, name)| (line, name))
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            at("hub.ts"),
+            vec![
+                (4, "order.created".to_string()),
+                (4, "order.paid".to_string()),
+                (15, "a.fixed".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        assert_eq!(
+            at("client.ts"),
+            vec![
+                (5, "order.created".to_string()),
+                (5, "order.paid".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        // Each element's listener pairs with its sender: one operation
+        // each, an endpoint and a call.
+        let ends = |side: RowSide| -> BTreeSet<String> {
+            rows.rows
+                .iter()
+                .filter(|row| row.name.starts_with("order."))
+                .map(|row| row.operation())
+                .filter(|(_, of)| *of == side)
+                .map(|(key, _)| format!("{key:?}"))
+                .collect()
+        };
+        assert_eq!(ends(RowSide::Endpoint).len(), 2, "{rows:#?}");
+        assert_eq!(ends(RowSide::Endpoint), ends(RowSide::Call), "{rows:#?}");
+        let mut leads: Vec<(u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        leads.sort();
+        assert_eq!(
+            leads.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+            vec![8, 11, 14],
+            "{:?}",
+            rows.leads
+        );
+        assert_ne!(leads[0].1, Stop::SeveralOperations, "{:?}", rows.leads);
+        assert_eq!(leads[1].1, Stop::SeveralOperations, "{:?}", rows.leads);
+        assert_eq!(leads[2].1, Stop::SeveralOperations, "{:?}", rows.leads);
+    }
+
+    /// carrick#4245, the pub/sub and queue half (open): a broker name read
+    /// per element is a name read anew, so it states no library row and the
+    /// site path's kind question decides (Q-B3e), as for any name the
+    /// reader reads that today's reading does not.
+    #[test]
+    fn a_broker_name_in_a_loop_over_a_stated_list_waits_on_the_kind_question() {
+        let Some((rows, _)) = read_walked(
+            &[(
+                "src/topics.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 const TOPICS = [\"orders.created\", \"orders.paid\"] as const;\n\
+                 export function wire() {\n\
+                 \x20 for (const t of TOPICS) bus.subscribe(t, () => {});\n\
+                 \x20 for (const t of TOPICS) bus.publish(t, {});\n\
+                 }\n",
+            )],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+        assert_eq!(
+            rows.names.count(NameOutcome::KindAsked),
+            2,
+            "{:?}",
+            rows.names
         );
     }
 }
