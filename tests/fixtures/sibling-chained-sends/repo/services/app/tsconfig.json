@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": [],
+    "lib": ["es2022"],
+    "baseUrl": ".",
+    "paths": {
+      "@fx/kit": ["../../packages/kit/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*"]
+}
