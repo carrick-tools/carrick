@@ -25,3 +25,9 @@ receiver to the maker, it does not match by member name.
 
 Traps: keep each send on its own line (a site is `file:line`); an npm stub
 needs a `package-lock.json` entry or the store never asks for it.
+
+With the declaration ask widened to the sibling's members (T1, carrick#4445),
+line 2 is a possible call (`pubsub producer`, `unanswered`) and an unread site
+`unanswered`, slot `kind`, with the labelled end `Queue.add`. Lines 3 to 8 do
+not move. Line 9 stays with the floor: the app loads no DOM lib, so the bus
+send is not verified from the app's root.
