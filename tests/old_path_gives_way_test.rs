@@ -6,7 +6,9 @@
 //! request at a call, a same-file wrapper's row there stating the same
 //! operation gives way to the fact, unless the call's line also holds a
 //! row of another operation: the fold cannot tell two calls on one line
-//! apart, so that line keeps today's rows.
+//! apart, so that line keeps today's rows. A row keyed as another site
+//! row on the line is that row's call (carrick#4433), so two calls that
+//! each state a site row each replace their own.
 //!
 //! Fixture README: `tests/fixtures/old-path-gives-way/README.md`.
 
@@ -249,23 +251,59 @@ fn a_fact_replaces_the_same_key_old_path_row_at_its_call() {
         ["POST /w/a wrapper_call client=send host=none base=relative"]
     );
     assert_eq!(requests_at("src/same-twice.ts", 3, "/w/a"), ["implicit 1"]);
-    // Kept out by a wrapper row, under the mixed guard: two-same and
-    // two-wrappers (2 each), mixed-plain (1) and mixed.ts (1, whose line
+    // Kept out by a wrapper row, under the mixed guard: mixed-plain (1,
+    // whose second call states no site row) and mixed.ts (1, whose line
     // also holds the summary row of another request). Kept out by the
-    // first call's fact: same-twice's second call.
+    // first call's fact: same-twice's second call. Two calls on one line
+    // that each state a site row keep none out (carrick#4433).
     let line = fold_line();
     assert!(
-        line.contains(r#"kept_out={"request_summary": 1, "same_file_wrapper": 6}"#),
+        line.contains(r#"kept_out={"request_summary": 1, "same_file_wrapper": 2}"#),
         "{line}"
+    );
+}
+
+/// carrick#4433: two calls on one line that each state their own request
+/// each replace the old-path row of their own key.
+#[test]
+fn both_calls_on_one_line_state_their_own_rows() {
+    assert_eq!(
+        calls_at("src/two-same.ts:3"),
+        ["POST /x/a request_summary", "POST /x/b request_summary"]
+    );
+    assert_eq!(
+        graph_at("src/two-same.ts:3"),
+        [
+            "POST /x/a wrapper_call client=send host=none base=relative",
+            "POST /x/b wrapper_call client=send host=none base=relative"
+        ]
+    );
+    assert_eq!(requests_at("src/two-same.ts", 3, "/x/a"), ["implicit 1"]);
+    assert_eq!(requests_at("src/two-same.ts", 3, "/x/b"), ["implicit 2"]);
+}
+
+/// carrick#4433: each fact's graph row reads where its call goes from the
+/// removed row of its own key, never from the other call on the line.
+#[test]
+fn two_wrappers_on_one_line_keep_their_own_client_host_and_base() {
+    assert_eq!(
+        calls_at("src/two-wrappers.ts:4"),
+        [
+            "POST ${process.env.B_BASE}/y/b request_summary",
+            "POST https://a.example.test/y/a request_summary"
+        ]
+    );
+    assert_eq!(
+        graph_at("src/two-wrappers.ts:4"),
+        [
+            "POST ${process.env.B_BASE}/y/b wrapper_call client=sendB host=none base=env",
+            "POST https://a.example.test/y/a wrapper_call client=sendA host=a.example.test base=none"
+        ]
     );
 }
 
 #[test]
 fn a_call_with_a_row_of_another_request_keeps_today() {
-    assert_eq!(
-        calls_at("src/two-same.ts:3"),
-        ["POST /x/a same_file_wrapper", "POST /x/b same_file_wrapper"]
-    );
     assert_eq!(
         calls_at("src/mixed-plain.ts:5"),
         ["POST /q/a same_file_wrapper", "POST /q/b same_file_wrapper"]
@@ -273,20 +311,6 @@ fn a_call_with_a_row_of_another_request_keeps_today() {
     assert_eq!(
         calls_at("src/mixed.ts:4"),
         ["GET /v/b request_summary", "POST /v/a same_file_wrapper"]
-    );
-    assert_eq!(
-        calls_at("src/two-wrappers.ts:4"),
-        [
-            "POST ${process.env.B_BASE}/y/b same_file_wrapper",
-            "POST https://a.example.test/y/a same_file_wrapper"
-        ]
-    );
-    assert_eq!(
-        graph_at("src/two-wrappers.ts:4"),
-        [
-            "POST ${process.env.B_BASE}/y/b network_request client=sendB host=none base=env",
-            "POST https://a.example.test/y/a network_request client=sendA host=a.example.test base=none"
-        ]
     );
 }
 

@@ -271,3 +271,20 @@ fn two_module_level_calls_on_one_line_keep_their_request_lines() {
     keeps("src/net/left.ts:4");
     keeps("src/net/right.ts:4");
 }
+
+/// The two calls on that line each state their own request: the first
+/// call's fact keeps no second fact out (carrick#4433).
+#[test]
+fn two_module_level_calls_on_one_line_each_state_their_row() {
+    let mut at = rows().get("src/load.ts:19").cloned().unwrap_or_default();
+    at.sort();
+    assert_eq!(
+        at,
+        vec![
+            ("POST /v1/left".to_string(), "request_summary".to_string()),
+            ("POST /v1/right".to_string(), "request_summary".to_string()),
+        ],
+        "{:#?}",
+        rows()
+    );
+}
