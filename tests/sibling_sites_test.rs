@@ -991,3 +991,69 @@ fn a_service_reads_a_send_a_sibling_makes_on_a_call_s_value() {
         );
     }
 }
+
+/// carrick#4472 T1: the kit installs `bullmq` and `fixture-fetcher` under its
+/// own `node_modules`, in another version than the root's, and the app's root
+/// resolves neither the kit's copy nor the HTTP client. The app's own ask
+/// leaves the kit's rows unread, so the kit is asked again from its own root
+/// and the answers are merged by declaration: line 2 (`Queue.add` at the kit's
+/// copy) and line 7 (`get`) are read, and the app's own call in `own-queue.ts`
+/// stays read from the root's copy. Line 9 (the DOM lib is the kit's) is not
+/// asserted. The answer key is `tests/fixtures/sibling-own-install/README.md`.
+#[test]
+fn a_sibling_s_members_are_verified_from_its_own_root() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "sibling-own-install", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/relay.ts";
+    let lead_at = |file: &str, line: u64| {
+        app["possible_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|lead| lead["file_path"] == file && lead["line_number"] == line)
+    };
+    let lead =
+        lead_at(relay, 2).unwrap_or_else(|| panic!("no lead at line 2: {}", app["possible_calls"]));
+    assert_eq!(lead["kind"], "pubsub", "{lead}");
+    assert_eq!(lead["role"], "producer", "{lead}");
+    assert_eq!(lead["unread"]["reason"], "unanswered", "{lead}");
+    let site = unread_site_of(app, relay, 2)
+        .unwrap_or_else(|| panic!("no unread site at line 2: {}", app["unread_sites"]));
+    assert_eq!(site["reason"], "unanswered", "{site}");
+    assert_eq!(site["slot"], "kind", "{site}");
+    assert_eq!(site["labelled_end"]["export"], "Queue", "{site}");
+    assert_eq!(site["labelled_end"]["member"], "add", "{site}");
+    assert_ne!(
+        unread_at(app, relay, 7)
+            .as_deref()
+            .map(|s| s.split(' ').next()),
+        Some(Some("missed_inside")),
+        "line 7 stays a floor row: {}",
+        app["unread_sites"]
+    );
+    assert!(
+        app["calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| row["key"]["path"] == "/kit/chained" && row["key"]["method"] == "GET"),
+        "{}",
+        app["calls"]
+    );
+    let own = "services/app/src/own-queue.ts";
+    assert!(
+        lead_at(own, 3).is_some(),
+        "the app's own call stays read: {}",
+        app["possible_calls"]
+    );
+    let site = unread_site_of(app, own, 3)
+        .unwrap_or_else(|| panic!("no unread site at own-queue:3: {}", app["unread_sites"]));
+    assert_eq!(site["reason"], "unanswered", "{site}");
+    assert_eq!(site["slot"], "kind", "{site}");
+}
