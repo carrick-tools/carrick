@@ -11578,8 +11578,8 @@ impl ServiceSidecar {
                     }
                     Err(e) => {
                         warn!(
-                            "Sidecar re-init for service '{}' failed: {} — type extraction may \
-                             be skipped for this service",
+                            "Compiler engine re-init failed for service '{}': {}. Type extraction \
+                             may be skipped for this service",
                             self.label, e
                         );
                         crate::scan_health::record_types_unavailable(&self.label, &e);
@@ -11819,7 +11819,7 @@ fn resolve_types_if_available(
             }
         }
         Err(e) => {
-            warn!("Sidecar not ready: {}", e);
+            warn!("Compiler engine not ready: {}", e);
             debug!("Skipping type resolution");
             let detail = format!(
                 "the compiler engine was not ready to read types because {}",
@@ -15771,12 +15771,12 @@ async fn build_cross_repo_analyzer(
         state
     } else {
         warn!(
-            "Skipping type checking: the type sidecar is unavailable, so v2 \
-             capture/check cannot run. Compat verdicts will be absent, not 'compatible'."
+            "Skipping type checking: the compiler engine is unavailable. \
+             Compatibility verdicts will be absent, not 'compatible'."
         );
         crate::local_mode::JoinTypeCheck::Skipped {
             reason: crate::scan_health::types_unavailable_reason(crate::scan_health::WHOLE_SCAN)
-                .unwrap_or_else(|| "the type sidecar is unavailable".to_string()),
+                .unwrap_or_else(|| "the compiler engine is unavailable".to_string()),
         }
     };
 
