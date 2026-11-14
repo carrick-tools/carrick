@@ -276,3 +276,24 @@ fn a_named_listener_registration_takes_no_edge() {
         "{edges:#?}"
     );
 }
+
+/// carrick#4176 T2: the walk's `handed` entry reads the one record of what a
+/// call hands on (`Calls::handed_on`) and the call graph's edges follow it:
+/// the fixture's whole edge set is what the per-argument scan gave before.
+/// A by-name handoff the record names takes its edge; a registration that
+/// keeps what it is handed takes none.
+#[test]
+fn the_edges_of_the_fixture_follow_the_one_handed_record() {
+    if !sidecar_available() {
+        eprintln!("Skipping: node or the built sidecar is missing");
+        return;
+    }
+    let edges = edges_of(&scan_blob(false));
+    let all: Vec<String> = edges
+        .iter()
+        .map(|(caller, callee, file, line)| format!("{caller}>{callee}@{file}:{line}"))
+        .collect();
+    assert_eq!(all, EXPECTED_EDGES, "{all:#?}");
+}
+
+const EXPECTED_EDGES: [&str; 0] = [];
