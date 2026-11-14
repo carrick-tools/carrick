@@ -1,0 +1,55 @@
+[
+  {
+    "role": "consumer",
+    "type_kind": "request",
+    "protocol": "http",
+    "method": "POST",
+    "path": "/orders",
+    "file": "src/client.ts",
+    "text": "{ sku, qty: 1 }",
+    "start": 247,
+    "end": 262
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "http",
+    "method": "POST",
+    "path": "/orders",
+    "file": "src/client.ts",
+    "text": "fetch('/orders', { method: 'POST', body: JSON.stringify({ sku, qty: 1 }) })",
+    "start": 191,
+    "end": 266
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "http",
+    "method": "GET",
+    "path": "/orders",
+    "file": "src/client.ts",
+    "text": "fetch('/orders')",
+    "start": 367,
+    "end": 383
+  },
+  {
+    "role": "consumer",
+    "type_kind": "request",
+    "protocol": "pubsub",
+    "path": "orders.created",
+    "file": "src/orders.ts",
+    "text": "{ topic: 'orders.created', sku, quantity }",
+    "start": 156,
+    "end": 198
+  },
+  {
+    "role": "consumer",
+    "type_kind": "request",
+    "protocol": "websocket",
+    "path": "chat.in",
+    "file": "src/live.ts",
+    "text": "{ text: \"hi\" }",
+    "start": 115,
+    "end": 129
+  }
+]
