@@ -8988,7 +8988,7 @@ export function listen(): void {
     /// lead with the resolver's own reason.
     #[test]
     fn a_maker_bound_queue_name_in_a_loop_is_read_at_the_maker() {
-        let sends = "import { Queue, Worker } from 'bullmq';\n\
+        let sends = "import { Queue, Worker } from 'bullmq'; import { flip } from './openers';\n\
 const SHIPPING = ['ship-created', 'ship-cancelled'] as const;\n\
 const BILLING = ['bill-opened', 'bill-closed'];\n\
 export async function pushShipping() { for (const q of SHIPPING) await new Queue(q).add('task', { n: 1 }); }\n\
@@ -8999,12 +8999,20 @@ function open(name: string) { return new Queue(name); }\n\
 export async function pushOpened() { for (const q of BILLING) await open(q).add('task', { n: 1 }); }\n\
 declare function listQueues(): string[];\n\
 export async function pushListed() { for (const q of listQueues()) await new Queue(q).add('task', { n: 1 }); }\n\
-export async function pushHeld() { for (const q of SHIPPING) { const held = new Queue(q); await held.add('task', { n: 1 }); } }\n";
+export async function pushHeld() { for (const q of SHIPPING) { const held = new Queue(q); await held.add('task', { n: 1 }); } }\n\
+function openTwice(name: string) { return new Queue(name); }\n\
+export async function pushTwiceShipping() { for (const q of SHIPPING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushTwiceBilling() { for (const q of BILLING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushFlip() { await flip.add('task', { n: 1 }); }\n";
+        let openers = "import { Queue } from 'bullmq';\n\
+const EVEN = 'flip-even';\n\
+const ODD = 'flip-odd';\n\
+export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
         let Some((on, exports, declarations)) = traced_fixture_files(
             "queue-enum-base-class-one",
             ".",
             "jobs",
-            &[("src/sends.ts", sends)],
+            &[("src/sends.ts", sends), ("src/openers.ts", openers)],
             |_| {},
         ) else {
             panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
@@ -9060,7 +9068,26 @@ export async function pushHeld() { for (const q of SHIPPING) { const held = new 
         );
         let listed = record_at(11);
         assert!(listed.names.is_empty(), "{shown:#?}");
-        assert!(listed.unread.is_some(), "{shown:#?}");
+        assert_eq!(
+            listed.unread,
+            Some(super::super::stop::Stop::UnreadExpression),
+            "{shown:#?}"
+        );
+        // One function makes the queue for two lists: its parameter's
+        // values are decided at two calls, so neither send states the
+        // other list's names.
+        for (line, other) in [(14, "bill-"), (15, "ship-")] {
+            assert!(
+                !record_at(line)
+                    .names
+                    .iter()
+                    .any(|name| name.starts_with(other)),
+                "{line}: {shown:#?}"
+            );
+        }
+        // A maker in another file: its argument is read in that file, one
+        // row per branch of the choice it writes.
+        assert_eq!(record_at(16).names, ["flip-even", "flip-odd"], "{shown:#?}");
         // The job name is never the queue's name.
         for record in &records {
             assert!(

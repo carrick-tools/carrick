@@ -69,6 +69,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         name: Vec::new(),
         key: None,
         name_args: BTreeSet::new(),
+        name_at: None,
         via: Vec::new(),
         payload: Some(PayloadBinding::Arg { arg: 1, key: None }),
         payload_slot: None,
