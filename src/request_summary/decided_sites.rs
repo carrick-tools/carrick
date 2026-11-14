@@ -2323,15 +2323,7 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
             // No spread or rest carries the caller's options: the literal is
             // all the callee receives. Closed and without the key, it states
             // the key absent here (carrick#4294).
-            _ => {
-                return matches!(object.key(field), KeyState::Absent).then_some(
-                    Walked::Unwritten {
-                        at: k,
-                        arg,
-                        through,
-                    },
-                );
-            }
+            _ => return None,
         };
         through.push((k, arg));
     }
