@@ -791,6 +791,7 @@ fn caller_row(
         body_literals: Default::default(),
         library_semantics: Vec::new(),
         at_caller: true,
+        holds_transport: false,
         call_body,
         static_asset: None,
         request_line: None,

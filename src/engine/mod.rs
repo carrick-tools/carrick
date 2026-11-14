@@ -17373,7 +17373,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             Path::new(""),
         );
         let modules = service_module_index(&repo, &Config::default());
-        let (_, _, _, body_asks) = orchestrator.collect_type_requests_and_body_asks(
+        let (_, _, _, body_asks, _) = orchestrator.collect_type_requests_and_body_asks(
             &file_results,
             &repo,
             &mount_graph,
