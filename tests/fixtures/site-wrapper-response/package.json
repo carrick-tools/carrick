@@ -1,0 +1,9 @@
+{
+  "name": "site-wrapper-response-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@fixture/http": "^1.0.0",
+    "@fixture/reply": "^1.0.0"
+  }
+}

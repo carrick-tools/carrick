@@ -528,23 +528,13 @@ fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
     ] {
         assert_eq!(response(file, line), wanted, "response at {file}:{line}");
     }
-    // The maker's own type parameter is open at the labelled call: a decided
-    // abstain, not the closure.
-    let typed = entry_at(&on, "response", "src/typed-maker.ts", 6);
+    // The maker's own type parameter is open at the labelled call; the maker
+    // call binds it (carrick#4375, carrick#4371 T5).
     assert_eq!(
-        captured_flat(&on, typed["type_alias"].as_str().unwrap()),
-        "unknown",
-        "{typed:#?}"
+        response("src/typed-maker.ts", 6),
+        "{ count: number; }",
+        "response at src/typed-maker.ts:6"
     );
-    let reasons: Vec<&str> = typed["any_provenance"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| row["reason"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_eq!(reasons, vec!["bound_by_callers"], "{typed:#?}");
     // The request slot does not move.
     let order = captured_flat(&on, &alias_at(&on, "request", "src/poster.ts", 7));
     assert_eq!(order, "{ sku: string; qty: number; }");
@@ -567,4 +557,51 @@ fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
     ] {
         assert_eq!(response(file, line), wanted, "response at {file}:{line}");
     }
+}
+
+/// carrick#4371 T1 and T5: `tests/fixtures/site-wrapper-response/`. A
+/// wrapper site's response is read at the deciding call only where the
+/// wrapper hands back the labelled call's body down a chain of returns, as
+/// the store's result label reads the body. Anywhere else (a field, a flag,
+/// an envelope, a caught value, nothing) it is read at the labelled call,
+/// and the deciding call binds the wrapper's open type parameter there
+/// (carrick#4375). A member read off a call the store labels no result for
+/// stays at the deciding call. The answer key is the fixture's README.
+#[test]
+fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-wrapper-response");
+    let on = scan(&repo, &[]);
+    let mut wrong = Vec::new();
+    for (name, wanted) in [
+        ("own-member", "{ ok: boolean; id: string; }"),
+        ("own-literal", "{ id: string; }"),
+        ("own-nothing", "{ purged: number; }"),
+        ("own-envelope", "{ ref: string; }"),
+        ("own-two-hop", "{ v: number; }"),
+        ("own-based", "{ hits: number; }"),
+        ("own-generic", "{ alive: boolean; }"),
+        ("reply-status", "{ name: string; }"),
+        ("reply-whole", "{ city: string; }"),
+        ("reply-generic-whole", "{ size: number; }"),
+        ("caught", "{ c: number; }"),
+        ("own-member-unlabelled", "boolean"),
+        ("keep-whole", "{ total: number; }"),
+        ("keep-awaited", "{ rows: number; }"),
+        ("keep-two-hop", "{ depth: number; }"),
+        ("keep-generic", "{ lines: number; }"),
+        ("reply-data", "{ name: string; }"),
+        ("reply-generic-data", "{ price: number; }"),
+        ("destructured", "{ zip: string; }"),
+        ("keep-retried", "{ n: number; }"),
+        ("then-data", "{ size: number; }"),
+        ("keep-local-run", "{ done: boolean; }"),
+    ] {
+        let file = format!("src/{name}.ts");
+        let got = captured_flat(&on, &alias_at(&on, "response", &file, 2));
+        if got != wanted {
+            wrong.push(format!("{file}:2 wanted `{wanted}`, got `{got}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
