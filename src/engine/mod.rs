@@ -8663,8 +8663,7 @@ fn withdraw_model_routes_at_their_handlers(
                         })
                 })
                 .count();
-            // RED (failing-first commit): the rule withdraws nothing yet.
-            registering == usize::MAX
+            registering == 1
         })
         .map(|(index, ..)| index)
         .collect();
