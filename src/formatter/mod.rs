@@ -238,10 +238,10 @@ fn still_used_groups<'a>(removals: &[&'a Finding]) -> Vec<StillUsed<'a>> {
                 groups.last_mut().expect("just pushed")
             }
         };
-        if let Some(name) = surviving {
-            if !group.surviving.contains(&name) {
-                group.surviving.push(name);
-            }
+        if let Some(name) = surviving
+            && !group.surviving.contains(&name)
+        {
+            group.surviving.push(name);
         }
     }
     groups
