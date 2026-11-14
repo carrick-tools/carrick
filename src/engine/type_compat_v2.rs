@@ -1128,12 +1128,13 @@ fn capture_in_a_fresh_process(
     };
     let mut died_before: Option<CaptureDeath> = None;
     loop {
-        sidecar
-            .restart(match died_before {
-                None => "a capture runs in a process of its own",
-                Some(_) => "the sidecar died during a capture, which is retried once",
-            })
-            .map_err(not_started)?;
+        // The first process is the one started ahead for it, when there is
+        // one; the retry after a death starts a fresh one, as it always did.
+        match died_before {
+            None => sidecar.restart_for_capture("a capture runs in a process of its own"),
+            Some(_) => sidecar.restart("the sidecar died during a capture, which is retried once"),
+        }
+        .map_err(not_started)?;
 
         let out_dir = std::env::temp_dir().join(format!(
             "carrick-capture-{}-{}",
@@ -8918,6 +8919,205 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             sidecar.is_ready(),
             "a live sidecar is left for the rest of the scan"
         );
+    }
+
+    /// A stand-in sidecar that logs every request it reads, with its own pid
+    /// and flags, and answers a capture with an error naming its pid.
+    #[cfg(unix)]
+    fn logging_stand_in(root: &Path) -> (PathBuf, PathBuf) {
+        let script = root.join("stand-in-sidecar.cjs");
+        let log = root.join("requests.log");
+        std::fs::write(
+            &script,
+            format!(
+                r#"
+const fs = require('fs');
+const write = (frame) => fs.writeSync(1, JSON.stringify(frame) + '\n');
+require('readline').createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  fs.appendFileSync({log:?}, JSON.stringify({{ pid: process.pid, flags: process.execArgv, request }}) + '\n');
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({{ request_id, status: 'ready' }});
+  write({{ request_id, status: 'error', errors: ['answered by ' + process.pid] }});
+}});
+"#
+            ),
+        )
+        .unwrap();
+        (script, log)
+    }
+
+    #[cfg(unix)]
+    fn logged(log: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn logged_inits(log: &Path) -> Vec<serde_json::Value> {
+        logged(log)
+            .into_iter()
+            .filter(|l| l["request"]["action"] == "init")
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_inits(log: &Path, n: usize) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while logged_inits(log).len() < n {
+            assert!(std::time::Instant::now() < until, "no init number {n}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn one_anchor() -> [CaptureAnchor; 1] {
+        [CaptureAnchor::Literal {
+            alias: "Only".to_string(),
+            type_text: "string".to_string(),
+            anchor_origin: AnchorOrigin::DeterministicInfer,
+            source_file: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+            absent_body_tolerated: false,
+        }]
+    }
+
+    #[cfg(unix)]
+    fn process_is_gone(pid: u64) -> bool {
+        !std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// The process started ahead takes the capture's place: its `init` is in
+    /// the log before the capture starts, it carries the same scope, scan
+    /// root and heap flags as the process it replaces, the capture is asked
+    /// of it, and no third process is started.
+    #[cfg(unix)]
+    #[test]
+    fn a_capture_is_asked_of_the_process_started_ahead_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (script, log) = logging_stand_in(&root);
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.set_scan_root(&root);
+        sidecar.start_init(&root, Some("tsconfig.json"));
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+
+        sidecar.start_spare();
+        wait_for_inits(&log, 2);
+        let inits = logged_inits(&log);
+        assert_ne!(inits[0]["pid"], inits[1]["pid"], "a process of its own");
+        assert_eq!(inits[0]["flags"], inits[1]["flags"], "the same heap flag");
+        let scope = |init: &serde_json::Value| {
+            let mut request = init["request"].clone();
+            request.as_object_mut().unwrap().remove("request_id");
+            request
+        };
+        assert_eq!(scope(&inits[0]), scope(&inits[1]), "the same scope");
+        // Absent on the wire when false.
+        assert_ne!(scope(&inits[1])["workspace_source"], true);
+        assert!(scope(&inits[1])["scan_root"].is_string());
+
+        let failure = capture_in_a_fresh_process(
+            &sidecar,
+            &root,
+            "fixture",
+            &one_anchor(),
+            &HashMap::new(),
+            Some("tsconfig.json"),
+            false,
+        )
+        .expect_err("the stand-in answers a capture with an error");
+        let CaptureFailure::Failed(detail) = failure else {
+            panic!("expected a failed capture, got {failure:?}");
+        };
+        assert!(
+            detail.contains(&format!("answered by {}", inits[1]["pid"])),
+            "the spare answered: {detail}"
+        );
+        assert_eq!(logged_inits(&log).len(), 2, "no process was started for it");
+        assert!(sidecar.is_ready());
+    }
+
+    /// A spare that exited before the capture is not waited for: the capture
+    /// starts a process as it always did and succeeds in asking it.
+    #[cfg(unix)]
+    #[test]
+    fn a_capture_whose_spare_died_starts_a_fresh_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (script, log) = logging_stand_in(&root);
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        sidecar.start_spare();
+        wait_for_inits(&log, 2);
+        let spare_pid = logged_inits(&log)[1]["pid"].as_u64().unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", &spare_pid.to_string()])
+            .status()
+            .unwrap();
+        // A killed child stays a zombie until the sidecar reaps it, so its
+        // pid cannot be polled: SIGKILL is delivered at once.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let failure = capture_in_a_fresh_process(
+            &sidecar,
+            &root,
+            "fixture",
+            &one_anchor(),
+            &HashMap::new(),
+            None,
+            false,
+        )
+        .expect_err("the stand-in answers a capture with an error");
+        let CaptureFailure::Failed(detail) = failure else {
+            panic!("expected a failed capture, got {failure:?}");
+        };
+        assert!(
+            !detail.contains(&spare_pid.to_string()),
+            "not the dead spare: {detail}"
+        );
+        assert_eq!(logged_inits(&log).len(), 3, "a fresh process was started");
+    }
+
+    /// A spare nobody used is killed and reaped with its sidecar.
+    #[cfg(unix)]
+    #[test]
+    fn a_spare_that_is_not_used_ends_with_its_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (script, log) = logging_stand_in(&root);
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        sidecar.start_init(&root, None);
+        sidecar
+            .wait_ready(std::time::Duration::from_secs(20))
+            .expect("the stand-in answers init");
+        sidecar.start_spare();
+        wait_for_inits(&log, 2);
+        let pids: Vec<u64> = logged_inits(&log)
+            .iter()
+            .map(|i| i["pid"].as_u64().unwrap())
+            .collect();
+        drop(sidecar);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pids.iter().all(|p| process_is_gone(*p)) {
+            assert!(std::time::Instant::now() < until, "left running: {pids:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Acceptance is fail-closed: adopt only a clean backfill self-check with
