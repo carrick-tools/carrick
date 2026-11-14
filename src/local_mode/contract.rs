@@ -636,9 +636,10 @@ pub struct Recheck {
     /// every other answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub known_miss: bool,
-    /// True on a `none` from `check --recheck --no-rescan` for an edit that
-    /// needs a re-scan: the call was asked not to start one, so the rows are
-    /// the indexed ones and a later `check --recheck` gives the answer. Absent
+    /// True on a `none` from `check --recheck --no-rescan` for an edit the
+    /// probe did not answer without a re-scan or a walk of every service's
+    /// imports: the call was asked to do neither, so the rows are the indexed
+    /// ones and a later `check --recheck` gives the answer. Absent
     /// on every other answer, including a re-check that did run and missed
     /// its budget (`known_miss`, `reason`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

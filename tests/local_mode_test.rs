@@ -5437,9 +5437,10 @@ fn add_a_case(file: &Path) {
 }
 
 /// An edit to a test file that still loads what it loaded is read by no
-/// service (the carry rule `--changed-only` uses), so the probe answers from
-/// the index and starts nothing. An edit that adds an import is read, so it
-/// is deferred, as every other edit that needs a re-scan is.
+/// service (the carry rule `--changed-only` uses), so the full re-check
+/// answers it from the index and starts nothing; the probe defers it, as it
+/// defers every edit that does not read the same. An edit that adds an import
+/// is read, so it is deferred on the probe too.
 #[test]
 #[serial]
 fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
@@ -5466,9 +5467,10 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
     };
     let before = recheck_temp_dirs(temp.path());
 
-    // (1) a case added to the test, imports kept: answered at once.
+    // (1) a case added to the test, imports kept: the full re-check answers
+    // from the index.
     add_a_case(&root.join(SHOP_TEST));
-    let kept = probe(SHOP_TEST);
+    let kept = recheck_json(root, SHOP_TEST, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         kept["recheck"]["ran"],
         serde_json::json!("none"),
@@ -5483,9 +5485,9 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
     );
     assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
 
-    // (3) the same edit to a file under `__mocks__`: answered at once.
+    // (3) the same edit to a file under `__mocks__`: the same answer.
     add_a_case(&root.join(SHOP_MOCK));
-    let mock = probe(SHOP_MOCK);
+    let mock = recheck_json(root, SHOP_MOCK, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         mock["recheck"]["ran"],
         serde_json::json!("none"),
@@ -5509,10 +5511,10 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
 }
 
 /// A new test file that declares nothing program-wide and gives no source its
-/// first importer is read by no service, so the probe answers from the index
-/// and starts nothing. One that would make a source file test-only (it is that
-/// file's first importer), declares a global, or is a script is read, so it is
-/// deferred.
+/// first importer is read by no service, so the full re-check answers from the
+/// index and starts nothing. One that would make a source file test-only (it
+/// is that file's first importer), declares a global, or is a script is read,
+/// so the probe defers it.
 #[test]
 #[serial]
 fn a_new_test_file_starts_no_re_scan() {
@@ -5549,7 +5551,7 @@ fn a_new_test_file_starts_no_re_scan() {
         "second.test.ts",
         "import { CatalogClient } from \"../client.js\";\n\nexport const again = new CatalogClient(\"http://catalog.test\");\n",
     );
-    let kept = probe(&kept);
+    let kept = recheck_json(root, &kept, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         kept["recheck"]["ran"],
         serde_json::json!("none"),
@@ -5590,6 +5592,111 @@ fn a_new_test_file_starts_no_re_scan() {
         script["recheck"]["deferred"],
         serde_json::json!(true),
         "{script:#}"
+    );
+}
+
+/// The probe never walks every service's imports (carrick#4034): on a large
+/// workspace that walk alone outlasted the hook's limit. An edit no service
+/// reads comes back `deferred` like any other edit that does not read the
+/// same, and the full re-check is where "no service reads it" is answered.
+/// The walk states a `recheck-timing no-service-reads` line when it runs, so
+/// this counts the work, not the time.
+#[test]
+#[serial]
+fn the_probe_walks_no_service_imports() {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    const WALK: &str = "recheck-timing no-service-reads";
+    // The answer and the stderr of one `check`, with the timing lines on.
+    let asked = |args: &[&str]| -> (serde_json::Value, String) {
+        let mut command = Command::new(carrick());
+        command
+            .args(args)
+            .current_dir(root)
+            .env_remove("CARRICK_TOKEN")
+            .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+            .env(AMPLE[0].0, AMPLE[0].1)
+            .env("TMPDIR", tmpdir)
+            .env("CARRICK_RECHECK_TIMING", "1");
+        as_signed_in(&mut command, args);
+        let output = command.output().expect("run check");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "carrick {args:?} exited {:?}:\n{stderr}",
+            output.status.code()
+        );
+        let answer =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}"));
+        (answer, stderr)
+    };
+    let probe = |file: &str| {
+        asked(&[
+            "check",
+            file,
+            "--workspace",
+            ".",
+            "--recheck",
+            "--no-rescan",
+            "--json",
+        ])
+    };
+    let full = |file: &str| asked(&["check", file, "--workspace", ".", "--recheck", "--json"]);
+
+    // (1) A test edit that keeps its imports: no service reads it, and the
+    // probe does not walk to learn that.
+    add_a_case(&root.join(SHOP_TEST));
+    let (kept, said) = probe(SHOP_TEST);
+    assert_eq!(
+        kept["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{kept:#}"
+    );
+    assert!(
+        !said.contains(WALK),
+        "the probe walked every service's imports:\n{said}"
+    );
+    // The full re-check asks, and answers from the index without a re-scan.
+    let (answered, said) = full(SHOP_TEST);
+    assert!(
+        said.contains(WALK),
+        "the full re-check asks who reads the edit:\n{said}"
+    );
+    assert_eq!(
+        answered["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answered:#}"
+    );
+    assert!(
+        answered["recheck"].get("deferred").is_none(),
+        "{answered:#}"
+    );
+    assert!(
+        answered["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no service reads the file")),
+        "{answered:#}"
+    );
+
+    // (2) A source edit that needs a re-scan: deferred, and still no walk.
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let (deferred, said) = probe(SHOP_CLIENT);
+    assert_eq!(
+        deferred["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{deferred:#}"
+    );
+    assert!(
+        !said.contains(WALK),
+        "the probe walked every service's imports:\n{said}"
     );
 }
 

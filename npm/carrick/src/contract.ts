@@ -240,9 +240,10 @@ export type Recheck = {
    */
   known_miss?: boolean;
   /**
-   * True on a `none` from `check --recheck --no-rescan` for an edit that
-   * needs a re-scan: the call was asked not to start one, so the rows are the
-   * indexed ones. Absent otherwise.
+   * True on a `none` from `check --recheck --no-rescan` for an edit the
+   * probe did not answer without a re-scan or a walk of every service's
+   * imports: the call was asked to do neither, so the rows are the indexed
+   * ones. Absent otherwise.
    */
   deferred?: boolean;
   /**

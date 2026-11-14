@@ -1,8 +1,10 @@
 // The post-edit hook's one question to the binary: the probe.
 //
-// `check <file> --recheck --no-rescan --json` answers at once when no re-scan
-// is needed (the file reads the same as the index, no service reads it, a
+// `check <file> --recheck --no-rescan --json` answers at once what the index,
+// git and the one file can tell (the file reads the same as the index, a
 // known miss at the background budget) and otherwise says `recheck.deferred`.
+// It walks no service's imports, so "no service reads it" is the full
+// re-check's answer, not the probe's.
 // This file is the only place that knows that shape, so the binary's half
 // (B3-R) can change its spelling in one place. A call that gives no answer,
 // including a binary too old to know the flag, reads as deferred: the edit is
