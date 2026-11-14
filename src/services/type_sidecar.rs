@@ -323,6 +323,7 @@ impl InferRequestItem {
             machinery: false,
             anchor_machinery: false,
             body_member: None,
+            read_spans: Vec::new(),
         })
     }
 }
@@ -2121,6 +2122,15 @@ pub struct ReachAnswer {
 // Response Types (matching TypeScript types)
 // ============================================================================
 
+/// One node an answer read (carrick#4244), in the compiler's positions:
+/// UTF-16 code units from the start of `file_path` (absolute), `[start, end)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadSpan {
+    pub file_path: String,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// Source location information for a type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceLocation {
@@ -2164,6 +2174,13 @@ pub struct InferredType {
     pub is_explicit: bool,
     /// Source location information
     pub source_location: SourceLocation,
+    /// carrick#4244: the nodes the published `type_string` was built from
+    /// (each success send or returned value a response joined, the
+    /// annotation or schema a declared contract came from, the one body read
+    /// a request was taken from). Empty on a decided abstain and on bare
+    /// `any`/`unknown` text. Carried only; the scanner stores none yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_spans: Vec<ReadSpan>,
     /// The kind of inference that was performed
     pub infer_kind: InferKind,
     /// Deterministic source symbol of the resolved type (`Payment`), from the
@@ -5944,6 +5961,53 @@ mod tests {
         );
     }
 
+    /// carrick#4244: the engine's `read_spans` reach the scanner as written,
+    /// and an answer without them reads and writes no key.
+    /// `infer-read-spans.test.ts` pins the same key on the engine's answer.
+    #[test]
+    fn inferred_type_carries_the_read_spans_the_engine_sent() {
+        let mut wire = serde_json::json!({
+            "alias": "Items",
+            "type_string": "{ made: string; } | { none: boolean; }",
+            "is_explicit": false,
+            "source_location": { "file_path": "/repo/src/routes.ts", "start_line": 4, "end_line": 9 },
+            "infer_kind": "response_body",
+        });
+        let bare: InferredType = serde_json::from_value(wire.clone()).unwrap();
+        assert!(bare.read_spans.is_empty());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("read_spans")
+                .is_none()
+        );
+
+        wire["read_spans"] = serde_json::json!([
+            { "file_path": "/repo/src/routes.ts", "start": 120, "end": 147 },
+            { "file_path": "/repo/src/handlers.ts", "start": 30, "end": 44 },
+        ]);
+        let read: InferredType = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            read.read_spans,
+            vec![
+                ReadSpan {
+                    file_path: "/repo/src/routes.ts".to_string(),
+                    start: 120,
+                    end: 147
+                },
+                ReadSpan {
+                    file_path: "/repo/src/handlers.ts".to_string(),
+                    start: 30,
+                    end: 44
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&read).unwrap()["read_spans"][1]["start"],
+            serde_json::json!(30)
+        );
+    }
+
     /// carrick#2100: the key the sidecar sets when the unwidened reading ran
     /// out of time. `infer-unwidened-response.test.ts` pins the same key on
     /// the sidecar's wire answer; a rename on either side fails one of them.
@@ -7961,6 +8025,7 @@ mod tests {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         }
     }
 

@@ -268,6 +268,7 @@ mod tests {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
             body_member: None,
         }
     }

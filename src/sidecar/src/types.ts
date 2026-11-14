@@ -1724,6 +1724,16 @@ export interface InferredType {
   is_explicit: boolean;
   /** Source location information */
   source_location: SourceLocation;
+  /**
+   * carrick#4244: the nodes the published `type_string` was built from, in
+   * source order of the reader that built it: each success send or returned
+   * expression a response joined, the annotation or schema a declared
+   * contract came from, or the one body read a request was taken from.
+   * `source_location` still names the one node the answer is located at (on
+   * a producer, usually the handler). Absent on a decided abstain and on an
+   * answer whose text is bare `any` or `unknown`: there is no value to place.
+   */
+  read_spans?: ReadSpan[];
   /** The kind of inference that was performed */
   infer_kind: InferKind;
   /** The unwrapped/extracted payload type (if different from type_string) */
@@ -1940,6 +1950,19 @@ export type TypeProvenanceReason = import('./capture/api.js').TypeProvenanceReas
 /**
  * Source location information for a type
  */
+/**
+ * One node an answer read (carrick#4244), in the compiler's positions:
+ * `start`/`end` are `node.getStart()`/`getEnd()`, UTF-16 code units from the
+ * start of the file, end exclusive. `file_path` is absolute, as
+ * `source_location.file_path` is: an imported handler's values sit in
+ * another file than the ask.
+ */
+export interface ReadSpan {
+  file_path: string;
+  start: number;
+  end: number;
+}
+
 export interface SourceLocation {
   /** File path relative to repo root */
   file_path: string;

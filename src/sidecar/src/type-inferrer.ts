@@ -52,6 +52,7 @@ import type {
   InferKind,
   ModelSymbol,
   ModelSymbolRelation,
+  ReadSpan,
   SourceLocation,
   StatedBody,
   ExtractionConfig,
@@ -428,6 +429,12 @@ const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
 interface DeclaredContract {
   text: string;
   provenance?: TypeProvenance[];
+  /**
+   * carrick#4244: the nodes `text` was read from (a schema value, an
+   * annotation, a typed read, each keyed parameter), stamped on the answer
+   * as `read_spans`.
+   */
+  reads?: Node[];
   /**
    * carrick#2674: the route states it takes no request body, and why. The
    * contract is then the decided `no_request_body` abstain, not `text`.
@@ -1118,6 +1125,20 @@ export class TypeInferrer {
     replaceFileText(pick.file, original.slice(0, pick.start) + pick.text + original.slice(pick.end));
     try {
       const result = this.inferRecordingNames(mapped, extractionConfig);
+      // carrick#4244: the spans were read in the rewritten file. Past the
+      // list they move back by `delta`; inside the list they name text the
+      // file as written does not hold, so they are dropped.
+      if (result?.read_spans) {
+        const file = pick.file.getFilePath();
+        const listEnd = pick.start + pick.text.length;
+        const kept = result.read_spans.flatMap((span) => {
+          if (span.file_path !== file || span.end <= pick.start) return [span];
+          if (span.start >= listEnd) return [{ ...span, start: span.start - delta, end: span.end - delta }];
+          return [];
+        });
+        if (kept.length > 0) result.read_spans = kept;
+        else delete result.read_spans;
+      }
       this.log(
         `Typed ${request.file_path}:${request.line_number} (${request.infer_kind}) for loop element ` +
           `${pick.index + 1} of ${pick.of}: ${request.route_path}`
@@ -1869,7 +1890,11 @@ export class TypeInferrer {
         unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
       ]);
     }
-    return inferred;
+    // carrick#4244: the annotation is what an annotated function's text was
+    // read from; otherwise its returned expressions. A generator's contract
+    // is what it yields, which no return statement holds: no reads.
+    const generator = 'isGenerator' in func && typeof func.isGenerator === 'function' && func.isGenerator();
+    return this.withReads(inferred, returnTypeNode ? [returnTypeNode] : generator ? [] : returned);
   }
 
   /**
@@ -2378,7 +2403,7 @@ export class TypeInferrer {
     if (byArguments && !byArguments.type && byArguments.tested.length > 0) {
       this.addArgumentReads(inferred, byArguments.tested);
     }
-    return inferred;
+    return this.withReads(inferred, [payloadNode]);
   }
 
   /**
@@ -2713,7 +2738,7 @@ export class TypeInferrer {
     );
     if (recovered.responseModes) inferred.response_modes = recovered.responseModes;
     this.relateModelSymbol(request, inferred, recovered.readTypes);
-    return inferred;
+    return this.withReads(inferred, recovered.nodes);
   }
 
   /**
@@ -4307,11 +4332,7 @@ export class TypeInferrer {
       // is kept only where a registration already had it.
       const typedRead = atLine ? this.inferRequestReadFromHandler(atLine.handler) : null;
       return typedRead
-        ? this.declaredRequestInferredType(
-            request,
-            { text: typedRead },
-            this.getNodeLocation(handler)
-          )
+        ? this.declaredRequestInferredType(request, typedRead, this.getNodeLocation(handler))
         : null;
     }
 
@@ -4505,7 +4526,7 @@ export class TypeInferrer {
         `Request locator at ${request.file_path}:${request.line_number} names ${inCall.from}; ` +
           "reading the body off the config variable's type"
       );
-      return this.createInferredType(
+      return this.withReads(this.createInferredType(
         request,
         this.expandResolvedTypeStructural(inCall.type, typeText(inCall.type, inCall.at)),
         false,
@@ -4515,7 +4536,7 @@ export class TypeInferrer {
         undefined,
         undefined,
         inCall.type
-      );
+      ), [inCall.at]);
     } else if (inCall.kind === 'abstain') {
       this.log(
         `Request locator at ${request.file_path}:${request.line_number}: ${inCall.why}; leaving unresolved`
@@ -4583,7 +4604,8 @@ export class TypeInferrer {
         return this.declaredRequestInferredType(
           request,
           validatedRead,
-          this.getNodeLocation(node)
+          this.getNodeLocation(node),
+          [node]
         );
       }
 
@@ -4682,7 +4704,8 @@ export class TypeInferrer {
         return this.declaredRequestInferredType(
           request,
           parsedWith,
-          this.getNodeLocation(node)
+          this.getNodeLocation(node),
+          [node]
         );
       }
     }
@@ -4707,7 +4730,7 @@ export class TypeInferrer {
 
     typeString = this.unwrapPromise(typeString, payloadType);
 
-    return this.unwidenedAtCaller(node, atCaller, this.createInferredType(
+    return this.unwidenedAtCaller(node, atCaller, this.withReads(this.createInferredType(
       request,
       typeString,
       isExplicit,
@@ -4721,7 +4744,7 @@ export class TypeInferrer {
         : unwrapResult.wasUnwrapped
           ? unwrapResult.payloadType
           : this.unwrapPromiseType(payloadType)
-    ));
+    ), [node]));
   }
 
   // ===========================================================================
@@ -9434,13 +9457,13 @@ export class TypeInferrer {
       : undefined;
   }
 
-  private inferRequestReadFromHandler(func: FunctionLike): string | null {
+  private inferRequestReadFromHandler(func: FunctionLike): DeclaredContract | null {
     const body = func.getBody();
     if (!body) {
       return null;
     }
 
-    let found: string | null = null;
+    let found: DeclaredContract | null = null;
     body.forEachDescendant((descendant, traversal) => {
       if (found !== null) {
         traversal.stop();
@@ -9453,7 +9476,7 @@ export class TypeInferrer {
         if (typeArgs.length > 0) {
           const resolved = this.structuralTextFromTypeNode(typeArgs[0]);
           if (resolved) {
-            found = resolved;
+            found = { text: resolved, reads: [descendant] };
             traversal.stop();
             return;
           }
@@ -9474,7 +9497,7 @@ export class TypeInferrer {
             ? this.structuralTextFromTypeNode(typeNode)
             : null;
         if (resolved) {
-          found = resolved;
+          found = { text: resolved, reads: [member ?? descendant] };
           traversal.stop();
           return;
         }
@@ -9622,7 +9645,10 @@ export class TypeInferrer {
         `Request at ${request.file_path}:${request.line_number} is the body its handler ` +
           'reads off the platform request, as the source types that read'
       );
-      return this.createInferredType(request, statedText, true, this.getNodeLocation(read));
+      return this.withReads(
+        this.createInferredType(request, statedText, true, this.getNodeLocation(read)),
+        [read]
+      );
     }
 
     const func = this.findContainingFunctionForNode(read);
@@ -9634,7 +9660,7 @@ export class TypeInferrer {
         `Request at ${request.file_path}:${request.line_number} is the body its handler ` +
           `reads off the platform request and states a type for (${validated.how}); publishing that type`
       );
-      return this.declaredRequestInferredType(request, validated, this.getNodeLocation(read));
+      return this.declaredRequestInferredType(request, validated, this.getNodeLocation(read), [read]);
     }
     return null;
   }
@@ -9749,13 +9775,16 @@ export class TypeInferrer {
       `Route registration at ${request.file_path}:${request.line_number} declares its ` +
         'response schema; using the declared contract'
     );
-    return this.createInferredType(
-      request,
-      declared.text,
-      true,
-      this.getNodeLocation(registration),
-      undefined,
-      undefined
+    return this.withReads(
+      this.createInferredType(
+        request,
+        declared.text,
+        true,
+        this.getNodeLocation(registration),
+        undefined,
+        undefined
+      ),
+      declared.reads ?? []
     );
   }
 
@@ -9774,8 +9803,7 @@ export class TypeInferrer {
     if (declared) {
       return declared;
     }
-    const read = this.inferRequestReadFromHandler(handler);
-    return read ? { text: read } : null;
+    return this.inferRequestReadFromHandler(handler);
   }
 
   /**
@@ -9804,6 +9832,7 @@ export class TypeInferrer {
     const siblings = (func as FunctionLike).getParameters();
 
     const members: string[] = [];
+    const keyedParams: Node[] = [];
     const seen = new Set<string>();
     let wholeBody: ParameterDeclaration | undefined;
     for (const sibling of siblings) {
@@ -9816,6 +9845,7 @@ export class TypeInferrer {
       }
       if (seen.has(keyed.key)) continue;
       seen.add(keyed.key);
+      keyedParams.push(sibling);
       const optional = sibling.hasQuestionToken() || sibling.hasInitializer();
       let type = sibling.getType();
       if (optional) type = type.getNonNullableType();
@@ -9827,11 +9857,11 @@ export class TypeInferrer {
     }
     if (members.length === 0) return null;
     const keyedText = `{ ${members.join(' ')} }`;
-    if (!wholeBody) return { text: keyedText };
+    if (!wholeBody) return { text: keyedText, reads: keyedParams };
     const wholeType = wholeBody.getType();
     const wholeText = this.expandResolvedTypeStructural(wholeType, typeText(wholeType, wholeBody));
     const operand = /^\{[\s\S]*\}$/.test(wholeText) ? wholeText : `(${wholeText})`;
-    return { text: `${operand} & ${keyedText}` };
+    return { text: `${operand} & ${keyedText}`, reads: [wholeBody, ...keyedParams] };
   }
 
   /**
@@ -10621,7 +10651,8 @@ export class TypeInferrer {
   private declaredRequestInferredType(
     request: InferRequestItem,
     contract: DeclaredContract,
-    location: SourceLocation
+    location: SourceLocation,
+    reads: Node[] = contract.reads ?? []
   ): InferredType {
     if (contract.noRequestBody !== undefined) {
       this.log(
@@ -10645,7 +10676,7 @@ export class TypeInferrer {
     if (contract.provenance && contract.provenance.length > 0) {
       inferred.any_provenance = contract.provenance;
     }
-    return inferred;
+    return this.withReads(inferred, reads);
   }
 
   /**
@@ -10670,12 +10701,12 @@ export class TypeInferrer {
     if (stated?.kind === 'body') {
       const text = this.structuralTextFromType(stated.type, stated.at);
       if (text) {
-        return { text };
+        return { text, reads: [stated.at] };
       }
     }
     const annotated = this.requestBodyFromHandlerParams(handler);
     if (annotated) {
-      return { text: annotated };
+      return annotated;
     }
     const schema =
       this.routeSchemaContract(registration, 'body') ??
@@ -10763,7 +10794,10 @@ export class TypeInferrer {
     const printed = texts.length === 1 ? texts[0] : texts.map((text) => `(${text})`).join(' | ');
     if (today && today.type_string === printed) return today;
     this.log(`Route at ${request.file_path}:${request.line_number}: ${why}`);
-    return this.createInferredType(request, printed, true, this.getNodeLocation(handler));
+    return this.withReads(
+      this.createInferredType(request, printed, true, this.getNodeLocation(handler)),
+      [stated.at]
+    );
   }
 
   /** Nothing read: `void`, or an `unknown` with no decided reason at its root. */
@@ -10795,7 +10829,7 @@ export class TypeInferrer {
    * ahead of the body read inside it. A `body` a library declares with one
    * fixed type says nothing about this route and is skipped.
    */
-  private requestBodyFromHandlerParams(func: FunctionLike): string | null {
+  private requestBodyFromHandlerParams(func: FunctionLike): DeclaredContract | null {
     for (const param of func.getParameters()) {
       let paramType: Type;
       try {
@@ -10815,7 +10849,7 @@ export class TypeInferrer {
       }
       const text = this.structuralTextFromType(bodyType, param);
       if (text) {
-        return text;
+        return { text, reads: [param.getTypeNode() ?? param] };
       }
     }
     return null;
@@ -10888,7 +10922,7 @@ export class TypeInferrer {
     for (const candidate of this.middlewareBodySchemaValues(registration)) {
       const declared = this.schemaContract(candidate, 'input');
       if (declared) {
-        return declared;
+        return { ...declared, reads: [this.unwrapExpressionNode(candidate)] };
       }
     }
     return null;
@@ -11346,7 +11380,8 @@ export class TypeInferrer {
     if (!value) {
       return null;
     }
-    return this.schemaContract(value, part === 'body' ? 'input' : 'output');
+    const declared = this.schemaContract(value, part === 'body' ? 'input' : 'output');
+    return declared ? { ...declared, reads: [this.unwrapExpressionNode(value)] } : null;
   }
 
   /**
@@ -12151,6 +12186,35 @@ export class TypeInferrer {
   // ===========================================================================
   // Result Building
   // ===========================================================================
+
+  /**
+   * carrick#4244: stamp the nodes `inferred`'s text was built from on it, as
+   * `read_spans`. Called at each builder's return with exactly those nodes.
+   * Offsets are taken now, as numbers, so a later rewrite of the file (the
+   * unwidened reading) cannot move them, and a spread of the answer keeps
+   * them. An answer whose text is bare `any`/`unknown`, a no-value type
+   * (`void`, `undefined`, `never`) or empty has no value to place and gets
+   * none, annotated or not; a decided abstain is built by
+   * `decidedAbstain` and never passes through here. Outer parentheses are
+   * peeled: `({ ... })` is the literal.
+   */
+  private withReads(inferred: InferredType, nodes: ReadonlyArray<Node | undefined>): InferredType {
+    if (/^\s*(any|unknown|void|undefined|never)?\s*$/.test(inferred.type_string)) return inferred;
+    const seen = new Set<string>();
+    const spans: ReadSpan[] = [];
+    for (const read of nodes) {
+      if (!read) continue;
+      let node: Node = read;
+      while (Node.isParenthesizedExpression(node)) node = node.getExpression();
+      const span = { file_path: node.getSourceFile().getFilePath(), start: node.getStart(), end: node.getEnd() };
+      const key = `${span.file_path}\u0000${span.start}\u0000${span.end}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      spans.push(span);
+    }
+    if (spans.length > 0) inferred.read_spans = spans;
+    return inferred;
+  }
 
   private getNodeLocation(node: Node): SourceLocation {
     const startLinePos = startLineOf(node);

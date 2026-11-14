@@ -25812,6 +25812,7 @@ unfollowed_member_calls_total: 0,
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -25887,6 +25888,7 @@ unfollowed_member_calls_total: 0,
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         });
 
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
@@ -25930,6 +25932,7 @@ unfollowed_member_calls_total: 0,
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         }
     }
 
