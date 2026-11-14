@@ -30156,7 +30156,7 @@ unfollowed_member_calls_total: 0,
             (
                 "src/use.ts",
                 "import { bus } from \"@fixture/bus\";\n\
-                 const TOPICS = [\"orders.created\", \"orders.paid\"] as const;\n\
+                 const TOPICS = [\"orders.created\", \"orders.shipped\"] as const;\n\
                  export async function a() {\n\
                  \x20 for (const t of TOPICS) await bus.publish(t, {});\n\
                  }\n",

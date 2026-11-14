@@ -5540,7 +5540,7 @@ mod tests {
     /// A server that listens in a loop over a stated list, and a client
     /// that sends in a loop over the same list, imported.
     const LOOP_EVENTS: &str =
-        "export const EVENTS = [\"order.created\", \"order.paid\"] as const;\n";
+        "export const EVENTS = [\"order.created\", \"order.shipped\"] as const;\n";
     const LOOP_HUB: &str = "import { io } from \"@fixture/socket\";\n\
         import { EVENTS } from \"./events\";\n\
         export function listen() {\n\
@@ -5597,7 +5597,7 @@ mod tests {
             at("hub.ts"),
             vec![
                 (4, "order.created".to_string()),
-                (4, "order.paid".to_string()),
+                (4, "order.shipped".to_string()),
                 (15, "a.fixed".to_string()),
             ],
             "{rows:#?}"
@@ -5606,7 +5606,7 @@ mod tests {
             at("client.ts"),
             vec![
                 (5, "order.created".to_string()),
-                (5, "order.paid".to_string()),
+                (5, "order.shipped".to_string()),
             ],
             "{rows:#?}"
         );
@@ -5650,7 +5650,7 @@ mod tests {
             &[(
                 "src/topics.ts",
                 "import { bus } from \"@fixture/bus\";\n\
-                 const TOPICS = [\"orders.created\", \"orders.paid\"] as const;\n\
+                 const TOPICS = [\"orders.created\", \"orders.shipped\"] as const;\n\
                  export function wire() {\n\
                  \x20 for (const t of TOPICS) bus.subscribe(t, () => {});\n\
                  \x20 for (const t of TOPICS) bus.publish(t, {});\n\
