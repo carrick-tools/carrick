@@ -127,7 +127,8 @@ fn a_root_abstain_drops_the_model_type_before_the_bundle() {
 
     // carrick#4306: the compiler's read decided the site states no type, so
     // the model's symbol is dropped before the bundle runs: no bundle row and
-    // no definition for the alias, and the drop is reported for the row.
+    // no definition for the alias beyond the placeholder, and the drop is
+    // reported for the row.
     assert!(
         result
             .explicit_manifest
@@ -137,7 +138,14 @@ fn a_root_abstain_drops_the_model_type_before_the_bundle() {
         result.explicit_manifest
     );
     let dts = result.dts_content.as_deref().unwrap_or("");
-    assert!(!dts.contains(alias), "{dts}");
+    // The alias keeps only the bundle's `unknown` placeholder.
+    assert!(
+        dts.lines()
+            .filter(|line| line.contains(alias))
+            .all(|line| line.contains(&format!("{alias} = unknown;"))),
+        "{dts}"
+    );
+    assert!(!dts.contains("T[]"), "{dts}");
     assert_eq!(
         result
             .anchor_changes
