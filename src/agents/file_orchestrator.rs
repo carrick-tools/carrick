@@ -1759,12 +1759,15 @@ pub(crate) fn route_response_request(
 
 /// [`FileOrchestrator::collect_type_requests_and_body_asks`]'s answer: the
 /// explicit requests, the infer requests, the inline aliases, and the asks a
-/// caller row's response waits on (carrick#4196).
+/// caller row's response waits on (carrick#4196), and how many such rows were
+/// not asked because their function holds no transport response
+/// (carrick#4270).
 pub type TypeRequestsAndBodyAsks = (
     Vec<SymbolRequest>,
     Vec<InferRequestItem>,
     Vec<(String, String)>,
     Vec<InferRequestItem>,
+    usize,
 );
 
 impl FileOrchestrator {
@@ -5231,7 +5234,7 @@ impl FileOrchestrator {
         Vec<InferRequestItem>,
         Vec<(String, String)>,
     ) {
-        let (explicit, infer, inline, _) = self.collect_type_requests_and_body_asks(
+        let (explicit, infer, inline, _, _) = self.collect_type_requests_and_body_asks(
             file_results,
             repo_path,
             mount_graph,
@@ -5278,6 +5281,9 @@ impl FileOrchestrator {
         // The asks a caller row's response waits on (carrick#4196): pushed
         // here, not with the requests, while `body_ask` is set.
         let mut body_asks: Vec<InferRequestItem> = Vec::new();
+        // The caller rows that wait on the answer and are not asked: their
+        // function holds no transport response (carrick#4270).
+        let mut body_asks_skipped: usize = 0;
         let body_ask = std::cell::Cell::new(false);
         let should_infer_request_body = crate::type_manifest::producer_reads_request_body;
         // `consumer_response` marks a symbol named for what a consumer call
@@ -6073,27 +6079,37 @@ impl FileOrchestrator {
                         self.result_index
                             .unanswered_at(call_file, call_span, anchor_line),
                     );
+                    // Only a caller whose function can hand back the
+                    // transport response held inside its value is worth
+                    // asking (carrick#4270): the engine names a body member
+                    // at no other. A row not asked still waits on the
+                    // answer, so it keeps no response type.
+                    let worth_asking = !asked_for_body || data_call.holds_transport;
+                    if !worth_asking {
+                        body_asks_skipped += 1;
+                    }
                     body_ask.set(asked_for_body);
-                    let call_inferred = push_infer(
-                        &anchor_absolute,
-                        anchor_line,
-                        InferKind::CallResult,
-                        response_alias.clone(),
-                        InferLocator::Text {
-                            expression_text: anchor.call_expression_text.as_deref(),
-                            expression_line: anchor.call_expression_line,
-                        },
-                    ) || push_infer(
-                        &anchor_absolute,
-                        anchor_line,
-                        InferKind::CallResult,
-                        response_alias.clone(),
-                        InferLocator::Span {
-                            span_start: anchor.call_expression_span_start,
-                            span_end: anchor.call_expression_span_end,
-                            at_registration: false,
-                        },
-                    );
+                    let call_inferred = worth_asking
+                        && (push_infer(
+                            &anchor_absolute,
+                            anchor_line,
+                            InferKind::CallResult,
+                            response_alias.clone(),
+                            InferLocator::Text {
+                                expression_text: anchor.call_expression_text.as_deref(),
+                                expression_line: anchor.call_expression_line,
+                            },
+                        ) || push_infer(
+                            &anchor_absolute,
+                            anchor_line,
+                            InferKind::CallResult,
+                            response_alias.clone(),
+                            InferLocator::Span {
+                                span_start: anchor.call_expression_span_start,
+                                span_end: anchor.call_expression_span_end,
+                                at_registration: false,
+                            },
+                        ));
                     body_ask.set(false);
                     *call_result.borrow_mut() = (None, false);
                     if !call_inferred
@@ -6190,7 +6206,13 @@ impl FileOrchestrator {
             inline_aliases.len()
         );
 
-        (explicit_requests, infer_requests, inline_aliases, body_asks)
+        (
+            explicit_requests,
+            infer_requests,
+            inline_aliases,
+            body_asks,
+            body_asks_skipped,
+        )
     }
 
     /// Build `SymbolRequest`s for Socket.IO payload anchors (#245 Phase 1).
@@ -11731,7 +11753,7 @@ impl FileOrchestrator {
         payload_infer: &[InferRequestItem],
         server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
     ) -> Result<TypeResolutionResult, Box<dyn std::error::Error>> {
-        let (mut explicit, mut infer, inline_aliases, body_asks) = self
+        let (mut explicit, mut infer, inline_aliases, body_asks, body_asks_skipped) = self
             .collect_type_requests_and_body_asks(
                 file_results,
                 repo_path,
@@ -11760,9 +11782,10 @@ impl FileOrchestrator {
             }
         };
         debug!(
-            "[FileOrchestrator] {} of {} caller row(s) asked at their own call read a body member",
+            "[FileOrchestrator] {} of {} caller row(s) asked at their own call read a body member; {} not asked: their function hands back no transport response",
             hand_back_bodies.len(),
-            body_asks.len()
+            body_asks.len(),
+            body_asks_skipped
         );
         let kept_asks: Vec<InferRequestItem> = body_asks
             .into_iter()
@@ -17014,7 +17037,7 @@ export * from "./aFetch.js";"#,
             Path::new(""),
             Path::new(""),
         );
-        let (explicit, infer, inline, body_asks) = orchestrator
+        let (explicit, infer, inline, body_asks, skipped) = orchestrator
             .collect_type_requests_and_body_asks(
                 &file_results,
                 &repo.path().to_string_lossy(),
@@ -17029,6 +17052,7 @@ export * from "./aFetch.js";"#,
             vec![10],
             "only the row whose function holds the transport is asked: {body_asks:?}"
         );
+        assert_eq!(skipped, 1, "the other is counted as not asked");
         assert!(
             infer
                 .iter()

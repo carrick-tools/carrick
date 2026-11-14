@@ -488,9 +488,305 @@ pub struct HeldReturn {
 /// Every function of `module`, by the span of its node, with the calls whose
 /// value it may hand back, whole or held inside its value (carrick#4270).
 /// In source order.
+///
+/// Read from the syntax alone. Every `return` argument and an arrow's
+/// expression body is walked, keeping its position (whole or held) through
+/// `await`, parentheses, type assertions, both arms of a conditional, `??` /
+/// `||` / `&&`, the last expression of a sequence, an assignment's value and
+/// every value a local name is given. What sits under an object literal's
+/// member, shorthand or spread, an array's element, or an argument of a call
+/// or `new` is held. A method call's receiver keeps the call's position (a
+/// call made on a value is a way of handing it on: `res.clone()`), and so
+/// does what an inline callback handed to a call returns, whose first
+/// parameter is the receiver's value (`fetch(u).then((res) => ({ res }))`).
+/// A member read, a body read ([`BODY_READS`]), a name taken apart
+/// (`const { data } = ...`), a template or any other operator ends the walk:
+/// none of them hands the value on.
 pub fn held_returns(module: &swc_ecma_ast::Module) -> Vec<(Span, HeldReturn)> {
-    let _ = module;
-    Vec::new()
+    #[derive(Default)]
+    struct HeldReader {
+        held: Vec<(Span, HeldReturn)>,
+    }
+    impl HeldReader {
+        fn read(&mut self, node: Span, returned: Vec<&Expr>, body: &dyn VisitWithScope) {
+            let mut scope = Scope::default();
+            body.collect(&mut scope);
+            let frame = Frame {
+                id: 0,
+                scope,
+                params: Vec::new(),
+                receiver: None,
+                parent: None,
+            };
+            let mut walk = HeldWalk::default();
+            for expr in returned {
+                walk.walk(expr, false, &frame);
+            }
+            self.held.push((node, walk.finish()));
+        }
+    }
+    impl Visit for HeldReader {
+        fn visit_function(&mut self, function: &Function) {
+            if let Some(body) = &function.body {
+                let mut returns = Returns::default();
+                body.visit_with(&mut returns);
+                self.read(
+                    function.span,
+                    returns.exprs.iter().collect(),
+                    &BodyRef::Block(body),
+                );
+            }
+            function.visit_children_with(self);
+        }
+
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            match &*arrow.body {
+                ArrowFunctionBody::FunctionBody(block) => {
+                    let mut returns = Returns::default();
+                    block.visit_with(&mut returns);
+                    self.read(
+                        arrow.span,
+                        returns.exprs.iter().collect(),
+                        &BodyRef::Block(block),
+                    );
+                }
+                ArrowFunctionBody::Expr(expr) => {
+                    self.read(arrow.span, vec![&**expr], &BodyRef::Expr(expr));
+                }
+            }
+            arrow.visit_children_with(self);
+        }
+    }
+    let mut reader = HeldReader::default();
+    module.visit_with(&mut reader);
+    reader.held.sort_by_key(|(span, _)| (span.lo, span.hi));
+    reader.held
+}
+
+/// The platform's reads of a response's body (`res.json()`, `res.text()`):
+/// what they hand back is the body, never the response. The compiler
+/// engine's list (platform-body-read.ts).
+const BODY_READS: [&str; 6] = ["json", "text", "blob", "arrayBuffer", "formData", "bytes"];
+
+/// One function body being walked by [`HeldWalk`]: its own names, and for an
+/// inline callback, the body it is written in.
+struct Frame<'p> {
+    /// Tells two frames' names apart in [`HeldWalk::followed`].
+    id: usize,
+    scope: Scope,
+    /// A callback's own parameter names: never the enclosing body's names.
+    params: Vec<String>,
+    /// For a callback handed to a method call: its first parameter's name and
+    /// the receiver whose value it is given, read in `parent`.
+    receiver: Option<(String, &'p Expr)>,
+    parent: Option<&'p Frame<'p>>,
+}
+
+/// The calls one function's returned values reach ([`held_returns`]).
+#[derive(Default)]
+struct HeldWalk {
+    bare: Vec<Span>,
+    held: Vec<Span>,
+    /// Names already followed, per frame and position.
+    followed: HashSet<(String, usize, bool)>,
+    frames: usize,
+}
+
+impl HeldWalk {
+    fn finish(mut self) -> HeldReturn {
+        for spans in [&mut self.bare, &mut self.held] {
+            spans.sort_by_key(|span| (span.lo, span.hi));
+            spans.dedup();
+        }
+        HeldReturn {
+            bare: self.bare,
+            held: self.held,
+        }
+    }
+
+    /// Walk a value the function may hand back: whole, or `held` inside it.
+    fn walk(&mut self, expr: &Expr, held: bool, frame: &Frame) {
+        match expr {
+            Expr::Await(awaited) => self.walk(&awaited.arg, held, frame),
+            Expr::Paren(paren) => self.walk(&paren.expr, held, frame),
+            Expr::TsAs(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsTypeAssertion(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsConstAssertion(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsNonNull(cast) => self.walk(&cast.expr, held, frame),
+            Expr::TsSatisfies(cast) => self.walk(&cast.expr, held, frame),
+            Expr::Cond(cond) => {
+                self.walk(&cond.cons, held, frame);
+                self.walk(&cond.alt, held, frame);
+            }
+            Expr::Bin(bin)
+                if matches!(
+                    bin.op,
+                    BinaryOp::LogicalOr | BinaryOp::LogicalAnd | BinaryOp::NullishCoalescing
+                ) =>
+            {
+                self.walk(&bin.left, held, frame);
+                self.walk(&bin.right, held, frame);
+            }
+            Expr::Seq(seq) => {
+                if let Some(last) = seq.exprs.last() {
+                    self.walk(last, held, frame);
+                }
+            }
+            Expr::Assign(assign) => self.walk(&assign.right, held, frame),
+            Expr::Ident(ident) => self.follow(&ident.sym, held, frame),
+            Expr::Object(object) => {
+                for prop in &object.props {
+                    match prop {
+                        PropOrSpread::Spread(spread) => self.walk(&spread.expr, true, frame),
+                        PropOrSpread::Prop(prop) => match &**prop {
+                            Prop::KeyValue(kv) => self.walk(&kv.value, true, frame),
+                            Prop::Shorthand(ident) => self.follow(&ident.sym, true, frame),
+                            _ => {}
+                        },
+                    }
+                }
+            }
+            Expr::Array(array) => {
+                for elem in array.elems.iter().flatten() {
+                    self.walk(&elem.expr, true, frame);
+                }
+            }
+            Expr::New(new) => {
+                for arg in new.args.iter().flatten() {
+                    self.walk(&arg.expr, true, frame);
+                }
+            }
+            Expr::Call(call) => self.call(call, held, frame),
+            _ => {}
+        }
+    }
+
+    fn call(&mut self, call: &CallExpr, held: bool, frame: &Frame) {
+        let Callee::Expr(callee) = &call.callee else {
+            return;
+        };
+        let receiver = match &**callee {
+            Expr::Member(member) => {
+                if matches!(&member.prop, MemberProp::Ident(name) if BODY_READS.contains(&&*name.sym))
+                {
+                    return;
+                }
+                Some(&*member.obj)
+            }
+            _ => None,
+        };
+        if held {
+            self.held.push(call.span);
+        } else {
+            self.bare.push(call.span);
+        }
+        if let Some(receiver) = receiver {
+            self.walk(receiver, held, frame);
+        }
+        for arg in &call.args {
+            match &*arg.expr {
+                Expr::Arrow(arrow) => {
+                    let returned: Vec<&Expr>;
+                    let mut returns = Returns::default();
+                    let body = match &*arrow.body {
+                        ArrowFunctionBody::FunctionBody(block) => {
+                            block.visit_with(&mut returns);
+                            returned = returns.exprs.iter().collect();
+                            BodyRef::Block(block)
+                        }
+                        ArrowFunctionBody::Expr(expr) => {
+                            returned = vec![&**expr];
+                            BodyRef::Expr(expr)
+                        }
+                    };
+                    let params: Vec<&Pat> = arrow.params.iter().collect();
+                    self.callback(&params, &body, returned, receiver, held, frame);
+                }
+                Expr::Fn(function) => {
+                    let Some(block) = &function.function.body else {
+                        continue;
+                    };
+                    let mut returns = Returns::default();
+                    block.visit_with(&mut returns);
+                    let params: Vec<&Pat> =
+                        function.function.params.iter().map(|p| &p.pat).collect();
+                    self.callback(
+                        &params,
+                        &BodyRef::Block(block),
+                        returns.exprs.iter().collect(),
+                        receiver,
+                        held,
+                        frame,
+                    );
+                }
+                expr => self.walk(expr, true, frame),
+            }
+        }
+    }
+
+    /// What an inline callback returns keeps the position of the call it
+    /// is handed to, its first parameter given the receiver's value.
+    fn callback(
+        &mut self,
+        params: &[&Pat],
+        body: &dyn VisitWithScope,
+        returned: Vec<&Expr>,
+        receiver: Option<&Expr>,
+        held: bool,
+        frame: &Frame,
+    ) {
+        let mut scope = Scope::default();
+        body.collect(&mut scope);
+        self.frames += 1;
+        let first = params.first().and_then(|param| match param {
+            Pat::Ident(ident) => Some(ident.id.sym.to_string()),
+            _ => None,
+        });
+        let child = Frame {
+            id: self.frames,
+            scope,
+            params: params
+                .iter()
+                .flat_map(|param| pattern_names(param))
+                .collect(),
+            receiver: first.zip(receiver),
+            parent: Some(frame),
+        };
+        for expr in returned {
+            self.walk(expr, held, &child);
+        }
+    }
+
+    /// Follow a name to every value it is given, in the frame that binds it.
+    fn follow(&mut self, name: &str, held: bool, frame: &Frame) {
+        if !self.followed.insert((name.to_string(), frame.id, held)) {
+            return;
+        }
+        // A name taken apart is a member of its value, not the value.
+        if frame.scope.parts.contains_key(name) {
+            return;
+        }
+        if let Some(given) = frame.scope.given.get(name) {
+            for value in given {
+                self.walk(value, held, frame);
+            }
+            return;
+        }
+        if let Some((first, receiver)) = &frame.receiver
+            && first.as_str() == name
+        {
+            if let Some(parent) = frame.parent {
+                self.walk(receiver, held, parent);
+            }
+            return;
+        }
+        if frame.params.iter().any(|param| param == name) {
+            return;
+        }
+        if let Some(parent) = frame.parent {
+            self.follow(name, held, parent);
+        }
+    }
 }
 
 fn shape_of(returned: &[&Expr], scope: &Scope) -> Option<ReturnShape> {

@@ -6436,7 +6436,7 @@ async fn analyze_current_repo_incremental(
             // types below (carrick#3103).
             let decision = if let Some(context) = reach {
                 let reach_started = Instant::now();
-                let (mut explicit, mut infer, _, body_asks) = file_orchestrator
+                let (mut explicit, mut infer, _, body_asks, _) = file_orchestrator
                     .collect_type_requests_and_body_asks(
                         &merged_results,
                         repo_path,
@@ -12260,7 +12260,7 @@ fn run_capture_for_service(
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
-    let (mut explicit, mut infer, inline_aliases, body_asks) = file_orchestrator
+    let (mut explicit, mut infer, inline_aliases, body_asks, _) = file_orchestrator
         .collect_type_requests_and_body_asks(file_results, repo_path, mount_graph, config, modules);
     // The caller rows whose own call the resolution read a body member out
     // of joined its requests there (carrick#4196); the rest never did.
