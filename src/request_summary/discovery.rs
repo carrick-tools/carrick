@@ -3148,7 +3148,7 @@ impl<'a> Walker<'a> {
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
-            out.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
+            out.stop = None;
         }
         out
     }
