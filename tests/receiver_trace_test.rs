@@ -3268,15 +3268,38 @@ fn a_route_in_a_loop_over_a_stated_list_is_one_row_per_element() {
         "{picture}"
     );
     assert!(scan.rows.iter().all(|row| !row.contains("${")), "{picture}");
-    // The response type of each element row of (a) and (c).
-    let typed: Vec<&String> = scan
+    // The response type each element row of (a) and (c) states, as the
+    // bundled declarations write it.
+    let bundled: String = blobs
+        .values()
+        .map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["bundled_types"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let typed: Vec<String> = scan
         .manifest
         .iter()
         .filter(|entry| {
-            entry.starts_with("src/server.ts:20 ") || entry.starts_with("src/server.ts:29 ")
+            (entry.starts_with("src/server.ts:20 ") || entry.starts_with("src/server.ts:29 "))
+                && entry.contains(" response ")
+        })
+        .map(|entry| {
+            let alias = entry.rsplit(' ').next().unwrap_or_default();
+            let declared = bundled
+                .lines()
+                .find(|line| line.contains(&format!("type {alias} ")))
+                .unwrap_or("<no declaration>")
+                .trim()
+                .to_string();
+            let (row, _) = entry.split_once(" response ").unwrap();
+            format!("{row} {declared}")
         })
         .collect();
-    assert_eq!(typed, Vec::<&String>::new(), "{picture}");
+    assert_eq!(typed, Vec::<String>::new(), "{picture}\nbundled {bundled}");
 }
 
 /// carrick#2093: a loop over a list of tuples reads both names of one
@@ -3342,7 +3365,10 @@ fn a_loop_over_a_list_the_code_does_not_state_keeps_todays_outcome() {
             "src/server.ts:45 unread_expression",
             "src/server.ts:47 unread_expression",
             "src/server.ts:49 unread_expression",
-            "src/server.ts:51 fan_out_cap",
+            // Each name alone is several texts: the saved reason is the
+            // first part's, read as parts (more than 16 routes would be
+            // `fan_out_cap` read whole).
+            "src/server.ts:51 unread_expression",
             "src/server.ts:53 callback_parameter",
         ],
         "{picture}"
