@@ -1,4 +1,4 @@
 [
-  { "package": "lib.dom", "export": "fetch", "member": null, "role": "http_client",
+  { "package": "lib:lib.dom.d.ts", "export": "fetch", "member": null, "role": "http_client",
     "method": { "from": { "arg": 1, "key": "method" }, "default": "GET" } }
 ]
