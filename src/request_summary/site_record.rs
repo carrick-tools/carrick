@@ -2623,7 +2623,7 @@ fn record(
     };
     // A maker's call returns the function that sends (carrick#4319): what
     // the send answers is read at the labelled call.
-    let result = if site.makes_end {
+    let result = if site.makes_end && site.span_start == u32::MAX {
         AnchorAt {
             file: site.end.file.clone(),
             line: site.end.line,
