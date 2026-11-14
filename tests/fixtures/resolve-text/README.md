@@ -222,3 +222,23 @@ at `ParamHub(_)`) and `subscribe`'s parameter.
 
 With no callers read (`text_values`), every probe reads as before S6-2: a
 hole, `unread_expression`, except `p_field_typed`, `orders.typed`.
+
+## Names a `for…of` head binds (`loops.ts`, carrick#2093)
+
+Each `p_*` probe's argument is a loop head's name (or a template over two).
+Read with `text_values`, a head over a list the code states, and that nothing
+changes, is one text per element:
+
+| Probe | Texts |
+|---|---|
+| `p_each` (a module `const` list) | `large`, `small` |
+| `p_tuple` (`[file, type]` over two pairs, joined element by element) | `f1:t1`, `f2:t2` |
+| `p_keyed` (`{ name }` over two objects) | `n1`, `n2` |
+| `p_two` (two nested loops) | `a1b1`, `a1b2`, `a2b1`, `a2b2` |
+| `p_frozen` (an exported `as const` list) | `apply`, `create` |
+| `p_local` (a list a function body declares) | `one`, `two` |
+
+Every other probe is one hole, never `outside_service`: `p_param` is
+`parameter_unread`; `p_loose` (exported, not `as const`), `p_pushed`,
+`p_handed`, `p_let_list`, `p_spread`, `p_call`, `p_let_head`, `p_in` and
+`p_default` are `unread_expression`.

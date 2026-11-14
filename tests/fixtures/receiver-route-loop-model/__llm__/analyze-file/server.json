@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "owner_node": "app",
+      "method": "POST",
+      "path": "/widgets/sizes/:size",
+      "handler_name": "anonymous",
+      "pattern_matched": ".post(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

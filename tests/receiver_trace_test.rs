@@ -1003,11 +1003,15 @@ fn a_package_used_only_through_its_types_is_asked_and_its_routes_join() {
 
 /// carrick#3237: in a package that uses its framework only through types,
 /// a route path that writes its first segment before a value the code does
-/// not read (`/widgets/kinds/${kind}`, `/docs/spec${tail}`) keeps the
+/// not read (`/docs/spec${tail}`, a loop over a parameter's key) keeps the
 /// reader's row, counted `unread_own_part`; the path that starts with its
 /// value (`${head}health`) is a guessed site and its row is withdrawn. The
 /// loop's reader row gives way to the literal registration of the same route
 /// (carrick#3236), which the trace corrects instead of copying untyped.
+///
+/// carrick#2093: the loop over the stated list `KINDS` is read, so the
+/// trace serves one route per element at `:14`, under the scope's prefix,
+/// and the model's `/widgets/kinds/:kind` row there gives way.
 #[test]
 fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
     let (on, fallbacks) = scan_fixture_reading("receiver-route-stated-head");
@@ -1016,13 +1020,23 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
         .iter()
         .filter(|row| row.contains("families.ts"))
         .collect();
+    let at_14: Vec<&String> = family
+        .iter()
+        .copied()
+        .filter(|row| row.contains("families.ts:14 "))
+        .collect();
+    assert_eq!(
+        at_14,
+        vec![
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/large library_claim familyRoutes",
+            "packages/routes/src/families.ts:14 POST /api/v1/widgets/kinds/small library_claim familyRoutes",
+        ],
+        "{family:#?}"
+    );
     assert!(
         family
             .iter()
-            .any(|row| row.contains("families.ts:14 POST /widgets/kinds/:kind"))
-            && family
-                .iter()
-                .any(|row| row.contains("families.ts:19 GET /api/v1/docs/spec library_claim")),
+            .any(|row| row.contains("families.ts:19 GET /api/v1/docs/spec library_claim")),
         "{family:#?}"
     );
     assert!(
@@ -1033,15 +1047,25 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
         family.iter().all(|row| !row.contains("health")),
         "{family:#?}"
     );
-    for row in family.iter().filter(|row| row.contains("families.ts:14 ")) {
-        assert!(row.contains(" model "), "{row}");
-    }
     let counts = route_counts(&fallbacks);
-    assert!(
-        counts.contains(&"routes routes_untraced_unread_own_part=2".to_string())
-            && counts.contains(&"routes routes_guessed_withdrawn=1".to_string())
-            && counts.contains(&"routes routes_across_corrected=2".to_string())
-            && counts.contains(&"routes routes_across_added_untyped=1".to_string()),
+    assert_eq!(
+        counts
+            .iter()
+            .filter(|count| count.starts_with("routes "))
+            .cloned()
+            .collect::<Vec<String>>(),
+        vec![
+            // One element row is added beside the other route the trace
+            // adds; the other element row replaces the model's `:kind` row.
+            "routes routes_across_added_untyped=2",
+            "routes routes_across_corrected=2",
+            "routes routes_across_replaced=1",
+            "routes routes_guessed_withdrawn=1",
+            // `:14`'s chains now end at the plugin's parameter, as the
+            // package's other routes do.
+            "routes routes_untraced_hole_entry_point=4",
+            "routes routes_untraced_unread_own_part=1",
+        ],
         "{counts:#?}"
     );
     // An incremental re-scan gives the same rows.
@@ -3229,5 +3253,259 @@ fn an_imported_handler_is_placed_in_its_declaring_file() {
             .count(),
         4,
         "{flat:#?}"
+    );
+}
+
+/// What `receiver-route-loop` states at `src/server.ts`: every mount-graph
+/// row there, every possible call there with why its path is unread, and the
+/// producer manifest entries there (`file:line METHOD path kind alias`).
+struct LoopScan {
+    rows: Vec<String>,
+    unread: Vec<String>,
+    manifest: Vec<String>,
+}
+
+fn loop_scan(blobs: &Blobs) -> LoopScan {
+    let at = "src/server.ts:";
+    LoopScan {
+        rows: endpoint_rows(blobs)
+            .0
+            .into_iter()
+            .filter(|row| row.starts_with(at))
+            .collect(),
+        unread: unread_reasons(blobs)
+            .into_iter()
+            .filter(|(site, _)| site.starts_with(at))
+            .map(|(site, reason)| format!("{site} {reason}"))
+            .collect(),
+        manifest: producer_manifest(blobs)
+            .into_iter()
+            .filter(|entry| entry.starts_with(at))
+            .collect(),
+    }
+}
+
+/// The rows of `scan` at `line`.
+fn rows_at(scan: &LoopScan, line: u32) -> Vec<String> {
+    let at = format!("src/server.ts:{line} ");
+    scan.rows
+        .iter()
+        .filter(|row| row.starts_with(&at))
+        .cloned()
+        .collect()
+}
+
+/// carrick#2093: a route registered in a `for…of` over a list the code
+/// states (a module constant, an imported `as const` list, a nested pair of
+/// literal lists) is one route per element, served by the trace: the cassette
+/// states no endpoint in `src/server.ts`, so each row is the trace's. No row
+/// keeps the template's `${…}`.
+///
+/// Ship condition (the 2093 ruling): the producer manifest at the element
+/// rows says whether each gets its own element's response type or the union
+/// of all of them; the assertion pins what the scan states.
+#[test]
+fn a_route_in_a_loop_over_a_stated_list_is_one_row_per_element() {
+    let (blobs, fallbacks) = scan_fixture_reading("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!(
+        "rows {:#?}\nunread {:#?}\nmanifest {:#?}\ncounts {:#?}",
+        scan.rows,
+        scan.unread,
+        scan.manifest,
+        route_counts(&fallbacks)
+    );
+    assert_eq!(
+        rows_at(&scan, 20),
+        vec![
+            "src/server.ts:20 POST /widgets/sizes/large library_claim app",
+            "src/server.ts:20 POST /widgets/sizes/small library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 25),
+        vec![
+            "src/server.ts:25 POST /teams/:id/plan/apply library_claim app",
+            "src/server.ts:25 POST /teams/:id/plan/create library_claim app",
+            "src/server.ts:25 POST /teams/:id/plan/preview library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 34),
+        vec![
+            "src/server.ts:34 GET /v1/teams library_claim app",
+            "src/server.ts:34 GET /v1/users library_claim app",
+            "src/server.ts:34 GET /v2/teams library_claim app",
+            "src/server.ts:34 GET /v2/users library_claim app",
+        ],
+        "{picture}"
+    );
+    assert!(scan.rows.iter().all(|row| !row.contains("${")), "{picture}");
+    // The response type each element row of (a) and (c) states, as the
+    // bundled declarations write it.
+    let bundled: String = blobs
+        .values()
+        .map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["bundled_types"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let typed: Vec<String> = scan
+        .manifest
+        .iter()
+        .filter(|entry| {
+            (entry.starts_with("src/server.ts:20 ") || entry.starts_with("src/server.ts:29 "))
+                && entry.contains(" response ")
+        })
+        .map(|entry| {
+            let alias = entry.rsplit(' ').next().unwrap_or_default();
+            let declared = bundled
+                .lines()
+                .find(|line| line.contains(&format!("type {alias} ")))
+                .and_then(|line| line.split_once(" = "))
+                .map_or("<no declaration>", |(_, body)| body.trim());
+            let (row, _) = entry.split_once(" response ").unwrap();
+            format!("{row} {declared}")
+        })
+        .collect();
+    // Each element row's response is its own element's, never the union.
+    assert_eq!(
+        typed,
+        vec![
+            "src/server.ts:20 POST /widgets/sizes/large { size: \"large\"; };",
+            "src/server.ts:20 POST /widgets/sizes/small { size: \"small\"; };",
+            "src/server.ts:29 GET /favicon.svg { type: \"image/svg+xml\"; };",
+            "src/server.ts:29 GET /logo.png { type: \"image/png\"; };",
+        ],
+        "{picture}\nbundled {bundled}"
+    );
+}
+
+/// carrick#2093: a loop over a list of tuples reads both names of one
+/// element together: `[file, type]` over two pairs gives two routes, never
+/// the four that mixing elements would, and no `/:file` row.
+#[test]
+fn a_tuple_loop_reads_each_element_whole_and_together() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!("rows {:#?}\nunread {:#?}", scan.rows, scan.unread);
+    assert_eq!(
+        rows_at(&scan, 29),
+        vec![
+            "src/server.ts:29 GET /favicon.svg library_claim app",
+            "src/server.ts:29 GET /logo.png library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 32),
+        vec![
+            "src/server.ts:32 GET /pair/x/1 library_claim app",
+            "src/server.ts:32 GET /pair/y/2 library_claim app",
+        ],
+        "{picture}"
+    );
+}
+
+/// carrick#2093: a loop over a list the code does not state, or one the code
+/// may change (a call's result, a parameter's key, a spread, a `let`, a list
+/// a module pushes to, an imported list another module pushes to), states no
+/// row, and neither does a loop whose routes would number more than the cap
+/// or a `forEach` callback (carrick#4246). Each such site is saved unread
+/// with a true reason: the loop variable is declared in the file, so never
+/// `outside_service`.
+#[test]
+fn a_loop_over_a_list_the_code_does_not_state_keeps_todays_outcome() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!("rows {:#?}\nunread {:#?}", scan.rows, scan.unread);
+    for line in [37, 40, 43, 45, 47, 49, 51, 53] {
+        assert_eq!(
+            rows_at(&scan, line),
+            Vec::<String>::new(),
+            "{line}: {picture}"
+        );
+    }
+    let unread: Vec<&String> = scan
+        .unread
+        .iter()
+        .filter(|site| {
+            [37, 40, 43, 45, 47, 49, 51, 53]
+                .iter()
+                .any(|line| site.starts_with(&format!("src/server.ts:{line} ")))
+        })
+        .collect();
+    assert_eq!(
+        unread,
+        vec![
+            "src/server.ts:37 unread_expression",
+            "src/server.ts:40 unread_expression",
+            "src/server.ts:43 unread_expression",
+            "src/server.ts:45 unread_expression",
+            "src/server.ts:47 unread_expression",
+            "src/server.ts:49 unread_expression",
+            // Each name alone is several texts: the saved reason is the
+            // first part's, read as parts (more than 16 routes would be
+            // `fan_out_cap` read whole).
+            "src/server.ts:51 unread_expression",
+            "src/server.ts:53 callback_parameter",
+        ],
+        "{picture}"
+    );
+}
+
+/// carrick#2093: a route at a literal parameter path, a route at a choice,
+/// and a request (not a route) in a loop over a stated list are as they
+/// were before loops were read.
+#[test]
+fn kept_sites_beside_a_loop_are_unchanged() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!(
+        "rows {:#?}\nunread {:#?}\ncalls {:#?}",
+        scan.rows,
+        scan.unread,
+        possible_calls(&blobs)
+    );
+    assert_eq!(
+        rows_at(&scan, 56),
+        vec!["src/server.ts:56 GET /:id library_claim app"],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 58),
+        vec![
+            "src/server.ts:58 GET /p library_claim app",
+            "src/server.ts:58 GET /q library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(rows_at(&scan, 60), Vec::<String>::new(), "{picture}");
+    assert!(
+        scan.unread
+            .iter()
+            .all(|site| !site.starts_with("src/server.ts:60 ")),
+        "{picture}"
+    );
+}
+
+/// carrick#2093: where the model states the loop's route as a parameter
+/// path (`POST /widgets/sizes/:size`), the trace replaces that row with one
+/// per element, and no `:size` row stands.
+#[test]
+fn a_model_row_over_a_loop_gives_way_to_one_row_per_element() {
+    let blobs = scan_fixture("receiver-route-loop-model");
+    let rows = endpoint_rows(&blobs).0;
+    assert_eq!(
+        rows,
+        vec![
+            "src/server.ts:8 POST /widgets/sizes/large library_claim app",
+            "src/server.ts:8 POST /widgets/sizes/small library_claim app",
+        ],
     );
 }

@@ -42,7 +42,9 @@ mod text;
 mod text_reader;
 
 pub(crate) use documents::{DocumentEnd, DocumentLookup, document_calls};
-pub(super) use text::{args_text, pattern_members, text_of};
+pub(super) use text::{
+    args_text, list_of, loop_head_names, pattern_members, text_of, written_as_const,
+};
 pub(super) use text_reader::{
     ArgTexts, Hop, PartValue, PiecedText, SpanAt, TextPart, TextValue, handed,
 };
@@ -127,16 +129,29 @@ pub(super) struct ModuleBinding {
     /// refused the local or disagrees with the write census (D6): every
     /// reader then keeps the initialiser and every write.
     pub(super) reads: BTreeMap<u32, Vec<flow::WayAt>>,
+    /// For a `const` whose initialiser is an array literal, its elements
+    /// ([`text::list_of`], carrick#2093): what a loop over it reads.
+    pub(super) elements: Option<Vec<ValueAt>>,
+    /// The initialiser is written `as const`: an importer cannot change the
+    /// list without a cast.
+    pub(super) list_frozen: bool,
+    /// The module never changes the list the binding holds
+    /// ([`WriteCensus::list_kept`]).
+    pub(super) list_kept: bool,
 }
 
 impl ModuleBinding {
     /// Whether the value readers (discovery's callee walk, the receiver
-    /// walk) read this entry: an enum holds no value, and a text-only local
-    /// is held by its scope. No reader opens a [`Self::scoped_entry`] yet.
+    /// walk) read this entry: an enum holds no value, a loop head is the
+    /// text reader's alone, and a text-only local is held by its scope. No
+    /// reader opens a [`Self::scoped_entry`] yet.
     pub(super) fn values_read(&self) -> bool {
         !matches!(
             self.kind,
-            BindingKind::Enum | BindingKind::StaticField | BindingKind::Getter
+            BindingKind::Enum
+                | BindingKind::StaticField
+                | BindingKind::Getter
+                | BindingKind::LoopElement
         ) && !self.text_only
             && !self.scoped_entry()
     }
@@ -211,6 +226,9 @@ pub(super) enum BindingKind {
     /// A function declared in a body (carrick#3794): `init` is the function
     /// itself, [`ValueAt::Function`] at where its node starts.
     Function,
+    /// A name a `for…of` or `for…in` head binds (carrick#2093): `text` is
+    /// its [`ValueAt::Each`]. Only the text reader reads it.
+    LoopElement,
 }
 
 impl From<VarDeclKind> for BindingKind {
@@ -255,6 +273,10 @@ pub(super) struct LocalBinding {
     /// where the flow places every write. [`module_bindings`] checks it
     /// against the census before the table keeps it.
     pub(super) flow: Option<flow::WrittenReads>,
+    /// As [`ModuleBinding::elements`].
+    pub(super) elements: Option<Vec<ValueAt>>,
+    /// As [`ModuleBinding::list_frozen`].
+    pub(super) list_frozen: bool,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -339,7 +361,29 @@ struct WriteCensus {
     /// R5): neither hands the object to anything a factory's returned
     /// object is not handed to.
     tested_or_returned: HashMap<BindingKey, HashSet<u32>>,
+    /// How many of the references are the list a `for…of` loops over
+    /// (`for (const x of LIST)`, carrick#2093).
+    loop_lists: HashMap<BindingKey, usize>,
+    /// A member of the binding that changes an array in place is read
+    /// (`LIST.push`, `LIST?.sort`, `LIST['splice']`): the list may change.
+    list_mutated: HashSet<BindingKey>,
 }
+
+/// The members that change an array in place: what a loop over a list
+/// reads as the list being changed (carrick#2093). The value resolver owns
+/// this set; the sidecar's loop reader keeps a copy until it retires
+/// (carrick#3188).
+const ARRAY_MUTATORS: [&str; 9] = [
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "splice",
+    "sort",
+    "reverse",
+    "fill",
+    "copyWithin",
+];
 
 /// A class that extends a named class.
 struct ClassEdge {
@@ -613,6 +657,21 @@ impl WriteCensus {
             && count(&self.references) == count(&self.member_bases) + writes + tested + 1
     }
 
+    /// Whether the module never changes the list `key` holds (carrick#2093):
+    /// nothing writes the name or an entry of it, no member that changes an
+    /// array in place is read off it, and every reference but its
+    /// declaration is a member read or the list of a `for…of`. A list
+    /// handed to a call, spread, returned or exported by name is refused:
+    /// whoever holds it may change it. An importer's half is the reader's.
+    fn list_kept(&self, key: &BindingKey) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        !self.is_unplaceable(key)
+            && !self.writes.contains_key(key)
+            && !self.written_through.contains(key)
+            && !self.list_mutated.contains(key)
+            && count(&self.references) == count(&self.member_bases) + count(&self.loop_lists) + 1
+    }
+
     /// Notes each binding `expr` only tests for truthiness: a name, or
     /// either side of `&&`, `||` or `??` or the operand of `!`, in a test.
     fn test_use(&mut self, expr: &Expr) {
@@ -863,10 +922,28 @@ impl Visit for WriteCensus {
         }
         let mut bases = Vec::new();
         member_leaves(&member.obj, false, &mut bases);
+        let mutator = match &member.prop {
+            MemberProp::Ident(prop) => ARRAY_MUTATORS.contains(&prop.sym.as_ref()),
+            MemberProp::Computed(computed) => !matches!(
+                crate::graphql_document_sites::unwrap_expression(&computed.expr),
+                Expr::Lit(Lit::Num(_))
+            ),
+            MemberProp::PrivateName(_) => false,
+        };
         for base in bases {
+            if mutator {
+                self.list_mutated.insert(base.clone());
+            }
             *self.member_bases.entry(base).or_default() += 1;
         }
         member.visit_children_with(self);
+    }
+
+    fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
+        if let Expr::Ident(list) = crate::request_summary::unwrap_value(&stmt.right) {
+            *self.loop_lists.entry(ident_key(list)).or_default() += 1;
+        }
+        stmt.visit_children_with(self);
     }
 
     fn visit_ident(&mut self, ident: &Ident) {
@@ -1075,6 +1152,9 @@ pub(super) fn module_bindings(
                         // Module-level writes may run in any function, in
                         // any order (carrick#3679 S8 P7).
                         reads: BTreeMap::new(),
+                        elements: None,
+                        list_frozen: false,
+                        list_kept: false,
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -1103,6 +1183,11 @@ pub(super) fn module_bindings(
                 object_kept: census.object_held(&key),
                 plain: true,
                 reads: BTreeMap::new(),
+                elements: init
+                    .filter(|_| var.kind == VarDeclKind::Const)
+                    .and_then(|init| text::list_of(init, &identity)),
+                list_frozen: init.is_some_and(text::written_as_const),
+                list_kept: census.list_kept(&key),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1133,11 +1218,19 @@ pub(super) fn module_bindings(
     scoped.extend(constructor_defaults.iter().map(|ir| (ir, Owner::Detached)));
     for (ir, owner) in scoped {
         let mut taken = |local: &LocalBinding, declared: Declared| {
+            // A loop head is written by each iteration (the census marks
+            // it), and a `const` head is never written otherwise: only a
+            // module that may write anything makes it unplaceable.
+            let unplaceable = if local.kind == BindingKind::LoopElement {
+                census.opaque
+            } else {
+                census.is_unplaceable(&local.key)
+            };
             let binding = ModuleBinding {
                 declared,
                 init: local.init.clone(),
                 writes: census.writes.get(&local.key).cloned().unwrap_or_default(),
-                unplaceable: census.is_unplaceable(&local.key),
+                unplaceable,
                 kind: local.kind,
                 text: local.text.clone(),
                 entries_kept: census.entries_kept(&local.key, false),
@@ -1148,6 +1241,12 @@ pub(super) fn module_bindings(
                 object_kept: false,
                 plain: local.plain,
                 reads: flow_checked(local, &census),
+                elements: local
+                    .elements
+                    .clone()
+                    .filter(|_| local.kind == BindingKind::Const),
+                list_frozen: local.list_frozen,
+                list_kept: census.list_kept(&local.key),
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut held) => {
@@ -1688,6 +1787,18 @@ pub(super) enum ValueAt {
     Entries(Vec<(ValueAt, ValueAt)>),
     /// An array literal's elements, the object of a `join`.
     Elements(Vec<ValueAt>),
+    /// A name a `for…of` head binds (carrick#2093): each element of `list`
+    /// in turn (an array literal written in place as [`Self::Elements`], or
+    /// the list's name as [`Self::Read`]; [`Self::Unread`] for a list no
+    /// reader states), at the tuple position `at` or the object key `key`
+    /// the pattern reads. `loop_at` is where the loop statement starts: two
+    /// names read through one loop take one element together.
+    Each {
+        list: Box<ValueAt>,
+        at: Option<usize>,
+        key: Option<String>,
+        loop_at: u32,
+    },
     /// An expression the names lowering does not read (a call of no
     /// built-in, a tag other than `String.raw`, any other form), spanning
     /// `lo..hi` (carrick#3504 B10-2a1): what the request summaries read
@@ -2781,6 +2892,8 @@ impl Reader<'_> {
                 block: false,
                 defaulted: true,
                 flow: None,
+                elements: None,
+                list_frozen: false,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -3466,6 +3579,7 @@ impl<'a> Resolver<'a> {
             | ValueAt::Alt { .. }
             | ValueAt::Entries(_)
             | ValueAt::Elements(_)
+            | ValueAt::Each { .. }
             // A maker's `new` is the receiver walk's alone, any other the
             // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
@@ -5252,8 +5366,9 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
 
     /// carrick#3794 T1: a declaration in a block, in a function written
     /// inside a body and a function declared in a body each has an entry of
-    /// its scope's class; a loop head, a `catch` binding, a shadowed name and
-    /// a nested parameter's default have none.
+    /// its scope's class; a loop head has a loop entry (carrick#2093); a
+    /// `catch` binding, a shadowed name and a nested parameter's default
+    /// have none.
     ///
     /// Proof it ran: `walked` is `None` without the built compiler engine
     /// (the test then returns early); CI builds it first.
@@ -5307,9 +5422,23 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         let pair = one("pair");
         assert!(pair.unplaceable, "{pair:?}");
 
-        // No entry: a loop head, a `catch` binding, a name the body declares
-        // twice (a shadow, decision D3) and a nested parameter's default.
-        for name in ["item", "err", "same", "n"] {
+        // A loop head is a loop entry, one per loop that binds the name, in
+        // its loop's block (carrick#2093).
+        let items = entries_named(file, "item");
+        assert_eq!(items.len(), 2, "{items:?}");
+        for item in items {
+            assert_eq!(item.kind, BindingKind::LoopElement, "{item:?}");
+            assert_eq!(item.declared, block, "{item:?}");
+            assert!(!item.unplaceable && !item.values_read(), "{item:?}");
+            assert!(
+                matches!(&item.text, Some(ValueAt::Each { list, at: None, key: None, .. })
+                    if matches!(&**list, ValueAt::Elements(items) if items.len() == 1)),
+                "{item:?}"
+            );
+        }
+        // No entry: a `catch` binding, a name the body declares twice (a
+        // shadow, decision D3) and a nested parameter's default.
+        for name in ["err", "same", "n"] {
             assert!(entries_named(file, name).is_empty(), "{name}");
         }
         let default = file

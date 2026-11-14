@@ -332,10 +332,29 @@ impl<'c, 'a> Collect<'c, 'a> {
             {
                 continue;
             }
-            let (Some(method), Some(path)) = (forced_route_method(site, labels), site.name_text())
-            else {
+            let Some(method) = forced_route_method(site, labels) else {
                 continue;
             };
+            // The route's own path: the one its call writes whole, else each
+            // way the trace read it as (a conditional's, a default's, a loop
+            // element's: carrick#2386, #2093), one segment per way.
+            let paths: Vec<String> = match site.name_text() {
+                Some(path) => vec![path],
+                None => {
+                    let mut ways: Vec<String> = site
+                        .composed
+                        .iter()
+                        .filter(|composed| boundary_end(&composed.end))
+                        .filter_map(|composed| composed.own.clone())
+                        .collect();
+                    ways.sort();
+                    ways.dedup();
+                    ways
+                }
+            };
+            if paths.is_empty() {
+                continue;
+            }
             let mut in_service = InService::default();
             for composed in site
                 .composed
@@ -362,23 +381,25 @@ impl<'c, 'a> Collect<'c, 'a> {
                 let End::Boundary { boundary } = above.end else {
                     continue;
                 };
-                out.push(RouteSegment {
-                    file: site.file.clone(),
-                    line: site.line,
-                    method: method.to_uppercase(),
-                    path: path.clone(),
-                    handler: site
-                        .handler
-                        .as_ref()
-                        .and_then(|handler| handler.name.clone()),
-                    owner: site
-                        .receiver
-                        .as_ref()
-                        .and_then(|receiver| receiver.symbol.clone()),
-                    below: above.parts,
-                    at: boundary,
-                    in_service: in_service.take(),
-                });
+                for path in &paths {
+                    out.push(RouteSegment {
+                        file: site.file.clone(),
+                        line: site.line,
+                        method: method.to_uppercase(),
+                        path: path.clone(),
+                        handler: site
+                            .handler
+                            .as_ref()
+                            .and_then(|handler| handler.name.clone()),
+                        owner: site
+                            .receiver
+                            .as_ref()
+                            .and_then(|receiver| receiver.symbol.clone()),
+                        below: above.parts.clone(),
+                        at: boundary.clone(),
+                        in_service: in_service.take(),
+                    });
+                }
             }
         }
         out
