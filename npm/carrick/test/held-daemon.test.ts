@@ -22,6 +22,7 @@ import { askHeld, ensureHeld } from "../src/held/client.ts";
 import { liveEntries, writeEntry } from "../src/held/registry.ts";
 import { lockPath as heldLockPath, logPath, socketPath } from "../src/held/paths.ts";
 import { compilerLinesEnabled } from "../src/facts/enabled.ts";
+import { takeLock } from "../src/hook/lock.ts";
 
 const MIN = 60_000;
 const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
@@ -342,7 +343,19 @@ test("a second ensureHeld starts nothing; with the switch off, none starts", () 
   }
 });
 
-test("over the socket: none, cold, ready; a second daemon on the same root does not start", async () => {
+test("a daemon does not start when another live process holds the root's lock", async () => {
+  const w = world(["api"]);
+  try {
+    assert.equal(takeLock(heldLockPath(w.root, w.home), process.ppid, Date.now(), 30_000), true);
+    const deps = { root: w.root, home: w.home, env: { ...ON }, programs: async () => w.inits, runtime: { start: async () => ({ state: "error" as const, reason: "x" }) } };
+    assert.equal(await serve(deps, {}), false);
+    assert.equal(fs.existsSync(socketPath(w.root, w.home)), false);
+  } finally {
+    w.done();
+  }
+});
+
+test("over the socket: none, cold, ready", async () => {
   const w = world(["api"]);
   const runtime: ServiceRuntime = {
     start: async () => ({
@@ -362,8 +375,6 @@ test("over the socket: none, cold, ready; a second daemon on the same root does 
     const ready = await askHeld(w.root, [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit" });
     assert.equal(ready.state, "ready");
     assert.deepEqual(ready.lines, [LINE]);
-    // The lock is held by this process (the daemon), so another serve returns false.
-    assert.equal(await serve(deps, { spawner: process.ppid, signal: new AbortController().signal }), false);
     // No daemon: unavailable, never a throw.
     assert.equal((await askHeld(w.root + "-none", [w.file("api")], { env: ON, home: w.home, session: "s", kind: "edit" })).state, "unavailable");
     // Switch off: no connection is tried.
