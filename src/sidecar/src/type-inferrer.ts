@@ -1767,10 +1767,15 @@ export class TypeInferrer {
       // response. There the recovery is restricted to an argument the SOURCE
       // annotates (`satisfies` / `as` / `<T>`): the developer stated the
       // contract, so it is a claim rather than a guess.
+      // carrick#4269: a send that returns the reply it was called on
+      // (`reply.send(x)`, `res.json(x)`) hands back the framework's own
+      // parameter, which is transport whatever members it declares.
+      const handsBackParameter = this.returnsHandlerParameterType(func, awaitedType);
       const machinery =
         unwrapResult.verifiedMachinery === true ||
         this.typeIsOrContainsResponseMachinery(awaitedType) ||
-        this.returnsLabelledSend(func);
+        this.returnsLabelledSend(func) ||
+        handsBackParameter;
       const unresolvable = awaitedType.isAny() || awaitedType.isUnknown();
       if (machinery || unresolvable) {
         const recovered = this.recoverPayloadFromReturnStatements(
@@ -1784,6 +1789,30 @@ export class TypeInferrer {
               "contract; recovered the payload from the response helper's argument"
           );
           return this.inferredFromRecoveredPayload(request, recovered);
+        }
+        if (handsBackParameter) {
+          const declaredTop = this.sentValuesDeclaredTop(func);
+          if (declaredTop) {
+            this.log(
+              `Return at ${request.file_path}:${request.line_number} sends a value its ` +
+                `code declares \`${declaredTop}\`; that is the body's type`
+            );
+            const inferred = this.createInferredType(
+              request,
+              declaredTop,
+              false,
+              this.getNodeLocation(func)
+            );
+            inferred.any_provenance = [
+              {
+                path: '',
+                kind: declaredTop,
+                reason: 'declared',
+                detail: `the handler sends a value its code declares \`${declaredTop}\``,
+              },
+            ];
+            return inferred;
+          }
         }
         // Nothing recoverable. Reject a wrapper envelope that IS or CONTAINS
         // framework machinery (carrick#371): `withApiWrapper({ handler: () =>
@@ -3099,6 +3128,52 @@ export class TypeInferrer {
    * keys. Its result is transport whatever its type looks like, so the body
    * is read from the send's argument.
    */
+  /**
+   * True when the handler's awaited return is the type of one of its own
+   * parameters, declared outside the repository (carrick#4269): the reply a
+   * fluent send hands back (`reply.send(x)` returns `reply`). That value is
+   * the object the framework passed in, never the body. A type the
+   * repository declares is not read this way: a function returning its own
+   * options type returns data.
+   */
+  private returnsHandlerParameterType(func: FunctionLike, awaitedType: Type): boolean {
+    if (awaitedType.isAny() || awaitedType.isUnknown()) return false;
+    const symbol = awaitedType.getSymbol() ?? awaitedType.getAliasSymbol();
+    if (!this.symbolIsLibOrExternalOrigin(symbol)) return false;
+    return func
+      .getParameters()
+      .some((parameter) => parameter.getType().compilerType === awaitedType.compilerType);
+  }
+
+  /**
+   * `any` or `unknown` when every returned send hands over a value whose code
+   * declares that top type (`reply.send(request.body)` with `body: unknown`),
+   * else `undefined`. The body is read where a send reads it: the slot a
+   * label states, else the first argument.
+   */
+  private sentValuesDeclaredTop(func: FunctionLike): 'any' | 'unknown' | undefined {
+    const kinds = new Set<'any' | 'unknown'>();
+    const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    if (branches.length === 0) return undefined;
+    for (const branch of branches) {
+      const call = this.peelTransparentExpression(branch);
+      if (!Node.isCallExpression(call)) return undefined;
+      const labelled = this.statedParams.sendAt(call);
+      const slot = labelled !== undefined && labelled !== 'setter' ? labelled.arg : 0;
+      const arg = call.getArguments()[slot];
+      if (!arg || Node.isSpreadElement(arg)) return undefined;
+      const sent = this.unwrapPromiseType(
+        this.unwrapJsonStringifyArg(this.peelTransparentExpression(arg)).getType()
+      );
+      if (sent.isAny()) kinds.add('any');
+      else if (sent.isUnknown()) kinds.add('unknown');
+      else return undefined;
+    }
+    return kinds.size === 1 ? [...kinds][0] : 'any';
+  }
+
   private returnsLabelledSend(func: FunctionLike): boolean {
     if (!this.statedParams.readsReplies) return false;
     return this.responseReturnedExpressions(func)
