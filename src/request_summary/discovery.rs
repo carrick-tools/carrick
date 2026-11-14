@@ -231,6 +231,9 @@ pub struct Discovery {
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
+    /// The calls whose stop is a sibling's, saved beside the ends the walk
+    /// found (carrick#4474); the fold keeps these on a row line.
+    pub beside_at: std::collections::BTreeSet<(String, u32, u32)>,
     /// The line and the callee as written of each `missed_inside` call, by
     /// file and SWC span: what an unread site states of it
     /// ([`crate::unread_sites`], carrick#3688 U3).
@@ -3417,7 +3420,11 @@ impl<'a> Walker<'a> {
                     .counts
                     .entry(format!("stop/{}/beside_ends", stop.as_str()))
                     .or_default() += 1;
-                discovery.sites.push(record(None, chain, Some(stop)));
+                let site = record(None, chain, Some(stop));
+                discovery
+                    .beside_at
+                    .insert((site.file.clone(), site.span_start, site.span_end));
+                discovery.sites.push(site);
             }
         }
         for inner in body.nested.iter().chain(&body.detached) {

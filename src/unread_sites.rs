@@ -102,6 +102,12 @@ pub struct UnreadSite {
     /// the wire.
     #[serde(skip)]
     listed: bool,
+    /// A stop read inside another service's function on a call that also
+    /// found an end: its call is on a row line by construction, so the fold
+    /// keeps it past the row-line drop (carrick#4474, #4151). Not on the
+    /// wire.
+    #[serde(skip)]
+    pub(crate) beside: bool,
 }
 
 impl UnreadSite {
@@ -114,6 +120,7 @@ impl UnreadSite {
     pub(crate) fn unread_lead(call: &PossibleCall) -> Self {
         UnreadSite {
             listed: false,
+            beside: false,
             ..Self::listed(call)
         }
     }
@@ -136,6 +143,7 @@ impl UnreadSite {
             role: call.role.clone(),
             ends: call.ends.clone(),
             listed: true,
+            beside: false,
         }
     }
 
@@ -188,6 +196,7 @@ impl UnreadSite {
             role: None,
             ends: Vec::new(),
             listed: false,
+            beside: false,
         }
     }
 
@@ -209,6 +218,7 @@ impl UnreadSite {
             role: role_of(&stop.end.role, stop.end.op.as_deref()).map(str::to_string),
             ends: Vec::new(),
             listed: false,
+            beside: false,
         }
     }
 }
@@ -251,6 +261,7 @@ impl UnreadSite {
             role: Some("consumer".to_string()),
             ends: Vec::new(),
             listed: false,
+            beside: false,
         }
     }
 }
@@ -279,6 +290,7 @@ impl UnreadSite {
             role: lead.role.map(str::to_string),
             ends: Vec::new(),
             listed: false,
+            beside: false,
         }
     }
 }
@@ -311,7 +323,14 @@ pub fn from_scan(
     }
     for site in discovery.sites.iter().filter(|site| site.end.is_none()) {
         if let Some(reason) = site.stop {
-            out.push(UnreadSite::of_discovery(site, reason));
+            out.push(UnreadSite {
+                beside: discovery.beside_at.contains(&(
+                    site.file.clone(),
+                    site.span_start,
+                    site.span_end,
+                )),
+                ..UnreadSite::of_discovery(site, reason)
+            });
         }
     }
     for at in &discovery.missed_inside {
@@ -346,6 +365,7 @@ pub fn from_scan(
                 .map(str::to_string),
             ends: Vec::new(),
             listed: false,
+            beside: false,
         });
     }
     // A walk that passed a call into a package the scan ended without an
@@ -373,6 +393,7 @@ pub fn from_scan(
             .filter(|lead| crate::possible_calls::class_only_graphql(lead))
             .map(|lead| UnreadSite {
                 listed: false,
+                beside: false,
                 ..UnreadSite::listed(&crate::possible_calls::from_lead(lead))
             }),
     );
@@ -450,6 +471,7 @@ pub fn with_unanswered(
             role: None,
             ends: Vec::new(),
             listed: false,
+            beside: false,
         });
     }
     stops
@@ -479,6 +501,7 @@ pub(crate) fn of_decorator_path(
         role: None,
         ends: Vec::new(),
         listed: false,
+        beside: false,
     }
 }
 
@@ -602,6 +625,7 @@ pub(crate) fn of_own_decorators(
             role: found.role.clone(),
             ends: Vec::new(),
             listed: false,
+            beside: false,
         });
     }
     out
@@ -745,6 +769,7 @@ pub fn attach(
     let mut rows: Vec<UnreadSite> = listed.iter().map(UnreadSite::listed).collect();
     rows.extend(stops.into_iter().map(|row| UnreadSite {
         listed: false,
+        beside: false,
         ..row
     }));
     // A site the decided pass could have scoped had the trace's ask
@@ -953,6 +978,7 @@ mod tests {
             role: None,
             ends: Vec::new(),
             listed: false,
+            beside: false,
         }
     }
 
