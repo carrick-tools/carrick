@@ -72,6 +72,8 @@ pub enum Stop {
     OwnerUnknown,
     /// A row resting only on a label slot, with no reader agreeing.
     Uncorroborated,
+    /// A library label whose check against the package's declarations came back unchecked for a reason other than the time budget.
+    LabelUnchecked,
     /// A route's instance is handed to a call no verified edge reads.
     MountUnverified,
     /// The function holding the receiver is called by nothing and handed to no library.
@@ -185,7 +187,7 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 57] = [
+    pub const ALL: [Stop; 58] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -209,6 +211,7 @@ impl Stop {
         Stop::NoMethod,
         Stop::OwnerUnknown,
         Stop::Uncorroborated,
+        Stop::LabelUnchecked,
         Stop::MountUnverified,
         Stop::EntryPoint,
         Stop::RunsByLibrary,
@@ -271,6 +274,7 @@ impl Stop {
             Stop::NoMethod => "no_method",
             Stop::OwnerUnknown => "owner_unknown",
             Stop::Uncorroborated => "uncorroborated",
+            Stop::LabelUnchecked => "label_unchecked",
             Stop::MountUnverified => "mount_unverified",
             Stop::EntryPoint => "entry_point",
             Stop::RunsByLibrary => "runs_by_library",

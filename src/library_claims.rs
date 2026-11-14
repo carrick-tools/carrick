@@ -1033,7 +1033,8 @@ pub fn read(
     // The word each check that did not verify saves a dropped call with
     // (carrick#3947, carrick#3946), where the verdict at its position names
     // it: `failed` is `uncorroborated`, a check the verifier's time budget
-    // did not reach `unanswered`. Any other `unchecked` saves nothing.
+    // did not reach `unanswered`, any other `unchecked` `label_unchecked`
+    // (carrick#4162).
     let unverified_words: HashMap<(String, String), Stop> = checks
         .iter()
         .zip(&verdicts)
@@ -1045,6 +1046,8 @@ pub fn read(
                 Stop::Uncorroborated
             } else if verdict.not_reached_in_time() {
                 Stop::Unanswered
+            } else if verdict.verdict == SemanticsVerdict::Unchecked {
+                Stop::LabelUnchecked
             } else {
                 return None;
             };
@@ -1339,9 +1342,11 @@ impl Reading<'_, '_> {
 
     /// Why the call states no row, with the op the reason is for, when the
     /// reader read it and dropped it (carrick#3947, carrick#3946): a name
-    /// slot a verified op read no name at, then a check the verifier's time
-    /// budget did not reach (`unanswered`), then a check answered `failed`
-    /// (`uncorroborated`), as `words` spells each check. `None` when no
+    /// slot a verified op read no name at, then by a fixed rank (carrick#4162)
+    /// a check the verifier's time budget did not reach (`unanswered`), a
+    /// check answered `unchecked` for another reason (`label_unchecked`), a
+    /// check answered `failed` (`uncorroborated`), as `words` spells each
+    /// check. `None` when no
     /// claim that states a message row applied here, or none of its checks
     /// has a word.
     fn unstated(&self, words: &HashMap<(String, String), Stop>) -> Option<(Stop, LibraryOp)> {
@@ -1357,11 +1362,13 @@ impl Reading<'_, '_> {
                     .map(|word| (*word, *op))
             })
             .collect();
-        worded
-            .iter()
-            .find(|(word, _)| *word == Stop::Unanswered)
-            .or_else(|| worded.first())
-            .copied()
+        // A fixed rank, not the order of the checks (carrick#4162).
+        let rank = |word: Stop| match word {
+            Stop::Unanswered => 0,
+            Stop::LabelUnchecked => 1,
+            _ => 2,
+        };
+        worded.iter().min_by_key(|(word, _)| rank(*word)).copied()
     }
 
     /// The op of the first claim on `through` that would state a message
@@ -3377,8 +3384,8 @@ mod tests {
         let lines: Vec<u32> = verified.rows.iter().map(|row| row.line).collect();
         assert_eq!(lines, vec![3, 4, 5], "{verified:#?}");
         assert!(verified.leads.is_empty(), "{:?}", verified.leads);
-        // Any other `unchecked`, and a verdict that names another check,
-        // save nothing here.
+        // Any other `unchecked` is saved as `label_unchecked`; a verdict that
+        // names another check saves nothing here.
         let other = read(&sites, &[bus()], None, |checks| {
             Ok(checks
                 .iter()
@@ -3391,7 +3398,18 @@ mod tests {
                 })
                 .collect())
         });
-        assert!(other.leads.is_empty(), "{:?}", other.leads);
+        assert_eq!(
+            saved(&other),
+            vec![
+                (3, Stop::LabelUnchecked, Some("pubsub"), Some("producer")),
+                (4, Stop::LabelUnchecked, Some("pubsub"), Some("producer")),
+                (5, Stop::LabelUnchecked, Some("pubsub"), Some("consumer")),
+                (6, Stop::LabelUnchecked, Some("pubsub"), Some("producer")),
+                (8, Stop::LabelUnchecked, Some("pubsub"), Some("consumer")),
+            ],
+            "{:?}",
+            other.leads
+        );
         let swapped = read(&sites, &[bus()], None, |checks| {
             Ok(checks
                 .iter()
@@ -3408,6 +3426,77 @@ mod tests {
                 .collect())
         });
         assert!(swapped.leads.is_empty(), "{:?}", swapped.leads);
+    }
+
+    /// carrick#4162: a check answered `unchecked` for a reason other than the
+    /// time budget saves its call as `label_unchecked`, ranked between the
+    /// budget (`unanswered`) and a `failed` check (`uncorroborated`) when one
+    /// call asks two checks.
+    #[test]
+    fn a_check_unchecked_for_a_fixed_reason_ranks_between_budget_and_failed() {
+        let dual = export(json!({
+            "package": "@fixture/dual", "version": "1.0.0", "specifier": "@fixture/dual",
+            "export": "dual", "role": "broker",
+            "claims": [
+                { "kind": "op", "op": "send", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "payload": { "arg": 1 },
+                  "name_scope": { "scope": "global", "namespace": null } },
+                { "kind": "op", "op": "receive", "member": "emit", "on": "export",
+                  "name": { "arg": 0 }, "handler": { "arg": 1 },
+                  "name_scope": { "scope": "global", "namespace": null } }
+            ]
+        }));
+        let sites = sites_of(&[(
+            "src/dual.ts",
+            "import { dual } from \"@fixture/dual\";\n\
+             export function go() { dual.emit(\"a.b\", {}); }\n",
+        )]);
+        let word = |send: (SemanticsVerdict, Option<&str>),
+                    receive: (SemanticsVerdict, Option<&str>)| {
+            let rows = read(&sites, std::slice::from_ref(&dual), None, |checks| {
+                assert_eq!(checks.len(), 2, "one call asks two checks: {checks:#?}");
+                Ok(checks
+                    .iter()
+                    .map(|check| {
+                        let (verdict, reason) = if check.claim_id.contains(":send:") {
+                            send
+                        } else {
+                            receive
+                        };
+                        SemanticsResult {
+                            claim_id: check.claim_id.clone(),
+                            receiver: check.receiver.clone(),
+                            verdict,
+                            reason: reason.map(str::to_string),
+                            declarations: Vec::new(),
+                        }
+                    })
+                    .collect())
+            });
+            assert!(rows.rows.is_empty(), "{rows:#?}");
+            let saved = saved(&rows);
+            assert_eq!(saved.len(), 1, "{saved:?}");
+            saved[0].1
+        };
+        use SemanticsVerdict::{Failed, Unchecked};
+        // (a) a failed check and an unchecked one: the unchecked one.
+        assert_eq!(
+            word((Failed, None), (Unchecked, Some("member_untyped"))),
+            Stop::LabelUnchecked
+        );
+        // (b) a budget check and another unchecked one: the budget.
+        assert_eq!(
+            word(
+                (Unchecked, Some("budget")),
+                (Unchecked, Some("claim_invalid"))
+            ),
+            Stop::Unanswered
+        );
+        // (c) unchecked with no reason at all.
+        assert_eq!(
+            word((Unchecked, None), (Failed, None)),
+            Stop::LabelUnchecked
+        );
     }
 
     /// carrick#3947: a verified op at a call whose name slot reads no name,
