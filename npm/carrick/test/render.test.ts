@@ -304,6 +304,49 @@ test("a deleted file says so and names the problem it leaves", () => {
   assert.equal(lines.length, 2);
 });
 
+/** A deleted file whose index answer holds `rows` rows, each with `counterparts` counterparts. */
+function deletedWith(rows: number, counterparts: number): CheckResult {
+  const base = fixture("check-deleted.json");
+  const template = base.items![0]!;
+  const counterpart = template.counterparts![0]!;
+  return {
+    ...base,
+    file: "src/gone/widgets.ts",
+    items: Array.from({ length: rows }, (_, index) => ({
+      ...template,
+      path: `/api/widgets/${index}`,
+      verdict: undefined,
+      counterparts: Array.from({ length: index === 0 ? counterparts : 0 }, () => counterpart),
+    })),
+  };
+}
+
+test("a deleted file the index holds no rows for prints nothing, on the edit, late and Stop paths", () => {
+  const result = deletedWith(0, 0);
+  assert.equal(renderPostToolUse(result, "src/gone/widgets.ts"), null);
+  assert.equal(renderPostToolUse(result, "src/gone/widgets.ts", { late: true }), null);
+  assert.equal(renderPostToolUse(result, "src/gone/widgets.ts", { uses: false, late: true }), null);
+  assert.equal(sessionCheckedLines([], [{ result, where: "src/gone/widgets.ts" }]).text.includes("gone from disk"), false);
+  assert.equal(sessionCheckedLines([{ result, where: "src/gone/widgets.ts" }], [{ result, where: "src/gone/widgets.ts" }]).text.includes("gone from disk"), false);
+});
+
+test("a deleted file with 2 rows and 3 counterparts keeps its line", () => {
+  const result = deletedWith(2, 3);
+  const line =
+    "Carrick: src/gone/widgets.ts is gone from disk and the index still holds 2 row(s) for it, with 3 counterpart(s) still on the other side.";
+  assert.equal((renderPostToolUse(result, "src/gone/widgets.ts") ?? "").split("\n")[0], line);
+  assert.equal((renderPostToolUse(result, "src/gone/widgets.ts", { late: true }) ?? "").split("\n")[0], line);
+  assert.match(sessionCheckedLines([], [{ result, where: "src/gone/widgets.ts" }]).text, new RegExp(line.replace(/[()]/g, "\\$&")));
+});
+
+test("a deleted file with 1 row and 0 counterparts keeps its line", () => {
+  const result = deletedWith(1, 0);
+  const line =
+    "Carrick: src/gone/widgets.ts is gone from disk and the index still holds 1 row(s) for it, with 0 counterpart(s) still on the other side.";
+  assert.equal((renderPostToolUse(result, "src/gone/widgets.ts") ?? "").split("\n")[0], line);
+  assert.match(sessionCheckedLines([], [{ result, where: "src/gone/widgets.ts" }]).text, new RegExp(line.replace(/[()]/g, "\\$&")));
+});
+
 test("a file with nothing to report prints nothing", () => {
   for (const name of ["check-silent.json", "check-clean.json"]) {
     const result = fixture(name);
