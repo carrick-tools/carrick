@@ -10,7 +10,7 @@ are invented.
 
 | File | Call line | What stands | Why |
 |---|---|---|---|
-| `two-lines.ts` | 3, 4 | `POST /z/a` and `POST /z/b`, each from the request summary, graph role `wrapper_call`, requests `1` and `2` | One call per line: the wrapper row states the fact's operation and gives way to it. |
+| `two-lines.ts` | 3, 4 | `POST /z/a` and `POST /z/b`, each from the request summary, graph role `network_request`, requests `1` and `2` | One call per line: the wrapper row states the fact's operation and gives way to it. The fact's graph row keeps the wrapper row's role: the call is the request. |
 | `same-twice.ts` | 3 | one `POST /w/a`, from the request summary, request `1` | Two identical calls on one line: the wrapper rows were the same row, keyed by place and operation. The second call's fact is kept out by the first's. |
 | `two-same.ts` | 3 | `POST /x/a` and `POST /x/b`, both from the request summary, requests `1` and `2` | Two calls on one line, each stating its own site row: a row keyed as the other call's site row is that call's, so each fact replaces only the wrapper row of its own operation. |
 | `two-wrappers.ts` | 4 | both from the request summary, each with its own graph client, host and base (`sendA`, `a.example.test`, none; `sendB`, none, `env`) | As `two-same.ts`, through two wrappers. Each fact's graph row reads the removed wrapper row of its own operation. |
