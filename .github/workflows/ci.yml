@@ -167,6 +167,27 @@ jobs:
           crate: cargo-nextest
           version: "0.9.148"
 
+      # carrick#4349: the Yarn releases tests/action_install_test.rs pins,
+      # fetched once per version list and then read with the network off, so a
+      # registry hiccup cannot fail an unrelated PR. The test reads the same
+      # list (tests/fixtures/action-install/yarn-versions) and the same folder.
+      - name: Restore Yarn releases
+        if: matrix.shard == 'n9'
+        id: yarn-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/carrick-tests/corepack
+          key: ${{ runner.os }}-corepack-${{ hashFiles('tests/fixtures/action-install/yarn-versions') }}
+
+      - name: Prepare Yarn releases
+        if: matrix.shard == 'n9'
+        run: |
+          home="$HOME/.cache/carrick-tests/corepack"
+          for version in $(cat tests/fixtures/action-install/yarn-versions); do
+            [ -d "$home/v1/yarn/$version" ] || COREPACK_HOME="$home" corepack prepare "yarn@$version"
+          done
+          echo "CARRICK_TEST_COREPACK_HOME=$home" >> "$GITHUB_ENV"
+
       # carrick#3762: the oldest release that must still read this build's
       # index blobs (tests/fixtures/blob-reader-floor/FLOOR) and the latest
       # release, for previous_release_reads_blob_test. One 16 MB release asset
