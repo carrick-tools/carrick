@@ -4410,6 +4410,72 @@ mod tests {
         );
     }
 
+    /// carrick#4266, the message roles: a topic read off a loop head over a
+    /// stated list of objects (`t.topic`) is each element's topic, never
+    /// `unread_expression`: one name per element, as for a list of texts
+    /// (#4245), which for a broker waits on the site path's kind question
+    /// (counted `kind_asked`, no lead). A list with a topic the code does
+    /// not state keeps `unread_expression`.
+    #[test]
+    fn a_topic_read_off_a_loop_head_over_stated_objects_is_each_element_s() {
+        let Some((rows, _)) = read_walked(
+            &[(
+                "src/topics.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 declare function make(): string;\n\
+                 const TOPICS = [{ topic: \"orders.created\" }, { topic: \"orders.shipped\" }];\n\
+                 for (const t of TOPICS) bus.publish(t.topic, {});\n\
+                 for (const t of [{ topic: \"a.one\" }, { topic: make() }]) bus.publish(t.topic, {});\n",
+            )],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        let mut leads: Vec<(u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        leads.sort();
+        assert_eq!(leads, vec![(5, Stop::UnreadExpression)], "{:?}", rows.leads);
+        assert_eq!(
+            rows.names.count(NameOutcome::KindAsked),
+            1,
+            "{:?}",
+            rows.names
+        );
+    }
+
+    /// carrick#4266 with #4245, the socket role: an event read off a loop
+    /// head over a stated list of objects (`e.name`) is one row per element
+    /// at the call.
+    #[test]
+    fn a_socket_event_read_off_a_loop_head_over_stated_objects_is_one_row_per_element() {
+        let Some((rows, _)) = read_walked(
+            &[(
+                "src/hub.ts",
+                "import { io } from \"@fixture/socket\";\n\
+                 const EVENTS = [{ name: \"order.created\" }, { name: \"order.shipped\" }];\n\
+                 for (const e of EVENTS) io.on(e.name, () => {});\n",
+            )],
+            &[loop_socket("io", "server")],
+            true,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            placed(&rows),
+            vec![
+                ("hub.ts".to_string(), 3, "order.created".to_string()),
+                ("hub.ts".to_string(), 3, "order.shipped".to_string()),
+            ],
+            "{rows:#?}"
+        );
+        assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
     /// Where the walk gave the text reader no compiler rows, today's reading
     /// stands, counted `no_rows`, and no lead is saved (carrick#3504 B10-3,
     /// Q-B3a): a failed walk loses no row.
