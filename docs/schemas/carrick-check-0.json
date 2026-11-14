@@ -198,7 +198,7 @@
         },
         "deferred": {
           "const": true,
-          "description": "Present, and true, only when ran is none because the call was `--recheck --no-rescan` and the edit needs a re-scan, which it did not start. The items are the indexed ones."
+          "description": "Present, and true, only when ran is none because the call was `--recheck --no-rescan` and the edit was not answered without a re-scan. The items are the indexed ones."
         },
         "new_functions": {
           "type": "array",

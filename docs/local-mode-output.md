@@ -90,12 +90,11 @@ whose own budget is no longer: a miss at ten seconds does not switch off a
 re-check given three minutes. A misses file written before that field existed
 reads as no misses.
 `--no-rescan` (with `--recheck`, on one file or on `--each`) asks the question
-"does this edit need a re-scan" and never starts one. A file that needs none
-is answered as without the flag: unchanged or gone, an edit that reads the
-same, no service reads it, a known miss. Any other file comes back with
-`ran: none`, the indexed rows, `new_functions`, and `deferred: true`; nothing
-is staged and no miss is recorded. The caller makes the re-check itself later
-with `--recheck` alone.
+"does this edit need a re-scan" and never starts one. A file that is unchanged
+or gone, an edit that reads the same, and a known miss are answered as without
+the flag. Any other edit comes back with `ran: none`, the indexed rows,
+`new_functions`, and `deferred: true`. Nothing is staged and no miss is
+recorded. Run `--recheck` alone for the fresh answer.
 `carrick check --each <file>... --recheck --json` answers several files in one
 process, each element of the printed JSON array the body `check <file>
 --recheck --json` prints for that file alone; the post-edit hook asks it for a
@@ -252,7 +251,7 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, as `{ "name": string, "line": int, "lead"?: object }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so present on a `none` that missed its budget too. Absent when the edit added no function and when the index could not be read |
 | `new_functions[].lead` | object \| absent | an indexed function, in any repo of the index and outside this file, whose body reads like this one's, as `{ name, repo, file, line, end_line, score, basis, return_types?, callers, callers_total, also }`. `basis` is `tokens` (the bodies share most of their words) or `name` (the same name and a body that shares a fair part of its words). A function that calls the other, or is called by it, is never a lead. `return_types` (`[this one's, the lead's]`) is set when both are written out and differ. `callers` names up to three indexed callers of the lead and `callers_total` counts them all. `also` names up to two more functions like the lead, each `{ name, file, line }`. Read from the index on this machine, with no network call. Absent when nothing is close enough, which is the usual answer |
 | `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
-| `deferred` | `true` \| absent | on a `none` from `--recheck --no-rescan` for an edit that needs a re-scan: the call was asked not to start one, so the rows are the indexed ones. Absent otherwise |
+| `deferred` | `true` \| absent | on a `none` from `--recheck --no-rescan` when the edit was not answered without a re-scan: none was started, so the rows are the indexed ones. Absent otherwise |
 | `deadline` | `true` \| absent | on a `none` whose re-check started and ran past its budget, so the rows are the indexed ones because time ran out. With it, as with `known_miss`, `check <file> --recheck` exits 2. Absent otherwise |
 | `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
 | `moved` | array \| absent | rows outside the edited file whose state this edit moved (below). Absent when the edit moved nothing |
