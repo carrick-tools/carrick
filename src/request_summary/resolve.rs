@@ -159,9 +159,8 @@ impl ModuleBinding {
     /// An entry of the carrick#3794 class: a declaration in a block, in a
     /// function written inside a body, or a function declared in a body.
     /// The table holds them, and every reader refuses them at its choke
-    /// point (the text reader's `declared_entry`, [`Self::values_read`], the
-    /// procedures walk's `binding`) until its own step opens them, so no
-    /// reader answers differently for having them.
+    /// point ([`Self::values_read`], the procedures walk's `binding`) until
+    /// its own step opens them; the text reader reads them (T2).
     pub(super) fn scoped_entry(&self) -> bool {
         !matches!(self.declared, Declared::Module | Declared::Body(_))
             || self.kind == BindingKind::Function
@@ -1782,6 +1781,10 @@ pub(super) enum ValueAt {
         lo: u32,
         hi: u32,
         branches: Vec<ValueAt>,
+        /// Written `a ?? b`: `b` is held only where `a` may be nullish, so a
+        /// left the compiler types as one non-nullable text is the whole
+        /// value (carrick#3835).
+        nullish: bool,
     },
     /// An object literal's entries in source order; a key may be computed.
     Entries(Vec<(ValueAt, ValueAt)>),
@@ -2886,6 +2889,7 @@ impl Reader<'_> {
                     lo: binding.span.lo.0,
                     hi: default.span().hi.0,
                     branches: vec![ValueAt::Unread, text_of(default, &identity)],
+                    nullish: false,
                 }),
                 reassigned: false,
                 plain: false,
@@ -5585,7 +5589,12 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             return;
         };
         let parts = interpolated(piece_probe(&on, "p_env"));
-        let [ValueAt::Alt { lo, hi, branches }] = parts.as_slice() else {
+        let [
+            ValueAt::Alt {
+                lo, hi, branches, ..
+            },
+        ] = parts.as_slice()
+        else {
             panic!("{parts:?}");
         };
         assert_eq!(

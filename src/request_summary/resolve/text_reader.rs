@@ -772,10 +772,24 @@ impl<'a> Resolver<'a> {
                 member: false,
                 ..
             } => self.text_of_name(file, *lo, *hi),
-            ValueAt::Alt { branches, .. } => branches
-                .iter()
-                .flat_map(|branch| self.text_of_branch(file, branch))
-                .collect(),
+            ValueAt::Alt {
+                branches, nullish, ..
+            } => {
+                // `a ?? b` holds `b` only where `a` may be nullish: a left
+                // the compiler types as one non-nullable text is the value
+                // alone. A nullable left is both sides, and a left no
+                // reader states stays a hole beside `b`, so no consumer
+                // takes `b` alone (carrick#3835).
+                let held = match branches.as_slice() {
+                    [left, _] if *nullish && self.is_non_nullable_text(file, left) => {
+                        &branches[..1]
+                    }
+                    all => all,
+                };
+                held.iter()
+                    .flat_map(|branch| self.text_of_branch(file, branch))
+                    .collect()
+            }
             ValueAt::Member {
                 lo,
                 hi,
@@ -914,6 +928,27 @@ impl<'a> Resolver<'a> {
             }
             _ => Err(UnreadExpression),
         }
+    }
+
+    /// Whether `value` is a name the compiler types as `string` or as
+    /// string literals alone: no `undefined`, no `null`, so a `??` after it
+    /// is never taken.
+    fn is_non_nullable_text(&self, file: &Path, value: &ValueAt) -> bool {
+        let ValueAt::Read {
+            lo,
+            hi,
+            member: false,
+            ..
+        } = value
+        else {
+            return false;
+        };
+        self.row_at(file, *lo, *hi, Kind::Ident)
+            .and_then(Row::type_text)
+            .is_some_and(|text| {
+                text.trim() == "string"
+                    || !super::super::site_record::literals_of_type(text).is_empty()
+            })
     }
 
     /// One branch of a choice. A name the compiler types as a union of
@@ -1128,15 +1163,7 @@ impl<'a> Resolver<'a> {
             .files
             .get(path)?
             .module_bindings
-            .get(&(line, symbol.clone()))
-            // A block-scoped or nested local is in the table, and no text
-            // read opens it yet (carrick#3794): it reads as no entry. A loop
-            // head is the one the text reader reads (carrick#2093): the
-            // compiler row's declaration line and name key it, so the
-            // compiler settles any shadowing.
-            .filter(|binding| {
-                !binding.scoped_entry() || binding.kind == BindingKind::LoopElement
-            })?;
+            .get(&(line, symbol.clone()))?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }
@@ -2013,45 +2040,64 @@ mod tests {
         resolver.text_values(&path, &text)
     }
 
-    /// carrick#3794 T1: the binding table holds an entry for every block or
-    /// nested local, and the text reader reads none of them yet: each name
-    /// answers as it did before the entry existed. Step T2 replaces this pin
-    /// with the answers.
+    /// What the argument of the one call of `callee` in `blocks.ts` reads as.
+    fn blocks_read(resolver: &Resolver<'_>, on: &Walked, callee: &str) -> Vec<TextValue> {
+        let path = on.path("services/web/src/blocks.ts");
+        let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}: {found:?}");
+        resolver.text_values(&path, &found[0])
+    }
+
+    /// The texts of a read, or the failure when it holds a hole.
+    fn texts_of(got: &[TextValue]) -> Result<Vec<&str>, String> {
+        got.iter()
+            .map(|value| match value {
+                TextValue::Text { text, .. } => Ok(text.as_str()),
+                hole => Err(format!("{hole:?}")),
+            })
+            .collect()
+    }
+
+    /// carrick#3794 T2: a local declared in a block, at module scope or in a
+    /// function written inside a body reads as its initialiser's text, a
+    /// `let` written again in a block as every value it holds.
     #[test]
-    fn no_reader_reads_a_block_or_nested_entry_yet() {
+    fn a_block_or_nested_local_reads_as_its_initialiser_text() {
         let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
             return;
         };
         let resolver = Resolver::new(&on.inputs, &[]);
-        let path = on.path("services/web/src/blocks.ts");
-        let argument = |callee: &str| -> ValueAt {
-            let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
-                .into_iter()
-                .filter(|(file, call, _)| *file == path && call.callee == callee)
-                .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
-                .collect();
-            assert_eq!(found.len(), 1, "{callee}: {found:?}");
-            found[0].clone()
-        };
-        for callee in [
-            "p_if",
-            "p_try",
-            "p_case",
-            "p_bare",
-            "p_loop_body",
-            "p_module_block",
-            "p_callback",
-            "p_callback_block",
-            "p_handler",
-            "p_moved",
-            "p_nested_moved",
-            "p_shadow",
-            "p_shadow_outer",
-            "p_pair_a",
-            "p_pair_b",
-            "p_catch",
+        for (callee, want) in [
+            ("p_if", vec!["order.created"]),
+            ("p_try", vec!["https://example.test/try"]),
+            ("p_case", vec!["case.a"]),
+            ("p_bare", vec!["bare"]),
+            ("p_loop_body", vec!["loop.body"]),
+            ("p_module_block", vec!["module.block"]),
+            ("p_callback", vec!["cb.top"]),
+            ("p_callback_block", vec!["cb.block"]),
+            ("p_handler", vec!["handler.top"]),
+            ("p_moved", vec!["a", "b"]),
         ] {
-            let got = resolver.text_values(&path, &argument(callee));
+            let got = blocks_read(&resolver, &on, callee);
+            assert_eq!(texts_of(&got), Ok(want), "{callee}: {got:?}");
+        }
+    }
+
+    /// A declaration the table refuses, or whose write is never placed, still
+    /// reads as before: F4 gives the refusals a true word.
+    #[test]
+    fn a_name_the_table_refuses_still_reads_as_today() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for callee in ["p_shadow", "p_shadow_outer", "p_catch"] {
+            let got = blocks_read(&resolver, &on, callee);
             assert!(
                 matches!(
                     got.as_slice(),
@@ -2063,9 +2109,21 @@ mod tests {
                 "{callee}: {got:?}"
             );
         }
+        // A nested `let` written again: its write is never placed.
+        let got = blocks_read(&resolver, &on, "p_nested_moved");
+        assert!(
+            matches!(
+                got.as_slice(),
+                [TextValue::Hole {
+                    reason: guards::HoleReason::Reassigned,
+                    ..
+                }]
+            ),
+            "{got:?}"
+        );
         // A loop head is the one block-scoped name the text reader reads
         // (carrick#2093): its list's one element.
-        let looped = resolver.text_values(&path, &argument("p_loop"));
+        let looped = blocks_read(&resolver, &on, "p_loop");
         assert!(
             matches!(looped.as_slice(), [TextValue::Text { text, .. }] if text == "x"),
             "{looped:?}"
@@ -2188,6 +2246,13 @@ mod tests {
         };
         assert_eq!(texts("p_coalesce"), (vec!["/fallback".to_string()], 1));
         assert_eq!(texts("p_or"), (vec!["/or".to_string()], 1));
+        // carrick#3835: a left typed as one non-nullable text is the whole
+        // value of `??`; `||` keeps both sides (as `p_coalesce` does for a nullable left).
+        assert_eq!(texts("p_nullish_typed"), (vec!["/api".to_string()], 0));
+        assert_eq!(
+            texts("p_or_typed"),
+            (vec!["/api".to_string(), "/falsy".to_string()], 0)
+        );
         assert_eq!(
             texts("p_cond"),
             (vec!["/api".to_string(), "/other".to_string()], 0)

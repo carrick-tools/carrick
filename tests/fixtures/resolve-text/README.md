@@ -64,6 +64,8 @@ function whose argument is the local.
 | `p_nullish` | `/a`, `/b` | an unconditional `??=` adds a way and keeps the one that reaches it |
 | `p_hidden` | `/a`, `/b` | a write in an `if` test: the flow refuses the local, and the set stands |
 
+`??` after a name the compiler types as one non-nullable text (carrick#3835): `p_nullish_typed` is `/api` alone, the right side is never taken; `p_or_typed` (`||`) stays `/api` and `/falsy`, an empty text falls through; `p_coalesce` (the left is `string | undefined`) keeps both sides.
+
 `selfread.ts`: `p_self` reads itself; the second read is a recursion hole, and
 reading it again gives the same answer (the mark is released).
 
@@ -194,9 +196,13 @@ compiler's literal type does not answer before the table does.
 | `pair` (two module blocks, one line) | one entry, unplaceable; the same two blocks in a body are a shadow and have none |
 | `item` (loop heads), `err` (`catch`), `same` (declared twice), `n` (a nested parameter's default) | no entry |
 
-No reader reads an entry of these classes yet: every probe above still reads
-as before (`outside_service`). The steps that open each reader replace that
-answer.
+The text reader reads an entry of these classes as its initialiser's text:
+`inIf` `order.created`, `inTry` `https://example.test/try`, `inCase`
+`case.a`, `bare`, `inLoop` `loop.body`, `atModule` `module.block`,
+`inCallback` `cb.top`, `deeper` `cb.block`, `inHandler` `handler.top`, and
+`moved` as `a` and `b`. `nestedMoved` reads `reassigned` (its write is never
+placed). `same`, `item` and `err` read `outside_service`. The value readers
+and the procedures walk still refuse every one of them.
 
 ## Fields a constructor sets from its parameters (`fields.ts`, carrick#3678 S6-2)
 
