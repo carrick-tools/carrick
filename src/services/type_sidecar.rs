@@ -488,6 +488,10 @@ pub struct CheckStubInput {
     pub service_name: String,
     /// Absolute path to the capture stub dir (package.json + types/ tree).
     pub stub_dir: String,
+    /// The service's GraphQL type table (carrick#4403), when its scan
+    /// recorded one: the sidecar reads a producer response's leaves from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_types: Option<crate::graphql::GraphqlTypes>,
 }
 
 /// One side of a matched pair: a service + the surface alias to probe.
@@ -512,6 +516,12 @@ pub struct CheckPairSpec {
     /// for a member typed as this literal. Set on pub/sub only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The root field a GraphQL producer response is read from
+    /// (carrick#4403), copied from its manifest entry. With the producer
+    /// stub's `graphql_types`, the sidecar's `wireFormFor` compares each
+    /// built-in scalar leaf in the type that scalar sends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_root: Option<crate::graphql::GraphqlRoot>,
 }
 
 /// Per-alias capture record (serialization tier + self-check outcome).
@@ -1979,6 +1989,8 @@ enum SidecarRequest {
         request_id: String,
         stub_dir: String,
         aliases: Vec<DefinitionAlias>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graphql_types: Option<crate::graphql::GraphqlTypes>,
     },
     #[serde(rename = "retype_check")]
     RetypeCheck {
@@ -2687,6 +2699,12 @@ pub struct DefinitionAlias {
     /// form is the router's transformer's, which may keep a `Date` as a
     /// `Date`, so the engine prints it as declared until that is known.
     pub procedure: bool,
+    /// The root field a GraphQL producer response is read from
+    /// (carrick#4403), from its entry (a derived alias carries its base
+    /// entry's). With the request's `graphql_types`, the stored text prints
+    /// each built-in scalar leaf in the type that scalar sends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graphql_root: Option<crate::graphql::GraphqlRoot>,
 }
 
 /// A single resolved type definition from the sidecar
@@ -4302,6 +4320,7 @@ impl TypeSidecar {
         &self,
         stub_dir: &str,
         aliases: &[DefinitionAlias],
+        graphql_types: Option<&crate::graphql::GraphqlTypes>,
     ) -> Result<Vec<ResolvedDefinitionResult>, SidecarError> {
         self.ensure_ready()?;
 
@@ -4313,6 +4332,7 @@ impl TypeSidecar {
             request_id: self.next_request_id(),
             stub_dir: stub_dir.to_string(),
             aliases: aliases.to_vec(),
+            graphql_types: graphql_types.cloned(),
         };
 
         self.send_request(&request)?;
@@ -6628,6 +6648,7 @@ mod tests {
             claim,
         };
         let pair = |protocol: ProbeProtocol, type_kind: ProbeTypeKind| CheckPairSpec {
+            graphql_root: None,
             pair_key: "p".into(),
             protocol,
             type_kind,
@@ -6805,6 +6826,7 @@ mod tests {
             SidecarRequest::CheckV2 {
                 request_id: id(),
                 stubs: vec![CheckStubInput {
+                    graphql_types: None,
                     service_name: "api".into(),
                     stub_dir: "/tmp/stub".into(),
                 }],
@@ -6817,9 +6839,11 @@ mod tests {
                 workspace_root: Some("/tmp/workspace".into()),
             },
             SidecarRequest::ResolveDefinitions {
+                graphql_types: None,
                 request_id: id(),
                 stub_dir: "/tmp/stub".into(),
                 aliases: vec![DefinitionAlias {
+                    graphql_root: None,
                     alias: "A".into(),
                     protocol: ProbeProtocol::Http,
                     type_kind: crate::cloud_storage::ManifestTypeKind::Response,
@@ -7244,6 +7268,7 @@ mod tests {
     #[test]
     fn check_pair_and_verdict_wire_shapes() {
         let spec = CheckPairSpec {
+            graphql_root: None,
             pair_key: "p".into(),
             protocol: ProbeProtocol::Pubsub,
             type_kind: ProbeTypeKind::Both,
@@ -7262,6 +7287,7 @@ mod tests {
         assert!(json.contains(r#""type_kind":"both""#));
         assert!(json.contains(r#""topic":"orders""#));
         let http = CheckPairSpec {
+            graphql_root: None,
             protocol: ProbeProtocol::Http,
             topic: None,
             ..spec.clone()
