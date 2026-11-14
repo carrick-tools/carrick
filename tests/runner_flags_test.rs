@@ -493,6 +493,7 @@ process.stdin.on("data", (chunk) => {{
     switch (request.action) {{
       case "position_rows":
         if (!{walk_answers}) {{
+          if ({walk_fails} && root.endsWith("beta")) fs.writeFileSync({died:?}, request.action);
           answer({{ status: "error", errors: ["the stand-in answers nothing else"] }});
           break;
         }}
@@ -530,6 +531,7 @@ process.stdin.resume();
             // The walk modes write rows for every service that lives, so a
             // walk that did not die is a walk that wrote its rows; the rest
             // answer the walk with an error (carrick#4247).
+            walk_fails = matches!(beta_dies, BetaDies::WalkFails),
             walk_answers = matches!(
                 beta_dies,
                 BetaDies::Walk | BetaDies::WalkOnce | BetaDies::AtResolution
