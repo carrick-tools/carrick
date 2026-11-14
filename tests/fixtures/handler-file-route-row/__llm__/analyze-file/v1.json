@@ -1,0 +1,21 @@
+{
+  "mounts": [],
+  "endpoints": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 4,
+      "owner_node": "allV1",
+      "method": "ALL",
+      "path": "/v1/*",
+      "handler_name": "allV1",
+      "pattern_matched": "reply.forward(",
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "response_expression_text": null,
+      "response_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "data_calls": []
+}

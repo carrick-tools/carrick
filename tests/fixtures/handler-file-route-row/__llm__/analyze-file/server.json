@@ -1,0 +1,14 @@
+{
+  "mounts": [
+    {
+      "line_number": 5,
+      "parent_node": "app",
+      "child_node": "router",
+      "mount_path": "/api",
+      "import_source": "./router",
+      "pattern_matched": "app.use("
+    }
+  ],
+  "endpoints": [],
+  "data_calls": []
+}

@@ -1,0 +1,11 @@
+{
+  "_doc": "Answer key for tests/handler_file_route_row_test.rs: every route row the scan stores. The model's rows at src/controllers/v1.ts:4 (ALL /v1/*) and src/controllers/items.ts:4 (GET /items/:id) restate registrations in src/routes.ts and are not stored. self.ts's own registration of h at /a stays beside routes.ts's at /b; graphql.ts and test-helper.ts both register gql and both stay.",
+  "routes": [
+    { "file_location": "src/routes.ts:6", "method": "ALL", "full_path": "/api/v1/*" },
+    { "file_location": "src/routes.ts:7", "method": "GET", "full_path": "/api/items/:id" },
+    { "file_location": "src/routes.ts:8", "method": "GET", "full_path": "/api/b" },
+    { "file_location": "src/controllers/self.ts:8", "method": "GET", "full_path": "/api/a" },
+    { "file_location": "src/graphql.ts:4", "method": "ALL", "full_path": "/api/graphql" },
+    { "file_location": "src/test-helper.ts:5", "method": "ALL", "full_path": "/graphql" }
+  ]
+}
