@@ -1363,12 +1363,19 @@ impl<'a> Outcome<'a> {
     /// The walk found ends, so the stop it also read is not the call's: a
     /// stop read at a call in a sibling's file, whose walk is final, is kept
     /// beside the ends instead of dropped (carrick#4474). `own` says whether
-    /// a file is one of this service's.
+    /// a file is one of this service's. A callback the call hands in is
+    /// written at the call and read by this service's own walk of it, so a
+    /// stop on a callback value (`injected_callee`,
+    /// `callback_into_own_function`) is no stop beside the ends.
     fn drop_stop_for_ends(&mut self, own: impl Fn(&Path) -> bool) {
         if let Some(read_in) = self.stop_read_in
             && self.cycle_at.is_none()
             && self.beside.is_none()
             && !own(read_in)
+            && !matches!(
+                self.stop,
+                Some((_, Stop::InjectedCallee | Stop::CallbackIntoOwnFunction))
+            )
         {
             self.beside = self.stop.take();
         }
