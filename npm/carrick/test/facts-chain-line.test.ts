@@ -416,7 +416,18 @@ test("with CARRICK_CHAIN_LINES unset or 0, the hook's stdout, exit code and file
     );
     return { code: result.code, stdout: result.stdout, written: written.sort() };
   };
-  const rows = baseRows();
+  // An fn row for the edited function, so every arm prints a line and the comparison is not of two empty outputs.
+  const fn = {
+    k: "fn",
+    repo: "orders-api",
+    file: "src/services/lines.ts",
+    line: 1,
+    name: "buildLines",
+    others: [{ repo: "orders-api", file: "src/services/format.ts", line: 3, name: "formatOrder" }],
+    total: 1,
+    text: "fn line for buildLines",
+  };
+  const rows = [...baseRows(), fn];
   const withoutChains = rows.filter((row) => row["k"] !== "chain");
   const envs: Array<Record<string, string>> = [{}, { CARRICK_CONTRACT_LINES: "1" }, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "0" }];
   for (const env of envs) {
@@ -425,12 +436,12 @@ test("with CARRICK_CHAIN_LINES unset or 0, the hook's stdout, exit code and file
     assert.equal(withRows.code, 0, JSON.stringify(env));
     assert.equal(withRows.code, without.code, JSON.stringify(env));
     assert.equal(withRows.stdout, without.stdout, JSON.stringify(env));
-    assert.ok(!withRows.stdout.includes("buildLines ("), JSON.stringify(env));
+    assert.equal(context(withRows.stdout), "fn line for buildLines", JSON.stringify(env));
     assert.deepEqual(withRows.written, without.written, JSON.stringify(env));
   }
-  // Not vacuous: with both switches on the same file prints the chain line.
+  // Not vacuous: with both switches on the same file prints the chain line, then the fn line.
   const on = await observe(rows, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" });
-  assert.ok(context(on.stdout).includes(BUILD_GET), on.stdout);
+  assert.equal(context(on.stdout), `${BUILD_GET}\n\nfn line for buildLines`);
 });
 
 // The store and the refresh.
@@ -498,6 +509,15 @@ test("every chain row of the pinned fixture is ingested and answered by function
   await buildFacts(wire.join("\n"), factsPath(root), [], new Date().toISOString());
   const store = (await openFacts(root))!;
   for (const row of chains) assert.deepEqual(store.chains(row["repo"], row["file"], row["name"]), [row], row["name"]);
+  // Every kept route joins exactly one printable producer response contract row, as the line looks it up.
+  for (const row of chains) {
+    for (const route of row["routes"]) {
+      const joined = store
+        .contracts(route["repo"], route["file"])
+        .filter((one) => one.side === route["side"] && one.label === route["label"] && one.line === route["line"] && one.direction === "response" && typeof one.groups[0]?.lead === "string");
+      assert.equal(joined.length, 1, `${row["name"]} -> ${route["label"]}`);
+    }
+  }
   store.close();
 });
 
