@@ -3057,14 +3057,14 @@ impl Analyzer {
                 | carrick_match::PairOutcome::ProcedureUnserved => {
                     if pairing.held_by_open_literals_only() {
                         unpaired_calls
-                            .extend(unpaired(Some(held_by_routes(&pairing, &pool_endpoints))));
+                            .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
                     }
                 }
                 carrick_match::PairOutcome::Matched
                 | carrick_match::PairOutcome::RouteCaseUnknown => {
                     if pairing.held_by_open_literals_only() {
                         unpaired_calls
-                            .extend(unpaired(Some(held_by_routes(&pairing, &pool_endpoints))));
+                            .extend(unpaired(Some(held_by_routes(&pairing, pool_endpoints))));
                     }
                     // The dispatch case is part of an operation's identity,
                     // so it is part of the consumed key: without it the nine
