@@ -187,6 +187,12 @@ export type FactStore = {
    */
   contracts: (repo: string, file: string) => ContractRow[];
   /**
+   * Every producer response row of an HTTP operation, in wire order, whatever
+   * its file: what the held compiler places checks from. `[]` for a file built
+   * without the `contracts` table, prepared on the first call as `contracts` is.
+   */
+  producerResponses: () => ContractRow[];
+  /**
    * The chain rows of function `name` declared in `file` of `repo`, in wire
    * order. `[]` for a file built without the `chains` table, prepared on the
    * first call as `contracts` is.
@@ -250,6 +256,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     const packageRow = open.prepare("SELECT * FROM pkgs WHERE package = ? ORDER BY id LIMIT 1");
     let contracts: ReturnType<typeof open.prepare> | null | undefined;
     let chains: ReturnType<typeof open.prepare> | null | undefined;
+    let producerResponses: ReturnType<typeof open.prepare> | null | undefined;
     handed = true;
     return {
       meta,
@@ -293,6 +300,20 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         }
         if (contracts === null) return [];
         return contracts.all(repo, rel).map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
+      },
+      producerResponses: () => {
+        if (producerResponses === undefined) {
+          try {
+            producerResponses = open.prepare(
+              "SELECT row FROM contracts WHERE side = 'producer' AND direction = 'response' AND protocol = 'http' ORDER BY id",
+            );
+          } catch {
+            // No table: a file an older package built.
+            producerResponses = null;
+          }
+        }
+        if (producerResponses === null) return [];
+        return producerResponses.all().map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
       },
       chains: (repo, rel, name) => {
         if (chains === undefined) {

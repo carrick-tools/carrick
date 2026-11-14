@@ -9,7 +9,8 @@ import { execFile } from "node:child_process";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { binary } from "../cli.ts";
 import { createLogger } from "../log.ts";
-import { serve, type DaemonDeps, type ServiceInit, type ServiceRuntime } from "./daemon.ts";
+import { serve, type DaemonDeps, type ServiceInit } from "./daemon.ts";
+import { createRuntime } from "./runtime.ts";
 
 const log = createLogger("carrick-held-run");
 
@@ -33,11 +34,6 @@ function readPrograms(root: string, env: NodeJS.ProcessEnv): Promise<ServiceInit
   });
 }
 
-/** Until the request path is wired in, no service has an engine. */
-const runtime: ServiceRuntime = {
-  start: async () => ({ state: "error", reason: "the engine for a service is not wired in yet" }),
-};
-
 async function main(): Promise<void> {
   const root = process.argv.slice(2)[0];
   if (!root) {
@@ -46,7 +42,7 @@ async function main(): Promise<void> {
   }
   const env = process.env;
   if (!compilerLinesEnabled(env)) return;
-  const deps: DaemonDeps = { root, env, programs: () => readPrograms(root, env), runtime };
+  const deps: DaemonDeps = { root, env, programs: () => readPrograms(root, env), runtime: createRuntime({ root, env }) };
   const stop = new AbortController();
   process.once("SIGTERM", () => stop.abort());
   process.once("SIGINT", () => stop.abort());

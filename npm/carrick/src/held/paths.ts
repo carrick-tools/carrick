@@ -27,6 +27,22 @@ export function lockPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.lock`);
 }
 
+/** A service name as one safe path segment (a hash keeps two names that sanitise alike apart). */
+function serviceSegment(service: string): string {
+  const hash = createHash("sha256").update(service).digest("hex").slice(0, 6);
+  return `${service.replace(/[^A-Za-z0-9._-]/g, "_")}-${hash}`;
+}
+
+/** D4: the service's shadow tree, `w/` (its own files) and `v/` (the vendored program). */
+export function shadowDir(root: string, service: string, home?: string): string {
+  return path.join(heldDir(home), rootKey(root), serviceSegment(service));
+}
+
+/** The rows the gate armed and the rows it saved with a reason. */
+export function placedPath(root: string, service: string, home?: string): string {
+  return path.join(heldDir(home), rootKey(root), `${serviceSegment(service)}.placed.json`);
+}
+
 /** One JSON line per request. */
 export function logPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.log`);

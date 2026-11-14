@@ -257,7 +257,7 @@ function takenId(row: Pick<ContractRow, "repo" | "side" | "label" | "file" | "li
 }
 
 /** The once-per-session key of a contract row's group `index`. */
-function contractKey(row: Pick<ContractRow, "repo" | "file" | "side" | "label">, index: number): string {
+export function contractKey(row: Pick<ContractRow, "repo" | "file" | "side" | "label">, index: number): string {
   return `contract::${row.repo}::${row.file}::${row.side}::${row.label}::${index}`;
 }
 
