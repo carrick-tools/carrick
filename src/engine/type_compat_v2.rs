@@ -5122,7 +5122,16 @@ mod tests {
             .unwrap()
             .prescreen_undefined_free = Some(WHY.to_string());
 
-        for producer in ["{ id: string; }", "never[]", "{ a: string } | null", "{}"] {
+        // carrick-cloud#3503: the wire-form print of a member class with
+        // `toJSON()` carries no `toJSON`, so it is decided here too, and
+        // still as Abstain.
+        for producer in [
+            "{ id: string; }",
+            "never[]",
+            "{ a: string } | null",
+            "{}",
+            "{ price: { v: number; }; at: string; }",
+        ] {
             let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
             let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
             let (items, decided) = retype_items(&pairs, &blamed, &local);
