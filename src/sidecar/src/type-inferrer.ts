@@ -12192,13 +12192,14 @@ export class TypeInferrer {
    * `read_spans`. Called at each builder's return with exactly those nodes.
    * Offsets are taken now, as numbers, so a later rewrite of the file (the
    * unwidened reading) cannot move them, and a spread of the answer keeps
-   * them. An answer whose text is bare `any`/`unknown` (or empty) has no
-   * value to place and gets none; a decided abstain is built by
+   * them. An answer whose text is bare `any`/`unknown`, a no-value type
+   * (`void`, `undefined`, `never`) or empty has no value to place and gets
+   * none, annotated or not; a decided abstain is built by
    * `decidedAbstain` and never passes through here. Outer parentheses are
    * peeled: `({ ... })` is the literal.
    */
   private withReads(inferred: InferredType, nodes: ReadonlyArray<Node | undefined>): InferredType {
-    if (/^\s*(any|unknown)?\s*$/.test(inferred.type_string)) return inferred;
+    if (/^\s*(any|unknown|void|undefined|never)?\s*$/.test(inferred.type_string)) return inferred;
     const seen = new Set<string>();
     const spans: ReadSpan[] = [];
     for (const read of nodes) {

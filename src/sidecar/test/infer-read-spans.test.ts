@@ -51,6 +51,7 @@ interface TypedReq<B> extends Req { body: B }
 declare function save(body: unknown): Promise<{ ok: boolean; item: Item }>;
 declare function load(): Promise<Item>;
 declare const ItemSchema: { parse(value: unknown): Item };
+declare const untypedClient: any;
 
 const app = new App();
 
@@ -88,6 +89,8 @@ app.get('/schema', { schema: { response: { 200: ItemSchema } } }, async () => lo
 app.get('/only-error', async (req, res) => {
   res.status(404).json({ missing: true });
 });
+
+app.get('/untyped', async () => untypedClient.fetchThing());
 
 app.get('/unicode', async () => {
   // naïve café ✓ 😀: non-ASCII text before the value
@@ -288,6 +291,13 @@ describe('carrick#4244 T3a: an answer names each value it read', () => {
       (got.any_provenance ?? []).some((p) => p.reason === 'no_success_payload'),
       `the abstain is decided: ${JSON.stringify(got)}`
     );
+    assert.strictEqual(got.read_spans, undefined);
+  });
+
+  it('an answer whose text is bare any names nothing', async () => {
+    const got = await ask(atRoute('Untyped', '/untyped', 'function_return'));
+    assert.ok(got, 'the route answers');
+    assert.strictEqual(got.type_string.trim(), 'any');
     assert.strictEqual(got.read_spans, undefined);
   });
 
