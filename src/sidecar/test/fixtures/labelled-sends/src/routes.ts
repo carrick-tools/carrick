@@ -122,3 +122,9 @@ app.get('/j', async (req, res) => {
   }
   res.json(doc);
 });
+
+// N
+function named(req: unknown, reply: Reply) {
+  reply.send(ok());
+}
+app.get('/n', named);

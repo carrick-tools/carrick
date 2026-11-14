@@ -1994,23 +1994,14 @@ export class TypeInferrer {
       // than a couple of lines from the registration.
       const atLine = this.registrationAtLine(sourceFile, request.line_number);
       if (atLine) {
-        const declared = this.declaredResponseInferredType(
-          request,
-          atLine.registration
-        );
-        if (declared) {
-          return declared;
-        }
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
         );
-        return (
-          this.buildFunctionReturnInferredType(
-            request,
-            atLine.handler,
-            extractionConfig,
-            true
-          ) ?? this.labelledSendBodies(request, atLine.handler)
+        return this.responseAtRegistration(
+          request,
+          atLine.registration,
+          atLine.handler,
+          extractionConfig
         );
       }
       // carrick#807: the request named an expression and the file holds none
@@ -2086,19 +2077,10 @@ export class TypeInferrer {
     if (!Node.isCallExpression(node)) {
       const registryHandler = this.resolveRegisteredHandler(node);
       if (registryHandler) {
-        const declared = this.declaredResponseInferredType(request, node);
-        if (declared) {
-          return declared;
-        }
         this.log(
           `Span resolves to a route-registry object literal at ${request.file_path}:${request.line_number}; following handler return`
         );
-        return this.buildFunctionReturnInferredType(
-          request,
-          registryHandler,
-          extractionConfig,
-          true
-        );
+        return this.responseAtRegistration(request, node, registryHandler, extractionConfig);
       }
     }
 
@@ -2165,40 +2147,19 @@ export class TypeInferrer {
     let payloadNode: Node = node;
     if (Node.isCallExpression(node)) {
       const args = node.getArguments();
-      // A call that receives a function is a callback registration (e.g. an
-      // endpoint registration like `app.get('/path', handler)`) — its first
-      // argument is the route path, not a payload. The span locator falls
-      // back to exactly this shape when no payload expression was reported,
-      // so drilling here would put the path literal's type in the manifest.
-      // A call handed a function whose result is plain data is not a
-      // registration but the payload: `rows.map((r) => ({ ... }))` sends the
-      // list, not the callback's return (carrick#2055).
-      const registersCallback =
-        args.some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg)) &&
-        !this.callResultIsPlainData(node);
-      if (registersCallback) {
-        // A registration that DECLARES its response contract in a schema needs
-        // no indirection: the declaration is the contract the framework
-        // serializes against, so it wins over whatever the handler happens to
-        // return.
-        const declared = this.declaredResponseInferredType(request, node);
-        if (declared) {
-          return declared;
-        }
-        // The locator lands on a route registration whose handler carries the
-        // response contract in its RETURN type — one indirection away. Follow
-        // the handler and infer its return instead of dropping the payload.
+      // A registration is not a payload: its first argument is the route
+      // path, and the span locator falls back to exactly this shape when no
+      // payload expression was reported, so drilling would put the path
+      // literal's type in the manifest. The route's response is what its
+      // handler returns, read through the one registration reader, or
+      // nothing where no handler can be followed.
+      if (this.registersHandlerAt(node, request)) {
         const handler = this.resolveRegisteredHandler(node);
         if (handler) {
           this.log(
             `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; following handler return`
           );
-          return this.buildFunctionReturnInferredType(
-            request,
-            handler,
-            extractionConfig,
-            true
-          );
+          return this.responseAtRegistration(request, node, handler, extractionConfig);
         }
         this.log(
           `Span resolves to a callback-registration call at ${request.file_path}:${request.line_number}; no payload to infer`
@@ -4244,6 +4205,18 @@ export class TypeInferrer {
       // would emit a spurious framework type. Report unresolved, as before.
       this.log(
         `Route registration at ${request.file_path}:${request.line_number} has no typed request read; leaving unresolved`
+      );
+      return null;
+    }
+
+    // A span at a registration whose handler cannot be followed (a wrapper
+    // call, a member reference) names no request expression either: reading
+    // the call's own value would publish the server instance as the body.
+    const locatedCall = this.unwrapExpressionNode(located);
+    if (Node.isCallExpression(locatedCall) && this.registersHandlerAt(locatedCall, request)) {
+      this.log(
+        `Route registration at ${request.file_path}:${request.line_number}: no handler to follow; ` +
+          'leaving the request unresolved'
       );
       return null;
     }
@@ -8907,6 +8880,52 @@ export class TypeInferrer {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Whether a call is a route registration, by one test for both sides: it is
+   * handed an inline function and its result is not plain data (`rows.map(fn)`
+   * sends the list), or the ask is located by span alone and the call names a
+   * handler or is handed a callable after its first argument. A model-located
+   * ask keeps today's reading, so `rows.map(toView)` is still a payload. A
+   * call whose own result is a primitive is a value, not a registration
+   * (`JSON.stringify(body, this.replacer)`).
+   */
+  private registersHandlerAt(call: CallExpression, request: InferRequestItem): boolean {
+    if (this.callResultIsPlainData(call)) return false;
+    const args = call.getArguments();
+    if (args.some((arg) => Node.isArrowFunction(arg) || Node.isFunctionExpression(arg))) {
+      return true;
+    }
+    if (request.span_start === undefined || request.expression_text) return false;
+    const own = call.getType();
+    if (own.isString() || own.isNumber() || own.isBoolean() || own.isStringLiteral() ||
+        own.isNumberLiteral() || own.isBooleanLiteral()) {
+      return false;
+    }
+    return (
+      this.handlerFromRegistrationCall(call) !== undefined ||
+      args.slice(1).some((arg) => this.isCallableType(arg.getType()))
+    );
+  }
+
+  /**
+   * A registration's response, read only from its handler: the contract the
+   * registration declares, else what the handler returns, else the bodies it
+   * sends through labelled sends. Shared by a line ask, a registry object and
+   * a registration call.
+   */
+  private responseAtRegistration(
+    request: InferRequestItem,
+    registration: Node,
+    handler: FunctionLike,
+    extractionConfig?: ExtractionConfig
+  ): InferredType | null {
+    return (
+      this.declaredResponseInferredType(request, registration) ??
+      this.buildFunctionReturnInferredType(request, handler, extractionConfig, true) ??
+      this.labelledSendBodies(request, handler)
+    );
   }
 
   /**

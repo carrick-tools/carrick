@@ -200,6 +200,37 @@ describe('carrick#2472 C2: labelled sends in the response-site walk', () => {
       assert.strictEqual(await infer('S', undefined, false), undefined, 'an unlabelled send stays unread');
     });
 
+    // carrick#4080: a span at a registration naming its handler reads the same
+    // handler, through the same reader, as the line ask does.
+    it('N: a span at the registration of a named handler answers what the line ask answers', async () => {
+      const call = "app.get('/n', named)";
+      const start = Buffer.byteLength(source.slice(0, source.indexOf(call)));
+      const ask = async (span: boolean): Promise<string> => {
+        const alias = `N_${span}_${id}`;
+        const response = await client.send<{ inferred_types?: Inferred[] }>(
+          {
+            action: 'infer',
+            request_id: `infer-${id++}`,
+            requests: [
+              {
+                file_path: routesPath,
+                line_number: lineOf('N', call),
+                infer_kind: 'response_body',
+                alias,
+                ...(span ? { span_start: start, span_end: start + call.length } : {}),
+              },
+            ],
+            server_claims: { from_dir: root, checks: LABELS, type_packages: {} },
+          },
+          60_000
+        );
+        return collapse(response.inferred_types?.find((t) => t.alias === alias)?.type_string);
+      };
+      const byLine = await ask(false);
+      assert.match(byLine, /total: number/, byLine);
+      assert.strictEqual(await ask(true), byLine);
+    });
+
     it('J: the labelled `res.json(x)` after an error guard is the body, the error send is dropped', async () => {
       const got = collapse((await infer('J', undefined, true))?.type_string);
       assert.match(got, /title: string/, got);
