@@ -4587,6 +4587,25 @@ impl FileOrchestrator {
                 "Withdrew {withdrawn} request summary row(s) made by a call the source states as an endpoint or the store labels a server framework"
             );
         }
+        // A request made through a labelled HTTP client sends the method the
+        // store's label states, before any summary row is written
+        // (carrick#4373).
+        let label_methods = fact_files
+            .as_ref()
+            .map(|facts| facts.label_method_starts())
+            .unwrap_or_default();
+        let relabelled = summaries.take_label_methods(&label_methods);
+        if !relabelled.is_empty() {
+            let total: usize = relabelled.values().sum();
+            let tally: Vec<String> = relabelled
+                .iter()
+                .map(|((from, to), n)| format!("{from}->{to}={n}"))
+                .collect();
+            debug!(
+                "{total} request summary row(s) take the method their store label states: {}",
+                tally.join(", ")
+            );
+        }
         let no_summary_rows: BTreeMap<u32, Vec<SummaryRow>> = BTreeMap::new();
         for late in late_summary_files {
             let Some(summary_rows) = summaries.rows(&late.file_path) else {

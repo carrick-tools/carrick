@@ -11472,6 +11472,40 @@ impl RequestSummaryIndex {
         withdrawn
     }
 
+    /// Give every row whose request is made by a call the store's label
+    /// states a method for that method (carrick#4373). `labelled` holds the
+    /// repo-relative file, span start and method of each such call
+    /// ([`fact_files::FactFiles::label_methods`]), matched against
+    /// [`SummaryRow::request_at`] as [`Self::withdraw_registrations`]
+    /// matches. The label answers what the call sends; the method these
+    /// rows read from the call's written shape does not. Returns how many
+    /// rows changed, per `(from, to)`.
+    pub fn take_label_methods(
+        &mut self,
+        labelled: &[(String, u32, String)],
+    ) -> BTreeMap<(String, String), usize> {
+        let mut changed: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for row in self
+            .rows
+            .values_mut()
+            .flat_map(|sites| sites.values_mut())
+            .flatten()
+        {
+            let Some((_, _, method)) = labelled.iter().find(|(file, start, _)| {
+                row.request_at.0.ends_with(Path::new(file)) && row.request_at.1 == *start
+            }) else {
+                continue;
+            };
+            if row.method != *method {
+                *changed
+                    .entry((row.method.clone(), method.clone()))
+                    .or_default() += 1;
+                row.method = method.clone();
+            }
+        }
+        changed
+    }
+
     /// The requests written in `file` that their callers' rows state, by
     /// span start (carrick#3961): the request's own line leaves its path to
     /// the callers, so it states no row, and every call of every function

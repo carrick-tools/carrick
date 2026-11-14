@@ -22,11 +22,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::LibrarySites;
-use super::decided_sites::Decided;
+use super::decided_sites::{Decided, SiteLabel};
 use super::discovery::Discovery;
+use super::site_record::label_method;
 use super::stop::Stop;
 use crate::library_store::FirstAnswer;
 use crate::services::type_sidecar::LibraryRole;
+use crate::type_manifest::is_http_method;
 
 /// What discovery recorded for one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +90,15 @@ pub struct FactFiles {
     /// reader states there is not a request the call makes. The site selects
     /// its file and lists nothing.
     pub graphql_client_calls: BTreeMap<String, BTreeSet<(u32, u32)>>,
+    /// The method the store's label states for each labelled HTTP-client
+    /// call, by file and span start (carrick#4373): only where the label
+    /// alone decides it for every caller, the one method the member always
+    /// sends or a default with no slot to read
+    /// ([`super::site_record::label_method`]). A request summary row whose
+    /// request is one of these calls states that method
+    /// (`RequestSummaryIndex::take_label_methods`). A label that reads the
+    /// method from a slot is not listed: the method there is each caller's.
+    pub label_methods: BTreeMap<String, BTreeMap<u32, String>>,
     /// Packages the first answer left without exports.
     pub unanswered_packages: usize,
     /// The ask got no answer at all.
@@ -239,7 +250,65 @@ impl FactFiles {
         self.listed.retain(|file, _| owns(file));
         self.calls.retain(|(file, _, _), _| owns(file));
         self.server_framework_starts.retain(|file, _| owns(file));
+        self.label_methods.retain(|file, _| owns(file));
         self
+    }
+
+    /// These fact files with the method the store's `labels` state at each
+    /// labelled HTTP-client call `decided` reaches, sites and leads alike
+    /// ([`Self::label_methods`]). A procedure call's method is its adapter's
+    /// wire method, not the label's word, and is not listed. Two labels that
+    /// state different methods at one call list neither.
+    pub fn with_label_methods(mut self, decided: &Decided, labels: &[SiteLabel]) -> Self {
+        let ends = decided
+            .sites
+            .iter()
+            .filter(|site| site.procedure.is_none())
+            .map(|site| &site.end)
+            .chain(decided.leads.iter().map(|lead| &lead.end));
+        let mut stated: BTreeMap<(String, u32), BTreeSet<String>> = BTreeMap::new();
+        for end in ends {
+            if end.role != "http_client" || end.procedure.is_some() {
+                continue;
+            }
+            let Some(method) = SiteLabel::find(labels, end)
+                .and_then(|label| label.method.as_ref())
+                .and_then(|method| label_method(method, None))
+                .map(|method| method.to_ascii_uppercase())
+                .filter(|method| is_http_method(method))
+            else {
+                continue;
+            };
+            stated
+                .entry((end.file.clone(), end.span_start))
+                .or_default()
+                .insert(method);
+        }
+        for ((file, start), methods) in stated {
+            if methods.len() != 1 {
+                continue;
+            }
+            if let Some(method) = methods.into_iter().next() {
+                self.label_methods
+                    .entry(file)
+                    .or_default()
+                    .insert(start, method);
+            }
+        }
+        self
+    }
+
+    /// The method the store's label states at each listed call, as
+    /// repo-relative file, call span start and method.
+    pub fn label_method_starts(&self) -> Vec<(String, u32, String)> {
+        self.label_methods
+            .iter()
+            .flat_map(|(file, starts)| {
+                starts
+                    .iter()
+                    .map(|(start, method)| (file.clone(), *start, method.clone()))
+            })
+            .collect()
     }
 
     /// Record what discovery found at one call. A site wins over anything
