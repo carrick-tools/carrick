@@ -15023,16 +15023,29 @@ fn enrich_manifest_with_type_resolution(
             .unwrap_or(false)
     };
 
+    let mut reads_by_alias: HashMap<&str, Vec<&crate::services::type_sidecar::InferredType>> =
+        HashMap::new();
+    for inferred in &type_resolution.inferred_types {
+        reads_by_alias
+            .entry(inferred.alias.as_str())
+            .or_default()
+            .push(inferred);
+    }
+
     // Update manifest entries
     for entry in manifest.iter_mut() {
         if let Some(provenance) = inferred_provenance.get(&entry.type_alias) {
             merge_any_provenance(&mut entry.any_provenance, provenance.iter().cloned());
         }
 
-        if entry.any_provenance.iter().any(|p| p.path.is_empty()) {
-            // carrick#4289: a reason at the type's own root says this site
-            // states no type, so no answer for the alias (the bundle's
-            // model symbol included) makes it typed.
+        if reads_by_alias
+            .get(entry.type_alias.as_str())
+            .is_some_and(|reads| type_compat_v2::alias_reads_decided_no_type(reads))
+        {
+            // carrick#4289: the compiler's reads decided this site states no
+            // type (the arbitration's own predicate, carrick#4306), so no
+            // answer for the alias (the bundle's model symbol included)
+            // makes it typed. A sibling read that saw a shape owns the alias.
             entry.is_explicit = false;
             entry.type_state = ManifestTypeState::Unknown;
             entry.evidence.is_explicit = false;
@@ -25835,7 +25848,7 @@ unfollowed_member_calls_total: 0,
     /// and nothing for a later stage to restore.
     #[test]
     fn a_root_reason_beside_a_model_type_reads_unknown() {
-        for reason in ["bound_by_callers", "unresolved_import"] {
+        for reason in ["bound_by_callers", "no_success_payload"] {
             let mut manifest = vec![consumer_entry("FeedView")];
             let mut resolution = empty_resolution();
             resolution
@@ -25876,6 +25889,87 @@ unfollowed_member_calls_total: 0,
             assert_eq!(entry.any_provenance.len(), 1, "{reason}");
             assert_eq!(entry.any_provenance[0].reason, reason);
         }
+    }
+
+    /// carrick#4289: a handler that annotates the value it returns
+    /// (`const body: Reply = {...}; return json(body)`) states its type in
+    /// code. The compiler's read of the response sees the framework's `json`
+    /// envelope and says `machinery_envelope` at the root; that reason is a
+    /// decision only for a call result, never for a handler's return, so the
+    /// entry stays explicit with the declared type.
+    #[test]
+    fn a_machinery_envelope_beside_a_declared_handler_type_stays_explicit() {
+        let mut entry = consumer_entry("ReplyView");
+        entry.role = ManifestRole::Producer;
+        entry.evidence.infer_kind = InferKind::ResponseBody;
+        let mut manifest = vec![entry];
+        let mut resolution = empty_resolution();
+        resolution
+            .explicit_manifest
+            .push(crate::services::type_sidecar::ManifestEntry {
+                alias: "ReplyView".to_string(),
+                original_name: "Reply".to_string(),
+                source_file: "routes/reply.ts".to_string(),
+                type_string: "{ ok: boolean; id: string }".to_string(),
+                is_explicit: true,
+            });
+        let mut read = inferred_with_symbol("Reply");
+        read.alias = "ReplyView".to_string();
+        read.type_string = "unknown".to_string();
+        read.primary_type_symbol = None;
+        read.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "machinery_envelope".to_string(),
+            detail: None,
+        }];
+        resolution.inferred_types.push(read);
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        let entry = &manifest[0];
+        assert_eq!(entry.type_state, ManifestTypeState::Explicit);
+        assert!(entry.is_explicit && entry.evidence.is_explicit);
+        assert_eq!(entry.any_provenance[0].reason, "machinery_envelope");
+    }
+
+    /// carrick#4289: the join reads one shared predicate. A decided
+    /// root reason beside a sibling read that saw a shape does not decide the
+    /// site states no type: the entry keeps its state and the model's type.
+    #[test]
+    fn a_root_reason_beside_a_sighted_sibling_read_keeps_the_entry_state() {
+        let mut manifest = vec![consumer_entry("FeedView")];
+        let mut resolution = empty_resolution();
+        resolution
+            .explicit_manifest
+            .push(crate::services::type_sidecar::ManifestEntry {
+                alias: "FeedView".to_string(),
+                original_name: "Feed".to_string(),
+                source_file: "lib/api.ts".to_string(),
+                type_string: "{ cursor: string }".to_string(),
+                is_explicit: true,
+            });
+        let mut abstain = inferred_with_symbol("Feed");
+        abstain.alias = "FeedView".to_string();
+        abstain.type_string = "unknown".to_string();
+        abstain.primary_type_symbol = None;
+        abstain.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "bound_by_callers".to_string(),
+            detail: None,
+        }];
+        let mut sighted = inferred_with_symbol("Feed");
+        sighted.alias = "FeedView".to_string();
+        sighted.type_string = "{ cursor: string }".to_string();
+        resolution.inferred_types.push(abstain);
+        resolution.inferred_types.push(sighted);
+
+        enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+        let entry = &manifest[0];
+        assert_ne!(entry.type_state, ManifestTypeState::Unknown);
+        assert!(entry.is_explicit && entry.evidence.is_explicit);
     }
 
     /// carrick#2011: the sending side's entry carries the spent-budget mark,
