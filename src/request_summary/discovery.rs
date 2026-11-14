@@ -9474,10 +9474,10 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
     /// service's file is read there, through the resolver every
     /// cross-service read uses, so the send is a lead with the resolver's
     /// reason, not a lead that was never asked about. With only the shared
-    /// package as a sibling, as a scan reaches it, the enum the name reads
-    /// is declared in a service the run never enters. This test hands in its
-    /// sibling set by hand, so it guards the reason only: the binary test
-    /// `queue_enum_base_class_test` runs the engine's own set.
+    /// package as a sibling, the enum the name reads is declared in a service
+    /// the read never enters. This test hands in that set by hand, on
+    /// purpose, so it guards the reason alone; the engine hands the sender
+    /// the enum package too (carrick#4444), which the test above runs.
     #[test]
     fn a_maker_bound_name_decided_in_a_sibling_is_read_there() {
         use super::super::stop::Stop;

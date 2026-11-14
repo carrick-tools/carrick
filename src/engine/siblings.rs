@@ -7,8 +7,9 @@
 //! Services are analysed side by side on threads of their own, so a sibling's
 //! facts are read once per run, from its own walk, and shared:
 //!
-//! - **Reached siblings only.** The services whose files some call of this one
-//!   is declared in, and transitively those they reach in turn. A service that
+//! - **Reached siblings only.** The services whose files some call of this one,
+//!   or some value it reads (an enum, a constant), is declared in, and
+//!   transitively those they reach in turn. A service that
 //!   calls into no other is read alone, as before.
 //! - **Built on first need,** by the first service that reaches it, with the
 //!   same discovery a service's own analysis runs, quietly ([`Read::Sibling`]):
@@ -167,12 +168,15 @@ impl SiblingRegistry {
         reads
     }
 
-    /// The declared services whose files the calls the rows `positions` hold
-    /// are declared in.
+    /// The declared services whose files the calls and the value reads the
+    /// rows `positions` hold are declared in (carrick#4444). The reach
+    /// ([`RequestSummaryInputs::outside_declarations`]) takes the same value
+    /// reads, so this set holds every service a read may enter.
     fn declared_in(&self, positions: &crate::position_rows::PositionIndex) -> BTreeSet<usize> {
         let owners = self.owners();
         positions
             .call_rows()
+            .chain(positions.value_reads())
             .filter_map(|row| row.decl_file())
             .filter(|file| !file.starts_with("lib:") && !file.starts_with("pkg:"))
             .collect::<BTreeSet<&str>>()
