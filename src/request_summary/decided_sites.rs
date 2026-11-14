@@ -3654,9 +3654,46 @@ impl<'a> Walk<'a, '_> {
             self.lead(&down[0], end, Stop::SeveralOperations);
             return false;
         };
+        if literal_name(name).is_none()
+            && !super::site_record::reads_env(name)
+            && decided_at_several_calls(made)
+        {
+            let stop = self.pooled_stop(made);
+            self.lead(&down[0], end, stop);
+            return false;
+        }
         let name_at = name_decided_at(self.root, name, made, &|file| self.calls.is_own(file));
         self.site(down, end, name.clone(), BTreeSet::new(), name_at);
         down.len() == 1
+    }
+
+    /// Why the values `made`, decided at several calls, state no name: the
+    /// one answer to that question (carrick#4418). Each value is read at its
+    /// own call by the resolver's set reader, and the first hole it meets is
+    /// the reason; where every value reads, the values differ by call, so
+    /// several operations.
+    fn pooled_stop(&mut self, made: &[&MadeWith<'a>]) -> Stop {
+        for value in made {
+            let [arg] = value.args.iter().copied().collect::<Vec<_>>()[..] else {
+                continue;
+            };
+            let file = relative(self.root, value.at.file);
+            let span = (value.at.call.site.span_start, value.at.call.site.span_end);
+            match self.fold.arg_texts(&file, span, arg, None) {
+                Some(super::resolve::ArgTexts::Unread(stop)) => return stop,
+                Some(super::resolve::ArgTexts::Values(values)) => {
+                    let hole = values.iter().find_map(|value| match value {
+                        super::resolve::TextValue::Hole { reason, .. } => Some(*reason),
+                        _ => None,
+                    });
+                    if let Some(reason) = hole {
+                        return Stop::from(reason);
+                    }
+                }
+                None => {}
+            }
+        }
+        Stop::SeveralOperations
     }
 
     /// A maker-bound name as the call that decided it reads it
@@ -3727,12 +3764,30 @@ impl<'a> Walk<'a, '_> {
     }
 }
 
+/// Whether the values `made` were decided at two or more calls, compared by
+/// file and span.
+fn decided_at_several_calls(made: &[&MadeWith<'_>]) -> bool {
+    let calls: BTreeSet<(&Path, u32, u32)> = made
+        .iter()
+        .map(|value| {
+            (
+                value.at.file,
+                value.at.call.site.span_start,
+                value.at.call.site.span_end,
+            )
+        })
+        .collect();
+    calls.len() > 1
+}
+
 /// Where the maker-bound `name` is read (carrick#4245 T3): the one call
 /// every value `made` was decided at, with the arguments it is read from
 /// there. `None` where the name is literal (the site states it as it is),
 /// or where the values that agree on `name` were decided at different
 /// calls: the same pieces at two calls (`open(q)` over two lists) are not
-/// one name, and no one call's argument states them. Also `None` where that
+/// one name, and no one call's argument states them. After carrick#4418
+/// `named_by` has already made a lead of such values, so this arm is reached
+/// only by names that read the environment. Also `None` where that
 /// call is outside this service's own files (a sibling package's
 /// constructor chain): such a name is left unread, as before; reading it
 /// there is not part of carrick#4245.

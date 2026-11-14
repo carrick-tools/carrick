@@ -9252,7 +9252,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
         // Two literals and two different identifiers through one opener stay
         // several operations.
-        for line in [17, 18, 21, 22] {
+        for line in [17, 18, 20, 21] {
             assert_eq!(
                 reason_at(line),
                 Some(Stop::SeveralOperations),
@@ -9260,7 +9260,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             );
         }
         // An environment read keeps its own word, at two calls and at one.
-        for line in [26, 27, 29] {
+        for line in [24, 25, 27] {
             assert_eq!(reason_at(line), Some(Stop::EnvValue), "{line}: {shown:#?}");
         }
         // No question was asked for a site that states no name here.

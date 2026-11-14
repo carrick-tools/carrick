@@ -1161,7 +1161,7 @@ fn env_based_text(pieces: &[super::Piece]) -> Option<String> {
 }
 
 /// Whether any piece of a name is an environment read.
-fn reads_env(pieces: &[super::Piece]) -> bool {
+pub(super) fn reads_env(pieces: &[super::Piece]) -> bool {
     pieces.iter().any(|piece| {
         matches!(
             piece,
