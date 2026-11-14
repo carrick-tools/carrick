@@ -93,7 +93,7 @@ runs:
         path: |
           src/sidecar/node_modules
           src/sidecar/dist
-        key: ${{ runner.os }}-sidecar-build-node24-${{ hashFiles('src/sidecar/package-lock.json', 'src/sidecar/package.json', 'src/sidecar/tsconfig.json', 'src/sidecar/src/**', 'src/sidecar/test/**') }}
+        key: ${{ runner.os }}-sidecar-build-node24-${{ hashFiles('src/sidecar/package-lock.json', 'src/sidecar/package.json', 'src/sidecar/tsconfig.json', 'src/sidecar/src/**', 'src/sidecar/test/**', 'src/sidecar/scripts/write-engine-stamp.mjs') }}
 
     - name: Build sidecar
       if: steps.sidecar.outputs.cache-hit != 'true'

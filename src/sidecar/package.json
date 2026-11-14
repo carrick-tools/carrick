@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "node node_modules/typescript/bin/tsc",
+    "build": "node node_modules/typescript/bin/tsc && node scripts/write-engine-stamp.mjs",
     "start": "node dist/index.js",
     "test": "node scripts/test-files.mjs run all --",
     "clean": "rm -rf dist",
