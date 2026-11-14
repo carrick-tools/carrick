@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.3.157](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.156...carrick-v0.3.157) (2026-11-14)
+
+
+### Features
+
+* **compiler engine:** a schema-validated request names its schema's declaration ([#2148](https://github.com/carrick-tools/carrick/issues/2148) H3) ([#4417](https://github.com/carrick-tools/carrick/issues/4417)) ([2b3d12a](https://github.com/carrick-tools/carrick/commit/2b3d12ae3b7f840d40c9279fbabf4b5f2411fced))
+* **match:** wasm SimilarRanker for find_similar ([#3490](https://github.com/carrick-tools/carrick/issues/3490) T5) ([#4424](https://github.com/carrick-tools/carrick/issues/4424)) ([cc6b809](https://github.com/carrick-tools/carrick/commit/cc6b809f5d97d7aad0182f38deff9f84c5c9aa50))
+* **release:** ship the type reasons list with the pinned matcher ([#4231](https://github.com/carrick-tools/carrick/issues/4231) T2b) ([#4317](https://github.com/carrick-tools/carrick/issues/4317)) ([e72406c](https://github.com/carrick-tools/carrick/commit/e72406c9353e8485a8ebe95ebd6deff892fc0f0f))
+* **sidecar:** one list of type reasons, read by the engine and Rust (carrick[#4231](https://github.com/carrick-tools/carrick/issues/4231)) ([#4313](https://github.com/carrick-tools/carrick/issues/4313)) ([6a24210](https://github.com/carrick-tools/carrick/commit/6a24210f74fda3da45c0c819886e6dd0058948a3))
+
+
+### Bug Fixes
+
+* a walk that wrote no rows is stated on the boundary ([#4247](https://github.com/carrick-tools/carrick/issues/4247)) ([#4267](https://github.com/carrick-tools/carrick/issues/4267)) ([1ab9572](https://github.com/carrick-tools/carrick/commit/1ab957281c0b2a05d2fce015169c5a76d7da8fd6))
+* **check:** an edit in a repo below its git top is read by its service ([#4390](https://github.com/carrick-tools/carrick/issues/4390)) ([#4407](https://github.com/carrick-tools/carrick/issues/4407)) ([ae4c828](https://github.com/carrick-tools/carrick/commit/ae4c828ca0c87d7ad4d1927e1828c669677b5867))
+* **check:** an edited file in no service's directory is re-checked for the services that read it ([#4412](https://github.com/carrick-tools/carrick/issues/4412)) ([#4432](https://github.com/carrick-tools/carrick/issues/4432)) ([aeec991](https://github.com/carrick-tools/carrick/commit/aeec99127ed57b6f8c9ec7f49adeb7f1009d533b))
+* **check:** check --changed checks a changed file in no service's roots that a service imports ([#4412](https://github.com/carrick-tools/carrick/issues/4412) T2) ([#4448](https://github.com/carrick-tools/carrick/issues/4448)) ([4f69af2](https://github.com/carrick-tools/carrick/commit/4f69af2a40be88cfcc1f791e1642f2bc92fcdc2f))
+* **facts:** a repo of several services is mapped by the refresh ([#4455](https://github.com/carrick-tools/carrick/issues/4455)) ([#4457](https://github.com/carrick-tools/carrick/issues/4457)) ([56b459d](https://github.com/carrick-tools/carrick/commit/56b459d67f5cbe3e9e03f39a86d577bad19f9d42))
+* **formatter:** the delta flags a removal from marked rows only ([#4292](https://github.com/carrick-tools/carrick/issues/4292) T2) ([#4352](https://github.com/carrick-tools/carrick/issues/4352)) ([f904f6a](https://github.com/carrick-tools/carrick/commit/f904f6a18e7e872d02af95690df6b2aefec3c402))
+* **hook:** the Bash hook writes a post-bash timing row through timed ([#4415](https://github.com/carrick-tools/carrick/issues/4415)) ([#4435](https://github.com/carrick-tools/carrick/issues/4435)) ([3ddaa91](https://github.com/carrick-tools/carrick/commit/3ddaa917eef527fda96ff7dc33270f60ea09bb85))
+* **request-summary:** a maker-bound name decided in a sibling file is read there ([#4471](https://github.com/carrick-tools/carrick/issues/4471)) ([07fb340](https://github.com/carrick-tools/carrick/commit/07fb34047e58661ca4625f4735cc141b9464199a))
+* **request-summary:** pooled maker values at two calls state the resolver's reason ([#4450](https://github.com/carrick-tools/carrick/issues/4450)) ([e4ffe0c](https://github.com/carrick-tools/carrick/commit/e4ffe0c022c635591a653fd07d9f354e1cff5982))
+* **scanner:** a lost walk's sites say walk_lost ([#4437](https://github.com/carrick-tools/carrick/issues/4437)) ([bb73df9](https://github.com/carrick-tools/carrick/commit/bb73df9bb73151e64b16376868d314a3ec230114))
+* **site_rows:** a fact replaces a same-key base-path row at its call ([#4434](https://github.com/carrick-tools/carrick/issues/4434)) ([#4465](https://github.com/carrick-tools/carrick/issues/4465)) ([84e4a13](https://github.com/carrick-tools/carrick/commit/84e4a137d5db6e1cfe429a0d5516a214e301e3f7))
+* **site_rows:** a fact replaces the old-path rows of its own request ([#4436](https://github.com/carrick-tools/carrick/issues/4436)) ([b106961](https://github.com/carrick-tools/carrick/commit/b106961442b6e1083355242c2b5fdbe8cfbc1640))
+
+
+### Refactoring
+
+* **check:** the similar-function ranker can be written and read back ([#4034](https://github.com/carrick-tools/carrick/issues/4034) T3-2) ([#4438](https://github.com/carrick-tools/carrick/issues/4438)) ([3f883ca](https://github.com/carrick-tools/carrick/commit/3f883ca363e9afed7a5889b4ea8cdbafa61e89a3))
+* **scanner:** Default for InferredType, ApiEndpointDetails, ResolvedEndpoint ([#4320](https://github.com/carrick-tools/carrick/issues/4320)) ([#4321](https://github.com/carrick-tools/carrick/issues/4321)) ([a704c8f](https://github.com/carrick-tools/carrick/commit/a704c8f1c5a795000c4cd6ea025a4f918173981b))
+
+
+### Performance
+
+* **local-mode:** the probe times each step and copies no blob ([#4426](https://github.com/carrick-tools/carrick/issues/4426)) ([aba4e35](https://github.com/carrick-tools/carrick/commit/aba4e35700ec6d57b4593fd10555068c2a79e19f)), closes [#4034](https://github.com/carrick-tools/carrick/issues/4034)
+
+
+### Documentation
+
+* **local-mode:** a shared file's re-check reads its readers ([#4412](https://github.com/carrick-tools/carrick/issues/4412)) ([#4475](https://github.com/carrick-tools/carrick/issues/4475)) ([4bd8145](https://github.com/carrick-tools/carrick/commit/4bd8145168357600b8e850e071cd038cc16920ee))
+* the edit hook lists the functions a new function may already exist as ([#4386](https://github.com/carrick-tools/carrick/issues/4386)) ([6bb76cc](https://github.com/carrick-tools/carrick/commit/6bb76cc05ae9e0fb3325f7792403bdd0be5cbca6))
+
+
+### CI/CD
+
+* resolve "latest" to the newest release that carries the Linux asset ([#4454](https://github.com/carrick-tools/carrick/issues/4454)) ([563e9bd](https://github.com/carrick-tools/carrick/commit/563e9bd7c0084f3c597bed90e228b69d0bd93e97)), closes [#4451](https://github.com/carrick-tools/carrick/issues/4451)
+
 ## [0.3.156](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.155...carrick-v0.3.156) (2026-11-14)
 
 
