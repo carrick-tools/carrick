@@ -1,0 +1,71 @@
+[
+  {
+    "role": "producer",
+    "type_kind": "response",
+    "method": "GET",
+    "name": "/two-success",
+    "values": [
+      {
+        "file": "src/routes.ts",
+        "text": "{ made: result.item.label }",
+        "start": 661,
+        "end": 688
+      },
+      {
+        "file": "src/routes.ts",
+        "text": "{ none: true }",
+        "start": 718,
+        "end": 732
+      }
+    ]
+  },
+  {
+    "role": "producer",
+    "type_kind": "request",
+    "method": "POST",
+    "name": "/read",
+    "values": [
+      {
+        "file": "src/routes.ts",
+        "text": "(await req.json()) as NewWidget",
+        "start": 872,
+        "end": 903
+      }
+    ]
+  },
+  {
+    "role": "producer",
+    "type_kind": "response",
+    "method": "POST",
+    "name": "/read",
+    "values": [
+      {
+        "file": "src/routes.ts",
+        "text": "{ name: body.name, again }",
+        "start": 947,
+        "end": 973
+      }
+    ]
+  },
+  {
+    "role": "producer",
+    "type_kind": "response",
+    "method": "GET",
+    "name": "/imported",
+    "values": [
+      {
+        "file": "src/handlers.ts",
+        "text": "{ pong: true, count: 2 }",
+        "start": 40,
+        "end": 64
+      }
+    ]
+  },
+  {
+    "role": "producer",
+    "type_kind": "response",
+    "method": "GET",
+    "name": "/stated",
+    "values": []
+  }
+]

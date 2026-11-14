@@ -35,7 +35,7 @@
 //!
 //! A stored blob without a place reads "not placed", never a default.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cloud_storage::{ManifestRole, TypeManifestEntry};
@@ -54,8 +54,11 @@ pub(crate) fn store_read_places(
     manifest: &mut [TypeManifestEntry],
     infer: &[InferRequestItem],
     answers: &[InferredType],
+    explicit: &HashSet<&str>,
+    repo_root: &Path,
     read_file: &dyn Fn(&str) -> Option<String>,
 ) {
+    let _ = (explicit, repo_root);
     let mut asks: HashMap<&str, Vec<&InferRequestItem>> = HashMap::new();
     for ask in infer {
         if let Some(alias) = ask.alias.as_deref() {
@@ -211,6 +214,7 @@ mod tests {
                 infer_kind,
                 is_explicit: false,
                 type_state: ManifestTypeState::Implicit,
+                value_spans: Vec::new(),
             },
             resolved_definition: None,
             expanded_definition: None,
@@ -339,7 +343,14 @@ mod tests {
             ask("ProducerBody", InferKind::RequestBody, Some((70, 80))),
             ask("ProducerResponse", InferKind::ResponseBody, Some((90, 99))),
         ];
-        store_read_places(&mut manifest, &infer, &[], &no_file);
+        store_read_places(
+            &mut manifest,
+            &infer,
+            &[],
+            &HashSet::new(),
+            Path::new("/repo"),
+            &no_file,
+        );
         let places: Vec<_> = manifest
             .iter()
             .map(|e| (e.evidence.span_start, e.evidence.span_end))
@@ -354,6 +365,97 @@ mod tests {
                 (None, None),
             ],
             "consumer and payload asks place; an HTTP producer's registration ask never does"
+        );
+    }
+
+    fn read_span(file: &str, start: u32, end: u32) -> crate::services::type_sidecar::ReadSpan {
+        crate::services::type_sidecar::ReadSpan {
+            file_path: file.to_string(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn a_producer_entry_stores_each_value_its_answer_read() {
+        let producer = |kind, alias, infer| {
+            entry(
+                OperationKey::http("GET", "/items"),
+                ManifestRole::Producer,
+                kind,
+                alias,
+                infer,
+            )
+        };
+        let mut manifest = vec![
+            producer(ManifestTypeKind::Response, "Sends", InferKind::ResponseBody),
+            producer(ManifestTypeKind::Request, "Body", InferKind::RequestBody),
+            producer(
+                ManifestTypeKind::Response,
+                "Stated",
+                InferKind::ResponseBody,
+            ),
+            producer(
+                ManifestTypeKind::Response,
+                "Outside",
+                InferKind::ResponseBody,
+            ),
+            producer(ManifestTypeKind::Response, "Bare", InferKind::ResponseBody),
+        ];
+        let infer: Vec<_> = ["Sends", "Body", "Stated", "Outside", "Bare"]
+            .iter()
+            .map(|alias| ask(alias, InferKind::ResponseBody, Some((1, 2))))
+            .collect();
+        let mut answers = vec![
+            answer("Sends", at(1, 0, 1)),
+            answer("Body", at(1, 0, 1)),
+            answer("Stated", at(1, 0, 1)),
+            answer("Outside", at(1, 0, 1)),
+            answer("Bare", at(1, 0, 1)),
+        ];
+        // The absolute path carries a `/./` the way a root service's does.
+        answers[0].read_spans = vec![
+            read_span("/repo/./src/a.ts", 10, 20),
+            read_span("/repo/src/handlers.ts", 30, 40),
+        ];
+        answers[1].read_spans = vec![read_span("/repo/src/a.ts", 5, 9)];
+        answers[2].read_spans = vec![read_span("/repo/src/a.ts", 50, 60)];
+        answers[3].read_spans = vec![
+            read_span("/elsewhere/x.ts", 1, 2),
+            read_span("/repo/src/a.ts", 7, 8),
+        ];
+        let explicit: HashSet<&str> = ["Stated"].into_iter().collect();
+        store_read_places(
+            &mut manifest,
+            &infer,
+            &answers,
+            &explicit,
+            Path::new("/repo"),
+            &no_file,
+        );
+        let spans = |i: usize| {
+            manifest[i]
+                .evidence
+                .value_spans
+                .iter()
+                .map(|v| (v.file_path.as_str(), v.span_start, v.span_end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spans(0),
+            vec![("src/a.ts", 10, 20), ("src/handlers.ts", 30, 40)]
+        );
+        assert_eq!(spans(1), vec![("src/a.ts", 5, 9)]);
+        assert!(spans(2).is_empty(), "an explicit symbol entry wins");
+        assert_eq!(
+            spans(3),
+            vec![("src/a.ts", 7, 8)],
+            "a span outside the repo is dropped"
+        );
+        assert!(spans(4).is_empty(), "no read, no spans");
+        assert_eq!(
+            manifest[0].evidence.span_start, None,
+            "the registration ask is still no place"
         );
     }
 
@@ -374,7 +476,14 @@ mod tests {
         text_ask.expression_text = Some("api.go()".to_string());
         text_ask.expression_line = Some(2);
         let answers = [answer("ByText", at(2, 4, 12))];
-        store_read_places(&mut manifest, &[text_ask], &answers, &read);
+        store_read_places(
+            &mut manifest,
+            &[text_ask],
+            &answers,
+            &HashSet::new(),
+            Path::new("/repo"),
+            &read,
+        );
         let evidence = &manifest[0].evidence;
         assert_eq!(
             (evidence.span_start, evidence.span_end),
@@ -407,7 +516,14 @@ mod tests {
         let source = "\n    api.go();\n";
         let read = |_: &str| Some(source.to_string());
         let answers = [answer("Live", at(2, 4, 12))];
-        store_read_places(&mut manifest, &infer, &answers, &read);
+        store_read_places(
+            &mut manifest,
+            &infer,
+            &answers,
+            &HashSet::new(),
+            Path::new("/repo"),
+            &read,
+        );
         let mut now: Vec<_> = stored_call_locators(&manifest, Path::new("/repo"))
             .into_keys()
             .collect();
@@ -441,6 +557,8 @@ mod tests {
             &mut manifest,
             &[text_ask.clone()],
             &[answer("T", at(2, 4, 12))],
+            &HashSet::new(),
+            Path::new("/repo"),
             &read,
         );
         assert_eq!(manifest[0].evidence.span_start, Some(5));
@@ -468,7 +586,14 @@ mod tests {
         let line_only = ask("LineOnly", InferKind::CallResult, None);
         let read = |_: &str| Some("\n    api.go();\n".to_string());
         let answers = [answer("LineOnly", at(2, 4, 12))];
-        store_read_places(&mut manifest, &[line_only], &answers, &read);
+        store_read_places(
+            &mut manifest,
+            &[line_only],
+            &answers,
+            &HashSet::new(),
+            Path::new("/repo"),
+            &read,
+        );
         assert_eq!(manifest[0].evidence.span_start, None);
         assert!(stored_call_locators(&manifest, Path::new("/repo")).is_empty());
     }
@@ -484,7 +609,14 @@ mod tests {
         )];
         let mut gone = ask("Gone", InferKind::CallResult, Some((1, 2)));
         gone.result_unanswered = true;
-        store_read_places(&mut manifest, &[gone], &[], &no_file);
+        store_read_places(
+            &mut manifest,
+            &[gone],
+            &[],
+            &HashSet::new(),
+            Path::new("/repo"),
+            &no_file,
+        );
         assert_eq!(manifest[0].evidence.span_start, None);
     }
 

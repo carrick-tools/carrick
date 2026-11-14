@@ -698,6 +698,7 @@ mod tests {
                 },
                 is_explicit,
                 type_state,
+                value_spans: Vec::new(),
             },
             resolved_definition: resolved.map(String::from),
             expanded_definition: None,

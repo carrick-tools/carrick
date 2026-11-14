@@ -4528,6 +4528,7 @@ mod tests {
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
                 type_state,
+                value_spans: Vec::new(),
             },
             resolved_definition: None,
             expanded_definition: None,

@@ -10990,6 +10990,7 @@ fn add_graphql_request_entry(
             infer_kind: infer_kind_for_manifest(role, type_kind),
             is_explicit: true,
             type_state: ManifestTypeState::Explicit,
+            value_spans: Vec::new(),
         },
         resolved_definition: Some(definition.clone()),
         expanded_definition: Some(definition),
@@ -11236,6 +11237,7 @@ fn add_protocol_manifest_entry(
         infer_kind,
         is_explicit: false,
         type_state: ManifestTypeState::Unknown,
+        value_spans: Vec::new(),
     };
     entries.push(TypeManifestEntry {
         key: key.clone(),
@@ -12332,6 +12334,12 @@ fn run_capture_for_service(
             manifest,
             &infer,
             &type_resolution.inferred_types,
+            &type_resolution
+                .explicit_manifest
+                .iter()
+                .map(|entry| entry.alias.as_str())
+                .collect(),
+            &absolute_repo,
             &|path| std::fs::read_to_string(path).ok(),
         );
     }
@@ -14912,6 +14920,7 @@ fn add_manifest_pair(
             infer_kind,
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
+            value_spans: Vec::new(),
         };
         entries.push(TypeManifestEntry {
             key: key.clone(),
@@ -19069,6 +19078,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     infer_kind: InferKind::Expression,
                     is_explicit: true,
                     type_state: ManifestTypeState::Explicit,
+                    value_spans: Vec::new(),
                 },
                 resolved_definition: Some(format!(
                     "export type Endpoint_Response = import(\"{}\").Order;",
@@ -25626,6 +25636,7 @@ unfollowed_member_calls_total: 0,
             infer_kind: InferKind::CallResult,
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
+            value_spans: Vec::new(),
         };
         TypeManifestEntry {
             key: OperationKey::http("GET", "/orders/:id"),

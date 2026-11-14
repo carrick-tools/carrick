@@ -4638,6 +4638,7 @@ export const typeDefs = gql`
                 infer_kind: crate::services::type_sidecar::InferKind::CallResult,
                 is_explicit: false,
                 type_state: ManifestTypeState::Unknown,
+                value_spans: Vec::new(),
             },
             resolved_definition: None,
             expanded_definition: None,

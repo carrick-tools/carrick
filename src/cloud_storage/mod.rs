@@ -90,6 +90,24 @@ pub struct TypeEvidence {
     pub is_explicit: bool,
     /// Current state of the type extraction
     pub type_state: ManifestTypeState,
+    /// The values a producer's published type was read from: each success
+    /// send or returned value, or the one body read, as the compiler engine
+    /// reported them (carrick#4244). `span_start`/`span_end` name the ask on
+    /// a producer (the registration), so the values sit here. Written by
+    /// `read_place::store_read_places` only; empty on every other entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_spans: Vec<ValueSpan>,
+}
+
+/// One value a producer's type was read from: a node in a repo file, as
+/// TypeScript positions (UTF-16 code units from 0, `[start, end)`), the unit
+/// of `TypeEvidence::span_start`. The file is repo-relative and may differ
+/// from the entry's own (an imported handler's values sit in its file).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ValueSpan {
+    pub file_path: String,
+    pub span_start: u32,
+    pub span_end: u32,
 }
 
 /// Entry in the type manifest mapping endpoints to their type information
@@ -2496,6 +2514,7 @@ mod tests {
                 infer_kind: InferKind::ResponseBody,
                 is_explicit: false,
                 type_state: ManifestTypeState::Unknown,
+                value_spans: Vec::new(),
             },
             resolved_definition: None,
             expanded_definition: None,
