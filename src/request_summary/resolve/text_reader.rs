@@ -890,7 +890,7 @@ impl<'a> Resolver<'a> {
                 if binding.kind != BindingKind::Const
                     || !binding.list_kept
                     || (binding.exported && !binding.list_frozen)
-                    || (objects && (binding.exported || !binding.elements_kept))
+                    || (objects && binding.kind == BindingKind::Enum)
                 {
                     return Err(UnreadExpression);
                 }
@@ -1409,9 +1409,6 @@ impl<'a> Resolver<'a> {
         else {
             return hole(UnreadExpression);
         };
-        if !binding.entries_kept {
-            return hole(UnreadExpression);
-        }
         let Some(_reading) = self.reading_text(at) else {
             return hole(Recursion);
         };
