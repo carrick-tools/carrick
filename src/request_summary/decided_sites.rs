@@ -871,6 +871,12 @@ pub struct DecidedSite {
     /// labelled call ([`super::site_record`]'s payload slots). Scanner-only;
     /// never part of a record's state.
     pub makes_end: bool,
+    /// Whether a function the chain enters below this call is also handed
+    /// on as a value ([`Calls::handed_on`], carrick#4176): a call through
+    /// that value may send the request with no labelled end read, so this
+    /// call need not be the request's only caller (carrick#4319 T2).
+    /// Scanner-only; never part of a record's state.
+    pub chain_handed_on: bool,
 }
 
 impl DecidedSite {
@@ -2903,6 +2909,11 @@ impl<'a> Walk<'a, '_> {
             .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
         let instances = self.instances(down);
         let makes_end = self.makes_end(down);
+        let chain_handed_on = down[1..].iter().any(|below| {
+            below
+                .key
+                .is_some_and(|key| !self.calls.handed_on(below.file, key).is_empty())
+        });
         self.kept.insert(id, self.out.sites.len());
         self.out.sites.push(DecidedSite {
             file,
@@ -2926,6 +2937,7 @@ impl<'a> Walk<'a, '_> {
             composed_trimmed: false,
             procedure: None,
             makes_end,
+            chain_handed_on,
         });
     }
 
@@ -3820,6 +3832,7 @@ impl<'a> Walk<'a, '_> {
                 composed_trimmed: false,
                 procedure: None,
                 makes_end: false,
+                chain_handed_on: false,
             });
         }
     }
@@ -4672,6 +4685,15 @@ impl SummaryPlacements {
     /// Each request and the file and line of every row stated for it.
     pub fn iter(&self) -> std::collections::hash_map::Iter<'_, At, HashSet<At>> {
         self.rows.iter()
+    }
+
+    /// Whether the summaries state any row for the request at `file`
+    /// (repo-relative, `/`-separated) and `span_start`, keyed as
+    /// [`Decided::yield_to_summaries`] reads it.
+    pub fn places_request(&self, root: &Path, file: &str, span_start: u32) -> bool {
+        self.rows
+            .keys()
+            .any(|(at, start)| *start == span_start && relative(root, at) == file)
     }
 }
 

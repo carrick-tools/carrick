@@ -40,3 +40,23 @@ Two shapes put the deciding call above the labelled call:
 Before T1 every maker row above read the closure's own type
 (`(tag: string) => Promise<{ ok: boolean; }>`), and `typed-maker.ts:6` read
 `() => Promise<{ count: number; }>`.
+
+## Model rows at the labelled call (T2)
+
+Where every deciding call of a labelled request only makes the function
+that sends, holds the request's fact row, and keys it by a bare path, the
+model's row at the labelled call is the same request stated again. It goes
+from the calls, the graph and the manifest; its type is read at the site
+rows (T1).
+
+| Row | Model row | Why |
+|---|---|---|
+| `gate.ts:5` | goes | maker |
+| `poster.ts:5` | goes | maker |
+| `twice.ts:4` | goes | maker, both calls stated |
+| `typed-maker.ts:4` | goes | maker |
+| `partial.ts:4` | stays | `:7` leaves the name open (a lead) |
+| `handed.ts:4` | stays | the maker is handed on as a value at `:8` |
+| `env-maker.ts:4` | stays | the site's key has an environment base, so it has no manifest entry; the model row keeps `{ trimmed: number; }` |
+| `generic.ts:4`, `local-run.ts:4`, `retried.ts:5` | stays | a wrapper that runs the send |
+| `pinger.ts:4` | goes | maker, both calls stated (`:6` and `:7` read `{ up: boolean; }`) |
