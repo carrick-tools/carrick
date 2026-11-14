@@ -3662,7 +3662,7 @@ impl<'a> Walk<'a, '_> {
             self.lead(&down[0], end, stop);
             return false;
         }
-        let name_at = name_decided_at(self.root, name, made, &|file| self.calls.is_own(file));
+        let name_at = name_decided_at(self.root, name, made);
         self.site(down, end, name.clone(), BTreeSet::new(), name_at);
         down.len() == 1
     }
@@ -3787,24 +3787,16 @@ fn decided_at_several_calls(made: &[&MadeWith<'_>]) -> bool {
 /// calls: the same pieces at two calls (`open(q)` over two lists) are not
 /// one name, and no one call's argument states them. After carrick#4418
 /// `named_by` has already made a lead of such values, so this arm is reached
-/// only by names that read the environment. Also `None` where that
-/// call is outside this service's own files (a sibling package's
-/// constructor chain): such a name is left unread, as before; reading it
-/// there is not part of carrick#4245.
-fn name_decided_at(
-    root: &Path,
-    name: &[Piece],
-    made: &[&MadeWith<'_>],
-    is_own: &dyn Fn(&Path) -> bool,
-) -> Option<NameAt> {
+/// only by names that read the environment. A call in a sibling service's
+/// file is a call like any other (carrick#4419): the record reads it
+/// through the resolver, which reads the run's siblings, and gives the
+/// resolver's reason where it cannot enter the declaration.
+fn name_decided_at(root: &Path, name: &[Piece], made: &[&MadeWith<'_>]) -> Option<NameAt> {
     if literal_name(name).is_some() {
         return None;
     }
     let mut at: Option<NameAt> = None;
     for value in made {
-        if !is_own(value.at.file) {
-            return None;
-        }
         let here = NameAt {
             file: relative(root, value.at.file),
             span_start: value.at.call.site.span_start,
