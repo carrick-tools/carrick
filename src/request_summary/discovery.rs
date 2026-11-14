@@ -9056,6 +9056,18 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             let record = record_at(line);
             assert_eq!(record.state.asked, vec![Slot::Kind], "{line}: {shown:#?}");
             assert_eq!(record.names, names, "{line}: {shown:#?}");
+            // The loop variable is one compiler name, read once.
+            let compiler = record.compiler().expect("the record's compiler part");
+            assert!(
+                compiler
+                    .names
+                    .iter()
+                    .filter(|name| name.text == "q")
+                    .count()
+                    <= 1,
+                "{line}: {:#?}",
+                compiler.names
+            );
         }
         assert_eq!(
             record_at(7)

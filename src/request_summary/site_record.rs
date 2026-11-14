@@ -2102,12 +2102,17 @@ fn record(
         None => (file, &parts, &site.name_args),
     };
     if decided_at.is_some() {
-        let idents: Vec<(String, Span)> = name_args
+        // A maker written in the call's own callee (`new Queue(q).add(...)`)
+        // already gave its names above: each is read once.
+        let at_names: Vec<(String, Span)> = name_args
             .iter()
             .filter_map(|index| name_parts.in_args.get(*index))
             .flat_map(|written| written.idents.iter().cloned())
+            .filter(|ident| name_file != file || !idents.contains(ident))
             .collect();
-        names.extend(compiler_names(sources, positions, root, name_file, &idents));
+        names.extend(compiler_names(
+            sources, positions, root, name_file, &at_names,
+        ));
     }
     let name_exprs: Vec<&Expr> = name_args
         .iter()
