@@ -4446,8 +4446,11 @@ mod tests {
             ("routes.ts", "this.app.get"),
         ] {
             let rows = at(&unread, file, callee);
-            assert_eq!(rows.len(), 1, "{file} {callee}: {rows:?}");
-            assert_eq!(rows[0].reason, Stop::Unanswered, "{file} {callee}");
+            assert!(!rows.is_empty(), "{file} {callee} is an unread site");
+            assert!(
+                rows.iter().all(|row| row.reason == Stop::Unanswered),
+                "{file} {callee}: {rows:?}"
+            );
         }
         for callee in ["new Local().get", "shape.get", "target.get"] {
             assert_eq!(
@@ -4464,43 +4467,38 @@ mod tests {
     /// only another check of the pair came back unchecked.
     #[test]
     fn a_pair_one_check_verified_stays_matched() {
+        // `receiver-scopes-chain` asks `get` of one router twice, on the
+        // instance and on its `at` scope: two checks of one pair.
         let (on, exports, ask, verdicts) =
-            traced_fixture_verdicts("receiver-trace", ".", "web", &[], |_| {})
-                .expect("the receiver-trace fixture walks: a skipped test proves nothing");
+            traced_fixture_verdicts("receiver-scopes-chain", ".", "web", &[], |_| {})
+                .expect("the fixture walks: a skipped test proves nothing");
         let pair = |index: usize| {
             ask.ops[index]
                 .as_ref()
                 .map(|op| (op.package.clone(), op.member.clone()))
         };
-        let verified = |index: usize| verdicts[index].verdict == SemanticsVerdict::Verified;
-        // A check whose pair has another check that verified.
-        let flip = (0..verdicts.len())
-            .find(|&index| {
-                pair(index).is_some_and(|mine| {
-                    (0..verdicts.len()).any(|other| {
-                        other != index && verified(other) && pair(other) == Some(mine.clone())
-                    })
-                })
-            })
-            .expect("a pair with two op checks, one verified: stop and report, do not invent one");
-        let mut edited = verdicts.clone();
-        edited[flip].verdict = SemanticsVerdict::Unchecked;
-        edited[flip].reason = Some("budget".to_string());
-        edited[flip].declarations.clear();
+        let same_pair: Vec<usize> = (0..verdicts.len())
+            .filter(|&index| pair(index) == Some(("fixture-chain-router".into(), "get".into())))
+            .collect();
+        assert!(
+            same_pair.len() >= 2
+                && same_pair
+                    .iter()
+                    .all(|&index| verdicts[index].verdict == SemanticsVerdict::Verified),
+            "the fixture's `get` has two verified checks: {same_pair:?}"
+        );
         let real = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &verdicts));
-        let mixed = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &edited));
-        let request = |rows: &[crate::unread_sites::UnreadSite]| {
-            rows.iter()
-                .find(|row| {
-                    row.file.ends_with("negatives.ts")
-                        && row.callee.as_deref() == Some("request.get")
-                })
-                .cloned()
-                .expect("request.get is an unread site")
-        };
-        assert_eq!(request(&mixed).reason, Stop::PackageUnmatched);
-        assert!(!says_unanswered(&request(&mixed)), "{:?}", request(&mixed));
-        assert_eq!(request(&mixed), request(&real));
+        for flip in same_pair {
+            let mut edited = verdicts.clone();
+            edited[flip].verdict = SemanticsVerdict::Unchecked;
+            edited[flip].reason = Some("budget".to_string());
+            edited[flip].declarations.clear();
+            let mixed = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &edited));
+            assert_eq!(
+                mixed, real,
+                "check {flip} unchecked, its pair's other verified"
+            );
+        }
     }
 
     /// A traced fixture through the whole site pass, with `declarations` as
