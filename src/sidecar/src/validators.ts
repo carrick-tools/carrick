@@ -635,6 +635,8 @@ const LibraryClaimSchema = z.discriminatedUnion('kind', [
       kind: z.literal('make'),
       form: z.enum(['call', 'new']),
       member: z.string().min(1).nullable(),
+      // Amendment 12: the verifier judges it (`claim_invalid`), not this schema.
+      of: z.string().min(1).optional(),
       base: ClaimSlotSchema.optional(),
       prefix: ClaimSlotSchema.optional(),
       protocol: z.enum(['http', 'graphql', 'rpc', 'socket', 'message']).optional(),

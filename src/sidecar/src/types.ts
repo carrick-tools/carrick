@@ -832,6 +832,14 @@ export type LibraryClaim =
       kind: 'make';
       form: 'call' | 'new';
       member: string | null;
+      /**
+       * Amendment 12: one maker receiver id the export lists (`instance:new`).
+       * The member is read on that receiver's type, as an op's `of` is, and its
+       * declared return is the made object. Needs `form: 'call'`, a `member`
+       * and a `name` at an argument; `base`, `prefix`, `handler`, `runs`,
+       * `protocol` and `result` beside it are `claim_invalid`.
+       */
+      of?: string;
       /** An HTTP base URL, or a broker's address. */
       base?: ClaimSlot;
       /** A prefix every name the instance sends gets. */
@@ -1433,7 +1441,7 @@ export interface SemanticsResult {
   verdict: 'verified' | 'failed' | 'unchecked';
   /** Absent exactly when verified. */
   reason?: string;
-  /** Verified op verdicts only: the declarations its member resolves to on the receiver. */
+  /** Verified op verdicts, and a verified `of`-make's (amendment 12): the declarations its member resolves to on the receiver. */
   declarations?: SemanticsDeclaration[];
   /**
    * Verified receive op verdicts only: the op verified but its `request`
