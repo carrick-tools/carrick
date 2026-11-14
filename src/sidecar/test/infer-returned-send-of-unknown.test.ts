@@ -6,8 +6,12 @@
  * typed `unknown` and `send` returning the reply, read as the send call's own
  * value: the reply's type. The same handler sending a typed value reads the
  * value it sends. A value typed as a parameter the registration hands the
- * handler is never the body, so an untyped send answers `unknown`, never the
- * reply.
+ * handler is never the body: the send's argument is read instead. A typed
+ * argument is the body; an argument the code declares `unknown` (or `any`)
+ * answers that type with the `declared` reason, never the reply.
+ *
+ * Express-shaped `res.json(x)` returns the response the same way. A function
+ * returning its own repository-declared parameter type keeps its answer.
  *
  * The server package is installed under `node_modules`, as in the
  * `discovery-framework` fixture, so its reply type is declared outside the
@@ -36,10 +40,28 @@ export interface ServerInstance {
 }
 `;
 
+const EXPRESS_D_TS = `export interface Request { body: any }
+export interface Response { json(body?: any): Response; status(code: number): Response }
+export type Handler = (req: Request, res: Response) => unknown;
+export interface App { post(path: string, handler: Handler): App }
+`;
+
 const ROUTES_TS = `import type { ServerInstance } from 'fixture-server';
+import type { App } from 'fixture-express';
 
 interface Item { id: string }
 declare const item: Item;
+
+interface Options { name: string }
+export function withDefaults(options: Options): Options {
+  const next: Options = { ...options };
+  return next;
+}
+
+export function expressRoutes(app: App) {
+  app.post('/ex-typed', async (req, res) => res.status(201).json([item]));
+  app.post('/ex-any', async (req, res) => res.json(req.body));
+}
 
 export async function itemRoutes(app: ServerInstance) {
   app.get('/typed', async (_request, reply) => reply.send([item]));
@@ -98,15 +120,23 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
     );
     fs.writeFileSync(
       path.join(repoDir, 'package.json'),
-      JSON.stringify({ name: 'fixture-4269', dependencies: { 'fixture-server': '1.0.0' } })
+      JSON.stringify({
+        name: 'fixture-4269',
+        dependencies: { 'fixture-server': '1.0.0', 'fixture-express': '1.0.0' },
+      })
     );
-    const pkg = path.join(repoDir, 'node_modules', 'fixture-server');
-    fs.mkdirSync(pkg, { recursive: true });
-    fs.writeFileSync(
-      path.join(pkg, 'package.json'),
-      JSON.stringify({ name: 'fixture-server', version: '1.0.0', types: 'index.d.ts' })
-    );
-    fs.writeFileSync(path.join(pkg, 'index.d.ts'), SERVER_D_TS);
+    for (const [name, declarations] of [
+      ['fixture-server', SERVER_D_TS],
+      ['fixture-express', EXPRESS_D_TS],
+    ]) {
+      const pkg = path.join(repoDir, 'node_modules', name);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(
+        path.join(pkg, 'package.json'),
+        JSON.stringify({ name, version: '1.0.0', types: 'index.d.ts' })
+      );
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), declarations);
+    }
     fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
     routesPath = path.join(repoDir, 'src', 'routes.ts');
     fs.writeFileSync(routesPath, ROUTES_TS);
@@ -128,7 +158,6 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
     const response = await client.send<InferShape>({
       action: 'infer',
       request_id: `infer-${alias}`,
-      framework_packages: ['fixture-server'],
       requests: [
         {
           file_path: routesPath,
@@ -143,23 +172,48 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
   };
 
   for (const by of ['span', 'line'] as const) {
-    it(`a typed send reads the value it sends (control, by ${by})`, async () => {
-      const answer = await responseBody('/typed', by);
-      assert.ok(answer, 'the typed send must answer');
-      assert.match(answer.type_string, /id: string/);
-    });
+    for (const route of ['/typed', '/ex-typed']) {
+      it(`${route}: a typed send reads the value it sends, never the reply (by ${by})`, async () => {
+        const answer = await responseBody(route, by);
+        assert.ok(answer, `${route} must answer`);
+        assert.match(answer.type_string, /id: string/);
+      });
+    }
 
     for (const route of ['/unknown', '/unknown-chained', '/unknown-block']) {
-      it(`${route}: an unknown body answers unknown, never the reply (by ${by})`, async () => {
+      it(`${route}: an unknown body answers unknown as declared, never the reply (by ${by})`, async () => {
         const answer = await responseBody(route, by);
         assert.ok(answer, `${route} must answer a decided unknown`);
         assert.strictEqual(answer.type_string, 'unknown');
-        assert.doesNotMatch(answer.type_string, /ServerReply/);
-        assert.ok(
-          (answer.any_provenance ?? []).some((p) => p.path === '' && p.kind === 'unknown'),
-          `${route} must say why it is unknown: ${JSON.stringify(answer.any_provenance)}`
+        assert.deepStrictEqual(
+          (answer.any_provenance ?? []).map((p) => [p.path, p.kind, p.reason]),
+          [['', 'unknown', 'declared']]
         );
       });
     }
+
+    it(`/ex-any: an any body answers any as declared, never the response (by ${by})`, async () => {
+      const answer = await responseBody('/ex-any', by);
+      assert.ok(answer, '/ex-any must answer');
+      assert.strictEqual(answer.type_string, 'any');
+      assert.deepStrictEqual(
+        (answer.any_provenance ?? []).map((p) => [p.path, p.kind, p.reason]),
+        [['', 'any', 'declared']]
+      );
+    });
   }
+
+  it('a function returning its own repository-declared parameter type keeps its answer', async () => {
+    const line = ROUTES_TS.slice(0, ROUTES_TS.indexOf('export function withDefaults')).split('\n').length;
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: 'infer-withDefaults',
+      requests: [
+        { file_path: routesPath, line_number: line, infer_kind: 'function_return', alias: 'Fn' },
+      ],
+    });
+    const answer = response.inferred_types?.find((t) => t.alias === 'Fn');
+    assert.ok(answer, 'the function return must answer');
+    assert.match(answer.type_string, /name: string/);
+  });
 });
