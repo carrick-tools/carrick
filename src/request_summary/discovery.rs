@@ -9272,14 +9272,16 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
     }
 
-    /// carrick#3527 S5: the instance walk reads the service that holds each
-    /// file, so a send through a wrapper declared as a sibling service
-    /// (`new AlphaProducer().add(...)`, the queue made two files away in the
-    /// shared package) ends at the maker and is named by its construction.
-    /// No site or lead stands in the package's files, and the job name is
-    /// never the queue's name.
-    #[test]
-    fn a_maker_bound_name_made_in_a_sibling_package_is_read_at_the_send() {
+    /// The `queue-enum-base-class` sender's decided sites and records, with
+    /// the shared package `queue-kit` as a sibling, and the enum package
+    /// `topics` too where `with_topics`. The engine reaches siblings through
+    /// call declarations only, so a scan reaches `queue-kit` alone.
+    fn queue_kit_sender_sites(
+        with_topics: bool,
+    ) -> (
+        super::super::decided_sites::Decided,
+        Vec<super::super::site_record::SiteRecord>,
+    ) {
         let services = [
             ("services/sender", "sender"),
             ("packages/queue-kit", "queue-kit"),
@@ -9311,7 +9313,11 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         let declarations = super::super::fixture_walk::census_declarations(
             &script, &on.repo, config, own, &exports,
         );
-        let siblings = [kit, topics];
+        let siblings: Vec<&RequestSummaryInputs> = if with_topics {
+            vec![kit, topics]
+        } else {
+            vec![kit]
+        };
         use super::super::decided_sites::{
             MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
         };
@@ -9339,6 +9345,18 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         );
         let records =
             super::super::site_record::site_records(own, &siblings, &on.repo, &decided, &labels);
+        (decided, records)
+    }
+
+    /// carrick#3527 S5: the instance walk reads the service that holds each
+    /// file, so a send through a wrapper declared as a sibling service
+    /// (`new AlphaProducer().add(...)`, the queue made two files away in the
+    /// shared package) ends at the maker and is named by its construction.
+    /// No site or lead stands in the package's files, and the job name is
+    /// never the queue's name.
+    #[test]
+    fn a_maker_bound_name_made_in_a_sibling_package_is_read_at_the_send() {
+        let (decided, records) = queue_kit_sender_sites(true);
         let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
         for record in &records {
             forced
@@ -9382,6 +9400,46 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                     "a job name is forced as a queue name: {forced:#?}"
                 );
             }
+        }
+    }
+
+    /// carrick#4419: a maker-bound name decided at a call in a sibling
+    /// service's file is read there, through the resolver every
+    /// cross-service read uses, so the send is a lead with the resolver's
+    /// reason, not a lead that was never asked about. With only the shared
+    /// package as a sibling, as a scan reaches it, the enum the name reads
+    /// is declared in a service the run never enters. This test hands in its
+    /// sibling set by hand, so it guards the reason only: the binary test
+    /// `queue_enum_base_class_test` runs the engine's own set.
+    #[test]
+    fn a_maker_bound_name_decided_in_a_sibling_is_read_there() {
+        use super::super::stop::Stop;
+        let (_, records) = queue_kit_sender_sites(false);
+        for line in [4, 8] {
+            let point = format!("services/sender/src/send.ts:{line}");
+            let found: Vec<_> = records
+                .iter()
+                .filter(|record| record.state.point.at == point)
+                .collect();
+            let [record] = found.as_slice() else {
+                panic!("one record at {point}: {records:#?}");
+            };
+            assert_eq!(
+                record.unread,
+                Some(Stop::OutsideService),
+                "{point}: {:?}",
+                record.names
+            );
+            assert_eq!(
+                record.state.forced.get(&crate::site_questions::Slot::Name),
+                None,
+                "{point}"
+            );
+            assert!(
+                !record.names.iter().any(|name| name == "job"),
+                "{point}: {:?}",
+                record.names
+            );
         }
     }
 
