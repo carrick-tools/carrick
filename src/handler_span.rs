@@ -109,38 +109,18 @@ pub fn attach_handler_spans(
             .push(def);
     }
 
-    let calls = registration_calls(data.file_results.as_ref());
     let Some(graph) = data.mount_graph.as_mut() else {
         return 0;
     };
-
-    // A row joined to a call is read at that call's span; any other row at the
-    // call its own file and line name.
-    let mut wanted: HashMap<String, Wanted> = HashMap::new();
-    for endpoint in &graph.endpoints {
-        let Some((file, line)) = split_location(&endpoint.file_location) else {
-            continue;
-        };
-        let method = endpoint.method.to_ascii_lowercase();
-        let call = calls.get(&(file.clone(), line, method.clone())).copied();
-        let asked = wanted.entry(file).or_default();
-        match call.flatten() {
-            Some(span) => {
-                asked.spans.insert(span);
-            }
-            None => {
-                asked.lines.insert((line, method));
-            }
-        }
-    }
-    let handed_in: HashMap<String, HandedInByCall> = wanted
-        .into_iter()
-        .filter_map(|(file, asked)| {
-            let text = read(&file)?;
-            let found = last_arguments(&file, text, &asked);
-            Some((file, found))
+    let rows: Vec<(String, u32, String)> = graph
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let (file, line) = split_location(&endpoint.file_location)?;
+            Some((file, line, endpoint.method.clone()))
         })
         .collect();
+    let mut lasts = last_handed_in(data.file_results.as_ref(), normalize, &rows, read).into_iter();
 
     let mut placed_rows: HashMap<RowIdentity, (HandlerSpan, Option<String>)> = HashMap::new();
     let mut placed = 0;
@@ -149,21 +129,7 @@ pub fn attach_handler_spans(
             continue;
         };
         let defs = by_file.get(&file).map(Vec::as_slice).unwrap_or_default();
-        let method = endpoint.method.to_ascii_lowercase();
-        let call = calls
-            .get(&(file.clone(), line, method.clone()))
-            .copied()
-            .flatten();
-        let found = handed_in.get(&file);
-        let last = match call {
-            Some(span) => Some(
-                found
-                    .and_then(|found| found.by_span.get(&span))
-                    .cloned()
-                    .unwrap_or(HandedIn::Other),
-            ),
-            None => found.and_then(|found| found.by_line.get(&(line, method)).cloned()),
-        };
+        let last = lasts.next().flatten();
         // A name the route's file does not declare, that an import of it
         // does: the handler sits in the declaring file.
         let imported = match &last {
@@ -215,10 +181,12 @@ pub fn attach_handler_spans(
 
 /// The call span each endpoint row was joined to, keyed by the row's file,
 /// line and lower-cased method (the mount graph's row is
-/// `file:line_number` of the same result). Two results at one key with
-/// different spans read as `None`: which call the graph row is cannot be told.
+/// `file:line_number` of the same result), the file in `file_key`'s form of the
+/// analysis key. Two results at one key with different spans read as
+/// `None`: which call the graph row is cannot be told.
 fn registration_calls(
     file_results: Option<&HashMap<String, FileAnalysisResult>>,
+    file_key: impl Fn(&str) -> String,
 ) -> HashMap<(String, u32, String), Option<CallSpan>> {
     let mut calls: HashMap<(String, u32, String), Option<CallSpan>> = HashMap::new();
     for (file, result) in file_results.into_iter().flatten() {
@@ -234,7 +202,7 @@ fn registration_calls(
             // (`FileOrchestrator`'s mount-graph build), its location
             // `<this key>:<line_number>`.
             let key = (
-                normalize(file),
+                file_key(file),
                 line,
                 endpoint.method.trim().to_ascii_lowercase(),
             );
@@ -249,6 +217,99 @@ fn registration_calls(
         }
     }
     calls
+}
+
+/// What a route row's registration call hands in last, as
+/// [`registered_identifiers`] states it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Registered {
+    /// A bare identifier.
+    Named(String),
+    /// The call was found and hands in something else (a function literal,
+    /// a wrapper call, a member).
+    NotNamed,
+    /// No call the row could be the registration of was found.
+    NotFound,
+}
+
+/// What the registration call of each of `rows` hands in last, read by the
+/// one reader [`attach_handler_spans`] reads it with ([`last_handed_in`]).
+pub(crate) fn registered_identifiers(
+    file_results: &HashMap<String, FileAnalysisResult>,
+    file_key: impl Fn(&str) -> String,
+    rows: &[(String, u32, String)],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<Registered> {
+    last_handed_in(Some(file_results), file_key, rows, read)
+        .into_iter()
+        .map(|last| match last {
+            Some(HandedIn::Named(name)) => Registered::Named(name),
+            Some(HandedIn::Literal(_) | HandedIn::Other) => Registered::NotNamed,
+            None => Registered::NotFound,
+        })
+        .collect()
+}
+
+/// What the registration call of each of `rows` hands in last: the one
+/// reader of a registration's handler argument. A row is `(file, line,
+/// method)`, its file in `file_key`'s form of an analysis key in
+/// `file_results`. A row joined to a call is read at that call's span (and
+/// reads [`HandedIn::Other`] when the call cannot be read there); any other
+/// row at the call its own file and line name, `None` when none is found.
+/// `read` returns a file's text by that form. Each file is parsed once.
+fn last_handed_in(
+    file_results: Option<&HashMap<String, FileAnalysisResult>>,
+    file_key: impl Fn(&str) -> String,
+    rows: &[(String, u32, String)],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<Option<HandedIn>> {
+    let calls = registration_calls(file_results, file_key);
+    let asked: Vec<(String, Option<CallSpan>, CallLine)> = rows
+        .iter()
+        .map(|(file, line, method)| {
+            let method = method.trim().to_ascii_lowercase();
+            let call = calls
+                .get(&(file.clone(), *line, method.clone()))
+                .copied()
+                .flatten();
+            (file.clone(), call, (*line, method))
+        })
+        .collect();
+    let mut wanted: HashMap<String, Wanted> = HashMap::new();
+    for (file, call, line) in &asked {
+        let file_wanted = wanted.entry(file.clone()).or_default();
+        match call {
+            Some(span) => {
+                file_wanted.spans.insert(*span);
+            }
+            None => {
+                file_wanted.lines.insert(line.clone());
+            }
+        }
+    }
+    let found: HashMap<String, HandedInByCall> = wanted
+        .into_iter()
+        .filter_map(|(file, asked)| {
+            let text = read(&file)?;
+            let found = last_arguments(&file, text, &asked);
+            Some((file, found))
+        })
+        .collect();
+    asked
+        .into_iter()
+        .map(|(file, call, line)| {
+            let found = found.get(&file);
+            match call {
+                Some(span) => Some(
+                    found
+                        .and_then(|found| found.by_span.get(&span))
+                        .cloned()
+                        .unwrap_or(HandedIn::Other),
+                ),
+                None => found.and_then(|found| found.by_line.get(&line).cloned()),
+            }
+        })
+        .collect()
 }
 
 /// What each call `asked` names hands in last, read from the file's text parsed

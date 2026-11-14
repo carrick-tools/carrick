@@ -357,6 +357,8 @@ fn declared_handler(operation: &crate::config::DeclaredOperation) -> Option<(&st
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredHandler {
     pub line: u32,
+    /// The line the definition closes on, 1-based and inclusive.
+    pub end_line: u32,
     /// `(name, annotated type text)`, in order. `None` where the source
     /// writes no annotation.
     pub params: Vec<(String, Option<String>)>,
@@ -392,6 +394,7 @@ impl DeclaredHandlers {
                 .or_default()
                 .push(DeclaredHandler {
                     line: definition.line_number,
+                    end_line: definition.end_line,
                     params: definition
                         .arguments
                         .iter()
@@ -412,6 +415,14 @@ impl DeclaredHandlers {
             [one] => Some(one),
             _ => None,
         }
+    }
+
+    /// The lines the one definition named `symbol` in `file` (repo-relative)
+    /// opens and closes on, inclusive. Two same-named definitions, or none,
+    /// place nothing.
+    pub(crate) fn lines_of_the_one(&self, file: &str, symbol: &str) -> Option<(u32, u32)> {
+        let found = self.the_one(file, symbol)?;
+        (found.line > 0 && found.end_line >= found.line).then_some((found.line, found.end_line))
     }
 }
 
@@ -1175,6 +1186,7 @@ mod tests {
                 .or_default()
                 .push(DeclaredHandler {
                     line: *line,
+                    end_line: *line,
                     params: params
                         .iter()
                         .map(|(name, text)| (name.to_string(), text.map(str::to_string)))
@@ -1226,6 +1238,7 @@ mod tests {
     fn a_case_request_is_the_handler_parameter_no_other_handler_takes() {
         let handler = |params: &[(&str, Option<&str>)]| DeclaredHandler {
             line: 1,
+            end_line: 1,
             params: params
                 .iter()
                 .map(|(name, text)| (name.to_string(), text.map(str::to_string)))

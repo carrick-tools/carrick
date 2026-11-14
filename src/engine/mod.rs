@@ -6168,15 +6168,17 @@ async fn analyze_current_repo_incremental(
                 service,
             );
             yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
-            let withdrawn = withdraw_model_routes_at_definitions(
+            let withdrawn = withdraw_model_routes_the_code_places_at_definitions(
                 &mut mount_graph,
                 &merged_results,
                 &protocol_extractions.library,
+                &HandlerPlaces {
+                    inputs: &request_inputs,
+                    definitions: &declared_handlers,
+                },
                 repo_path,
             );
-            if withdrawn > 0 {
-                debug!("Model routes withdrawn at library definitions: {withdrawn}");
-            }
+            log_definition_withdrawals(withdrawn);
             let guessed_withdrawn = withdraw_guessed_routes(
                 &mut mount_graph,
                 &protocol_extractions.site.traced.guessed,
@@ -8450,12 +8452,224 @@ fn read_library_rows(
     })
 }
 
-/// Withdraw every model route stated at exactly the span of a definition
-/// read through a verified library claim (carrick#1662): the call
-/// registers a handler under a name, which the library row states, and is
-/// no HTTP route. Fails closed: a model route at any other span, a route a
-/// pass stated, or a definition the scan cannot place keeps its row.
-fn withdraw_model_routes_at_definitions(
+/// How many model routes [`withdraw_model_routes_the_code_places_at_definitions`]
+/// withdrew, by rule.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DefinitionWithdrawals {
+    /// At a definition a verified library claim reads (carrick#1662).
+    library_definitions: usize,
+    /// Inside the body of a handler another file registers (carrick#4238).
+    handler_definitions: usize,
+}
+
+/// One debug count per rule of
+/// [`withdraw_model_routes_the_code_places_at_definitions`].
+fn log_definition_withdrawals(withdrawn: DefinitionWithdrawals) {
+    if withdrawn.library_definitions > 0 {
+        debug!(
+            "Model routes withdrawn at library definitions: {}",
+            withdrawn.library_definitions
+        );
+    }
+    if withdrawn.handler_definitions > 0 {
+        debug!(
+            "Model routes withdrawn inside a handler another file registers: {}",
+            withdrawn.handler_definitions
+        );
+    }
+}
+
+/// Where the code places a handler: the one definition of a name in a file,
+/// and what an import names, for
+/// [`withdraw_model_routes_the_code_places_at_definitions`].
+struct HandlerPlaces<'a> {
+    inputs: &'a crate::request_summary::RequestSummaryInputs,
+    definitions: &'a crate::dispatch::DeclaredHandlers,
+}
+
+/// Withdraw every model route the code places at a definition rather than at
+/// a registration. One answerer for "does a model route row stand where the
+/// code places a definition", by two rules, each failing closed:
+///
+/// - **Library definitions** (carrick#1662): a model route at exactly the
+///   span of a definition read through a verified library claim. The call
+///   registers a handler under a name, which the library row states, and is
+///   no HTTP route. A model route at any other span, a route a pass stated,
+///   or a definition the scan cannot place keeps its row.
+/// - **Handler definitions** (carrick#4238): a model route written inside the
+///   body of the function it names as its handler, when exactly one
+///   registration in another file registers that function, by the same
+///   method. The registration is the route, and the model row a second
+///   reading of it at the handler. See
+///   [`withdraw_model_routes_at_their_handlers`].
+fn withdraw_model_routes_the_code_places_at_definitions(
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    library: &crate::library_claims::LibraryRows,
+    handlers: &HandlerPlaces<'_>,
+    repo_path: &str,
+) -> DefinitionWithdrawals {
+    DefinitionWithdrawals {
+        library_definitions: withdraw_model_routes_at_library_definitions(
+            mount_graph,
+            file_results,
+            library,
+            repo_path,
+        ),
+        handler_definitions: withdraw_model_routes_at_their_handlers(
+            mount_graph,
+            file_results,
+            handlers,
+            repo_path,
+        ),
+    }
+}
+
+/// The handler-definition rule of
+/// [`withdraw_model_routes_the_code_places_at_definitions`] (carrick#4238).
+///
+/// A model row R is withdrawn only when all hold:
+/// - R's line lies inside the one definition in R's own file named by R's
+///   handler (two same-named definitions, or none, keep R);
+/// - exactly one registration S (a `file:line`) in another file, of R's
+///   method, registers that same function: the identifier S's registration
+///   call hands in last ([`crate::handler_span::registered_identifiers`]; the
+///   row's own handler name only when no such call is found) is an import
+///   declared, by [`crate::handler_span::declared_through`], as R's handler
+///   name in R's file.
+///
+/// Path text is never compared, and a name alone never matches: a handler
+/// imported as a whole module, an import that does not resolve, a wrapped
+/// handler and two registrations each keep R. The registration is unchanged;
+/// the withdrawn row hands nothing on (its type anchors are lines in the
+/// handler's file).
+fn withdraw_model_routes_at_their_handlers(
+    mount_graph: &mut crate::mount_graph::MountGraph,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    handlers: &HandlerPlaces<'_>,
+    repo_path: &str,
+) -> usize {
+    use crate::agents::file_analyzer_agent::ResolutionSource;
+    use crate::handler_span::{Registered, normalize, split_location};
+
+    let relative = |file: &str| normalize(crate::utils::repo_relative_source_path(file, repo_path));
+    let place =
+        |location: &str| split_location(location).map(|(file, line)| (relative(&file), line));
+    let plain_identifier = |name: &str| {
+        let name = name.trim();
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+
+    // R: a model row inside the one definition its handler names, in its own
+    // file. None means nothing is parsed.
+    let candidates: Vec<(usize, String, u32, String)> = mount_graph
+        .endpoints
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.resolution_source == Some(ResolutionSource::Model))
+        .filter_map(|(index, row)| {
+            let handler = row.handler.as_deref().map(str::trim)?;
+            if !plain_identifier(handler) {
+                return None;
+            }
+            let (file, line) = place(&row.file_location)?;
+            let (start, end) = handlers.definitions.lines_of_the_one(&file, handler)?;
+            (start <= line && line <= end).then(|| (index, file, line, handler.to_string()))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    // S: every other registration of a candidate's method, once per
+    // `file:line` (a router mounted twice is one registration).
+    let methods: HashSet<String> = candidates
+        .iter()
+        .map(|(index, ..)| mount_graph.endpoints[*index].method.to_uppercase())
+        .collect();
+    let mut registrations: Vec<(String, u32, String, Option<String>)> = Vec::new();
+    let mut seen: HashSet<(String, u32, String)> = HashSet::new();
+    for row in &mount_graph.endpoints {
+        let method = row.method.to_uppercase();
+        if !methods.contains(&method) {
+            continue;
+        }
+        let Some((file, line)) = place(&row.file_location) else {
+            continue;
+        };
+        if seen.insert((file.clone(), line, method.clone())) {
+            registrations.push((file, line, method, row.handler.clone()));
+        }
+    }
+    let asked: Vec<(String, u32, String)> = registrations
+        .iter()
+        .map(|(file, line, method, _)| (file.clone(), *line, method.clone()))
+        .collect();
+    let root = Path::new(repo_path);
+    let identifiers =
+        crate::handler_span::registered_identifiers(file_results, relative, &asked, |file| {
+            std::fs::read_to_string(root.join(file)).ok()
+        });
+
+    // What a registration's identifier names: an import of one binding,
+    // `(declaring file, name)`, both repo-relative, from the one answer to
+    // "where does this imported handler live".
+    let declared = crate::handler_span::declared_through(&handlers.inputs.bindings, repo_path);
+    let registered: Vec<Option<(String, String)>> = registrations
+        .iter()
+        .zip(identifiers)
+        .map(|((file, _, _, handler), identifier)| {
+            let local = match identifier {
+                Registered::Named(name) => name,
+                Registered::NotFound => handler
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| plain_identifier(name))?
+                    .to_string(),
+                Registered::NotNamed => return None,
+            };
+            declared(file, &local)
+        })
+        .collect();
+
+    let withdrawn: HashSet<usize> = candidates
+        .into_iter()
+        .filter(|(index, file, _, handler)| {
+            let method = mount_graph.endpoints[*index].method.to_uppercase();
+            let registering = registrations
+                .iter()
+                .zip(&registered)
+                .filter(|((at, _, of, _), names)| {
+                    at != file
+                        && *of == method
+                        && names.as_ref().is_some_and(|(declared_in, name)| {
+                            declared_in == file && name == handler
+                        })
+                })
+                .count();
+            registering == 1
+        })
+        .map(|(index, ..)| index)
+        .collect();
+    if withdrawn.is_empty() {
+        return 0;
+    }
+    let mut index = 0;
+    mount_graph.endpoints.retain(|_| {
+        let keep = !withdrawn.contains(&index);
+        index += 1;
+        keep
+    });
+    withdrawn.len()
+}
+
+/// The library-definition rule of
+/// [`withdraw_model_routes_the_code_places_at_definitions`] (carrick#1662).
+fn withdraw_model_routes_at_library_definitions(
     mount_graph: &mut crate::mount_graph::MountGraph,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
     library: &crate::library_claims::LibraryRows,
@@ -15258,15 +15472,17 @@ async fn analyze_current_repo(
         service,
     );
     yield_bus_to_sockets(&mut protocol_extractions, repo_path, service);
-    let withdrawn = withdraw_model_routes_at_definitions(
+    let withdrawn = withdraw_model_routes_the_code_places_at_definitions(
         &mut analysis_result.mount_graph,
         &analysis_result.file_results,
         &protocol_extractions.library,
+        &HandlerPlaces {
+            inputs: &request_inputs,
+            definitions: &declared_handlers,
+        },
         repo_path,
     );
-    if withdrawn > 0 {
-        debug!("Model routes withdrawn at library definitions: {withdrawn}");
-    }
+    log_definition_withdrawals(withdrawn);
     let guessed_withdrawn = withdraw_guessed_routes(
         &mut analysis_result.mount_graph,
         &protocol_extractions.site.traced.guessed,
@@ -30725,8 +30941,12 @@ unfollowed_member_calls_total: 0,
             ],
             ..LibraryRows::default()
         };
-        let withdrawn =
-            withdraw_model_routes_at_definitions(&mut mount_graph, &file_results, &library, ".");
+        let withdrawn = withdraw_model_routes_at_library_definitions(
+            &mut mount_graph,
+            &file_results,
+            &library,
+            ".",
+        );
         assert_eq!(withdrawn, 1);
         let kept: Vec<&str> = mount_graph
             .endpoints
@@ -30758,7 +30978,7 @@ unfollowed_member_calls_total: 0,
             ..LibraryRows::default()
         };
         assert_eq!(
-            withdraw_model_routes_at_definitions(
+            withdraw_model_routes_at_library_definitions(
                 &mut absolute_graph,
                 &absolute_results,
                 &absolute_library,
@@ -30766,6 +30986,332 @@ unfollowed_member_calls_total: 0,
             ),
             1,
             "an absolute repo path withdraws the same route"
+        );
+    }
+
+    /// A service where `src/routes.ts` registers handlers other files define
+    /// (carrick#4238), discovered as a scan discovers it: its request inputs
+    /// (import bindings) and the definitions by file and name.
+    fn handler_file_service() -> (
+        tempfile::TempDir,
+        crate::request_summary::RequestSummaryInputs,
+        crate::dispatch::DeclaredHandlers,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files: &[(&str, &str)] = &[
+            ("src/router.ts", "export const router: any = {};\n"),
+            (
+                "src/controllers/v1.ts",
+                "export function allV1(request: any, reply: any) {\n  reply.forward(request);\n}\n",
+            ),
+            (
+                "src/controllers/items.ts",
+                "export function getItem(request: any, reply: any) {\n  reply.send(request.params.id);\n}\n",
+            ),
+            (
+                "src/controllers/self.ts",
+                "import { router } from \"../router\";\n\
+                 export function h(request: any, reply: any) {\n  reply.send(\"h\");\n}\n\
+                 router.get(\"/a\", h);\n",
+            ),
+            (
+                "src/controllers/orphan.ts",
+                "export function orphan(request: any, reply: any) {\n  reply.send(1);\n}\n",
+            ),
+            (
+                "src/controllers/twice.ts",
+                "export function twice(request: any, reply: any) {\n  reply.send(2);\n}\n",
+            ),
+            (
+                "src/controllers/missing.ts",
+                "export function missing(request: any, reply: any) {\n  reply.send(3);\n}\n",
+            ),
+            (
+                "src/controllers/modh.ts",
+                "export function modh(request: any, reply: any) {\n  reply.send(4);\n}\n",
+            ),
+            (
+                "src/controllers/wrapped.ts",
+                "export function wrapped(request: any, reply: any) {\n  reply.send(5);\n}\n",
+            ),
+            (
+                "src/gql-handler.ts",
+                "export function gql(request: any, reply: any) {\n  reply.send(6);\n}\n",
+            ),
+            // A handler the scan places no definition for: a value a call
+            // returns.
+            (
+                "src/controllers/made.ts",
+                "const makeHandler = () => (request: any, reply: any) => reply.send(7);\n\
+                 export const made = makeHandler();\n",
+            ),
+            // Two definitions of one name in one file.
+            (
+                "src/controllers/dup.ts",
+                "export function dup(request: any, reply: any) {\n  reply.send(8);\n}\n\
+                 export namespace again {\n  export function dup(request: any, reply: any) {\n    reply.send(9);\n  }\n}\n",
+            ),
+            (
+                "src/routes.ts",
+                "import { router } from \"./router\";\n\
+                 import { allV1 } from \"./controllers/v1\";\n\
+                 import { getItem } from \"./controllers/items\";\n\
+                 import { h } from \"./controllers/self\";\n\
+                 import { twice } from \"./controllers/twice\";\n\
+                 import { missing } from \"./controllers/nowhere\";\n\
+                 import * as mod from \"./controllers/modh\";\n\
+                 import { wrapped } from \"./controllers/wrapped\";\n\
+                 const wrap = (f: any) => f;\n\
+                 router.all(\"/v1/*\", allV1);\n\
+                 router.get(\"/items/:id\", getItem);\n\
+                 router.get(\"/b\", h);\n\
+                 router.get(\"/twice\", twice);\n\
+                 router.get(\"/m\", missing);\n\
+                 router.get(\"/mod\", mod.modh);\n\
+                 router.get(\"/w\", wrap(wrapped));\n\
+                 import { made } from \"./controllers/made\";\n\
+                 import { dup } from \"./controllers/dup\";\n\
+                 router.get(\"/made\", made);\n\
+                 router.get(\"/dup\", dup);\n",
+            ),
+            (
+                "src/other.ts",
+                "import { router } from \"./router\";\n\
+                 import { twice } from \"./controllers/twice\";\n\
+                 router.get(\"/twice-again\", twice);\n",
+            ),
+            (
+                "src/graphql.ts",
+                "import { router } from \"./router\";\n\
+                 import { gql } from \"./gql-handler\";\n\
+                 router.all(\"/graphql\", gql);\n",
+            ),
+            (
+                "src/test-helper.ts",
+                "import { router } from \"./router\";\n\
+                 import { gql } from \"./gql-handler\";\n\
+                 router.all(\"/graphql\", gql);\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        }
+        let root = dir.path().to_string_lossy().to_string();
+        let cm: Lrc<SourceMap> = Default::default();
+        let discovery =
+            discover_files_and_symbols(&root, &Config::default(), cm).expect("discovery");
+        let definitions = crate::dispatch::DeclaredHandlers::from_definitions(
+            discovery.function_definitions.values(),
+            &root,
+        );
+        (dir, discovery.request_inputs, definitions)
+    }
+
+    /// carrick#4238: a model route written inside the body of the handler it
+    /// names is withdrawn when exactly one registration in another file
+    /// registers that handler by the same method, whatever path it states
+    /// (catch-all, same path, no mount prefix, a path made up from the
+    /// name). Every other row keeps its place: a handler no one registers,
+    /// one registered twice, another method, an import that does not
+    /// resolve, a whole-module import, a wrapped handler, a handler with no
+    /// definition the scan places or with two, a row outside the
+    /// handler's body, a row a pass stated, and two real registrations of
+    /// one handler (golden-a's `ALL /graphql` shape).
+    #[test]
+    fn a_model_route_inside_a_handler_another_file_registers_is_withdrawn_and_nothing_else() {
+        use crate::agents::file_analyzer_agent::ResolutionSource::{FileBasedRoute, Model};
+
+        let (dir, inputs, definitions) = handler_file_service();
+        let root = dir.path().to_string_lossy().to_string();
+        let rows = |prefix: &str| {
+            let row = |file: &str, line: u32, method: &str, path: &str, handler: &str, source| {
+                crate::mount_graph::ResolvedEndpoint {
+                    handler: Some(handler.to_string()),
+                    ..traced_row(
+                        &format!("{prefix}{file}:{line}"),
+                        method,
+                        path,
+                        path,
+                        source,
+                    )
+                }
+            };
+            vec![
+                // Registrations.
+                row("src/routes.ts", 10, "ALL", "/api/v1/*", "allV1", Model),
+                row(
+                    "src/routes.ts",
+                    11,
+                    "GET",
+                    "/api/items/:id",
+                    "getItem",
+                    Model,
+                ),
+                row("src/routes.ts", 12, "GET", "/api/b", "h", Model),
+                row("src/routes.ts", 13, "GET", "/api/twice", "twice", Model),
+                row("src/other.ts", 3, "GET", "/api/twice-again", "twice", Model),
+                row("src/routes.ts", 14, "GET", "/api/m", "missing", Model),
+                row("src/routes.ts", 15, "GET", "/api/mod", "modh", Model),
+                row("src/routes.ts", 16, "GET", "/api/w", "wrapped", Model),
+                row("src/routes.ts", 19, "GET", "/api/made", "made", Model),
+                row("src/routes.ts", 20, "GET", "/api/dup", "dup", Model),
+                row("src/graphql.ts", 3, "ALL", "/graphql", "gql", Model),
+                row("src/test-helper.ts", 3, "ALL", "/graphql", "gql", Model),
+                row("src/controllers/self.ts", 5, "GET", "/a", "h", Model),
+                // Withdrawn: the four measured shapes.
+                row("src/controllers/v1.ts", 2, "ALL", "/v1/*", "allV1", Model),
+                row(
+                    "src/controllers/items.ts",
+                    2,
+                    "GET",
+                    "/api/items/:id",
+                    "getItem",
+                    Model,
+                ),
+                row(
+                    "src/controllers/items.ts",
+                    2,
+                    "GET",
+                    "/items/:id",
+                    "getItem",
+                    Model,
+                ),
+                row(
+                    "src/controllers/items.ts",
+                    2,
+                    "GET",
+                    "/getItem",
+                    "getItem",
+                    Model,
+                ),
+                // Kept.
+                row(
+                    "src/controllers/items.ts",
+                    2,
+                    "POST",
+                    "/items/:id",
+                    "getItem",
+                    Model,
+                ),
+                row(
+                    "src/controllers/orphan.ts",
+                    2,
+                    "GET",
+                    "/orphan",
+                    "orphan",
+                    Model,
+                ),
+                row(
+                    "src/controllers/twice.ts",
+                    2,
+                    "GET",
+                    "/twice",
+                    "twice",
+                    Model,
+                ),
+                row(
+                    "src/controllers/missing.ts",
+                    2,
+                    "GET",
+                    "/m",
+                    "missing",
+                    Model,
+                ),
+                row("src/controllers/modh.ts", 2, "GET", "/mod", "modh", Model),
+                row(
+                    "src/controllers/wrapped.ts",
+                    2,
+                    "GET",
+                    "/w",
+                    "wrapped",
+                    Model,
+                ),
+                row("src/controllers/made.ts", 2, "GET", "/made", "made", Model),
+                row("src/controllers/dup.ts", 2, "GET", "/dup", "dup", Model),
+                row(
+                    "src/controllers/v1.ts",
+                    2,
+                    "ALL",
+                    "/v1/stated/*",
+                    "allV1",
+                    FileBasedRoute,
+                ),
+            ]
+        };
+        let places = HandlerPlaces {
+            inputs: &inputs,
+            definitions: &definitions,
+        };
+        let no_results = HashMap::new();
+        let kept_of = |graph: &crate::mount_graph::MountGraph, prefix: &str| {
+            graph
+                .endpoints
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} {} {}",
+                        row.file_location.trim_start_matches(prefix),
+                        row.method,
+                        row.path
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<String> = [
+            "src/routes.ts:10 ALL /api/v1/*",
+            "src/routes.ts:11 GET /api/items/:id",
+            "src/routes.ts:12 GET /api/b",
+            "src/routes.ts:13 GET /api/twice",
+            "src/other.ts:3 GET /api/twice-again",
+            "src/routes.ts:14 GET /api/m",
+            "src/routes.ts:15 GET /api/mod",
+            "src/routes.ts:16 GET /api/w",
+            "src/routes.ts:19 GET /api/made",
+            "src/routes.ts:20 GET /api/dup",
+            "src/graphql.ts:3 ALL /graphql",
+            "src/test-helper.ts:3 ALL /graphql",
+            "src/controllers/self.ts:5 GET /a",
+            "src/controllers/items.ts:2 POST /items/:id",
+            "src/controllers/orphan.ts:2 GET /orphan",
+            "src/controllers/twice.ts:2 GET /twice",
+            "src/controllers/missing.ts:2 GET /m",
+            "src/controllers/modh.ts:2 GET /mod",
+            "src/controllers/wrapped.ts:2 GET /w",
+            "src/controllers/made.ts:2 GET /made",
+            "src/controllers/dup.ts:2 GET /dup",
+            "src/controllers/v1.ts:2 ALL /v1/stated/*",
+        ]
+        .map(str::to_string)
+        .to_vec();
+
+        // The incremental scan's graph holds repo-relative rows; the full
+        // scan's the walked path, absolute when the repo path is.
+        for prefix in ["", &format!("{root}/")] {
+            let mut graph = crate::mount_graph::MountGraph::new();
+            graph.endpoints = rows(prefix);
+            let withdrawn =
+                withdraw_model_routes_at_their_handlers(&mut graph, &no_results, &places, &root);
+            assert_eq!(withdrawn, 4, "prefix {prefix:?}");
+            assert_eq!(kept_of(&graph, prefix), expected, "prefix {prefix:?}");
+        }
+
+        // The rule runs inside the one answerer, beside the library rule.
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints = rows("");
+        assert_eq!(
+            withdraw_model_routes_the_code_places_at_definitions(
+                &mut graph,
+                &no_results,
+                &crate::library_claims::LibraryRows::default(),
+                &places,
+                &root,
+            ),
+            DefinitionWithdrawals {
+                library_definitions: 0,
+                handler_definitions: 4,
+            }
         );
     }
 
