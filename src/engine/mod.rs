@@ -30473,12 +30473,15 @@ unfollowed_member_calls_total: 0,
         );
     }
 
-    /// carrick#4245, the pub/sub and queue half (open): a broker call in a
-    /// loop over a stated list states no library row and saves no library
-    /// lead; the site path asks its kind, and unanswered the site is a
-    /// possible call, so the site is never lost.
+    /// carrick#4245, the pub/sub and queue half: a broker call in a loop
+    /// over a stated list states no library row and saves no library lead;
+    /// the site path asks only its kind and names one row per element of the
+    /// list (the compiler's union of the elements is no choice the model
+    /// names), and unanswered the site is a possible call, so the site is
+    /// never lost.
     #[tokio::test]
-    async fn a_broker_call_in_a_loop_over_a_stated_list_is_asked_by_the_site_path() {
+    async fn a_broker_call_in_a_loop_over_a_stated_list_is_one_row_per_element() {
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
         let edit = [
             (
                 "package.json",
@@ -30544,20 +30547,51 @@ unfollowed_member_calls_total: 0,
             .iter()
             .find(|record| record.anchors.call.file == file && record.anchors.call.line == 4)
             .expect("the loop's call is a decided site");
+        assert_eq!(record.state.asked, vec![Slot::Kind], "{:?}", record.state);
+        assert_eq!(record.names, vec!["orders.created", "orders.shipped"]);
+        let rows_with = |kind: Option<&str>| {
+            let mut answers = SiteAnswers::default();
+            if let Some(kind) = kind {
+                let mut answered = Answered::default();
+                answered.kind = Some(SlotAnswer {
+                    value: Some(SlotValue::Text(kind.to_string())),
+                    confidence: 0.95,
+                    orders_agree: true,
+                });
+                answers
+                    .answered
+                    .insert(crate::site_rows::site_id(&record.anchors), answered);
+            }
+            crate::site_rows::of(&of.decided, &of.records, &of.labels, &answers)
+        };
+        let topic = rows_with(Some("topic"));
+        let mut keys: Vec<_> = topic
+            .rows
+            .iter()
+            .filter(|row| row.file == file && row.line == 4)
+            .inspect(|row| {
+                assert!(!row.needs_reader, "the names are the code's own: {row:?}");
+                assert_eq!(format!("{:?}", row.source), "Model", "{row:?}");
+            })
+            .map(|row| row.key.clone())
+            .collect();
+        keys.sort_by_key(|key| format!("{key:?}"));
+        assert_eq!(
+            keys,
+            vec![
+                crate::operation::OperationKey::pubsub("orders.created"),
+                crate::operation::OperationKey::pubsub("orders.shipped"),
+            ],
+            "{:#?}",
+            topic.rows
+        );
+        let job = rows_with(Some("job"));
         assert!(
-            record
-                .state
-                .asked
-                .contains(&crate::site_questions::Slot::Kind),
-            "{:?}",
-            record.state
+            job.rows.iter().all(|row| row.file != file),
+            "a job name is no topic row: {:#?}",
+            job.rows
         );
-        let unanswered = crate::site_rows::of(
-            &of.decided,
-            &of.records,
-            &of.labels,
-            &crate::site_questions::SiteAnswers::default(),
-        );
+        let unanswered = rows_with(None);
         assert!(
             unanswered
                 .leads
@@ -30566,9 +30600,300 @@ unfollowed_member_calls_total: 0,
             "unanswered, the site is a possible call: {:#?}",
             unanswered.leads
         );
-        // Recorded for whoever scopes this half: the slots the site path
-        // asks at the loop's call.
-        eprintln!("carrick#4245 asked at the loop: {:?}", record.state.asked);
+    }
+
+    /// The packages and the labels the loop-site tests walk: a bus, a socket
+    /// server, an in-process emitter, a queue and an HTTP client, each
+    /// labelled the way the library store labels it.
+    const LOOP_PACKAGES: [(&str, &str); 11] = [
+        (
+            "package.json",
+            r#"{ "name": "web", "version": "1.0.0", "dependencies": { "@fixture/bus": "^1.0.0", "@fixture/sock": "^1.0.0", "@fixture/events": "^1.0.0", "@fixture/queue": "^1.0.0", "@fixture/http": "^1.0.0" } }"#,
+        ),
+        (
+            "node_modules/@fixture/http/package.json",
+            r#"{ "name": "@fixture/http", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/@fixture/http/index.d.ts",
+            "export interface Client {\n  post<T>(url: string, data?: unknown): Promise<T>;\n}\nexport declare const http: Client;\n",
+        ),
+        (
+            "node_modules/@fixture/queue/package.json",
+            r#"{ "name": "@fixture/queue", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/@fixture/queue/index.d.ts",
+            "export declare class Worker {\n  constructor(name: string, run: (job: unknown) => Promise<void>);\n}\n",
+        ),
+        (
+            "node_modules/@fixture/events/package.json",
+            r#"{ "name": "@fixture/events", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/@fixture/events/index.d.ts",
+            "export interface Emitter {\n  on(ev: string, h: (m: unknown) => void): void;\n  emit(ev: string, m: unknown): void;\n}\nexport declare const emitter: Emitter;\n",
+        ),
+        (
+            "node_modules/@fixture/bus/package.json",
+            r#"{ "name": "@fixture/bus", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/@fixture/bus/index.d.ts",
+            "export interface Bus {\n  publish(topic: string, data: unknown): Promise<void>;\n  subscribe(topic: string, h: (m: unknown) => void): void;\n}\nexport declare const bus: Bus;\n",
+        ),
+        (
+            "node_modules/@fixture/sock/package.json",
+            r#"{ "name": "@fixture/sock", "version": "1.0.0", "types": "index.d.ts" }"#,
+        ),
+        (
+            "node_modules/@fixture/sock/index.d.ts",
+            "export interface Io {\n  on(ev: string, h: (m: unknown) => void): void;\n  emit(ev: string, m: unknown): void;\n}\nexport declare const io: Io;\n",
+        ),
+    ];
+
+    const LOOP_LABELS: &str = r#"{"library_claims":[{"package":"@fixture/bus","version":"1.0.0","status":"answered",
+        "exports":[{"specifier":"@fixture/bus","export":"bus","role":"broker",
+        "makes":[],"scopes":[],
+        "ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1}},
+               {"op":"receive","member":"subscribe","on":"export","name":{"arg":0},"handler":{"arg":1}}],
+        "reserved":[],"calls":[],"patterns":[]}]},
+        {"package":"@fixture/sock","version":"1.0.0","status":"answered",
+        "exports":[{"specifier":"@fixture/sock","export":"io","role":"socket","side":"server",
+        "makes":[],"scopes":[],
+        "ops":[{"op":"send","member":"emit","on":"export","name":{"arg":0},"payload":{"arg":1}},
+               {"op":"receive","member":"on","on":"export","name":{"arg":0},"handler":{"arg":1}}],
+        "reserved":[],"calls":[],"patterns":[]}]},
+        {"package":"@fixture/queue","version":"1.0.0","status":"answered",
+        "exports":[{"specifier":"@fixture/queue","export":"Worker","role":"broker",
+        "makes":[],"scopes":[],
+        "ops":[{"op":"receive","member":null,"on":"export","form":"new","name":{"arg":0},"handler":{"arg":1}}],
+        "reserved":[],"calls":[],"patterns":[]}]},
+        {"package":"@fixture/http","version":"1.0.0","status":"answered",
+        "exports":[{"specifier":"@fixture/http","export":"http","role":"http_client","side":"client",
+        "makes":[],"scopes":[],
+        "ops":[{"op":"request","member":"post","on":"export","name":{"arg":0},"payload":{"arg":1},"method":"POST"}],
+        "reserved":[],"calls":[],"patterns":[]}]},
+        {"package":"@fixture/events","version":"1.0.0","status":"answered",
+        "exports":[{"specifier":"@fixture/events","export":"emitter","role":"in_process_bus",
+        "makes":[],"scopes":[],
+        "ops":[{"op":"send","member":"emit","on":"export","name":{"arg":0},"payload":{"arg":1}},
+               {"op":"receive","member":"on","on":"export","name":{"arg":0},"handler":{"arg":1}}],
+        "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+
+    /// `use_ts` as `src/use.ts` (with `src/topics.ts` beside it) walked over
+    /// [`LOOP_PACKAGES`], and the site records of that walk.
+    fn loop_walk(
+        use_ts: &str,
+    ) -> Option<(
+        crate::request_summary::fixture_walk::Walked,
+        super::SiteRecordsOf,
+    )> {
+        let mut edit: Vec<(&str, &str)> = LOOP_PACKAGES.to_vec();
+        edit.push((
+            "src/topics.ts",
+            "export const SHARED = [\"orders.created\", \"orders.shipped\"] as const;\n",
+        ));
+        edit.push(("src/use.ts", use_ts));
+        let on = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        )?;
+        let exports = crate::library_store::parse_answer(LOOP_LABELS).exports;
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        Some((on, of))
+    }
+
+    /// carrick#4245: message handlers and senders registered in a loop over
+    /// a stated list are one name per element, whatever the role: the
+    /// subscriber and the publisher of one list pair on every element.
+    #[tokio::test]
+    async fn message_handlers_in_a_loop_over_a_stated_list_pair_per_element() {
+        use crate::site_questions::{Answered, SiteAnswers, Slot, SlotAnswer, SlotValue};
+        let Some((_on, of)) = loop_walk(
+            "import { bus } from \"@fixture/bus\";\n\
+             import { io } from \"@fixture/sock\";\n\
+             import { emitter } from \"@fixture/events\";\n\
+             import { Worker } from \"@fixture/queue\";\n\
+             import { http } from \"@fixture/http\";\n\
+             import { SHARED } from \"./topics\";\n\
+             const TOPICS = [\"orders.created\", \"orders.shipped\"] as const;\n\
+             const URLS = [\"/h/one\", \"/h/two\"] as const;\n\
+             export async function pubs() { for (const t of TOPICS) await bus.publish(t, {}); }\n\
+             export function subs() { for (const t of SHARED) bus.subscribe(t, () => {}); }\n\
+             export async function tuples() { for (const [t, n] of [[\"p.one\", 1], [\"p.two\", 2]] as const) await bus.publish(t, { n }); }\n\
+             function send(topic: string) { return bus.publish(topic, {}); }\n\
+             export function viaCallee() { for (const t of TOPICS) send(t); }\n\
+             export function inProcess() { for (const t of TOPICS) emitter.on(t, () => {}); }\n\
+             export function workers() { for (const q of TOPICS) new Worker(q, async () => {}); }\n\
+             export function sockets() { for (const t of TOPICS) io.on(t, () => {}); }\n\
+             export function requests() { for (const u of URLS) http.post(u, null); }\n",
+        ) else {
+            return;
+        };
+        let file = "services/web/src/use.ts";
+        let record_at = |line: u32| {
+            of.records
+                .iter()
+                .find(|record| record.anchors.call.file == file && record.anchors.call.line == line)
+                .unwrap_or_else(|| panic!("a decided site at line {line}"))
+        };
+        let both = vec!["orders.created", "orders.shipped"];
+        for (line, label) in [
+            (9, "a publisher"),
+            (10, "an imported list's subscriber"),
+            (13, "a send through a callee"),
+            (14, "an in-process listener"),
+            (15, "a queue worker"),
+        ] {
+            let record = record_at(line);
+            assert_eq!(
+                record.state.asked,
+                vec![Slot::Kind],
+                "{label}: {:?}",
+                record.state
+            );
+            assert_eq!(record.names, both, "{label}");
+        }
+        let tuple = record_at(11);
+        assert_eq!(tuple.state.asked, vec![Slot::Kind], "{:?}", tuple.state);
+        assert_eq!(tuple.names, vec!["p.one", "p.two"]);
+        // A socket's kind is the label's: the names are stated, nothing is
+        // asked, and an HTTP client over a list of URLs states one request
+        // per element as a plain list already does.
+        let socket = record_at(16);
+        assert!(socket.state.asked.is_empty(), "{:?}", socket.state);
+        assert_eq!(socket.names, both);
+        let request = record_at(17);
+        assert!(
+            !request.state.asked.contains(&Slot::Name),
+            "{:?}",
+            request.state
+        );
+        assert_eq!(request.names, vec!["/h/one", "/h/two"]);
+        // Answered `topic`, the subscriber's keys are the publisher's.
+        let mut answers = SiteAnswers::default();
+        for record in &of.records {
+            let mut answered = Answered::default();
+            if record.state.asked.contains(&Slot::Kind) {
+                answered.kind = Some(SlotAnswer {
+                    value: Some(SlotValue::Text("topic".to_string())),
+                    confidence: 0.95,
+                    orders_agree: true,
+                });
+            }
+            answers
+                .answered
+                .insert(crate::site_rows::site_id(&record.anchors), answered);
+        }
+        let rows = crate::site_rows::of(&of.decided, &of.records, &of.labels, &answers);
+        let keys_at = |line: u32, side: crate::site_rows::RowSide| {
+            let mut keys: Vec<String> = rows
+                .rows
+                .iter()
+                .filter(|row| row.file == file && row.line == line && row.side == side)
+                .map(|row| format!("{:?}", row.key))
+                .collect();
+            keys.sort();
+            keys
+        };
+        let published = keys_at(9, crate::site_rows::RowSide::Call);
+        assert_eq!(published.len(), 2, "{:#?}", rows.rows);
+        assert_eq!(
+            keys_at(10, crate::site_rows::RowSide::Endpoint),
+            published,
+            "{:#?}",
+            rows.rows
+        );
+        assert_eq!(
+            keys_at(13, crate::site_rows::RowSide::Call),
+            published,
+            "{:#?}",
+            rows.rows
+        );
+        assert_eq!(
+            keys_at(16, crate::site_rows::RowSide::Endpoint).len(),
+            2,
+            "{:#?}",
+            rows.rows
+        );
+    }
+
+    /// carrick#4245: what the per-element read does not reach keeps its
+    /// record: names the compiler types as a union or the code builds, a
+    /// list written again, a choice, a callback parameter, a literal and an
+    /// HTTP template.
+    #[tokio::test]
+    async fn message_sites_beside_a_loop_keep_their_records() {
+        let Some((_on, of)) = loop_walk(
+            "import { bus } from \"@fixture/bus\";\n\
+             import { http } from \"@fixture/http\";\n\
+             const TOPICS = [\"orders.created\", \"orders.shipped\"] as const;\n\
+             const PLAIN = [\"plain.one\", \"plain.two\"];\n\
+             const GROWN = [\"g.one\"];\n\
+             GROWN.push(\"g.two\");\n\
+             declare const later: string[];\n\
+             function send(topic: string) { return bus.publish(topic, {}); }\n\
+             function sendApp(topic: string) { return bus.publish(`app.${topic}`, {}); }\n\
+             export async function a(flag: boolean) {\n\
+             \x20 for (const t of later) await bus.publish(t, {});\n\
+             \x20 for (const t of TOPICS) await bus.publish(flag ? t : \"x.y\", {});\n\
+             \x20 await bus.publish(flag ? \"a.one\" : \"a.two\", {});\n\
+             \x20 for (const t of PLAIN) await bus.publish(t, {});\n\
+             \x20 for (const t of PLAIN) await bus.publish(flag ? t : \"x.y\", {});\n\
+             \x20 for (const t of GROWN) await bus.publish(t, {});\n\
+             \x20 for (const t of TOPICS) sendApp(t);\n\
+             \x20 TOPICS.forEach((t) => bus.publish(t, {}));\n\
+             \x20 await bus.publish(\"lit.one\", {});\n\
+             \x20 send(flag ? \"m.one\" : \"m.two\");\n\
+             \x20 for (const v of [\"a\", \"b\"] as const) http.post(`/p/n-loop/${v}`, null);\n\
+             \x20 for (const u of [\"/hp/one\", \"/hp/two\"]) http.post(u, null);\n\
+             }\n",
+        ) else {
+            return;
+        };
+        let file = "services/web/src/use.ts";
+        let mut seen: Vec<String> = of
+            .records
+            .iter()
+            .filter(|record| record.anchors.call.file == file)
+            .map(|record| {
+                format!(
+                    "{} {:?} asked={:?} names={:?} unread={:?}",
+                    record.anchors.call.line,
+                    record.bucket,
+                    record.state.asked,
+                    record.names,
+                    record.unread
+                )
+            })
+            .collect();
+        seen.sort();
+        // Line 18 (`forEach`, a callback parameter) is no decided site.
+        assert_eq!(
+            seen,
+            vec![
+                "11 Lead asked=[Kind] names=[] unread=Some(UnreadExpression)",
+                "12 Asked asked=[Kind, Name] names=[] unread=None",
+                "13 Asked asked=[Kind] names=[\"a.one\", \"a.two\"] unread=None",
+                "14 Asked asked=[Kind] names=[\"plain.one\", \"plain.two\"] unread=None",
+                "15 Asked asked=[Kind] names=[\"plain.one\", \"plain.two\", \"x.y\"] unread=None",
+                "16 Lead asked=[Kind] names=[] unread=Some(UnreadExpression)",
+                "17 Lead asked=[Kind] names=[] unread=Some(UnreadExpression)",
+                "19 Asked asked=[Kind] names=[] unread=None",
+                "20 Asked asked=[Kind] names=[\"m.one\", \"m.two\"] unread=None",
+                "21 Forced asked=[] names=[] unread=None",
+                "22 Forced asked=[] names=[\"/hp/one\", \"/hp/two\"] unread=None",
+            ]
+        );
     }
 
     /// carrick#4365: a choice handed to a callee that builds the message name

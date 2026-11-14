@@ -457,3 +457,38 @@ fn a_verified_library_pubsub_call_is_anchored_and_typed_at_its_slot() {
     let unique: std::collections::BTreeSet<&&str> = aliases.iter().collect();
     assert_eq!(unique.len(), aliases.len(), "no alias twice: {aliases:#?}");
 }
+
+/// carrick#4245: `tests/fixtures/site-payloads-pubsub-loop/`, a publisher and
+/// a subscriber each registered in a loop over a list of topics
+/// (`src/publish.ts` over a same-file list, `src/listen.ts` over an imported
+/// one, both `as const`). The reader's cassettes state no pub/sub row, and the
+/// site questions answer only the kind (`topic`): each element is a row, and
+/// the publisher's rows pair with the subscriber's.
+#[test]
+fn a_loop_over_a_stated_list_of_topics_writes_a_row_per_element_that_pairs() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-pubsub-loop");
+    let on = scan(&repo, &[]);
+    // The topics each row of `array` in `file` names.
+    let topics_in = |array: &str, file: &str| -> Vec<String> {
+        let mut topics: Vec<String> = on[array]
+            .as_array()
+            .unwrap_or_else(|| panic!("a {array} array"))
+            .iter()
+            .filter(|row| row["file"].as_str().is_some_and(|f| f.ends_with(file)))
+            .flat_map(|row| {
+                let text = row.to_string();
+                ["feed.created", "feed.updated"]
+                    .into_iter()
+                    .filter(|topic| text.contains(&format!("\"{topic}\"")))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        topics.sort();
+        topics
+    };
+    let elements = vec!["feed.created".to_string(), "feed.updated".to_string()];
+    assert_eq!(topics_in("calls", "src/publish.ts"), elements, "{on:#}");
+    assert_eq!(topics_in("endpoints", "src/listen.ts"), elements, "{on:#}");
+}
