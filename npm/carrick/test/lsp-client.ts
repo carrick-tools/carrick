@@ -14,6 +14,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { Framer, frame } from "../src/lsp-frame.ts";
 import { pluginDir } from "./helpers.ts";
 
 export type Publish = { uri: string; diagnostics: unknown[] };
@@ -29,7 +30,7 @@ function readText(file: string): string {
 
 export class LspClient {
   private readonly child: ChildProcessWithoutNullStreams;
-  private buffer = Buffer.alloc(0);
+  private readonly framer = new Framer();
   private nextId = 1;
   /** Milliseconds since the last publish arrived, for settling. */
   private lastPublishAt = 0;
@@ -64,29 +65,9 @@ export class LspClient {
   }
 
   private consume(chunk: Buffer): void {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    for (;;) {
-      const separator = this.buffer.indexOf("\r\n\r\n");
-      if (separator === -1) return;
-      const match = /Content-Length:\s*(\d+)/i.exec(
-        this.buffer.subarray(0, separator).toString("ascii"),
-      );
-      if (!match?.[1]) {
-        this.buffer = this.buffer.subarray(separator + 4);
-        continue;
-      }
-      const length = Number.parseInt(match[1], 10);
-      if (this.buffer.length < separator + 4 + length) return;
-      const body = this.buffer.subarray(separator + 4, separator + 4 + length).toString("utf8");
-      this.buffer = this.buffer.subarray(separator + 4 + length);
-      const message = JSON.parse(body) as {
-        id?: number;
-        method?: string;
-        params?: Publish;
-        result?: unknown;
-      };
+    for (const message of this.framer.push(chunk)) {
       if (message.method === "textDocument/publishDiagnostics" && message.params) {
-        this.publishes.push(message.params);
+        this.publishes.push(message.params as unknown as Publish);
         this.lastPublishAt = Date.now();
       } else if (message.method) {
         this.notifications.push({ method: message.method, params: message.params });
@@ -97,9 +78,7 @@ export class LspClient {
   }
 
   private write(message: Record<string, unknown>): void {
-    const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", ...message }), "utf8");
-    this.child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
-    this.child.stdin.write(body);
+    this.child.stdin.write(frame(message));
   }
 
   notify(method: string, params: Record<string, unknown>): void {
