@@ -622,20 +622,6 @@ impl RequestSummaryInputs {
                 },
             )
             .collect();
-        if let Some(positions) = self.positions.as_ref() {
-            files.extend(
-                positions
-                    .value_reads()
-                    .filter_map(|row| row.decl_file())
-                    .filter(|file| {
-                        !file.starts_with("lib:")
-                            && !file.starts_with("pkg:")
-                            && !file.split('/').any(|part| part == "node_modules")
-                    })
-                    .map(|file| positions.path_of(file))
-                    .filter(|file| !self.files.contains_key(file)),
-            );
-        }
         files.sort();
         files.dedup();
         files
