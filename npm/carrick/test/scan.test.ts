@@ -48,8 +48,7 @@ type Row = { pipe: "out" | "err"; text: string };
 
 /** The fake's default stream as rows, each tagged with the pipe it travels on. */
 const STREAM: Row[] = [
-  { pipe: "err", text: BUILD[0] },
-  { pipe: "err", text: BUILD[1] },
+  ...BUILD.slice(0, 2).map((text): Row => ({ pipe: "err", text })),
   { pipe: "out", text: TREE_LINE },
   { pipe: "out", text: BOUNDARY },
   ...BUILD.slice(2).map((text): Row => ({ pipe: "err", text })),
@@ -91,8 +90,8 @@ function readOrders(rows: Row[], n: number): Row[][] {
     let i = 0;
     let j = 0;
     while (i < out.length || j < err.length) {
-      if (j >= err.length || (i < out.length && rand() < 0.5)) merged.push(out[i++]);
-      else merged.push(err[j++]);
+      if (j >= err.length || (i < out.length && rand() < 0.5)) merged.push(out[i++] as Row);
+      else merged.push(err[j++] as Row);
     }
     all.push(merged);
   }
