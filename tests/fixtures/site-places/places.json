@@ -4,52 +4,52 @@
     "type_kind": "request",
     "protocol": "http",
     "method": "POST",
-    "path": "/orders",
     "file": "src/client.ts",
     "text": "{ sku, qty: 1 }",
     "start": 247,
-    "end": 262
+    "end": 262,
+    "name": "/orders"
   },
   {
     "role": "consumer",
     "type_kind": "response",
     "protocol": "http",
     "method": "POST",
-    "path": "/orders",
     "file": "src/client.ts",
     "text": "fetch('/orders', { method: 'POST', body: JSON.stringify({ sku, qty: 1 }) })",
     "start": 191,
-    "end": 266
+    "end": 266,
+    "name": "/orders"
   },
   {
     "role": "consumer",
     "type_kind": "response",
     "protocol": "http",
     "method": "GET",
-    "path": "/orders",
     "file": "src/client.ts",
     "text": "fetch('/orders')",
     "start": 367,
-    "end": 383
+    "end": 383,
+    "name": "/orders"
   },
   {
     "role": "consumer",
-    "type_kind": "request",
+    "type_kind": "response",
     "protocol": "pubsub",
-    "path": "orders.created",
     "file": "src/orders.ts",
     "text": "{ topic: 'orders.created', sku, quantity }",
     "start": 156,
-    "end": 198
+    "end": 198,
+    "name": "orders.created"
   },
   {
     "role": "consumer",
-    "type_kind": "request",
-    "protocol": "websocket",
-    "path": "chat.in",
+    "type_kind": "response",
+    "protocol": "socket",
     "file": "src/live.ts",
     "text": "{ text: \"hi\" }",
     "start": 115,
-    "end": 129
+    "end": 129,
+    "name": "chat.in"
   }
 ]

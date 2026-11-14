@@ -3166,25 +3166,6 @@ fn is_consumer_call_result(entry: &TypeManifestEntry) -> bool {
         && entry.evidence.infer_kind == InferKind::CallResult
 }
 
-/// Write each consumer response locator into its manifest entry's evidence,
-/// so a later `--changed-only` run that carries this service can retype the
-/// same call from the stored blob (carrick#2567). The locator is stored as
-/// the inference had it: a span, or the call's text and line.
-pub(crate) fn store_call_locators(
-    manifest: &mut [TypeManifestEntry],
-    calls: &HashMap<String, CallLocator>,
-) {
-    for entry in manifest.iter_mut().filter(|e| is_consumer_call_result(e)) {
-        let Some(call) = calls.get(&entry.type_alias) else {
-            continue;
-        };
-        entry.evidence.span_start = call.span_start;
-        entry.evidence.span_end = call.span_end;
-        entry.evidence.expression_text = call.expression_text.clone();
-        entry.evidence.expression_line = call.expression_line;
-    }
-}
-
 /// A carried service's consumer calls, read back from its stored manifest
 /// (carrick#2567). A carried service's files are byte-identical to its
 /// stored commit, so a stored locator names the call the run that stored it
@@ -6439,96 +6420,6 @@ mod tests {
         assert_eq!(calls.len(), 1, "only call results are retyped: {calls:?}");
         assert_eq!(calls["C"].line_number, 8);
         assert_eq!(calls["C"].span_start, Some(80));
-    }
-
-    /// carrick#2567: a consumer's call locators survive the stored blob, as
-    /// the inference had them (by text or by span), at the clone's root.
-    #[test]
-    fn stored_call_locators_read_back_what_the_capture_stored() {
-        let consumer = |alias: &str, line: u32| {
-            let mut e = entry(
-                OperationKey::http("GET", "/orders"),
-                ManifestRole::Consumer,
-                ManifestTypeKind::Response,
-                alias,
-                "web/src/client.ts",
-                line,
-                ManifestTypeState::Unknown,
-            );
-            e.evidence.infer_kind = InferKind::CallResult;
-            e
-        };
-        let mut producer = consumer("P", 3);
-        producer.role = ManifestRole::Producer;
-        let mut manifest = vec![
-            consumer("ByText", 8),
-            consumer("BySpan", 12),
-            consumer("Unlocated", 16),
-            producer,
-        ];
-        let at = |line: u32| CallLocator {
-            file_path: "/scan/web/src/client.ts".to_string(),
-            line_number: line,
-            span_start: None,
-            span_end: None,
-            expression_text: None,
-            expression_line: None,
-            prescreen: None,
-            prescreen_fresh_type: None,
-            prescreen_undefined_free: None,
-        };
-        let calls = HashMap::from([
-            (
-                "ByText".to_string(),
-                CallLocator {
-                    expression_text: Some("api.get(\"/orders\")".to_string()),
-                    expression_line: Some(8),
-                    ..at(8)
-                },
-            ),
-            (
-                "BySpan".to_string(),
-                CallLocator {
-                    span_start: Some(120),
-                    span_end: Some(140),
-                    ..at(12)
-                },
-            ),
-            (
-                "P".to_string(),
-                CallLocator {
-                    span_start: Some(1),
-                    span_end: Some(2),
-                    ..at(3)
-                },
-            ),
-        ]);
-        store_call_locators(&mut manifest, &calls);
-        assert_eq!(
-            manifest[3].evidence.span_start, None,
-            "a producer entry carries no consumer locator"
-        );
-
-        let read = stored_call_locators(&manifest, Path::new("/clone"));
-        assert_eq!(read.len(), 2, "an unlocated call is left out: {read:?}");
-        assert_eq!(
-            read["ByText"],
-            CallLocator {
-                file_path: "/clone/web/src/client.ts".to_string(),
-                expression_text: Some("api.get(\"/orders\")".to_string()),
-                expression_line: Some(8),
-                ..at(8)
-            }
-        );
-        assert_eq!(
-            read["BySpan"],
-            CallLocator {
-                file_path: "/clone/web/src/client.ts".to_string(),
-                span_start: Some(120),
-                span_end: Some(140),
-                ..at(12)
-            }
-        );
     }
 
     // ---- derive_capture_anchors -------------------------------------------

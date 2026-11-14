@@ -77,6 +77,7 @@ pub mod pr_delta_anchor;
 pub mod pr_functions;
 pub mod preflight;
 pub mod progress;
+pub mod read_place;
 pub mod receiver_origin;
 pub mod receiver_type;
 pub mod registration_scope;

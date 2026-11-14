@@ -85,7 +85,9 @@ fn site_places_fixture_stores_each_value_span() {
                 && entry["protocol"] == field("protocol")
                 && (row["method"].is_null()
                     || entry["method"].as_str().unwrap_or_default() == field("method"))
-                && entry["path"] == field("path")
+                && ["path", "topic", "event"]
+                    .iter()
+                    .any(|name| entry[*name] == field("name"))
         });
         let Some(entry) = entry else {
             failures.push(format!("no entry for {row}"));
@@ -109,7 +111,7 @@ fn site_places_fixture_stores_each_value_span() {
                 field("role"),
                 field("type_kind"),
                 field("method"),
-                field("path"),
+                field("name"),
                 (start, end)
             ));
         }
