@@ -237,7 +237,7 @@ fn load_reads(
 ) -> Option<RepoReads> {
     let bytes = std::fs::read(dir_of(workspace, generation)?.join(READS)).ok()?;
     let file: ReadsIn = serde_json::from_slice(&bytes).ok()?;
-    if file.format != FORMAT || file.inputs != *now {
+    if file.format != FORMAT {
         return None;
     }
     file.repos.into_iter().find(|reads| reads.path == repo)
