@@ -3,7 +3,9 @@
 Synthetic two-service monorepo for carrick#1491: a consumer that calls a
 generic HTTP client instance with and without a type argument, and reads a
 field off the response. `http-client` and `http-server` are hand-written
-declarations, not real packages. The client's `post<T>` resolves to an envelope
+declarations, installed under each service's `node_modules` with a lockfile,
+and `__llm__/library-claims/default.json` is the library store's answer for
+them (carrick#3711). The client's `post<T>` resolves to an envelope
 that carries `T` as `data` beside a request-data parameter defaulting to `any`,
 which is the shape that leaves both calls without a comparable type.
 

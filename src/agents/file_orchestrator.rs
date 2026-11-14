@@ -25010,7 +25010,7 @@ export async function POST(request: Request): Promise<Response> {
             source,
             &[RoutingConvention::nextjs_app()],
         );
-        let scan = scanner.scan_content(rel, source, &[], &[]);
+        let scan = scanner.scan_every_call(rel, source);
         let candidates = scan
             .candidates
             .into_iter()
@@ -25616,7 +25616,7 @@ export async function POST(request: Request): Promise<Response> {
     /// derived for it: the module sits outside every routing convention.
     fn unstated_route_candidates(source: &str) -> HashMap<String, CandidateTarget> {
         SwcScanner::new()
-            .scan_content(Path::new("src/handlers/things.ts"), source, &[], &[])
+            .scan_every_call(Path::new("src/handlers/things.ts"), source)
             .candidates
             .into_iter()
             .filter(|candidate| candidate.protocol == Protocol::Http)
