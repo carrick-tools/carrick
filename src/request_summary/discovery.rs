@@ -858,7 +858,6 @@ pub fn declaration_ask(
     let own = called_by(positions);
     let sibling_only: HashSet<(String, String)> = siblings
         .iter()
-        .take(0)
         .filter_map(|sibling| sibling.positions.as_ref())
         .flat_map(called_by)
         .filter(|pair| !own.contains(pair))
