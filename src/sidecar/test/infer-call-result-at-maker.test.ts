@@ -81,7 +81,7 @@ describe('carrick#4375: a call result generic in a maker takes the maker call', 
     fs.rmSync(repoDir, { recursive: true, force: true });
   });
 
-  const infer = async (alias: string, callText: string, call: string | undefined) => {
+  const infer = async (alias: string, callText: string, call: string | undefined, whole = false) => {
     const at = spanOf(MAKER_TS, callText);
     const through = call === undefined ? undefined : spanOf(USE_TS, call);
     const response = await client.send<InferShape>({
@@ -95,6 +95,7 @@ describe('carrick#4375: a call result generic in a maker takes the maker call', 
           span_end: at.end,
           infer_kind: 'call_result',
           alias,
+          ...(whole ? { result: { whole: true } } : {}),
           ...(through
             ? { through_call: { file_path: usePath, span_start: through.start, span_end: through.end } }
             : {}),
@@ -108,6 +109,11 @@ describe('carrick#4375: a call result generic in a maker takes the maker call', 
 
   it('reads the result as the maker call instantiates it', async () => {
     const { text } = await infer('Stock', 'request<T>(`${root}/read`)', "makeLookup<{ count: number }>('/stock')");
+    assert.match(text, /^\{ count: number;? \}$/, text);
+  });
+
+  it('reads a labelled result as the maker call instantiates it', async () => {
+    const { text } = await infer('Labelled', 'request<T>(`${root}/read`)', "makeLookup<{ count: number }>('/stock')", true);
     assert.match(text, /^\{ count: number;? \}$/, text);
   });
 

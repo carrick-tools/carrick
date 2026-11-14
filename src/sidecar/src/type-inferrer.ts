@@ -3366,10 +3366,11 @@ export class TypeInferrer {
   private labelledCallResult(
     request: InferRequestItem,
     callExpr: CallExpression,
-    label: NonNullable<InferRequestItem['result']>
+    label: NonNullable<InferRequestItem['result']>,
+    instantiated?: Type
   ): InferredType {
     const location = this.getNodeLocation(callExpr);
-    const raw = callExpr.getType();
+    const raw = instantiated ?? callExpr.getType();
     const awaited = this.awaitedBeyondPromise(raw) ?? this.unwrapPromiseType(raw);
     const missing = (what: string): InferredType =>
       this.decidedAbstain(request, location, {
@@ -3442,6 +3443,26 @@ export class TypeInferrer {
     );
   }
 
+  /**
+   * The type of a call result read inside a maker, as the call `through_call`
+   * names instantiates it (carrick#4375): the same read a built body takes,
+   * `typeAtThroughCall`. Only a request that names a call is read this way; a
+   * result with none keeps the reading it has. `undefined` where the read
+   * holds nothing the call binds.
+   */
+  private callResultAtThroughCall(
+    node: Node,
+    request: InferRequestItem
+  ): { type: Type } | { abstain: InferredType } | undefined {
+    if (!request.through_call) return undefined;
+    const atCaller = this.typeAtThroughCall(node, request);
+    if (atCaller.kind === 'open') return { abstain: atCaller.abstain };
+    if (atCaller.kind === 'as_read') return undefined;
+    // The read is made inside the maker, where the parameter is open again.
+    this.readNodes.delete(this.getNodeLocation(node));
+    return { type: atCaller.type };
+  }
+
   private inferCallResult(
     sourceFile: SourceFile,
     request: InferRequestItem,
@@ -3462,14 +3483,20 @@ export class TypeInferrer {
     // holds the response body. The label is the library's own statement, so it
     // is read before any wrapper rule of the service's extraction config.
     if (request.result) {
-      return this.labelledCallResult(request, callExpr, request.result);
+      // carrick#4375: a result generic in a maker is read as the maker call
+      // named in `through_call` instantiates it, by the path a built body takes.
+      const labelled = this.callResultAtThroughCall(callExpr, request);
+      if (labelled && 'abstain' in labelled) return labelled.abstain;
+      return this.labelledCallResult(request, callExpr, request.result, labelled?.type);
     }
 
     // Walk up from the already-found call expression instead of re-searching
     const func = this.findContainingFunctionForNode(callExpr);
     const use = this.resolveCallResultTerminalNode(callExpr, func);
     const terminalNode = use.terminal;
-    const returnType = terminalNode.getType();
+    const atCaller = this.callResultAtThroughCall(terminalNode, request);
+    if (atCaller && 'abstain' in atCaller) return atCaller.abstain;
+    const returnType = atCaller?.type ?? terminalNode.getType();
     let typeString = typeText(returnType, terminalNode);
     // Blueprint row N8: the type `typeString` prints, while it prints one.
     let printedType: Type | undefined = this.unwrapPromiseType(returnType);
