@@ -16,6 +16,7 @@ import { describe, it, before } from 'node:test';
 import * as assert from 'node:assert';
 import { DefinitionResolver } from '../src/definition-resolver.js';
 import type { DefinitionAlias } from '../src/types.js';
+import type { GraphqlTypes } from '../src/capture/api.js';
 import { stubDirFor } from './helpers.js';
 
 const STUB = `export interface Row {
@@ -31,8 +32,16 @@ export interface Priced {
   price: Money;
   size: bigint;
 }
+export interface Receipt {
+  totalMinor: bigint;
+  at: Date;
+  stamp: Date;
+  lines: { amountMinor: bigint | null }[];
+  note?: bigint;
+}
 export type Endpoint_row = Row;
 export type Endpoint_priced = Priced;
+export type Endpoint_receipt = Receipt;
 `;
 
 describe('resolve_definitions prints the sending side of an http payload in wire form (carrick-cloud#3503)', () => {
@@ -80,6 +89,58 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(d.expanded, /createdAt: string/, d.expanded);
     assert.doesNotMatch(d.expanded, /Date/, d.expanded);
     assert.match(d.definition, /createdAt: Date/, 'the as-written form keeps the declared type');
+  });
+
+  it('a GraphQL producer response with its SDL types prints each built-in leaf in its scalar\'s sent type (carrick#4403)', () => {
+    const types: GraphqlTypes = {
+      Query: { fields: { receipt: { non_null: { type: 'Receipt' } } } },
+      Receipt: {
+        fields: {
+          totalMinor: { non_null: { scalar: 'String' } },
+          at: { non_null: { scalar: 'Float' } },
+          stamp: { scalar: 'DateTime' },
+          lines: { list: { type: 'Line' } },
+          note: { scalar: 'String' },
+        },
+      },
+      Line: { fields: { amountMinor: { scalar: 'String' } } },
+    };
+    const [d] = new DefinitionResolver().resolveFromStub(
+      stubDir,
+      [
+        {
+          alias: 'Endpoint_receipt',
+          protocol: 'graphql',
+          type_kind: 'response',
+          side: 'producer',
+          procedure: false,
+          graphql_root: { type: 'Query', field: 'receipt' },
+        },
+      ],
+      types,
+    );
+    assert.ok(d, 'Endpoint_receipt resolved');
+    assert.match(d.expanded, /totalMinor: string;/, d.expanded);
+    assert.match(d.expanded, /at: number;/, d.expanded);
+    // A custom scalar keeps the JSON form.
+    assert.match(d.expanded, /stamp: string;/, d.expanded);
+    assert.match(d.expanded, /lines: \{ amountMinor: null \| string; \}\[\]/, d.expanded);
+    assert.match(d.expanded, /note\?: string;/, d.expanded);
+    assert.doesNotMatch(d.expanded, /bigint|Date/, d.expanded);
+    assert.match(d.definition, /totalMinor: bigint/, 'the as-written form keeps the declared type');
+
+    // Without the types it is #4275's JSON form: the bigint stays.
+    const [json] = new DefinitionResolver().resolveFromStub(stubDir, [
+      {
+        alias: 'Endpoint_receipt',
+        protocol: 'graphql',
+        type_kind: 'response',
+        side: 'producer',
+        procedure: false,
+        graphql_root: { type: 'Query', field: 'receipt' },
+      },
+    ]);
+    assert.match(json.expanded, /totalMinor: bigint;/, json.expanded);
   });
 
   it('a GraphQL request is read by the server as declared', () => {

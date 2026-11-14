@@ -44,16 +44,20 @@ type SameVariant<One, Other> = One extends { action: infer Tag }
 
 /**
  * The keys of `One` that `Other` does not declare, each as the path that
- * reaches it; `never` when there are none.
+ * reaches it; `never` when there are none. A record (a string index
+ * signature) declares no keys: its keys are data, and a recursive one (the
+ * GraphQL leaf tree, carrick#4403) would never end.
  */
 type UndeclaredKeys<One, Other, At extends string = ''> = One extends readonly (infer Item)[]
   ? UndeclaredKeys<Item, Other extends readonly (infer Element)[] ? Element : never, `${At}[]`>
   : One extends object
-    ? {
-        [Key in keyof One & string]-?: Key extends KeysOfAny<SameVariant<One, Other>>
-          ? UndeclaredKeys<One[Key], ValueAt<SameVariant<One, Other>, Key>, `${At}.${Key}`>
-          : `${At}.${Key}`;
-      }[keyof One & string]
+    ? string extends keyof One
+      ? never
+      : {
+          [Key in keyof One & string]-?: Key extends KeysOfAny<SameVariant<One, Other>>
+            ? UndeclaredKeys<One[Key], ValueAt<SameVariant<One, Other>, Key>, `${At}.${Key}`>
+            : `${At}.${Key}`;
+        }[keyof One & string]
     : never;
 
 /** Compiles for `never` alone. */
