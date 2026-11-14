@@ -130,11 +130,11 @@ describe('carrick#1605: the bundle follows a name through its re-exports', () =>
     assert.strictEqual(res.symbol_failures, undefined, JSON.stringify(res.symbol_failures));
     const entry = res.manifest?.find((e) => e.alias === 'Account_Home');
     assert.ok(entry, JSON.stringify(res.manifest));
-    assert.deepStrictEqual(entry.home, {
-      symbol: 'Account',
-      file_path: path.join(fs.realpathSync(repo), 'src', 'core', 'api.ts'),
-      line: 2,
-    });
+    assert.ok(entry.home, JSON.stringify(entry));
+    assert.deepStrictEqual(
+      { ...entry.home, file_path: fs.realpathSync(entry.home.file_path) },
+      { symbol: 'Account', file_path: path.join(fs.realpathSync(repo), 'src', 'core', 'api.ts'), line: 2 }
+    );
   });
 
   it('resolves a type through `export { Me } from`', async () => {

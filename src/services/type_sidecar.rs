@@ -303,7 +303,7 @@ impl InferRequestItem {
             infer_kind: InferKind::RequestConfig,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: vec![TypeProvenance {
@@ -2122,6 +2122,16 @@ pub struct ReachAnswer {
 // Response Types (matching TypeScript types)
 // ============================================================================
 
+/// Where a named type is declared, as the compiler engine reports it
+/// (carrick#2148): the name, the declaring file (absolute, past any barrel)
+/// and the 1-based line of the declaration's name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeHomeReport {
+    pub symbol: String,
+    pub file_path: String,
+    pub line: u32,
+}
+
 /// One node an answer read (carrick#4244), in the compiler's positions:
 /// UTF-16 code units from the start of `file_path` (absolute), `[start, end)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2161,6 +2171,9 @@ pub struct ManifestEntry {
     pub type_string: String,
     /// Whether this was an explicit annotation or inferred
     pub is_explicit: bool,
+    /// carrick#2148: where the bundled declaration is, past any barrel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<TypeHomeReport>,
 }
 
 /// An inferred type result
@@ -2202,18 +2215,19 @@ pub struct InferredType {
     /// is not always what `type_string` prints (a def-use walk's terminal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
-    /// Declaration file (absolute path) of `primary_type_symbol`. Not every
-    /// inference reports it: the pub/sub infer kinds (`function_param`,
-    /// `expression`) do (#413), and so does a response whose anchor was read
-    /// off the annotation as written (carrick#768). Two readers:
-    /// `demote_witnessed_borrowed_anchors` re-aims a demoted explicit
-    /// `SymbolRequest` at it, because the bundler resolves a symbol only
-    /// against declarations IN the request's `source_file` and the inference
-    /// is the only party that knows where the tsc-witnessed payload type
-    /// lives; and the engine's `anchor_inferred_symbols` states it as the home
-    /// of an anchor it fills (carrick#1819).
+    /// carrick#2148: where the type `type_string` was printed from is
+    /// declared. Where `primary_type_symbol` is reported, it is that symbol's
+    /// declaration; otherwise the printed type's, with array levels and a
+    /// `| null`/`| undefined` around one named type peeled. Absent for a shape
+    /// nobody named, a TypeScript lib type, framework machinery, a type
+    /// declared inside an ambient `declare module "<specifier>"` block, and a
+    /// decided abstain. Two readers: `demote_witnessed_borrowed_anchors`
+    /// re-aims a demoted explicit `SymbolRequest` at its file, because the
+    /// bundler resolves a symbol only against declarations IN the request's
+    /// `source_file`; and the engine's `anchor_inferred_symbols` states it as
+    /// the home of an anchor it fills (carrick#1819).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_type_symbol_source: Option<String>,
+    pub type_home: Option<TypeHomeReport>,
     /// Blueprint row N8: the type `type_string` prints is framework
     /// machinery, decided by the sidecar from where it is declared (a library
     /// or installed package carrying the transport's members, or a package
@@ -2436,9 +2450,10 @@ pub struct StatedBody {
     /// an object literal type, or a union of several types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
-    /// Declaration file (absolute path) of `root`, when it resolves to one.
+    /// Where `root` is declared (carrick#2148), by `InferredType::type_home`'s
+    /// rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_source: Option<String>,
+    pub root_home: Option<TypeHomeReport>,
     /// Array levels peeled on the way to `root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub array_depth: Option<u32>,
@@ -5286,7 +5301,8 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 return Some(req.clone());
             }
             // Re-aiming needs the root's declaration file.
-            let Some(root_source) = inf.primary_type_symbol_source.as_deref() else {
+            let Some(root_source) = inf.type_home.as_ref().map(|home| home.file_path.as_str())
+            else {
                 return Some(req.clone());
             };
             // Never install machinery as a payload.
@@ -5346,6 +5362,9 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
                 Some(AnchorRoot {
                     symbol: kept.symbol_name.clone(),
                     source_file: kept.source_file.clone(),
+                    home: inferred_by_alias
+                        .get(alias)
+                        .and_then(|inf| reaimed_home(inf, kept)),
                 }),
             )),
             _ => None,
@@ -5389,6 +5408,24 @@ pub struct AnchorChange {
 pub struct AnchorRoot {
     pub symbol: String,
     pub source_file: String,
+    /// carrick#2148: the home the re-aim was read from, with its line.
+    pub home: Option<TypeHomeReport>,
+}
+
+/// The home an inference reported for the root a request was re-aimed at:
+/// the stated body's root or the inference's own type, whichever names that
+/// root in that file.
+fn reaimed_home(inf: &InferredType, kept: &SymbolRequest) -> Option<TypeHomeReport> {
+    [
+        inf.stated_body
+            .as_ref()
+            .and_then(|stated| stated.root_home.as_ref()),
+        inf.type_home.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|home| home.symbol == kept.symbol_name && home.file_path == kept.source_file)
+    .cloned()
 }
 
 /// The server claims an `infer` request carries (carrick#2674): only where
@@ -5559,7 +5596,10 @@ fn arbitrate_stated_body(
     };
     if let (Some(root), Some(root_source), Some(array_depth)) = (
         stated.root.as_deref(),
-        stated.root_source.as_deref(),
+        stated
+            .root_home
+            .as_ref()
+            .map(|home| home.file_path.as_str()),
         reaim_depth,
     ) && !stated.machinery
     {
@@ -8011,7 +8051,7 @@ mod tests {
             infer_kind: InferKind::FunctionReturn,
             primary_type_symbol: symbol.map(str::to_string),
             array_depth,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -8211,7 +8251,11 @@ mod tests {
     ) -> InferredType {
         let mut inf = inferred(alias, symbol, None);
         inf.type_string = type_string.to_string();
-        inf.primary_type_symbol_source = symbol_source.map(str::to_string);
+        inf.type_home = symbol_source.map(|file| TypeHomeReport {
+            symbol: symbol.unwrap_or_default().to_string(),
+            file_path: file.to_string(),
+            line: 1,
+        });
         inf
     }
 
@@ -8471,7 +8515,11 @@ mod tests {
             "{ results: { name: string; }[]; messageKey?: string; }",
             StatedBody {
                 root: Some("SearchResponse".to_string()),
-                root_source: Some("/repo/src/search.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "SearchResponse".to_string(),
+                    file_path: "/repo/src/search.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: false,
@@ -8495,7 +8543,11 @@ mod tests {
             "{ id: string; name: string; email: string; }",
             StatedBody {
                 root: Some("Member".to_string()),
-                root_source: Some("/repo/src/members.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "Member".to_string(),
+                    file_path: "/repo/src/members.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: false,
@@ -8521,7 +8573,11 @@ mod tests {
             "MemberPage[]",
             StatedBody {
                 root: Some("MemberPage".to_string()),
-                root_source: Some("/repo/src/pages.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "MemberPage".to_string(),
+                    file_path: "/repo/src/pages.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: Some(1),
                 root_type_arguments: None,
                 machinery: false,
@@ -8552,7 +8608,11 @@ mod tests {
             "readonly MemberPage[]",
             StatedBody {
                 root: Some("MemberPage".to_string()),
-                root_source: Some("/repo/src/pages.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "MemberPage".to_string(),
+                    file_path: "/repo/src/pages.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: Some(1),
                 root_relation: Some(ModelSymbolRelation {
                     relation: SymbolRelationKind::List,
@@ -8587,7 +8647,11 @@ mod tests {
                 text,
                 StatedBody {
                     root: Some("Page".to_string()),
-                    root_source: Some("/repo/src/pages.ts".to_string()),
+                    root_home: Some(TypeHomeReport {
+                        symbol: "Page".to_string(),
+                        file_path: "/repo/src/pages.ts".to_string(),
+                        line: 1,
+                    }),
                     root_type_arguments: Some(1),
                     root_relation: relation.map(|relation| ModelSymbolRelation {
                         relation,
@@ -8646,7 +8710,11 @@ mod tests {
             "Response",
             StatedBody {
                 root: Some("Response".to_string()),
-                root_source: Some("/repo/node_modules/types/fetch.d.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "Response".to_string(),
+                    file_path: "/repo/node_modules/types/fetch.d.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: None,
                 root_type_arguments: None,
                 machinery: true,
@@ -8745,7 +8813,11 @@ mod tests {
             "MemberPage[]",
             StatedBody {
                 root: Some("MemberPage".to_string()),
-                root_source: Some("/repo/src/pages.ts".to_string()),
+                root_home: Some(TypeHomeReport {
+                    symbol: "MemberPage".to_string(),
+                    file_path: "/repo/src/pages.ts".to_string(),
+                    line: 1,
+                }),
                 array_depth: Some(1),
                 root_type_arguments: None,
                 machinery: false,
@@ -8777,6 +8849,11 @@ mod tests {
                     reaimed: Some(AnchorRoot {
                         symbol: "MemberPage".to_string(),
                         source_file: "/repo/src/pages.ts".to_string(),
+                        home: Some(TypeHomeReport {
+                            symbol: "MemberPage".to_string(),
+                            file_path: "/repo/src/pages.ts".to_string(),
+                            line: 1,
+                        }),
                     }),
                 },
                 AnchorChange {
@@ -8785,6 +8862,11 @@ mod tests {
                     reaimed: Some(AnchorRoot {
                         symbol: "OrderPlaced".to_string(),
                         source_file: "/repo/src/orders.ts".to_string(),
+                        home: Some(TypeHomeReport {
+                            symbol: "OrderPlaced".to_string(),
+                            file_path: "/repo/src/orders.ts".to_string(),
+                            line: 1,
+                        }),
                     }),
                 },
             ]
@@ -8809,7 +8891,11 @@ mod tests {
                 "{ id: string; }",
                 StatedBody {
                     root: Some("Member".to_string()),
-                    root_source: Some("/repo/src/members.ts".to_string()),
+                    root_home: Some(TypeHomeReport {
+                        symbol: "Member".to_string(),
+                        file_path: "/repo/src/members.ts".to_string(),
+                        line: 1,
+                    }),
                     array_depth: None,
                     root_type_arguments: None,
                     machinery: false,

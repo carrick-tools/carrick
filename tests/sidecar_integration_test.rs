@@ -1464,11 +1464,11 @@ export function onOrderPlaced(evt: OrderPlaced): void {
         .expect("expected an inference for the demoted alias");
     assert_eq!(inf.primary_type_symbol.as_deref(), Some("OrderPlaced"));
     assert!(
-        inf.primary_type_symbol_source
-            .as_deref()
-            .is_some_and(|s| s.ends_with("types.ts")),
-        "anchor source must be the declaration file, got {:?}",
-        inf.primary_type_symbol_source
+        inf.type_home
+            .as_ref()
+            .is_some_and(|home| home.file_path.ends_with("types.ts")),
+        "anchor home must be the declaration file, got {:?}",
+        inf.type_home
     );
 
     // Witnessed borrow: the alias is bundled from the tsc-witnessed payload

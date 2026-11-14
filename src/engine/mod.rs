@@ -14787,8 +14787,10 @@ fn anchor_stated_body_roots(
         let Some(stated) = inf.stated_body.as_ref() else {
             continue;
         };
-        let (Some(root), Some(source_file)) = (stated.root.as_ref(), stated.root_source.as_ref())
-        else {
+        let (Some(root), Some(source_file)) = (
+            stated.root.as_ref(),
+            stated.root_home.as_ref().map(|home| &home.file_path),
+        ) else {
             continue;
         };
         if stated.machinery {
@@ -14797,6 +14799,7 @@ fn anchor_stated_body_roots(
         let root = crate::services::type_sidecar::AnchorRoot {
             symbol: root.clone(),
             source_file: source_file.clone(),
+            home: stated.root_home.clone(),
         };
         let Some(home) = reported_declaration_home(&root, repo_path, &cm, &handler) else {
             continue;
@@ -14829,7 +14832,7 @@ fn anchor_stated_body_roots(
 /// call's inference anchors on the call's own type, which for `fetch` is
 /// `Response`: the thing the body is read out of, not the body.
 ///
-/// The home is read off the same inference (`primary_type_symbol_source`)
+/// The home is read off the same inference (`type_home`'s file)
 /// and resolved as a re-aimed root's is (`reported_declaration_home`): the
 /// declaration's line, in a file inside the repo. A package installed under
 /// the repo's `node_modules` is inside the repo, and its home is the path it
@@ -14849,9 +14852,10 @@ fn anchor_inferred_symbols(
             .as_deref()
             .filter(|_| !inf.anchor_machinery)
         {
-            named
-                .entry(inf.alias.as_str())
-                .or_insert((symbol, inf.primary_type_symbol_source.as_deref()));
+            named.entry(inf.alias.as_str()).or_insert((
+                symbol,
+                inf.type_home.as_ref().map(|home| home.file_path.as_str()),
+            ));
         }
     }
     let cm: Lrc<SourceMap> = Default::default();
@@ -14873,6 +14877,7 @@ fn anchor_inferred_symbols(
                     let root = crate::services::type_sidecar::AnchorRoot {
                         symbol: symbol.to_string(),
                         source_file: source_file.to_string(),
+                        home: None,
                     };
                     reported_declaration_home(&root, repo_path, &cm, &handler)
                 })
@@ -25799,7 +25804,7 @@ unfollowed_member_calls_total: 0,
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -25875,7 +25880,7 @@ unfollowed_member_calls_total: 0,
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -25919,7 +25924,7 @@ unfollowed_member_calls_total: 0,
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: Some(symbol.to_string()),
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -26063,7 +26068,11 @@ unfollowed_member_calls_total: 0,
     /// the file that declares it.
     fn inferred_from(symbol: &str, source: Option<&Path>) -> InferredType {
         let mut inferred = inferred_with_symbol(symbol);
-        inferred.primary_type_symbol_source = source.map(as_reported);
+        inferred.type_home = source.map(|path| crate::services::type_sidecar::TypeHomeReport {
+            symbol: symbol.to_string(),
+            file_path: as_reported(path),
+            line: 1,
+        });
         inferred
     }
 
@@ -26499,6 +26508,7 @@ unfollowed_member_calls_total: 0,
             reaimed: Some(crate::services::type_sidecar::AnchorRoot {
                 symbol: "MemberPage".to_string(),
                 source_file: declaring.to_string_lossy().into_owned(),
+                home: None,
             }),
         }];
 
@@ -26543,6 +26553,7 @@ unfollowed_member_calls_total: 0,
             reaimed: Some(crate::services::type_sidecar::AnchorRoot {
                 symbol: "MemberPage".to_string(),
                 source_file: declaring.to_string_lossy().into_owned(),
+                home: None,
             }),
         }];
 
@@ -26601,7 +26612,11 @@ unfollowed_member_calls_total: 0,
     fn stated_root(root: &str, source: &str) -> crate::services::type_sidecar::StatedBody {
         crate::services::type_sidecar::StatedBody {
             root: Some(root.to_string()),
-            root_source: Some(source.to_string()),
+            root_home: Some(crate::services::type_sidecar::TypeHomeReport {
+                symbol: root.to_string(),
+                file_path: source.to_string(),
+                line: 1,
+            }),
             array_depth: None,
             root_type_arguments: None,
             machinery: false,
@@ -26784,7 +26799,7 @@ unfollowed_member_calls_total: 0,
             .canonicalize()
             .expect("canonical");
         let mut no_source = stated_root("MemberPage", &declaring);
-        no_source.root_source = None;
+        no_source.root_home = None;
         let cases = [
             ("declared nowhere the sidecar found", no_source),
             (
@@ -27421,6 +27436,7 @@ unfollowed_member_calls_total: 0,
                 source_file: "lib/types.ts".to_string(),
                 type_string: type_string.to_string(),
                 is_explicit: true,
+                home: None,
             });
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
         manifest

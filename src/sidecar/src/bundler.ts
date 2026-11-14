@@ -18,6 +18,7 @@ import type {
   ManifestEntry,
   SymbolFailure,
   SymbolFailureKind,
+  TypeHome,
 } from './types.js';
 import {
   expandTypeStructural,
@@ -239,6 +240,7 @@ export class TypeBundler {
             source_file: symbol.source_file,
             type_string: typeInfo.typeString,
             is_explicit: true,
+            ...this.homeField(symbol),
           });
         } else {
           symbolFailures.push({
@@ -363,6 +365,24 @@ export class TypeBundler {
       };
     }
     return { valid: true };
+  }
+
+  /**
+   * carrick#2148: where the bundled declaration is, past any barrel: the
+   * declaration's own name, its file (absolute) and the line of that name.
+   */
+  private homeField(symbol: SymbolRequest): { home?: TypeHome } {
+    const site = this.siteOf(symbol);
+    if (!site) return {};
+    const { sourceFile, name } = site;
+    const declaration =
+      sourceFile.getInterface(name) ??
+      sourceFile.getTypeAlias(name) ??
+      sourceFile.getClass(name) ??
+      sourceFile.getEnum(name);
+    const nameNode = declaration?.getNameNode();
+    if (!nameNode) return {};
+    return { home: { symbol: name, file_path: sourceFile.getFilePath(), line: nameNode.getStartLineNumber() } };
   }
 
   /** Where a requested symbol is declared, or undefined when it cannot be found. */
