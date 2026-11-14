@@ -9639,9 +9639,22 @@ impl FileOrchestrator {
             // call the handler MAKES, and anchoring a route to one moves the
             // row off its registration (carrick#1395).
             let listed = candidate_map.get(&endpoint.candidate_id);
-            let site = listed.filter(|candidate| {
-                Self::candidate_can_register_a_route(candidate, endpoint.line_number)
-            });
+            let site = listed
+                .filter(|candidate| {
+                    Self::candidate_can_register_a_route(candidate, endpoint.line_number)
+                })
+                // A line holds more than one call (`this.app = make(); ...
+                // this.app.get('/p', ...)`), and the model may name the one
+                // that states no route. That call is not the registration:
+                // the row goes to the call on its line that writes the
+                // row's own path, when exactly one does (carrick#4271).
+                .map(|candidate| {
+                    Self::registration_beside(candidate, &endpoint, candidate_map)
+                        .unwrap_or(candidate)
+                });
+            if let Some(site) = site {
+                endpoint.candidate_id = site.candidate_id.clone();
+            }
             let candidate = match site {
                 Some(candidate) => Some(candidate),
                 None => {
@@ -10421,6 +10434,44 @@ impl FileOrchestrator {
             return RegistrationLiteral::ExtendsWithPrefix(canonical_literal);
         }
         RegistrationLiteral::Contradicts(canonical_literal)
+    }
+
+    /// The one listed call, other than `named`, whose line range holds the
+    /// model's line and which writes the row's own path as a route literal,
+    /// when `named` writes no route path itself (carrick#4271).
+    ///
+    /// A call that states no route path is placed by containment alone, so on
+    /// a line with several calls any of them passes. The span of a call that
+    /// makes the app, rather than registers a route, would then be the row's
+    /// anchor, and the type layer would read the factory call as the response.
+    /// Two such registrations, or none, leave the named site as it was.
+    fn registration_beside<'a>(
+        named: &CandidateTarget,
+        endpoint: &EndpointResult,
+        candidate_map: &'a HashMap<String, CandidateTarget>,
+    ) -> Option<&'a CandidateTarget> {
+        let states_a_route_path = |candidate: &CandidateTarget| {
+            Self::route_literal_from_snippet(candidate.path_snippet.as_deref())
+                .is_some_and(|literal| is_producer_route_path(&literal))
+        };
+        if endpoint.line_number <= 0 || states_a_route_path(named) {
+            return None;
+        }
+        let line = endpoint.line_number as usize;
+        let path = Self::canonicalize_route_path(&endpoint.path);
+        let mut found = candidate_map.values().filter(|candidate| {
+            candidate.candidate_id != named.candidate_id
+                && candidate.line_number <= line
+                && line <= candidate.end_line
+                && Self::route_literal_from_snippet(candidate.path_snippet.as_deref()).is_some_and(
+                    |literal| {
+                        is_producer_route_path(&literal)
+                            && Self::canonicalize_route_path(&literal) == path
+                    },
+                )
+        });
+        let only = found.next()?;
+        found.next().is_none().then_some(only)
     }
 
     /// Could this candidate be the site the model's endpoint row is registered
@@ -20474,6 +20525,78 @@ export { routes };
         // route's own payload, so it carries the type anchor.
         assert_eq!(result.endpoints[0].candidate_id, "happy");
         assert_eq!(stats.model_only_rows, 1);
+    }
+
+    /// A line that makes the app and registers a route on it holds two calls
+    /// (`this.app = make(); this.app.get('/p', ...)`). The model names the
+    /// maker's call; the row stands at the registration, never at the maker
+    /// (carrick#4271).
+    #[test]
+    fn a_route_named_at_a_factory_call_stands_at_the_registration_on_its_line() {
+        let site = |id: &str, snippet: Option<&str>, span: u32, callee: &str, member: &str| {
+            let mut candidate = candidate_with_snippet(id, snippet);
+            candidate.span_start = span;
+            candidate.span_end = span + 20;
+            candidate.line_number = 2;
+            candidate.end_line = 2;
+            candidate.callee_object = callee.to_string();
+            candidate.callee_property = Some(member.to_string());
+            candidate
+        };
+        let mut candidates = HashMap::new();
+        candidates.insert("make".to_string(), site("make", None, 52, "make", ""));
+        candidates.insert(
+            "reg".to_string(),
+            site("reg", Some("'/p/s-twice'"), 130, "app", "get"),
+        );
+        let route = |candidate_id: &str| EndpointResult {
+            handler_declaration_line: None,
+            registration_literal: None,
+            view_module: false,
+            candidate_id: candidate_id.to_string(),
+            line_number: 2,
+            owner_node: "app".to_string(),
+            method: "GET".to_string(),
+            path: "/p/s-twice".to_string(),
+            handler_name: "anonymous".to_string(),
+            pattern_matched: ".get(".to_string(),
+            call_expression_span_start: None,
+            call_expression_span_end: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            response_expression_text: None,
+            response_expression_line: None,
+            emission_style: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            resolution_source: None,
+            dispatch: None,
+        };
+        let spans = |model_id: &str, candidates: &HashMap<String, CandidateTarget>| {
+            let (result, _) = emit_and_join(
+                FileAnalysisResult {
+                    endpoints: vec![route(model_id)],
+                    ..Default::default()
+                },
+                candidates,
+                "src/s-twice.ts",
+            );
+            result
+                .endpoints
+                .iter()
+                .map(|row| (row.call_expression_span_start, row.call_expression_span_end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans("make", &candidates), vec![(Some(130), Some(150))]);
+        assert_eq!(spans("reg", &candidates), vec![(Some(130), Some(150))]);
+
+        // Two registrations of the path on the line: nothing says which one
+        // the model meant, so the site it named stands as it did.
+        candidates.insert(
+            "reg2".to_string(),
+            site("reg2", Some("'/p/s-twice'"), 190, "app", "get"),
+        );
+        assert_eq!(spans("make", &candidates), vec![(Some(52), Some(72))]);
     }
 
     /// Two registrations of one route in one file: the model states the loop's
