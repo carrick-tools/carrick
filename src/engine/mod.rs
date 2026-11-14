@@ -48,6 +48,7 @@ use swc_ecma_visit::VisitWith;
 
 mod answers_ahead;
 pub mod durability;
+pub mod fact_seam;
 mod pair_settle;
 mod pr_removals;
 mod route_boundaries;

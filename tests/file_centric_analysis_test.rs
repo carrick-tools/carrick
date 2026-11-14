@@ -3,6 +3,9 @@
 //! These tests verify that the FileAnalyzerAgent and FileOrchestrator
 //! correctly process files and build the MountGraph.
 
+#[path = "support/fact_files.rs"]
+mod fact_files;
+
 use carrick::agent_service::AgentService;
 use carrick::agents::file_analyzer_agent::{
     DataCallResult, EndpointResult, FileAnalysisResult, FileAnalyzerAgent, MountResult,
@@ -958,12 +961,11 @@ async fn test_file_orchestrator_with_mock_agent() {
     // SAFETY: This test runs in isolation, environment variable modification is safe
     unsafe { std::env::set_var("CARRICK_MOCK_ALL", "1") };
 
-    let agent_service = AgentService::new();
-    let orchestrator = FileOrchestrator::new(agent_service);
     let guidance = create_express_guidance();
     let detection = create_express_detection();
 
-    // Create a temp file with some express-like code
+    // Create a temp file with some express-like code, express installed from
+    // its stand-in and answered by the store (carrick#3711 R2).
     let temp_dir = tempfile::tempdir().unwrap();
     let test_file = temp_dir.path().join("test.ts");
     std::fs::write(
@@ -976,6 +978,10 @@ app.post('/users', (req, res) => res.json({ created: true }));
 "#,
     )
     .unwrap();
+    fact_files::install_real(temp_dir.path(), &["express"], &["express"]);
+    let facts = fact_files::walked(temp_dir.path()).await;
+    let orchestrator =
+        FileOrchestrator::new(AgentService::new()).with_fact_files(fact_files::source(&facts));
 
     let files = vec![test_file];
     let result = orchestrator

@@ -7,7 +7,9 @@
 //! `tag` names its paths after the test that generated it.
 //!
 //! Read by the unit tests of `src/agents/source_parts.rs` and by
-//! `tests/ask_in_parts_test.rs`.
+//! `tests/ask_in_parts_test.rs`. Receivers come from the invented installed
+//! packages `fixture-table` and `fixture-http` (`tests/support/fact_files.rs`),
+//! so the fact layer lists their calls (carrick#3711 R2).
 
 #![allow(dead_code)]
 
@@ -38,7 +40,7 @@ pub fn flat_module(tag: &str, n: usize) -> Shape {
         write!(source, "{}, ", imported_name(i)).unwrap();
     }
     source.push_str("} from \"./shapes\";\n");
-    source.push_str("declare const client: any;\n\n");
+    source.push_str("declare const client: import(\"fixture-http\").ConfigClient;\n\n");
     let mut starts = Vec::with_capacity(n);
     for i in 0..n {
         writeln!(source, "/** Reads item {i}. */").unwrap();
@@ -96,7 +98,7 @@ pub fn route_array(tag: &str, n: usize) -> Shape {
 /// with an inline handler.
 pub fn registering_function(tag: &str, n: usize) -> Shape {
     let mut source = String::from("const SERVICE = \"generated\";\n\n");
-    source.push_str("export function register(app: any) {\n");
+    source.push_str("export function register(app: import(\"fixture-table\").Table) {\n");
     let mut starts = Vec::with_capacity(n);
     for i in 0..n {
         source.push_str("  ");
@@ -115,7 +117,7 @@ pub fn registering_function(tag: &str, n: usize) -> Shape {
 
 /// A class with `n` methods that each make one request.
 pub fn request_class(tag: &str, n: usize) -> Shape {
-    let mut source = String::from("declare const http: any;\n\n");
+    let mut source = String::from("declare const http: import(\"fixture-http\").Client;\n\n");
     source.push_str("export class GeneratedClient {\n");
     source.push_str("  constructor(private readonly base: string) {}\n\n");
     let mut starts = Vec::with_capacity(n);
@@ -139,7 +141,7 @@ pub fn request_class(tag: &str, n: usize) -> Shape {
 /// construct those lines open and close, under one declaration above it.
 /// Each registration ends on the line `  });`.
 pub fn statements_inside(tag: &str, n: usize, opening: &str, closing: &str) -> Shape {
-    let mut source = String::from("declare const app: any;\n\n");
+    let mut source = String::from("declare const app: import(\"fixture-table\").Table;\n\n");
     writeln!(source, "{opening}").unwrap();
     let mut starts = Vec::with_capacity(n);
     for i in 0..n {

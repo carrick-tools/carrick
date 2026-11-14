@@ -14,6 +14,13 @@
 //!
 //! Its own test binary, `#[serial]`: the request counters, the injected
 //! answers, the scan-health registry and the environment are process-globals.
+//!
+//! T1 and T2's route files register on a table an installed package builds,
+//! and each analysis is handed the fact layer's files as a scan hands them
+//! (carrick#3711): the routes are the calls the fact layer lists.
+
+#[path = "support/fact_files.rs"]
+mod fact_files;
 
 use async_trait::async_trait;
 use carrick::agent_service::{self, AgentService};
@@ -96,6 +103,7 @@ impl Routes {
     fn of(sources: Vec<(String, String)>) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
+        fact_files::install_table_package(&root);
         let mut files = Vec::new();
         for (name, source) in sources {
             let path = root.join(format!("src/{name}.ts"));
@@ -114,7 +122,7 @@ impl Routes {
 
     fn source(tag: &str, name: &str) -> String {
         format!(
-            "declare function makeTable(): any;\nconst table = makeTable();\n\
+            "import makeTable from \"fixture-table\";\nconst table = makeTable();\n\
              table.get(\"/{tag}/{name}\", (req: any, res: any) => res.send({{ ok: true }}));\n"
         )
     }
@@ -132,11 +140,16 @@ impl Routes {
     }
 
     async fn analyze(&self, ahead: AheadRole) -> FileCentricAnalysisResult {
-        self.analyze_with(ahead, FileOrchestrator::new(AgentService::new()))
-            .await
+        let facts = fact_files::walked(&self.root).await;
+        self.analyze_with(
+            ahead,
+            FileOrchestrator::new(AgentService::new()).with_fact_files(fact_files::source(&facts)),
+        )
+        .await
     }
 
-    /// [`Self::analyze`] by `orchestrator`, as the caller built it.
+    /// [`Self::analyze`] by `orchestrator`, as the caller built it with its
+    /// own fact files.
     async fn analyze_with(
         &self,
         ahead: AheadRole,
@@ -316,12 +329,15 @@ async fn a_failed_ask_ahead_is_asked_again_by_the_loop() {
 #[serial]
 async fn a_file_the_lane_stopped_unmatched_in_is_not_asked_ahead() {
     use carrick::agents::file_orchestrator::FactFileSource;
-    use carrick::request_summary::fact_files::{FactFiles, Followed};
+    use carrick::request_summary::fact_files::Followed;
     use carrick::request_summary::stop::Stop;
     offline();
     let routes = Routes::new("t4077");
+    // The fact layer's files for the tree, with the lane's untraced stop in
+    // `src/a.ts` added, as its first discovery records it.
+    let walked = fact_files::walked(&routes.root).await;
     let facts = || {
-        let mut facts = FactFiles::default();
+        let mut facts = walked.clone();
         facts.calls.insert(
             ("src/a.ts".to_string(), 1, 2),
             Followed::Unfollowed(Stop::PackageUnmatched),
@@ -437,7 +453,8 @@ async fn a_lane_ask_is_one_request_and_never_cut_or_retried() {
 async fn a_file_asked_in_parts_is_asked_ahead_each_part_once() {
     offline();
     let pad = "x".repeat(700);
-    let mut source = "declare function makeTable(): any;\nconst table = makeTable();\n".to_string();
+    let mut source =
+        "import makeTable from \"fixture-table\";\nconst table = makeTable();\n".to_string();
     for at in 0..400 {
         source.push_str(&format!(
             "table.get(\"/parts/r{at}\", (req: any, res: any) => res.send({{ pad: \"{pad}\" }}));\n"

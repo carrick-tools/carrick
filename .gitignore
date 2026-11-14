@@ -174,3 +174,7 @@ tests/fixtures/**/.carrick/
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/package.json
 !tests/fixtures/spread-absent-key/repo/node_modules/fixture-table/index.d.ts
+!tests/fixtures/inline-registration-scope/node_modules/
+!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/
+!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/package.json
+!tests/fixtures/inline-registration-scope/node_modules/fixture-plugin-server/index.d.ts

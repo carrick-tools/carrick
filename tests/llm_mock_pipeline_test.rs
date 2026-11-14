@@ -33,6 +33,9 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llm-mocked-api")
 }
 
+#[path = "support/fact_files.rs"]
+mod fact_files;
+
 fn express_guidance() -> FrameworkGuidance {
     let pattern = |pattern: &str, description: &str| PatternExample {
         pattern: pattern.to_string(),
@@ -90,7 +93,11 @@ async fn mock_llm_output_flows_through_validation_and_mount_graph() {
         root.join("src/reports.ts"),
     ];
 
-    let orchestrator = FileOrchestrator::new(AgentService::new());
+    // The fact layer's files, as a scan with `express` installed and
+    // answered hands them over (carrick#3711).
+    let facts = fact_files::walked_copy(&root, &["express"], &["express", "lib-dom-fetch"]);
+    let orchestrator =
+        FileOrchestrator::new(AgentService::new()).with_fact_files(fact_files::source(&facts));
     let result = orchestrator
         .analyze_files(
             &files,
