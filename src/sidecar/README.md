@@ -894,6 +894,8 @@ Response:
 }
 ```
 
+`read_spans` (carrick#4244), when present, lists the nodes the answer's `type_string` was built from, each as `{ "file_path": <absolute>, "start": <n>, "end": <n> }` in the compiler's positions (UTF-16 code units from the start of the file, end exclusive). On a response these are the success sends or returned values the reader joined (an error send it dropped is not listed), or the return annotation or schema value a declared contract came from. On a request it is the one node the contract came from: the parameter annotation, the schema, or the typed body read. `source_location` is unchanged and still names the node the answer is located at, which on a producer is usually the handler. A decided abstain, and an answer whose text is bare `any` or `unknown`, carry no `read_spans`. A loop-registered route's spans are mapped back to the file as written.
+
 `infer_timing` says how long the batch's requests took and what the time went on (carrick#1985). It is for the caller's log: no answer depends on it, and it holds no type text.
 
 - `slots` counts every request the batch was done with, answered or not, and `slots_ms` adds up their wall times in milliseconds.

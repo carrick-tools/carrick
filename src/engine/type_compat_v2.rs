@@ -6580,6 +6580,7 @@ mod tests {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         }
     }
 
@@ -8324,6 +8325,7 @@ mod tests {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         };
 
         let infer = vec![
@@ -8491,6 +8493,7 @@ mod tests {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         };
 
         let infer = vec![infer_item("Pub_Resolved"), infer_item("Pub_Unresolved")];
@@ -9155,6 +9158,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            read_spans: Vec::new(),
         };
 
         let explicit = vec![
