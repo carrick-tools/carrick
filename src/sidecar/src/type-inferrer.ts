@@ -1770,7 +1770,7 @@ export class TypeInferrer {
       // carrick#4269: a send that returns the reply it was called on
       // (`reply.send(x)`, `res.json(x)`) hands back the framework's own
       // parameter, which is transport whatever members it declares.
-      const handsBackParameter = this.returnsHandlerParameterType(func, awaitedType);
+      const handsBackParameter = this.returnsHandlerParameterType(request, func, awaitedType);
       const machinery =
         unwrapResult.verifiedMachinery === true ||
         this.typeIsOrContainsResponseMachinery(awaitedType) ||
@@ -2312,7 +2312,12 @@ export class TypeInferrer {
       }
       // A call whose result is a value the repo shapes is not a send: it is
       // the payload (carrick#1732), and drilling would publish its input.
-      if (args.length > 0 && !this.callResultIsPayload(node)) {
+      // carrick#4283: a send that hands back a registration handler's own
+      // reply is drilled whoever declares the reply.
+      if (
+        args.length > 0 &&
+        (!this.callResultIsPayload(node) || this.locatedSendHandsBackReply(node, request))
+      ) {
         payloadNode = args[0];
       }
     }
@@ -3130,19 +3135,84 @@ export class TypeInferrer {
    */
   /**
    * True when the handler's awaited return is the type of one of its own
-   * parameters, declared outside the repository (carrick#4269): the reply a
-   * fluent send hands back (`reply.send(x)` returns `reply`). That value is
-   * the object the framework passed in, never the body. A type the
-   * repository declares is not read this way: a function returning its own
-   * options type returns data.
+   * parameters: the reply a fluent send hands back (`reply.send(x)` returns
+   * `reply`). That value is the object the framework passed in, never the
+   * body.
+   *
+   * A type declared outside the repository is read this way whatever the
+   * function returns it from (carrick#4269). A type the repository declares
+   * is read this way only by its shape (carrick#4283): the function is a
+   * route registration's handler and every return is a send that hands the
+   * reply back (`sendHandsBackHandlerParameter`). A function returning its
+   * own options type, or a builder's fluent setter, returns data.
    */
-  private returnsHandlerParameterType(func: FunctionLike, awaitedType: Type): boolean {
+  private returnsHandlerParameterType(
+    request: InferRequestItem,
+    func: FunctionLike,
+    awaitedType: Type
+  ): boolean {
     if (awaitedType.isAny() || awaitedType.isUnknown()) return false;
     const symbol = awaitedType.getSymbol() ?? awaitedType.getAliasSymbol();
-    if (!this.symbolIsLibOrExternalOrigin(symbol)) return false;
-    return func
-      .getParameters()
-      .some((parameter) => parameter.getType().compilerType === awaitedType.compilerType);
+    if (this.symbolIsLibOrExternalOrigin(symbol)) {
+      return func
+        .getParameters()
+        .some((parameter) => parameter.getType().compilerType === awaitedType.compilerType);
+    }
+    if (!this.isRegisteredHandler(request, func)) return false;
+    const branches = this.responseReturnedExpressions(func).flatMap((expression) =>
+      this.expandResponseBranches(expression, 0)
+    );
+    return (
+      branches.length > 0 &&
+      branches.every((branch) =>
+        this.sendHandsBackHandlerParameter(this.peelTransparentExpression(branch), func)
+      )
+    );
+  }
+
+  /**
+   * True when `node` is a send on a handler's own parameter that hands that
+   * parameter back (carrick#4283): a method call given a value whose result
+   * is the type of the object it was called on, and that type is one of the
+   * handler's parameters (`reply.send(x)`, `reply.code(201).send(x)`). Its
+   * result is the reply, and the value it was given is the body.
+   */
+  private sendHandsBackHandlerParameter(node: Node, handler: FunctionLike): boolean {
+    if (!Node.isCallExpression(node) || node.getArguments().length === 0) return false;
+    const callee = node.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return false;
+    const result = node.getType().compilerType;
+    if (callee.getExpression().getType().compilerType !== result) return false;
+    return handler.getParameters().some((parameter) => parameter.getType().compilerType === result);
+  }
+
+  /**
+   * True when a located call is a send that hands back the reply of the
+   * registration handler it sits in (carrick#4283), read by the same shape
+   * `returnsHandlerParameterType` reads a returned send with.
+   */
+  private locatedSendHandsBackReply(call: CallExpression, request: InferRequestItem): boolean {
+    const handler = this.findContainingFunctionForNode(call);
+    return (
+      handler !== undefined &&
+      this.isRegisteredHandler(request, handler) &&
+      this.sendHandsBackHandlerParameter(call, handler)
+    );
+  }
+
+  /**
+   * True when `func` is a route registration's handler: the one the
+   * registration on the request's line hands in (found as
+   * `registrationAtLine` finds it), or an inline function a registration
+   * call is handed, for a request on a line inside it.
+   */
+  private isRegisteredHandler(request: InferRequestItem, func: FunctionLike): boolean {
+    const sourceFile = this.project.getSourceFile(request.file_path);
+    if (sourceFile && this.registrationAtLine(sourceFile, request.line_number)?.handler === func) {
+      return true;
+    }
+    const parent = func.getParent();
+    return Node.isCallExpression(parent) && this.registrationHandlerAt(parent) === func;
   }
 
   /**
