@@ -1502,7 +1502,9 @@ fn group_env_var_suggestions(findings: &[&Finding]) -> Vec<EnvVarSuggestionGroup
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::findings::{EndpointRef, FileNotReadReason, Finding, PackageVersionRef, tier};
+    use crate::findings::{
+        EndpointRef, FileNotReadReason, Finding, PackageVersionRef, Removal, RemovedSide, tier,
+    };
     use crate::operation::EndpointProvenance;
 
     /// A poly-repo topology with peers, so connectivity findings are
@@ -2754,6 +2756,35 @@ mod tests {
         assert!(output.contains("- New endpoint `GET /health`"));
     }
 
+    /// A row the scanner marked as a pairing main had and the PR lost: the
+    /// removed side is `method path` served by `service`.
+    fn with_removed(row: Finding, method: &str, path: &str, service: Option<&str>) -> Finding {
+        row.with_removal(
+            Removal {
+                removed: RemovedSide {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    service: service.map(str::to_string),
+                    place: "src/routes.ts:1".to_string(),
+                },
+                edge_source: None,
+                verdict_state: None,
+                on_main: Some(false),
+                on_main_unknown: None,
+            },
+            Vec::new(),
+        )
+    }
+
+    fn removed_ref(method: &str, path: &str, service: Option<&str>) -> EndpointRef {
+        EndpointRef {
+            method: method.to_string(),
+            path: path.to_string(),
+            service: service.map(str::to_string),
+            edge_source: None,
+        }
+    }
+
     #[test]
     fn test_pr_delta_lists_removed_endpoints_and_flags_still_consumed() {
         // A removed endpoint whose (method, path) still shows up as a missing
@@ -2776,11 +2807,16 @@ mod tests {
                 },
             ],
         };
-        let findings = vec![Finding::missing_endpoint(
+        let findings = vec![with_removed(
+            Finding::missing_endpoint(
+                "DELETE",
+                "/api/sessions",
+                None,
+                vec!["web/src/auth.ts:9".to_string()],
+            ),
             "DELETE",
             "/api/sessions",
             None,
-            vec!["web/src/auth.ts:9".to_string()],
         )];
         let output =
             format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
@@ -2790,55 +2826,101 @@ mod tests {
         assert!(!output.contains("`GET /api/unused` (`auth`) — ⚠"));
     }
 
-    /// The "still consumed" join must be param-aware: the removed side
-    /// carries declared param names (`/orders/:id`) while the missing side is
-    /// normalized (`/orders/:param`) or concrete — literal equality would
-    /// never flag a parameterized route.
+    /// The "still consumed" flag joins a delta row to a marked row by identity
+    /// (method, path, service), never by overlap: the scanner spells the
+    /// removed side as it spells the delta row.
     #[test]
-    fn test_pr_delta_still_consumed_join_is_param_aware() {
+    fn test_pr_delta_still_consumed_join_is_identity() {
         let delta = PrDelta {
             files_not_read: Vec::new(),
             new_endpoints: vec![],
             removed_endpoints: vec![
-                // Param name differs from the missing finding's `:param`.
-                EndpointRef {
-                    method: "GET".to_string(),
-                    path: "/orders/:id".to_string(),
-                    service: None,
-                    edge_source: None,
-                },
-                // Same prefix, different segment count — must NOT be flagged.
-                EndpointRef {
-                    method: "GET".to_string(),
-                    path: "/orders".to_string(),
-                    service: None,
-                    edge_source: None,
-                },
-                // Param matches a concrete missing segment, but the method
-                // differs — must NOT be flagged.
-                EndpointRef {
-                    method: "DELETE".to_string(),
-                    path: "/users/:id".to_string(),
-                    service: None,
-                    edge_source: None,
-                },
+                removed_ref("GET", "/orders/:id", None),
+                // Same prefix, different segment count: not flagged.
+                removed_ref("GET", "/orders", None),
+                // Same path, different method: not flagged.
+                removed_ref("DELETE", "/orders/:id", None),
             ],
         };
-        let findings = vec![
+        let findings = vec![with_removed(
             Finding::missing_endpoint(
                 "GET",
                 "/orders/:param",
                 None,
                 vec!["web/src/orders.ts:3".to_string()],
             ),
-            Finding::missing_endpoint("GET", "/users/42", None, vec![]),
-        ];
+            "GET",
+            "/orders/:id",
+            None,
+        )];
         let output =
             format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
 
         assert!(output.contains("- Removed `GET /orders/:id` — ⚠ still consumed"));
         assert!(output.contains("- Removed `GET /orders`\n"));
-        assert!(output.contains("- Removed `DELETE /users/:id`\n"));
+        assert!(output.contains("- Removed `DELETE /orders/:id`\n"));
+    }
+
+    /// (a) An unmarked missing call that merely overlaps a removed route is
+    /// not evidence the PR removed its producer: main never paired it.
+    #[test]
+    fn test_pr_delta_unmarked_missing_row_does_not_flag_a_removal() {
+        let delta = PrDelta {
+            files_not_read: Vec::new(),
+            new_endpoints: vec![],
+            removed_endpoints: vec![removed_ref("GET", "/api/v1/reports/daily", None)],
+        };
+        let findings = vec![Finding::missing_endpoint(
+            "GET",
+            "/api/v1/reports/:param",
+            Some("other-web".to_string()),
+            vec!["other-web/src/r.ts:4".to_string()],
+        )];
+        let output =
+            format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("- Removed `GET /api/v1/reports/daily`\n"));
+        assert!(!output.contains("still consumed"));
+    }
+
+    /// (b) A removed sender has no delta row; its marked row prints a line.
+    #[test]
+    fn test_pr_delta_marked_row_without_a_delta_row_gets_its_own_line() {
+        let delta = PrDelta::default();
+        let findings = vec![with_removed(
+            Finding::orphaned_endpoint("CLIENT->SERVER", "order:update", Some("gateway".into())),
+            "SERVER->CLIENT",
+            "order:update",
+            Some("orders"),
+        )];
+        let output =
+            format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("**In this PR**"));
+        assert!(output.contains(
+            "- Removed `SERVER->CLIENT order:update` (`orders`) — ⚠ still used by `gateway`\n"
+        ));
+    }
+
+    /// (c) A marked row for another service's operation does not flag a delta
+    /// row that only shares method and path.
+    #[test]
+    fn test_pr_delta_marked_row_of_another_service_does_not_flag() {
+        let delta = PrDelta {
+            files_not_read: Vec::new(),
+            new_endpoints: vec![],
+            removed_endpoints: vec![removed_ref("GET", "/x", Some("a"))],
+        };
+        let findings = vec![with_removed(
+            Finding::missing_endpoint("GET", "/x", Some("web".into()), vec![]),
+            "GET",
+            "/x",
+            Some("b"),
+        )];
+        let output =
+            format_analysis_results(result_with(findings), &topology_baseline(), Some(&delta));
+
+        assert!(output.contains("- Removed `GET /x` (`a`)\n"));
     }
 
     #[test]
