@@ -5,6 +5,7 @@
 
 import type { ResponseModes } from './response-modes.js';
 import type { ResultLabel } from './capture/api.js';
+import type { ShadowResult } from './held-shadow.js';
 
 // ============================================================================
 // Inference Kind Enum
@@ -349,6 +350,15 @@ export interface ShutdownRequest extends BaseRequest {
  */
 export interface ListProgramFilesRequest extends BaseRequest {
   action: 'list_program_files';
+}
+
+/**
+ * Write the init'd service's program as a shadow tree a held-open TypeScript 7
+ * compiler reads (see held-shadow.ts). `out_dir` must lie outside the checkout.
+ */
+export interface WriteShadowRequest extends BaseRequest {
+  action: 'write_shadow';
+  out_dir: string;
 }
 
 /**
@@ -1034,6 +1044,7 @@ export type SidecarRequest =
   | HealthRequest
   | ShutdownRequest
   | ListProgramFilesRequest
+  | WriteShadowRequest
   | ReachGraphRequest
   | ReachRequest
   | AddProgramFilesRequest
@@ -1313,6 +1324,13 @@ export interface PositionRowsCounts {
 export interface ListProgramFilesResponse extends BaseResponse {
   /** The program's root files, as absolute paths, in order. */
   files?: string[];
+  errors?: string[];
+}
+
+/**
+ * Response for write_shadow action: the fields of `ShadowResult`.
+ */
+export interface WriteShadowResponse extends BaseResponse, Partial<ShadowResult> {
   errors?: string[];
 }
 
@@ -1710,6 +1728,7 @@ export type SidecarResponse =
   | HealthResponse
   | ShutdownResponse
   | ListProgramFilesResponse
+  | WriteShadowResponse
   | ReachGraphResponse
   | ReachResponse
   | AddProgramFilesResponse
