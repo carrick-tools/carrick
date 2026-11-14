@@ -1502,7 +1502,7 @@ pub fn fold(
                 .find(|call| {
                     call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                 })
-                .or_else(|| match own.as_slice() {
+                .or(match own.as_slice() {
                     [one] => Some(one),
                     _ => None,
                 })
