@@ -9087,13 +9087,23 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
         );
         // One function makes the queue for two lists: its parameter's
         // values are decided at two calls, so neither send states the
-        // other list's names.
-        for (line, other) in [(14, "bill-"), (15, "ship-")] {
+        // other list's names: no record states any, and a lead says why
+        // (carrick#4418).
+        for line in [14, 15] {
+            let point = at(line);
             assert!(
-                !record_at(line)
-                    .names
-                    .iter()
-                    .any(|name| name.starts_with(other)),
+                !records.iter().any(|record| record.state.point.at == point),
+                "{line}: {shown:#?}"
+            );
+            let reasons: Vec<_> = decided
+                .leads
+                .iter()
+                .filter(|lead| lead.file == "src/sends.ts" && lead.line == line)
+                .map(|lead| lead.reason)
+                .collect();
+            assert_eq!(
+                reasons,
+                [super::super::stop::Stop::SeveralOperations],
                 "{line}: {shown:#?}"
             );
         }
@@ -9142,6 +9152,124 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             "{:#?}",
             rows.rows
         );
+    }
+
+    /// carrick#4418: values that agree on a name's pieces but were decided
+    /// at two or more calls (one opener called from two loops) are not one
+    /// name, and no one call states them. The send is a lead whose reason
+    /// is the resolver's own: the first hole it meets reading a value, else
+    /// `several_operations`. No question was asked of the model for it, so
+    /// it is never `unanswered`. A name that reads the environment keeps
+    /// `env_value`.
+    #[test]
+    fn maker_values_pooled_at_two_calls_are_a_lead_with_the_resolver_s_reason() {
+        use super::super::stop::Stop;
+        let pooled = "import { Queue } from 'bullmq';\n\
+const SHIPPING = ['ship-created', 'ship-cancelled'] as const;\n\
+const BILLING = ['bill-opened', 'bill-closed'];\n\
+function open(name: string) { return new Queue(name); }\n\
+export async function pushOpened() { for (const q of BILLING) await open(q).add('task', { n: 1 }); }\n\
+function openTwice(name: string) { return new Queue(name); }\n\
+export async function pushTwiceShipping() { for (const q of SHIPPING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushTwiceBilling() { for (const q of BILLING) await openTwice(q).add('task', { n: 1 }); }\n\
+declare function loadConfig(): { name: string };\n\
+function openCfg(name: string) { return new Queue(name); }\n\
+export async function pushCfgA() { const cfg = loadConfig(); await openCfg(cfg.name).add('task', { n: 1 }); }\n\
+export async function pushCfgB() { const cfg = loadConfig(); await openCfg(cfg.name).add('task', { n: 1 }); }\n\
+function openSame(name: string) { return new Queue(name); }\n\
+export async function pushSameA() { for (const q of SHIPPING) await openSame(q).add('task', { n: 1 }); }\n\
+export async function pushSameB() { for (const q of SHIPPING) await openSame(q).add('task', { n: 1 }); }\n\
+function openLit(name: string) { return new Queue(name); }\n\
+export async function pushLitA() { await openLit('lit-a').add('task', { n: 1 }); }\n\
+export async function pushLitB() { await openLit('lit-b').add('task', { n: 1 }); }\n\
+function openDiff(name: string) { return new Queue(name); }\n\
+export async function pushDiffA() { for (const a of SHIPPING) await openDiff(a).add('task', { n: 1 }); }\n\
+export async function pushDiffB() { for (const b of BILLING) await openDiff(b).add('task', { n: 1 }); }\n\
+declare const process: { env: Record<string, string> };\n\
+function openEnv(name: string) { return new Queue(name); }\n\
+export async function pushEnvA() { await openEnv(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n\
+export async function pushEnvB() { await openEnv(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n\
+function openEnvOne(name: string) { return new Queue(name); }\n\
+export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n";
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/pooled.ts", pooled)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let calls = crate::possible_calls::from_sites(&decided, &records);
+        let shown: Vec<String> = records
+            .iter()
+            .filter(|record| record.state.point.at.starts_with("src/pooled.ts:"))
+            .map(|record| {
+                format!(
+                    "{} {:?} names={:?} unread={:?}",
+                    record.state.point.at, record.bucket, record.names, record.unread
+                )
+            })
+            .collect();
+        let reason_at = |line: u32| -> Option<Stop> {
+            calls
+                .iter()
+                .find(|call| call.file_path == "src/pooled.ts" && call.line_number == line)
+                .map(|call| call.unread.reason)
+        };
+        let has_record = |line: u32| {
+            let point = format!("src/pooled.ts:{line}");
+            records.iter().any(|record| record.state.point.at == point)
+        };
+        // One opener, one caller: the names are read at that call.
+        assert!(has_record(5), "{shown:#?}");
+        assert_eq!(reason_at(5), None, "{shown:#?}");
+        // Two loops over different lists through one opener, and the same
+        // list looped twice: the send states no name, and several
+        // operations say why.
+        for line in [7, 8, 14, 15] {
+            assert!(!has_record(line), "{line}: {shown:#?}");
+            assert_eq!(
+                reason_at(line),
+                Some(Stop::SeveralOperations),
+                "{line}: {shown:#?}"
+            );
+        }
+        // A field of a call result at two calls: the resolver cannot read it.
+        for line in [11, 12] {
+            assert!(!has_record(line), "{line}: {shown:#?}");
+            assert_eq!(
+                reason_at(line),
+                Some(Stop::UnreadExpression),
+                "{line}: {shown:#?}"
+            );
+        }
+        // Two literals and two different identifiers through one opener stay
+        // several operations.
+        for line in [17, 18, 21, 22] {
+            assert_eq!(
+                reason_at(line),
+                Some(Stop::SeveralOperations),
+                "{line}: {shown:#?}"
+            );
+        }
+        // An environment read keeps its own word, at two calls and at one.
+        for line in [26, 27, 29] {
+            assert_eq!(reason_at(line), Some(Stop::EnvValue), "{line}: {shown:#?}");
+        }
+        // No question was asked for a site that states no name here.
+        for call in calls
+            .iter()
+            .filter(|call| call.file_path == "src/pooled.ts")
+        {
+            assert_ne!(call.unread.reason, Stop::Unanswered, "{shown:#?}");
+        }
     }
 
     /// carrick#3527 S5: the instance walk reads the service that holds each
