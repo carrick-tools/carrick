@@ -504,7 +504,7 @@ impl ServiceBoundary {
             && let Some(reason) = lost.reasons.first()
         {
             out.push(format!(
-                "  No per-position compiler rows for this service: {reason}. Calls that needed them are listed as unread (rows_missing)."
+                "  No compiler rows for this service because {reason}. Calls that needed them are listed as unread (rows_missing)."
             ));
         }
         if self.model_only_rows > 0 {
@@ -1259,7 +1259,7 @@ mod tests {
             boundary
                 .lines("app")
                 .iter()
-                .all(|line| !line.contains("per-position")),
+                .all(|line| !line.contains("No compiler rows")),
             "{:?}",
             boundary.lines("app")
         );
@@ -1273,9 +1273,8 @@ mod tests {
             serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
         );
         assert!(
-            boundary.lines("app").iter().any(|line| line.contains(
-                "No per-position compiler rows for this service: the compiler walk failed."
-            )),
+            boundary.lines("app").iter().any(|line| line
+                .contains("No compiler rows for this service because the compiler walk failed.")),
             "{:?}",
             boundary.lines("app")
         );

@@ -1007,7 +1007,7 @@ fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
     );
     assert!(
         run.stdout
-            .contains("No per-position compiler rows for this service: the compiler walk died of memory at a heap cap of 4096 MB."),
+            .contains("No compiler rows for this service because the compiler walk died of memory at a heap cap of 4096 MB."),
         "{}",
         run.stdout
     );
