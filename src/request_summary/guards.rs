@@ -48,7 +48,7 @@ use swc_common::{Span, Spanned};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
-use super::decided_sites::Calls;
+use super::decided_sites::{Calls, HandedOn};
 use super::library_sites::{LinkedNames, TextPiece, text_pieces};
 use super::resolve::{Resolver, ValueAt, args_text, text_of};
 use super::{
@@ -1563,7 +1563,7 @@ impl CallWalker<'_, '_, '_> {
             rest_values: self.reader.rest_values(args, self.scope, bound),
             arg_spans: super::arg_spans(args),
             tested: None,
-            handed: self.reader.handed(args, self.scope, bound),
+            handed_names: self.reader.handed(args, self.scope, bound),
             names: self.reader.arg_names(args, self.scope),
             spread_args: Vec::new(),
             receiver_spans: super::discovery::receiver_spans(&new.callee),
@@ -1627,7 +1627,7 @@ impl CallWalker<'_, '_, '_> {
             rest_values: self.reader.rest_values(&call.args, self.scope, bound),
             arg_spans: super::arg_spans(&call.args),
             tested: None,
-            handed: self.reader.handed(&call.args, self.scope, bound),
+            handed_names: self.reader.handed(&call.args, self.scope, bound),
             names: self.reader.arg_names(&call.args, self.scope),
             spread_args: self.reader.spread_args(&call.args, self.scope),
             receiver_spans: super::discovery::receiver_spans(&call.callee),
@@ -2198,9 +2198,15 @@ pub(super) struct Chains<'a> {
     /// reads, each call's edge from what the rows say it reaches (carrick#2432)
     /// or, without rows, from the call graph.
     callers: Calls<'a>,
-    /// (file, function name) -> each call that hands it on.
-    handed: HashMap<(&'a Path, String), Vec<HandedAt>>,
+    /// (file, whether a construction, span start, span end) of a call ->
+    /// each definition it hands on by name: the argument, the keys down to
+    /// it and its key, read off [`Calls::handed_on`] (carrick#4176).
+    handed_by_call: HashMap<(&'a Path, bool, u32, u32), Vec<HandedName>>,
 }
+
+/// A definition a call hands on by name: the argument, the keys down to it
+/// and its key.
+type HandedName = (usize, Vec<String>, String);
 
 /// One call or construction of a node, by its index in [`FnIr::calls`] or
 /// [`FnIr::constructions`].
@@ -2254,7 +2260,7 @@ impl<'a> Chains<'a> {
             } else {
                 Calls::index(inputs)
             },
-            handed: HashMap::new(),
+            handed_by_call: HashMap::new(),
         };
         let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
         paths.sort();
@@ -2292,15 +2298,28 @@ impl<'a> Chains<'a> {
                     At::New(i) => (&mut chains.constructions, i),
                 };
                 map.insert((node.file, call.site.lo, call.site.hi), (index, i));
-                for (arg, path, name) in &call.handed {
-                    chains
-                        .handed
-                        .entry((node.file, name.clone()))
-                        .or_default()
-                        .push((index, at, *arg, path.clone()));
-                }
             }
         }
+        let mut handed_by_call: HashMap<_, Vec<HandedName>> = HashMap::new();
+        for ((_, key), handed) in chains.callers.every_handed_on() {
+            if handed.optional {
+                continue;
+            }
+            let Some((_, at)) = chains.handing_call(handed) else {
+                continue;
+            };
+            let site = &handed.placed.call.site;
+            handed_by_call
+                .entry((
+                    handed.placed.file,
+                    matches!(at, At::New(_)),
+                    site.lo,
+                    site.hi,
+                ))
+                .or_default()
+                .push((handed.arg, handed.keys.clone(), key.clone()));
+        }
+        chains.handed_by_call = handed_by_call;
         chains
     }
 
@@ -2454,10 +2473,22 @@ impl<'a> Chains<'a> {
     fn handed_at(&self, node: usize) -> Vec<HandedAt> {
         let current = &self.nodes[node];
         let mut handed: Vec<HandedAt> = Vec::new();
-        if let Some(key) = &current.key
-            && let Some(calls) = self.handed.get(&(current.file, key.clone()))
-        {
-            handed.extend(calls.iter().cloned());
+        if let Some(key) = &current.key {
+            handed.extend(
+                self.callers
+                    .handed_on(current.file, key)
+                    .iter()
+                    .filter(|handed| !handed.optional)
+                    .filter_map(|handed| {
+                        let (node, at) = self.handing_call(handed)?;
+                        Some((node, at, handed.arg, handed.keys.clone()))
+                    }),
+            );
+            // In node order, each node's calls before its constructions.
+            handed.sort_by_key(|(node, at, _, _)| match at {
+                At::Call(index) => (*node, 0, *index),
+                At::New(index) => (*node, 1, *index),
+            });
         }
         if let Some(written_in) = &current.ir.written_in {
             let (map, at): (_, fn(usize) -> At) = if written_in.constructed {
@@ -2471,6 +2502,18 @@ impl<'a> Chains<'a> {
             }
         }
         handed
+    }
+
+    /// The node and the call or construction `handed` is placed at.
+    fn handing_call(&self, handed: &HandedOn<'a>) -> Option<(usize, At)> {
+        let site = &handed.placed.call.site;
+        let at = (handed.placed.file, site.lo, site.hi);
+        if let Some(&(node, index)) = self.calls.get(&at) {
+            return Some((node, At::Call(index)));
+        }
+        self.constructions
+            .get(&at)
+            .map(|&(node, index)| (node, At::New(index)))
     }
 
     /// The call or construction `at` of `node`.
@@ -3272,11 +3315,17 @@ impl<'a> Chains<'a> {
                 path: path.clone(),
                 name: None,
             })
-            .chain(call.handed.iter().map(|(arg, path, name)| CallFunction {
-                arg: *arg,
-                path: path.clone(),
-                name: Some(name.clone()),
-            }))
+            .chain(
+                self.handed_by_call
+                    .get(&(file, constructed, call.site.lo, call.site.hi))
+                    .into_iter()
+                    .flatten()
+                    .map(|(arg, path, name)| CallFunction {
+                        arg: *arg,
+                        path: path.clone(),
+                        name: Some(name.clone()),
+                    }),
+            )
             .collect();
         functions.sort();
         functions.dedup();

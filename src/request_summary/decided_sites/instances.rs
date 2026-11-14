@@ -515,8 +515,9 @@ type Host<'a> = (Placed<'a>, usize);
 /// service (carrick#2474 R2b): the library calls that may run a function,
 /// and the receiver ends of each scope call already walked.
 pub(super) struct WalkIndex<'a> {
-    /// By file and function name: the library calls written in that file
-    /// handed the function by name (`server.register(plugin)`).
+    /// By the definition's file and key: the library calls of the service
+    /// handed the function whole by name (`server.register(plugin)`), in
+    /// any file ([`Calls::handed_on`], carrick#4176), once per call.
     by_name: HashMap<(PathBuf, String), Vec<Host<'a>>>,
     /// By the declaration (`decl_file`, `decl_line`) the compiler resolves
     /// an argument to: the calls of a `runs` scope member handed it
@@ -610,34 +611,30 @@ impl<'a> WalkIndex<'a> {
             .filter(|label| matches!(label.binds, ScopeBinds::Runs { .. }))
             .map(|label| label.member.as_str())
             .collect();
+        for (def, handed) in calls.every_handed_on() {
+            if !handed.keys.is_empty()
+                || !calls.is_own(handed.placed.file)
+                || !library_call(inputs, handed.placed.file, handed.placed.call)
+            {
+                continue;
+            }
+            index
+                .by_name
+                .entry(def.clone())
+                .or_default()
+                .push((handed.placed, handed.arg));
+        }
+        for hosts in index.by_name.values_mut() {
+            // One host per call: the first argument it hands the function at.
+            sort_hosts(hosts);
+            hosts.dedup_by(|a, b| same_call(&a.0, &b.0));
+        }
         for placed in calls.by_span.values() {
-            // Read off the syntax first: the compiler's row is looked up
-            // only for a call handed a function by name, or a `runs`
-            // member's.
-            let names: Vec<(usize, &str)> = {
-                let mut names: Vec<(usize, &str)> = Vec::new();
-                for (arg, keys, name) in &placed.call.handed {
-                    if keys.is_empty() && !names.iter().any(|(_, known)| known == name) {
-                        names.push((*arg, name.as_str()));
-                    }
-                }
-                names
-            };
-            let runs_member = runs.contains(placed.call.callee.as_str());
-            if names.is_empty() && !runs_member {
-                continue;
-            }
-            if !library_call(inputs, placed.file, placed.call) {
-                continue;
-            }
-            for (arg, name) in names {
-                index
-                    .by_name
-                    .entry((placed.file.to_path_buf(), name.to_string()))
-                    .or_default()
-                    .push((*placed, arg));
-            }
-            if !runs_member {
+            // The compiler's row is looked up only for a `runs` member's
+            // call.
+            if !runs.contains(placed.call.callee.as_str())
+                || !library_call(inputs, placed.file, placed.call)
+            {
                 continue;
             }
             let (Some(positions), Some(ir)) =
@@ -700,6 +697,13 @@ impl<'a> WalkIndex<'a> {
 /// `hosts` in file and source order: by file, span start, span end and
 /// argument, since a chained call starts where the call it is made on does
 /// (`app.register(a).register(b)`).
+/// Whether `a` and `b` are the one call: its file and span.
+fn same_call(a: &Placed<'_>, b: &Placed<'_>) -> bool {
+    a.file == b.file
+        && a.call.site.span_start == b.call.site.span_start
+        && a.call.site.span_end == b.call.site.span_end
+}
+
 fn sort_hosts(hosts: &mut [Host<'_>]) {
     hosts.sort_by(|a, b| {
         (
@@ -1893,11 +1897,12 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
     }
 
     /// The library calls that may run the function `key` of `file`, each
-    /// with the argument it is handed at, in file and source order: those
-    /// in `file` handed it by name (`server.register(plugin)`), then the
-    /// calls of a `runs` scope member in another file handed a name the
-    /// compiler resolves to it (`app.register(items)`, `items` imported;
-    /// carrick#2474 R2b).
+    /// with the argument it is handed at, each once: those handed it by
+    /// name (`server.register(plugin)`, carrick#4176), and the calls of a
+    /// `runs` scope member in another file handed a name the compiler
+    /// resolves to it (`app.register(items)`, `items` imported;
+    /// carrick#2474 R2b). Those in `file` come first, then the rest in file
+    /// and source order.
     pub(super) fn hosts_of(&self, file: &Path, key: &str) -> Vec<Host<'a>> {
         let mut hosts: Vec<Host<'a>> = self
             .index
@@ -1924,6 +1929,9 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     .copied(),
             );
         }
+        sort_hosts(&mut hosts);
+        hosts.sort_by_key(|(placed, _)| placed.file != file);
+        hosts.dedup_by(|a, b| same_call(&a.0, &b.0) && a.1 == b.1);
         hosts
     }
 }
@@ -2648,5 +2656,65 @@ mod tests {
             0
         )));
         assert!(!library_row(&row(Some("src/server.ts"), 0)));
+    }
+
+    /// carrick#4176: the library calls that may run a function list a call
+    /// in another file that hands it by name (`app.get('/health', ping)`,
+    /// `ping` imported), each once, as they list a call in its own file;
+    /// a `runs` member's call the compiler resolves to the function
+    /// (`app.register(catalogPlugin, …)`) is listed once, though both
+    /// reads find it.
+    #[test]
+    fn the_receiver_scopes_hosts_list_an_imported_function_once() {
+        let on = super::super::super::fixture_walk::walked(
+            "receiver-scopes-aliased",
+            ".",
+            "web",
+            &[],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        let calls = Calls::index(&on.inputs);
+        let scopes = vec![ScopeLabel {
+            package: "fixture-aliased-server".into(),
+            export: "default".into(),
+            member: "register".into(),
+            verified_on: Vec::new(),
+            name: None,
+            binds: ScopeBinds::Runs {
+                arg: 0,
+                key: None,
+                param: 0,
+            },
+            open: false,
+        }];
+        let index = WalkIndex::of(&calls, &on.inputs, &scopes, Vec::new(), HashMap::new());
+        let walk = InstanceWalk::new(&calls, &on.inputs, &on.repo, &[], &scopes, &index);
+        let hosts = |file: &str, key: &str| -> Vec<String> {
+            walk.hosts_of(&on.repo.join(file), key)
+                .iter()
+                .map(|(placed, arg)| {
+                    format!(
+                        "{}:{} {} {arg}",
+                        relative(&on.repo, placed.file),
+                        placed.call.site.line,
+                        placed.call.callee_text
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            hosts("src/handlers.ts", "ping"),
+            vec![
+                "src/catalog.ts:11 instance.get 1",
+                "src/catalog.ts:14 inner.post 1",
+                "src/index.ts:7 app.get 1",
+                "src/index.ts:12 scope.get 1",
+            ]
+        );
+        assert_eq!(
+            hosts("src/catalog.ts", "catalogPlugin"),
+            vec!["src/index.ts:18 app.register 0"]
+        );
     }
 }
