@@ -594,7 +594,9 @@ fn add_named_call(root: &Path) {
 ///
 /// The second seed documents a member of the producer's response type. The
 /// published text stays the same, so the pair's spec does too; the stub's
-/// declaration moves, and every pair on it is judged.
+/// declaration moves, and every pair on it is judged. The request pairs read
+/// nothing that declaration holds (the call writes no body and the handler
+/// reads none), so their judge input is main's and they settle.
 #[test]
 fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
     if !sidecar_built() {
@@ -701,13 +703,36 @@ fn a_reached_pair_settles_only_when_its_judge_input_is_mains() {
         ("  y: number;\n", "  /** Units sold. */ y: number;\n"),
         "member",
     );
-    assert_eq!(reached_line(&log), 0, "{log}");
+    // A pair is on the moved declaration when its producer side is the
+    // response alias (`CheckoutResult`).
+    let on_moved = |key: &str| {
+        key.split('~')
+            .next()
+            .is_some_and(|producer| producer.contains("_Response_"))
+    };
+    let unmoved = main
+        .iter()
+        .filter(|(key, (left, _))| !*left && !on_moved(key))
+        .count();
+    assert!(unmoved > 0, "{main:#?}");
+    assert_eq!(reached_line(&log), unmoved, "{log}");
     let checked = checked_keys(&events);
+    assert!(
+        settled.iter().any(|key| on_moved(key)),
+        "seed 1 settled a pair on the response: {settled:#?}"
+    );
     for key in &settled {
-        assert!(
-            checked.contains(*key),
-            "the moved pair is judged: {key}\n{events}"
-        );
+        if on_moved(key) {
+            assert!(
+                checked.contains(*key),
+                "the moved pair is judged: {key}\n{events}"
+            );
+        } else {
+            assert!(
+                !checked.contains(*key),
+                "a pair the edit does not reach settles: {key}\n{events}"
+            );
+        }
     }
 }
 
