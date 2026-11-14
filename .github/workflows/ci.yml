@@ -552,6 +552,12 @@ jobs:
             assert.strictEqual(m.method_matches('ALL', 'POST'), true);
             assert.strictEqual(m.method_matches('get', 'GET'), true);
             assert.strictEqual(m.method_matches('POST', 'ALL'), false);
+            assert.strictEqual(m.catch_all_prefix('/proxy{/*splat}'), '/proxy');
+            assert.strictEqual(m.catch_all_prefix('/v1/*rest'), '/v1');
+            assert.strictEqual(m.catch_all_prefix('/users/:id'), undefined);
+            assert.strictEqual(m.is_wildcard_segment('*rest'), true);
+            assert.strictEqual(m.is_wildcard_segment('*.js'), false);
+            assert.deepStrictEqual(m.literal_segments('/proxy{/*splat}'), ['proxy']);
             console.log('wasm smoke ok');
           "
 

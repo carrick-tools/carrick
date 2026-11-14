@@ -1187,19 +1187,16 @@ fn served_at(composed: &[super::Composed]) -> Vec<Result<String, Unmounted>> {
         .collect()
 }
 
-/// `path` without its last segment, when that segment is a catch-all
-/// ([`carrick_match::is_catch_all_path`]: `*`, `**`, `(.*)`): what serves
-/// every path below it.
+/// The prefix a catch-all path covers ([`carrick_match::catch_all_prefix`]:
+/// `*`, `**`, `(.*)`, a named `*name` / `{*name}`, or a trailing
+/// `{/*name}`): what serves every path below it.
 fn below_catch_all(path: &str) -> Option<String> {
     let path = if path.starts_with('/') {
         path.to_string()
     } else {
         format!("/{path}")
     };
-    if !carrick_match::is_catch_all_path(&path) {
-        return None;
-    }
-    let (above, _) = path.rsplit_once('/')?;
+    let above = carrick_match::catch_all_prefix(&path)?;
     Some(if above.is_empty() {
         "/".to_string()
     } else {
@@ -1257,6 +1254,22 @@ mod tests {
         );
         assert_eq!(below_catch_all("/(.*)"), Some("/".to_string()));
         assert_eq!(below_catch_all("/api/rpc"), None);
+        // carrick#4205: the path-to-regexp v8 named forms.
+        assert_eq!(
+            below_catch_all("/api/rpc/*rest"),
+            Some("/api/rpc".to_string())
+        );
+        assert_eq!(
+            below_catch_all("/api/rpc/{*rest}"),
+            Some("/api/rpc".to_string())
+        );
+        assert_eq!(
+            below_catch_all("/api/rpc{/*rest}"),
+            Some("/api/rpc".to_string())
+        );
+        assert_eq!(below_catch_all("*splat"), Some("/".to_string()));
+        assert_eq!(below_catch_all("/{/*splat}"), Some("/".to_string()));
+        assert_eq!(below_catch_all("/api/*.js"), None);
         assert_eq!(below_catch_all("/api/:rest"), None);
     }
 }

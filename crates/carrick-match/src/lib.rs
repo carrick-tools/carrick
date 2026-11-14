@@ -34,7 +34,8 @@
 //!
 //! The `wasm` feature (default off) adds wasm-bindgen exports for
 //! [`paths_match`], [`is_param_segment`], [`route_identity`], [`match_agreement`],
-//! [`path_literal_specificity`], [`is_catch_all_path`],
+//! [`path_literal_specificity`], [`is_catch_all_path`], [`catch_all_prefix`],
+//! [`is_wildcard_segment`], [`literal_segments`],
 //! [`is_unknown_call_path`], [`match_verdict`], [`reportable_agreement`],
 //! [`classify_relationship`], [`method_matches`], and the body-dispatch trio [`dispatch_key`],
 //! [`dispatch_verdict`], [`match_verdict_with_dispatch`] /
@@ -184,7 +185,7 @@ pub(crate) struct SplitPath<'a, S> {
 }
 
 impl<'a, S: AsRef<str>> SplitPath<'a, S> {
-    /// `segments` must be `text.split('/')`, in order.
+    /// `segments` must be `split_route(text)`, in order.
     pub(crate) fn new(text: &'a str, segments: &'a [S]) -> Self {
         SplitPath { text, segments }
     }
@@ -194,14 +195,42 @@ impl<'a, S: AsRef<str>> SplitPath<'a, S> {
     }
 }
 
-/// `path.split('/')`, borrowed: a one-shot comparison's segments.
+/// [`split_route`], borrowed: a one-shot comparison's segments.
 pub(crate) fn segments(path: &str) -> Vec<&str> {
-    path.split('/').collect()
+    split_route(path).collect()
 }
 
-/// `path.split('/')`, owned: the segments a [`PairingPool`] holds per route.
+/// `path.split('/')`, except a trailing optional wildcard group `{/*name}`
+/// (path-to-regexp v8, Express 5) splits as the segment `*name` after its
+/// prefix: `/proxy{/*splat}` reads as `/proxy/*splat`, never as the literals
+/// `proxy{` and `*splat}`. The matcher's `/*name` already covers the bare
+/// prefix, so the optional form reads the same as `/*name` (carrick#4205).
+/// Every split of a route path (comparison, pool, literal count) goes
+/// through here.
+pub(crate) fn split_route(path: &str) -> impl Iterator<Item = &str> {
+    let (head, tail) = match optional_wildcard_tail(path) {
+        Some(open) => {
+            let above = &path[..open];
+            (
+                above.strip_suffix('/').unwrap_or(above),
+                Some(&path[open + 2..path.len() - 1]),
+            )
+        }
+        None => (path, None),
+    };
+    head.split('/').chain(tail)
+}
+
+/// Byte offset of a trailing `{/*name}` group, when the path ends in one.
+fn optional_wildcard_tail(path: &str) -> Option<usize> {
+    let body = path.strip_suffix('}')?;
+    let open = body.rfind("{/*")?;
+    is_wildcard_name(&body[open + 3..]).then_some(open)
+}
+
+/// [`split_route`], owned: the segments a [`PairingPool`] holds per route.
 pub(crate) fn owned_segments(path: &str) -> Box<[Box<str>]> {
-    path.split('/').map(Box::from).collect()
+    split_route(path).map(Box::from).collect()
 }
 
 /// [`match_agreement`] over paths already split.
@@ -222,13 +251,14 @@ pub(crate) fn agreement<E: AsRef<str>, C: AsRef<str>>(
 
 /// Number of LITERAL segments in a path: segments that are real text rather
 /// than a placeholder (`:id`, `{id}`, `<id>`, `[id]`), a wildcard (`*`,
-/// `**`, `(.*)`), or empty/whitespace. This is the most agreement any pairing
+/// `**`, `(.*)`, a named `*name` / `{*name}`), or empty/whitespace. A
+/// trailing `{/*name}` group splits as `*name` ([`split_route`]). This is the most agreement any pairing
 /// with this path could ever produce — 0 means the path can never corroborate
 /// a match (`/*`, `/**`, `/:param`), i.e. it is routing infrastructure, not a
 /// concrete contract.
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn path_literal_specificity(path: &str) -> u32 {
-    literal_count(path.split('/'))
+    literal_count(split_route(path))
 }
 
 /// [`path_literal_specificity`] over a path already split.
@@ -243,15 +273,84 @@ fn literal_count<'s>(segments: impl Iterator<Item = &'s str>) -> u32 {
 }
 
 /// Whether a producer route ends in a catch-all wildcard (`/*`, `/**`,
-/// `/(.*)`) — the patterns the matcher treats as unbounded prefix matches.
+/// `/(.*)`, or a named `/*name`, `/{*name}`, `{/*name}`) — the patterns the
+/// matcher treats as unbounded prefix matches. See [`catch_all_prefix`].
 /// Such a route is a mount or fallback: it absorbs calls by design, so
 /// "no consumer matched it" (orphaned) is not a meaningful observation.
 #[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
 pub fn is_catch_all_path(path: &str) -> bool {
-    path.ends_with("/*") || path.ends_with("/**") || path.ends_with("/(.*)")
+    catch_all_prefix(path).is_some()
 }
 
-/// Whether `endpoint_path` is a catch-all (`/*`, `/**`, `/(.*)`) that routes
+/// The one answer to "is this route a catch-all, and what prefix does it
+/// cover" (carrick#4205): the part of the route before its wildcard, or
+/// `None` when the route is not a catch-all. Every catch-all reader
+/// ([`is_catch_all_path`], the matcher, [`catch_all_covers_call_literal`],
+/// the scanner's mount read) takes its prefix from here.
+///
+/// Forms, all as the LAST part of the path:
+/// - `/*`, `/**`, `/(.*)`, trimmed exactly as the matcher always trimmed them
+///   (`/a/*/**` trims to `/a`);
+/// - the path-to-regexp v8 (Express 5) named forms `/*name` and `/{*name}`;
+/// - the optional group `{/*name}` (`/proxy{/*splat}` covers `/proxy`).
+///
+/// A name is `[A-Za-z_$][A-Za-z0-9_$]*`; anything else (`/files/*.js`, a
+/// quoted name) stays literal. A mid-path `*name` is not a catch-all: it
+/// matches one segment, like a mid-path `*`. Stored paths are never
+/// rewritten; this is a read-time answer, so `route_identity` still tells
+/// `/v1/*` and `/v1/*rest` apart.
+pub fn catch_all_prefix(path: &str) -> Option<&str> {
+    if path.ends_with("/*") || path.ends_with("/**") {
+        return Some(path.trim_end_matches("/**").trim_end_matches("/*"));
+    }
+    if path.ends_with("/(.*)") {
+        return Some(path.trim_end_matches("/(.*)"));
+    }
+    if let Some(open) = optional_wildcard_tail(path) {
+        let above = &path[..open];
+        return Some(above.strip_suffix('/').unwrap_or(above));
+    }
+    let (above, last) = path.rsplit_once('/')?;
+    is_named_wildcard(last).then_some(above)
+}
+
+/// [`catch_all_prefix`] over wasm: a JS string, or `undefined` when the
+/// route is not a catch-all.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = catch_all_prefix)]
+pub fn catch_all_prefix_owned(path: &str) -> Option<String> {
+    catch_all_prefix(path).map(str::to_string)
+}
+
+/// The literal segments of a route path, in order: what is left after
+/// [`split_route`] drops placeholders, wildcards and empty segments. The
+/// cloud's near-miss text reads this rather than splitting a path itself
+/// (`/proxy{/*splat}` -> `["proxy"]`).
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn literal_segments(path: &str) -> Vec<String> {
+    split_route(path)
+        .filter(|seg| is_literal_segment(seg.trim_end_matches('?')))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `[A-Za-z_$][A-Za-z0-9_$]*`: the name a path-to-regexp v8 wildcard takes.
+fn is_wildcard_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// `*name` or `{*name}`: a path-to-regexp v8 named wildcard segment.
+fn is_named_wildcard(seg: &str) -> bool {
+    let inner = seg
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(seg);
+    inner.strip_prefix('*').is_some_and(is_wildcard_name)
+}
+
+/// Whether `endpoint_path` is a catch-all ([`catch_all_prefix`]) that routes
 /// `call_path` AND the call states a literal segment inside the wildcard's
 /// tail (carrick#4186). Such a route says nothing about that segment, so its
 /// handler's type is a generic envelope, not the contract of the call's path:
@@ -259,20 +358,18 @@ pub fn is_catch_all_path(path: &str) -> bool {
 ///
 /// A placeholder in the tail does not count: `/packets/**` vs `/packets/:enc`
 /// states no literal the route fails to cover, so that pair is still
-/// compared. The prefix is trimmed as `agreement_with_wildcards` trims it.
+/// compared. The prefix is [`catch_all_prefix`], the one the matcher reads.
 ///
 /// Not a wasm export and read by nothing that decides routing: it changes no
 /// part of `paths_match`, `match_agreement` or `match_verdict`; only the type
 /// pairing reads it.
 pub fn catch_all_covers_call_literal(endpoint_path: &str, call_path: &str) -> bool {
-    if !is_catch_all_path(endpoint_path) || match_agreement(endpoint_path, call_path).is_none() {
+    let Some(prefix) = catch_all_prefix(endpoint_path) else {
+        return false;
+    };
+    if match_agreement(endpoint_path, call_path).is_none() {
         return false;
     }
-    let prefix = if endpoint_path.ends_with("/(.*)") {
-        endpoint_path.trim_end_matches("/(.*)")
-    } else {
-        endpoint_path.trim_end_matches("/**").trim_end_matches("/*")
-    };
     path_literal_specificity(call_path) > path_literal_specificity(prefix)
 }
 
@@ -605,9 +702,14 @@ fn is_literal_segment(seg: &str) -> bool {
     !seg.trim().is_empty() && !is_param_segment(seg) && !is_wildcard_segment(seg)
 }
 
-/// The wildcard tokens the matcher understands as single segments.
-fn is_wildcard_segment(seg: &str) -> bool {
-    seg == "*" || seg == "**" || seg == "(.*)"
+/// Whether one route segment is a wildcard token: `*`, `**`, `(.*)`, or a
+/// path-to-regexp v8 named wildcard `*name` / `{*name}`. A wildcard is never
+/// a literal (it counts toward no agreement). Split a path with
+/// [`literal_segments`] rather than `split('/')`: a trailing `{/*name}` group
+/// is one wildcard, not two text segments.
+#[cfg_attr(feature = "wasm", wasm_bindgen::prelude::wasm_bindgen)]
+pub fn is_wildcard_segment(seg: &str) -> bool {
+    seg == "*" || seg == "**" || seg == "(.*)" || is_named_wildcard(seg)
 }
 
 /// Segment-by-segment matching with route parameters (on either side) and
@@ -744,12 +846,15 @@ pub fn route_identity(path: &str) -> String {
 ///
 /// Match semantics as implemented (kept byte-identical to the scanner's
 /// original boolean matcher):
-/// - An endpoint ending in `/*`, `/**`, or `/(.*)` is a prefix match: the
+/// - An endpoint ending in a catch-all ([`catch_all_prefix`]: `/*`, `/**`,
+///   `/(.*)`, `/*name`, `/{*name}`, `{/*name}`) is a prefix match: the
 ///   call path only has to start with the part before the wildcard. A
 ///   trailing `/*` therefore matches any number of segments, exactly like
 ///   `/**`, not just one. Agreement is the literal specificity of the
 ///   prefix — the wildcard-covered tail vouches for nothing.
-/// - Anywhere else, a `*` segment matches exactly one call segment, and both
+/// - Anywhere else, a `*` or named `*name` segment matches exactly one call
+///   segment (path-to-regexp v8 lets a mid-path `*name` span several; this
+///   reads it as one, so it never pairs a call v8 would refuse), and both
 ///   paths must have the same number of segments. Agreement counts the
 ///   literal positions.
 fn agreement_with_wildcards<E: AsRef<str>, C: AsRef<str>>(
@@ -767,16 +872,7 @@ fn agreement_with_wildcards<E: AsRef<str>, C: AsRef<str>>(
         }
     }
 
-    // Check for catch-all patterns
-    if endpoint_path.ends_with("/*") || endpoint_path.ends_with("/**") {
-        let prefix = endpoint_path.trim_end_matches("/**").trim_end_matches("/*");
-        return prefix_matches_on_boundary(prefix, call_path)
-            .then(|| path_literal_specificity(prefix));
-    }
-
-    // Check for regex-style catch-all
-    if endpoint_path.ends_with("/(.*)") {
-        let prefix = endpoint_path.trim_end_matches("/(.*)");
+    if let Some(prefix) = catch_all_prefix(endpoint_path) {
         return prefix_matches_on_boundary(prefix, call_path)
             .then(|| path_literal_specificity(prefix));
     }
@@ -789,7 +885,7 @@ fn agreement_with_wildcards<E: AsRef<str>, C: AsRef<str>>(
     let mut agreement = 0u32;
     let pairs = endpoint.segments.iter().zip(call.segments.iter());
     for (endpoint_seg, call_seg) in pairs.map(|(e, c)| (e.as_ref(), c.as_ref())) {
-        if endpoint_seg == "*" {
+        if endpoint_seg == "*" || is_named_wildcard(endpoint_seg) {
             continue; // Single-segment wildcard matches anything
         }
         if endpoint_seg != call_seg {
@@ -1193,12 +1289,19 @@ mod tests {
 
         // Regression: file-based routing synthesizes Next.js catch-all routes
         // (`app/files/[...slug]/route.ts`) as `/files/**`, which must match
-        // single- and multi-segment caller URLs. A named catch-all (the old
-        // `*slug` emission) would be treated as a literal and NOT match —
-        // guards against regressing the router.
+        // single- and multi-segment caller URLs.
         assert!(agreement_with_wildcards("/files/**", "/files/foo").is_some());
         assert!(agreement_with_wildcards("/files/**", "/files/foo/bar").is_some());
-        assert!(agreement_with_wildcards("/files/*slug", "/files/foo").is_none());
+        // carrick#4205: a named catch-all (`*slug`, the Express 5 spelling)
+        // is a catch-all too, not a literal.
+        assert_eq!(
+            agreement_with_wildcards("/files/*slug", "/files/foo"),
+            Some(1)
+        );
+        assert_eq!(
+            agreement_with_wildcards("/files/*slug", "/files/foo/bar"),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1389,9 +1492,106 @@ mod tests {
         assert!(is_catch_all_path("/files/(.*)"));
         assert!(!is_catch_all_path("/api/v1/chat/new"));
         assert!(!is_catch_all_path("/users/:id"));
-        assert!(!is_catch_all_path("/files/*slug"));
+        assert!(is_catch_all_path("/files/*slug"));
         // Mid-path single-segment wildcard is not a catch-all.
         assert!(!is_catch_all_path("/api/*/users"));
+    }
+
+    /// carrick#4205: the path-to-regexp v8 (Express 5) named wildcards are
+    /// catch-alls, and `catch_all_prefix` is what each one covers.
+    #[test]
+    fn named_wildcards_are_catch_alls_with_their_prefix() {
+        let catch_alls = [
+            ("/v1/*rest", "/v1"),
+            ("/*splat", ""),
+            ("/{*splat}", ""),
+            ("/files/{*path}", "/files"),
+            ("/proxy{/*splat}", "/proxy"),
+            ("/proxy/{/*splat}", "/proxy"),
+            ("/{/*path}", ""),
+            ("/v1/*", "/v1"),
+            ("/v1/**", "/v1"),
+            ("/v1/(.*)", "/v1"),
+            ("/*", ""),
+        ];
+        for (path, prefix) in catch_alls {
+            assert!(is_catch_all_path(path), "{path} is a catch-all");
+            assert_eq!(catch_all_prefix(path), Some(prefix), "prefix of {path}");
+        }
+        for path in [
+            "/files/*.js",
+            "/a/*x/b",
+            "/users/:id",
+            "/v1/*1x",
+            "/v1/{*}",
+            "/v1{/*}",
+            "/v1/rest*",
+            "/x{/:id}",
+        ] {
+            assert!(!is_catch_all_path(path), "{path} is not a catch-all");
+            assert_eq!(catch_all_prefix(path), None, "{path} has no prefix");
+        }
+    }
+
+    #[test]
+    fn named_wildcards_count_no_literal_and_fold_the_optional_group() {
+        assert_eq!(path_literal_specificity("/proxy{/*splat}"), 1);
+        assert_eq!(path_literal_specificity("/*splat"), 0);
+        assert_eq!(path_literal_specificity("/{*splat}"), 0);
+        assert_eq!(path_literal_specificity("/{/*path}"), 0);
+        assert_eq!(path_literal_specificity("/v1/*rest"), 1);
+        assert_eq!(match_verdict("/*splat", "/x"), MatchVerdict::CatchAllRoute);
+        assert_eq!(
+            match_verdict("/{*splat}", "/x"),
+            MatchVerdict::CatchAllRoute
+        );
+        assert_eq!(
+            match_verdict("/{/*path}", "/x"),
+            MatchVerdict::CatchAllRoute
+        );
+        assert_eq!(literal_segments("/proxy{/*splat}"), vec!["proxy"]);
+        assert_eq!(literal_segments("/v1/*splat"), vec!["v1"]);
+        assert_eq!(literal_segments("/v1/:id/{*rest}"), vec!["v1"]);
+        assert!(is_wildcard_segment("*rest"));
+        assert!(is_wildcard_segment("{*rest}"));
+        assert!(!is_wildcard_segment("*.js"));
+    }
+
+    #[test]
+    fn named_catch_alls_pair_like_the_unnamed_ones() {
+        assert_eq!(reportable_agreement("/v1/*rest", "/v1/users/7"), Some(1));
+        assert_eq!(reportable_agreement("/v1/{*rest}", "/v1/users/7"), Some(1));
+        assert_eq!(reportable_agreement("/proxy{/*splat}", "/proxy"), Some(1));
+        assert_eq!(
+            reportable_agreement("/proxy{/*splat}", "/proxy/a/b"),
+            Some(1)
+        );
+        // R3: `/v1/*rest` covers the bare prefix, exactly as `/v1/*` does.
+        assert_eq!(reportable_agreement("/v1/*rest", "/v1"), Some(1));
+        assert_eq!(reportable_agreement("/v1/*", "/v1"), Some(1));
+        // The prefix ends on a segment boundary.
+        assert_eq!(reportable_agreement("/v1/*rest", "/v10/x"), None);
+        assert_eq!(reportable_agreement("/proxy{/*splat}", "/proxyx/a"), None);
+        // A mid-path named wildcard matches one segment, like a mid-path `*`.
+        assert_eq!(match_agreement("/a/*x/b", "/a/1/b"), Some(2));
+        assert_eq!(match_agreement("/a/*x/b", "/a/1/2/b"), None);
+        // A glob is literal text, not a wildcard.
+        assert_eq!(match_agreement("/files/*.js", "/files/app.js"), None);
+        assert_eq!(match_agreement("/files/*.js", "/files/*.js"), Some(2));
+    }
+
+    /// carrick#4215 over the named forms: a catch-all covering a call literal
+    /// takes its prefix from `catch_all_prefix`.
+    #[test]
+    fn named_catch_all_covering_a_call_literal() {
+        assert!(catch_all_covers_call_literal("/v1/*rest", "/v1/jobs/open"));
+        assert!(catch_all_covers_call_literal(
+            "/v1{/*rest}",
+            "/v1/jobs/open"
+        ));
+        assert!(catch_all_covers_call_literal("/{*splat}", "/jobs"));
+        assert!(!catch_all_covers_call_literal("/v1/*rest", "/v1/:id"));
+        assert!(!catch_all_covers_call_literal("/v1/*rest", "/v1"));
     }
 
     /// #537: the consumer-side gap. A call whose path never resolved to a
