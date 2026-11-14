@@ -8,7 +8,8 @@
  * its own, and the body is the union of the arms. A conditional with no
  * serialised arm is none of this module's business and reads as it always did.
  *
- * Pure compiler-API code so the v1 inferrer (ts-morph) and the capture anchor
+ * Lives in the capture bundle; the v1 inferrer (ts-morph) reaches it through
+ * capture/index.js, and the capture anchor
  * resolver (raw program) answer it with the same rule.
  */
 

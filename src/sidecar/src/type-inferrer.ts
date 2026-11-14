@@ -94,6 +94,7 @@ import {
   constituentsOf,
   isFrameworkMachinery,
   nodeByLocatorText,
+  serialisedConditionalType,
   normalizeLocatorText,
   symbolDeclaredOutside,
   typeIsOrContainsMachinery,
@@ -103,7 +104,6 @@ import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
 import { enclosingTypeParameterIn, instantiatedAtCall } from './type-parameters.js';
-import { serialisedConditionalType } from './serialised-arms.js';
 import { loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,

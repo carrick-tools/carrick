@@ -26,7 +26,7 @@ import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import { statesNoShape, statusTableBody } from './status-table.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
-import { serialisedConditionalType } from '../serialised-arms.js';
+import { serialisedConditionalType } from './serialised-arms.js';
 import {
   unresolvedAtAnchor,
   unresolvedSpecifiersReachableFrom,
