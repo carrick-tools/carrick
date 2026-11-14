@@ -1300,6 +1300,12 @@ struct Outcome<'a> {
     /// decided ([`Discovery::declarations_unanswered`]), when that call's
     /// own walk found nothing (carrick#3991).
     declarations_open: bool,
+    /// The walk passed, in a sibling's file, a call chained on a maker's
+    /// value (`new Queue(q).add`, `new BroadcastChannel(n).postMessage`) that
+    /// the maker's export claims as an op, and read nothing at it
+    /// (carrick#4445). The ends found elsewhere are real; this call is not
+    /// read, so the call that entered the sibling is `missed_inside`.
+    passed_op: bool,
     /// Each callee whose value a caller of the body decides (carrick#2432).
     open: Vec<Open<'a>>,
     /// The outcome of a value the resolver read to a labelled export or a
@@ -1391,6 +1397,7 @@ impl<'a> Outcome<'a> {
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
         self.declarations_open |= other.declarations_open;
+        self.passed_op |= other.passed_op;
         self.cycle_at = match (self.cycle_at, other.cycle_at) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -3045,6 +3052,7 @@ impl<'a> Walker<'a> {
     /// What the calls `body` makes reach.
     fn body(&mut self, file: &'a Path, body: &'a FnIr) -> Outcome<'a> {
         let mut out = Outcome::default();
+        let mut inners: Vec<(&'a CallIr, Outcome<'a>)> = Vec::new();
         for (call, construction) in body.read_calls() {
             let mut inner = self.call(file, body, call, construction);
             if self.misses(file, body, call, construction, &inner) {
@@ -3059,12 +3067,68 @@ impl<'a> Walker<'a> {
             if inner.ends.is_empty() && self.declaration_left_open(file, call) {
                 inner.declarations_open = true;
             }
+            inners.push((call, inner));
+        }
+        // The maker ends (no op: a construction or a call) each call's own
+        // walk found, by the call's span: the value a chained call reads.
+        let made: HashMap<(u32, u32), Vec<(&str, &str)>> = inners
+            .iter()
+            .map(|(call, inner)| {
+                let makers = inner
+                    .ends
+                    .iter()
+                    .filter(|found| found.end.op.is_none())
+                    .map(|found| (found.end.package.as_str(), found.end.export.as_str()))
+                    .collect();
+                ((call.site.lo, call.site.hi), makers)
+            })
+            .collect();
+        let passed: Vec<bool> = inners
+            .iter()
+            .map(|(call, inner)| {
+                // In a sibling's file only: the own service's chained calls
+                // are read by the receiver trace.
+                !self.inputs.files.contains_key(file)
+                    && inner.ends.is_empty()
+                    && inner.stop.is_none()
+                    && self.chained_on_maker_op(file, call, &made)
+            })
+            .collect();
+        for ((_, mut inner), passed_op) in inners.into_iter().zip(passed) {
+            inner.passed_op |= passed_op;
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
             out.stop = None;
         }
         out
+    }
+
+    /// Whether `call` is chained on the value of a call in the same body that
+    /// `made` holds a maker end for, and that maker's export claims the call's
+    /// member as an op (carrick#4445). The receiver is linked to the maker: a
+    /// member name alone would give `window.addEventListener` a row beside a
+    /// `BroadcastChannel` construction, because the DOM lib is one store key.
+    fn chained_on_maker_op(
+        &self,
+        file: &Path,
+        call: &CallIr,
+        made: &HashMap<(u32, u32), Vec<(&str, &str)>>,
+    ) -> bool {
+        let Some(makers) = call
+            .receiver_object
+            .and_then(|(lo, hi, _)| made.get(&(lo, hi)))
+        else {
+            return false;
+        };
+        let Some(symbol) = self.row(file, call).and_then(|row| row.symbol()) else {
+            return false;
+        };
+        makers.iter().any(|(package, export)| {
+            self.labels
+                .get(package, export)
+                .is_some_and(|claims| claims_member(claims, symbol))
+        })
     }
 
     /// Whether the walk read `call`'s member declaration for an op the
@@ -3239,6 +3303,20 @@ impl<'a> Walker<'a> {
                     ..record(None, chain, Some(stop))
                 });
                 continue;
+            }
+            // A walk that found ends but passed, in a sibling's file, a send
+            // on a maker's value it read nothing at: the call passes through
+            // a call Carrick did not read (carrick#4445), beside its sites.
+            if outcome.passed_op {
+                *discovery
+                    .counts
+                    .entry("missed_inside/beside_ends".to_string())
+                    .or_default() += 1;
+                let at = (self.rel(file), call.site.span_start, call.site.span_end);
+                discovery
+                    .missed_at
+                    .insert(at.clone(), (call.site.line, call.callee_text.clone()));
+                discovery.missed_inside.push(at);
             }
             let mut sibling_routes = 0;
             let mut sibling_end: Option<SiteEnd> = None;
