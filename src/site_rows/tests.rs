@@ -3199,19 +3199,24 @@ fn the_name_census_counts_each_reader_s_outcome() {
         placed(4, "socket", literal(), Vec::new()),
         placed(5, "broker", Vec::new(), Vec::new()),
         placed(6, "http_client", literal(), Vec::new()),
+        placed(7, "broker", Vec::new(), Vec::new()),
     ];
     let mut records: Vec<SiteRecord> = sites.iter().map(|s| record(s, &[], &[])).collect();
     // Several names the code states: each is a row, none is asked.
     records[2].names = vec!["a".to_string(), "b".to_string()];
     records[3] = record(&sites[3], &[], &[Slot::Name]);
     records[4].bucket = Bucket::Lead;
+    // A lead with the resolver's reason is unstated; one with none is not
+    // told apart from a question asked (carrick#4446).
+    records[6].bucket = Bucket::Lead;
+    records[6].unread = Some(Stop::NoOpClaim);
     let decided = Decided {
         sites,
         ..Decided::default()
     };
     assert_eq!(
         site_names(&decided, &records).line(),
-        "literal_piece=1 filled_param=1 resolver_fold=1 asked=1 unstated=1"
+        "literal_piece=1 filled_param=1 resolver_fold=1 asked=1 unstated=1 no_reason=1"
     );
 
     let held = a_socket_fact_row();
