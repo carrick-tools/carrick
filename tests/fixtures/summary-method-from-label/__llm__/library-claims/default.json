@@ -1,0 +1,159 @@
+{
+  "library_claims": [
+    {
+      "package": "@fixture/http",
+      "version": "1.0.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/http",
+          "export": "http",
+          "role": "http_client",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "post",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "method": "POST",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "remove",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1,
+                "key": "data"
+              },
+              "method": "DELETE",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "purge",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "method": "DELETE",
+              "picker": "fixture-picker"
+            },
+            {
+              "op": "request",
+              "member": "request",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1,
+                "key": "data"
+              },
+              "method_key": {
+                "arg": 1,
+                "key": "method"
+              },
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@fixture/bus",
+      "version": "1.2.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/bus",
+          "export": "bus",
+          "role": "broker",
+          "side": null,
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "publish",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [
+            "*"
+          ]
+        }
+      ]
+    },
+    {
+      "package": "@fixture/wire",
+      "version": "2.0.0",
+      "status": "answered",
+      "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "exports": [
+        {
+          "specifier": "@fixture/wire",
+          "export": "wire",
+          "role": "socket",
+          "side": "client",
+          "classifier": "fixture-classifier",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "send",
+              "member": "emit",
+              "on": "export",
+              "name": {
+                "arg": 0
+              },
+              "payload": {
+                "arg": 1
+              },
+              "name_scope": {
+                "scope": "global",
+                "namespace": null
+              },
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

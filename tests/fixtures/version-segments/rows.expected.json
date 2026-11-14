@@ -1,7 +1,7 @@
 {
   "rows": {
-    "src/use-options.ts:2": "GET /v1/a",
-    "src/use-options.ts:3": "GET /v2/b",
+    "src/use-options.ts:2": "POST /v1/a",
+    "src/use-options.ts:3": "POST /v2/b",
     "src/use-options.ts:4": "POST /v1/c",
     "src/use-options.ts:5": "POST /v2/d",
     "src/use-param-key.ts:2": "POST /v1/k/omitted",
@@ -19,8 +19,8 @@
     "src/use-method.ts:2": "POST /m/omitted",
     "src/use-method.ts:3": "GET /m/get",
     "src/use-method.ts:4": "POST /m/body",
-    "src/use-bag-method.ts:2": "PUT /bm/one",
-    "src/use-bag-method.ts:3": "PATCH /bm/two",
+    "src/use-bag-method.ts:2": "POST /bm/one",
+    "src/use-bag-method.ts:3": "POST /bm/two",
     "src/use-event.ts:2": "room.versioned",
     "src/use-event.ts:3": "room.given"
   },

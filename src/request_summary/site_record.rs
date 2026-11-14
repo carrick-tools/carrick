@@ -1910,6 +1910,27 @@ fn procedure_wire_label(
     (label, None)
 }
 
+/// The method an HTTP label states for a call, as the label alone decides it
+/// (carrick#4373): the one method the member always sends, or its default
+/// where the call writes nothing at the label's method slot (`site_method`
+/// is [`MethodValue::Unwritten`]) or the label names no slot. `None` where
+/// the code writes the slot, or where nothing says what the slot holds: that
+/// method is the code's, read by the record's own `stated_whole`. The one
+/// answer the site record's Method slot and the request summaries'
+/// correction ([`super::fact_files::FactFiles::label_methods`]) both read.
+pub fn label_method(
+    method_label: &MethodLabel,
+    site_method: Option<&MethodValue>,
+) -> Option<String> {
+    match (&method_label.literal, &method_label.from, site_method) {
+        (Some(literal), _, _) => Some(literal.clone()),
+        (None, Some(_), Some(MethodValue::Unwritten)) | (None, None, _) => {
+            method_label.default.clone()
+        }
+        (None, Some(_), _) => None,
+    }
+}
+
 fn place(from: PlaceFrom, at: &str) -> Place {
     Place {
         from,
@@ -2402,37 +2423,34 @@ fn record(
         // sends, the default where nothing writes the slot, or the whole
         // values the code writes there. Forced only when that is a single
         // request method; asked otherwise.
-        let methods: Option<BTreeSet<String>> = match (&method_label.literal, &method_label.from) {
-            (Some(literal), _) => Some(BTreeSet::from([literal.clone()])),
-            (None, Some(_)) => match &site.method {
-                Some(MethodValue::Unwritten) => method_label
-                    .default
-                    .clone()
-                    .map(|default| BTreeSet::from([default])),
-                Some(MethodValue::Pieces(pieces)) => {
-                    let exprs: Vec<&Expr> = parts.arg_exprs.iter().collect();
-                    stated_whole(
-                        sources.get(file),
-                        pieces,
-                        &exprs,
-                        &literals,
-                        &Choices {
-                            resolver,
-                            root,
-                            file,
-                            in_place: false,
-                            hole: &Cell::new(None),
-                        },
-                        true,
-                    )
-                    .map(|whole| whole.values)
-                }
-                None => None,
-            },
-            (None, None) => method_label
-                .default
-                .clone()
-                .map(|default| BTreeSet::from([default])),
+        let methods: Option<BTreeSet<String>> = match (&method_label, &site.method) {
+            (
+                MethodLabel {
+                    literal: None,
+                    from: Some(_),
+                    ..
+                },
+                Some(MethodValue::Pieces(pieces)),
+            ) => {
+                let exprs: Vec<&Expr> = parts.arg_exprs.iter().collect();
+                stated_whole(
+                    sources.get(file),
+                    pieces,
+                    &exprs,
+                    &literals,
+                    &Choices {
+                        resolver,
+                        root,
+                        file,
+                        in_place: false,
+                        hole: &Cell::new(None),
+                    },
+                    true,
+                )
+                .map(|whole| whole.values)
+            }
+            _ => label_method(&method_label, site.method.as_ref())
+                .map(|method| BTreeSet::from([method])),
         };
         // A procedure call's method is already a wire method here
         // ([`procedure_wire_label`], carrick#3186), like any HTTP call's.

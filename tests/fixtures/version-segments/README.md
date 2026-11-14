@@ -7,6 +7,13 @@ Each caller sends the key its object writes, else the default, also through
 a wrapper that spreads its caller's options after its own keys
 (`{ version: 'v2', ...options }`: the caller's key, else `v2`).
 
+The `method` shapes: `use-method.ts` goes through `http.request`, which reads
+the verb from a `method` key, so the client's default is the verb a caller
+omits. `use-options.ts` and `use-bag-method.ts` end in `http.post(url, {
+method, body })`: post's second argument is the body, so those rows are POST
+whatever the bag's `method` says (it is a body field); only `request` reads a
+method key. Their `/v1`, `/v2` and `/bm` segments still move (carrick#3608).
+
 One client per shape in `repo/src/client/`, one caller file per shape in
 `repo/src/use-*.ts`, so no same-file wrapper row masks the result.
 

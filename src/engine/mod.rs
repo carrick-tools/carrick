@@ -7624,12 +7624,13 @@ fn first_discovery(
             ..SiteContext::default()
         },
     );
+    let labels = crate::request_summary::decided_sites::SiteLabel::from_exports(&answer.exports);
     let decided = crate::request_summary::decided_sites::decided_sites_with(
         inputs,
         siblings,
         root,
         &discovered_sites(&discovery),
-        &crate::request_summary::decided_sites::SiteLabel::from_exports(&answer.exports),
+        &labels,
     );
     let facts = crate::request_summary::fact_files::FactFiles::of(
         &discovery,
@@ -7637,7 +7638,8 @@ fn first_discovery(
         Some(library),
         &answer,
         root,
-    );
+    )
+    .with_label_methods(&decided, &labels);
     // A walk into a sibling ends in a file this service does not read: it
     // selects none of its own and lists no span there (carrick#2618).
     if siblings.is_empty() {
