@@ -2921,7 +2921,7 @@ impl<'a> Walker<'a> {
         // so the walk, the guard chains and the call graph's `handed` edge
         // follow the same rows.
         let mut handed: Vec<(usize, PathBuf, String)> =
-            handed_by(self.inputs_for(file), file, call)
+            Vec::<(PathBuf, String, usize, Vec<String>)>::new()
                 .into_iter()
                 .filter(|(_, _, index, keys)| {
                     keys.is_empty() && !matches!(call.args.get(*index), Some(Value::Callback(_)))
