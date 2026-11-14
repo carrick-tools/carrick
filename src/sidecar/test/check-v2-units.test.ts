@@ -152,9 +152,24 @@ describe('the JSON wire assignment', () => {
     assert.strictEqual(decisiveAssignmentLine(plan), plan.wireAssignmentLine);
   });
 
-  it('a protocol that does not serialise has no wire assignment to judge', () => {
-    for (const protocol of ['socket', 'pubsub', 'graphql'] as const) {
-      const plan = buildProbe(spec({ protocol }), PKG);
+  it('a GraphQL response is judged on the comparand in its serialised form (carrick#4275)', () => {
+    const plan = buildProbe(spec({ protocol: 'graphql' }), PKG);
+    assert.ok(plan.wireAssignmentLine, 'a graphql response must carry a wire assignment');
+    const lines = plan.source.split('\n');
+    assert.strictEqual(
+      lines[plan.wireAssignmentLine! - 1],
+      'const expectedWire: GqlExpected = sentWire;'
+    );
+    assert.strictEqual(decisiveAssignmentLine(plan), plan.wireAssignmentLine);
+  });
+
+  it('a payload whose codec is not a known fact has no wire assignment to judge', () => {
+    for (const [protocol, type_kind] of [
+      ['socket', 'response'],
+      ['pubsub', 'response'],
+      ['graphql', 'request'],
+    ] as const) {
+      const plan = buildProbe(spec({ protocol, type_kind }), PKG);
       assert.strictEqual(plan.wireAssignmentLine, undefined, protocol);
       assert.strictEqual(decisiveAssignmentLine(plan), plan.assignmentLine, protocol);
     }

@@ -98,7 +98,7 @@ export {
 // reaches it only through this door (index.js).
 export { runCheck } from './check.js';
 export type { CheckProgress } from './check.js';
-export { jsonWireDeclarations, sentInJsonWireForm } from './check-probe.js';
+export { jsonWireDeclarations, wireFormFor } from './check-probe.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';

@@ -7,7 +7,7 @@
  * side of an `http` pair in that form (`JsonWire<T>` in the probe). The
  * definitions pass printed the same alias as declared, so the stored
  * `expanded` text said `Date` where the judge read `string`. Both now read
- * one rule, `sentInJsonWireForm`.
+ * one rule, `wireFormFor` (a GraphQL producer response too, carrick#4275).
  *
  * `definition` (as written) keeps the declared names in every case.
  */
