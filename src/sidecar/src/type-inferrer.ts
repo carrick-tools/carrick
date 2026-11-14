@@ -2410,9 +2410,23 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
       anchor.element
     );
-    this.relateModelSymbol(request, inferred, [
-      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
-    ]);
+    // carrick#2111: a located expression inside a callback an array or a
+    // promise is handed (`row` in `rows.find((row) => …)`) reads the callback,
+    // not the route, and a read of the wrong function must never displace the
+    // symbol the model named. Such a callback was once read as a registration,
+    // which decided the answer before this point (carrick#4379); it is asked
+    // only where the callback is the function the row's line names.
+    const owner = this.findContainingFunctionForNode(payloadNode);
+    const ownerCall = owner?.getParent();
+    const inIteration =
+      owner !== undefined &&
+      Node.isCallExpression(ownerCall) &&
+      this.calledOnCollectionOrPromise(ownerCall);
+    if (!inIteration || this.isTheRowsOwnFunction(request, owner)) {
+      this.relateModelSymbol(request, inferred, [
+        unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
+      ]);
+    }
     if (byArguments && !byArguments.type && byArguments.tested.length > 0) {
       this.addArgumentReads(inferred, byArguments.tested);
     }
@@ -9480,11 +9494,29 @@ export class TypeInferrer {
    * reading the first function read a middleware as the route. The path
    * literal is not function-valued, so it is skipped naturally. No callee-name
    * check: a call whose argument resolves to a function is structurally a
-   * registration regardless of the framework.
+   * registration regardless of the framework, unless it is called on an array
+   * or a promise (carrick#4379).
    */
+  /**
+   * carrick#4379: whether a call is made on an array or a promise (`rows.map(cb)`,
+   * `rows.filter(cb)`, `pending.then(cb)`). Such a call hands its function to
+   * an iteration or a continuation, never to a server or router, so the
+   * function is no route handler and the call's result is the value to read.
+   * Decided by the receiver's compiler type, so it names no method.
+   */
+  private calledOnCollectionOrPromise(call: CallExpression): boolean {
+    const callee = call.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return false;
+    const receiver = callee.getExpression().getType().getNonNullableType();
+    if (receiver.isArray() || receiver.isTuple() || receiver.getArrayElementType()) return true;
+    const then = receiver.getProperty('then');
+    return !!then && this.isCallableType(then.getTypeAtLocation(call));
+  }
+
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
+    if (this.calledOnCollectionOrPromise(call)) return undefined;
     for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
