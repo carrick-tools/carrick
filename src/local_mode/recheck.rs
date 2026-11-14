@@ -513,7 +513,7 @@ fn miss_reason(owner: &Owner, miss: &Miss) -> String {
             miss.files
         ),
         Owner::File { file, .. } => format!(
-            "re-reading the services that read {file} ({} indexed files) took longer than {took} \
+            "re-reading services that read {file} ({} indexed files) took longer than {took} \
              against this index, so edits to {file} are not re-checked until `carrick refresh`. \
              Run `carrick check --changed` before you finish.",
             miss.files
