@@ -142,6 +142,7 @@ describe('verify_library_claims: an of-make (carrick-cloud#3534 T1)', () => {
   it('parses in a request, and the schema stays strict elsewhere', () => {
     const request = (claim: Record<string, unknown>) =>
       VerifyLibraryClaimsRequestSchema.safeParse({
+        request_id: 'r1',
         action: 'verify_library_claims',
         from_dir: '/x',
         checks: [{ claim_id: 'a', package: 'fixture-hub', export: 'Hub', role: 'broker', receiver: 'instance:new', claim }],
