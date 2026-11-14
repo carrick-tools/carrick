@@ -7,9 +7,9 @@
   "scripts": {
     "build": "node node_modules/typescript/bin/tsc",
     "start": "node dist/index.js",
-    "test": "node --test dist/test/**/*.test.js",
+    "test": "node scripts/test-files.mjs run all --",
     "clean": "rm -rf dist",
-    "test:coverage": "node --test --experimental-test-coverage dist/test/**/*.test.js"
+    "test:coverage": "node scripts/test-files.mjs run all -- --experimental-test-coverage"
   },
   "dependencies": {
     "@ts-morph/common": "0.29.0",
