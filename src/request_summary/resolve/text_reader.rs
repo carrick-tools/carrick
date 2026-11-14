@@ -2242,6 +2242,61 @@ mod tests {
         texts("p_local", &["one", "two"]);
     }
 
+    /// carrick#4266: a key read off a name a `for…of` head binds over a
+    /// stated list of objects is each element's entry at that key: two keys
+    /// of one head join element by element, and a key reads under a
+    /// destructured key or a tuple position. Fixture `resolve-text`
+    /// (`loops.ts`).
+    #[test]
+    fn a_key_read_off_a_loop_head_is_each_element_s_entry() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let texts = |callee: &str, want: &[&str]| {
+            let want: Vec<String> = want.iter().map(|text| text.to_string()).collect();
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (want, Vec::new()),
+                "{callee}"
+            );
+        };
+        texts("p_member", &["/a", "/b"]);
+        texts("p_member_pair", &["get /x", "post /y"]);
+        texts("p_member_held", &["/h1", "/h2"]);
+        texts("p_member_tuple", &["/t1", "/t2"]);
+        texts("p_member_again", &["/again"]);
+    }
+
+    /// carrick#4266: a key read off a loop head is one `unread_expression`
+    /// hole where an element does not state it plainly (a call's value, a
+    /// computed key, a key read by a computed name, a key one element omits)
+    /// or where an element may change (the head handed to a call or written
+    /// through, the list read other than by the loop, an exported list).
+    #[test]
+    fn a_key_read_off_a_loop_head_an_element_may_not_state_is_a_hole() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for callee in [
+            "p_member_computed",
+            "p_member_computed_key",
+            "p_member_dynamic",
+            "p_member_missing",
+            "p_member_handed",
+            "p_member_written",
+            "p_member_reached",
+            "p_member_exported",
+        ] {
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (Vec::new(), vec![guards::HoleReason::UnreadExpression]),
+                "{callee}"
+            );
+        }
+    }
+
     /// carrick#2093: a loop head whose list the code does not state, or may
     /// change, is one hole of why, and never `outside_service`: the head is
     /// declared in the file. A list exported without `as const`, pushed to,

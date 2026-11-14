@@ -3553,3 +3553,38 @@ fn a_model_row_over_a_loop_gives_way_to_one_row_per_element() {
         ],
     );
 }
+
+/// carrick#4266: a route registered in a `for…of` over a stated list of
+/// objects, its path read off the head (`r.path`, `${r.base}/${r.leaf}`), is
+/// one route per element, two keys of one head joined element by element
+/// (two rows, never four). A list one of whose paths is a call's value
+/// states no row and saves `unread_expression`. A method read off the head
+/// names the member (`app[r.verb]`): a computed callee, which no claim
+/// reads, keeps today's outcome.
+#[test]
+fn a_route_in_a_loop_over_stated_objects_is_one_row_per_element() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let at = "src/objects.ts:";
+    let rows: Vec<String> = endpoint_rows(&blobs)
+        .0
+        .into_iter()
+        .filter(|row| row.starts_with(at))
+        .collect();
+    let unread: Vec<String> = unread_reasons(&blobs)
+        .into_iter()
+        .filter(|(site, _)| site.starts_with(at))
+        .map(|(site, reason)| format!("{site} {reason}"))
+        .collect();
+    assert_eq!(
+        (rows, unread),
+        (
+            vec![
+                "src/objects.ts:13 GET /reports/daily library_claim app".to_string(),
+                "src/objects.ts:13 GET /reports/weekly library_claim app".to_string(),
+                "src/objects.ts:15 GET /v1/jobs library_claim app".to_string(),
+                "src/objects.ts:15 GET /v2/tasks library_claim app".to_string(),
+            ],
+            vec!["src/objects.ts:18 unread_expression".to_string()],
+        ),
+    );
+}
