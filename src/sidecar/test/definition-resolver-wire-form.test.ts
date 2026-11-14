@@ -75,8 +75,15 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(input.expanded, /createdAt: Date/, input.expanded);
   });
 
-  it('a GraphQL producer response keeps its declared Date', () => {
+  it('a GraphQL producer response travels as its JSON form: the server serialises each leaf (carrick#4275)', () => {
     const d = resolve({ protocol: 'graphql', type_kind: 'response', side: 'producer' });
+    assert.match(d.expanded, /createdAt: string/, d.expanded);
+    assert.doesNotMatch(d.expanded, /Date/, d.expanded);
+    assert.match(d.definition, /createdAt: Date/, 'the as-written form keeps the declared type');
+  });
+
+  it('a GraphQL request is read by the server as declared', () => {
+    const d = resolve({ protocol: 'graphql', type_kind: 'request', side: 'consumer' });
     assert.match(d.expanded, /createdAt: Date/, d.expanded);
   });
 
