@@ -475,15 +475,13 @@ fn a_loop_over_a_stated_list_of_topics_writes_a_row_per_element_that_pairs() {
             .as_array()
             .unwrap_or_else(|| panic!("a {array} array"))
             .iter()
-            .filter(|row| row["file"].as_str().is_some_and(|f| f.ends_with(file)))
-            .flat_map(|row| {
-                let text = row.to_string();
-                ["feed.created", "feed.updated"]
-                    .into_iter()
-                    .filter(|topic| text.contains(&format!("\"{topic}\"")))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+            .filter(|row| {
+                row["file_path"]
+                    .as_str()
+                    .is_some_and(|at| at.starts_with(file))
+                    && row["key"]["protocol"] == "pubsub"
             })
+            .filter_map(|row| row["key"]["topic"].as_str().map(str::to_string))
             .collect();
         topics.sort();
         topics
