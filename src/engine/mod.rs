@@ -17359,6 +17359,8 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         let mut result = make_file_result(vec![], vec!["/orders"]);
         let call = &mut result.data_calls[0];
         call.at_caller = true;
+        // The wrapper holds the transport, so the gate (carrick#4270) asks it.
+        call.holds_transport = true;
         call.line_number = 2;
         call.call_expression_text = Some("fetch('/orders')".to_string());
         call.call_expression_line = Some(2);
