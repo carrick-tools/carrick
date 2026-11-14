@@ -20157,6 +20157,7 @@ unfollowed_member_calls_total: 0,
             call_body: None,
             static_asset: None,
             request_line: None,
+            holds_transport: false,
         };
         let mut file_results = HashMap::new();
         file_results.insert(
