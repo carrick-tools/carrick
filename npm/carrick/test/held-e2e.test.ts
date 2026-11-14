@@ -48,6 +48,10 @@ test("two rows arm on real TypeScript 7; a break is one line, a half-written edi
   const home = path.join(dir, "home");
   fs.cpSync(FIXTURE, root, { recursive: true, dereference: true });
   const orders = path.join(root, "src", "orders.ts");
+  // `total` takes its type from the helper, so a change to the helper alone reaches the route.
+  fs.writeFileSync(orders, fs.readFileSync(orders, "utf8").replace("const total: number =", "const total ="));
+  const helper = path.join(root, "src", "helper.ts");
+  const helperOriginal = fs.readFileSync(helper, "utf8");
   const original = fs.readFileSync(orders, "utf8");
   const init: ServiceInit = { repo: "shop", service: "orders-api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
   const env = { ...process.env, CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
@@ -113,17 +117,32 @@ test("two rows arm on real TypeScript 7; a break is one line, a half-written edi
   assert.equal(movedBroken.lines.length, 1, JSON.stringify(movedBroken.lines));
   assert.equal(movedBroken.lines[0]!.label, "GET /orders");
 
+  // A file the hook never named changes on disk behind the daemon (a checkout, a
+  // formatter): it is synced before the answer, and the route it reaches speaks.
+  fs.writeFileSync(orders, original);
+  fs.writeFileSync(helper, helperOriginal.replace('Number(process.env.LIMIT ?? "10")', '"ten"'));
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(helper, later, later);
+  const drift = await ask("edit");
+  assert.equal(drift.lines.length, 1, JSON.stringify(drift.lines));
+  assert.equal(drift.lines[0]!.label, "GET /orders");
+  fs.writeFileSync(helper, helperOriginal);
+  const back = new Date(Date.now() + 120_000);
+  fs.utimesSync(helper, back, back);
+  assert.deepEqual((await ask("edit")).lines, []);
+
   // The fact file moves and a row's stated type changes to one the route does
   // not have: the row is gated again (in the background) and is unarmed, with
   // its reason saved, while the other row stays armed.
   fs.writeFileSync(orders, original);
   current = [ROWS[0]!, row(1, "POST /orders", "/orders", 14, "{ created: string }")];
   stampValue = "moved";
-  let regated: { armed: Array<{ label: string }>; unarmed: Array<{ label: string; reason: string }> } | null = null;
+  type Placed = { armed: Array<{ label: string }>; unarmed: Array<{ label: string; reason: string }> };
+  let regated: Placed | null = null;
   for (let i = 0; i < 60 && regated === null; i++) {
     await ask("edit");
     await new Promise((resolve) => setTimeout(resolve, 500));
-    const now = JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8")) as NonNullable<typeof regated>;
+    const now: Placed = JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8"));
     if (now.unarmed.length > 0) regated = now;
   }
   assert.ok(regated, "the changed row was never gated again");
