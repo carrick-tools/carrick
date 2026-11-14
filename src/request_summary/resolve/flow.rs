@@ -20,8 +20,9 @@
 //!   under the test's negation. A way that comes through both branches
 //!   untouched is one way, without that test (dropping a test that holds on
 //!   every path is sound; attaching one that does not hold is not).
-//! - `return` and `throw` end a branch: it passes nothing on. A read no path
-//!   reaches has no entry.
+//! - `return` and `throw` end a branch: it passes nothing on, and so does an
+//!   unlabelled `continue` in a loop body ([`loop_body_tests`]). A read no
+//!   path reaches has no entry.
 //! - A write of the local in any other form or place (inside an `if` test, a
 //!   call argument, a loop, `try`, `switch`, a labelled statement, a function
 //!   written in the body, `++`, any other compound operator, a destructuring) refuses
@@ -193,6 +194,44 @@ pub(in crate::request_summary) fn tests_at<'a>(
     }]);
     flow.block(stmts, entry, &[]);
     flow.at
+}
+
+/// The `if` tests on a path, each with the branch taken.
+pub(in crate::request_summary) type PathTests<'a> = Vec<(&'a Expr, bool)>;
+
+/// The `if` tests that hold on every path from the start of a loop body to
+/// each read of a name the loop's head binds (carrick#4265), as [`tests_at`]
+/// places them, an unlabelled `continue` ending a path: for each read
+/// outside a function written in the body, where it starts, which of `keys`
+/// it reads, and the tests. A read with no test on its way has no entry.
+pub(in crate::request_summary) fn loop_body_tests<'a>(
+    body: &'a Stmt,
+    keys: &[BindingKey],
+) -> Vec<(u32, usize, PathTests<'a>)> {
+    let stmts: &'a [Stmt] = match body {
+        Stmt::Block(block) => &block.stmts,
+        other => std::slice::from_ref(other),
+    };
+    let mut reads: Vec<(u32, usize)> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let mut uses = Uses {
+            key,
+            reads: Vec::new(),
+            writes: false,
+            nested: 0,
+        };
+        body.visit_with(&mut uses);
+        reads.extend(uses.reads.into_iter().map(|read| (read, index)));
+    }
+    let points: Vec<u32> = reads.iter().map(|(read, _)| *read).collect();
+    let mut found = tests_at(stmts, &points);
+    reads
+        .into_iter()
+        .filter_map(|(read, index)| {
+            let tests = found.remove(&read).filter(|tests| !tests.is_empty())?;
+            Some((read, index, tests))
+        })
+        .collect()
 }
 
 /// The ways that reach a point of the body.
@@ -449,6 +488,11 @@ impl<'a> Flow<'_, 'a> {
                 self.uses(&*exit.arg, &state);
                 State::Dead
             }
+            // An unlabelled `continue` ends the pass through the loop body
+            // the walk reads ([`loop_body_tests`], carrick#4265): it passes
+            // nothing on, as `return` does. The walk enters no loop, so it
+            // is always that body's own.
+            Stmt::Continue(next) if next.label.is_none() => State::Dead,
             other => {
                 self.uses(other, &state);
                 state

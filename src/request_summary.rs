@@ -7026,6 +7026,7 @@ impl Reader<'_> {
                     .init
                     .as_deref()
                     .is_some_and(resolve::written_as_const),
+                element_tests: BTreeMap::new(),
             });
         }
         // `const { a, b: name } = init`: each plain key is a local of its own
@@ -7052,6 +7053,7 @@ impl Reader<'_> {
                     flow: None,
                     elements: None,
                     list_frozen: false,
+                    element_tests: BTreeMap::new(),
                 });
             }
         }
@@ -9157,6 +9159,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 flow: None,
                 elements: None,
                 list_frozen: false,
+                element_tests: BTreeMap::new(),
             };
             self.push_entry(entry);
         }
@@ -9185,7 +9188,7 @@ impl Visit for CallWalker<'_, '_, '_> {
     }
 
     fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
-        self.push_loop_entries(&stmt.left, None, stmt.span.lo.0);
+        self.push_loop_entries(&stmt.left, None, &stmt.body, stmt.span.lo.0);
         let in_head = std::mem::replace(&mut self.in_head, true);
         stmt.left.visit_with(self);
         self.in_head = in_head;
@@ -9199,7 +9202,7 @@ impl Visit for CallWalker<'_, '_, '_> {
         let list = (!stmt.is_await
             && matches!(&stmt.left, ForHead::VarDecl(var) if var.kind == VarDeclKind::Const))
         .then_some(&*stmt.right);
-        self.push_loop_entries(&stmt.left, list, stmt.span.lo.0);
+        self.push_loop_entries(&stmt.left, list, &stmt.body, stmt.span.lo.0);
         let in_head = std::mem::replace(&mut self.in_head, true);
         stmt.left.visit_with(self);
         self.in_head = in_head;
@@ -9344,13 +9347,37 @@ impl CallWalker<'_, '_, '_> {
     /// here (carrick#2093): each name it binds, holding each element of
     /// `list` (a `const` head's list; `None` reads no list) at the position
     /// or key the pattern reads. Keyed by its declaration line, as every
-    /// entry is: two loops that reuse a name are two entries.
-    fn push_loop_entries(&mut self, head: &ForHead, list: Option<&Expr>, loop_at: u32) {
+    /// entry is: two loops that reuse a name are two entries. Each entry
+    /// keeps the tests of the head's names on the way to each of its reads
+    /// in `body` (carrick#4265, [`Self::element_test`]).
+    fn push_loop_entries(
+        &mut self,
+        head: &ForHead,
+        list: Option<&Expr>,
+        body: &Stmt,
+        loop_at: u32,
+    ) {
         let kind = match head {
             ForHead::VarDecl(var) => var.kind,
             _ => return,
         };
-        for (bound, text) in resolve::loop_head_names(head, list, loop_at, &|lo| lo) {
+        let names = resolve::loop_head_names(head, list, loop_at, &|lo| lo);
+        let keys: Vec<BindingKey> = names
+            .iter()
+            .map(|(bound, _)| ident_key(&bound.id))
+            .collect();
+        let mut element_tests: Vec<BTreeMap<u32, Vec<resolve::ElementTest>>> =
+            vec![BTreeMap::new(); names.len()];
+        for (read, index, path) in resolve::flow::loop_body_tests(body, &keys) {
+            let tests: Vec<resolve::ElementTest> = path
+                .iter()
+                .filter_map(|(test, holds)| self.element_test(test, *holds, &keys, &names))
+                .collect();
+            if !tests.is_empty() {
+                element_tests[index].insert(read, tests);
+            }
+        }
+        for ((bound, text), element_tests) in names.into_iter().zip(element_tests) {
             let entry = resolve::LocalBinding {
                 key: ident_key(&bound.id),
                 line: self
@@ -9369,9 +9396,57 @@ impl CallWalker<'_, '_, '_> {
                 flow: None,
                 elements: None,
                 list_frozen: false,
+                element_tests,
             };
             self.push_entry(entry);
         }
+    }
+
+    /// An `if` test on the way to a read in a loop body as one each element
+    /// decides (carrick#4265): a comparison by `===`, `==`, `!==` or `!=`,
+    /// under any number of `!`, of a name the loop's head binds (`keys`,
+    /// `names` in the same order) with text, as the guards read its sides
+    /// ([`Self::comparison_sides`]). `holds` is the branch the path takes.
+    /// `None` for any other test: it decides no element, which keeps it.
+    fn element_test(
+        &self,
+        test: &Expr,
+        holds: bool,
+        keys: &[BindingKey],
+        names: &[(&BindingIdent, ValueAt)],
+    ) -> Option<resolve::ElementTest> {
+        let mut holds = holds;
+        let mut inner = test;
+        let bin = loop {
+            match inner {
+                Expr::Paren(paren) => inner = &paren.expr,
+                Expr::Unary(unary) if unary.op == UnaryOp::Bang => {
+                    holds = !holds;
+                    inner = &unary.arg;
+                }
+                Expr::Bin(bin) => break bin,
+                _ => return None,
+            }
+        };
+        let negated = match bin.op {
+            BinaryOp::EqEq | BinaryOp::EqEqEq => false,
+            BinaryOp::NotEq | BinaryOp::NotEqEq => true,
+            _ => return None,
+        };
+        let (guards::GuardLiteral::Text(text), subject) =
+            self.comparison_sides(&bin.left, &bin.right)?
+        else {
+            return None;
+        };
+        let Expr::Ident(name) = crate::graphql_document_sites::unwrap_expression(subject) else {
+            return None;
+        };
+        let index = keys.iter().position(|key| *key == ident_key(name))?;
+        Some(resolve::ElementTest {
+            of: names[index].1.clone(),
+            test: alternatives::WayTest::Equals(text),
+            holds: holds != negated,
+        })
     }
 
     /// Adds an entry to the walked body, once: a declaration the walk reaches

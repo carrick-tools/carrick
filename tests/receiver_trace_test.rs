@@ -3494,6 +3494,50 @@ fn kept_sites_beside_a_loop_are_unchanged() {
     );
 }
 
+/// carrick#4265: a guard in a loop body decides per element. `if (k ===
+/// 'x') continue;` before the route, and `if (k !== 'x') { … }` around it,
+/// leave no route for `x`; a test of another name of the same loop's tuple
+/// (`'png' === kind`) leaves none for that tuple. A test no element decides
+/// (`ok(k)`, a call) keeps every element, as before guards were read. No
+/// list here is `as const`: over one that is, the compiler narrows the
+/// name at the read to one literal itself, and that answer comes first.
+#[test]
+fn a_guard_in_a_loop_body_drops_the_element_it_skips() {
+    let blobs = scan_fixture("receiver-route-loop");
+    let scan = loop_scan(&blobs);
+    let picture = format!("rows {:#?}\nunread {:#?}", scan.rows, scan.unread);
+    assert_eq!(
+        rows_at(&scan, 66),
+        vec![
+            "src/server.ts:66 GET /skip/a library_claim app",
+            "src/server.ts:66 GET /skip/b library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 71),
+        vec![
+            "src/server.ts:71 GET /only/a library_claim app",
+            "src/server.ts:71 GET /only/b library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 77),
+        vec![
+            "src/server.ts:77 GET /unsure/a library_claim app",
+            "src/server.ts:77 GET /unsure/b library_claim app",
+            "src/server.ts:77 GET /unsure/x library_claim app",
+        ],
+        "{picture}"
+    );
+    assert_eq!(
+        rows_at(&scan, 82),
+        vec!["src/server.ts:82 GET /asset/a.svg library_claim app"],
+        "{picture}"
+    );
+}
+
 /// carrick#2093: where the model states the loop's route as a parameter
 /// path (`POST /widgets/sizes/:size`), the trace replaces that row with one
 /// per element, and no `:size` row stands.

@@ -17,6 +17,7 @@
 
 use super::flow::WayFrom;
 use super::*;
+use crate::request_summary::alternatives::{Verdict, WayGuard};
 
 /// One text a name may be, read by [`Resolver::text_values`] (carrick#3504
 /// S2). Never collapsed: the consumer applies its own policy.
@@ -840,13 +841,7 @@ impl<'a> Resolver<'a> {
         };
         let mut out = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            let part = match (at, key, item) {
-                (None, None, item) => Some(item.clone()),
-                (Some(at), None, ValueAt::Elements(tuple)) => tuple.get(at).cloned(),
-                (None, Some(key), ValueAt::Entries(_)) => handed(item, &[key.to_string()]),
-                _ => None,
-            };
-            let Some(part) = part else {
+            let Some(part) = element_part(item, at, key) else {
                 return hole(guards::HoleReason::UnreadExpression);
             };
             match self.one_text(&listed_in, &part) {
@@ -866,6 +861,44 @@ impl<'a> Resolver<'a> {
         }
         if out.is_empty() {
             return hole(guards::HoleReason::UnreadExpression);
+        }
+        out
+    }
+
+    /// The elements of the loop `binding` (a loop head) takes that no pass
+    /// through the body reaches the read at `lo` with (carrick#4265): those
+    /// a test on the way ([`ModuleBinding::element_tests`]) rules out, as
+    /// the guard of a way decides it ([`WayGuard::verdict`]) with the text
+    /// the tested name takes at that element. A test of an element no
+    /// reader states as one text decides nothing, and the element stays.
+    fn skipped_elements(&self, file: &Path, binding: &ModuleBinding, lo: u32) -> Vec<usize> {
+        let Some(tests) = binding.element_tests.get(&lo) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for test in tests {
+            let ValueAt::Each { list, at, key, .. } = &test.of else {
+                continue;
+            };
+            let Ok((items, listed_in, _, _reading)) = self.list_elements(file, list) else {
+                continue;
+            };
+            for (index, item) in items.iter().enumerate() {
+                let Some(part) = element_part(item, *at, key.as_deref()) else {
+                    continue;
+                };
+                let Ok((text, _)) = self.one_text(&listed_in, &part) else {
+                    continue;
+                };
+                let guard = WayGuard {
+                    subject: vec![Piece::Lit(text)],
+                    test: test.test.clone(),
+                    holds: test.holds,
+                };
+                if guard.verdict() == Verdict::RuledOut && !out.contains(&index) {
+                    out.push(index);
+                }
+            }
         }
         out
     }
@@ -1140,6 +1173,18 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// What a loop head name holds at one element of its list (carrick#2093):
+/// the element, its tuple position `at`, or its object key `key`. `None`
+/// where the element has no such part.
+fn element_part(item: &ValueAt, at: Option<usize>, key: Option<&str>) -> Option<ValueAt> {
+    match (at, key, item) {
+        (None, None, item) => Some(item.clone()),
+        (Some(at), None, ValueAt::Elements(tuple)) => tuple.get(at).cloned(),
+        (None, Some(key), ValueAt::Entries(_)) => handed(item, &[key.to_string()]),
+        _ => None,
+    }
+}
+
 /// Notes each file of `from` in `read_from`, once.
 fn note_all(read_from: &mut Vec<String>, from: Vec<String>) {
     for file in from {
@@ -1280,6 +1325,17 @@ impl<'a> Resolver<'a> {
                 }
                 out.push(value);
             }
+        }
+        // A loop head read past a test that rules an element out never
+        // holds that element here (carrick#4265).
+        if let Some(ValueAt::Each { loop_at, .. }) = &binding.text
+            && binding.kind == BindingKind::LoopElement
+        {
+            let skipped = self.skipped_elements(at.0, binding, lo);
+            out.retain(|value| {
+                !matches!(value, TextValue::Text { elements, .. }
+                    if elements.iter().any(|(at, index)| at == loop_at && skipped.contains(index)))
+            });
         }
         if out.is_empty() {
             return hole(UnreadExpression);
