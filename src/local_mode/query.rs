@@ -628,8 +628,7 @@ fn rechecked(
         &before.indexed_at,
         reach,
         before,
-        rescan,
-        probe,
+        (rescan, probe),
     ) {
         Ok(fresh) => (
             Some((fresh.items, fresh.type_check, fresh.unread)),
@@ -1898,6 +1897,7 @@ mod drift_tests {
 
         let ask = |name: &str| {
             answer(
+                &mut Asked::default(),
                 folder.path(),
                 &folder.path().join(name).join("src/main.ts"),
                 Mode::Check,
@@ -1951,6 +1951,7 @@ mod drift_tests {
             std::fs::create_dir_all(&index_dir).unwrap();
             index.write(&index_dir.join("index.json")).unwrap();
             let output = answer(
+                &mut Asked::default(),
                 folder.path(),
                 &root.join("src/main.ts"),
                 Mode::Check,

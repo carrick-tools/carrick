@@ -388,8 +388,7 @@ pub fn run(
     index_generation: &str,
     reach: &Reach,
     before: &super::read_model::LocalIndex,
-    rescan: bool,
-    probe: &mut ProbeReads,
+    (rescan, probe): (bool, &mut ProbeReads),
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     let budget = budget();
