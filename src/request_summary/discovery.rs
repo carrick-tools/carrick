@@ -944,8 +944,9 @@ pub struct MemberDeclarations {
     /// (it failed, or came back short): a call whose `call` row names one
     /// is a call the answer would have decided, saved `unanswered` beside
     /// its own reason ([`Discovery::declarations_unanswered`], carrick#3991).
-    /// Empty when the verifier answered, including answers that verified
-    /// nothing.
+    /// Also the pairs whose op checks the answer left unchecked with none of
+    /// theirs verified (carrick#4473). Empty when the verifier answered and
+    /// left no such pair, including answers that verified nothing.
     unanswered: HashSet<(String, String)>,
 }
 
@@ -1017,6 +1018,10 @@ impl MemberDeclarations {
         if verdicts.len() != ask.checks.len() {
             return out;
         }
+        // The (store key, member) pairs with an op check the answer left
+        // unchecked, and those with one that verified (carrick#4473).
+        let mut unchecked: HashSet<(String, String)> = HashSet::new();
+        let mut verified: HashSet<(String, String)> = HashSet::new();
         for (((check, op), scope), verdict) in ask
             .checks
             .iter()
@@ -1024,11 +1029,20 @@ impl MemberDeclarations {
             .zip(&ask.scopes)
             .zip(verdicts)
         {
-            if verdict.verdict != SemanticsVerdict::Verified
-                || verdict.claim_id != check.claim_id
-                || verdict.receiver != check.receiver
-            {
+            if verdict.claim_id != check.claim_id || verdict.receiver != check.receiver {
                 continue;
+            }
+            if verdict.verdict == SemanticsVerdict::Unchecked {
+                if let Some(op) = op {
+                    unchecked.insert((op.package.clone(), op.member.clone()));
+                }
+                continue;
+            }
+            if verdict.verdict != SemanticsVerdict::Verified {
+                continue;
+            }
+            if let Some(op) = op {
+                verified.insert((op.package.clone(), op.member.clone()));
             }
             if let Some(scope) = scope {
                 let mut declarations: Vec<(String, u32)> = verdict
@@ -1054,6 +1068,15 @@ impl MemberDeclarations {
                 }
             }
         }
+        // A pair no check of verified, with one left unchecked, was not
+        // decided: its calls are `unanswered`. One verified check indexes
+        // the pair's declarations, so a call outside them is another member
+        // of that name (carrick#4473).
+        out.unanswered.extend(
+            unchecked
+                .into_iter()
+                .filter(|pair| !verified.contains(pair)),
+        );
         out
     }
 
@@ -2490,7 +2513,19 @@ impl<'a> Walker<'a> {
                 if reasons.iter().any(Option::is_none) {
                     return None;
                 }
-                reasons.into_iter().flatten().next()
+                let reason = reasons.into_iter().flatten().next();
+                // The trace left this call's check open: no match was
+                // decided, so `package_unmatched` would state a result the
+                // scan never got (carrick#4473).
+                if reason == Some(Stop::PackageUnmatched)
+                    && self
+                        .labels
+                        .declarations
+                        .is_some_and(|d| d.left_open(row, self.labels.exports))
+                {
+                    return Some(Stop::Unanswered);
+                }
+                reason
             }
             _ => None,
         }
@@ -4304,6 +4339,13 @@ mod tests {
         assert!(kept[0].also.is_empty());
     }
 
+    /// Whether a row says the trace left its call open: as its reason (a
+    /// `package_unmatched` call with its check open, carrick#4473) or beside
+    /// the walk's own reason (carrick#3991).
+    fn says_unanswered(row: &crate::unread_sites::UnreadSite) -> bool {
+        row.reason == Stop::Unanswered || row.also.contains(&Stop::Unanswered)
+    }
+
     /// The receiver-trace fixture's unread sites, with `declarations` as the
     /// trace's answer.
     fn unread_traced(
@@ -4369,18 +4411,17 @@ mod tests {
         let opened: Vec<_> = unread.iter().filter(|row| !in_read(row)).cloned().collect();
         for row in &opened {
             assert!(
-                row.also.contains(&Stop::Unanswered),
+                says_unanswered(row),
                 "{}:{} {:?} {:?}",
                 row.file,
                 row.line,
                 row.callee,
                 row.reason
             );
-            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
         }
         let mut also_unread: Vec<String> = unread
             .iter()
-            .filter(|row| in_read(row) && row.also.contains(&Stop::Unanswered))
+            .filter(|row| in_read(row) && says_unanswered(row))
             .map(|row| {
                 format!(
                     "{}:{} {}",
@@ -4447,7 +4488,7 @@ mod tests {
         assert!(!answered.is_empty(), "the verifier answered the fixture");
         for row in unread_traced(&on, &exports, &answered) {
             assert!(
-                !row.also.contains(&Stop::Unanswered),
+                !says_unanswered(&row),
                 "{}:{} {:?}",
                 row.file,
                 row.line,
@@ -4477,11 +4518,103 @@ mod tests {
         for callee in ["new Local().get", "shape.get", "target.get"] {
             assert_eq!(at(&unread, callee), at(&read, callee), "{callee}");
             if let Some(row) = at(&unread, callee) {
-                assert!(!row.also.contains(&Stop::Unanswered), "{callee}");
+                assert!(!says_unanswered(&row), "{callee}");
             }
         }
         let request = at(&unread, "request.get").expect("request.get is an unread site");
-        assert!(request.also.contains(&Stop::Unanswered), "{request:?}");
+        assert!(says_unanswered(&request), "{request:?}");
+    }
+
+    /// carrick#4473: an op check the answer left unchecked (here its time
+    /// limit) decided nothing, so its call says `unanswered` as its reason:
+    /// `package_unmatched` would state a match result the scan never got. A
+    /// call the ask was not for keeps its row.
+    #[test]
+    fn a_check_the_answer_left_unchecked_saves_its_call_unanswered() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let verdicts: Vec<SemanticsResult> = ask
+            .checks
+            .iter()
+            .map(|check| SemanticsResult {
+                claim_id: check.claim_id.clone(),
+                receiver: check.receiver.clone(),
+                verdict: SemanticsVerdict::Unchecked,
+                reason: Some("budget".to_string()),
+                declarations: Vec::new(),
+            })
+            .collect();
+        let open = MemberDeclarations::of(&ask, &verdicts);
+        let read = unread_traced(&on, &exports, &answered);
+        let unread = unread_traced(&on, &exports, &open);
+        let at = |rows: &[crate::unread_sites::UnreadSite], file: &str, callee: &str| {
+            rows.iter()
+                .filter(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for (file, callee) in [
+            ("helpers.ts", "app.get"),
+            ("client.ts", "client.get"),
+            ("routes.ts", "this.app.get"),
+        ] {
+            let rows = at(&unread, file, callee);
+            assert!(!rows.is_empty(), "{file} {callee} is an unread site");
+            assert!(
+                rows.iter().all(|row| row.reason == Stop::Unanswered),
+                "{file} {callee}: {rows:?}"
+            );
+        }
+        for callee in ["new Local().get", "shape.get", "target.get"] {
+            assert_eq!(
+                at(&unread, "negatives.ts", callee),
+                at(&read, "negatives.ts", callee),
+                "{callee}"
+            );
+        }
+    }
+
+    /// carrick#4473 R3: a (package, member) pair one of whose checks
+    /// verified indexed its declarations, so a call outside them is another
+    /// member of that name: `request.get` stays `package_unmatched` when
+    /// only another check of the pair came back unchecked.
+    #[test]
+    fn a_pair_one_check_verified_stays_matched() {
+        // `receiver-scopes-chain` asks `get` of one router twice, on the
+        // instance and on its `at` scope: two checks of one pair.
+        let (on, exports, ask, verdicts) =
+            traced_fixture_verdicts("receiver-scopes-chain", ".", "web", &[], |_| {})
+                .expect("the fixture walks: a skipped test proves nothing");
+        let pair = |index: usize| {
+            ask.ops[index]
+                .as_ref()
+                .map(|op| (op.package.clone(), op.member.clone()))
+        };
+        let same_pair: Vec<usize> = (0..verdicts.len())
+            .filter(|&index| pair(index) == Some(("fixture-chain-router".into(), "get".into())))
+            .collect();
+        assert!(
+            same_pair.len() >= 2
+                && same_pair
+                    .iter()
+                    .all(|&index| verdicts[index].verdict == SemanticsVerdict::Verified),
+            "the fixture's `get` has two verified checks: {same_pair:?}"
+        );
+        let real = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &verdicts));
+        for flip in same_pair {
+            let mut edited = verdicts.clone();
+            edited[flip].verdict = SemanticsVerdict::Unchecked;
+            edited[flip].reason = Some("budget".to_string());
+            edited[flip].declarations.clear();
+            let mixed = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &edited));
+            // The unchecked check's declarations are gone, so a call it
+            // decided may now be unread: `package_unmatched`, since the
+            // pair's other check verified. Nothing says `unanswered`.
+            assert!(mixed.len() >= real.len(), "check {flip}");
+            assert!(
+                !mixed.iter().any(says_unanswered),
+                "check {flip} unchecked, its pair's other verified: {mixed:?}"
+            );
+        }
     }
 
     /// A traced fixture through the whole site pass, with `declarations` as
@@ -4609,10 +4742,7 @@ mod tests {
                 .iter()
                 .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
                 .collect();
-            let marked = !here.is_empty()
-                && here.iter().all(|row| {
-                    row.also.contains(&Stop::Unanswered) && row.reason != Stop::Unanswered
-                });
+            let marked = !here.is_empty() && here.iter().all(|row| says_unanswered(row));
             let moves = rows_at(&real_rows, at) != rows_at(&dead_rows, at)
                 || real_sites.get(at) != dead_sites.get(at);
             let name = format!("{}:{}", at.0, line_of(at));
@@ -4629,7 +4759,7 @@ mod tests {
                         dead_sites.get(at)
                     ));
                 }
-            } else if here.iter().any(|row| row.also.contains(&Stop::Unanswered)) {
+            } else if here.iter().any(|row| says_unanswered(row)) {
                 marked_unmoved.push(name);
             }
         }
@@ -7604,6 +7734,27 @@ export function listen(): void {
         Vec<ExportClaims>,
         MemberDeclarations,
     )> {
+        let (on, exports, ask, verdicts) =
+            traced_fixture_verdicts(name, dir, service, files, edit)?;
+        let declarations = MemberDeclarations::of(&ask, &verdicts);
+        Some((on, exports, declarations))
+    }
+
+    /// [`traced_fixture_files`] before the verdicts are indexed: the ask and
+    /// the verifier's verdicts for it, one per check.
+    #[allow(clippy::type_complexity)]
+    fn traced_fixture_verdicts(
+        name: &str,
+        dir: &str,
+        service: &str,
+        files: &[(&str, &str)],
+        edit: impl FnOnce(&mut Vec<ExportClaims>),
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        DeclarationAsk,
+        Vec<SemanticsResult>,
+    )> {
         let on = walked(name, dir, service, files, true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7626,8 +7777,7 @@ export function listen(): void {
             .expect("the verifier answers")
             .verdicts;
         let verdicts = with_scope_declarations(name, &ask, verdicts);
-        let declarations = MemberDeclarations::of(&ask, &verdicts);
-        Some((on, exports, declarations))
+        Some((on, exports, ask, verdicts))
     }
 
     /// One verified scope verdict's declarations, as a cassette holds them.
