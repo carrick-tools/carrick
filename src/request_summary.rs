@@ -11479,28 +11479,31 @@ impl RequestSummaryIndex {
     /// [`SummaryRow::request_at`] as [`Self::withdraw_registrations`]
     /// matches. The label answers what the call sends; the method these
     /// rows read from the call's written shape does not. Returns how many
-    /// rows changed, per `(from, to)`.
+    /// rows changed, per `(from, to)`. A site's rows are merged again where
+    /// one changed ([`merge_rows`]), so two rows that now agree are one.
     pub fn take_label_methods(
         &mut self,
         labelled: &[(String, u32, String)],
     ) -> BTreeMap<(String, String), usize> {
         let mut changed: BTreeMap<(String, String), usize> = BTreeMap::new();
-        for row in self
-            .rows
-            .values_mut()
-            .flat_map(|sites| sites.values_mut())
-            .flatten()
-        {
-            let Some((_, _, method)) = labelled.iter().find(|(file, start, _)| {
-                row.request_at.0.ends_with(Path::new(file)) && row.request_at.1 == *start
-            }) else {
-                continue;
-            };
-            if row.method != *method {
-                *changed
-                    .entry((row.method.clone(), method.clone()))
-                    .or_default() += 1;
-                row.method = method.clone();
+        for rows in self.rows.values_mut().flat_map(|sites| sites.values_mut()) {
+            let mut relabelled = false;
+            for row in rows.iter_mut() {
+                let Some((_, _, method)) = labelled.iter().find(|(file, start, _)| {
+                    row.request_at.0.ends_with(Path::new(file)) && row.request_at.1 == *start
+                }) else {
+                    continue;
+                };
+                if row.method != *method {
+                    *changed
+                        .entry((row.method.clone(), method.clone()))
+                        .or_default() += 1;
+                    row.method = method.clone();
+                    relabelled = true;
+                }
+            }
+            if relabelled {
+                merge_rows(rows);
             }
         }
         changed
