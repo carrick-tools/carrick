@@ -43,10 +43,16 @@
  *   source, or an installed package's file, reaches every file. An import that
  *   resolves to an augmented interface reads the augmentation by its own name
  *   (`AUGMENTATION`), so an unchanged augmentation stops nothing.
+ * - A barrel is an importer of what it re-exports. `export { X } from` reads
+ *   the declaration `X` resolves to; `export * from` and `export * as ns
+ *   from` read every export of the module, and never the module as a whole,
+ *   so a change no export reads (a private function's body) stops at the
+ *   declaring file. The compiler resolves a chain of barrels, so each barrel
+ *   of the chain reads the declaring file directly and is reached from it.
  * - An export added or removed in a file that exists on both sides (an export
  *   list, or a new exported declaration) reaches every file importing that
  *   name from anywhere, and the statements of every file holding a namespace
- *   or dynamic import that read it.
+ *   or dynamic import or a star re-export that read it.
  *
  * Dependencies run from a file to the declarations it names; the compiler
  * never types a file from the files that import it, so nothing is followed the
@@ -469,12 +475,14 @@ function safeAliased(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol | un
   }
 }
 
-/** Every declaration a module's exports resolve to, and the module file itself when it exports `=`. */
-function originsOfModule(checker: ts.TypeChecker, moduleSymbol: ts.Symbol | undefined, into: Origin[]): void {
-  if (!moduleSymbol) return;
-  const target = moduleSymbol.flags & ts.SymbolFlags.Alias ? safeAliased(checker, moduleSymbol) : moduleSymbol;
+function moduleTarget(checker: ts.TypeChecker, moduleSymbol: ts.Symbol | undefined): ts.Symbol | undefined {
+  if (!moduleSymbol) return undefined;
+  return moduleSymbol.flags & ts.SymbolFlags.Alias ? safeAliased(checker, moduleSymbol) : moduleSymbol;
+}
+
+/** Every declaration a module's exports resolve to, through every re-export. */
+function originsOfExports(checker: ts.TypeChecker, target: ts.Symbol | undefined, into: Origin[]): void {
   if (!target) return;
-  for (const decl of target.declarations ?? []) into.push({ file: decl.getSourceFile().fileName, name: '*' });
   let exports: ts.Symbol[] = [];
   try {
     exports = checker.getExportsOfModule(target);
@@ -484,6 +492,14 @@ function originsOfModule(checker: ts.TypeChecker, moduleSymbol: ts.Symbol | unde
   for (const exported of exports) originsOfSymbol(checker, exported, into);
 }
 
+/** Every declaration a module's exports resolve to, and the module file itself when it exports `=`. */
+function originsOfModule(checker: ts.TypeChecker, moduleSymbol: ts.Symbol | undefined, into: Origin[]): void {
+  const target = moduleTarget(checker, moduleSymbol);
+  if (!target) return;
+  for (const decl of target.declarations ?? []) into.push({ file: decl.getSourceFile().fileName, name: '*' });
+  originsOfExports(checker, target, into);
+}
+
 const WHOLE_MODULE_HINT = /\bimport\s*\(|\brequire\s*\(/;
 
 /** A JavaScript file's `@import` tag. */
@@ -491,6 +507,9 @@ const JSDOC_IMPORT_HINT = /@import\b/;
 
 /** The name a dynamic import, `require()` or import type is bound under: no identifier can spell it. */
 const WHOLE_MODULE = '\u0000reads module ';
+
+/** The name a re-export (`export * from`, `export { X } from`) is bound under: no identifier can spell it. */
+const RE_EXPORT = '\u0000re-exports ';
 
 /**
  * Whether the program reads a file as a module: an ES module, or CommonJS
@@ -573,7 +592,36 @@ function nodeOf(checker: ts.TypeChecker, root: string, sourceFile: ts.SourceFile
       }
       lookUp(statement.moduleSpecifier, declaredNames(statement));
     } else if (ts.isExportDeclaration(statement)) {
-      if (statement.moduleSpecifier) lookUp(statement.moduleSpecifier, []);
+      if (statement.moduleSpecifier) {
+        // A barrel's types read the declarations it re-exports, so it is
+        // their importer: a binding to exactly those declarations, never to
+        // the module file as a whole, so a change no export reads stops at
+        // the declaring file.
+        const clause = statement.exportClause;
+        const locals: string[] = [];
+        if (clause && ts.isNamedExports(clause)) {
+          // `export { X } from`: one binding per name, which an export of the
+          // name added or removed there moves, as for a named import.
+          for (const el of clause.elements) {
+            const local = `${RE_EXPORT}${node.bindings.size}`;
+            const origins: Origin[] = [];
+            originsOfSymbol(checker, checker.getExportSpecifierLocalTargetSymbol(el), origins);
+            setBinding(local, origins);
+            node.importedNames.set(local, (el.propertyName ?? el.name).text);
+            locals.push(local);
+          }
+        } else {
+          // `export * from` and `export * as ns from` read every export of
+          // the module, so an export added or removed there reaches them.
+          const local = `${RE_EXPORT}${node.bindings.size}`;
+          const origins: Origin[] = [];
+          originsOfExports(checker, moduleTarget(checker, checker.getSymbolAtLocation(statement.moduleSpecifier)), origins);
+          setBinding(local, origins);
+          node.wholeLocals.add(local);
+          locals.push(local);
+        }
+        lookUp(statement.moduleSpecifier, locals);
+      }
     } else if (ts.isImportEqualsDeclaration(statement)) {
       if (ts.isExternalModuleReference(statement.moduleReference)) {
         const origins: Origin[] = [];
