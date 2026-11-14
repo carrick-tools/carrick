@@ -759,6 +759,22 @@ impl LibrarySite {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LibrarySites {
     pub sites: Vec<LibrarySite>,
+    /// The calls made through a computed key on a library receiver
+    /// (`app[k](…)`, carrick#4327), kept apart from `sites`: none names a
+    /// member, and a site in `sites` with no member is the receiver itself
+    /// called. Nothing is asked of a store for them.
+    pub keyed: Vec<KeyedSite>,
+}
+
+/// A call through a computed key on a library receiver (`app[k](…)`,
+/// carrick#4327): the site as [`LibrarySites::sites`] would hold it, with no
+/// member, and the key the member is read through. Discovery saves such a
+/// call with the key's own reason ([`super::discovery`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedSite {
+    pub site: LibrarySite,
+    /// The key as the text lowering states it.
+    pub(super) key: ValueAt,
 }
 
 impl LibrarySites {
@@ -868,6 +884,7 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
     let names = LinkedNames::link(&inputs.files, &inputs.bindings, inputs.links.as_ref());
     let callers = Callers::index(inputs);
     let mut sites = Vec::new();
+    let mut keyed = Vec::new();
     let mut paths: Vec<&PathBuf> = inputs.files.keys().collect();
     paths.sort();
     for path in paths {
@@ -883,9 +900,9 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
             callers: &callers,
         };
         for key in keys {
-            reader.collect(&file.functions[key], Some(key), &mut sites);
+            reader.collect(&file.functions[key], Some(key), &mut sites, &mut keyed);
         }
-        reader.collect(&file.module_level, None, &mut sites);
+        reader.collect(&file.module_level, None, &mut sites, &mut keyed);
     }
     share_lazy_clients(&mut sites, &callers, inputs);
     sites.sort_by(|a, b| {
@@ -897,7 +914,14 @@ pub fn library_sites(inputs: &RequestSummaryInputs) -> LibrarySites {
             &b.origin,
         ))
     });
-    LibrarySites { sites }
+    keyed.sort_by(|a: &KeyedSite, b: &KeyedSite| {
+        (&a.site.file, a.site.span_start, a.site.span_end).cmp(&(
+            &b.site.file,
+            b.site.span_start,
+            b.site.span_end,
+        ))
+    });
+    LibrarySites { sites, keyed }
 }
 
 /// Every holder of a getter's one instance holds one object (carrick#1790),
@@ -1299,7 +1323,13 @@ impl SiteReader<'_> {
     /// Every library site `ir` writes, and those its callers fill. `key` is
     /// the function's definition key when `ir` is a keyed function's own
     /// body: only its parameters are what a call of that key passes.
-    fn collect(&self, ir: &FnIr, key: Option<&str>, out: &mut Vec<LibrarySite>) {
+    fn collect(
+        &self,
+        ir: &FnIr,
+        key: Option<&str>,
+        out: &mut Vec<LibrarySite>,
+        keyed: &mut Vec<KeyedSite>,
+    ) {
         for site in &ir.library {
             // A call the call graph resolves to a function of this service is
             // that function's, whatever its receiver's name.
@@ -1429,6 +1459,15 @@ impl SiteReader<'_> {
                     }
                 }
             };
+            // A call through a computed key names no member: it is kept
+            // apart, and no caller fills it (carrick#4327).
+            if let Some(read) = &site.key {
+                keyed.push(KeyedSite {
+                    site: library,
+                    key: read.clone(),
+                });
+                continue;
+            }
             // A name taken from a parameter is filled where the function is
             // called (carrick#1562).
             if let Some(key) = key
@@ -1447,7 +1486,7 @@ impl SiteReader<'_> {
             out.push(library);
         }
         for nested in ir.nested.iter().chain(&ir.detached) {
-            self.collect(nested, None, out);
+            self.collect(nested, None, out, keyed);
         }
     }
 
@@ -2468,6 +2507,10 @@ pub(super) struct LibrarySiteIr {
     /// The decorated member's name, set by the decorator reader
     /// ([`super::Reader::decorator_sites`]); `None` for any other site.
     pub(super) decorated: Option<String>,
+    /// For a call through a computed key (`app[k](…)`, carrick#4327): the
+    /// key as the text lowering states it, read by the text reader. Such a
+    /// site names no member ([`KeyedSite`]).
+    pub(super) key: Option<ValueAt>,
 }
 
 /// What a library site's receiver is read through.
@@ -2487,8 +2530,15 @@ pub(super) enum SiteBinding {
 }
 
 /// The receiver a library site names: the binding, the sub-object hops, the
-/// member, and the span of the member's name (or the callee's).
-type LibraryReceiver = (SiteBinding, Vec<String>, Option<String>, Span);
+/// member, the span of the member's name (or the callee's), and the key a
+/// computed member is read through (then the member is `None`).
+type LibraryReceiver = (
+    SiteBinding,
+    Vec<String>,
+    Option<String>,
+    Span,
+    Option<ValueAt>,
+);
 
 impl Reader<'_> {
     /// The library site a call or a `new` writes, when its callee names a
@@ -2506,7 +2556,11 @@ impl Reader<'_> {
         if form == MakerForm::New && spread_from(args).is_some() {
             return None;
         }
-        let (binding, path, member, named) = self.library_receiver(callee, scope)?;
+        let (binding, path, member, named, key) = self.library_receiver(callee, scope)?;
+        // Only a call is made through a computed key.
+        if key.is_some() && form != MakerForm::Call {
+            return None;
+        }
         Some(LibrarySiteIr {
             site: self.site(span),
             op_line: self.line(named),
@@ -2517,6 +2571,7 @@ impl Reader<'_> {
             args: site_args(args, scope),
             arg_texts: super::resolve::args_text(args, &|lo| lo, scope.class()),
             decorated: None,
+            key,
         })
     }
 
@@ -2525,7 +2580,10 @@ impl Reader<'_> {
     /// `client.member(…)`, `client.a.b.member(…)`, the same on a class
     /// field ([`field_binding`]), and the same on what a maker call or an
     /// own call returns (`createQueue("emails").add(…)`, carrick#1562).
-    /// Every hop is a plain name; anything computed is no site.
+    /// Every hop is a plain name. The member is a plain name too, or a
+    /// computed key that is no literal (`app[k](…)`, carrick#4327): such a
+    /// receiver carries the key instead of a member. Anything else computed
+    /// is no site.
     ///
     /// The one place a library receiver is identified.
     fn library_receiver(&self, callee: &Expr, scope: &Scope<'_>) -> Option<LibraryReceiver> {
@@ -2537,6 +2595,7 @@ impl Reader<'_> {
                     Vec::new(),
                     None,
                     ident.span,
+                    None,
                 ));
             }
             // `sock.on(…)` and `sock?.on(…)` name the same receiver: the
@@ -2549,9 +2608,21 @@ impl Reader<'_> {
                 Vec::new(),
                 None,
                 outer.prop.span(),
+                None,
             ));
         }
-        let member = member_prop(outer)?;
+        let (member, key) = match (&outer.prop, member_prop(outer)) {
+            (_, Some(member)) => (Some(member), None),
+            (MemberProp::Computed(computed), None)
+                if super::resolve::static_key(outer).is_none() =>
+            {
+                (
+                    None,
+                    Some(super::resolve::text_of(&computed.expr, &|lo| lo)),
+                )
+            }
+            _ => return None,
+        };
         let named = outer.prop.span();
         let mut path: Vec<String> = Vec::new();
         let mut obj = unwrap_expression(&outer.obj);
@@ -2560,7 +2631,7 @@ impl Reader<'_> {
                 Expr::Ident(ident) => {
                     path.reverse();
                     let binding = SiteBinding::Client(Box::new(scope.site_binding(ident)?));
-                    return Some((binding, path, Some(member), named));
+                    return Some((binding, path, member, named, key));
                 }
                 Expr::Call(_) | Expr::New(_) | Expr::Await(_) => {
                     path.reverse();
@@ -2568,8 +2639,9 @@ impl Reader<'_> {
                     return Some((
                         SiteBinding::Chained(Box::new(client)),
                         path,
-                        Some(member),
+                        member,
                         named,
+                        key,
                     ));
                 }
                 // A hop, plain or optional (`this.a?.b.on(…)`).
@@ -2577,7 +2649,7 @@ impl Reader<'_> {
                     let inner = as_member(obj)?;
                     if matches!(&*inner.obj, Expr::This(_)) {
                         path.reverse();
-                        return Some((field_binding(inner, scope)?, path, Some(member), named));
+                        return Some((field_binding(inner, scope)?, path, member, named, key));
                     }
                     path.push(member_prop(inner)?);
                     obj = unwrap_expression(&inner.obj);
@@ -4490,6 +4562,7 @@ mod tests {
                  \x20 bus.emit(\"b\", {});\n\
                  }\n",
             )]),
+            keyed: Vec::new(),
         };
 
         let trigger = site(&sites.sites, "src/send.ts", 4, Some("trigger"));

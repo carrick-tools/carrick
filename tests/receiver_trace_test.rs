@@ -3516,7 +3516,8 @@ fn a_model_row_over_a_loop_gives_way_to_one_row_per_element() {
 /// (two rows, never four). A list one of whose paths is a call's value
 /// states no row and saves `unread_expression`. A method read off the head
 /// names the member (`app[r.verb]`): a computed callee, which no claim
-/// reads, keeps today's outcome.
+/// reads, states no row; it is saved as an unread callee with its key's
+/// reason (carrick#4327 T0), which this test does not read.
 #[test]
 fn a_route_in_a_loop_over_stated_objects_is_one_row_per_element() {
     let blobs = scan_fixture("receiver-route-loop");
@@ -3601,8 +3602,9 @@ fn a_call_through_a_computed_key_on_a_library_receiver_is_saved_with_its_key_s_r
             vec![
                 "src/keyed.ts:9 unread_expression".to_string(),
                 "src/keyed.ts:12 unread_expression".to_string(),
-                "src/keyed.ts:16 V4".to_string(),
-                "src/keyed.ts:19 V5".to_string(),
+                "src/keyed.ts:16 unread_expression".to_string(),
+                "src/keyed.ts:19 parameter_unread".to_string(),
+                "src/keyed.ts:20 parameter_unread".to_string(),
                 "src/keyed.ts:23 unread_expression".to_string(),
                 "src/keyed.ts:27 package_unmatched".to_string(),
                 "src/keyed.ts:31 package_unmatched".to_string(),

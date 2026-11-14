@@ -1603,6 +1603,17 @@ pub(super) fn receiver_at(
     })
 }
 
+/// One call-form op the store claims on a library receiver's member
+/// ([`Walker::receiver_ops`]): the package key and export whose claims hold
+/// it, and the member it is claimed on.
+struct ReceiverOp<'a> {
+    key: String,
+    export: &'a str,
+    claims: &'a ExportClaims,
+    op: LibraryOp,
+    member: &'a str,
+}
+
 struct Walker<'a> {
     inputs: &'a RequestSummaryInputs,
     /// The run's other services, in declared order (carrick#2618): the walk
@@ -1614,6 +1625,10 @@ struct Walker<'a> {
     /// a package export's maker built (`const app = pkg(); app.post(…)`),
     /// by its file and SWC span ([`super::library_sites`]).
     instances: HashMap<(&'a Path, u32, u32), &'a LibrarySite>,
+    /// Each call the library-site reader reads as made through a computed
+    /// key on a library receiver (`app[k](…)`, carrick#4327), by its file
+    /// and SWC span ([`super::LibrarySites::keyed`]).
+    keyed: HashMap<(&'a Path, u32, u32), &'a KeyedSite>,
     /// What a callee that is a value may hold (carrick#2432, carrick#3504):
     /// the walk follows each end it reaches ([`Follow`]).
     values: &'a Resolver<'a>,
@@ -1853,6 +1868,85 @@ impl<'a> Walker<'a> {
     /// The binding `call` is made on ([`receiver_at`]).
     fn receiver_of(&self, file: &Path, call: &CallIr) -> Option<ReceiverAt> {
         receiver_at(self.inputs, file, call)
+    }
+
+    /// Each call-form op the store claims on a member of `site`'s receiver,
+    /// one that applies to it (an instance's maker, or the export), in the
+    /// order the instance branch of [`Self::library_end`] tries them:
+    /// package key, then export, then claim. Empty for a receiver read
+    /// through hops (`app.a.get(…)`), where no op is claimed.
+    ///
+    /// The one answer to "which ops are claimed on this library receiver":
+    /// the instance branch takes the op its member names, and a call
+    /// through a computed key ([`Self::keyed_stop`]) asks whether any is.
+    fn receiver_ops(&self, site: &'a LibrarySite) -> Vec<ReceiverOp<'a>> {
+        let mut found = Vec::new();
+        if !site.path.is_empty() {
+            return found;
+        }
+        let receivers = site.receiver_ids();
+        let exports = if site.export == "default" {
+            vec!["default", "export ="]
+        } else {
+            vec![site.export.as_str()]
+        };
+        for key in specifier_keys(&site.specifier) {
+            for export in &exports {
+                let Some(claims) = self.labels.get(&key, export) else {
+                    continue;
+                };
+                for claim in claims.claims.iter().filter(|claim| claim.is_call_form()) {
+                    if let LibraryClaim::Op {
+                        op,
+                        member: Some(member),
+                        path,
+                        on,
+                        of,
+                        ..
+                    } = claim
+                        && path.is_empty()
+                        && receivers
+                            .iter()
+                            .any(|receiver| applies(*on, of.as_deref(), receiver))
+                    {
+                        found.push(ReceiverOp {
+                            key: key.clone(),
+                            export: *export,
+                            claims,
+                            op: *op,
+                            member,
+                        });
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The reason a call through a computed key on a library receiver
+    /// (`app[k](…)`, carrick#4327) is saved with, when the store claims an
+    /// op on that receiver: the key's own, as the text reader answers it.
+    /// A key that is several texts, or one that names a claimed op (which
+    /// this call does not yet state), is `unread_expression`; a hole is its
+    /// reason; one text that names no claimed op is what the same call
+    /// written with that member gets (`package_unmatched`). `None` for any
+    /// other call, which keeps the reason the walk gives it.
+    fn keyed_stop(&self, file: &Path, call: &CallIr) -> Option<Stop> {
+        let keyed: &'a KeyedSite = self
+            .keyed
+            .get(&(file, call.site.span_start, call.site.span_end))
+            .copied()?;
+        let ops = self.receiver_ops(&keyed.site);
+        if ops.is_empty() {
+            return None;
+        }
+        Some(match self.values.one_text(file, &keyed.key) {
+            Err(reason) => Stop::from(reason),
+            Ok((member, _)) if ops.iter().any(|claimed| claimed.member == member) => {
+                Stop::UnreadExpression
+            }
+            Ok(_) => Stop::PackageUnmatched,
+        })
     }
 
     /// The member a call reads through a computed key the code states as
@@ -2222,53 +2316,19 @@ impl<'a> Walker<'a> {
         if let Some(site) = self
             .instances
             .get(&(file, call.site.span_start, call.site.span_end))
-            && site.path.is_empty()
             && let Some(member) = site.member.as_deref()
+            && let Some(claimed) = self
+                .receiver_ops(*site)
+                .into_iter()
+                .find(|claimed| claimed.member == member)
         {
-            let receivers = site.receiver_ids();
-            let exports = if site.export == "default" {
-                vec!["default", "export ="]
-            } else {
-                vec![site.export.as_str()]
-            };
-            for key in specifier_keys(&site.specifier) {
-                for export in &exports {
-                    let Some(claims) = self.labels.get(&key, export) else {
-                        continue;
-                    };
-                    let op = claims
-                        .claims
-                        .iter()
-                        .filter(|claim| claim.is_call_form())
-                        .find_map(|claim| match claim {
-                            LibraryClaim::Op {
-                                op,
-                                member: claimed,
-                                path,
-                                on,
-                                of,
-                                ..
-                            } if claimed.as_deref() == Some(member)
-                                && path.is_empty()
-                                && receivers
-                                    .iter()
-                                    .any(|receiver| applies(*on, of.as_deref(), receiver)) =>
-                            {
-                                Some(*op)
-                            }
-                            _ => None,
-                        });
-                    if let Some(op) = op {
-                        return Some((
-                            SiteEnd {
-                                op: Some(op),
-                                ..end(&key, export, Some(member), claims)
-                            },
-                            ReachedBy::Instance,
-                        ));
-                    }
-                }
-            }
+            return Some((
+                SiteEnd {
+                    op: Some(claimed.op),
+                    ..end(&claimed.key, claimed.export, Some(member), claimed.claims)
+                },
+                ReachedBy::Instance,
+            ));
         }
         if let Some(positions) = inputs.positions.as_ref() {
             for (lo, hi, member, _) in &call.receiver_spans {
@@ -2701,6 +2761,13 @@ impl<'a> Walker<'a> {
                 }],
                 ..Outcome::default()
             };
+        }
+        // `app[k](…)` on a library receiver the store claims ops on, its
+        // member not found above (carrick#4327): the call is saved with the
+        // key's own reason, before any reading of the key's binding as the
+        // callee's value.
+        if !construction && let Some(stop) = self.keyed_stop(file, call) {
+            return Outcome::stopped(stop);
         }
         // A callee that is a value (carrick#2432): followed through each
         // value it may hold, before the interface member that types it. A
@@ -3785,6 +3852,14 @@ pub fn discover_with(
         .filter(|site| site.origin.is_none() && !site.makers().is_empty())
         .map(|site| ((site.file.as_path(), site.span_start, site.span_end), site))
         .collect();
+    let keyed = library
+        .keyed
+        .iter()
+        .map(|keyed| {
+            let site = &keyed.site;
+            ((site.file.as_path(), site.span_start, site.span_end), keyed)
+        })
+        .collect();
     let values = Resolver::new(inputs, siblings);
     let mut walker = Walker {
         inputs,
@@ -3792,6 +3867,7 @@ pub fn discover_with(
         labels,
         root,
         instances,
+        keyed,
         values: &values,
         memo: HashMap::new(),
         callbacks: HashMap::new(),
