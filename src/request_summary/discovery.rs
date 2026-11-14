@@ -8629,8 +8629,8 @@ export function listen(): void {
     }
 
     /// carrick#3237: a route path that writes its first segment whole before
-    /// a value the code does not read (`/widgets/kinds/${kind}`,
-    /// `/docs/spec${tail}`) is not a guessed site: no route is served there
+    /// a value the code does not read (`/docs/spec${tail}`) is not a guessed
+    /// site: no route is served there
     /// yet, it is counted as `unread_own_part`, and the reader's row stands.
     /// A path that starts with its value (`${head}health`) stays guessed.
     #[test]
@@ -8659,9 +8659,12 @@ export function listen(): void {
             "{:#?}",
             routes.guessed
         );
+        // `/docs/spec${tail}` alone: the loop over the stated `KINDS` at
+        // `:14` is read, one way per element (carrick#2093), and its chains
+        // end at the plugin's parameter like the package's other routes.
         assert_eq!(
             routes.untraced.get("unread_own_part"),
-            Some(&2),
+            Some(&1),
             "{:#?}",
             routes.untraced
         );
