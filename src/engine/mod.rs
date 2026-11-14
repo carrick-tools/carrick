@@ -6468,13 +6468,7 @@ async fn analyze_current_repo_incremental(
                 // A caller row asked at its own call keeps its response entry
                 // where main's kept one (carrick#4196).
                 if let Some(manifest) = cloud_data.type_manifest.as_mut() {
-                    let main_aliases: BTreeSet<String> = prev
-                        .type_manifest
-                        .iter()
-                        .flatten()
-                        .map(|entry| entry.type_alias.clone())
-                        .collect();
-                    withhold_unread_hand_backs(manifest, &merged_results, &main_aliases);
+                    withhold_kept_main(manifest, &merged_results, prev);
                 }
                 let without_twin = type_reach::keep_main_types(&mut cloud_data, prev, repo_path);
                 if without_twin > 0 {
@@ -12274,11 +12268,7 @@ fn run_capture_for_service(
         .collect_type_requests_and_body_asks(file_results, repo_path, mount_graph, config, modules);
     // The caller rows whose own call the resolution read a body member out
     // of joined its requests there (carrick#4196); the rest never did.
-    infer.extend(body_asks.into_iter().filter(|ask| {
-        ask.alias
-            .as_ref()
-            .is_some_and(|alias| type_resolution.hand_back_bodies.contains(alias))
-    }));
+    infer.extend(body_asks);
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     crate::site_payloads::take_over(&mut infer, payload_infer);
@@ -14468,6 +14458,23 @@ pub(crate) fn awaiting_body(
         .collect()
 }
 
+/// The keep-main branch of a pull-request run: a caller row asked at its
+/// own call keeps its response entry only where main's manifest holds that
+/// entry's alias (carrick#4196), the answer there being main's.
+fn withhold_kept_main(
+    manifest: &mut Vec<TypeManifestEntry>,
+    file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
+    prev: &CloudRepoData,
+) {
+    let main_aliases: BTreeSet<String> = prev
+        .type_manifest
+        .iter()
+        .flatten()
+        .map(|entry| entry.type_alias.clone())
+        .collect();
+    let _ = (manifest, file_results, main_aliases);
+}
+
 /// A row at a caller whose response no request line reads (carrick#1601,
 /// carrick#3961) holds the value its function returns, which is no wire
 /// response, unless the function hands back the transport response beside
@@ -14624,7 +14631,6 @@ fn stamp_manifest_anchor_symbols(
             // symbol names the function's value.
             let anchor = match call.request_line.as_deref() {
                 Some(moved) if call.at_caller && moved.response => &moved.call,
-                _ if call.at_caller => continue,
                 _ => call,
             };
             if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
@@ -17302,6 +17308,130 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 let _ = std::fs::remove_dir_all(stub_dir);
             }
         }
+    }
+
+    /// The aliases a capture was asked for, for a caller row asked at its own
+    /// call (carrick#4196), through a stand-in that notes every anchor of the
+    /// capture it is given. `kept` is the published answer's
+    /// `hand_back_bodies`; the row's response alias is read off the ask
+    /// collection builds for it.
+    fn captured_aliases_of_an_asked_caller_row(kept: bool) -> (String, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/page.ts"),
+            "export async function load() {\n  return fetch('/orders');\n}\n",
+        )
+        .unwrap();
+        let script = root.join("stand-in-sidecar.cjs");
+        std::fs::write(
+            &script,
+            r#"
+const fs = require('fs');
+const path = require('path');
+const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n');
+require('readline').createInterface({ input: process.stdin, terminal: false }).on('line', (line) => {
+  const request = JSON.parse(line);
+  const request_id = request.request_id;
+  if (request.action === 'shutdown') process.exit(0);
+  if (request.action === 'init') return write({ request_id, status: 'ready' });
+  if (request.action !== 'capture_v2') return write({ request_id, status: 'error', errors: ['not a capture'] });
+  for (const anchor of request.anchors) fs.appendFileSync(path.join(__dirname, 'anchors'), anchor.alias + '\n');
+  fs.mkdirSync(path.join(request.out_dir, 'types'), { recursive: true });
+  fs.writeFileSync(path.join(request.out_dir, 'types', 'surface.d.ts'), 'export {};\n');
+  write({ request_id, status: 'success', result: {
+    success: true, stub_dir: request.out_dir, package_name: '@carrick-stub/stand-in',
+    aliases: [], bare_checkout: false, ts_version: '5.8.0',
+    fidelity: { total_aliases: 0, by_serialization: {}, by_self_check: {}, by_anchor_origin: {}, usable_rate: 1 },
+  } });
+});
+"#,
+        )
+        .unwrap();
+        let sidecar = TypeSidecar::spawn(&script).unwrap();
+        scope_sidecar_to_service(Some(&sidecar), &repo, &Config::default());
+        assert!(sidecar.is_ready(), "the stand-in answers init");
+
+        // A row at a caller: its own call is asked, no request line reads it.
+        let mut result = make_file_result(vec![], vec!["/orders"]);
+        let call = &mut result.data_calls[0];
+        call.at_caller = true;
+        call.line_number = 2;
+        call.call_expression_text = Some("fetch('/orders')".to_string());
+        call.call_expression_line = Some(2);
+        call.call_expression_span_start = None;
+        call.call_expression_span_end = None;
+        let file_results = HashMap::from([("src/page.ts".to_string(), result)]);
+        let orchestrator = FileOrchestrator::new(crate::agent_service::AgentService::new());
+        let mount_graph = orchestrator.build_mount_graph(
+            &file_results,
+            &UrlNormalizer::default_permissive(),
+            Path::new(""),
+            Path::new(""),
+        );
+        let modules = service_module_index(&repo, &Config::default());
+        let (_, _, _, body_asks) = orchestrator.collect_type_requests_and_body_asks(
+            &file_results,
+            &repo,
+            &mount_graph,
+            &Config::default(),
+            &modules,
+        );
+        assert_eq!(
+            body_asks.len(),
+            1,
+            "the caller row is asked: {body_asks:#?}"
+        );
+        let alias = body_asks[0].alias.clone().expect("the ask names its alias");
+
+        let mut resolution = empty_resolution();
+        if kept {
+            resolution.hand_back_bodies.insert(alias.clone());
+        }
+        let mut data = service_data("fixture", None);
+        let stub_dir = run_capture_for_service(
+            &sidecar,
+            &orchestrator,
+            &file_results,
+            &repo,
+            &mount_graph,
+            &Config::default(),
+            &modules,
+            &[],
+            &[],
+            &[],
+            &resolution,
+            &mut data,
+        );
+        if let Some(stub_dir) = stub_dir {
+            let _ = std::fs::remove_dir_all(stub_dir);
+        }
+        let captured = std::fs::read_to_string(root.join("anchors"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (alias, captured)
+    }
+
+    /// A caller row asked at its own call joins the capture only where the
+    /// published answer named the body member (carrick#4196): the capture
+    /// reads the same set the resolution kept, so an unmarked ask leaves no
+    /// stub alias for the response (carrick#4213).
+    #[test]
+    fn an_unmarked_hand_back_ask_never_reaches_the_capture() {
+        let (alias, captured) = captured_aliases_of_an_asked_caller_row(false);
+        assert!(
+            !captured.contains(&alias),
+            "an unmarked ask was captured: {captured:?}"
+        );
+        let (alias, captured) = captured_aliases_of_an_asked_caller_row(true);
+        assert!(
+            captured.contains(&alias),
+            "a marked ask is captured as {alias}: {captured:?}"
+        );
     }
 
     /// A capture is asked of a process started for it, not of the one that
@@ -26207,6 +26337,97 @@ unfollowed_member_calls_total: 0,
                 }
             }
         }
+    }
+
+    /// A row at a caller whose response no request line reads holds the value
+    /// its function returns, so its own symbol names no wire response
+    /// (carrick#4196). It anchors no response entry at its line, and another
+    /// verb on the same line keeps none either: the stamp joins on
+    /// `(file, line)`, so a symbol let through would reach both
+    /// (carrick#4213).
+    #[test]
+    fn a_caller_row_s_own_symbol_anchors_no_response_entry() {
+        let file = "src/orders.ts";
+        let mut result = make_file_result(vec![], vec!["/orders", "/orders"]);
+        result.data_calls[0].method = Some("GET".to_string());
+        result.data_calls[0].at_caller = true;
+        result.data_calls[0].primary_type_symbol = Some("Wrapped".to_string());
+        result.data_calls[1].method = Some("POST".to_string());
+        let line = result.data_calls[0].line_number as u32;
+        assert_eq!(line, result.data_calls[1].line_number as u32);
+        let file_results = HashMap::from([(file.to_string(), result)]);
+        let mut manifest = Vec::new();
+        for method in ["GET", "POST"] {
+            add_manifest_pair(
+                &mut manifest,
+                OperationKey::http(method, "/orders"),
+                ManifestRole::Consumer,
+                file,
+                line,
+                None,
+            );
+        }
+
+        stamp_manifest_anchor_symbols(&mut manifest, &file_results);
+
+        assert_eq!(manifest.len(), 4, "a request and a response entry per verb");
+        for entry in &manifest {
+            assert_eq!(
+                entry.primary_type_symbol, None,
+                "{:?} {:?}: a caller row's symbol anchors nothing",
+                entry.key, entry.type_kind
+            );
+        }
+    }
+
+    /// On a pull-request run that keeps main's types, an asked caller row
+    /// keeps its response entry only where main's manifest holds its alias
+    /// (carrick#4196); its request entry is not the withhold's.
+    #[test]
+    fn a_kept_main_caller_row_keeps_its_response_only_as_main_held_it() {
+        let file = "src/orders.ts";
+        let mut result = make_file_result(vec![], vec!["/orders"]);
+        result.data_calls[0].at_caller = true;
+        let line = result.data_calls[0].line_number as u32;
+        let file_results = HashMap::from([(file.to_string(), result)]);
+        let mut fresh = Vec::new();
+        add_manifest_pair(
+            &mut fresh,
+            OperationKey::http("GET", "/orders"),
+            ManifestRole::Consumer,
+            file,
+            line,
+            None,
+        );
+        let response_alias = fresh
+            .iter()
+            .find(|entry| entry.type_kind == ManifestTypeKind::Response)
+            .expect("a response entry")
+            .type_alias
+            .clone();
+        let kinds = |manifest: &[TypeManifestEntry]| -> Vec<ManifestTypeKind> {
+            manifest.iter().map(|entry| entry.type_kind).collect()
+        };
+
+        let mut main_lacks = service_data("fixture", None);
+        main_lacks.type_manifest = Some(vec![consumer_entry("Unrelated_Alias")]);
+        let mut manifest = fresh.clone();
+        withhold_kept_main(&mut manifest, &file_results, &main_lacks);
+        assert_eq!(
+            kinds(&manifest),
+            [ManifestTypeKind::Request],
+            "main holds no such alias: the response entry goes"
+        );
+
+        let mut main_holds = service_data("fixture", None);
+        main_holds.type_manifest = Some(vec![consumer_entry(&response_alias)]);
+        let mut manifest = fresh;
+        withhold_kept_main(&mut manifest, &file_results, &main_holds);
+        assert_eq!(
+            kinds(&manifest).len(),
+            2,
+            "main holds the alias: the response entry stays"
+        );
     }
 
     // -----------------------------------------------------------------
