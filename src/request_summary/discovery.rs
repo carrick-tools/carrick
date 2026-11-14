@@ -3755,7 +3755,7 @@ impl<'a> Walker<'a> {
             outcome.absorb(settled);
         }
         if !outcome.ends.is_empty() {
-            outcome.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
+            outcome.stop = None;
         }
         outcome
     }
