@@ -254,3 +254,17 @@ fn one_probe_call_builds_the_index_once() {
     assert!(nothing.is_empty());
     assert_eq!(BUILDS.with(|builds| builds.get()), 0);
 }
+
+/// carrick-cloud#3490: a renamed copy whose words overlap the indexed one by
+/// less than the 0.70 floor is still the function its writer is about to
+/// duplicate, and the edit should name it.
+#[test]
+fn a_near_copy_under_the_lead_floor_is_listed() {
+    let renamed = "export function relativePath(dir: string, name: string) {\n  \
+        const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;\n  \
+        const log = console.debug('relative', name);\n  \
+        const cut = base.length + 1;\n  \
+        return name.startsWith(base) ? name.slice(cut) : name;\n}\n";
+    let lead = only_lead(leads(&[here(JOIN, &[])], renamed));
+    assert_eq!(lead.map(|lead| lead.name), Some("joinRelative".to_string()));
+}
