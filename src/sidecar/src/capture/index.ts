@@ -68,6 +68,7 @@ export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
 export { withStubResolution, type StubModuleResolver } from './stub-resolution.js';
 export { isInsideCheckout, untrustedReadBound, UNTRUSTED_TREE_ENV, type ReadBound } from './checkout.js';
+export { serialisedConditionalType } from './serialised-arms.js';
 export { serviceConfigPath } from './project-references.js';
 export { referenceRedirectOf, workspaceSourceRedirectOf } from './reference-redirect.js';
 export { findServiceTsconfig, GoverningConfigs } from './service-config.js';

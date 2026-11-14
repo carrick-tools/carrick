@@ -94,6 +94,7 @@ import {
   constituentsOf,
   isFrameworkMachinery,
   nodeByLocatorText,
+  serialisedConditionalType,
   normalizeLocatorText,
   symbolDeclaredOutside,
   typeIsOrContainsMachinery,
@@ -4611,7 +4612,9 @@ export class TypeInferrer {
 
     const atCaller = this.typeAtThroughCall(node, request);
     if (atCaller.kind === 'open') return atCaller.abstain;
-    const payloadType = atCaller.type;
+    // carrick#4285: a conditional body (`x ? JSON.stringify(x) : null`) is the
+    // union of its arms read as a direct `JSON.stringify` body is.
+    const payloadType = this.serialisedConditionalPayload(node) ?? atCaller.type;
     let typeString = typeText(payloadType, node);
     let isExplicit = false;
 
@@ -7187,6 +7190,26 @@ export class TypeInferrer {
       return node;
     }
     return this.unwrapExpressionNode(args[0]);
+  }
+
+  /**
+   * The union of a conditional serialised body's arms (carrick#4285), or
+   * undefined where `node` is no such conditional or the union holds a type
+   * parameter, which only a caller binds.
+   */
+  private serialisedConditionalPayload(node: Node): Type | undefined {
+    const checker = this.project.getTypeChecker().compilerObject;
+    const union = serialisedConditionalType(checker, node.compilerNode);
+    if (!union || openAt(checker, union, node.compilerNode).kind !== 'as_read') {
+      return undefined;
+    }
+    // ts-morph has no public wrapper for a compiler type it did not hand out.
+    const factory = (
+      node.getSourceFile() as unknown as {
+        _context: { compilerFactory: { getType(type: ts.Type): Type } };
+      }
+    )._context.compilerFactory;
+    return factory.getType(union);
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {

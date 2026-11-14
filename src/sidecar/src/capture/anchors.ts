@@ -26,6 +26,7 @@ import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import { statesNoShape, statusTableBody } from './status-table.js';
 import type { UnresolvedAtAnchor } from './deep-walk.js';
+import { serialisedConditionalType } from './serialised-arms.js';
 import {
   unresolvedAtAnchor,
   unresolvedSpecifiersReachableFrom,
@@ -475,6 +476,8 @@ export function resolveAnchor(
   // carrick#1162: a serialised body is the JSON of its argument. The call's own
   // `string` result is never the payload's contract, and publishing it reads
   // incompatible against every object-typed counterparty.
+  // carrick#4285: a conditional body reads each arm the same way.
+  const armsType = serialisedConditionalType(checker, located);
   located = serialisedArgument(located);
   // #439 part 1: a producer anchor whose locator landed inside a fluent
   // builder chain's config-descriptor argument (an all-literal metadata
@@ -498,7 +501,8 @@ export function resolveAnchor(
     located,
     args.placeholder,
     reaimNote,
-    args.repoRoot
+    args.repoRoot,
+    armsType
   );
 }
 
@@ -515,7 +519,8 @@ function finishInferAnchor(
   located: ts.Node,
   placeholder: ts.TypeAliasDeclaration | undefined,
   reaimNote: string | undefined,
-  repoRoot: string
+  repoRoot: string,
+  typeOverride?: ts.Type
 ): ResolvedAnchor {
   const checker = program.getTypeChecker();
   const demote = (reason: string, cause: TypeProvenanceReason): ResolvedAnchor => ({
@@ -525,7 +530,7 @@ function finishInferAnchor(
     failureReason: reason,
     unreadCause: cause,
   });
-  const rawType = checker.getTypeAtLocation(located);
+  const rawType = typeOverride ?? checker.getTypeAtLocation(located);
   let type = rawType;
   if ((request.unwrap ?? 'awaited') === 'awaited') {
     type = checker.getAwaitedType(type) ?? type;
