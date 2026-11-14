@@ -5537,9 +5537,10 @@ fn normalize_held_request_lines(
 }
 
 /// After the site fold (carrick#4121): each request line the fold found
-/// stated at its module-level callers' facts leaves the file results, as a
-/// model row withdrawn in the analysis does, and its type anchors move to
-/// its summary callers, which carry them as
+/// stated at its callers' facts leaves the file results, as a model row
+/// withdrawn in the analysis does. Where the summaries held the line
+/// (module-level callers), its type anchors move to its summary callers,
+/// which carry them as
 /// [`crate::agents::file_analyzer_agent::DataCallResult::request_line`]. A
 /// module-level fact row's request is not asked here: its slot is the body
 /// the wrapper builds ([`crate::request_summary::site_record`], carrick#4128).
@@ -5553,20 +5554,23 @@ fn settle_request_lines_stated_at_module_callers(
 ) {
     use crate::agents::file_analyzer_agent::{RequestLineAnchors, ResolutionSource};
     for (file, span_start) in &fold.stated_at_fact_callers {
-        let Some(line) = held
+        // A line the site pass named alone (a maker's labelled call,
+        // carrick#4319) has no summary callers to move anchors to: its
+        // deciding calls read the request's types themselves.
+        let line = held
             .iter()
-            .find(|line| line.file == *file && line.span_start == *span_start)
-        else {
-            continue;
-        };
+            .find(|line| line.file == *file && line.span_start == *span_start);
         for (key, result) in file_results.iter_mut() {
             let key = crate::site_rows::relative(Path::new(repo_path), key);
-            if key == line.file {
+            if key == *file {
                 result.data_calls.retain(|call| {
-                    !(call.call_expression_span_start == Some(line.span_start)
+                    !(call.call_expression_span_start == Some(*span_start)
                         && call.resolution_source == Some(ResolutionSource::Model))
                 });
             }
+            let Some(line) = line else {
+                continue;
+            };
             for (caller_file, caller_start, response) in &line.stating {
                 if key != *caller_file {
                     continue;
@@ -7924,6 +7928,29 @@ async fn site_rows_of(
         decided_at_each_call = rows.held_open.len(),
         "site questions: request lines held at module-level calls (carrick#4121)"
     );
+    // The labelled calls whose every deciding call only makes the function
+    // that sends (carrick#4319 T2). With no placements to read, whether the
+    // summaries own a request is unknown, and none is named. A line both
+    // producers name keeps the module-level entry.
+    if let Some(placed) = context.placements {
+        let at_makers = crate::site_rows::held_at_maker_sites(&decided, |file, span_start| {
+            placed.places_request(root, file, span_start)
+        });
+        let named = at_makers.len();
+        for held in at_makers {
+            if !rows
+                .held_open
+                .iter()
+                .any(|known| known.file == held.file && known.span_start == held.span_start)
+            {
+                rows.held_open.push(held);
+            }
+        }
+        debug!(
+            at_makers = named,
+            "site questions: labelled calls held at maker sites (carrick#4319)"
+        );
+    }
     // The requests the service builds and returns for a caller to send
     // (carrick#3470): candidate rows, folded as every site row is.
     rows.rows
@@ -20093,6 +20120,85 @@ unfollowed_member_calls_total: 0,
             consumer_paths.contains(&"/api/notifications/status"),
             "expected normalized notification path, got {:?}",
             consumer_paths
+        );
+    }
+
+    /// carrick#4319 T2: a labelled call the site pass alone held open (a
+    /// maker's, with no summaries' `HeldRequestLine`) whose fold found it
+    /// stated at its callers' facts leaves the file results: the model's row
+    /// at its span goes, and every other row stays as it was.
+    #[test]
+    fn a_line_the_site_pass_held_alone_drops_its_model_row_from_the_file_results() {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        let row = |span: u32, source: ResolutionSource| DataCallResult {
+            call_kind: None,
+            candidate_id: format!("span:{span}"),
+            line_number: 5,
+            target: "/api/reset".to_string(),
+            method: Some("DELETE".to_string()),
+            pattern_matched: "http.remove".to_string(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: None,
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            resolution_source: Some(source),
+            dispatch: None,
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+            static_asset: None,
+            request_line: None,
+        };
+        let mut file_results = HashMap::new();
+        file_results.insert(
+            "/repo/src/gate.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    row(131, ResolutionSource::Model),
+                    row(131, ResolutionSource::RequestSummary),
+                    row(200, ResolutionSource::Model),
+                ],
+                ..Default::default()
+            },
+        );
+        file_results.insert(
+            "/repo/src/other.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![row(131, ResolutionSource::Model)],
+                ..Default::default()
+            },
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated_at_fact_callers: vec![("src/gate.ts".to_string(), 131)],
+            ..Default::default()
+        };
+        settle_request_lines_stated_at_module_callers(&mut file_results, &[], &fold, "/repo");
+        let left = |file: &str| -> Vec<(Option<u32>, Option<ResolutionSource>)> {
+            file_results[file]
+                .data_calls
+                .iter()
+                .map(|call| (call.call_expression_span_start, call.resolution_source))
+                .collect()
+        };
+        assert_eq!(
+            left("/repo/src/gate.ts"),
+            vec![
+                (Some(131), Some(ResolutionSource::RequestSummary)),
+                (Some(200), Some(ResolutionSource::Model)),
+            ]
+        );
+        assert_eq!(
+            left("/repo/src/other.ts"),
+            vec![(Some(131), Some(ResolutionSource::Model))]
         );
     }
 

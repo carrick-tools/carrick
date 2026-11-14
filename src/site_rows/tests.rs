@@ -88,6 +88,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         composed_trimmed: false,
         procedure: None,
         makes_end: false,
+        chain_handed_on: false,
     }
 }
 
@@ -2136,6 +2137,146 @@ fn two_reader_rows_at_the_request_line_keep_it() {
     );
     assert_eq!(at_site(&calls, HELD_LINE).len(), 2);
     assert!(fold.stated_at_fact_callers.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A labelled call whose every deciding call only makes the function that
+// sends (carrick#4319 T2).
+
+const MAKER_FILE: &str = "src/maker.ts";
+
+/// A site at `caller:LINE` whose call makes the function, written in
+/// `src/maker.ts` at span 40, that sends to `name`.
+fn maker_site(caller: &str, name: &str) -> DecidedSite {
+    let mut site = site(caller, "http_client", "remove", "http");
+    site.end.file = MAKER_FILE.to_string();
+    site.end.line = 4;
+    site.end.span_start = 40;
+    site.end.span_end = 90;
+    site.name = vec![crate::request_summary::Piece::Lit(name.to_string())];
+    site.makes_end = true;
+    site
+}
+
+fn held_at_makers(decided: &Decided) -> Vec<HeldOpen> {
+    held_at_maker_sites(decided, |_, _| false)
+}
+
+fn makers(sites: Vec<DecidedSite>) -> Decided {
+    Decided {
+        sites,
+        ..Decided::default()
+    }
+}
+
+/// Every deciding call a maker call with a bare path: the labelled call is
+/// held open on each of them.
+#[test]
+fn a_labelled_call_every_maker_call_decides_is_held_on_them() {
+    let decided = makers(vec![
+        maker_site("src/a.ts", "/alpha/cache"),
+        maker_site("src/b.ts", "/beta/cache"),
+    ]);
+    assert_eq!(
+        held_at_makers(&decided),
+        vec![HeldOpen {
+            file: MAKER_FILE.to_string(),
+            line: 4,
+            span_start: 40,
+            fact_calls: vec![
+                ("src/a.ts".to_string(), LINE),
+                ("src/b.ts".to_string(), LINE)
+            ],
+        }]
+    );
+}
+
+/// (a) One deciding call runs the send (a wrapper) beside a maker call.
+#[test]
+fn a_maker_end_beside_a_call_that_runs_the_send_is_not_held() {
+    let mut runs = maker_site("src/b.ts", "/beta/cache");
+    runs.makes_end = false;
+    let decided = makers(vec![maker_site("src/a.ts", "/alpha/cache"), runs]);
+    assert!(held_at_makers(&decided).is_empty());
+}
+
+/// (b) A caller this pass left open names the labelled call: a lead or a
+/// stop.
+#[test]
+fn a_maker_end_a_lead_or_a_stop_names_is_not_held() {
+    let site = maker_site("src/a.ts", "/alpha/cache");
+    let mut decided = makers(vec![site.clone()]);
+    decided
+        .leads
+        .push(crate::request_summary::decided_sites::DecidedLead {
+            file: "src/c.ts".to_string(),
+            line: 9,
+            span_start: 10,
+            span_end: 20,
+            depth: 0,
+            end: site.end.clone(),
+            reason: Stop::NameNeverBound,
+        });
+    assert!(held_at_makers(&decided).is_empty());
+
+    let mut decided = makers(vec![site.clone()]);
+    decided
+        .stops
+        .push(crate::request_summary::decided_sites::DecidedStop {
+            file: "src/c.ts".to_string(),
+            line: 9,
+            span_start: 10,
+            span_end: 20,
+            callee: None,
+            depth: 0,
+            end: site.end.clone(),
+            reason: Stop::Unplaced,
+        });
+    assert!(held_at_makers(&decided).is_empty());
+}
+
+/// (c) The maker is also handed on as a value.
+#[test]
+fn a_maker_end_on_a_chain_handed_on_is_not_held() {
+    let mut site = maker_site("src/a.ts", "/alpha/cache");
+    site.chain_handed_on = true;
+    assert!(held_at_makers(&makers(vec![site])).is_empty());
+}
+
+/// (d) The summaries state rows for the request.
+#[test]
+fn a_maker_end_the_summaries_place_is_not_held() {
+    let decided = makers(vec![maker_site("src/a.ts", "/alpha/cache")]);
+    let held = held_at_maker_sites(&decided, |file, span_start| {
+        file == MAKER_FILE && span_start == 40
+    });
+    assert!(held.is_empty());
+}
+
+/// (e) A deciding call's own path is not bare (an environment base, or a
+/// composed way that is not): its row gets no manifest pair.
+#[test]
+fn a_maker_end_with_a_name_that_is_not_a_bare_path_is_not_held() {
+    let decided = makers(vec![maker_site("src/a.ts", "https://api.test/trim")]);
+    assert!(held_at_makers(&decided).is_empty());
+
+    let mut site = maker_site("src/a.ts", "/alpha/cache");
+    site.composed = vec![crate::request_summary::decided_sites::Composed {
+        path: None,
+        parts: Vec::new(),
+        end: "top".to_string(),
+        own: Some("api/cache".to_string()),
+        own_pieces: Vec::new(),
+    }];
+    assert!(held_at_makers(&makers(vec![site])).is_empty());
+}
+
+/// Only HTTP requests are held: a message send through a maker is a gap.
+#[test]
+fn a_maker_end_of_another_role_is_not_held() {
+    let mut site = maker_site("src/a.ts", "orders");
+    site.end.role = "pubsub_producer".to_string();
+    assert!(held_at_makers(&makers(vec![site])).is_empty());
 }
 
 // ---------------------------------------------------------------------------
