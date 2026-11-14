@@ -779,6 +779,43 @@ test("R24.7: two header repos that map to one checkout are neither mapped", asyn
   assert.deepEqual(locate("/w/api/src/a.ts", [both[1]!]), { repo: "zeta/api", rel: "src/a.ts", top: "/w/api" });
 });
 
+test("a repo listed under several services is mapped by the refresh, as one with a single service is", async (t) => {
+  const { openFacts } = await import("../src/facts/store.ts");
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-multi-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, ".carrick", "hosted"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".carrick", "hosted", "snapshot.json"), JSON.stringify({ resolution: { repos: [{ project_slug: "multi-demo" }] } }));
+  fs.writeFileSync(
+    path.join(root, ".carrick", "index.json"),
+    JSON.stringify({ repos: [{ name: "alpha", path: path.join(root, "alpha") }, { name: "beta", path: path.join(root, "beta") }] }),
+  );
+  const header = JSON.stringify({
+    schema: 1,
+    writer: 1,
+    project_id: "p",
+    project_slug: "multi-demo",
+    digest: "d1",
+    built_at: "2026-01-01T00:00:00Z",
+    // `alpha` holds three services, `beta` one: the header has one entry per service.
+    repos: [
+      { repo: "alpha", service: "alpha-web", commit: "1" },
+      { repo: "alpha", service: "alpha-api", commit: "1" },
+      { repo: "alpha", service: "alpha-jobs", commit: "1" },
+      { repo: "beta", service: "beta", commit: "1" },
+    ],
+    counts: { rows: 0, producers: 0, consumers: 0 },
+  });
+  const request = (async (url: string) =>
+    String(url).includes("amazonaws.com")
+      ? new Response(`${header}\n`)
+      : new Response(JSON.stringify({ staged_url: "https://bucket.s3.amazonaws.com/f.ndjson" }))) as typeof fetch;
+  assert.equal(await refreshFacts(root, { request, env: { ...process.env, CARRICK_TOKEN: "t" } }), "written");
+  const store = (await openFacts(root))!;
+  const mapped = store.repos.map((entry) => entry.repo).sort();
+  store.close();
+  assert.deepEqual(mapped, ["alpha", "beta"]);
+});
+
 test("a fact file for another project is not read", async (t) => {
   const ws = await factsWorkspace(t);
   const edited = { file: ws.at("orders-api/src/routes/orders.ts"), snippets: ["res.status(201).json(created);"] };

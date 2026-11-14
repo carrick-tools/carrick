@@ -192,7 +192,8 @@ export async function refreshFacts(root: string, options: FactsRefreshOptions = 
     const gzipped = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
     const text = (gzipped ? zlib.gunzipSync(bytes) : bytes).toString("utf8");
     const header = JSON.parse(text.slice(0, text.indexOf("\n") >>> 0)) as { repos?: Array<{ repo?: unknown }> };
-    const names = (header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string");
+    // The header has one entry per service, so a repo of several services is named several times: each name once, in first-seen order.
+    const names = [...new Set((header.repos ?? []).map((repo) => repo.repo).filter((repo): repo is string => typeof repo === "string"))];
     const built = await buildFacts(text, factsPath(root), matchRepos(names, localRepos(root)), now, { contract: answer["contract"] === true });
     return built ? "written" : "none";
   } catch (error) {
