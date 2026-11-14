@@ -1911,7 +1911,7 @@ impl<'a> Walker<'a> {
                     {
                         found.push(ReceiverOp {
                             key: key.clone(),
-                            export: *export,
+                            export,
                             claims,
                             op: *op,
                             member,
@@ -2318,7 +2318,7 @@ impl<'a> Walker<'a> {
             .get(&(file, call.site.span_start, call.site.span_end))
             && let Some(member) = site.member.as_deref()
             && let Some(claimed) = self
-                .receiver_ops(*site)
+                .receiver_ops(site)
                 .into_iter()
                 .find(|claimed| claimed.member == member)
         {
