@@ -284,7 +284,7 @@ pub fn mark_lost_pairings(
                         removed: RemovedSide {
                             method: first.method.clone(),
                             path: first.path.clone(),
-                            service: None,
+                            service: first.service_name.clone(),
                             place: first.place.clone(),
                         },
                         removed_service: producer.service.clone(),
@@ -331,7 +331,7 @@ pub fn mark_lost_pairings(
                         removed: RemovedSide {
                             method: first.method.clone(),
                             path: first.path.clone(),
-                            service: None,
+                            service: first.service_name.clone(),
                             place: first.place.clone(),
                         },
                         removed_service: consumer.service.clone(),

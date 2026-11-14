@@ -299,7 +299,7 @@ fn removed_operations(
                     .into_iter()
                     .map(|(service, place, source)| RemovedOperation {
                         service,
-                        service_name: None,
+                        service_name: id.0.clone(),
                         key: key.clone(),
                         method: method.clone(),
                         path: path.clone(),
@@ -368,7 +368,7 @@ fn removed_sends(
                 .push(Place::parse(&repo.service_name, &place));
             removal.rows.push(RemovedSend {
                 service: service_id(&repo.service_name, &repo.repo_name),
-                service_name: None,
+                service_name: repo.service_name.clone(),
                 key: id.1.clone(),
                 file: id.2.clone(),
                 method,
