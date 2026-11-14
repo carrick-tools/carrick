@@ -2207,8 +2207,9 @@ pub struct NamePlace {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameFallback {
     /// The text reader has no compiler rows for the slot (a `rows_missing`
-    /// hole: no walk, or a failed one).
-    NoRows,
+    /// hole: no walk was asked; or a `walk_lost` one: it wrote none). Carries
+    /// the hole, which is the stop an unnamed slot is saved with.
+    NoRows(super::guards::HoleReason),
 }
 
 /// One value of a name slot at one place: the text, or why none is
@@ -2363,7 +2364,9 @@ impl<'a> SiteNames<'a> {
             .iter()
             .any(|value| hole(value) == Some(HoleReason::RowsMissing))
         {
-            return Some(SlotName::Today(NameFallback::NoRows));
+            return Some(SlotName::Today(NameFallback::NoRows(
+                HoleReason::RowsMissing,
+            )));
         }
         // One group per caller chain, in the order read.
         let mut chains: Vec<(&[_], Vec<&super::resolve::TextValue>)> = Vec::new();

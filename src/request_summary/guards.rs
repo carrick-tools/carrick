@@ -136,9 +136,13 @@ pub enum HoleReason {
     /// The chain reaches a function it already passed through.
     Recursion,
     /// No compiler row answers the position: the service has no rows file
-    /// (its walk failed, died or timed out), the file is not in it, or it
-    /// holds no row of the kind there (carrick#2413).
+    /// (no walk was asked), the file is not in it, or it holds no row of the
+    /// kind there (carrick#2413).
     RowsMissing,
+    /// The service holding the position was walked and its walk wrote no
+    /// rows (carrick#4247), so every position in it is this hole
+    /// (carrick#4256).
+    WalkLost,
     /// The file's bytes hash otherwise than the ones its rows were read
     /// from.
     RowsStale,

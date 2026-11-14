@@ -585,6 +585,40 @@ mod tests {
         assert_eq!(walked.rows_lost(), None);
     }
 
+    /// carrick#4256: a walk that was asked and wrote no rows, whether it
+    /// failed or died of memory, gives an index whose every file is
+    /// `walk_lost`; a walk never asked still gives `rows_missing`.
+    #[test]
+    fn a_lost_walk_s_index_says_walk_lost() {
+        let walked = |asked: bool, lost: Option<WalkLoss>| Walked {
+            rows: None,
+            lands_at: None,
+            service: None,
+            scan_root: PathBuf::from("/repo"),
+            label: "client".to_string(),
+            peak_mb: None,
+            asked,
+            lost,
+        };
+        let file = Path::new("/repo/src/a.ts");
+        for lost in [
+            WalkLoss::Failed,
+            WalkLoss::Memory {
+                heap_cap_mb: Some(4096),
+            },
+        ] {
+            assert_eq!(
+                walked(true, Some(lost)).index().file_hole(file),
+                Some(crate::request_summary::HoleReason::WalkLost),
+                "{lost:?}"
+            );
+        }
+        assert_eq!(
+            walked(false, None).index().file_hole(file),
+            Some(crate::request_summary::HoleReason::RowsMissing)
+        );
+    }
+
     fn node_missing() -> bool {
         std::process::Command::new("node")
             .arg("--version")

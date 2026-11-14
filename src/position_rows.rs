@@ -620,6 +620,12 @@ impl PositionIndex {
         }
     }
 
+    /// An index with no rows, for a service whose walk was asked and wrote
+    /// none: every lookup is [`HoleReason::WalkLost`] (carrick#4256).
+    pub fn walk_lost(scan_root: &Path) -> Self {
+        Self::missing(scan_root)
+    }
+
     /// The index over a rows file read for the repo rooted at `scan_root`.
     pub fn of(scan_root: &Path, rows: RowsFile) -> Self {
         let mut library_globals: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -1283,6 +1289,28 @@ mod tests {
                 .err(),
             Some(HoleReason::RowsMissing)
         );
+    }
+
+    /// carrick#4256: a service whose walk was asked and wrote no rows reads
+    /// `walk_lost` at every position and file; one with no walk still reads
+    /// `rows_missing`.
+    #[test]
+    fn a_lost_walk_s_index_says_walk_lost_and_a_missing_one_rows_missing() {
+        let root = Path::new("/repo");
+        let a = root.join("src/a.ts");
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let lost = PositionIndex::walk_lost(root);
+        assert_eq!(
+            lost.lookup(&a, base, base + 3, Kind::Call).err(),
+            Some(HoleReason::WalkLost)
+        );
+        assert_eq!(lost.file_hole(&a), Some(HoleReason::WalkLost));
+        let missing = PositionIndex::missing(root);
+        assert_eq!(
+            missing.lookup(&a, base, base + 3, Kind::Call).err(),
+            Some(HoleReason::RowsMissing)
+        );
+        assert_eq!(missing.file_hole(&a), Some(HoleReason::RowsMissing));
     }
 
     /// A span in a file with multi-byte text, CRLF line ends or a BOM joins

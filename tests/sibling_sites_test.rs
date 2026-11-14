@@ -536,8 +536,10 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
 /// A sidecar directory whose `dist/src/index.js` runs the built sidecar and
 /// passes it every request as it comes, except a `position_rows` walk of a
 /// service named in `delays` (milliseconds), which it holds that long
-/// first: that service's walk ends late, whatever the machine.
-fn late_walks(dir: &Path, delays: &str) -> PathBuf {
+/// first: that service's walk ends late, whatever the machine. A service
+/// named in `fails` (a JS array) never has its `position_rows` walk
+/// forwarded: it is answered with an error, as a failed walk is.
+fn late_walks(dir: &Path, delays: &str, fails: &str) -> PathBuf {
     let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
     let entry = dir.join("dist/src/index.js");
     fs::create_dir_all(entry.parent().unwrap()).unwrap();
@@ -548,6 +550,7 @@ fn late_walks(dir: &Path, delays: &str) -> PathBuf {
 const {{ spawn }} = require('child_process');
 const readline = require('readline');
 const delays = {delays};
+const fails = {fails};
 const child = spawn(process.execPath, [...process.execArgv, {real:?}], {{
   stdio: ['pipe', 'inherit', 'inherit'],
 }});
@@ -556,6 +559,10 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
   let delay = 0;
   try {{
     const request = JSON.parse(line);
+    if (request.action === 'position_rows' && fails.includes(request.service)) {{
+      require('fs').writeSync(1, JSON.stringify({{ request_id: request.request_id, status: 'error', errors: ['the walk failed'] }}) + '\n');
+      return;
+    }}
     if (request.action === 'position_rows') delay = delays[request.service] ?? 0;
   }} catch {{}}
   setTimeout(() => child.stdin.write(line + '\n'), delay);
@@ -612,7 +619,7 @@ fn an_analysis_whose_rows_hold_an_unresolved_import_waits_for_every_walk() {
 
     let repo = unresolved_copy(&tmp.path().join("late"));
     let store = tempfile::tempdir().unwrap();
-    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ client: 15000 }"#);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ client: 15000 }"#, "[]");
     let sidecar = sidecar.to_string_lossy();
     let (late, printed) = scan_with(
         &repo,
@@ -674,7 +681,7 @@ fn a_carried_service_reached_through_an_unresolved_import_reads_its_kept_rows() 
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "app and worker"]);
 
-    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ worker: 15000 }"#);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ worker: 15000 }"#, "[]");
     let sidecar = sidecar.to_string_lossy();
     let (scoped, printed) = scan_with(
         &repo,
@@ -712,4 +719,143 @@ fn a_carried_service_reached_through_an_unresolved_import_reads_its_kept_rows() 
     let worker_walked = line_of(&printed, "Walk worker ended: ").expect("the worker was walked");
     let app_analysed = line_of(&printed, "Analyzing service app ").expect("the app was analysed");
     assert!(worker_walked < app_analysed, "{printed}");
+}
+
+/// The phrase the reasons table gives `word`, as the CLI and the cloud show it.
+fn phrase_of(word: &str) -> String {
+    let table: serde_json::Value =
+        serde_json::from_str(include_str!("../npm/carrick/src/unread-reasons.json")).unwrap();
+    table[word].as_str().unwrap().to_string()
+}
+
+/// A service's unread sites as `line reason`, for one file prefix.
+fn unread_in(blob: &serde_json::Value, prefix: &str) -> Vec<String> {
+    let mut sites: Vec<String> = blob["unread_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|site| site["file"].as_str().is_some_and(|f| f.starts_with(prefix)))
+        .map(|site| {
+            format!(
+                "{} {}",
+                site["line"].as_u64().unwrap(),
+                site["reason"].as_str().unwrap()
+            )
+        })
+        .collect();
+    sites.sort();
+    sites
+}
+
+/// What the app's own unread sites say when the client's walk wrote no rows:
+/// the four calls into the client's code read `walk_lost` (they read
+/// `rows_missing` before carrick#4256), at the client's file, and the
+/// boundary's lines end with the word's phrase.
+fn assert_the_app_names_the_lost_walk(app: &serde_json::Value) {
+    assert_eq!(
+        app["unread_sites_by_reason"],
+        serde_json::json!({"outside_service": 1, "walk_lost": 4}),
+        "{}",
+        app["unread_sites"]
+    );
+    let lost: Vec<&serde_json::Value> = app["unread_sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|site| site["reason"] == "walk_lost")
+        .collect();
+    let mut lines: Vec<u64> = lost.iter().map(|s| s["line"].as_u64().unwrap()).collect();
+    lines.sort();
+    assert_eq!(lines, vec![5, 9, 14, 18]);
+    for site in lost {
+        assert!(
+            site["stop_at"]
+                .as_str()
+                .is_some_and(|at| at.starts_with("packages/client/src/http.ts")),
+            "{site}"
+        );
+    }
+    let phrase = phrase_of("walk_lost");
+    let said: Vec<&str> = app["boundary"]["unread_sites"]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line.as_str())
+        .filter(|line| line.contains("services/app/src/main.ts"))
+        .filter(|line| line.ends_with(&phrase))
+        .collect();
+    assert_eq!(said.len(), 4, "{said:?}");
+}
+
+/// carrick#4256: the client is carried and its walk fails on demand for the
+/// app. The app's rows are today's (a lost walk's), and its four sites into
+/// the client say `walk_lost`.
+#[test]
+fn a_carried_sibling_whose_walk_fails_is_named_at_the_sites_that_needed_it() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let (full, _) = scan_with(&repo, store.path(), &[], false, &[]);
+    assert_app_rows(&full);
+    let before = blob_of(&full, "client")["commit_hash"].clone();
+    fs::remove_file(kept_client_rows(store.path())).unwrap();
+    change_the_app(&repo);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (scoped, printed) = scan_with(
+        &repo,
+        store.path(),
+        &["--changed-only"],
+        false,
+        &[("CARRICK_SIDECAR_DIR", &sidecar)],
+    );
+    assert_eq!(blob_of(&scoped, "client")["commit_hash"], before, "carried");
+    assert_eq!(
+        call_rows(blob_of(&scoped, "app")),
+        [
+            "services/app/src/main.ts:14 DELETE /v1/api/items/:id",
+            "services/app/src/main.ts:5 GET /v1/api/items/:id",
+        ],
+        "{printed}"
+    );
+    assert_the_app_names_the_lost_walk(blob_of(&scoped, "app"));
+}
+
+/// carrick#4256: the client is analysed and its own walk fails. The app's
+/// sites into it, and the client's own, say `walk_lost`, and #4267's
+/// `walk_rows_lost` is unchanged.
+#[test]
+fn an_analysed_sibling_whose_walk_fails_is_named_at_every_site_that_needed_it() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (blobs, printed) = scan_with(
+        &repo,
+        store.path(),
+        &[],
+        true,
+        &[("CARRICK_SIDECAR_DIR", &sidecar)],
+    );
+    assert_the_app_names_the_lost_walk(blob_of(&blobs, "app"));
+    let client = blob_of(&blobs, "client");
+    assert_eq!(
+        client["unread_sites_by_reason"],
+        serde_json::json!({"walk_lost": 5}),
+        "{}",
+        client["unread_sites"]
+    );
+    assert_eq!(unread_in(client, "packages/client/").len(), 5, "{printed}");
+    assert_eq!(call_rows(client).len(), 3, "{:?}", call_rows(client));
+    assert_eq!(
+        client["boundary"]["walk_rows_lost"],
+        serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
+    );
 }

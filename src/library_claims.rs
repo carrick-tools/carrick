@@ -1685,14 +1685,14 @@ impl Reading<'_, '_> {
                     return None;
                 }
                 self.noted(match today_read {
-                    Some(SlotName::Today(NameFallback::NoRows)) => NameOutcome::NoRows,
+                    Some(SlotName::Today(NameFallback::NoRows(_))) => NameOutcome::NoRows,
                     _ => site_outcome(self.site, arg, key),
                 });
                 let name = today();
                 if name.is_none() {
                     self.unnamed(
                         match today_read {
-                            Some(SlotName::Today(NameFallback::NoRows)) => Stop::RowsMissing,
+                            Some(SlotName::Today(NameFallback::NoRows(_))) => Stop::RowsMissing,
                             _ => slot_stop(&self.site.args, arg, key),
                         },
                         op,
@@ -4225,14 +4225,32 @@ mod tests {
         exports: &[ExportClaims],
         with_rows: bool,
     ) -> Option<(LibraryRows, PathBuf)> {
+        use crate::request_summary::fixture_walk::Rows;
+        read_walked_over(
+            files,
+            exports,
+            if with_rows {
+                Rows::Walked
+            } else {
+                Rows::Absent
+            },
+        )
+    }
+
+    /// [`read_walked`] with the service's rows from `rows`.
+    fn read_walked_over(
+        files: &[(&str, &str)],
+        exports: &[ExportClaims],
+        rows: crate::request_summary::fixture_walk::Rows,
+    ) -> Option<(LibraryRows, PathBuf)> {
         let mut edit: Vec<(&str, &str)> = vec![("package.json", MANIFEST)];
         edit.extend_from_slice(files);
-        let on = crate::request_summary::fixture_walk::walked(
+        let on = crate::request_summary::fixture_walk::walked_over(
             "resolve-text",
             "services/web",
             "web",
             &edit,
-            with_rows,
+            rows,
         )?;
         let sites = library_sites(&on.inputs);
         let names = SiteNames::of(&on.inputs);
@@ -4425,6 +4443,51 @@ mod tests {
         // The wrapper's call, the caller that fills it, and the constant.
         assert_eq!(rows.names.count(NameOutcome::NoRows), 3, "{:?}", rows.names);
         assert!(rows.leads.is_empty(), "{:?}", rows.leads);
+    }
+
+    /// carrick#4256: a service whose walk was asked and wrote no rows keeps
+    /// today's reading of a name slot exactly as one with no walk does: the
+    /// same rows, the same `no_rows` count, no lead. Only the stop an unnamed
+    /// slot is saved with differs (`walk_lost`).
+    #[test]
+    fn a_slot_over_a_lost_walk_keeps_the_same_names_as_over_a_missing_one() {
+        use crate::request_summary::fixture_walk::Rows;
+        let files = [
+            ("src/wrapper.ts", NAMES_WRAPPER),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 import { send } from \"./wrapper\";\n\
+                 const TOPIC = \"orders.const\";\n\
+                 export function a() {\n\
+                 \x20 send(\"orders.direct\");\n\
+                 \x20 bus.publish(TOPIC, {});\n\
+                 }\n",
+            ),
+        ];
+        let Some((missing, _)) = read_walked_over(
+            &files,
+            &[bus()],
+            Rows::Index(crate::position_rows::PositionIndex::missing),
+        ) else {
+            return;
+        };
+        let (lost, _) = read_walked_over(
+            &files,
+            &[bus()],
+            Rows::Index(crate::position_rows::PositionIndex::walk_lost),
+        )
+        .expect("the sidecar is built");
+        assert!(!placed(&missing).is_empty(), "{missing:#?}");
+        assert_eq!(placed(&lost), placed(&missing), "{lost:#?}");
+        assert!(missing.names.count(NameOutcome::NoRows) > 0);
+        assert_eq!(
+            lost.names.count(NameOutcome::NoRows),
+            missing.names.count(NameOutcome::NoRows),
+            "{:?}",
+            lost.names
+        );
+        assert!(lost.leads.is_empty(), "{:?}", lost.leads);
     }
 
     /// A name the maker that made the receiver was handed stays on the maker
