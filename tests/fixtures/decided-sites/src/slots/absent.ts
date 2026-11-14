@@ -103,3 +103,41 @@ function helped(path: string, init: RequestInit) {
 export function helpedCaller(): Promise<Response> {
   return helped("/absent/helped", { method: "POST" });
 }
+
+// carrick#4294: a closed options literal below the deciding call lacks the
+// body key: the call sends none.
+function wipe(path: string) {
+  return fetch(`${process.env.API}${path}/wiped`, { method: "DELETE", headers: {} });
+}
+
+export function wiped(): Promise<Response> {
+  return wipe("/absent/wiped");
+}
+
+// Controls: a literal that spreads its caller's options, options built in a
+// local a branch may extend, and a literal handed to a hop that writes onto it.
+function wipeWith(path: string, extra: RequestInit) {
+  return fetch(`${process.env.API}${path}/wipe-with`, { method: "DELETE", ...extra });
+}
+
+export function wipedWith(): Promise<Response> {
+  return wipeWith("/absent/wipe-with", { body: "x" });
+}
+
+function wipeBuilt(path: string, text?: string) {
+  const init: RequestInit = { method: "DELETE" };
+  if (text) init.body = text;
+  return fetch(`${process.env.API}${path}/wipe-built`, init);
+}
+
+export function wipedBuilt(): Promise<Response> {
+  return wipeBuilt("/absent/wipe-built");
+}
+
+function wipeStamped(path: string) {
+  return stamp(path, { method: "DELETE" });
+}
+
+export function wipedStamped(): Promise<Response> {
+  return wipeStamped("/absent/wipe-stamped");
+}
