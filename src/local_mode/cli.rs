@@ -128,6 +128,9 @@ pub enum LocalCommand {
         workspace: Option<PathBuf>,
         json: bool,
     },
+    /// Each indexed service's program init, as the scan loads it. Hidden:
+    /// the reader that keeps a compiler open asks it ([`super::held_programs`]).
+    HeldPrograms { workspace: Option<PathBuf> },
 }
 
 impl LocalCommand {
@@ -150,8 +153,47 @@ pub const LOCAL_COMMANDS: [&str; 7] = [
 
 /// Read a local command from the argument list, or `None` when the first
 /// argument is not one of those names.
+///
+/// `held-programs` is parsed here too and named nowhere else: a hidden
+/// subcommand for the compiler-held-open reader ([`super::held_programs`]),
+/// so it is neither in [`LOCAL_COMMANDS`] nor in `--help`.
+const HELD_PROGRAMS: &str = "held-programs";
+
+fn parse_held_programs(rest: &[String]) -> Result<LocalCommand, String> {
+    let mut workspace: Option<PathBuf> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--workspace" | "-w" => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--workspace needs a directory".to_string())?;
+                workspace = Some(PathBuf::from(value));
+            }
+            "--json" => json = true,
+            other => {
+                return Err(format!(
+                    "unknown option for `carrick {HELD_PROGRAMS}`: {other}"
+                ));
+            }
+        }
+        index += 1;
+    }
+    if !json {
+        return Err(format!(
+            "`carrick {HELD_PROGRAMS}` prints JSON only: pass --json"
+        ));
+    }
+    Ok(LocalCommand::HeldPrograms { workspace })
+}
+
 pub fn parse(args: &[String]) -> Option<Result<LocalCommand, String>> {
     let name = args.first()?.as_str();
+    if name == HELD_PROGRAMS {
+        return Some(parse_held_programs(&args[1..]));
+    }
     if !LOCAL_COMMANDS.contains(&name) {
         return None;
     }
@@ -579,6 +621,22 @@ pub fn run(command: LocalCommand) -> i32 {
             all,
         ),
         LocalCommand::Status { workspace, json } => status(workspace.as_deref(), json),
+        LocalCommand::HeldPrograms { workspace } => {
+            let Some(root) = super::workspace::locate(workspace.as_deref(), None) else {
+                crate::errln!("carrick {HELD_PROGRAMS}: no workspace here");
+                return 1;
+            };
+            match super::held_programs::document(&root) {
+                Ok(document) => {
+                    crate::outln!("{document}");
+                    0
+                }
+                Err(error) => {
+                    crate::errln!("carrick {HELD_PROGRAMS}: {error}");
+                    1
+                }
+            }
+        }
     }
 }
 

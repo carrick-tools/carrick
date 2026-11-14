@@ -22,6 +22,7 @@ mod changed;
 mod checkout;
 pub mod cli;
 pub(crate) mod contract;
+mod held_programs;
 pub(crate) mod hosted;
 pub(crate) mod index;
 pub(crate) mod jobs;
