@@ -6,6 +6,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/real_packages.rs"]
+mod real_packages;
+
 const TOKEN: &str = "synthetic-hosted-reader";
 
 fn git(path: &Path, args: &[&str]) -> String {
@@ -41,6 +44,17 @@ fn spawn(root: &Path, args: &[&str], token: Option<&str>) -> std::process::Outpu
         .env_remove("CARRICK_LOCAL_STORAGE_DIR")
         .env_remove("CARRICK_LOCAL_HOSTED_PREVIOUS")
         .env_remove("CARRICK_MOCK_ALL");
+    // A refresh scans the tree and asks the library store about the packages
+    // installed in it. The store is out of reach here, so a test that installs
+    // a package writes the store's answer for it to `<root>/cassettes`, and
+    // only the refresh reads it from there.
+    let cassettes = root.join("cassettes");
+    if args.first() == Some(&"refresh") && cassettes.join("library-claims/default.json").is_file() {
+        command.env("CARRICK_MOCK_ALL", "1").env(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            format!("{}/", cassettes.display()),
+        );
+    }
     if let Some(token) = token {
         command.env("CARRICK_TOKEN", token);
     }
@@ -742,6 +756,8 @@ fn a_refresh_without_carrick_json_reads_with_the_hosted_config() {
     .unwrap();
     let server = "import express from \"express\";\nconst app = express();\napp.get(\"/orders\", (_req, res) => {\n  res.json([{ id: 1 }]);\n});\nexport default app;\n";
     std::fs::write(repo.join("packages/b/server.ts"), server).unwrap();
+    real_packages::install(&repo, &["express"]);
+    real_packages::write_claims(&root.join("cassettes"), &["express"]);
     init_repo(&repo);
     git(
         &repo,
