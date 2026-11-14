@@ -272,7 +272,7 @@ fn a_ranker_read_back_answers_as_built() {
         return file.startsWith(root) ? file.slice(root.length + 1) : file;\n}\n\
         export function inside(p: string) { return joinRelative('/', p); }\n";
     let first = "export function first(p: string) { return joinRelative('/', p); }\n";
-    let held = vec![
+    let held = [
         HeldFile {
             file: "src/hit.ts",
             intent: Some("Cuts a root prefix off a file path."),
