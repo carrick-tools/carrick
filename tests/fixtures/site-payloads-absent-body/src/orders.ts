@@ -36,3 +36,26 @@ export function stampNow() { return stamp("/orders/stamp", { headers: {} }); }
 function addData(init: { headers?: object; data?: unknown }) { init.data = "x"; }
 function helped(u: string, init: { headers?: object; data?: unknown }) { addData(init); return http.remove(u, init); }
 export function helpedNow() { return helped("/orders/helped", { headers: {} }); }
+
+// carrick#4294: a closed options literal below the deciding call lacks `data`.
+function drop(u: string) { return http.remove(u, { headers: {} }); }
+export function dropNine() { return drop("/orders/9"); }
+
+function makeRemover(base: string) { return (id: string) => http.remove(`${base}/orders/${id}`, { headers: {} }); }
+export const removeMade = makeRemover("/svc");
+
+// Must not be decided: the literal spreads its caller's options.
+function dropWith(u: string, extra: { headers?: object; data?: unknown }) { return http.remove(u, { ...extra }); }
+export function dropWithData(order: Order) { return dropWith("/orders/with", { data: order }); }
+
+// Must not be decided: the options are built, and a branch may add the body.
+function dropBuilt(u: string, b?: Order) {
+  const o: { headers?: object; data?: unknown } = { headers: {} };
+  if (b) o.data = b;
+  return http.remove(u, o);
+}
+export function dropBuiltNone() { return dropBuilt("/orders/built"); }
+
+// Must not be decided: the literal is handed to a hop that writes the body onto it.
+function stampVia(u: string) { return stamp(u, { headers: {} }); }
+export function stampLater() { return stampVia("/orders/later"); }

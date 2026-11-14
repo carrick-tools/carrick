@@ -303,6 +303,38 @@ fn a_wrapper_that_writes_onto_the_options_it_is_handed_is_not_decided_no_body() 
     }
 }
 
+/// carrick#4294: a call below the deciding call that writes a closed options
+/// literal lacking the body key states the request body absent, as the
+/// deciding call's own literal does. `tests/fixtures/site-payloads-absent-body/`
+/// `src/orders.ts`:
+///
+/// | line | call | the request |
+/// |---|---|---|
+/// | 42 | `drop(...)`, whose `http.remove` writes `{ headers: {} }` | `no_request_body` |
+/// | 45 | `makeRemover(...)`, the same inside a returned function | `no_request_body` |
+/// | 49 | `dropWith(...)`, whose literal spreads the caller's options | not decided |
+/// | 57 | `dropBuilt(...)`, whose options are a local a branch may extend | not decided |
+/// | 61 | `stampVia(...)`, the literal handed to a hop that writes the body | not decided |
+#[test]
+fn a_closed_literal_below_the_deciding_call_is_decided_no_body() {
+    const FILE: &str = "src/orders.ts";
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-absent-body");
+    let on = scan(&repo, &[]);
+    let decided = "no_request_body".to_string();
+    for line in [42, 45] {
+        assert_eq!(
+            root_reasons(&on, FILE, line),
+            vec![decided.clone()],
+            "{FILE}:{line}"
+        );
+    }
+    for line in [49, 57, 61] {
+        let reasons = root_reasons(&on, FILE, line);
+        assert!(!reasons.contains(&decided), "{FILE}:{line} {reasons:?}");
+    }
+}
+
 /// carrick#2472 C3: a pub/sub payload a slot types is read there, not at the
 /// symbol the reader named.
 ///

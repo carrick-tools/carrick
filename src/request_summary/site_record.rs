@@ -1172,6 +1172,20 @@ impl Sources<'_> {
             .or_insert_with(|| Parsed::read(&root.join(file)))
             .as_ref()
     }
+
+    /// The call or construction of `file` at `span`, as written (the one
+    /// lookup behind [`built_payload`] and the unwritten slot).
+    fn call_at(&mut self, file: &str, span: (u32, u32)) -> Option<CallParts> {
+        let parsed = self.get(file)?;
+        let mut finder = CallFinder {
+            parsed,
+            target: span,
+            handing: Vec::new(),
+            found: None,
+        };
+        parsed.module.visit_with(&mut finder);
+        finder.found
+    }
 }
 
 /// A part of the record as the wire carries it: a JSON value.
@@ -1934,15 +1948,12 @@ fn built_payload(payload: &Option<PayloadBinding>, sources: &mut Sources<'_>) ->
         return None;
     };
     let (file, _) = built_inside.rsplit_once(':')?;
+    let expr = sources
+        .call_at(file, (*span_start, *span_end))?
+        .arg_exprs
+        .get(*arg)?
+        .clone();
     let parsed = sources.get(file)?;
-    let mut finder = CallFinder {
-        parsed,
-        target: (*span_start, *span_end),
-        handing: Vec::new(),
-        found: None,
-    };
-    parsed.module.visit_with(&mut finder);
-    let expr = finder.found?.arg_exprs.get(*arg)?.clone();
     let span = payload_expr(&expr, key.as_deref())?;
     Some(PayloadAt::Value(AnchorAt {
         file: file.to_string(),
@@ -2036,17 +2047,7 @@ fn record(
     };
     let at = format!("{file}:{}", site.line);
     let call_at = format!("{file}:{call_line}");
-    let parts = {
-        let parsed = sources.get(file)?;
-        let mut finder = CallFinder {
-            parsed,
-            target: (site.span_start, site.span_end),
-            handing: Vec::new(),
-            found: None,
-        };
-        parsed.module.visit_with(&mut finder);
-        finder.found?
-    };
+    let parts = sources.call_at(file, (site.span_start, site.span_end))?;
     let point = {
         let parsed = sources.get(file)?;
         Point {
@@ -2519,6 +2520,29 @@ fn record(
         _ => None,
     };
     let carried = site.payload_slot.as_ref().and_then(|binding| {
+        // The literal sits in the call the slot names, which may be a call
+        // below the deciding one, in another file (carrick#4294).
+        if let SlotBinding::Unwritten { arg, key, call } = binding {
+            let expr = sources
+                .call_at(&call.file, (call.span_start, call.span_end))?
+                .arg_exprs
+                .get(*arg)?
+                .clone();
+            let Expr::Object(_) = expr else {
+                return None;
+            };
+            let parsed = sources.get(&call.file)?;
+            let span = expr.span();
+            return Some(PayloadAt::Unwritten {
+                at: AnchorAt {
+                    file: call.file.clone(),
+                    line: parsed.line(span.lo.0),
+                    span_start: span.lo.0,
+                    span_end: span.hi.0,
+                },
+                key: key.clone(),
+            });
+        }
         let parsed = sources.get(file)?;
         let at = |span: Span| AnchorAt {
             file: file.to_string(),
@@ -2531,13 +2555,8 @@ fn record(
                 payload_expr(parts.arg_exprs.get(*arg)?, Some(key))
                     .map(|span| PayloadAt::Value(at(span)))
             }
-            SlotBinding::Unwritten { arg, key } => match parts.arg_exprs.get(*arg)? {
-                expr @ Expr::Object(_) => Some(PayloadAt::Unwritten {
-                    at: at(expr.span()),
-                    key: key.clone(),
-                }),
-                _ => None,
-            },
+            // Read above, at the call it names.
+            SlotBinding::Unwritten { .. } => None,
             // No call writes the payload argument (carrick#4165): the call
             // itself is the place.
             SlotBinding::Absent => Some(PayloadAt::Absent {
