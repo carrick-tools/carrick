@@ -52,9 +52,9 @@ fn copy_dir(src: &Path, dst: &Path) {
 struct Blob {
     /// Each publisher row, as `file:line topic resolution_source`.
     publishers: BTreeSet<String>,
-    /// Each pub/sub producer possible call, as `file:line reason`.
+    /// Each pub/sub producer possible call, as `file:line slot reason`.
     producer_leads: BTreeSet<String>,
-    /// Each pub/sub consumer possible call, as `file:line reason`.
+    /// Each pub/sub consumer possible call, as `file:line slot reason`.
     consumer_leads: BTreeSet<String>,
     /// Every pub/sub row of the blob, either side.
     pubsub_rows: usize,
@@ -158,9 +158,10 @@ fn scan(fixture: &str) -> BTreeMap<String, Blob> {
             }
             found.pubsub_leads += 1;
             let at = format!(
-                "{}:{} {}",
+                "{}:{} {} {}",
                 lead["file_path"].as_str().unwrap(),
                 lead["line_number"],
+                lead["unread"]["slot"].as_str().unwrap(),
                 lead["unread"]["reason"].as_str().unwrap()
             );
             if lead["role"] == "producer" {
