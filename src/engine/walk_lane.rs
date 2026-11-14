@@ -121,7 +121,6 @@ impl Walked {
     pub(super) fn index(&self) -> PositionIndex {
         match &self.rows {
             Some(rows) => crate::position_rows::load_index(rows, &self.scan_root, &self.label),
-            None if self.lost.is_some() => PositionIndex::walk_lost(&self.scan_root),
             None => PositionIndex::missing(&self.scan_root),
         }
     }
