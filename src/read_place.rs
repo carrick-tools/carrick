@@ -27,6 +27,8 @@
 //!   handler from the registration, so the ask's span is the registration
 //!   call, not a value; the value places are a separate question (carrick#4244
 //!   T3).
+//! - A call result asked by line alone (no span, no text): its answer names
+//!   the result node, not the call (a named gap).
 //! - A call whose result label went unanswered (carrick#4154): it has no
 //!   body, so it has no place.
 //! - GraphQL resolver returns, RPC procedures and queues (named gaps).
@@ -77,6 +79,10 @@ pub(crate) fn store_read_places(
         }
         let place = match (ask.span_start, ask.span_end) {
             (Some(start), Some(end)) => Some((start, end)),
+            // A call result asked by line alone stays unplaced, as on main:
+            // its answer names the result node, and a replay by that span
+            // would retype the result, not the call.
+            _ if ask.infer_kind == InferKind::CallResult && ask.expression_text.is_none() => None,
             _ => answered
                 .get(entry.type_alias.as_str())
                 .and_then(|answer| answer_place(answer, &ask.file_path, read_file)),
