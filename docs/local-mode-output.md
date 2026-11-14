@@ -54,6 +54,9 @@ and the services that hold an operation reading a type declared in that file
 capture, no model, nothing on the wire — and re-runs the join over the blobs
 already in `.carrick/repos` plus the cached hosted snapshot, so the verdicts it
 prints are about the working tree rather than the tree the index was built on.
+A file in no service's directory has no service of its own. It re-scans every
+service that reads it through its roots (`include` roots too) or an import, or
+every service of the repo when that cannot be worked out.
 Every other service is judged at its newest known version: the copy the last
 re-check of it left in `.carrick/working/<index generation>/`, when its edits
 since the index are exactly the ones that copy was read for, else the index's
@@ -82,8 +85,10 @@ A re-check that missed its budget is remembered in
 (its `indexed_at`). Until `refresh` or `index` writes a new index, a later
 `--recheck` of a file in that service starts no re-scan: it answers at once with
 the indexed verdicts and the new functions from the parse, and its block
-carries `known_miss: true`. Another service of the same repo is still
-re-checked. On such a service `carrick check --changed` is the fresh read. A
+carries `known_miss: true`. A miss on a file in no service's directory is
+recorded under `files`, keyed by repo and path. It silences later re-checks of
+that file only, never the services that read it. Another service of the same
+repo is still re-checked. On such a service `carrick check --changed` is the fresh read. A
 service where the re-check fits never misses and is never recorded. A miss
 records the budget it ran under (`budget_ms`) and silences only a re-check
 whose own budget is no longer: a miss at ten seconds does not switch off a
@@ -91,8 +96,11 @@ re-check given three minutes. A misses file written before that field existed
 reads as no misses.
 `--no-rescan` (with `--recheck`, on one file or on `--each`) asks the question
 "does this edit need a re-scan" and never starts one. A file that is unchanged
-or gone, an edit that reads the same, a file outside every service's
-directory, and a known miss are answered at once. Any other edit comes back with `ran: none`, the indexed rows,
+or gone, an edit that reads the same, and a known miss are answered at once. A
+path that no scan reads, such as a README or a workflow, is answered at once in
+any directory. A file in no service's directory whose edit reads the same is
+answered at once when every service of its repo was indexed at one clean commit.
+Any other edit comes back with `ran: none`, the indexed rows,
 `new_functions`, and `deferred: true`. Nothing is staged and no miss is
 recorded. Run `--recheck` alone for the fresh answer.
 `carrick check --each <file>... --recheck --json` answers several files in one
@@ -250,10 +258,10 @@ has not moved past: nothing needed re-judging, so nothing was.
 | `reason` | string | why the re-check did not run, in one sentence. Present only on a `none` |
 | `new_functions` | array \| absent | functions this file declares in the working tree that the index does not hold under that name, as `{ "name": string, "line": int, "similar"?: array }`, in line order, at most 20. Named from a parse of the file that does not wait on the re-scan, so present on a `none` that missed its budget too. Absent when the edit added no function and when the index could not be read |
 | `new_functions[].similar` | array \| absent | up to 6 indexed functions, in any repo of the index and outside this file, that this one may already exist as, best first, each `{ name, repo, file, line, end_line, score, signature?, exported, called_from, intent? }`. Ranking is BM25 over a bag of words. The query is the new function's name, body tokens and written signature, and each indexed function is matched on its name, intent sentence, tokens and signature (`crates/carrick-match/src/similar.rs`). There is no score floor, so the list is empty only when no indexed function shares a word with the new one. A function that calls the new one, or is called by it, is never listed, and the member named like the new function comes first. `called_from` counts the other files whose indexed calls name the row. `signature` and `intent` are the index's own and are absent when it holds none. `score` is for logs, never for a reader's text. Read from the index on this machine, with no network call |
-| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service already missed its budget against this index. Absent otherwise |
+| `known_miss` | `true` \| absent | on a `none` that did not start a re-scan, because a re-check of this file's service (or of this file alone, when it is in no service's directory) already missed its budget against this index. Absent otherwise |
 | `deferred` | `true` \| absent | on a `none` from `--recheck --no-rescan` when the edit was not answered without a re-scan: none was started, so the rows are the indexed ones. Absent otherwise |
 | `deadline` | `true` \| absent | on a `none` whose re-check started and ran past its budget, so the rows are the indexed ones because time ran out. With it, as with `known_miss`, `check <file> --recheck` exits 2. Absent otherwise |
-| `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
+| `scope` | object \| absent | which services this re-check read: `reread` (the file's service first, then every service holding an operation that reads a type declared in the file; for a file in no service's directory, the services that read it, in index order), `not_reread` (`{ service, operations, reason }` for each other service, saying whose copy its verdicts used), and `stale` (the `not_reread` services judged at a version that predates the work: edited since the index with no copy of the last re-check to stand in, or reading a path edited since the index, which their `reason` names as `reads <path>, edited since the index`). The hook's headline is never "no contract problem" while `stale` is non-empty: it says what it re-read and names up to three of the stale services. Absent on a `none` that decided no scope |
 | `moved` | array \| absent | rows outside the edited file whose state this edit moved (below). Absent when the edit moved nothing |
 | `engine_ready` | boolean \| absent | whether the compiler engine was ready for this re-check's re-scan: `false` when it was not found or missed its ready budget. The hook writes it to its timing rows. Absent when no re-scan ran |
 
@@ -672,6 +680,12 @@ type-checked, but does not make the run exit 2: its matched method and path
 are the check it can have. That holds whichever side changed, so a branch
 that only adds request builders exits 0, and so does one that only changes a
 route those builders alone call (carrick#3532).
+
+A changed source file in no
+service's directory is checked when a service imports it, or when that cannot
+be worked out. The repo is then scanned, and the services that read it are
+re-read. When no service imports it, the file is skipped and counted as "in no
+indexed service".
 
 A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
