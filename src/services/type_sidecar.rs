@@ -5157,6 +5157,13 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// because the read adds `null` or `undefined` to it is not reported in
 /// `changed`: it still names the body.
 ///
+/// Before any witness, the compiler's own decision that a site states no type
+/// (carrick#4306): when a read of the alias abstained with a decided reason
+/// at the type's root (`inference_decided_no_contract`, such as
+/// `bound_by_callers`) and no read of it saw a shape, the model's symbol is
+/// dropped, so neither the bundle nor the capture answers the alias from it.
+/// The fan-in keep above still applies.
+///
 /// Every request the arbitration did not keep as it came in is reported in
 /// `changed` (carrick#1779): the manifest stamped the rejected symbol onto the
 /// alias's row before any of this ran, and only this function knows the row
@@ -5171,6 +5178,23 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
     for inf in inferred {
         inferred_by_alias.entry(inf.alias.as_str()).or_insert(inf);
     }
+
+    let mut reads_by_alias: HashMap<&str, Vec<&InferredType>> = HashMap::new();
+    for inf in inferred {
+        reads_by_alias
+            .entry(inf.alias.as_str())
+            .or_default()
+            .push(inf);
+    }
+    // carrick#4306: the compiler engine read the site and decided it states
+    // no type (a reason at the type's root), and no other read of the alias
+    // saw a shape. The model's symbol is no answer then: dropped here, before
+    // the bundle and the capture run, so neither defines the alias from it.
+    let decided_no_type = |alias: &str| {
+        reads_by_alias
+            .get(alias)
+            .is_some_and(|reads| crate::engine::type_compat_v2::alias_reads_decided_no_type(reads))
+    };
 
     let mut alias_counts: HashMap<&str, usize> = HashMap::new();
     for req in explicit {
@@ -5187,6 +5211,15 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
             };
             if alias_counts.get(alias).copied().unwrap_or(0) > 1 {
                 return Some(req.clone());
+            }
+            if decided_no_type(alias) {
+                info!(
+                    alias = %alias,
+                    explicit_symbol = %req.symbol_name,
+                    "[type_sidecar] anchor arbitration: the compiler read decided \
+                     the site states no type; dropping the model's symbol"
+                );
+                return None;
             }
             let Some(inf) = inferred_by_alias.get(alias) else {
                 return Some(req.clone());
@@ -8119,6 +8152,77 @@ mod tests {
         assert_eq!(kept[0].alias.as_deref(), Some("Alias_Response"));
         assert_eq!(kept[0].array_depth, None);
         assert!(!kept[0].payload_borrow_witness, "witness consumed");
+    }
+
+    /// A consumer call's read that abstained at the type's root, as decided.
+    fn root_abstain(alias: &str, reason: &str) -> InferredType {
+        let mut inf = inferred(alias, None, None);
+        inf.infer_kind = InferKind::CallResult;
+        inf.type_string = "unknown".to_string();
+        inf.any_provenance = vec![TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: reason.to_string(),
+            detail: None,
+        }];
+        inf
+    }
+
+    /// carrick#4306: the compiler's read of a consumer call decided the site
+    /// states no type (the call result is still the enclosing generic
+    /// function's type parameter). The model's symbol for the same alias is
+    /// dropped before the bundle and the capture run, so neither defines the
+    /// alias from it, and the drop is reported for the manifest row.
+    #[test]
+    fn arbitration_drops_a_model_symbol_beside_a_root_abstain() {
+        let mut request = symbol_request("Feed", "Feed_Consumer_Response", None);
+        request.consumer_response = true;
+        let explicit = vec![request];
+        let inferred = vec![root_abstain("Feed_Consumer_Response", "bound_by_callers")];
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert!(arbitrated.requests.is_empty(), "{:?}", arbitrated.requests);
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Feed_Consumer_Response".to_string(),
+                rejected: "Feed".to_string(),
+                reaimed: None,
+            }]
+        );
+    }
+
+    /// carrick#4306 bounds: the abstain decides the alias only when no read of
+    /// it saw a shape (a sibling call site that read the body owns the alias,
+    /// carrick#1375), and only for a decided reason: a root reason that is
+    /// not an abstain, or a blind read with no reason, keeps the symbol.
+    #[test]
+    fn arbitration_keeps_a_model_symbol_a_root_abstain_does_not_decide() {
+        let explicit = vec![symbol_request("Feed", "Feed_Consumer_Response", None)];
+        let mut sighted = inferred("Feed_Consumer_Response", Some("Feed"), None);
+        sighted.infer_kind = InferKind::CallResult;
+        sighted.type_string = "Feed".to_string();
+        let mut undecided = root_abstain("Feed_Consumer_Response", "not_recorded");
+        undecided.infer_kind = InferKind::CallResult;
+        let mut blind = root_abstain("Feed_Consumer_Response", "bound_by_callers");
+        blind.any_provenance.clear();
+
+        for (case, inferred) in [
+            (
+                "sighted sibling",
+                vec![
+                    root_abstain("Feed_Consumer_Response", "bound_by_callers"),
+                    sighted,
+                ],
+            ),
+            ("undecided reason", vec![undecided]),
+            ("blind read", vec![blind]),
+        ] {
+            let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+            assert_eq!(arbitrated.requests, explicit, "{case}");
+            assert!(arbitrated.changed.is_empty(), "{case}");
+        }
     }
 
     /// An array-form inference (`Root[]`) demotes with the inferred depth so

@@ -1,6 +1,7 @@
 //! A consumer read inside a generic function whose answer is still the
 //! function's own type parameter states no type (carrick#4201), even when the
-//! model named a type for the same alias (carrick#4289).
+//! model named a type for the same alias (carrick#4289). The read's decided
+//! abstain drops the model's symbol before the bundle runs (carrick#4306).
 //!
 //! Drives the real sidecar through `resolve_all_types` with the explicit
 //! request and the inference request `collect_type_requests` issues for a
@@ -79,7 +80,7 @@ fn sidecar_path() -> Option<PathBuf> {
 }
 
 #[test]
-fn a_model_type_and_a_root_abstain_answer_the_same_alias() {
+fn a_root_abstain_drops_the_model_type_before_the_bundle() {
     let Some(sidecar_path) = sidecar_path() else {
         return;
     };
@@ -124,23 +125,41 @@ fn a_model_type_and_a_root_abstain_answer_the_same_alias() {
         .resolve_all_types(&explicit, &infer, None, None)
         .expect("resolve_all_types");
 
-    // The two answers the manifest join receives for one alias: the bundle
-    // defines it from the model's symbol, with the type parameter left
-    // dangling, while the compiler's read abstains at the type's root. The
-    // join (`enrich_manifest_with_type_resolution`) must read the entry
-    // `Unknown` from these; its unit test holds that half.
-    let bundled = result
-        .explicit_manifest
-        .iter()
-        .find(|entry| entry.alias == alias)
-        .unwrap_or_else(|| {
-            panic!(
-                "the bundle answers {alias}: {:#?}",
-                result.explicit_manifest
-            )
-        });
-    assert!(bundled.is_explicit, "{bundled:#?}");
-    assert!(bundled.type_string.contains("T[]"), "{bundled:#?}");
+    // carrick#4306: the compiler's read decided the site states no type, so
+    // the model's symbol is dropped before the bundle runs: no bundle row and
+    // no definition for the alias beyond the placeholder, and the drop is
+    // reported for the row.
+    assert!(
+        result
+            .explicit_manifest
+            .iter()
+            .all(|entry| entry.alias != alias),
+        "{:#?}",
+        result.explicit_manifest
+    );
+    let dts = result.dts_content.as_deref().unwrap_or("");
+    // The alias keeps only the bundle's `unknown` placeholder.
+    assert!(
+        dts.lines()
+            .filter(|line| line.contains(alias))
+            .all(|line| line.contains(&format!("{alias} = unknown;"))),
+        "{dts}"
+    );
+    assert!(!dts.contains("T[]"), "{dts}");
+    assert_eq!(
+        result
+            .anchor_changes
+            .iter()
+            .map(|change| (
+                change.alias.as_str(),
+                change.rejected.as_str(),
+                change.reaimed.is_none()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(alias, "Feed", true)],
+        "{:#?}",
+        result.anchor_changes
+    );
 
     let read = result
         .inferred_types

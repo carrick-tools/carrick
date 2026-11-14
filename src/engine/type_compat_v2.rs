@@ -282,7 +282,7 @@ pub(crate) fn inferred_response_modes(
 /// reports the depth of the call's result even where its text is a decayed
 /// read of something after it, and a depth with no element named says nothing
 /// of the symbol this is asked about (carrick#1967).
-fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
+pub(crate) fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
     let peeled_a_named_list = inf.primary_type_symbol.is_some() && inf.array_depth.is_some();
     !peeled_a_named_list && text_is_bare_top_type(&inf.type_string)
 }
@@ -475,7 +475,9 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
 /// (carrick#1841). The capture's re-run would publish the carrier. A handler
 /// return with that reason states that some of its union branches were unread
 /// (carrick#166), and keeps the capture's own read as its recovery.
-fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredType) -> bool {
+pub(crate) fn inference_decided_no_contract(
+    inf: &crate::services::type_sidecar::InferredType,
+) -> bool {
     text_is_bare_top_type(&inf.type_string)
         && inf.any_provenance.iter().any(|p| {
             p.path.is_empty()
@@ -7534,6 +7536,82 @@ mod tests {
                 assert_eq!(*anchor_origin, AnchorOrigin::DeterministicInfer);
             }
             other => panic!("expected the stated body as a literal anchor, got {other:?}"),
+        }
+    }
+
+    /// carrick#4306: a consumer call inside a generic function whose result
+    /// is still the function's own type parameter states no type, and the
+    /// model named a type for the same alias. The capture anchors what the
+    /// arbitration left, in the order `run_capture_for_service` runs them: the
+    /// model's symbol is gone, so the alias is the decided `unknown` and the
+    /// capture publishes no definition for it.
+    #[test]
+    fn derive_anchors_capture_no_model_symbol_beside_a_root_abstain() {
+        let alias = "Feed_Consumer_Response";
+        // The symbol anchor needs its declaring file on disk.
+        let repo = tempfile::TempDir::new().expect("temp dir");
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        let client = repo.path().join("src/client.ts");
+        std::fs::write(&client, "export interface Feed<T> { items: T[] }\n").unwrap();
+        let client = client.to_string_lossy().into_owned();
+        let root = repo.path().to_string_lossy().into_owned();
+        let explicit = vec![SymbolRequest {
+            symbol_name: "Feed".to_string(),
+            source_file: client.clone(),
+            alias: Some(alias.to_string()),
+            array_depth: None,
+            payload_borrow_witness: false,
+            consumer_response: true,
+        }];
+        let infer = vec![InferRequestItem {
+            member: None,
+            result: None,
+            file_path: client.clone(),
+            line_number: 14,
+            span_start: None,
+            span_end: None,
+            expression_text: Some("this.client.fetchFeed(id)".to_string()),
+            expression_line: Some(14),
+            infer_kind: InferKind::CallResult,
+            alias: Some(alias.to_string()),
+            param_name: None,
+            route_path: None,
+            at_registration: false,
+            result_unanswered: false,
+            through_call: None,
+        }];
+        // The read names the model's symbol, so the blind-read guard alone
+        // (`Sightings::none_of`) would keep the symbol anchor.
+        let mut abstain = inferred(alias, "unknown", Some("Feed"), None);
+        abstain.infer_kind = InferKind::CallResult;
+        abstain.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "bound_by_callers".to_string(),
+            detail: None,
+        }];
+        let inferred_types = vec![abstain];
+
+        let explicit = crate::services::type_sidecar::demote_witnessed_borrowed_anchors(
+            &explicit,
+            &inferred_types,
+        )
+        .requests;
+        let explicit =
+            crate::services::type_sidecar::apply_inferred_array_depth(&explicit, &inferred_types);
+        let anchors = derive_capture_anchors(&explicit, &infer, &[], &inferred_types, &[], &root);
+
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        match &anchors[0] {
+            CaptureAnchor::Literal {
+                alias: anchored,
+                type_text,
+                ..
+            } => {
+                assert_eq!(anchored, alias);
+                assert_eq!(type_text, "unknown");
+            }
+            other => panic!("expected the decided unknown, got {other:?}"),
         }
     }
 
