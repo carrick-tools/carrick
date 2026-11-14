@@ -9424,11 +9424,29 @@ export class TypeInferrer {
    * reading the first function read a middleware as the route. The path
    * literal is not function-valued, so it is skipped naturally. No callee-name
    * check: a call whose argument resolves to a function is structurally a
-   * registration regardless of the framework.
+   * registration regardless of the framework, unless it is called on an array
+   * or a promise (carrick#4379).
    */
+  /**
+   * carrick#4379: whether a call is made on an array or a promise (`rows.map(cb)`,
+   * `rows.filter(cb)`, `pending.then(cb)`). Such a call hands its function to
+   * an iteration or a continuation, never to a server or router, so the
+   * function is no route handler and the call's result is the value to read.
+   * Decided by the receiver's compiler type, so it names no method.
+   */
+  private calledOnCollectionOrPromise(call: CallExpression): boolean {
+    const callee = call.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return false;
+    const receiver = callee.getExpression().getType().getNonNullableType();
+    if (receiver.isArray() || receiver.isTuple() || receiver.getArrayElementType()) return true;
+    const then = receiver.getProperty('then');
+    return !!then && this.isCallableType(then.getTypeAtLocation(call));
+  }
+
   private handlerFromRegistrationCall(
     call: CallExpression
   ): FunctionLike | undefined {
+    if (this.calledOnCollectionOrPromise(call)) return undefined;
     for (const arg of [...call.getArguments()].reverse()) {
       const handler = this.asHandlerFunction(arg);
       if (handler) {
