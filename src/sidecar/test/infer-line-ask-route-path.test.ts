@@ -122,6 +122,11 @@ describe('carrick#4381: a line-only ask picks the registration its route path na
     assert.match(answer.type_string, /id: string/);
   });
 
+  it('/first-code: a mount prefix on the inner route still names its registration', async () => {
+    const answer = await ask('/first-code', '/api/v1/first-code');
+    assert.strictEqual(answer, undefined, `got ${JSON.stringify(answer)}`);
+  });
+
   it('/pick-send: no route_path keeps the first registration', async () => {
     // The first registration on the line starts with the outer call, which
     // registers `/pick-code`: status only, no answer.
