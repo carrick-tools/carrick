@@ -729,6 +729,7 @@ pub struct CloudRepoData {
     pub mounts: Vec<Mount>,
     #[serde(serialize_with = "sorted_keys::map")]
     pub apps: HashMap<String, AppContext>,
+    #[serde(default)]
     pub imported_handlers: Vec<(String, String, String, String)>,
     #[serde(serialize_with = "sorted_keys::map")]
     pub function_definitions: HashMap<String, FunctionDefinition>,
@@ -4620,5 +4621,20 @@ mod tests {
         assert_eq!(endpoints[0].declared_at.as_deref(), Some("carrick.json:12"));
         let json = serde_json::to_value(&endpoints[0]).unwrap();
         assert_eq!(json["declared_at"], "carrick.json:12");
+    }
+
+    /// carrick#4253 step 1: a blob without `imported_handlers` reads, so a later
+    /// release can stop writing the field once the reader floor passes this one.
+    #[test]
+    fn a_blob_without_imported_handlers_reads() {
+        let mut blob = serde_json::to_value(empty_repo("orders-service", None)).unwrap();
+        assert!(
+            blob.as_object_mut()
+                .unwrap()
+                .remove("imported_handlers")
+                .is_some()
+        );
+        let read: CloudRepoData = serde_json::from_value(blob).unwrap();
+        assert!(read.imported_handlers.is_empty());
     }
 }
