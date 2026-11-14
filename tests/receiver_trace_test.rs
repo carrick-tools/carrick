@@ -1055,9 +1055,15 @@ fn a_route_path_that_writes_its_first_segment_keeps_the_readers_row() {
             .cloned()
             .collect::<Vec<String>>(),
         vec![
+            // One element row is added beside the other route the trace
+            // adds; the other element row replaces the model's `:kind` row.
             "routes routes_across_added_untyped=2",
             "routes routes_across_corrected=2",
+            "routes routes_across_replaced=1",
             "routes routes_guessed_withdrawn=1",
+            // `:14`'s chains now end at the plugin's parameter, as the
+            // package's other routes do.
+            "routes routes_untraced_hole_entry_point=4",
             "routes routes_untraced_unread_own_part=1",
         ],
         "{counts:#?}"
