@@ -25,10 +25,14 @@ function where(row: SimilarFunction, ownRepo: string | null): string {
   return ownRepo !== null && row.repo !== ownRepo ? `${row.repo}/${spot}` : spot;
 }
 
-/** The first `cap` characters, never splitting a surrogate pair. */
+/**
+ * One line: every run of whitespace (newlines included) becomes one space, then
+ * the first `cap` characters, never splitting a surrogate pair; a cut text ends
+ * in "...".
+ */
 function cut(text: string, cap: number): string {
-  const chars = [...text];
-  return chars.length <= cap ? text : chars.slice(0, cap).join("");
+  const chars = [...text.replace(/\s+/g, " ").trim()];
+  return chars.length <= cap ? chars.join("") : `${chars.slice(0, cap).join("")}...`;
 }
 
 function row(position: number, found: SimilarFunction, ownRepo: string | null): string {
