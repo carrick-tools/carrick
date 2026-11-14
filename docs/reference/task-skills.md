@@ -223,8 +223,8 @@ is written (rule 1 of the AGENTS.md section, the `carrick-reuse` skill), so the
 line and the per-session list of new functions were removed from both hosts.
 `carrick check --recheck` still answers with `recheck.new_functions`. The
 post-edit hook prints one block for a new function that has `similar` rows
-(carrick-cloud#3490), once per function per session, as the edit lands. Nothing about
-new functions is said at the end of the task.
+(carrick-cloud#3490), once per function per session, as the edit lands. The hook says nothing
+about new functions at the end of the task.
 
 **The channel.** A Stop hook's `hookSpecificOutput.additionalContext` reaches
 the model and the conversation continues, so it is the one Stop channel that is
