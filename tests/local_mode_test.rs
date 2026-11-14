@@ -5437,9 +5437,10 @@ fn add_a_case(file: &Path) {
 }
 
 /// An edit to a test file that still loads what it loaded is read by no
-/// service (the carry rule `--changed-only` uses), so the probe answers from
-/// the index and starts nothing. An edit that adds an import is read, so it
-/// is deferred, as every other edit that needs a re-scan is.
+/// service (the carry rule `--changed-only` uses), so the full re-check
+/// answers it from the index and starts nothing; the probe defers it, as it
+/// defers every edit that does not read the same. An edit that adds an import
+/// is read, so it is deferred on the probe too.
 #[test]
 #[serial]
 fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
@@ -5466,9 +5467,10 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
     };
     let before = recheck_temp_dirs(temp.path());
 
-    // (1) a case added to the test, imports kept: answered at once.
+    // (1) a case added to the test, imports kept: the full re-check answers
+    // from the index.
     add_a_case(&root.join(SHOP_TEST));
-    let kept = probe(SHOP_TEST);
+    let kept = recheck_json(root, SHOP_TEST, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         kept["recheck"]["ran"],
         serde_json::json!("none"),
@@ -5483,9 +5485,9 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
     );
     assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
 
-    // (3) the same edit to a file under `__mocks__`: answered at once.
+    // (3) the same edit to a file under `__mocks__`: the same answer.
     add_a_case(&root.join(SHOP_MOCK));
-    let mock = probe(SHOP_MOCK);
+    let mock = recheck_json(root, SHOP_MOCK, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         mock["recheck"]["ran"],
         serde_json::json!("none"),
@@ -5509,10 +5511,10 @@ fn a_test_edit_that_keeps_its_imports_starts_no_re_scan() {
 }
 
 /// A new test file that declares nothing program-wide and gives no source its
-/// first importer is read by no service, so the probe answers from the index
-/// and starts nothing. One that would make a source file test-only (it is that
-/// file's first importer), declares a global, or is a script is read, so it is
-/// deferred.
+/// first importer is read by no service, so the full re-check answers from the
+/// index and starts nothing. One that would make a source file test-only (it
+/// is that file's first importer), declares a global, or is a script is read,
+/// so the probe defers it.
 #[test]
 #[serial]
 fn a_new_test_file_starts_no_re_scan() {
@@ -5549,7 +5551,7 @@ fn a_new_test_file_starts_no_re_scan() {
         "second.test.ts",
         "import { CatalogClient } from \"../client.js\";\n\nexport const again = new CatalogClient(\"http://catalog.test\");\n",
     );
-    let kept = probe(&kept);
+    let kept = recheck_json(root, &kept, &[AMPLE[0], ("TMPDIR", tmpdir)]);
     assert_eq!(
         kept["recheck"]["ran"],
         serde_json::json!("none"),

@@ -116,7 +116,7 @@ export async function editFlow(
   // The edit just landed, so the index describes the file as it was before
   // it. Without a fact file the hook asks the binary once, with a probe that
   // never starts a re-scan: an answer that needs none (the file reads the
-  // same, no service reads it, a known miss) comes back at once and prints
+  // same, a known miss) comes back at once and prints
   // below. Every other file is queued for the background runner
   // (carrick#3198). With a fact file the fact lines print now and every file
   // is queued in place of the probe: its answer, problem and uses lines and

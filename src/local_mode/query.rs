@@ -41,8 +41,10 @@ pub enum Mode {
 pub enum Freshness {
     Indexed,
     /// `rescan: false` is the probe (`check --recheck --no-rescan`): it answers
-    /// at once what needs no re-scan and marks the rest `deferred`, starting
-    /// nothing (`recheck.rs`, "deferred").
+    /// at once what the index, git and the one file can tell (unchanged, gone,
+    /// reads the same, a known miss) and marks every other changed file
+    /// `deferred`. It starts nothing and walks no service's imports
+    /// (`recheck.rs`, "deferred").
     Recheck {
         rescan: bool,
     },
@@ -132,8 +134,9 @@ pub fn answer(
             // to re-scan: the indexed rows stand, each at the line its node
             // moved to. So has an edit no service reads (a test file that
             // loads what it loaded, a file outside every service's closure):
-            // the rows stand where they were. Every other edit takes the
-            // re-scan below.
+            // the rows stand where they were. That second exit is the full
+            // re-check's only; the probe never walks to find it. Every other
+            // edit takes the re-scan below.
             let unchanged = service_row
                 .filter(|service| !service.dirty && !service.commit.is_empty())
                 .and_then(|service| {
@@ -141,6 +144,14 @@ pub fn answer(
                         .map(Some)
                 })
                 .or_else(|| {
+                    // The probe never walks every service's imports to learn
+                    // that no service reads the edit: on a large workspace
+                    // that walk took 1-25 s, past the hook's limit. Such an
+                    // edit comes back deferred and the full re-check answers
+                    // it (carrick#4034).
+                    if !rescan {
+                        return None;
+                    }
                     let only = HashSet::from([relative.clone()]);
                     super::recheck::no_service_reads(workspace_root, &tree, repo, &only)
                         .then_some(None)
