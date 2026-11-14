@@ -1152,6 +1152,9 @@ pub(super) fn module_bindings(
                         // Module-level writes may run in any function, in
                         // any order (carrick#3679 S8 P7).
                         reads: BTreeMap::new(),
+                        elements: None,
+                        list_frozen: false,
+                        list_kept: false,
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -2889,6 +2892,8 @@ impl Reader<'_> {
                 block: false,
                 defaulted: true,
                 flow: None,
+                elements: None,
+                list_frozen: false,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -3574,6 +3579,7 @@ impl<'a> Resolver<'a> {
             | ValueAt::Alt { .. }
             | ValueAt::Entries(_)
             | ValueAt::Elements(_)
+            | ValueAt::Each { .. }
             // A maker's `new` is the receiver walk's alone, any other the
             // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
