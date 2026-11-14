@@ -231,6 +231,9 @@ pub struct Discovery {
     /// The calls whose walk found no site and passed a call it could not
     /// follow on the way (`no_site` all the same): not followed to the end.
     pub missed_inside: Vec<(String, u32, u32)>,
+    /// The calls whose stop is a sibling's, saved beside the ends the walk
+    /// found (carrick#4474); the fold keeps these on a row line.
+    pub beside_at: std::collections::BTreeSet<(String, u32, u32)>,
     /// The line and the callee as written of each `missed_inside` call, by
     /// file and SWC span: what an unread site states of it
     /// ([`crate::unread_sites`], carrick#3688 U3).
@@ -1301,6 +1304,15 @@ struct Outcome<'a> {
     ends: Vec<Found>,
     /// The first stop, when the walk entered code and found nothing there.
     stop: Option<(Vec<ChainHop>, Stop)>,
+    /// With `stop`: the file of the call it was read at, so a stop read in a
+    /// sibling's code can be told from one read in this service's own
+    /// (carrick#4474).
+    stop_read_in: Option<&'a Path>,
+    /// A stop the walk read at a call in a sibling's file, beside the ends it
+    /// found: no site walk of this service reads that call, so the call
+    /// that entered the sibling is where it is saved (carrick#4474). The
+    /// ends are real, and the stop would otherwise be dropped with `stop`.
+    beside: Option<(Vec<ChainHop>, Stop)>,
     /// With `stop`: the other ways the callee's values stopped, when they
     /// stopped in several (carrick#3688 U2, R3). Distinct, at most
     /// [`MAX_ALSO`].
@@ -1362,11 +1374,36 @@ struct Open<'a> {
 type Held<'a> = super::resolve::Held<Outcome<'a>>;
 
 impl<'a> Outcome<'a> {
-    fn stopped(reason: Stop) -> Self {
+    /// A stop read at a call written in `file`.
+    fn stopped(reason: Stop, file: &'a Path) -> Self {
         Outcome {
             stop: Some((Vec::new(), reason)),
+            stop_read_in: Some(file),
             ..Outcome::default()
         }
+    }
+
+    /// The walk found ends, so the stop it also read is not the call's: a
+    /// stop read at a call in a sibling's file, whose walk is final, is kept
+    /// beside the ends instead of dropped (carrick#4474). `own` says whether
+    /// a file is one of this service's. A callback the call hands in is
+    /// written at the call and read by this service's own walk of it, so a
+    /// stop on a callback value (`injected_callee`,
+    /// `callback_into_own_function`) is no stop beside the ends.
+    fn drop_stop_for_ends(&mut self, own: impl Fn(&Path) -> bool) {
+        if let Some(read_in) = self.stop_read_in
+            && self.cycle_at.is_none()
+            && self.beside.is_none()
+            && !own(read_in)
+            && !matches!(
+                self.stop,
+                Some((_, Stop::InjectedCallee | Stop::CallbackIntoOwnFunction))
+            )
+        {
+            self.beside = self.stop.take();
+        }
+        self.stop = None;
+        self.stop_read_in = None;
     }
 
     /// The same, as seen from a call one function further up.
@@ -1375,6 +1412,9 @@ impl<'a> Outcome<'a> {
             found.chain.insert(0, hop.clone());
         }
         if let Some((chain, _)) = &mut self.stop {
+            chain.insert(0, hop.clone());
+        }
+        if let Some((chain, _)) = &mut self.beside {
             chain.insert(0, hop.clone());
         }
         for open in &mut self.open {
@@ -1414,8 +1454,12 @@ impl<'a> Outcome<'a> {
         }
         if self.stop.is_none() {
             self.stop = other.stop;
+            self.stop_read_in = other.stop_read_in;
             self.also = other.also;
             self.valued = other.valued;
+        }
+        if self.beside.is_none() {
+            self.beside = other.beside;
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
@@ -2644,7 +2688,7 @@ impl<'a> Walker<'a> {
             .implementations?
             .at(file, call.site.lo, call.site.hi)?;
         let found = match followed {
-            Followed::OverCap => return Some(Outcome::stopped(Stop::ImplementationsOverCap)),
+            Followed::OverCap => return Some(Outcome::stopped(Stop::ImplementationsOverCap, file)),
             Followed::Found(found) => found,
         };
         let targets = self.implementation_targets(file, found)?;
@@ -2765,7 +2809,7 @@ impl<'a> Walker<'a> {
             return self.agree(values, invoke, Vec::new(), OF_VALUES);
         }
         if call.invokes_param.is_some() {
-            return Outcome::stopped(Stop::InjectedCallee);
+            return Outcome::stopped(Stop::InjectedCallee, file);
         }
         let reach = self.reach(file, call);
         // A member of an object the compiler declares in the repository and
@@ -2818,7 +2862,7 @@ impl<'a> Walker<'a> {
                     // The walk came back to a definition it is reading.
                     Some(depth) => Outcome {
                         cycle_at: Some(*depth),
-                        ..Outcome::stopped(Stop::Recursion)
+                        ..Outcome::stopped(Stop::Recursion, file)
                     },
                     None => {
                         let inner = self.definition(&id);
@@ -2850,14 +2894,14 @@ impl<'a> Walker<'a> {
                     out.missed = true;
                 }
                 if !out.ends.is_empty() {
-                    out.stop = None;
+                    out.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
                 }
                 out
             }
             Reach::OutsideService(..) => Outcome::default(),
             Reach::NoFunction if self.interface_member(file, call) => self
                 .through_implementations(file, call, invoke)
-                .unwrap_or_else(|| Outcome::stopped(Stop::InterfaceMember)),
+                .unwrap_or_else(|| Outcome::stopped(Stop::InterfaceMember, file)),
             // A call into a library whose declaration returns what the
             // function it is handed returns (carrick#2634): the compiler's
             // row says so, and the function written at the call is walked.
@@ -2869,7 +2913,7 @@ impl<'a> Walker<'a> {
                 let mut out = self.handed(file, body, call, None, |_| true);
                 out.absorb(self.handed_by_name(file, call));
                 if !out.ends.is_empty() {
-                    out.stop = None;
+                    out.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
                 }
                 out
             }
@@ -2877,7 +2921,7 @@ impl<'a> Walker<'a> {
             Reach::NoFunction => self
                 .through_type(invoke, &[Held::Reached(Outcome::default())])
                 .unwrap_or_default(),
-            Reach::Unknown(reason) => Outcome::stopped(Stop::from(reason)),
+            Reach::Unknown(reason) => Outcome::stopped(Stop::from(reason), file),
         }
     }
 
@@ -3008,7 +3052,7 @@ impl<'a> Walker<'a> {
             let inner = match self.reading.get(&id) {
                 Some(depth) => Outcome {
                     cycle_at: Some(*depth),
-                    ..Outcome::stopped(Stop::Recursion)
+                    ..Outcome::stopped(Stop::Recursion, file)
                 },
                 None => self.definition(&id),
             };
@@ -3033,10 +3077,15 @@ impl<'a> Walker<'a> {
         // starts): what it calls is not known, so the walk stops there and
         // says so.
         let Some((file, ir)) = self.function(&id.0, &id.1) else {
-            return Outcome::stopped(Stop::NoBody);
+            // No file to say where: the stop is dropped beside ends, as it
+            // was before carrick#4474.
+            return Outcome {
+                stop: Some((Vec::new(), Stop::NoBody)),
+                ..Outcome::default()
+            };
         };
         if ir.bodyless {
-            return Outcome::stopped(Stop::InterfaceMember);
+            return Outcome::stopped(Stop::InterfaceMember, file);
         }
         let depth = self.reading.len();
         self.reading.insert(id.clone(), depth);
@@ -3134,7 +3183,7 @@ impl<'a> Walker<'a> {
             out.absorb(inner);
         }
         if !out.ends.is_empty() {
-            out.stop = None;
+            out.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
         }
         out
     }
@@ -3404,6 +3453,21 @@ impl<'a> Walker<'a> {
                     discovery.missed_inside.push(at);
                 }
             }
+            // A stop the walk read in a sibling's code, beside the ends it
+            // found there: no site walk of this service reads that call, so
+            // it is saved at this one, as a call with no end beside it
+            // saves it (carrick#4474).
+            if let Some((chain, stop)) = outcome.beside {
+                *discovery
+                    .counts
+                    .entry(format!("stop/{}/beside_ends", stop.as_str()))
+                    .or_default() += 1;
+                let site = record(None, chain, Some(stop));
+                discovery
+                    .beside_at
+                    .insert((site.file.clone(), site.span_start, site.span_end));
+                discovery.sites.push(site);
+            }
         }
         for inner in body.nested.iter().chain(&body.detached) {
             self.sites(file, key, depth.saturating_add(1), inner, discovery);
@@ -3492,7 +3556,7 @@ impl<'a> Walker<'a> {
         if let Some(depth) = self.reading.get(&id) {
             return Outcome {
                 cycle_at: Some(*depth),
-                ..Outcome::stopped(Stop::Recursion)
+                ..Outcome::stopped(Stop::Recursion, invoke.file)
             };
         }
         let inner = self.definition(&id);
@@ -3629,13 +3693,13 @@ impl<'a> Walker<'a> {
             };
         }
         if known.is_empty() {
-            return Outcome::stopped(Stop::ValueNeverBound).below(&chain);
+            return Outcome::stopped(Stop::ValueNeverBound, invoke.file).below(&chain);
         }
         if known.len() > MAX_VALUES {
-            return Outcome::stopped(plural.over_cap).below(&chain);
+            return Outcome::stopped(plural.over_cap, invoke.file).below(&chain);
         }
         if known.iter().all(|value| matches!(value, Held::Callback)) {
-            return Outcome::stopped(Stop::InjectedCallee).below(&chain);
+            return Outcome::stopped(Stop::InjectedCallee, invoke.file).below(&chain);
         }
         // Why each value reached nothing, where it says: the resolver's
         // reason, a callback's, or the stop the walk met inside it. A value
@@ -3682,6 +3746,7 @@ impl<'a> Walker<'a> {
             // one of several, with the ways named (carrick#3688 U2, R3).
             let (stop, also) = agreed_stop(&reasons, plural.several);
             out.stop = Some((Vec::new(), stop));
+            out.stop_read_in = Some(invoke.file);
             out.also = also;
             out.valued = true;
         }
@@ -3730,7 +3795,7 @@ impl<'a> Walker<'a> {
             if values.is_empty() && handed {
                 let stopped = Outcome {
                     valued: true,
-                    ..Outcome::stopped(Stop::CallbackIntoOwnFunction)
+                    ..Outcome::stopped(Stop::CallbackIntoOwnFunction, open.invoke.file)
                 };
                 outcome.absorb(stopped.below(&open.chain));
                 continue;
@@ -3739,7 +3804,7 @@ impl<'a> Walker<'a> {
             outcome.absorb(settled);
         }
         if !outcome.ends.is_empty() {
-            outcome.stop = None;
+            outcome.drop_stop_for_ends(|read_in| self.inputs.files.contains_key(read_in));
         }
         outcome
     }
