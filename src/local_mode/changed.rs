@@ -747,7 +747,7 @@ fn changed_files(
             .into_iter()
             .filter(|file| crate::file_finder::is_scanned_source(&repo.join(file), repo))
             .collect();
-        let files: BTreeSet<String> = sources
+        let mut files: BTreeSet<String> = sources
             .iter()
             .filter(|file| {
                 indexed.services.is_empty()
@@ -755,6 +755,17 @@ fn changed_files(
             })
             .cloned()
             .collect();
+        // A changed source file in no service's roots that a service imports
+        // is part of the change those services read: one walk for the set
+        // (carrick#4412). Files no service reads keep the line below.
+        let outside: std::collections::HashSet<String> =
+            sources.difference(&files).cloned().collect();
+        if !outside.is_empty()
+            && !super::recheck::services_reading(&workspace.root, &tree, indexed, &outside)
+                .is_some_and(|readers| readers.is_empty())
+        {
+            files.extend(outside);
+        }
         if files.len() < sources.len() {
             entry.unchecked = sources.len() - files.len();
             entry.skipped = Some(format!(
@@ -793,6 +804,7 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             rescan: None,
         });
     };
+    let mut outside: BTreeMap<String, (&IndexedRepo, Tree, Vec<(&Path, String)>)> = BTreeMap::new();
     for file in files {
         let Some((repo, relative, tree)) = index.locate_file(file) else {
             skip(&mut listed, file, "not in a repo of this workspace");
@@ -807,7 +819,13 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             continue;
         }
         if !repo.services.is_empty() && !repo.services.iter().any(|s| s.covers(&relative)) {
-            skip(&mut listed, file, "no indexed service covers it");
+            // Held back until one walk per repo says whether a service
+            // imports it (carrick#4412).
+            outside
+                .entry(repo.name.clone())
+                .or_insert_with(|| (repo, tree, Vec::new()))
+                .2
+                .push((file.as_path(), relative));
             continue;
         }
         changed
@@ -815,6 +833,23 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             .or_insert_with(|| (tree, BTreeSet::new()))
             .1
             .insert(relative);
+    }
+    for (name, (repo, tree, held)) in outside {
+        let paths = held.iter().map(|(_, relative)| relative.clone()).collect();
+        let none_reads = super::recheck::services_reading(root, &tree, repo, &paths)
+            .is_some_and(|readers| readers.is_empty());
+        if none_reads {
+            for (file, _) in held {
+                skip(&mut listed, file, "no indexed service covers it");
+            }
+        } else {
+            let entry = changed
+                .entry(name)
+                .or_insert_with(|| (tree, BTreeSet::new()));
+            entry
+                .1
+                .extend(held.into_iter().map(|(_, relative)| relative));
+        }
     }
     let mut repos: Vec<ChangedRepo> = changed
         .iter()
