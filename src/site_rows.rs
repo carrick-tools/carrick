@@ -1408,8 +1408,7 @@ pub fn fold(
             |call: &DataFetchingCall, file: &str, line: u32, key: &OperationKey| {
                 (call.resolution_source == Some(ResolutionSource::Model)
                     || call.resolution_source == Some(ResolutionSource::RequestSpec)
-                    || call.resolution_source.is_some_and(is_old_path_source)
-                    || call.resolution_source.is_some_and(is_base_path_source))
+                    || call.resolution_source.is_some_and(is_old_path_source))
                     && call.file_location.rsplit_once(':').is_some_and(|(f, l)| {
                         relative(root, f) == file && l.parse::<u32>().ok() == Some(line)
                     })
