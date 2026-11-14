@@ -697,11 +697,6 @@ fn stated_whole(
             // read before the compiler's type: over an `as const` list that
             // type is the union of the elements, a choice the model would be
             // asked to name (carrick#4245).
-            if choices.in_place
-                && let Some(whole) = choices.per_element(&expr)
-            {
-                return Some(whole);
-            }
             // A name the resolver reads as several texts (a `let` written
             // again, carrick#3504 S2b-8, D6). One text is the fold's, read
             // after this.
