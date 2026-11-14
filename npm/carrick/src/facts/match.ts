@@ -73,8 +73,8 @@ function isIdPart(ch: string): boolean {
 /** After these a `<` in a `.tsx` or `.jsx` file opens an element. */
 const JSX_AFTER_PUNC = new Set(["(", ",", "=", ":", "?", "&&", "||", "??", "=>", "{", "[", ";", "!"]);
 const JSX_AFTER_WORD = new Set(["return", "yield", "await", "default"]);
-/** A `<` that opens type parameters in a `.tsx` file: `<T,>` or `<T extends X>`. */
-const TYPE_PARAMS_IN_JSX = /^<\s*[A-Za-z_$][\w$]*\s*(?:,|extends\s+[^=\s])/;
+/** A `<` that opens type parameters in a `.tsx` file: `<T,>`, `<T extends X>`, `<T = X>` or `<const T,>`. */
+const TYPE_PARAMS_IN_JSX = /^<\s*(?:const\s+)?[A-Za-z_$][\w$]*\s*(?:,|=(?!=)|extends\s+[^=\s])/;
 
 /**
  * The tokens of `text`, or null when a string, template, comment, regex or
@@ -153,18 +153,79 @@ function lexAll(text: string, jsx: boolean): Token[] {
     return null;
   };
 
+  // Whether the `!` just read is a non-null assertion (`total! / count`):
+  // it follows, on its line, a name or a closing bracket that is not the
+  // head of an `if`, `while`, `for` or `with`. A `/` or `<` after it is
+  // then an operator, never a regex or an element.
+  const postfixBang = (prev: Token): boolean => {
+    if (prev.kind !== "punc" || prev.value !== "!" || tokens.length - 1 === containerFrom) return false;
+    const before = tokens[tokens.length - 2];
+    if (before === undefined || before.line !== prev.line) return false;
+    if (before.kind === "id") return !REGEX_AFTER_WORD.has(before.value) && !JSX_AFTER_WORD.has(before.value);
+    if (before.kind !== "punc" || (before.value !== ")" && before.value !== "]")) return false;
+    if (before.value === "]") return true;
+    let depth = 0;
+    for (let k = tokens.length - 2; k >= 0; k -= 1) {
+      const token = tokens[k]!;
+      if (token.kind !== "punc") continue;
+      if (token.value === ")") depth += 1;
+      else if (token.value === "(" && --depth === 0) {
+        const head = tokens[k - 1];
+        return !(head?.kind === "id" && ["if", "while", "for", "with"].includes(head.value));
+      }
+    }
+    return false;
+  };
+
   // Whether a `<` at `i` opens an element: in expression position, before a
   // tag name or `>`, and not a generic arrow's type parameters (`<T,>`,
-  // `<T extends X>`), which a component file must spell that way.
+  // `<T extends X>`, `<T = X>`), which a component file must spell that way.
   const jsxStarts = (): boolean => {
-    if (!jsx || !/[A-Za-z>]/.test(text[i + 1] ?? "")) return false;
+    if (!jsx || !/[A-Za-z_$>]/.test(text[i + 1] ?? "")) return false;
     if (TYPE_PARAMS_IN_JSX.test(text.slice(i, i + 200))) return false;
     const prev = prevSignificant();
     return (
       prev === undefined ||
-      (prev.kind === "punc" && JSX_AFTER_PUNC.has(prev.value)) ||
+      (prev.kind === "punc" && JSX_AFTER_PUNC.has(prev.value) && !postfixBang(prev)) ||
       (prev.kind === "id" && JSX_AFTER_WORD.has(prev.value))
     );
+  };
+
+  // The index after a JSX attribute string at `at`: it runs to the next
+  // same quote, may span lines and has no escapes. -1 when it does not end.
+  const skipAttributeString = (at: number): number => {
+    const close = text.indexOf(text[at]!, at + 1);
+    if (close < 0) return -1;
+    for (let k = at + 1; k < close; k += 1) if (text[k] === "\n") line += 1;
+    return close + 1;
+  };
+
+  // Past an opening tag's name and its type arguments (`<Table<Row> rows={r} />`).
+  const tagName = (): void => {
+    while (i < n && /[\w$.:-]/.test(text[i]!)) i += 1;
+    let k = i;
+    while (k < n && /\s/.test(text[k]!)) k += 1;
+    if (text[k] !== "<") return;
+    for (let at = i; at < k; at += 1) if (text[at] === "\n") line += 1;
+    i = k;
+    let depth = 0;
+    while (i < n) {
+      const c = text[i]!;
+      if (c === "\n") line += 1;
+      if (c === '"' || c === "'" || c === "`") {
+        const close = c === "`" ? skipTemplate(i)?.end ?? null : skipString(i);
+        if (close === null) throw BAIL;
+        i = close;
+        continue;
+      }
+      if (c === "<") depth += 1;
+      else if (c === ">" && text[i - 1] !== "=" && --depth === 0) {
+        i += 1;
+        return;
+      }
+      i += 1;
+    }
+    throw BAIL;
   };
 
   // A JSX `{...}` container from its `{` to after its `}`; its code is tokenized.
@@ -180,6 +241,7 @@ function lexAll(text: string, jsx: boolean): Token[] {
 
   // A tag's inside, from after `<` to after its `>`; true when it closed itself (`/>`).
   const jsxTag = (): boolean => {
+    tagName();
     while (i < n) {
       const c = text[i]!;
       if (c === "\n") {
@@ -188,8 +250,8 @@ function lexAll(text: string, jsx: boolean): Token[] {
         continue;
       }
       if (c === '"' || c === "'") {
-        const close = skipString(i);
-        if (close === null) throw BAIL;
+        const close = skipAttributeString(i);
+        if (close < 0) throw BAIL;
         i = close;
         continue;
       }
@@ -317,7 +379,7 @@ function lexAll(text: string, jsx: boolean): Token[] {
       const prev = prevSignificant();
       const regex =
         prev === undefined ||
-        (prev.kind === "punc" && REGEX_AFTER_PUNC.has(prev.value)) ||
+        (prev.kind === "punc" && REGEX_AFTER_PUNC.has(prev.value) && !postfixBang(prev)) ||
         (prev.kind === "id" && REGEX_AFTER_WORD.has(prev.value));
       if (regex) {
         let k = i + 1;
@@ -488,6 +550,18 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
     return after > 0 && punc(after, "(") ? after : -1;
   };
 
+  /**
+   * At the `<` of type arguments in a type after `as` or `satisfies`
+   * (`x as Record<string, T>`), the index after their `>`, so their commas
+   * do not end the entry; else -1.
+   */
+  const assertedTypeArgs = (k: number, limit: number): number => {
+    if (!punc(k, "<") || !is(k - 1, "id")) return -1;
+    let name = k - 1;
+    while (punc(name - 1, ".") && is(name - 2, "id")) name -= 2;
+    return is(name - 1, "id", "as") || is(name - 1, "id", "satisfies") ? angleEnd(k, limit) : -1;
+  };
+
   /** Past a type parameter list at `k` when there is one; -1 when it does not close. */
   const pastTypeParams = (k: number, limit: number): number => (punc(k, "<") ? angleEnd(k, limit) : k);
 
@@ -522,7 +596,10 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
     calls.push({ from, start: token.start, end: tokens[close]!.end, member, literals, takesFunction });
   }
 
-  /** Skips a type annotation after `:` up to the token where `stop` holds, jumping brackets. */
+  /**
+   * Skips a type annotation after `:` up to the token where `stop` holds,
+   * jumping brackets and type argument lists (`Map<\n  string,\n  T\n>`).
+   */
   const skipType = (from: number, limit: number, stop: (index: number) => boolean): number => {
     let k = from;
     while (k < limit && !stop(k)) {
@@ -530,6 +607,13 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
       if (token.kind === "punc" && OPEN[token.value]) {
         k = match.get(k)! + 1;
         continue;
+      }
+      if (token.kind === "punc" && token.value === "<") {
+        const after = angleEnd(k, limit);
+        if (after > 0) {
+          k = after;
+          continue;
+        }
       }
       if (token.kind === "punc" && (token.value === ";" || CLOSE.has(token.value))) return k;
       k += 1;
@@ -578,6 +662,8 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
   /** The end (exclusive token index) of an expression starting at `from`. */
   const exprEnd = (from: number, limit: number): number => {
     let k = from;
+    // Where the last asserted type's argument list ended: its `>` ends an operand.
+    let typeArgsEnd = -1;
     while (k < limit) {
       const token = t(k)!;
       if (token.kind === "punc" && OPEN[token.value]) {
@@ -589,13 +675,20 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
         k = call;
         continue;
       }
+      const asserted = assertedTypeArgs(k, limit);
+      if (asserted > 0) {
+        k = typeArgsEnd = asserted;
+        continue;
+      }
       if (token.kind === "punc" && (token.value === "," || token.value === ";" || CLOSE.has(token.value))) return k;
       if (k > from) {
         const prev = t(k - 1)!;
         const prevEnds =
           prev.kind === "str" || prev.kind === "num" || prev.kind === "tpl" || prev.kind === "regex" ||
-          (prev.kind === "id" && !REGEX_AFTER_WORD.has(prev.value)) ||
-          (prev.kind === "punc" && (prev.value === ")" || prev.value === "]" || prev.value === "}"));
+          // A keyword after `.` is a property name (`Effect.void`), so an operand.
+          (prev.kind === "id" && (!REGEX_AFTER_WORD.has(prev.value) || punc(k - 2, ".") || punc(k - 2, "?."))) ||
+          (prev.kind === "punc" && (prev.value === ")" || prev.value === "]" || prev.value === "}")) ||
+          k === typeArgsEnd;
         const startsStatement =
           (token.kind === "id" && !["as", "satisfies", "instanceof", "in", "of"].includes(token.value)) ||
           token.kind === "str";
@@ -686,7 +779,8 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
     let i = from;
     while (i < limit) {
       const token = t(i)!;
-      if (token.kind === "id" && token.value === "function") {
+      // `function` as a member name (`errors.function`) is not a declaration.
+      if (token.kind === "id" && token.value === "function" && !punc(i - 1, ".") && !punc(i - 1, "?.")) {
         let k = i + 1;
         if (punc(k, "*")) k += 1;
         if (is(k, "id")) {
@@ -724,18 +818,24 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
               continue;
             }
           }
-          const fn = functionAt(value, limit);
+          // A type assertion (`<T>value`, not before `(`): its operand is the value.
+          const assertion = punc(value, "<") ? angleEnd(value, limit) : -1;
+          const operand = assertion > 0 && !punc(assertion, "(") ? assertion : value;
+          const fn = functionAt(operand, limit);
           if (fn) {
             i = named(name, i, fn, i + 1);
             continue;
           }
           // A function this scanner did not read (a generic it cannot close, an
-          // `async` or `function` value it cannot follow): not read at all.
-          if (punc(value, "<") || is(value, "id", "function") || (is(value, "id", "async") && !punc(value + 1, "."))) {
+          // `async` or `function` value it cannot follow): not read at all. A
+          // value named `async` (`async ? a : b`) is a value.
+          const unreadGeneric = punc(operand, "<");
+          const unreadAsync = is(operand, "id", "async") && (is(operand + 1, "id") || punc(operand + 1, "(") || punc(operand + 1, "<"));
+          if (unreadGeneric || is(operand, "id", "function") || unreadAsync) {
             unplaced = true;
             return;
           }
-          i = value;
+          i = operand;
           continue;
         }
       }
@@ -788,6 +888,11 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
       const call = typeArgsCall(k, limit);
       if (call > 0) {
         k = call;
+        continue;
+      }
+      const asserted = assertedTypeArgs(k, limit);
+      if (asserted > 0) {
+        k = asserted;
         continue;
       }
       if (token.kind === "punc" && OPEN[token.value]) {
@@ -870,14 +975,23 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
       }
       const memberStart = i;
       let k = i;
-      // Decorators: `@name`, `@a.b`, `@name(...)`.
+      // Decorators: `@name`, `@a.b`, `@name(...)`, `@name<T>(...)`; a name
+      // on the next line is the member's, never the decorator's.
       while (punc(k, "@")) {
         k += 1;
-        while (is(k, "id") || punc(k, ".")) k += 1;
+        if (is(k, "id")) k += 1;
+        while (punc(k, ".") && is(k + 1, "id")) k += 2;
+        if (punc(k, "<")) {
+          k = angleEnd(k, limit);
+          if (k < 0) {
+            unplaced = true;
+            return;
+          }
+        }
         if (punc(k, "(")) k = match.get(k)! + 1;
       }
-      // A modifier word followed by what follows a name (`get<T>()`) is the name.
-      while (is(k, "id") && CLASS_MODIFIERS.has(t(k)!.value) && !punc(k + 1, "(") && !punc(k + 1, "=") && !punc(k + 1, ";") && !punc(k + 1, ":") && !punc(k + 1, "<")) {
+      // A modifier word followed by what follows a name (`get<T>()`, `public!: boolean`) is the name.
+      while (is(k, "id") && CLASS_MODIFIERS.has(t(k)!.value) && !punc(k + 1, "(") && !punc(k + 1, "=") && !punc(k + 1, ";") && !punc(k + 1, ":") && !punc(k + 1, "<") && !punc(k + 1, "?") && !punc(k + 1, "!")) {
         k += 1;
       }
       if (punc(k, "*")) k += 1;
