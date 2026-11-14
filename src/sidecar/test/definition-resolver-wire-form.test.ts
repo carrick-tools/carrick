@@ -7,7 +7,7 @@
  * side of an `http` pair in that form (`JsonWire<T>` in the probe). The
  * definitions pass printed the same alias as declared, so the stored
  * `expanded` text said `Date` where the judge read `string`. Both now read
- * one rule, `sentInJsonWireForm`.
+ * one rule, `wireFormFor` (a GraphQL producer response too, carrick#4275).
  *
  * `definition` (as written) keeps the declared names in every case.
  */
@@ -75,8 +75,15 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(input.expanded, /createdAt: Date/, input.expanded);
   });
 
-  it('a GraphQL producer response keeps its declared Date', () => {
+  it('a GraphQL producer response travels as its JSON form: the server serialises each leaf (carrick#4275)', () => {
     const d = resolve({ protocol: 'graphql', type_kind: 'response', side: 'producer' });
+    assert.match(d.expanded, /createdAt: string/, d.expanded);
+    assert.doesNotMatch(d.expanded, /Date/, d.expanded);
+    assert.match(d.definition, /createdAt: Date/, 'the as-written form keeps the declared type');
+  });
+
+  it('a GraphQL request is read by the server as declared', () => {
+    const d = resolve({ protocol: 'graphql', type_kind: 'request', side: 'consumer' });
     assert.match(d.expanded, /createdAt: Date/, d.expanded);
   });
 

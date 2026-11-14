@@ -59,6 +59,7 @@ import type {
   ExtractionRule,
   TypeHome,
   TypeProvenance,
+  WireFormat,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
 import { declarationSite } from './bundler.js';
@@ -135,7 +136,6 @@ import {
   jsonWireType,
   type ExpandOrigin,
   type MemberOverrides,
-  type WireFormat,
 } from './type-structural-expander.js';
 
 /**

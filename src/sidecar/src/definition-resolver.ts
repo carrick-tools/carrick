@@ -11,10 +11,10 @@
  *    line itself is the as-written form.
  *  - `expanded`: the fully *structural* form, with every named member type
  *    inlined to its member structure, recursively. The sending side of an
- *    `http` payload prints in JSON wire form (a `Date` as `string`), by the
- *    rule the judge compares it under (`sentInJsonWireForm`,
- *    carrick-cloud#3503): the stored text says what travels. `definition`
- *    stays as written.
+ *    `http` payload and a GraphQL producer response print in JSON wire form
+ *    (a `Date` as `string`), by the rule the judge compares them under
+ *    (`wireFormFor`, carrick-cloud#3503, carrick#4275): the stored text says
+ *    what travels. `definition` stays as written.
  *
  * An alias whose own type did not resolve produces neither: the tree is read
  * as its self-check read it, so a reference that leaves it and that the
@@ -44,7 +44,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Project, Node, type SourceFile, type Type } from 'ts-morph';
-import { sentInJsonWireForm, sidecarCompilerOptions, withStubResolution } from './capture/index.js';
+import { wireFormFor, sidecarCompilerOptions, withStubResolution } from './capture/index.js';
 import { defaultLibraryOptions } from './default-library.js';
 import {
   expandTypeStructural,
@@ -184,11 +184,9 @@ export class DefinitionResolver {
       // form the payload travels in where the judge compares that form. An
       // RPC procedure fails closed to the declared form: its router's
       // transformer, not JSON, decides what travels (carrick#4275).
-      const wire =
-        !payload.procedure &&
-        sentInJsonWireForm(payload.protocol, payload.type_kind, payload.side)
-          ? 'json'
-          : 'declared';
+      const wire = payload.procedure
+        ? 'declared'
+        : wireFormFor(payload.protocol, payload.type_kind, payload.side);
       const expanded = expandTypeStructural(type, origin, { wire });
 
       return { type_alias: alias, definition, expanded };

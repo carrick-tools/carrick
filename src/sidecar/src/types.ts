@@ -523,8 +523,9 @@ export interface ResolveDefinitionsRequest extends BaseRequest {
  * One surface alias to resolve, and the payload it types: which protocol,
  * which kind of payload, and which side of the operation the entry is on.
  * The resolver prints the alias's structural form in JSON wire form exactly
- * where the judge compares that form (`sentInJsonWireForm`,
- * carrick-cloud#3503): the sending side of an `http` payload. A derived alias
+ * where the judge compares that form (`wireFormFor`, carrick-cloud#3503,
+ * carrick#4275): the sending side of an `http` payload and a GraphQL producer
+ * response. A derived alias
  * (an unwidened reading, a response-mode case) carries its base entry's facts.
  */
 export interface DefinitionAlias {
@@ -2018,6 +2019,8 @@ export type TypeProvenance = import('./capture/api.js').TypeProvenance;
 /** carrick#1836: declared in the capture bundle, which reads it on a literal anchor. */
 export type PrintedName = import('./capture/api.js').PrintedName;
 export type TypeProvenanceReason = import('./capture/api.js').TypeProvenanceReason;
+/** carrick#4275: declared in the capture bundle, where `wireFormFor` answers it. */
+export type WireFormat = import('./capture/api.js').WireFormat;
 
 /**
  * Source location information for a type

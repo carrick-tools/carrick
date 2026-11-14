@@ -36,6 +36,7 @@ import type {
   CheckPairSpec,
   ProbeProtocol,
   ProbeTypeKind,
+  WireFormat,
 } from './api.js';
 
 /** Which pair endpoint supplies the `sent` value / the `expected` binding. */
@@ -71,20 +72,29 @@ export function directionFor(
 }
 
 /**
- * Whether a payload travels in its JSON wire form: the one rule the judge and
- * the stored type text both read (carrick-cloud#3503). An `http` payload is
- * serialised before it travels, and `JSON.stringify` writes a value's
- * `toJSON()` result, so the SENDING side of an `http` pair (`directionFor`'s
- * `sent`: the producer of a response, the consumer of a request body) is
- * what the other side receives in wire form. Every other protocol is compared
- * and stored as declared (carrick#4275 decides theirs here, once).
+ * The form a payload travels in: the one rule the judge and the stored type
+ * text both read (carrick-cloud#3503, carrick#4275). Only the SENDING side
+ * (`directionFor`'s `sent`) is ever transformed, because that is where
+ * serialisation happens:
+ *
+ *  - `http`: a body is serialised with `JSON.stringify`, which writes a
+ *    value's `toJSON()` result, so the producer of a response and the
+ *    consumer of a request body send their JSON form;
+ *  - `graphql` response: the server sends each leaf through its scalar's
+ *    `serialize`, so a resolver's `Date` reaches the client as a string. The
+ *    request (variables) is read by the server as declared;
+ *  - socket and pub/sub payloads stay declared until the codec each library
+ *    uses is a known fact: the codec belongs to the client, not the protocol.
  */
-export function sentInJsonWireForm(
+export function wireFormFor(
   protocol: ProbeProtocol,
   typeKind: ProbeTypeKind,
   side: Side
-): boolean {
-  return protocol === 'http' && directionFor(protocol, typeKind).sent === side;
+): WireFormat {
+  if (directionFor(protocol, typeKind).sent !== side) return 'declared';
+  if (protocol === 'http') return 'json';
+  if (protocol === 'graphql' && typeKind === 'response') return 'json';
+  return 'declared';
 }
 
 /** Deterministic FNV-1a (32-bit) over the pair's stable key. Never a path. */
@@ -383,7 +393,9 @@ export function buildProbe(
   const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
   push(`declare const sent: ${sentBody};`);
 
+  const wire = wireFormFor(spec.protocol, spec.type_kind, direction.sent);
   let assignmentLine: number;
+  let wireAssignmentLine: number | undefined;
   if (spec.protocol === 'graphql') {
     // GraphQL selection-set semantics (v1 `unwrapGraphqlPayload` parity): the
     // producer side (always `sent` for graphql — see the direction table) is
@@ -478,6 +490,19 @@ export function buildProbe(
     );
     push(`declare const sentComparand: GqlComparand;`);
     assignmentLine = push(`const expected: GqlExpected = sentComparand;`);
+    // The wire line over the comparand (carrick#4275): JSON applies after the
+    // envelope unwrap, so the unwrap reads the declared shape and never meets
+    // the transform. It mirrors `WireSent` below and keeps the comparand
+    // whenever that already assigns. The const is `sentWire`, the name the
+    // field report reads (`comparedTypes`).
+    if (wire === 'json') {
+      for (const line of jsonWireDeclarations('')) push(line);
+      push(
+        `type GqlWire = [GqlComparand] extends [GqlExpected] ? GqlComparand : (JsonWireSame<JsonWire<GqlComparand>, GqlComparand> extends true ? GqlComparand : JsonWire<GqlComparand>);`
+      );
+      push(`declare const sentWire: GqlWire;`);
+      wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
+    }
   } else {
     assignmentLine = push(`const expected: Expected = sent;`);
   }
@@ -496,8 +521,7 @@ export function buildProbe(
   // so a pair that agrees as declared never instantiates the mapped type (no
   // cost, and no way for the transform to turn an agreeing pair into a
   // disagreeing one). tsc stays the judge of both forms.
-  let wireAssignmentLine: number | undefined;
-  if (sentInJsonWireForm(spec.protocol, spec.type_kind, direction.sent)) {
+  if (spec.protocol !== 'graphql' && wire === 'json') {
     // Keep the DECLARED type whenever serialising changes nothing observable,
     // so the compiler's headline still names the real surface alias (the probe
     // prints `Sent`, which the scrub rewrites) instead of expanding a mapped

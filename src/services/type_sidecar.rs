@@ -2672,10 +2672,11 @@ pub struct InferTiming {
 /// One surface alias to resolve, and the payload it types: its protocol, its
 /// kind and the side of the operation its entry is on (carrick-cloud#3503).
 /// The compiler engine prints the alias's structural form in JSON wire form
-/// exactly where the check compares that form, the sending side of an http
-/// payload; the rule is the engine's own (`sentInJsonWireForm`), so this
-/// carries the facts and never the answer. A derived alias (an unwidened
-/// reading, a response-mode case) carries its base entry's facts.
+/// exactly where the check compares that form (the sending side of an http
+/// payload, a GraphQL producer response); the rule is the engine's own
+/// (`wireFormFor`), so this carries the facts and never the answer. A
+/// derived alias (an unwidened reading, a response-mode case) carries its
+/// base entry's facts.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DefinitionAlias {
     pub alias: String,
