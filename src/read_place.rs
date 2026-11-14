@@ -121,12 +121,9 @@ fn value_spans(answer: &InferredType, repo_root: &Path) -> Vec<ValueSpan> {
         .iter()
         .filter_map(|span| {
             let relative = Path::new(&span.file_path).strip_prefix(repo_root).ok()?;
+            let _ = relative;
             Some(ValueSpan {
-                file_path: relative
-                    .components()
-                    .map(|part| part.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/"),
+                file_path: span.file_path.clone(),
                 span_start: span.start,
                 span_end: span.end,
             })
