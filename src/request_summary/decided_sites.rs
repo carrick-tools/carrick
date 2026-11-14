@@ -1169,7 +1169,7 @@ enum RowRead {
 /// decides where it gives a read there; where it gives none, the name the
 /// syntax reads stands ([`CallIr::handed_names`]). A member read (`deps.g`)
 /// is no name.
-fn handed_by(
+pub(super) fn handed_by(
     source: &RequestSummaryInputs,
     file: &Path,
     call: &CallIr,
