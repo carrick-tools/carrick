@@ -244,8 +244,7 @@ function graphqlLeafText(
     return namedText(type);
   }
   if (type.isUnion()) {
-    const members = canonicalMembers(type.getUnionTypes(), seen, depth, cursor, here, origin);
-    return [...new Set(members)].join(' | ');
+    return canonicalMembers(type.getUnionTypes(), seen, depth, cursor, here, origin).join(' | ');
   }
   const json = () => expandAt(type, seen, depth, cursor, 'json', origin);
   if ('list' in leaf) {
@@ -490,9 +489,12 @@ function canonicalMembers(
   wire: WireWalk,
   origin: ExpandOrigin,
 ): string[] {
-  return orderMembers(members, (member) =>
+  const texts = orderMembers(members, (member) =>
     expandAt(member, seen, depth + 1, cursor, wire, origin),
   );
+  // Under a GraphQL leaf several members can send one type (`bigint |
+  // string` under `String`): print it once (carrick#4403).
+  return typeof wire === 'object' ? [...new Set(texts)] : texts;
 }
 
 /**

@@ -40,6 +40,8 @@ export interface Receipt {
   note?: bigint;
   extra: unknown;
   due: Date;
+  flag?: true | false;
+  ref?: string | number;
 }
 export type Endpoint_row = Row;
 export type Endpoint_priced = Priced;
@@ -105,6 +107,8 @@ describe('resolve_definitions prints the sending side of an http payload in wire
           note: { scalar: 'String' },
           extra: { scalar: 'String' },
           due: { non_null: { type: 'Moment' } },
+          flag: { scalar: 'Boolean' },
+          ref: { scalar: 'ID' },
         },
       },
       Line: { fields: { amountMinor: { scalar: 'String' } } },
@@ -134,6 +138,9 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(d.expanded, /extra: unknown;/, d.expanded);
     // A type reference the table does not hold keeps the JSON form.
     assert.match(d.expanded, /due: string;/, d.expanded);
+    // An optional union under one scalar prints that scalar once.
+    assert.match(d.expanded, /flag\?: boolean;/, d.expanded);
+    assert.match(d.expanded, /ref\?: string;/, d.expanded);
     assert.doesNotMatch(d.expanded, /bigint|Date/, d.expanded);
     assert.match(d.definition, /totalMinor: bigint/, 'the as-written form keeps the declared type');
 
