@@ -452,7 +452,7 @@ test("Stop names a flagged answer that did not answer the edit as a gap, once, a
 });
 
 // R46.2: with a finding Stop prints, Stop prints the answer as the next
-// carrier would have (problem, uses and lead lines), once, and claims it.
+// carrier would have (problem, uses and similar-function lines), once, and claims it.
 test("Stop prints an answer queued in place of the probe whole when it holds a finding, and nothing prints it again", async (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
@@ -460,7 +460,7 @@ test("Stop prints an answer queued in place of the probe whole when it holds a f
   const entry = enqueue(workspace.root, SESSION, [workspace.file], now, { home, insteadOfProbe: true })[0]!;
   // Recorded, as the edit hook records every file it queues.
   recordEdit(SESSION, workspace.root, now, home, [workspace.file]);
-  const lead = fixture("check-deferred-lead.json").recheck!.new_functions!;
+  const lead = fixture("check-deferred-similar.json").recheck!.new_functions!;
   const whole: CheckResult = {
     ...problem(),
     recheck: { ran: "extraction+types", elapsed_ms: 1, new_functions: lead },
@@ -476,7 +476,7 @@ test("Stop prints an answer queued in place of the probe whole when it holds a f
   once(/after your earlier edit to it: 2 contract problems\./);
   once(/^- .*type_mismatch/m);
   once(/Other files use what this file declares/);
-  once(/`slugify` looks like `toSlug`/);
+  once(/`slugify` may already exist/);
   assert.ok(fs.existsSync(path.join(sessionsDir(home), `${SESSION}.recheck.${entry.seq}.delivered`)), "claimed at Stop");
   assert.equal((await bashHook(home, workspace.root)).stdout, "", "the next carrier prints nothing of it");
 });

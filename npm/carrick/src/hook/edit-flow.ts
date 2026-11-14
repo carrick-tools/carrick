@@ -13,8 +13,8 @@ import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
-import { leadLines } from "./lead.ts";
-import type { LeadLines } from "./lead.ts";
+import { similarLines } from "./similar.ts";
+import type { SimilarLines } from "./similar.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
@@ -92,7 +92,7 @@ export async function editFlow(
   // Files whose uses lines this message carries, remembered only once it is
   // delivered: who uses a file is shown once per file per session (carrick#2067).
   const told: string[] = [];
-  // Lead lines (carrick#3249) are remembered the same way, once delivered.
+  // Similar-function blocks (carrick-cloud#3490) are remembered the same way, once delivered.
   const led: string[] = [];
   const relatives = edited.map((file) => path.relative(choice.root, file));
   // Where each operation the edited code serves or calls sits in other
@@ -145,7 +145,7 @@ export async function editFlow(
   for (const [at, index] of probed.entries()) results[index] = answers.results[at] ?? null;
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
-  const leads = new Map<number, LeadLines>();
+  const leads = new Map<number, SimilarLines>();
   for (const [index, relative] of relatives.entries()) {
     if (queued.has(edited[index]!)) {
       log("queued in place of the probe:", relative);
@@ -161,8 +161,8 @@ export async function editFlow(
       if (queueable) toQueue.push(index);
       continue;
     }
-    // The lead rides on the probe answer, so a queued file gets it too.
-    const found = leadLines(result, relative, (key) => !session || !wasLed(session, key), log);
+    // The block rides on the probe answer, so a queued file gets it too.
+    const found = similarLines(result, relative, (key) => !session || !wasLed(session, key), log);
     if (found.lines.length > 0) leads.set(index, found);
     if (queueable && needsBackground(result)) {
       toQueue.push(index);

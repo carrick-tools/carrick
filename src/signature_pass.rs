@@ -588,7 +588,7 @@ fn build_infer_requests(
 /// Defaulted trailing parameters are optional at the call site. Before a
 /// required parameter they still occupy a position, but accept `undefined`.
 /// Initializer source remains in the argument record rather than this type.
-fn compose_signature(def: &FunctionDefinition) -> String {
+pub(crate) fn compose_signature(def: &FunctionDefinition) -> String {
     let last_required = def
         .arguments
         .iter()

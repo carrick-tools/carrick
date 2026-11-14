@@ -308,14 +308,14 @@ export type NewFunction = {
   /** Where it starts, so a reader can open it without searching. */
   line: number;
   /**
-   * An indexed function this one looks like, read from body tokens and the
-   * name alone. Absent when nothing passes, which is the usual answer.
+   * Indexed functions this one may already exist as, best first, at most six.
+   * No score floor: empty or absent only when none shares a word with it.
    */
-  lead?: Lead;
+  similar?: SimilarFunction[];
 };
 
-/** The indexed function a new function looks like. */
-export type Lead = {
+/** An indexed function a new function may already exist as. */
+export type SimilarFunction = {
   /** As the index spells it: `name`, or `Class.member`. */
   name: string;
   /**
@@ -327,20 +327,16 @@ export type Lead = {
   line: number;
   /** 0 when the index holds no end line. */
   end_line: number;
-  /** Weighted token overlap, 0 to 1. For logs, never for a reader's text. */
+  /** The ranking's score, 0 to 1. For logs, never for a reader's text. */
   score: number;
-  basis: "tokens" | "name";
-  /** `[this function's, the lead's]` when both are written and differ. */
-  return_types?: [string, string];
-  /** Up to three indexed callers of the lead. */
-  callers: LeadRef[];
-  callers_total: number;
-  /** Up to two more indexed functions like the lead. */
-  also: LeadRef[];
+  /** The index's one-line signature, when it holds one. */
+  signature?: string;
+  exported: boolean;
+  /** How many other files hold an indexed call that names it. */
+  called_from: number;
+  /** The index's one sentence about what it does, when it holds one. */
+  intent?: string;
 };
-
-/** One indexed function a lead names beside itself. */
-export type LeadRef = { name: string; file: string; line: number };
 
 export const SCHEMA = "carrick.check/0";
 export const STATUS_SCHEMA = "carrick.status/0";

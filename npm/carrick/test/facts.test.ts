@@ -1333,7 +1333,7 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
 // R46.2 end to end (the review's S4): a deferred answer is named at its first
 // Stop as with the switch off, once, and its lead is not lost: Stop leaves the
 // answer for the next carrier, which prints the lead.
-test("with a fact file, a deferred answer is named at Stop as before, once, and its lead prints on the next carrier", async (t) => {
+test("with a fact file, a deferred answer is named at Stop as before, once, and its similar-function block prints on the next carrier", async (t) => {
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");
   // The `check --changed` the first Stop queues answers late, whichever runner
@@ -1343,7 +1343,7 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   const slowCheck = { CARRICK_FAKE_FULL_DELAY_MS: "2000" };
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "lead",
-    probe: "check-deferred-lead.json",
+    probe: "check-deferred-similar.json",
     env: slowCheck,
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
@@ -1363,14 +1363,19 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   // machine the queued check can answer before this Stop runs in spite of the
   // hold; Stop then states its clean line itself (carrick#4085), and that is
   // the one time it is said.
-  const lead = "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.";
+  const lead = [
+    "Carrick: `slugify` may already exist. Existing functions that could do this job:",
+    "1. `toSlug(title: string) => string` at shared-lib/src/text/slug.ts:4 (exported; called from 2 other files)",
+    "   Turns a title into a lowercase, dash-joined URL segment.",
+    "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
+  ].join("\n");
   const clean = "Carrick checked orders-api/src/routes/orders.ts and found no contract problem.";
   const second = context(await stop(ws, "lead"));
   assert.ok(second === "" || second === clean, `named once: ${second}`);
   // The `check --changed` Stop queued has answered (the fake binary: clean).
   await waitForSessionAnswers(ws.home, "lead", 2);
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
-  // The lead always prints here; the clean line prints here unless the second Stop said it.
+  // The block always prints here; the clean line prints here unless the second Stop said it.
   assert.equal(context(next.stdout), second === "" ? `${lead}\n\n${clean}` : lead);
 });
 

@@ -1131,62 +1131,73 @@ test("on the lsp channel nothing is queued and nothing is printed; with no sessi
 });
 
 // ---------------------------------------------------------------------------
-// The edit-time lead (carrick#3249): a function the edit added that looks like
-// an indexed one gets one line naming it, once per function per session.
+// The edit-time similar-function list (carrick-cloud#3490): a function the edit
+// added gets one block naming the indexed functions it may already exist as,
+// once per function per session. The wording is frozen with the measured block.
 
-const LEAD_LINE =
-  "Carrick: `slugify` looks like `toSlug` at src/text/slug.ts:4 (called from src/routes/users.ts:10, src/views/page.ts:22, +2 more): reuse or extend it if it does the same job.";
+const SIMILAR_BLOCK = [
+  "Carrick: `slugify` may already exist. Existing functions that could do this job:",
+  "1. `toSlug(title: string) => string` at src/text/slug.ts:4 (exported; called from 4 other files)",
+  "   Turns a title into a lowercase, dash-joined URL segment.",
+  "2. `urlSegment` at src/routes/segment.ts:11 (not exported; called from 0 other files)",
+  "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
+].join("\n");
 
-test("an answered edit whose new function has a lead prints the lead line once per session", async (t) => {
+test("an answered edit whose new function has similar rows prints the block once per session", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
-  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-lead.json") });
+  const env = fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-similar.json") });
   const edit = (session: string) =>
     runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });
 
-  const first = contextOf((await edit("sess-lead")).stdout);
-  assert.ok(first.split("\n\n").includes(LEAD_LINE), first);
-  // A second save in the same session: the lead is not repeated.
-  const second = contextOf((await edit("sess-lead")).stdout);
-  assert.equal(second.includes("looks like"), false, second);
+  const first = contextOf((await edit("sess-similar")).stdout);
+  assert.ok(first.split("\n\n").includes(SIMILAR_BLOCK), first);
+  // A second save in the same session: the block is not repeated.
+  const second = contextOf((await edit("sess-similar")).stdout);
+  assert.equal(second.includes("may already exist"), false, second);
   // Another session is told again.
-  assert.ok(contextOf((await edit("sess-lead-2")).stdout).includes(LEAD_LINE));
+  assert.ok(contextOf((await edit("sess-similar-2")).stdout).includes(SIMILAR_BLOCK));
 });
 
-test("an answer without a lead prints the same bytes as before", async (t) => {
+test("an answer without similar rows prints the same bytes as before", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
   const plain = await runHook("post-edit.ts", {
-    payload: { ...editPayload(workspace), session_id: "sess-nolead" },
+    payload: { ...editPayload(workspace), session_id: "sess-nosimilar" },
     env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions.json") }),
   });
-  assert.equal(contextOf(plain.stdout).includes("looks like"), false);
-  const led = await runHook("post-edit.ts", {
-    payload: { ...editPayload(workspace), session_id: "sess-withlead" },
-    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-lead.json") }),
+  assert.equal(contextOf(plain.stdout).includes("may already exist"), false);
+  const listed = await runHook("post-edit.ts", {
+    payload: { ...editPayload(workspace), session_id: "sess-withsimilar" },
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-new-functions-similar.json") }),
   });
-  assert.equal(contextOf(led.stdout).replace(LEAD_LINE, "").trim(), contextOf(plain.stdout).trim());
+  assert.equal(contextOf(listed.stdout).replace(SIMILAR_BLOCK, "").trim(), contextOf(plain.stdout).trim());
 });
 
-test("a queued edit with a lead prints the lead alone, and names another repo", async (t) => {
+test("a queued edit with similar rows prints the block alone, and names another repo", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const home = fakeHome(t);
   const run = await runHook("post-edit.ts", {
-    payload: { ...editPayload(workspace), session_id: "sess-lead-q" },
+    payload: { ...editPayload(workspace), session_id: "sess-similar-q" },
     env: deferredEnv(home, {
-      CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred-lead.json"),
+      CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred-similar.json"),
       CARRICK_FAKE_FULL_DELAY_MS: "100",
     }),
   });
-  // The lead is a finding, so it speaks; the queued file itself says nothing.
+  // The list is a finding, so it speaks; the queued file itself says nothing.
   const lines = contextOf(run.stdout).split("\n\n");
   assert.deepEqual(lines, [
-    "Carrick: `slugify` looks like `toSlug` at shared-lib/src/text/slug.ts:4: reuse or extend it if it does the same job.",
+    [
+      "Carrick: `slugify` may already exist. Existing functions that could do this job:",
+      "1. `toSlug(title: string) => string` at shared-lib/src/text/slug.ts:4 (exported; called from 2 other files)",
+      "   Turns a title into a lowercase, dash-joined URL segment.",
+      "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
+    ].join("\n"),
   ]);
-  await waitForAnswers(home, "sess-lead-q", 1);
+  await waitForAnswers(home, "sess-similar-q", 1);
 });
 
 test("the probe's limit is 600 ms whatever the file count", () => {

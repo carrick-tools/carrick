@@ -18,18 +18,20 @@
       {
         "name": "slugify",
         "line": 12,
-        "lead": {
-          "name": "toSlug",
-          "repo": "shared-lib",
-          "file": "src/text/slug.ts",
-          "line": 4,
-          "end_line": 9,
-          "score": 0.83,
-          "basis": "tokens",
-          "callers": [],
-          "callers_total": 0,
-          "also": []
-        }
+        "similar": [
+          {
+            "name": "toSlug",
+            "repo": "shared-lib",
+            "file": "src/text/slug.ts",
+            "line": 4,
+            "end_line": 9,
+            "score": 0.83,
+            "signature": "(title: string) => string",
+            "exported": true,
+            "called_from": 2,
+            "intent": "Turns a title into a lowercase, dash-joined URL segment."
+          }
+        ]
       }
     ]
   }
