@@ -42,8 +42,27 @@ pub fn document(workspace_root: &Path) -> Result<serde_json::Value, String> {
 
 /// The services of one repo, as a scan of it would load them.
 pub fn repo_programs(repo_path: &Path, repo_name: &str) -> Result<Vec<HeldProgram>, String> {
-    let _ = (repo_path, repo_name);
-    Ok(Vec::new())
+    // No `carrick.json`: the scan derives the list from the tree's manifests
+    // (`service_derivation::resolve`), and so does this.
+    let services = crate::service_derivation::resolve_for_scan(repo_path)?;
+    let scan_root = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let repo_str = repo_path.display().to_string();
+    Ok(services
+        .iter()
+        .map(|service| HeldProgram {
+            repo: repo_name.to_string(),
+            service: service
+                .service_name
+                .clone()
+                .unwrap_or_else(|| repo_name.to_string()),
+            repo_path: scan_root.display().to_string(),
+            sidecar_root: crate::engine::service_sidecar_root(&repo_str, service)
+                .display()
+                .to_string(),
+            tsconfig: service.tsconfig.clone(),
+            scan_root: scan_root.display().to_string(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -79,6 +98,7 @@ mod tests {
             r#"{"services":[{"serviceName":"orders","directory":"packages/orders","tsconfig":"tsconfig.build.json"}]}"#,
         );
         write(&mono.join("packages/orders/src/routes.ts"), "export {};\n");
+        write(&mono.join("packages/orders/tsconfig.build.json"), "{}\n");
         let solo = dir.path().join("solo");
         write(&solo.join("carrick.json"), r#"{"serviceName":"billing"}"#);
         write(&solo.join("src/app.ts"), "export {};\n");
@@ -122,6 +142,20 @@ mod tests {
             "tsconfig": ts,
             "scan_root": canonical.display().to_string(),
         })
+    }
+
+    /// Hidden: parsed, but only with `--json`, and named in no help list.
+    #[test]
+    fn the_subcommand_needs_json_and_is_not_listed() {
+        use crate::local_mode::cli::{LOCAL_COMMANDS, LocalCommand, parse};
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!LOCAL_COMMANDS.contains(&"held-programs"));
+        assert!(!crate::help::HELP.contains("held-programs"));
+        assert!(parse(&args(&["held-programs"])).unwrap().is_err());
+        assert_eq!(
+            parse(&args(&["held-programs", "--json"])).unwrap().unwrap(),
+            LocalCommand::HeldPrograms { workspace: None }
+        );
     }
 
     /// Both rows, exactly: the directory service roots its program at its

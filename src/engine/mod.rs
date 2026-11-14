@@ -11744,7 +11744,7 @@ fn service_scan_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
 
 /// The directory a service's sidecar is initialised at: the service's
 /// directory under the repo's absolute path, as `main` initialises its own.
-fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
+pub(crate) fn service_sidecar_root(repo_path: &str, service: &Config) -> std::path::PathBuf {
     let canonical =
         std::fs::canonicalize(repo_path).unwrap_or_else(|_| std::path::PathBuf::from(repo_path));
     match &service.directory {
