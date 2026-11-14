@@ -4462,9 +4462,12 @@ mod tests {
             names.sort();
             names
         };
-        let without_api = listing.view(|path| path.starts_with("apps/api/"));
-        let without_web = listing.view(|path| path.starts_with("apps/web/"));
-        let without_worker = listing.view(|path| path.starts_with("apps/worker/"));
+        let without_api =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/api/")));
+        let without_web =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/web/")));
+        let without_worker =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/worker/")));
         assert_eq!(names(&without_api), ["apps/web/src/checkout.test.ts"]);
         assert_eq!(names(&without_web), ["apps/api/src/server.ts"]);
         assert_eq!(
@@ -4476,6 +4479,44 @@ mod tests {
             1,
             "one git listing for three services"
         );
+    }
+
+    /// carrick#4390: a view of a folder below the git top asks its predicate by
+    /// the folder's own paths, `None` for a path outside the folder, and lists
+    /// what it keeps relative to the top level.
+    #[test]
+    fn a_view_below_the_git_top_asks_by_the_folders_paths() {
+        let (dir, commit) = crate::git_state::tests::committed_repo(&[
+            ("svc/src/a.ts", "export const value = 1;"),
+            ("shared/b.ts", "export const value = 1;"),
+        ]);
+        std::fs::write(dir.path().join("svc/src/a.ts"), "export const value = 2;").unwrap();
+        std::fs::write(dir.path().join("shared/b.ts"), "export const value = 2;").unwrap();
+        let folder = dir.path().join("svc").to_string_lossy().to_string();
+        let listing = ChangedSince::new(&folder, &[], &[]);
+        let commit = commit.trim().to_string();
+        let names = |view: &ChangedSince| -> Vec<String> {
+            let mut names: Vec<String> = view
+                .since(&commit)
+                .unwrap()
+                .into_iter()
+                .map(|change| change.path)
+                .collect();
+            names.sort();
+            names
+        };
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let seen = asked.clone();
+        let all = listing.view(move |path| {
+            seen.lock().unwrap().push(path.map(str::to_string));
+            false
+        });
+        assert_eq!(names(&all), ["shared/b.ts", "svc/src/a.ts"]);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, [None, Some("src/a.ts".to_string())]);
+        let own = listing.view(|path| path == Some("src/a.ts"));
+        assert_eq!(names(&own), ["shared/b.ts"]);
     }
 
     /// carrick#3230: which services load a package a pull request moved. A
