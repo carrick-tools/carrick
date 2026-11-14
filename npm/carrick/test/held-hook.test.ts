@@ -70,7 +70,7 @@ const contractRow = () => ({
 
 async function workspace(t: { after: (fn: () => void) => void }): Promise<Ws> {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-held-hook-")));
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-held-hook-home-")));
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "hh-")));
   t.after(async () => {
     await drainRunner(root);
     fs.rmSync(root, { recursive: true, force: true });
