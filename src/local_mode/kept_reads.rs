@@ -251,7 +251,7 @@ pub(super) fn read(
     repo: &Path,
 ) -> Option<RepoReads> {
     let began = Instant::now();
-    let found = load_reads(workspace, generation, now, repo)?;
+    let found = load_reads(workspace, generation, now, repo).filter(|_| false)?;
     took("probe-kept-read", began);
     Some(found)
 }
