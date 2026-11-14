@@ -12,8 +12,8 @@
       "emission_style": "imperative-send",
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "response_expression_text": null,
-      "response_expression_line": null,
+      "response_expression_text": "{ made: result.item.label }",
+      "response_expression_line": 22,
       "primary_type_symbol": null,
       "type_import_source": null
     },
@@ -28,8 +28,8 @@
       "emission_style": "imperative-send",
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "response_expression_text": null,
-      "response_expression_line": null,
+      "response_expression_text": "{ name: body.name, again }",
+      "response_expression_line": 32,
       "primary_type_symbol": null,
       "type_import_source": null
     },

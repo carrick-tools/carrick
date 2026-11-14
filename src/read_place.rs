@@ -21,12 +21,19 @@
 //! the place is the node the compiler engine's answer read (its
 //! `source_location`), converted to an offset.
 //!
+//! # Producers: `value_spans`
+//!
+//! A producer entry's ask names the registration, not a value, so it gets no
+//! `span_start`. The compiler engine's answer lists the nodes the published
+//! text was built from (`read_spans`); they are stored as
+//! `evidence.value_spans`, repo-relative, unless the alias has an explicit
+//! symbol entry (its text did not come from the answer) or the span is in a
+//! file outside the repo.
+//!
 //! # What is never placed
 //!
-//! - An HTTP producer's request or response. The compiler engine follows the
-//!   handler from the registration, so the ask's span is the registration
-//!   call, not a value; the value places are a separate question (carrick#4244
-//!   T3).
+//! - An HTTP producer's `span_start`: the ask's span is the registration
+//!   call, not a value.
 //! - A call result asked by line alone (no span, no text): its answer names
 //!   the result node, not the call (a named gap).
 //! - A call whose result label went unanswered (carrick#4154): it has no
@@ -38,7 +45,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::cloud_storage::{ManifestRole, TypeManifestEntry};
+use crate::cloud_storage::{ManifestRole, TypeManifestEntry, ValueSpan};
 use crate::operation::Protocol;
 use crate::services::type_sidecar::{InferKind, InferRequestItem, InferredType, SourceLocation};
 
@@ -58,7 +65,6 @@ pub(crate) fn store_read_places(
     repo_root: &Path,
     read_file: &dyn Fn(&str) -> Option<String>,
 ) {
-    let _ = (explicit, repo_root);
     let mut asks: HashMap<&str, Vec<&InferRequestItem>> = HashMap::new();
     for ask in infer {
         if let Some(alias) = ask.alias.as_deref() {
@@ -70,6 +76,16 @@ pub(crate) fn store_read_places(
         answered.entry(answer.alias.as_str()).or_insert(answer);
     }
     for entry in manifest.iter_mut() {
+        if entry.role == ManifestRole::Producer {
+            // The precedence of `enrich_manifest_with_type_resolution`: an
+            // explicit symbol entry's text wins, so no read made it.
+            if !explicit.contains(entry.type_alias.as_str()) {
+                if let Some(answer) = answered.get(entry.type_alias.as_str()) {
+                    entry.evidence.value_spans = value_spans(answer, repo_root);
+                }
+            }
+            continue;
+        }
         let Some(ask) = asks
             .get(entry.type_alias.as_str())
             .and_then(|asks| asks.iter().find(|ask| names_a_value(entry, ask)))
@@ -95,6 +111,27 @@ pub(crate) fn store_read_places(
             entry.evidence.span_end = Some(end);
         }
     }
+}
+
+/// The values an answer read, as repo-relative spans. A span in a file
+/// outside the repo is dropped: a reader of the blob has no file to open.
+fn value_spans(answer: &InferredType, repo_root: &Path) -> Vec<ValueSpan> {
+    answer
+        .read_spans
+        .iter()
+        .filter_map(|span| {
+            let relative = Path::new(&span.file_path).strip_prefix(repo_root).ok()?;
+            Some(ValueSpan {
+                file_path: relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                span_start: span.start,
+                span_end: span.end,
+            })
+        })
+        .collect()
 }
 
 /// Whether `ask` points at the value `entry`'s type was read from.

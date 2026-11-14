@@ -11,7 +11,7 @@ const app = new App();
 
 // naïve café ✓ 😀: non-ASCII text ahead of every value below
 
-// Two success sends and one error send: the error is not the contract.
+// A success send and an error send: only the located success payload is read.
 app.get('/two-success', async (req, res) => {
   const result = await save(req.body);
   if (!result.ok) {

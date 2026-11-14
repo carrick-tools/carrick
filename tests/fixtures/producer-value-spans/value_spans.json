@@ -8,14 +8,8 @@
       {
         "file": "src/routes.ts",
         "text": "{ made: result.item.label }",
-        "start": 661,
-        "end": 688
-      },
-      {
-        "file": "src/routes.ts",
-        "text": "{ none: true }",
-        "start": 718,
-        "end": 732
+        "start": 668,
+        "end": 695
       }
     ]
   },
@@ -28,8 +22,8 @@
       {
         "file": "src/routes.ts",
         "text": "(await req.json()) as NewWidget",
-        "start": 872,
-        "end": 903
+        "start": 879,
+        "end": 910
       }
     ]
   },
@@ -42,8 +36,8 @@
       {
         "file": "src/routes.ts",
         "text": "{ name: body.name, again }",
-        "start": 947,
-        "end": 973
+        "start": 954,
+        "end": 980
       }
     ]
   },
