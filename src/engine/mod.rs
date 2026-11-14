@@ -15143,7 +15143,15 @@ fn enrich_manifest_with_type_resolution(
             merge_any_provenance(&mut entry.any_provenance, provenance.iter().cloned());
         }
 
-        if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
+        if entry.any_provenance.iter().any(|p| p.path.is_empty()) {
+            // carrick#4289: a reason at the type's own root says this site
+            // states no type, so no answer for the alias (the bundle's
+            // model symbol included) makes it typed.
+            entry.is_explicit = false;
+            entry.type_state = ManifestTypeState::Unknown;
+            entry.evidence.is_explicit = false;
+            entry.evidence.type_state = ManifestTypeState::Unknown;
+        } else if let Some((type_string, is_explicit)) = resolved_types.get(&entry.type_alias) {
             // Check if the type is actually resolved. The shared
             // disqualifying-top-type notion (adversarial-review finding 2)
             // rejects not just whole-string "any"/"unknown" but any/unknown
@@ -25952,6 +25960,58 @@ unfollowed_member_calls_total: 0,
         enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
 
         assert_eq!(manifest[0].type_state, ManifestTypeState::Implicit);
+    }
+
+    /// carrick#4289: the model named a type for a consumer call while the
+    /// compiler's read of the same call abstained with a reason at the type's
+    /// root (the call result is still the enclosing generic function's type
+    /// parameter, or its import did not resolve). The bundle answers the alias
+    /// from the model's symbol, so the entry used to read `Explicit` beside a
+    /// reason saying the site states no type. A root reason means `Unknown`,
+    /// and nothing for a later stage to restore.
+    #[test]
+    fn a_root_reason_beside_a_model_type_reads_unknown() {
+        for reason in ["bound_by_callers", "unresolved_import"] {
+            let mut manifest = vec![consumer_entry("FeedView")];
+            let mut resolution = empty_resolution();
+            resolution
+                .explicit_manifest
+                .push(crate::services::type_sidecar::ManifestEntry {
+                    alias: "FeedView".to_string(),
+                    original_name: "Feed".to_string(),
+                    source_file: "lib/api.ts".to_string(),
+                    type_string: "{ cursor: string }".to_string(),
+                    is_explicit: true,
+                });
+            let mut abstain = inferred_with_symbol("Feed");
+            abstain.alias = "FeedView".to_string();
+            abstain.type_string = "unknown".to_string();
+            abstain.primary_type_symbol = None;
+            abstain.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+                path: String::new(),
+                kind: "unknown".to_string(),
+                reason: reason.to_string(),
+                detail: None,
+            }];
+            resolution.inferred_types.push(abstain);
+
+            enrich_manifest_with_type_resolution(&mut manifest, &resolution, None);
+
+            let entry = &manifest[0];
+            assert_eq!(entry.type_state, ManifestTypeState::Unknown, "{reason}");
+            assert_eq!(
+                entry.evidence.type_state,
+                ManifestTypeState::Unknown,
+                "{reason}"
+            );
+            assert!(
+                !entry.is_explicit && !entry.evidence.is_explicit,
+                "{reason}"
+            );
+            assert!(entry.v1_before_demotion.is_none(), "{reason}");
+            assert_eq!(entry.any_provenance.len(), 1, "{reason}");
+            assert_eq!(entry.any_provenance[0].reason, reason);
+        }
     }
 
     /// carrick#2011: the sending side's entry carries the spent-budget mark,
