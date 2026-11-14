@@ -106,7 +106,7 @@ export {
 } from './site-node.js';
 // v2 check core ("tsc as the judge"). Same bundle, same seam: the sidecar
 // reaches it only through this door (index.js).
-export { runCheck } from './check.js';
+export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, sentInJsonWireForm } from './check-probe.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';

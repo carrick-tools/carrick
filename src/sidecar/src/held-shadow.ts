@@ -28,7 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
-import { judgeTscPath } from './capture/check.js';
+import { WriteGuard, judgeTscPath } from './capture/index.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {
@@ -119,6 +119,7 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     return !segments.includes('node_modules') && segments[0] !== '.carrick';
   };
   const ownRelative = (file: string): string => path.relative(underRoot(file) ?? scanRoot, file);
+  const guard = WriteGuard.of({ dirs: [outDir], protect: [scanRoot, loader.getRepoRoot()] });
   const own = path.join(outDir, 'w');
   const vendoredRoot = path.join(outDir, 'v');
   const shadowPath = (file: string): string =>
@@ -156,8 +157,8 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     if (isOwn(file)) {
       ownFiles.push(ownRelative(file));
       const out = shadowPath(file);
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.copyFileSync(file, out);
+      guard.mkdir(path.dirname(out));
+      guard.copyFile(file, out);
       for (const lit of literals) {
         if (lit.text.startsWith('.') || path.isAbsolute(lit.text)) continue;
         if (!lit.to || !inProgram.has(lit.to)) continue; // unresolved stays unresolved: no `paths` entry
@@ -199,8 +200,8 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     for (const edit of edits) text = text.slice(0, edit.start) + edit.text + text.slice(edit.end);
     rewritten += edits.length;
     const out = shadowPath(file);
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, text);
+    guard.mkdir(path.dirname(out));
+    guard.writeFile(out, text);
     vendored++;
   }
 
@@ -241,8 +242,8 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     paths,
   };
   const tsconfig = path.join(own, 'tsconfig.json');
-  fs.mkdirSync(own, { recursive: true });
-  fs.writeFileSync(tsconfig, JSON.stringify({ compilerOptions, files, include: [] }, null, 1));
+  guard.mkdir(own);
+  guard.writeFile(tsconfig, JSON.stringify({ compilerOptions, files, include: [] }, null, 1));
 
   return {
     tsconfig,
