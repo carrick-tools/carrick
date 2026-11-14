@@ -11,7 +11,9 @@
 //! `@carrick-progress {json}`, one object per update. It is written only when
 //! the parent asks for it by setting [`PROGRESS_ENV`], so a CI log is
 //! unchanged, and it goes to stderr beside the log lines rather than to stdout,
-//! which carries the report.
+//! which carries the report. The one exception is `@carrick-answered {}`: it
+//! goes on stdout because it separates two kinds of stdout line (the command's
+//! answer, then the map), which a reader of two pipes cannot do by timing.
 //!
 //! Updates are throttled to one every [`MIN_GAP`], with the last update of a
 //! phase always sent: a file loop that ticks thousands of times must not turn
@@ -19,7 +21,7 @@
 //! on the screen.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -367,6 +369,39 @@ pub fn parse(line: &str) -> Option<Update> {
     serde_json::from_str(payload).ok()
 }
 
+/// The prefix of the one marker that goes on stdout: the line that closes the
+/// command's own answer (carrick#4357).
+///
+/// The npm wrapper reads the two pipes separately and cannot tell which line
+/// arrived first, so the answer (stdout before this line) and the map (stdout
+/// after it) are told apart on the pipe they share, not by the phase markers on
+/// the other one. Written once, just before the first phase or summary marker,
+/// and only when [`PROGRESS_ENV`] is set; the wrapper never draws it.
+const ANSWERED_MARKER: &str = "@carrick-answered ";
+
+/// Whether the boundary has been written by this process.
+static ANSWERED: AtomicBool = AtomicBool::new(false);
+
+/// Close the command's answer on stdout, the first time only.
+///
+/// Called from [`report_phase`] and [`report_summary`] after their
+/// `enabled()` check and from nowhere else, so it is written exactly when the
+/// phase markers are: a parent set [`PROGRESS_ENV`]. A run nobody reads, a
+/// person at a terminal and the Action never see it.
+fn close_answer() {
+    if !ANSWERED.swap(true, Ordering::SeqCst) {
+        crate::outln!("{ANSWERED_MARKER}{{}}");
+    }
+}
+
+/// Read the answer's boundary out of a line of a build's stdout.
+#[allow(dead_code)] // As [`parse_phase`]: the reader is the npm wrapper's.
+pub fn parse_answered(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(ANSWERED_MARKER)
+        .is_some_and(|payload| payload.trim() == "{}")
+}
+
 /// The prefix a build names the phase it is entering or leaving on.
 const PHASE_MARKER: &str = "@carrick-phase ";
 
@@ -409,6 +444,7 @@ pub fn report_phase(label: &str, state: PhaseState) {
         state,
     };
     if let Ok(line) = serde_json::to_string(&update) {
+        close_answer();
         crate::errln!("{PHASE_MARKER}{line}");
     }
 }
@@ -480,6 +516,7 @@ pub fn report_summary(summary: &Summary) {
         return;
     }
     if let Ok(line) = serde_json::to_string(summary) {
+        close_answer();
         crate::errln!("{SUMMARY_MARKER}{line}");
     }
 }
@@ -710,6 +747,27 @@ mod tests {
         assert!(parse("Analyzing service api (1/3)").is_none());
         assert!(parse("@carrick-progress not json").is_none());
         assert!(parse("").is_none());
+    }
+
+    /// The boundary is its own marker: no other family reads it, and it reads
+    /// none of theirs (carrick#4357).
+    #[test]
+    fn the_answer_boundary_is_not_another_marker() {
+        let line = format!("{ANSWERED_MARKER}{{}}");
+        assert!(parse_answered(&line));
+        assert!(parse_phase(&line).is_none());
+        assert!(parse_summary(&line).is_none());
+        assert!(parse_notice(&line).is_none());
+        assert!(parse(&line).is_none());
+        for other in [
+            r#"@carrick-phase {"label":"indexing api","state":"started"}"#,
+            r#"@carrick-notice {"text":"x"}"#,
+            "@carrick-progress {}",
+            "@carrick-summary {}",
+            "indexed 2 repo(s)",
+        ] {
+            assert!(!parse_answered(other), "{other}");
+        }
     }
 
     #[test]

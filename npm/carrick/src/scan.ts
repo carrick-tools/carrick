@@ -20,10 +20,13 @@
 //
 //   - A marker (`@carrick-…`) is rendered. `src/progress.rs` is the other
 //     half of each of these shapes.
-//   - Everything else is buffered. A stdout line that arrives BEFORE the
-//     first phase is the command's own answer — what `resume` collected, what
-//     it is still waiting for — and is shown. After the first phase, stdout
-//     is the map, and the summary marker carries what a person needs of it.
+//   - Everything else is buffered. A stdout line that arrives BEFORE stdout's
+//     own `@carrick-answered` is the command's own answer — what `resume`
+//     collected, what it is still waiting for — and is shown. One after it is
+//     the map, and the summary marker carries what a person needs of it. The
+//     boundary rides stdout, so the answer and the map are told apart on one
+//     pipe and the order the two pipes are read in cannot change the result.
+//     No boundary (an older binary) fails closed: the answer is not drawn.
 //
 // A child that states no phase and no summary was not building anything: a
 // refusal, a `resume` with nothing to collect, a help text. Its output is
@@ -95,13 +98,16 @@ export type Marker =
   | { kind: "summary"; summary: Summary }
   | { kind: "notice"; text: string }
   /** The wait a notice described is over (carrick#1674). */
-  | { kind: "noticeEnded"; text: string };
+  | { kind: "noticeEnded"; text: string }
+  /** Stdout's own boundary: what came before it on stdout is the answer. */
+  | { kind: "answered" };
 
 const PREFIXES = {
   phase: "@carrick-phase ",
   progress: "@carrick-progress ",
   summary: "@carrick-summary ",
   notice: "@carrick-notice ",
+  answered: "@carrick-answered ",
 } as const;
 
 /**
@@ -133,6 +139,7 @@ export function parseMarker(line: string): Marker | null {
       if (typeof update.total !== "number") return null;
       return { kind: "progress", update };
     }
+    if (kind === "answered") return { kind: "answered" };
     if (kind === "summary") {
       const summary = payload as Summary;
       if (!Array.isArray(summary.services)) return null;
@@ -276,6 +283,13 @@ export class ScanRender {
   private readonly buffered: string[] = [];
   /** The command's own answer, said before any phase began. */
   private readonly answered: string[] = [];
+  /** Stdout's own `@carrick-answered` has been read (carrick#4357). */
+  private split = false;
+  private release: () => void = () => {};
+  /** Settles when stdout's boundary is read, or the child is over. */
+  private readonly answerKnown: Promise<void> = new Promise((settle) => {
+    this.release = settle;
+  });
 
   constructor(output: InitOutput, version: string) {
     this.output = output;
@@ -294,10 +308,17 @@ export class ScanRender {
 
   /** One line of the child's stdout. */
   stdout(line: string): void {
+    if (parseMarker(line)?.kind === "answered") {
+      this.split = true;
+      this.release();
+      return;
+    }
     if (this.consume(line)) return;
-    // Before the first phase this is the command answering — what `resume`
-    // collected, what it is still waiting on. After it, it is the map.
-    if (!this.opened && line.trim().length > 0) {
+    // Before stdout's own boundary this is the command answering — what
+    // `resume` collected, what it is still waiting on. After it, it is the
+    // map. Which pipe is read first decides nothing: the boundary is a line
+    // on this pipe, so the order of the two pipes cannot move it.
+    if (!this.split && line.trim().length > 0) {
       this.answered.push(line);
       return;
     }
@@ -313,6 +334,8 @@ export class ScanRender {
   private consume(line: string): boolean {
     const marker = parseMarker(line);
     if (!marker) return false;
+    // The binary writes the boundary on stdout only; one here is not it.
+    if (marker.kind === "answered") return true;
     if (marker.kind === "phase") this.phase(marker.phase);
     else if (marker.kind === "progress") this.progress(marker.update);
     else if (marker.kind === "notice") this.notice(marker.text);
@@ -324,8 +347,13 @@ export class ScanRender {
   private begin(): void {
     if (this.opened) return;
     this.opened = true;
-    this.schedule(() => {
+    this.schedule(async () => {
+      // Hold the intro and the answer until stdout says where the answer
+      // ends, or the child is over. A stream with phases and no boundary
+      // (an older binary) never says it: nothing is drawn as the answer.
+      await this.answerKnown;
       this.output.intro(`carrick ${this.version}`);
+      if (!this.split) return;
       for (const line of this.answered) this.output.say(line);
       this.answered.length = 0;
     });
@@ -453,6 +481,8 @@ export class ScanRender {
    * rendered nothing can write the output through instead of eating it.
    */
   async finish(failed: boolean): Promise<boolean> {
+    // The child is over, so stdout is complete: release the hold.
+    this.release();
     if (this.open) {
       this.close(
         failed

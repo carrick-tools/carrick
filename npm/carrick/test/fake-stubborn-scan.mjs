@@ -26,6 +26,7 @@ for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"]) {
 // passing it through, so a test waiting on the parent's own stderr waits for
 // something that only arrives when the run is over.
 if (record) fs.writeFileSync(`${record}.ready`, "up");
+process.stdout.write("@carrick-answered {}\n");
 process.stderr.write("@carrick-phase {\"label\":\"indexing api\",\"state\":\"started\"}\n");
 // Long enough that nothing here ends on its own inside a test.
 setInterval(() => {}, 60000);

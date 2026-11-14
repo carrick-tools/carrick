@@ -41,6 +41,75 @@ const BUILD = [
 /** What the build says before it starts, read from the last one (carrick#1452). */
 const TREE_LINE = "Reading the tree: 1204 files across 5 services; last time 2m13s.";
 
+/** What the binary writes on stdout, once, just before its first phase (carrick#4357). */
+const BOUNDARY = "@carrick-answered {}";
+
+type Row = { pipe: "out" | "err"; text: string };
+
+/** The fake's default stream as rows, each tagged with the pipe it travels on. */
+const STREAM: Row[] = [
+  ...BUILD.slice(0, 2).map((text): Row => ({ pipe: "err", text })),
+  { pipe: "out", text: TREE_LINE },
+  { pipe: "out", text: BOUNDARY },
+  ...BUILD.slice(2).map((text): Row => ({ pipe: "err", text })),
+  { pipe: "out", text: "" },
+  { pipe: "out", text: "indexed 1 repo(s) in 169.4s at 2026-09-17T13:31:59Z" },
+  { pipe: "out", text: "boundary (pan-api): candidates: from the hosted index at 1bf3de5" },
+];
+
+/** The same stream from a binary that predates the boundary. */
+const OLD_STREAM: Row[] = STREAM.filter((row) => row.text !== BOUNDARY);
+
+/** What a reader sees of STREAM, whichever order the two pipes are read in. */
+const PINNED =
+  "carrick 0.3.81\n" +
+  `${TREE_LINE}\n` +
+  "◇ indexing api  95 files, Ns\n" +
+  "◇ 111 routes · 363 functions · 175 types · 10 external calls · 46 routes without a response type\n" +
+  "local read 1m1s · model analysis 1m36s · upload 12.0s\n" +
+  "Your agents can query it now. `carrick index --verbose` shows the full report.\n";
+
+/** The three fixed read orders: as written, stdout first, stderr first. */
+function fixedOrders(rows: Row[]): Row[][] {
+  return [
+    rows,
+    [...rows.filter((r) => r.pipe === "out"), ...rows.filter((r) => r.pipe === "err")],
+    [...rows.filter((r) => r.pipe === "err"), ...rows.filter((r) => r.pipe === "out")],
+  ];
+}
+
+/** The fixed orders plus `n` seeded merges that keep each pipe's own order. */
+function readOrders(rows: Row[], n: number): Row[][] {
+  const out = rows.filter((r) => r.pipe === "out");
+  const err = rows.filter((r) => r.pipe === "err");
+  const all = fixedOrders(rows);
+  let seed = 7;
+  const rand = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  for (let k = 0; k < n; k++) {
+    const merged: Row[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < out.length || j < err.length) {
+      if (j >= err.length || (i < out.length && rand() < 0.5)) merged.push(out[i++] as Row);
+      else merged.push(err[j++] as Row);
+    }
+    all.push(merged);
+  }
+  return all;
+}
+
+/** What a plain renderer draws for one read order, elapsed times normalised. */
+async function drawnFor(order: Row[]): Promise<string> {
+  const written: string[] = [];
+  const render = new ScanRender(plainOutput((text) => written.push(text)), "0.3.81");
+  for (const row of order) {
+    if (row.pipe === "out") render.stdout(row.text);
+    else render.stderr(row.text);
+  }
+  await render.finish(false);
+  return written.join("").replace(/(95 files, )\d+\.\ds/, "$1Ns");
+}
+
 /**
  * The interactive rendering as a reader sees it: colour and cursor control
  * removed, so an assertion is about the line and not about clack's escapes.
@@ -65,6 +134,7 @@ test("a build renders as an intro, one step per phase and the counts", async () 
   // Said before the first phase, which is what makes it the line a reader
   // meets before the wait rather than one more thing after it.
   render.stdout(TREE_LINE);
+  render.stdout(BOUNDARY);
   for (const line of BUILD) render.stderr(line);
   assert.equal(await render.finish(false), true);
 
@@ -141,9 +211,65 @@ test("what a command says before its first phase is its answer, and is shown", a
   const { stream, text } = captured();
   const render = new ScanRender(interactiveOutput(stream), "0.3.81");
   render.stdout("Collected the analysis of acme/api (95 file(s)).");
+  render.stdout(BOUNDARY);
   for (const line of BUILD) render.stderr(line);
   await render.finish(false);
   assert.match(text(), /Collected the analysis of acme\/api/);
+});
+
+test("every read order of the two pipes draws the same lines (carrick#4357)", async () => {
+  const orders = readOrders(STREAM, 300);
+  assert.ok(orders.length >= 303);
+  for (const order of orders) {
+    assert.equal(await drawnFor(order), PINNED);
+  }
+});
+
+test("the intro and the answer are drawn before the stream ends, in either arrival order", async () => {
+  const phase = '@carrick-phase {"label":"indexing api","state":"started"}';
+  const tick = () => new Promise((settle) => setImmediate(settle));
+
+  // (a) the answer and the boundary first, then the phase.
+  const a: string[] = [];
+  const first = new ScanRender(plainOutput((text) => a.push(text)), "0.3.81");
+  first.stdout(TREE_LINE);
+  first.stdout(BOUNDARY);
+  first.stderr(phase);
+  await tick();
+  assert.equal(a.join(""), `carrick 0.3.81\n${TREE_LINE}\n`);
+  await first.finish(false);
+
+  // (b) the mirror: the phase first draws nothing; the boundary releases it.
+  const b: string[] = [];
+  const second = new ScanRender(plainOutput((text) => b.push(text)), "0.3.81");
+  second.stderr(phase);
+  await tick();
+  assert.equal(b.join(""), "");
+  second.stdout(TREE_LINE);
+  second.stdout(BOUNDARY);
+  await tick();
+  assert.equal(b.join(""), `carrick 0.3.81\n${TREE_LINE}\n`);
+  await second.finish(false);
+});
+
+test("a stream with phases and no boundary draws no answer and no map", async () => {
+  for (const order of fixedOrders(OLD_STREAM)) {
+    const drawn = await drawnFor(order);
+    assert.ok(!drawn.includes("boundary ("), drawn);
+    assert.ok(!drawn.includes("Reading the tree"), drawn);
+    assert.ok(!drawn.includes("indexed 1 repo(s)"), drawn);
+  }
+});
+
+test("a boundary on stderr is not the boundary", async () => {
+  const written: string[] = [];
+  const render = new ScanRender(plainOutput((text) => written.push(text)), "0.3.81");
+  render.stdout(TREE_LINE);
+  render.stderr(BOUNDARY);
+  render.stderr('@carrick-phase {"label":"indexing api","state":"started"}');
+  await render.finish(false);
+  assert.ok(!written.join("").includes("@carrick-"), written.join(""));
+  assert.ok(!written.join("").includes("Reading the tree"), written.join(""));
 });
 
 test("a run that renders nothing writes its output through", async () => {
@@ -230,6 +356,7 @@ test("a notice comes off the line once its wait is over, and only its own", asyn
   const render = new ScanRender(plainOutput((text) => written.push(text)), "0.3.81");
   const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
   const waiting = "2 client libraries being described, waiting up to 30 s";
+  render.stdout(BOUNDARY);
   render.stderr('@carrick-phase {"label":"indexing api","state":"started"}');
   await turn();
   render.stderr(
@@ -317,6 +444,7 @@ test("the whole stream, end to end, through the spawned binary", async (t) => {
   assert.match(drawn, /◇ 111 routes · 363 functions · 175 types · 10 external calls/);
   // The two lines the wait is bracketed by, both through the spawned binary:
   // what the last read took, and what this one took (carrick#1452).
+  assert.equal(drawn.split(TREE_LINE).length - 1, 1, drawn);
   assert.ok(drawn.indexOf(TREE_LINE) < drawn.indexOf("indexing api"), drawn);
   assert.match(drawn, /local read 1m1s · model analysis 1m36s · upload 12\.0s/);
   assert.ok(!drawn.includes("Carrick run starting"), drawn);
