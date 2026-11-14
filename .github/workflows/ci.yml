@@ -252,6 +252,7 @@ jobs:
               # Last: it flips carrick-match's features, which would make every
               # target above Dirty if it ran first.
               cargo test -p carrick-match --verbose || rc=$?
+              cargo test -p carrick-match --features wasm --test similar_wasm --verbose || rc=$?
               ;;
             *)
               echo "::error::unknown runner $RUNNER"
@@ -597,6 +598,24 @@ jobs:
             }
             assert.throws(() => new m.PairingPool('not json'));
             console.log('pairing vectors ok: ' + file.cases.length + ' cases');
+          "
+
+      # The similar ranker (carrick-cloud#3490 T5) through the wasm
+      # SimilarRanker: the native test (tests/similar_wasm.rs) reads the same
+      # vector file.
+      - name: Run the similar ranker vectors through the wasm SimilarRanker
+        run: |
+          node -e "
+            const assert = require('assert');
+            const m = require('./target/wasm-smoke/carrick_match.js');
+            const file = require('./crates/carrick-match/tests/fixtures/similar_wasm.vectors.json');
+            const ranker = new m.SimilarRanker(JSON.stringify(file.rows));
+            const got = JSON.parse(ranker.rank(JSON.stringify(file.query)));
+            ranker.free();
+            assert.deepStrictEqual(got.map((r) => r.doc), file.expect_docs);
+            assert.strictEqual(got[1].score, got[2].score);
+            assert.throws(() => new m.SimilarRanker('not json'));
+            console.log('similar ranker ok');
           "
 
   lint:

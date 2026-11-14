@@ -1,0 +1,17 @@
+{
+  "_note": "Six invented function rows and one query, in the JSON shape the wasm SimilarRanker takes. Read natively by tests/similar_wasm.rs and over the built wasm by the wasm-match job in .github/workflows/ci.yml. Rows 4 and 5 tie on score; the tie goes to the path (ui/a.ts before ui/b.ts) whatever order the index was fed in.",
+  "rows": [
+    { "name": "renderDurationLabel", "file": "ui/duration.ts", "tokens": ["seconds", "minutes", "hours", "padStart", "floor", "3600", "60", "join"], "exported": true, "line": 10 },
+    { "name": "loadInvoices", "file": "billing/load.ts", "tokens": ["invoice", "ledger", "rows"], "exported": true, "line": 3 },
+    { "name": "sendWelcomeMail", "file": "mail/welcome.ts", "tokens": ["smtp", "template", "welcome"], "exported": true, "line": 5 },
+    { "name": "resizeAvatar", "file": "media/avatar.ts", "tokens": ["sharp", "width", "height"], "exported": true, "line": 7 },
+    { "name": "minutesLabelB", "file": "ui/b.ts", "tokens": ["minutes", "hours"], "exported": false, "line": 1 },
+    { "name": "minutesLabelA", "file": "ui/a.ts", "tokens": ["minutes", "hours"], "exported": false, "line": 1 }
+  ],
+  "query": {
+    "name": "formatElapsedTime",
+    "file": "ui/clock.ts",
+    "tokens": ["seconds", "minutes", "hours", "padStart", "floor", "3600", "60"]
+  },
+  "expect_docs": [0, 5, 4]
+}
