@@ -41,6 +41,7 @@ use crate::config::Config;
 use crate::findings::{
     ChangedFunction, FunctionChange, FunctionCounts, FunctionRef, FunctionsBlock, FunctionsUnknown,
     MAX_CHANGED_FUNCTIONS, MAX_FUNCTION_EDGES, MAX_REMOVED_FUNCTIONS, NamedFunctions,
+    SimilarIndexSize,
 };
 use crate::visitor::{FunctionDefinition, FunctionDefinitionExtractor, MODULE_SCOPE_KEY};
 
@@ -568,7 +569,50 @@ fn attach_similar(
     source: SimilarSource<'_>,
     except: &HashSet<(String, String, String)>,
 ) {
-    let _ = (block, data, source, except);
+    if !block
+        .changed
+        .iter()
+        .any(|entry| entry.change == FunctionChange::Added)
+    {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let index = crate::local_mode::similar::Similar::build_except(source.blobs, except);
+    // This run's own rows, by the key the blob carries: they hold the tokens,
+    // the written signature and the callees the added function is asked by.
+    let rows: HashMap<(String, String), &FunctionDefinition> = data
+        .iter()
+        .flat_map(|service| service.function_definitions.values())
+        .filter(|row| row.name != MODULE_SCOPE_KEY)
+        .map(|row| (key_of(row), row))
+        .collect();
+    let mut ranked = 0;
+    for entry in block
+        .changed
+        .iter_mut()
+        .filter(|entry| entry.change == FunctionChange::Added)
+    {
+        let query = rows
+            .get(&(entry.file.clone(), entry.name.clone()))
+            .map_or_else(
+                || crate::local_mode::similar::Query::named(&entry.name),
+                |row| {
+                    let callees = row.calls.iter().map(|call| call.name.clone()).collect();
+                    crate::local_mode::similar::Query::of(row, callees)
+                },
+            );
+        entry.similar = Some(index.similar(&query, source.repo, &entry.file));
+        ranked += 1;
+    }
+    let (functions, with_tokens) = index.size();
+    block.similar_index = Some(SimilarIndexSize {
+        functions,
+        with_tokens,
+    });
+    info!(
+        "Similar functions: ranked {ranked} added function(s) against {functions} indexed function(s) in {} ms",
+        started.elapsed().as_millis()
+    );
 }
 
 #[cfg(test)]

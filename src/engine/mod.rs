@@ -2612,7 +2612,17 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // the rows are about to move into the analyzer. It decides nothing, and a
     // run that cannot name them says so in the block.
     let pr_functions = is_pr_run.then(|| {
-        crate::pr_functions::block_for_run(
+        // What an added function may already exist as: main's copy of this
+        // repo and every peer, as the edit hook ranks them (carrick-cloud#3490).
+        let blobs: Vec<(String, &CloudRepoData)> = main_baseline_input
+            .as_ref()
+            .map(|input| input.main_self.iter())
+            .into_iter()
+            .flatten()
+            .chain(all_repo_data.iter())
+            .map(|blob| (blob.repo_name.clone(), blob))
+            .collect();
+        crate::pr_functions::block_for_run_with(
             repo_path,
             pr_base.as_deref(),
             &services,
@@ -2621,6 +2631,10 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .iter()
                 .map(|source| source.place.file.clone())
                 .collect(),
+            (!blobs.is_empty()).then_some(crate::pr_functions::SimilarSource {
+                repo: &repo_name,
+                blobs,
+            }),
         )
     });
 
