@@ -658,7 +658,7 @@ pub struct ProcessingStats {
     /// candidate there (carrick#2613).
     pub fact_layer_files: usize,
     /// Register-signal candidates kept for the reader at a call discovery
-    /// could not follow, by signal (`C2`-`C4`): the old path's selection
+    /// could not follow, by signal (`C3`-`C4`): the old path's selection
     /// fallback, stated on the scan's fallbacks line (carrick#2613, D4).
     pub fallback_selection: BTreeMap<&'static str, usize>,
     pub total_mounts: usize,
@@ -2606,7 +2606,7 @@ impl FileOrchestrator {
             when_empty: WhenEmpty,
             /// How many candidates of an unrouted protocol it raised.
             unrouted: usize,
-            /// The candidates only register signals raised (C2-C4), by span,
+            /// The candidates only register signals raised (C3-C4), by span,
             /// with those signals. Filled only when the fact layer chooses
             /// the reader's files (carrick#2613, D4).
             held: BTreeMap<(u32, u32), BTreeSet<crate::swc_scanner::RegisterSignal>>,
