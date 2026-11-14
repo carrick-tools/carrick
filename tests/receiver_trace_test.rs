@@ -3516,7 +3516,8 @@ fn a_model_row_over_a_loop_gives_way_to_one_row_per_element() {
 /// (two rows, never four). A list one of whose paths is a call's value
 /// states no row and saves `unread_expression`. A method read off the head
 /// names the member (`app[r.verb]`): a computed callee, which no claim
-/// reads, keeps today's outcome.
+/// reads, states no row; it is saved as an unread callee with its key's
+/// reason (carrick#4327 T0), which this test does not read.
 #[test]
 fn a_route_in_a_loop_over_stated_objects_is_one_row_per_element() {
     let blobs = scan_fixture("receiver-route-loop");
@@ -3541,6 +3542,79 @@ fn a_route_in_a_loop_over_stated_objects_is_one_row_per_element() {
                 "src/objects.ts:15 GET /v2/tasks library_claim app".to_string(),
             ],
             vec!["src/objects.ts:18 unread_expression".to_string()],
+        ),
+    );
+}
+
+/// Every callee-slot unread site the blobs list (`unread_sites`, the list a
+/// person reads) in `file`, as `file:line reason`.
+fn callee_unread_sites(blobs: &Blobs, file: &str) -> Vec<String> {
+    let mut sites: Vec<String> = blobs
+        .values()
+        .flat_map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["unread_sites"].as_array().cloned().unwrap_or_default()
+        })
+        .filter(|site| site["file"] == file && site["slot"] == "callee")
+        .map(|site| {
+            format!(
+                "{}:{} {}",
+                site["file"].as_str().unwrap_or_default(),
+                site["line"],
+                site["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    sites.sort_by_key(|site| {
+        let (at, _) = site.split_once(' ').unwrap_or_default();
+        let line = at.rsplit(':').next().unwrap_or_default();
+        line.parse::<u32>().unwrap_or_default()
+    });
+    sites
+}
+
+/// carrick#4327 T0: a call through a computed key on a library receiver
+/// the store claims ops on (`app[k](…)`) is saved with the key's own
+/// reason, as the text reader answers it: `unread_expression` for a key
+/// that is several texts or one naming a claimed op (no row is stated for
+/// it yet), the hole's reason for a key the code does not state, and
+/// `package_unmatched` for one text naming no op, as the same call written
+/// with that member gets. A receiver the store claims no op on keeps the
+/// walk's reason. HTTP, socket and queue receivers alike.
+#[test]
+fn a_call_through_a_computed_key_on_a_library_receiver_is_saved_with_its_key_s_reason() {
+    let route = scan_fixture("receiver-route-loop");
+    let socket = scan_fixture("socket-inherited-listener");
+    let queue = scan_fixture("queue-maker-fan-out");
+    let got = (
+        callee_unread_sites(&route, "src/objects.ts")
+            .into_iter()
+            .filter(|site| site.starts_with("src/objects.ts:21 "))
+            .collect::<Vec<_>>(),
+        callee_unread_sites(&route, "src/keyed.ts"),
+        callee_unread_sites(&socket, "services/server/src/server.ts"),
+        callee_unread_sites(&queue, "src/keyed.ts"),
+    );
+    assert_eq!(
+        got,
+        (
+            vec!["src/objects.ts:21 unread_expression".to_string()],
+            vec![
+                "src/keyed.ts:9 unread_expression".to_string(),
+                "src/keyed.ts:12 unread_expression".to_string(),
+                "src/keyed.ts:16 unread_expression".to_string(),
+                "src/keyed.ts:19 parameter_unread".to_string(),
+                "src/keyed.ts:20 parameter_unread".to_string(),
+                "src/keyed.ts:23 unread_expression".to_string(),
+                "src/keyed.ts:27 package_unmatched".to_string(),
+                "src/keyed.ts:31 package_unmatched".to_string(),
+                "src/keyed.ts:33 value_callee".to_string(),
+            ],
+            vec!["services/server/src/server.ts:16 unread_expression".to_string()],
+            vec![
+                "src/keyed.ts:5 unread_expression".to_string(),
+                "src/keyed.ts:6 unread_expression".to_string(),
+            ],
         ),
     );
 }

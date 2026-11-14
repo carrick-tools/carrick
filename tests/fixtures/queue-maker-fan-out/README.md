@@ -12,6 +12,11 @@ This fixture exceeds the cap, so the answer key is the capped reading:
 |---|---|---|
 | `src/open.ts:8` | one site, name not forced (asked), `composed_trimmed` set | the walk stopped at its cap |
 
+`src/keyed.ts` (carrick#4327) sends through a computed key on a queue
+instance (`q[M](…)`, and in a loop). Each is saved as an unread callee
+with the key's own reason (`unread_expression`), read by
+`receiver_trace_test.rs`.
+
 Store answer: the same as `queue-enum-base-class-one`.
 
 Protocol: pub/sub (queues).

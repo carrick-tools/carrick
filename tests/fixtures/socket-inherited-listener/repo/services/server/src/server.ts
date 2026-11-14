@@ -12,3 +12,5 @@ server.emit("h:joined", {});
 server.emit("s:message", {});
 server.emit("s:bus", {});
 server.emit("data", {});
+const K = "emit" as const;
+server[K]("k:const", {});
