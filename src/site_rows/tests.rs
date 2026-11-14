@@ -862,7 +862,12 @@ fn a_fact_replaces_an_old_path_row_at_its_site() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, old)],
+            vec![(
+                file.to_string(),
+                LINE,
+                old,
+                Some(OperationKey::http("POST", "/v1/items"))
+            )],
             "{source:?}"
         );
     }
@@ -889,7 +894,7 @@ fn a_fact_replaces_an_old_path_row_stating_its_operation() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, same)],
+            vec![(file.to_string(), LINE, same.clone(), Some(same))],
             "{source:?}"
         );
         assert!(fold.kept_out.is_empty(), "{source:?}: {:?}", fold.kept_out);
@@ -987,7 +992,7 @@ fn a_fact_replaces_a_base_path_row_stating_its_operation() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, same)],
+            vec![(file.to_string(), LINE, same.clone(), Some(same))],
             "{source:?}"
         );
         assert!(fold.kept_out.is_empty(), "{source:?}: {:?}", fold.kept_out);
@@ -1080,6 +1085,69 @@ fn a_replaced_base_path_row_leaves_the_graph() {
     );
     assert_eq!(graph[0].client, "post");
     assert_eq!(graph[0].host.as_deref(), Some("api.example.test"));
+}
+
+/// Two facts on one line, from two records: the forced HTTP send's row and
+/// a second call's row of another operation.
+fn two_facts_on_one_line(file: &str, other: &OperationKey) -> SiteRows {
+    let all = rows();
+    let first = all
+        .rows
+        .into_iter()
+        .find(|row| row.file == file)
+        .expect("the forced HTTP send states a row");
+    let mut second = first.clone();
+    second.key = other.clone();
+    second.anchors.call.span_start += 20;
+    second.anchors.call.span_end += 20;
+    assert_ne!(first.anchors, second.anchors, "two records");
+    SiteRows {
+        enabled: true,
+        rows: vec![first, second],
+        ..SiteRows::default()
+    }
+}
+
+/// carrick#4433: a row keyed as another site row at the same call is that
+/// row's. Two calls on one line each state their own request: each fact
+/// replaces the old-path row of its own key, and neither keeps the other
+/// out.
+#[test]
+fn a_row_keyed_as_another_site_row_at_the_call_is_that_rows() {
+    let file = "src/forced-http.ts";
+    let same = OperationKey::http("POST", "/v1/items");
+    let other = OperationKey::http("POST", "/v1/other");
+    let site = two_facts_on_one_line(file, &other);
+    let mut calls = vec![
+        blob_row(
+            same.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::SameFileWrapper),
+        ),
+        blob_row(
+            other.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::SameFileWrapper),
+        ),
+    ];
+    let fold = fold_rows(&mut calls, &mut Vec::new(), &site, Path::new("."), "", make);
+    assert_eq!(
+        at_site(&calls, file),
+        vec![
+            (same.clone(), Some(ResolutionSource::RequestSummary), None),
+            (other.clone(), Some(ResolutionSource::RequestSummary), None),
+        ]
+    );
+    assert!(fold.kept_out.is_empty(), "{:?}", fold.kept_out);
+    assert_eq!(
+        fold.replaced_by_fact,
+        vec![
+            (file.to_string(), LINE, same.clone(), Some(same)),
+            (file.to_string(), LINE, other.clone(), Some(other)),
+        ]
+    );
 }
 
 /// An answer in the band is no fact: an old-path row at its site keeps the
@@ -1700,6 +1768,128 @@ fn a_fact_keeps_the_client_and_dispatch_of_its_call() {
     assert_eq!(graph[0].dispatch, Some(dispatch));
 }
 
+/// carrick#4433: where one line holds two calls, each fact's graph row reads
+/// its client, host and base from the removed row of its own key, never
+/// from the other call's.
+#[test]
+fn a_fact_reads_its_graph_values_from_the_removed_row_of_its_own_key() {
+    let file = "src/forced-http.ts";
+    let same = OperationKey::http("POST", "/v1/items");
+    let other = OperationKey::http("POST", "/v1/other");
+    let site = two_facts_on_one_line(file, &other);
+    // The other call's row comes first, so a read by line alone gives the
+    // first fact the other call's values.
+    let mut a = graph_call("POST", "/v1/other", file, ResolutionSource::SameFileWrapper);
+    a.client = "sendB".to_string();
+    a.host = Some("b.example.test".to_string());
+    let mut b = graph_call("POST", "/v1/items", file, ResolutionSource::SameFileWrapper);
+    b.client = "sendA".to_string();
+    b.base = Some(crate::call_base::CallBaseResolution {
+        written: "${process.env.A_BASE}".to_string(),
+        kind: crate::call_base::CallBaseKind::Env,
+        env_var: Some("A_BASE".to_string()),
+        fallback: None,
+        fallback_is_loopback: false,
+        declared_optional: None,
+    });
+    let mut data = blob_with_graph(
+        vec![
+            blob_row(
+                other.clone(),
+                file,
+                LINE,
+                Some(ResolutionSource::SameFileWrapper),
+            ),
+            blob_row(
+                same.clone(),
+                file,
+                LINE,
+                Some(ResolutionSource::SameFileWrapper),
+            ),
+        ],
+        vec![a, b],
+    );
+    fold_into(&mut data, &site);
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 2, "{graph:?}");
+    let of = |path: &str| {
+        graph
+            .iter()
+            .find(|call| call.canonical_path == path)
+            .unwrap_or_else(|| panic!("{path} joins the graph: {graph:?}"))
+    };
+    let items = of("/v1/items");
+    assert_eq!(
+        items.resolution_source,
+        Some(ResolutionSource::RequestSummary)
+    );
+    assert_eq!(items.client, "sendA");
+    assert_eq!(items.host, None);
+    assert_eq!(
+        items.base.as_ref().and_then(|base| base.env_var.as_deref()),
+        Some("A_BASE")
+    );
+    let other_row = of("/v1/other");
+    assert_eq!(other_row.client, "sendB");
+    assert_eq!(other_row.host.as_deref(), Some("b.example.test"));
+    assert_eq!(other_row.base, None);
+}
+
+/// carrick#4463: where one line holds two calls and only one call's fact
+/// replaced a row there, the other fact's graph row reads none of it: the
+/// removed row is the first call's, read off a misreading of its spelling.
+#[test]
+fn a_fact_with_no_row_of_its_own_reads_no_graph_values() {
+    let file = "src/forced-http.ts";
+    let other = OperationKey::http("POST", "/v1/other");
+    let site = two_facts_on_one_line(file, &other);
+    // One old-path row of a third operation: the first fact replaces it
+    // (carrick#3283), and the second fact's call held no row.
+    let misread = OperationKey::http("POST", "${HOST}/items");
+    let mut removed = graph_call(
+        "POST",
+        "${HOST}/items",
+        file,
+        ResolutionSource::SameFileWrapper,
+    );
+    removed.client = "sendA".to_string();
+    removed.host = Some("api.example.test".to_string());
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            misread.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::SameFileWrapper),
+        )],
+        vec![removed],
+    );
+    let fold = fold_into(&mut data, &site);
+    assert_eq!(
+        fold.replaced_by_fact,
+        vec![(
+            file.to_string(),
+            LINE,
+            misread,
+            Some(OperationKey::http("POST", "/v1/items"))
+        )]
+    );
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 2, "{graph:?}");
+    let of = |path: &str| {
+        graph
+            .iter()
+            .find(|call| call.canonical_path == path)
+            .unwrap_or_else(|| panic!("{path} joins the graph: {graph:?}"))
+    };
+    let items = of("/v1/items");
+    assert_eq!(items.client, "sendA");
+    assert_eq!(items.host.as_deref(), Some("api.example.test"));
+    let other_row = of("/v1/other");
+    assert_eq!(other_row.client, "");
+    assert_eq!(other_row.host, None);
+    assert_eq!(other_row.base, None);
+}
+
 /// A candidate replacement (an answer in the band) leaves the graph as it
 /// was: the reader's row stays, and nothing is added.
 #[test]
@@ -1882,7 +2072,7 @@ fn a_module_callers_fact_withdraws_the_reader_row_at_the_request_line() {
     );
     assert!(
         fold.replaced_by_fact
-            .contains(&(HELD_LINE.to_string(), LINE, key))
+            .contains(&(HELD_LINE.to_string(), LINE, key, None))
     );
     assert_eq!(
         fold.stated_at_fact_callers,

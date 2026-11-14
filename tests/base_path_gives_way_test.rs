@@ -4,8 +4,8 @@
 //! the fixture's library-store answer), and reads each call's rows and
 //! graph rows from the blob. Where the fact layer states a request at a call
 //! whose env or literal origin a base-path pass also reads, the pass's row
-//! stating the same operation gives way to the fact, unless the call's line
-//! also holds a row of another operation.
+//! stating the same operation gives way to the fact. On a line of two calls,
+//! each fact claims only its own key's rows (carrick#4433).
 //!
 //! Fixture README: `tests/fixtures/base-path-gives-way/README.md`.
 
@@ -231,20 +231,45 @@ fn a_fact_replaces_the_same_key_base_path_row_at_its_call() {
 }
 
 #[test]
-fn a_line_with_two_calls_keeps_its_base_path_rows() {
+fn a_line_with_two_calls_gives_each_base_path_row_to_its_own_fact() {
     assert_eq!(
         calls_at("src/two-literal.ts:3"),
         [
-            "POST https://api.example.com/t/a literal_base_path",
-            "POST https://api.example.com/t/b literal_base_path"
+            "POST https://api.example.com/t/a request_summary",
+            "POST https://api.example.com/t/b request_summary"
         ]
     );
     assert_eq!(
         calls_at("src/two-env.ts:3"),
         [
-            "POST ${process.env.API_URL}/te/a env_base_path",
-            "POST ${process.env.API_URL}/te/b env_base_path"
+            "POST ${process.env.API_URL}/te/a request_summary",
+            "POST ${process.env.API_URL}/te/b request_summary"
         ]
+    );
+    // The safety condition: each call keeps exactly the client, host and base
+    // its base-path row had on main (read from main's CI build). Only the
+    // row's source and role move.
+    assert_eq!(
+        graph_at("src/two-literal.ts:3"),
+        [
+            "POST https://api.example.com/t/a none client=post host=api.example.com base=none",
+            "POST https://api.example.com/t/b none client=post host=api.example.com base=none"
+        ]
+    );
+    assert_eq!(
+        graph_at("src/two-env.ts:3"),
+        [
+            "POST ${process.env.API_URL}/te/a none client=post host=none base=env",
+            "POST ${process.env.API_URL}/te/b none client=post host=none base=env"
+        ]
+    );
+    // R6: the mixed line's `/m/b` names no host.
+    assert!(
+        graph_at("src/mixed.ts:3")
+            .iter()
+            .any(|row| row.starts_with("POST /m/b ") && row.contains("host=none")),
+        "{:?}",
+        graph_at("src/mixed.ts:3")
     );
 }
 
@@ -259,10 +284,7 @@ fn a_path_base_has_no_base_path_row() {
 #[test]
 fn the_fold_line_counts_what_is_kept_out() {
     let line = fold_line();
-    assert!(
-        line.contains(
-            r#"kept_out={"env_base_path": 2, "literal_base_path": 2, "request_summary": 1}"#
-        ),
-        "{line}"
-    );
+    // Every base-path row stated its own operation, so each gave way
+    // (carrick#4434, #4433): nothing is kept out.
+    assert!(line.contains("kept_out={}"), "{line}");
 }
