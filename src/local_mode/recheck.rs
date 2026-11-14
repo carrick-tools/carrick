@@ -17,7 +17,8 @@
 //!    code uses, no source (`engine/mod.rs` `read_from_library_store`,
 //!    `library_store.rs` `RegistryPackage`). It
 //!    re-reads the edited file's own service and the services that hold an
-//!    operation reading a type declared in that file ([`Reach`]); every other
+//!    operation reading a type declared in that file, or for a file in no
+//!    service's directory the services that read it ([`Reach`]); every other
 //!    service stands in at its newest known version, the copy the last
 //!    re-check of it left or else the index's ([`Plan`], carrick#3198). The
 //!    blob the last index wrote for that repo is handed in as `previous_data`,
@@ -183,16 +184,37 @@ fn budget_from(raw: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
-/// The services one re-check reads, decided from the index (carrick#3198).
+/// Who a re-check's miss is remembered for (carrick#4412).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    /// The service whose directory holds the edited file: a miss silences
+    /// later re-checks of every file of that service.
+    Service(String),
+    /// An edited file in no service's directory: a miss silences later
+    /// re-checks of this file only, never a service that reads it.
+    File { repo: String, file: String },
+}
+
+impl Owner {
+    /// The key a file's miss is kept under.
+    fn file_key(repo: &str, file: &str) -> String {
+        format!("{repo}/{file}")
+    }
+}
+
+/// The services one re-check reads, decided from the index (carrick#3198,
+/// carrick#4412).
 ///
-/// The edited file's own service, plus every service that holds an operation
-/// reading a type declared in that file (`uses[file].types[].operations`,
-/// same repo only). Every other service of the repo is judged at its newest
-/// known version, never re-read.
+/// A file in a service's directory re-reads that service plus every service
+/// that holds an operation reading a type declared in the file
+/// (`uses[file].types[].operations`, same repo only). A file in no service's
+/// directory re-reads the services that read it. Every other service of the
+/// repo is judged at its newest known version, never re-read.
 pub struct Reach {
-    /// The service the file belongs to: the one a miss is remembered for.
-    pub owner: String,
-    /// The owner first, then the others, in index order.
+    /// Who a miss is remembered for.
+    pub owner: Owner,
+    /// The re-read services: the owner first for a service's file, else in
+    /// index order.
     pub reread: Vec<String>,
     /// The repo's services as the index lists them.
     services: Vec<IndexedService>,
@@ -200,43 +222,103 @@ pub struct Reach {
     files: std::collections::BTreeMap<String, usize>,
 }
 
+/// The services holding an operation that reads a type declared in `relative`.
+fn type_readers<'a>(
+    repo: &'a IndexedRepo,
+    relative: &str,
+) -> impl Iterator<Item = &'a str> + Clone {
+    repo.uses
+        .as_ref()
+        .and_then(|uses| uses.get(relative))
+        .into_iter()
+        .flat_map(|uses| &uses.types)
+        .flat_map(|used| &used.operations)
+        .map(|operation| operation.service.as_str())
+}
+
+/// Indexed files per service of `reread`, for the miss reason.
+fn indexed_files(
+    repo: &IndexedRepo,
+    reread: &[String],
+) -> std::collections::BTreeMap<String, usize> {
+    reread
+        .iter()
+        .filter_map(|name| {
+            let service = repo.services.iter().find(|service| &service.name == name)?;
+            let count = repo
+                .files
+                .keys()
+                .filter(|file| service.covers(file))
+                .count();
+            Some((name.clone(), count))
+        })
+        .collect()
+}
+
 impl Reach {
-    /// `None` when `owner` is no service of this repo: nothing reads the file.
-    pub fn of(repo: &IndexedRepo, relative: &str, owner: &str) -> Option<Self> {
-        repo.services.iter().find(|service| service.name == owner)?;
-        let mut reread = vec![owner.to_string()];
-        let reading = repo
-            .uses
-            .as_ref()
-            .and_then(|uses| uses.get(relative))
-            .into_iter()
-            .flat_map(|uses| &uses.types)
-            .flat_map(|used| &used.operations)
-            .map(|operation| operation.service.as_str());
+    /// The services one re-check of `relative` reads (carrick#3198,
+    /// carrick#4412). A file in a service's directory is that service's
+    /// (`service_row`: its rows' service, else the directory's): that service
+    /// first, then every service holding an operation that reads a type
+    /// declared in the file. A file in no service's directory is no service's,
+    /// rows or not: the services the walk names (`readers`,
+    /// [`services_reading`]) and those type readers, in index order, or every
+    /// service of the repo when the walk could not say (`None`).
+    /// `None` only for a repo the index holds with no service: nothing can
+    /// read the file there.
+    pub fn for_edit(
+        repo: &IndexedRepo,
+        relative: &str,
+        service_row: Option<&IndexedService>,
+        readers: Option<&[String]>,
+    ) -> Option<Self> {
+        if repo.services.is_empty() {
+            return None;
+        }
+        Some(match repo.service_for(relative).and(service_row) {
+            Some(owner) => Self::owned(repo, relative, owner),
+            None => Self::shared(repo, relative, readers),
+        })
+    }
+
+    fn owned(repo: &IndexedRepo, relative: &str, owner: &IndexedService) -> Self {
+        let mut reread = vec![owner.name.clone()];
+        let reading = type_readers(repo, relative);
         for service in repo.services.iter().map(|service| service.name.as_str()) {
             let reads = reading.clone().any(|name| name == service);
             if reads && !reread.iter().any(|known| known == service) {
                 reread.push(service.to_string());
             }
         }
-        let files = reread
-            .iter()
-            .filter_map(|name| {
-                let service = repo.services.iter().find(|service| &service.name == name)?;
-                let count = repo
-                    .files
-                    .keys()
-                    .filter(|file| service.covers(file))
-                    .count();
-                Some((name.clone(), count))
-            })
-            .collect();
-        Some(Self {
-            owner: owner.to_string(),
+        Self {
+            owner: Owner::Service(owner.name.clone()),
+            files: indexed_files(repo, &reread),
             reread,
             services: repo.services.clone(),
-            files,
-        })
+        }
+    }
+
+    fn shared(repo: &IndexedRepo, relative: &str, readers: Option<&[String]>) -> Self {
+        let reading = type_readers(repo, relative);
+        let reread: Vec<String> = repo
+            .services
+            .iter()
+            .map(|service| service.name.as_str())
+            .filter(|name| {
+                readers.is_none_or(|readers| readers.iter().any(|reader| reader == name))
+                    || reading.clone().any(|reader| reader == *name)
+            })
+            .map(str::to_string)
+            .collect();
+        Self {
+            owner: Owner::File {
+                repo: repo.name.clone(),
+                file: relative.to_string(),
+            },
+            files: indexed_files(repo, &reread),
+            reread,
+            services: repo.services.clone(),
+        }
     }
 }
 
@@ -391,15 +473,13 @@ pub fn run(
             // which of the services it was reading had not finished, so only
             // the edited file's own service is recorded: a reader service
             // re-read beside it is tried again on its own next edit, where a
-            // miss is its own. A lost record costs one more re-check; a wrong
-            // one switches a service off for the whole index.
+            // miss is its own. A file in no service's directory is its own
+            // owner: its miss silences that file and no service that reads
+            // it. A lost record costs one more re-check; a wrong one
+            // switches a service off for the whole index.
             let missed = Instant::now() >= deadline;
-            if missed {
-                ServiceMisses::record(
-                    &misses,
-                    index_generation,
-                    &plan.miss_of(&reach.owner, started.elapsed(), budget),
-                );
+            if missed && let Some(miss) = plan.miss_of(&reach.owner, started.elapsed(), budget) {
+                ServiceMisses::record(&misses, index_generation, &reach.owner, miss);
             }
             Err(Box::new(Degraded {
                 reason,
@@ -419,18 +499,26 @@ pub fn run(
 const DEFERRED_REASON: &str = "this edit needs a re-scan, which this call was asked not to start";
 
 /// The reason a re-check that skipped its re-scan gives.
-fn miss_reason(service: &str, miss: &Miss) -> String {
+fn miss_reason(owner: &Owner, miss: &Miss) -> String {
     let took = if miss.elapsed_ms >= 1000 {
         format!("{} s", miss.elapsed_ms / 1000)
     } else {
         format!("{} ms", miss.elapsed_ms)
     };
-    format!(
-        "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
-         edits in {service} are not re-checked until `carrick refresh`. Run `carrick check \
-         --changed` before you finish.",
-        miss.files
-    )
+    match owner {
+        Owner::Service(service) => format!(
+            "re-reading {service} ({} indexed files) took longer than {took} against this index, so \
+             edits in {service} are not re-checked until `carrick refresh`. Run `carrick check \
+             --changed` before you finish.",
+            miss.files
+        ),
+        Owner::File { file, .. } => format!(
+            "re-reading the services that read {file} ({} indexed files) took longer than {took} \
+             against this index, so edits to {file} are not re-checked until `carrick refresh`. \
+             Run `carrick check --changed` before you finish.",
+            miss.files
+        ),
+    }
 }
 
 /// One service's re-read that missed its budget.
@@ -466,6 +554,10 @@ struct ServiceMisses {
     generation: String,
     /// Service ids, as the index names them.
     services: std::collections::BTreeMap<String, Miss>,
+    /// Files in no service's directory, keyed `<repo>/<file>` (carrick#4412).
+    /// Absent from a misses file written before it existed: no file misses.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    files: std::collections::BTreeMap<String, Miss>,
 }
 
 impl ServiceMisses {
@@ -485,17 +577,20 @@ impl ServiceMisses {
     /// The miss that silences a re-check under `budget`: one recorded under
     /// a budget at least as long. A miss at 10 s says nothing about a call
     /// that has 180 s.
-    fn holds(&self, generation: &str, service: &str, budget: Duration) -> Option<&Miss> {
+    fn holds(&self, generation: &str, owner: &Owner, budget: Duration) -> Option<&Miss> {
         if generation.is_empty() || self.generation != generation {
             return None;
         }
-        self.services
-            .get(service)
-            .filter(|miss| u128::from(miss.budget_ms) >= budget.as_millis())
+        match owner {
+            Owner::Service(service) => self.services.get(service),
+            Owner::File { repo, file } => self.files.get(&Owner::file_key(repo, file)),
+        }
+        .filter(|miss| u128::from(miss.budget_ms) >= budget.as_millis())
     }
 
-    /// Add `misses` for `generation`, dropping the misses of any older one.
-    fn record(path: &Path, generation: &str, misses: &[(String, Miss)]) {
+    /// Add the miss of `owner` for `generation`, dropping the misses of any
+    /// older one.
+    fn record(path: &Path, generation: &str, owner: &Owner, miss: Miss) {
         if generation.is_empty() {
             return;
         }
@@ -503,12 +598,13 @@ impl ServiceMisses {
         if held.generation != generation {
             held = Self {
                 generation: generation.to_string(),
-                services: Default::default(),
+                ..Default::default()
             };
         }
-        for (service, miss) in misses {
-            held.services.insert(service.clone(), miss.clone());
-        }
+        match owner {
+            Owner::Service(service) => held.services.insert(service.clone(), miss),
+            Owner::File { repo, file } => held.files.insert(Owner::file_key(repo, file), miss),
+        };
         if let Ok(text) = serde_json::to_string_pretty(&held) {
             let _ = std::fs::write(path, text);
         }
@@ -708,22 +804,23 @@ impl Plan {
     }
 
     /// The miss to remember when this re-check ran out of time: the edited
-    /// file's own service only, never a reader service re-read beside it.
-    fn miss_of(&self, owner: &str, elapsed: Duration, budget: Duration) -> Vec<(String, Miss)> {
-        self.services
-            .iter()
-            .filter(|service| service.as_str() == owner)
-            .map(|service| {
-                (
-                    service.clone(),
-                    Miss {
-                        elapsed_ms: elapsed.as_millis() as u64,
-                        budget_ms: budget.as_millis() as u64,
-                        files: self.files.get(service).copied().unwrap_or(0),
-                    },
-                )
-            })
-            .collect()
+    /// file's own service only, never a reader service re-read beside it; or,
+    /// for a file in no service's directory, that file (carrick#4412).
+    fn miss_of(&self, owner: &Owner, elapsed: Duration, budget: Duration) -> Option<Miss> {
+        let files = match owner {
+            Owner::Service(name) => {
+                if !self.services.contains(name) {
+                    return None;
+                }
+                self.files.get(name).copied().unwrap_or(0)
+            }
+            Owner::File { .. } => self.files.values().sum(),
+        };
+        Some(Miss {
+            elapsed_ms: elapsed.as_millis() as u64,
+            budget_ms: budget.as_millis() as u64,
+            files,
+        })
     }
 
     /// Keep a re-read service's fresh blob for the next re-check. A service
@@ -844,41 +941,34 @@ fn readers_of_the_edit(
     readers
 }
 
-/// Whether no service of the repo reads any of `paths`, by the rule that
-/// carries a service under `--changed-only`
-/// ([`crate::change_scope::untouched_since`]): an edited test file that still
-/// loads what it loaded, a file outside every service's roots and import
-/// closure. Such an edit changes no row, so the index's answer stands and no
-/// re-scan is owed (the scan decides what it reads, not a second classifier).
+/// The services of the repo that read any of `paths`, in index order, by the
+/// rule that carries a service under `--changed-only`
+/// ([`crate::change_scope::untouched_since`]): its roots (directory and
+/// `include` roots), its import closure, and the packages and tsconfig chain
+/// it reads. Empty when none does: an edited test file that still loads what
+/// it loaded, a file outside every service's roots and import closure. Such an
+/// edit changes no row, so the index's answer stands and no re-scan is owed
+/// (the scan decides what it reads, not a second classifier). It is the one
+/// answerer of "which services read this file" in local mode (carrick#4412).
 ///
-/// `false` whenever that rule cannot say: the repo's services are not all at
+/// `None` whenever that rule cannot say: the repo's services are not all at
 /// one commit and clean, a service's config is not on this machine, or the
 /// workspace cannot be read. Then the caller takes the path it always took.
 /// When its walk runs it states a `no-service-reads` timing line
 /// ([`TIMING_ENV`]).
-pub(super) fn no_service_reads(
+pub(super) fn services_reading(
     workspace_root: &Path,
     tree: &Tree,
     indexed: &IndexedRepo,
     paths: &HashSet<String>,
-) -> bool {
+) -> Option<Vec<String>> {
     let began = Instant::now();
-    let Some(commit) = indexed.services.first().map(|service| &service.commit) else {
-        return false;
-    };
-    if commit.is_empty()
-        || indexed
-            .services
-            .iter()
-            .any(|service| &service.commit != commit || service.dirty)
-    {
-        return false;
-    }
+    let commit = indexed.clean_commit()?;
     let Ok(workspace) = Workspace::load(workspace_root) else {
-        return false;
+        return None;
     };
     let Ok(local) = read_blobs(&workspace.blobs_dir()) else {
-        return false;
+        return None;
     };
     let name = repo_label(&tree.repo);
     let hosted = super::hosted::cached(&workspace).local_blobs(&tree.repo);
@@ -895,7 +985,7 @@ pub(super) fn no_service_reads(
             .and_then(|blob| blob.config_json.as_deref())
             .and_then(|json| serde_json::from_str::<crate::config::Config>(json).ok());
         let Some(config) = config else {
-            return false;
+            return None;
         };
         configs.push(config);
     }
@@ -907,11 +997,17 @@ pub(super) fn no_service_reads(
     // compares by the folder's form. A change outside the folder is not an
     // edited file (carrick#4390).
     let only = listing.view(move |path| !path.is_some_and(|path| kept.contains(path)));
-    let none = crate::change_scope::untouched_since(&repo_path, &configs, &only, commit)
-        .iter()
-        .all(Option::is_none);
+    let read = crate::change_scope::untouched_since(&repo_path, &configs, &only, commit);
     took("no-service-reads", began);
-    none
+    // `configs` is built in `indexed.services` order, so the zip lines up.
+    Some(
+        indexed
+            .services
+            .iter()
+            .zip(read)
+            .filter_map(|(service, read)| read.map(|_| service.name.clone()))
+            .collect(),
+    )
 }
 
 /// What the working tree holds, since the index, of the files `service` reads:
@@ -2400,6 +2496,10 @@ mod tests {
 
     const TEN_S: Duration = Duration::from_millis(10_000);
 
+    fn svc(name: &str) -> Owner {
+        Owner::Service(name.to_string())
+    }
+
     /// A miss is remembered per service and per index generation: another
     /// service of the same repo, or the same service against a newer index,
     /// tries the re-check again (carrick#3198).
@@ -2422,17 +2522,14 @@ mod tests {
                 stale: Vec::new(),
             },
         };
-        let recorded = plan.miss_of("types-owner", TEN_S, TEN_S);
+        let recorded = plan.miss_of(&svc("types-owner"), TEN_S, TEN_S);
         assert_eq!(
             recorded,
-            vec![(
-                "types-owner".to_string(),
-                Miss {
-                    elapsed_ms: 10_000,
-                    budget_ms: 10_000,
-                    files: 3
-                }
-            )],
+            Some(Miss {
+                elapsed_ms: 10_000,
+                budget_ms: 10_000,
+                files: 3
+            }),
             "a reader re-read beside the edited service is tried again on its own edit"
         );
     }
@@ -2444,39 +2541,43 @@ mod tests {
 
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", "big", TEN_S)
+                .holds("g1", &svc("big"), TEN_S)
                 .is_none()
         );
-        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
-        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
         let read = ServiceMisses::read(&path);
-        assert_eq!(read.holds("g1", "big", TEN_S), Some(&miss(40)));
+        assert_eq!(read.holds("g1", &svc("big"), TEN_S), Some(&miss(40)));
         assert_eq!(read.services.len(), 1, "recorded once");
         assert!(
-            read.holds("g1", "small", TEN_S).is_none(),
+            read.holds("g1", &svc("small"), TEN_S).is_none(),
             "a sibling service of the same repo still re-checks"
         );
         assert!(
-            read.holds("g2", "big", TEN_S).is_none(),
+            read.holds("g2", &svc("big"), TEN_S).is_none(),
             "a new index tries again"
         );
 
         // A miss against a newer index replaces the older generation's.
-        ServiceMisses::record(&path, "g2", &[("small".to_string(), miss(3))]);
+        ServiceMisses::record(&path, "g2", &svc("small"), miss(3));
         let read = ServiceMisses::read(&path);
-        assert!(read.holds("g2", "small", TEN_S).is_some());
-        assert!(read.holds("g2", "big", TEN_S).is_none());
-        assert!(read.holds("g1", "big", TEN_S).is_none());
+        assert!(read.holds("g2", &svc("small"), TEN_S).is_some());
+        assert!(read.holds("g2", &svc("big"), TEN_S).is_none());
+        assert!(read.holds("g1", &svc("big"), TEN_S).is_none());
 
         // No generation means no record either way.
-        ServiceMisses::record(&path, "", &[("big".to_string(), miss(40))]);
-        assert!(ServiceMisses::read(&path).holds("", "big", TEN_S).is_none());
+        ServiceMisses::record(&path, "", &svc("big"), miss(40));
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("", &svc("big"), TEN_S)
+                .is_none()
+        );
 
         // The file the repo-wide rule wrote reads as no misses.
         std::fs::write(&path, r#"{"generation":"g2","repos":["/w/big"]}"#).unwrap();
         assert!(
             ServiceMisses::read(&path)
-                .holds("g2", "big", TEN_S)
+                .holds("g2", &svc("big"), TEN_S)
                 .is_none()
         );
     }
@@ -2488,30 +2589,30 @@ mod tests {
         let long = Duration::from_millis(180_000);
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("recheck-misses.json");
-        ServiceMisses::record(&path, "g1", &[("big".to_string(), miss(40))]);
+        ServiceMisses::record(&path, "g1", &svc("big"), miss(40));
         let read = ServiceMisses::read(&path);
-        assert!(read.holds("g1", "big", TEN_S).is_some());
+        assert!(read.holds("g1", &svc("big"), TEN_S).is_some());
         assert!(
-            read.holds("g1", "big", Duration::from_millis(5_000))
+            read.holds("g1", &svc("big"), Duration::from_millis(5_000))
                 .is_some()
         );
         assert!(
-            read.holds("g1", "big", long).is_none(),
+            read.holds("g1", &svc("big"), long).is_none(),
             "a miss at 10 s says nothing about a call with 180 s"
         );
         let at_cap = Miss {
             budget_ms: 180_000,
             ..miss(40)
         };
-        ServiceMisses::record(&path, "g1", &[("big".to_string(), at_cap)]);
+        ServiceMisses::record(&path, "g1", &svc("big"), at_cap);
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", "big", long)
+                .holds("g1", &svc("big"), long)
                 .is_some()
         );
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", "big", TEN_S)
+                .holds("g1", &svc("big"), TEN_S)
                 .is_some()
         );
     }
@@ -2529,7 +2630,7 @@ mod tests {
         .unwrap();
         assert!(
             ServiceMisses::read(&path)
-                .holds("g1", "big", TEN_S)
+                .holds("g1", &svc("big"), TEN_S)
                 .is_none()
         );
     }
@@ -2538,13 +2639,153 @@ mod tests {
     /// the index holds, and the command that gives a fresh answer.
     #[test]
     fn the_miss_reason_names_the_service_and_the_fresh_read() {
-        let reason = miss_reason("catalog", &miss(12));
+        let reason = miss_reason(&svc("catalog"), &miss(12));
         assert!(
             reason.contains("re-reading catalog (12 indexed files)"),
             "{reason}"
         );
         assert!(reason.contains("took longer than 10 s"), "{reason}");
         assert!(reason.contains("check --changed"), "{reason}");
+    }
+
+    fn shared() -> Owner {
+        Owner::File {
+            repo: "shop".to_string(),
+            file: "shared/types.ts".to_string(),
+        }
+    }
+
+    /// A shop of three services at one commit: catalog and ledger include
+    /// `shared/`, inventory does not.
+    fn shop() -> IndexedRepo {
+        let service = |name: &str, include: serde_json::Value| {
+            serde_json::json!({
+                "name": name, "directory": name, "include": include,
+                "commit": "c1", "dirty": false, "indexed_at": "t",
+                "routes": 0, "calls": 0,
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "name": "shop",
+            "path": "/w/shop",
+            "services": [
+                service("catalog", serde_json::json!(["shared"])),
+                service("inventory", serde_json::json!([])),
+                service("ledger", serde_json::json!(["shared"])),
+            ],
+            "files": {},
+        }))
+        .expect("an indexed repo")
+    }
+
+    /// A file in no service's directory re-reads the services the walk names,
+    /// in index order, and every service when the walk could not say.
+    #[test]
+    fn a_shared_edit_re_reads_its_readers_in_index_order_and_every_service_when_unknown() {
+        let repo = shop();
+        let reach = Reach::for_edit(
+            &repo,
+            "shared/types.ts",
+            None,
+            Some(&["ledger".to_string(), "catalog".to_string()]),
+        )
+        .expect("a reach");
+        assert_eq!(reach.reread, vec!["catalog", "ledger"]);
+        assert_eq!(reach.owner, shared());
+        let reach = Reach::for_edit(&repo, "shared/types.ts", None, None).expect("a reach");
+        assert_eq!(reach.reread, vec!["catalog", "inventory", "ledger"]);
+    }
+
+    #[test]
+    fn rows_never_make_a_service_the_owner_of_a_file_outside_its_directory() {
+        let repo = shop();
+        let catalog = repo.services[0].clone();
+        let reach = Reach::for_edit(
+            &repo,
+            "shared/types.ts",
+            Some(&catalog),
+            Some(&["catalog".to_string(), "ledger".to_string()]),
+        )
+        .expect("a reach");
+        assert_eq!(reach.owner, shared());
+        let reach =
+            Reach::for_edit(&repo, "catalog/app/x.ts", Some(&catalog), None).expect("a reach");
+        assert_eq!(reach.owner, svc("catalog"));
+        assert_eq!(reach.reread, vec!["catalog"]);
+    }
+
+    #[test]
+    fn a_shared_files_miss_holds_for_that_file_and_silences_no_service() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        ServiceMisses::record(&path, "g1", &shared(), miss(5));
+        let read = ServiceMisses::read(&path);
+        assert_eq!(read.holds("g1", &shared(), TEN_S), Some(&miss(5)));
+        let other = Owner::File {
+            repo: "shop".to_string(),
+            file: "shared/other.ts".to_string(),
+        };
+        assert!(read.holds("g1", &other, TEN_S).is_none());
+        assert!(read.holds("g1", &svc("catalog"), TEN_S).is_none());
+        assert!(read.holds("g2", &shared(), TEN_S).is_none());
+        assert!(read.services.is_empty());
+    }
+
+    #[test]
+    fn a_timed_out_re_check_of_a_shared_file_is_remembered_for_the_file() {
+        let plan = Plan {
+            generation: "g1".to_string(),
+            services: vec!["catalog".to_string(), "ledger".to_string()],
+            digests: Default::default(),
+            working: Default::default(),
+            files: [("catalog".to_string(), 3), ("ledger".to_string(), 2)]
+                .into_iter()
+                .collect(),
+            scope: RecheckScope {
+                reread: vec!["catalog".to_string(), "ledger".to_string()],
+                not_reread: Vec::new(),
+                stale: Vec::new(),
+            },
+        };
+        assert_eq!(
+            plan.miss_of(&shared(), TEN_S, TEN_S),
+            Some(Miss {
+                elapsed_ms: 10_000,
+                budget_ms: 10_000,
+                files: 5
+            })
+        );
+    }
+
+    #[test]
+    fn the_miss_reason_for_a_shared_file_names_the_file_and_the_fresh_read() {
+        let reason = miss_reason(&shared(), &miss(5));
+        assert!(reason.contains("shared/types.ts"), "{reason}");
+        assert!(reason.contains("carrick refresh"), "{reason}");
+        assert!(reason.contains("carrick check --changed"), "{reason}");
+    }
+
+    #[test]
+    fn a_miss_file_without_files_still_holds_its_service_misses() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("recheck-misses.json");
+        std::fs::write(
+            &path,
+            r#"{"generation":"g1","services":{"big":{"elapsed_ms":10000,"budget_ms":10000,"files":40}}}"#,
+        )
+        .unwrap();
+        assert!(
+            ServiceMisses::read(&path)
+                .holds("g1", &svc("big"), TEN_S)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_indexed_service_has_no_reach() {
+        let mut repo = shop();
+        repo.services.clear();
+        assert!(Reach::for_edit(&repo, "x.ts", None, None).is_none());
     }
 
     fn write(root: &Path, relative: &str, text: &str) {
