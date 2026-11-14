@@ -24,6 +24,25 @@
           "patterns": []
         }
       ]
+    },
+    {
+      "package": "fixture-plain-store",
+      "version": "1.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "fixture-plain-store",
+          "export": "default",
+          "role": "server_framework",
+          "side": null,
+          "makes": [{ "form": "call", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
     }
   ]
 }
