@@ -108,7 +108,7 @@ const OF_IMPLEMENTATIONS: Plural = Plural {
 };
 
 /// The hop a walk records where it enters a function through a value.
-use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP};
+use super::decided_sites::{BoundCall, CALLBACK_HOP, HopMaker, VALUE_HOP, handed_by};
 use super::stop::Stop;
 
 /// One discovered site, or one walk that entered code and stopped.
@@ -2916,44 +2916,67 @@ impl<'a> Walker<'a> {
     /// states. Any other argument reads nothing here.
     fn handed_by_name(&mut self, file: &'a Path, call: &'a CallIr) -> Outcome<'a> {
         let mut out = Outcome::default();
+        // The definitions the call hands on as a whole argument: the one
+        // record ([`handed_by`], what `Calls::handed_on` holds, carrick#4176),
+        // so the walk, the guard chains and the call graph's `handed` edge
+        // follow the same rows.
+        let mut handed: Vec<(usize, PathBuf, String)> =
+            handed_by(self.inputs_for(file), file, call)
+                .into_iter()
+                .filter(|(_, _, index, keys)| {
+                    keys.is_empty() && !matches!(call.args.get(*index), Some(Value::Callback(_)))
+                })
+                .map(|(target, key, index, _)| (index, target, key))
+                .collect();
+        // A member read (`deps.g`) is no name in the record (carrick#4176
+        // R7): read here, as before.
         for (index, values) in call.arg_values.iter().enumerate() {
             if matches!(call.args.get(index), Some(Value::Callback(_))) {
                 continue;
             }
             for value in values {
-                let ValueAt::Read { lo, hi, member, .. } = value else {
-                    continue;
-                };
-                let kind = if *member { Kind::Member } else { Kind::Ident };
-                let Reach::Function(target, key) =
-                    self.inputs_for(file).row_names(file, *lo, *hi, kind)
+                let ValueAt::Read {
+                    lo,
+                    hi,
+                    member: true,
+                    ..
+                } = value
                 else {
                     continue;
                 };
-                self.enter(
-                    file,
-                    call,
-                    &target,
-                    EnteredFunction::Keyed(key.clone()),
-                    EnteredKind::Handed,
-                );
-                let hop = self.hop(&target, &key);
-                let id = (target, key);
-                let inner = match self.reading.get(&id) {
-                    Some(depth) => Outcome {
-                        cycle_at: Some(*depth),
-                        ..Outcome::stopped(Stop::Recursion)
-                    },
-                    None => self.definition(&id),
-                };
-                let written = ChainHop {
-                    function: CALLBACK_HOP.to_string(),
-                    file: self.rel(file),
-                    line: call.site.line,
-                    made: None,
-                };
-                out.absorb(self.lifted(inner).under(hop).under(written));
+                if let Reach::Function(target, key) =
+                    self.inputs_for(file)
+                        .row_names(file, *lo, *hi, Kind::Member)
+                {
+                    handed.push((index, target, key));
+                }
             }
+        }
+        handed.sort_by_key(|(index, ..)| *index);
+        for (_, target, key) in handed {
+            self.enter(
+                file,
+                call,
+                &target,
+                EnteredFunction::Keyed(key.clone()),
+                EnteredKind::Handed,
+            );
+            let hop = self.hop(&target, &key);
+            let id = (target, key);
+            let inner = match self.reading.get(&id) {
+                Some(depth) => Outcome {
+                    cycle_at: Some(*depth),
+                    ..Outcome::stopped(Stop::Recursion)
+                },
+                None => self.definition(&id),
+            };
+            let written = ChainHop {
+                function: CALLBACK_HOP.to_string(),
+                file: self.rel(file),
+                line: call.site.line,
+                made: None,
+            };
+            out.absorb(self.lifted(inner).under(hop).under(written));
         }
         out
     }
