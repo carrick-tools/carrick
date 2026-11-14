@@ -60,6 +60,8 @@ struct Written {
     intent: Option<&'static str>,
     tokens: Vec<String>,
     signature: Option<&'static str>,
+    exported: bool,
+    line: u32,
     calls: Vec<&'static str>,
 }
 
@@ -70,6 +72,8 @@ fn function(name: &'static str, file: &'static str, tokens: &[&str]) -> Written 
         intent: None,
         tokens: tokens.iter().map(|t| t.to_string()).collect(),
         signature: None,
+        exported: false,
+        line: 1,
         calls: Vec::new(),
     }
 }
@@ -81,6 +85,8 @@ fn index(corpus: &[Written]) -> SimilarIndex {
         intent: f.intent,
         tokens: &f.tokens,
         signature: f.signature,
+        exported: f.exported,
+        line: f.line,
         calls: f.calls.clone(),
     }))
 }
@@ -285,4 +291,91 @@ fn the_score_is_bm25_over_the_bag_less_the_query_idf_mass() {
     assert!((got("alpha") - want_alpha).abs() < 1e-9);
     assert!((got("beta") - want_beta).abs() < 1e-9);
     assert_eq!(rows.len(), 2);
+}
+
+/// A deterministic shuffle (xorshift), so a failure names a seed that repeats.
+fn shuffled<T>(mut items: Vec<T>, seed: u64) -> Vec<T> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for at in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(at, (state % (at as u64 + 1)) as usize);
+    }
+    items
+}
+
+/// Eight functions with the same words score the same; the rows that fit the
+/// cut must not depend on the order the index was fed.
+#[test]
+fn equal_scores_rank_the_same_whatever_order_the_index_was_built_in() {
+    let tokens = ["window", "span", "clamp", "bucket"];
+    let files = [
+        "a/one.ts",
+        "b/two.ts",
+        "c/three.ts",
+        "d/four.ts",
+        "e/five.ts",
+        "f/six.ts",
+        "g/seven.ts",
+        "h/eight.ts",
+    ];
+    let names = [
+        "pickAlpha",
+        "pickBravo",
+        "pickCharlie",
+        "pickDelta",
+        "pickEcho",
+        "pickFoxtrot",
+        "pickGolf",
+        "pickHotel",
+    ];
+    let query_tokens = texts(&tokens);
+    for seed in 0..20u64 {
+        let mut corpus = filler();
+        corpus.extend(
+            files
+                .iter()
+                .zip(names)
+                .map(|(file, name)| function(name, file, &tokens)),
+        );
+        let corpus = shuffled(corpus, seed);
+        let ranked = index(&corpus).rank(&query("clampWindow", "z/mine.ts", &query_tokens, &[]));
+        assert_eq!(ranked.len(), SIMILAR_ROWS);
+        let got: Vec<&str> = ranked.iter().map(|row| corpus[row.doc].file).collect();
+        // Scores tie, so the file path breaks it: the first six paths, in order.
+        assert_eq!(got, files[..SIMILAR_ROWS], "seed {seed}");
+    }
+}
+
+/// Exported comes before not exported, then the file path, then the line.
+#[test]
+fn a_score_tie_goes_to_exported_then_path_then_line() {
+    let tokens = ["window", "span", "clamp", "bucket"];
+    let query_tokens = texts(&tokens);
+    // (name, file, exported, line) in the order the ranker must return them.
+    let want = [
+        ("pickA", "m/x.ts", true, 3),
+        ("pickB", "m/x.ts", true, 9),
+        ("pickC", "m/y.ts", true, 1),
+        ("pickD", "a/z.ts", false, 2),
+        ("pickE", "b/z.ts", false, 1),
+        ("pickF", "b/z.ts", false, 5),
+        ("pickG", "c/z.ts", false, 1),
+        ("pickH", "d/z.ts", false, 1),
+    ];
+    for seed in 0..20u64 {
+        let mut corpus = filler();
+        for (name, file, exported, line) in want {
+            let mut f = function(name, file, &tokens);
+            f.exported = exported;
+            f.line = line;
+            corpus.push(f);
+        }
+        let corpus = shuffled(corpus, seed);
+        let ranked = index(&corpus).rank(&query("clampWindow", "z/mine.ts", &query_tokens, &[]));
+        let got: Vec<&str> = ranked.iter().map(|row| corpus[row.doc].name).collect();
+        let names: Vec<&str> = want[..SIMILAR_ROWS].iter().map(|w| w.0).collect();
+        assert_eq!(got, names, "seed {seed}");
+    }
 }

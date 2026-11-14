@@ -150,6 +150,8 @@ impl<'a> Similar<'a> {
                 intent: entry.definition.intent.as_deref(),
                 tokens: &entry.definition.tokens,
                 signature: entry.definition.signature.as_deref(),
+                exported: entry.definition.is_exported,
+                line: entry.definition.line_number,
                 calls: entry
                     .definition
                     .calls
