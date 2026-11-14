@@ -3162,3 +3162,72 @@ fn a_hooks_proxy_imported_into_tsx_pairs_each_procedure() {
         ]
     );
 }
+
+/// carrick#4244: a handler handed in by name that the route's file imports is
+/// placed at its declaring file's definition, and the row names that file.
+/// `ping` is declared at `src/handlers.ts` lines 3-5 and handed in by four
+/// routes of two files (one inside a plugin written in place); a handler declared in the route's own file carries no
+/// `handler_file`.
+#[test]
+fn an_imported_handler_is_placed_in_its_declaring_file() {
+    let blobs = scan_fixture("receiver-scopes-aliased");
+    let placed = |rows: &serde_json::Value, at: &dyn Fn(&serde_json::Value) -> String| {
+        let mut found: Vec<String> = rows
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| !row["handler_span"].is_null())
+            .map(|row| {
+                format!(
+                    "{} {}-{} in {}",
+                    at(row),
+                    row["handler_span"]["start_line"],
+                    row["handler_span"]["end_line"],
+                    row["handler_file"].as_str().unwrap_or("(own file)"),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let mut graph = Vec::new();
+    let mut flat = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        graph.extend(placed(&blob["mount_graph"]["endpoints"], &|row| {
+            row["file_location"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }));
+        flat.extend(placed(&blob["endpoints"], &|row| {
+            format!(
+                "{}:{}",
+                row["file_path"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default()
+            )
+        }));
+    }
+    let imported: Vec<&String> = graph
+        .iter()
+        .filter(|row| row.ends_with("handlers.ts"))
+        .collect();
+    assert_eq!(
+        imported,
+        vec![
+            "src/catalog.ts:11 3-5 in src/handlers.ts",
+            "src/catalog.ts:14 3-5 in src/handlers.ts",
+            "src/index.ts:12 3-5 in src/handlers.ts",
+            "src/index.ts:7 3-5 in src/handlers.ts",
+        ],
+        "{graph:#?}"
+    );
+    assert_eq!(
+        flat.iter()
+            .filter(|row| row.ends_with("handlers.ts"))
+            .count(),
+        4,
+        "{flat:#?}"
+    );
+}

@@ -1481,6 +1481,7 @@ pub fn endpoint_details(endpoint: &crate::mount_graph::ResolvedEndpoint) -> ApiE
         schema_binding: None,
         undeclared_selection: None,
         handler_span: endpoint.handler_span,
+        handler_file: endpoint.handler_file.clone(),
         declared_at: endpoint.declared_at.clone(),
         name_scope: None,
         library_semantics: Vec::new(),
@@ -1517,6 +1518,7 @@ pub fn call_details(call: &crate::mount_graph::DataFetchingCall) -> ApiEndpointD
         undeclared_selection: None,
         // A call has no handler.
         handler_span: None,
+        handler_file: None,
         name_scope: None,
         library_semantics: Vec::new(),
         inference: None,
@@ -2344,6 +2346,7 @@ mod tests {
                 schema_binding: None,
                 undeclared_selection: None,
                 handler_span: None,
+                handler_file: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
@@ -2590,6 +2593,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -2629,6 +2633,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         // A route whose module also renders a view (carrick#704).
@@ -2650,6 +2655,7 @@ mod tests {
             view_module: true,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         graph.data_calls.push(DataFetchingCall {
@@ -2728,6 +2734,7 @@ mod tests {
             view_module: false,
             dispatch,
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         graph.endpoints.push(route(Some(case("search-by-intent"))));
@@ -2858,6 +2865,7 @@ mod tests {
             view_module,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         graph
@@ -3501,6 +3509,7 @@ mod tests {
             schema_binding: binding,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -4614,6 +4623,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         let (endpoints, _calls) = mount_graph_to_api_details(&graph);

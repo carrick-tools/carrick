@@ -345,6 +345,10 @@ pub struct ApiEndpointDetails {
     /// the scan could not place, and on rows written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_span: Option<crate::mount_graph::HandlerSpan>,
+    /// The file `handler_span` is in when it is not `file_path`'s file
+    /// (carrick#4244); carried from the mount-graph row like `handler_span`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_file: Option<String>,
     /// Where `carrick.json` declares this operation, `carrick.json:<line>`;
     /// set only on a row a written (not generated) `operations` block produced
     /// from a tracked `carrick.json`. Retention only: matching never reads it.
@@ -5037,6 +5041,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -5969,6 +5974,7 @@ mod tests {
                 schema_binding: None,
                 undeclared_selection: None,
                 handler_span: None,
+                handler_file: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
@@ -6017,6 +6023,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -6042,6 +6049,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }
@@ -6138,6 +6146,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -6162,6 +6171,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -6239,6 +6249,7 @@ mod tests {
                 schema_binding: None,
                 undeclared_selection: None,
                 handler_span: None,
+                handler_file: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
@@ -6263,6 +6274,7 @@ mod tests {
                 resolution_source: producer_source,
                 dispatch: None,
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
             mount_graph.data_calls.push(DataFetchingCall {
@@ -6408,6 +6420,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -6634,6 +6647,7 @@ mod tests {
             resolution_source: Some(FileBasedRoute),
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
@@ -6722,6 +6736,7 @@ mod tests {
             resolution_source: Some(FileBasedRoute),
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         // The one call row the scan holds in that file is on another line,
@@ -7086,6 +7101,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -7120,6 +7136,7 @@ mod tests {
                 resolution_source: source,
                 dispatch: None,
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -7185,6 +7202,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -7254,6 +7272,7 @@ mod tests {
                 schema_binding: None,
                 undeclared_selection: None,
                 handler_span: None,
+                handler_file: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,
@@ -7283,6 +7302,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: Some(case(value)),
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -7348,6 +7368,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -7373,6 +7394,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: Some(case(value)),
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -7485,6 +7507,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -7509,6 +7532,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -7557,6 +7581,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -7581,6 +7606,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -7629,6 +7655,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -7654,6 +7681,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
@@ -7675,6 +7703,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7796,6 +7825,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         // repo-beta: the identical call to the same external endpoint.
@@ -7888,6 +7918,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7962,6 +7993,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         mount_graph.data_calls.push(DataFetchingCall {
@@ -8027,6 +8059,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }

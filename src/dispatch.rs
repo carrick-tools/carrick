@@ -302,6 +302,7 @@ pub fn apply_declared_operations(
                         value: operation.value.clone(),
                     }),
                     handler_span: None,
+                    handler_file: None,
                     address: None,
                 });
                 written += 1;
@@ -1362,6 +1363,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1414,6 +1416,7 @@ mod tests {
                 value: value.to_string(),
             }),
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         // Inference found two of the three, and misread one of them.
@@ -1519,6 +1522,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -1610,6 +1614,7 @@ mod tests {
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,

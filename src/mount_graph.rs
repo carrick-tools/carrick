@@ -107,6 +107,13 @@ pub struct ResolvedEndpoint {
     /// could not be placed, and on graphs serialized before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler_span: Option<HandlerSpan>,
+    /// The repo-relative file `handler_span` is in, when that is not this
+    /// row's own file: a handler handed in by name that an import of the
+    /// route's file declares elsewhere (carrick#4244). `None` means the span,
+    /// if any, is in the row's own file. The cloud reads it beside
+    /// `HandlerSpan` (mcp-server `types.ts`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler_file: Option<String>,
     /// The parts this route's address is composed of, outermost first, each
     /// with the `file:line` that states it (`docs/reference/address-chain.md`).
     /// `None` means this scanner recorded none for the row (a graph
@@ -808,6 +815,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -845,6 +853,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         let old = serde_json::to_value(&row).unwrap();
@@ -1123,6 +1132,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1407,6 +1417,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1460,6 +1471,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         let normalizer = UrlNormalizer::new(&Config::default());
@@ -1498,6 +1510,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1538,6 +1551,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1580,6 +1594,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
 
@@ -1617,6 +1632,7 @@ mod tests {
                 resolution_source: None,
                 dispatch: None,
                 handler_span: None,
+                handler_file: None,
                 address: None,
             });
         }
@@ -1704,6 +1720,7 @@ mod tests {
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         crate::cloud_storage::CloudRepoData {
