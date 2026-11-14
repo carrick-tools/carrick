@@ -579,6 +579,9 @@ pub struct PositionIndex {
     /// declares, by the library file (`lib.dom.d.ts`): the symbol of each
     /// identifier row whose declaration is a `lib:` file.
     library_globals: BTreeMap<String, BTreeSet<String>>,
+    /// Whether the walk was asked and wrote no rows: a file the index does
+    /// not hold is then [`HoleReason::WalkLost`] (carrick#4256).
+    walk_lost: bool,
     /// How many lookups converted a span, for the tests that a reader asks
     /// once per position.
     #[cfg(test)]
@@ -617,6 +620,15 @@ impl PositionIndex {
         Self {
             scan_root: scan_root.to_path_buf(),
             ..Self::default()
+        }
+    }
+
+    /// An index with no rows, for a service whose walk was asked and wrote
+    /// none: every lookup is [`HoleReason::WalkLost`] (carrick#4256).
+    pub fn walk_lost(scan_root: &Path) -> Self {
+        Self {
+            walk_lost: true,
+            ..Self::missing(scan_root)
         }
     }
 
@@ -788,7 +800,11 @@ impl PositionIndex {
         let indexed = self
             .relative(file)
             .and_then(|relative| self.files.get(&relative))
-            .ok_or(HoleReason::RowsMissing)?;
+            .ok_or(if self.walk_lost {
+                HoleReason::WalkLost
+            } else {
+                HoleReason::RowsMissing
+            })?;
         if indexed.skip.is_some() {
             return Err(HoleReason::NotInProgram);
         }
@@ -1283,6 +1299,28 @@ mod tests {
                 .err(),
             Some(HoleReason::RowsMissing)
         );
+    }
+
+    /// carrick#4256: a service whose walk was asked and wrote no rows reads
+    /// `walk_lost` at every position and file; one with no walk still reads
+    /// `rows_missing`.
+    #[test]
+    fn a_lost_walk_s_index_says_walk_lost_and_a_missing_one_rows_missing() {
+        let root = Path::new("/repo");
+        let a = root.join("src/a.ts");
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        let lost = PositionIndex::walk_lost(root);
+        assert_eq!(
+            lost.lookup(&a, base, base + 3, Kind::Call).err(),
+            Some(HoleReason::WalkLost)
+        );
+        assert_eq!(lost.file_hole(&a), Some(HoleReason::WalkLost));
+        let missing = PositionIndex::missing(root);
+        assert_eq!(
+            missing.lookup(&a, base, base + 3, Kind::Call).err(),
+            Some(HoleReason::RowsMissing)
+        );
+        assert_eq!(missing.file_hole(&a), Some(HoleReason::RowsMissing));
     }
 
     /// A span in a file with multi-byte text, CRLF line ends or a BOM joins

@@ -125,6 +125,31 @@ pub(crate) fn walked(
     )
 }
 
+/// Builds an index over a copied repo's root.
+pub(crate) type IndexOf = fn(&Path) -> PositionIndex;
+
+/// Where a fixture service's rows come from.
+#[derive(Clone, Copy)]
+pub(crate) enum Rows {
+    /// The real sidecar's walk.
+    Walked,
+    /// No index at all (`positions: None`).
+    Absent,
+    /// An index built over the copied repo's root, as a lost walk or no walk
+    /// leaves one (carrick#4256).
+    Index(IndexOf),
+}
+
+impl Rows {
+    fn of(with_rows: bool) -> Self {
+        if with_rows {
+            Self::Walked
+        } else {
+            Self::Absent
+        }
+    }
+}
+
 /// [`walked`], binding the rows within `budget` (carrick#2564).
 pub(crate) fn walked_within(
     fixture: &str,
@@ -132,6 +157,42 @@ pub(crate) fn walked_within(
     service: &str,
     edit: &[(&str, &str)],
     with_rows: bool,
+    budget: std::time::Duration,
+) -> Option<Walked> {
+    walked_with(
+        fixture,
+        service_dir,
+        service,
+        edit,
+        Rows::of(with_rows),
+        budget,
+    )
+}
+
+/// [`walked`], with the service's rows from `rows` (carrick#4256).
+pub(crate) fn walked_over(
+    fixture: &str,
+    service_dir: &str,
+    service: &str,
+    edit: &[(&str, &str)],
+    rows: Rows,
+) -> Option<Walked> {
+    walked_with(
+        fixture,
+        service_dir,
+        service,
+        edit,
+        rows,
+        super::ROWS_JOIN_BUDGET,
+    )
+}
+
+fn walked_with(
+    fixture: &str,
+    service_dir: &str,
+    service: &str,
+    edit: &[(&str, &str)],
+    rows: Rows,
     budget: std::time::Duration,
 ) -> Option<Walked> {
     let script = sidecar()?;
@@ -159,8 +220,18 @@ pub(crate) fn walked_within(
         .position(|config| config.service_name.as_deref() == Some(service))
         .unwrap_or(0);
     let config = services.remove(at);
-    let positions =
-        with_rows.then(|| rows_of(&script, dir.path(), &repo, &service_root, &config, service));
+    let positions = match rows {
+        Rows::Walked => Some(rows_of(
+            &script,
+            dir.path(),
+            &repo,
+            &service_root,
+            &config,
+            service,
+        )),
+        Rows::Absent => None,
+        Rows::Index(index) => Some(index(&repo)),
+    };
     let started = std::time::Instant::now();
     let inputs = crate::engine::discover_service_inputs_within(&repo, &config, positions, budget);
     Some(Walked {
@@ -227,6 +298,17 @@ pub(crate) fn walked_services(
     services: &[(&str, &str)],
     with_rows: bool,
 ) -> Option<WalkedServices> {
+    walked_services_over(fixture, services, with_rows, None)
+}
+
+/// [`walked_services`], the service named in `instead` read over the index
+/// its function builds from the repo root rather than walked (carrick#4256).
+pub(crate) fn walked_services_over(
+    fixture: &str,
+    services: &[(&str, &str)],
+    with_rows: bool,
+    instead: Option<(&str, IndexOf)>,
+) -> Option<WalkedServices> {
     let script = sidecar()?;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = tempfile::tempdir().unwrap();
@@ -243,16 +325,22 @@ pub(crate) fn walked_services(
                 .iter()
                 .find(|config| config.service_name.as_deref() == Some(*service))
                 .unwrap_or_else(|| panic!("carrick.json declares no service {service}"));
-            let positions = with_rows.then(|| {
-                rows_of(
-                    &script,
-                    dir.path(),
-                    &repo,
-                    &repo.join(service_dir),
-                    config,
-                    service,
-                )
-            });
+            let positions = if let Some((name, index)) = instead
+                && name == *service
+            {
+                Some(index(&repo))
+            } else {
+                with_rows.then(|| {
+                    rows_of(
+                        &script,
+                        dir.path(),
+                        &repo,
+                        &repo.join(service_dir),
+                        config,
+                        service,
+                    )
+                })
+            };
             crate::engine::discover_service_inputs_within(
                 &repo,
                 config,

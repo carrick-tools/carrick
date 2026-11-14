@@ -7282,6 +7282,65 @@ export function listen(): void {
         );
     }
 
+    /// carrick#4256: the calls into a sibling whose walk wrote no rows stop
+    /// `walk_lost`, where the same calls into a sibling that was never walked
+    /// stop `rows_missing` (today's reading, which this pins). The reaching
+    /// service's own rows are the walked ones in both.
+    #[test]
+    fn a_call_into_a_sibling_with_a_lost_walk_stops_walk_lost() {
+        let stops_into_client = |index: fn(&Path) -> crate::position_rows::PositionIndex| {
+            let on = super::super::fixture_walk::walked_services_over(
+                "discovery-siblings",
+                &[("services/app", "app"), ("packages/client", "client")],
+                true,
+                Some(("client", index)),
+            )?;
+            let text = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/discovery-siblings/library-claims.json"),
+            )
+            .unwrap();
+            let answer = crate::library_store::parse_answer(&text);
+            let labels = Labels::of_answer(&answer);
+            let [app, client] = on.inputs.as_slice() else {
+                panic!("two services");
+            };
+            let with = discover_with(app, &[client], &labels, &on.repo);
+            let mut stops: Vec<(u32, Option<&str>)> = with
+                .sites
+                .iter()
+                .filter(|site| site.end.is_none())
+                .chain(&with.unfollowed)
+                .filter(|site| site.file == "services/app/src/main.ts")
+                .filter(|site| [5, 9, 14, 18].contains(&site.line))
+                .map(|site| (site.line, site.stop.map(Stop::as_str)))
+                .collect();
+            stops.sort();
+            stops.dedup();
+            Some(stops)
+        };
+        let Some(missing) = stops_into_client(crate::position_rows::PositionIndex::missing) else {
+            return;
+        };
+        let lost = stops_into_client(crate::position_rows::PositionIndex::walk_lost)
+            .expect("the sidecar is built");
+        let lines: Vec<u32> = missing.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, vec![5, 9, 14, 18], "{missing:?}");
+        assert!(
+            missing
+                .iter()
+                .all(|(_, stop)| *stop == Some("rows_missing")),
+            "{missing:?}"
+        );
+        assert_eq!(
+            lost,
+            missing
+                .iter()
+                .map(|(line, _)| (*line, Some("walk_lost")))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// carrick#2618: a labelled call a walk reaches in a sibling's code is a
     /// site only when it sends. The same fixture with the store labelling
     /// the export a server framework (a route the sibling registers, which

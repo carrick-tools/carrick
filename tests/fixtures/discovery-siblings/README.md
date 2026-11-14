@@ -45,3 +45,17 @@ row names a file of the other service. The app asks for `fetch` only because
 the client does: the scan adds the services a walk may enter to the app's ask.
 A `--changed-only` scan of a change to the app alone carries the client, walks
 it for the app's calls, and states the same rows.
+
+## A walk that writes no rows
+
+When the client's compiler walk is asked and writes no rows (it failed, or died
+of memory), the app's calls into the client's code cannot be read. The app's
+unread sites at lines 5, 9, 14 and 18 of `main.ts` read `walk_lost`, with
+`stop_at` in `packages/client/src/http.ts`, beside the one `outside_service`
+site at line 22 (`unread_sites_by_reason` is `{"outside_service": 1,
+"walk_lost": 4}`). The app then states only lines 5 (GET) and 14 (DELETE): the
+POST at line 9 is absent while the client has no rows. The client's own five
+unread sites read `walk_lost` when its walk fails in a full scan, and its
+`boundary.walk_rows_lost` says why. A service whose walk was never asked (no
+compiler engine) keeps `rows_missing`. `tests/sibling_sites_test.rs` holds both
+scans and `discovery.rs` the same read without a scan.

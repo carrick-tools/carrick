@@ -109,6 +109,8 @@ pub enum Stop {
     Recursion,
     /// No compiler row answers the position.
     RowsMissing,
+    /// The compiler walk of the service holding this position wrote no rows.
+    WalkLost,
     /// The file's bytes differ from the ones its rows were read from.
     RowsStale,
     /// The walk read no rows for the file.
@@ -185,7 +187,7 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 57] = [
+    pub const ALL: [Stop; 58] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
@@ -227,6 +229,7 @@ impl Stop {
         Stop::FanOutCap,
         Stop::Recursion,
         Stop::RowsMissing,
+        Stop::WalkLost,
         Stop::RowsStale,
         Stop::NotInProgram,
         Stop::CheckerThrew,
@@ -289,6 +292,7 @@ impl Stop {
             Stop::FanOutCap => "fan_out_cap",
             Stop::Recursion => "recursion",
             Stop::RowsMissing => "rows_missing",
+            Stop::WalkLost => "walk_lost",
             Stop::RowsStale => "rows_stale",
             Stop::NotInProgram => "not_in_program",
             Stop::CheckerThrew => "checker_threw",
@@ -351,6 +355,7 @@ impl From<HoleReason> for Stop {
             HoleReason::FanOutCap => Stop::FanOutCap,
             HoleReason::Recursion => Stop::Recursion,
             HoleReason::RowsMissing => Stop::RowsMissing,
+            HoleReason::WalkLost => Stop::WalkLost,
             HoleReason::RowsStale => Stop::RowsStale,
             HoleReason::NotInProgram => Stop::NotInProgram,
             HoleReason::CheckerThrew => Stop::CheckerThrew,
@@ -456,6 +461,7 @@ mod tests {
             (H::FanOutCap, "fan_out_cap"),
             (H::Recursion, "recursion"),
             (H::RowsMissing, "rows_missing"),
+            (H::WalkLost, "walk_lost"),
             (H::RowsStale, "rows_stale"),
             (H::NotInProgram, "not_in_program"),
             (H::CheckerThrew, "checker_threw"),
