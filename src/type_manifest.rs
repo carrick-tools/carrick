@@ -1,5 +1,7 @@
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind};
 use crate::operation::OperationKey;
+use swc_common::{SourceMap, sync::Lrc};
+use swc_ecma_ast::{Decl, ModuleDecl, ModuleItem, Stmt};
 
 pub fn normalize_manifest_method(method: &str) -> String {
     let trimmed = method.trim();
@@ -71,8 +73,11 @@ pub fn build_manifest_type_alias(
     let hash_input = format!("{}|{}|{}", key.canonical(), role_label, type_label);
     let hash = fnv1a_hash(&hash_input);
 
-    format!("Endpoint_{:016x}_{}", hash, type_label)
+    format!("{ENDPOINT_ALIAS_PREFIX}{:016x}_{}", hash, type_label)
 }
+
+/// What every synthetic manifest alias name starts with.
+pub const ENDPOINT_ALIAS_PREFIX: &str = "Endpoint_";
 
 /// Hash a consumer call site into the 16-hex id embedded in
 /// site-suffixed aliases. The id is a join key across the manifest,
@@ -306,6 +311,109 @@ pub fn dts_servable_types(content: &str) -> usize {
         .into_iter()
         .filter(|name| dts_alias_serves_a_shape(content, name))
         .count()
+}
+
+/// Remove from a `.d.ts` every top-level `type` or `interface` declaration
+/// of a synthetic `Endpoint_` name that `held` does not hold, with the rest
+/// of its line. `held` reads the declared name as written (derived aliases
+/// included), so the caller decides how a derived name maps to its base. Every
+/// other declaration, and every byte of a kept one, stays as it was. Returns
+/// the text and how many declarations went. Text that does not parse is an
+/// `Err` naming where and why, never a silent no-op: the caller keeps the text
+/// and says so ([`DeclarationsUnparsed`]).
+pub fn drop_alias_declarations(
+    dts: &str,
+    held: &dyn Fn(&str) -> bool,
+) -> Result<(String, usize), DeclarationsUnparsed> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let module = crate::parser::try_parse_source(
+        std::path::Path::new("surface.d.ts"),
+        swc_common::FileName::Custom("surface.d.ts".to_string()),
+        dts.to_string(),
+        &cm,
+        None,
+    )
+    .map_err(|error| {
+        let span = swc_common::Spanned::span(&error);
+        let at = cm.lookup_char_pos(span.lo);
+        DeclarationsUnparsed {
+            line: at.line,
+            column: at.col_display + 1,
+            offset: cm.lookup_byte_offset(span.lo).pos.0 as usize,
+            message: error.kind().msg().to_string(),
+        }
+    })?;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for item in &module.body {
+        let (decl, span) = match item {
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => (&export.decl, export.span),
+            ModuleItem::Stmt(Stmt::Decl(decl)) => (
+                decl,
+                match decl {
+                    Decl::TsInterface(d) => d.span,
+                    Decl::TsTypeAlias(d) => d.span,
+                    _ => continue,
+                },
+            ),
+            _ => continue,
+        };
+        let name = match decl {
+            Decl::TsInterface(d) => &d.id.sym,
+            Decl::TsTypeAlias(d) => &d.id.sym,
+            _ => continue,
+        };
+        if !name.starts_with(ENDPOINT_ALIAS_PREFIX) || held(name) {
+            continue;
+        }
+        let lo = cm.lookup_byte_offset(span.lo).pos.0 as usize;
+        let hi = cm.lookup_byte_offset(span.hi).pos.0 as usize;
+        if lo >= hi || hi > dts.len() {
+            continue;
+        }
+        // The whole line goes when nothing else is on it.
+        let line_start = dts[..lo].rfind('\n').map_or(0, |at| at + 1);
+        let line_end = dts[hi..].find('\n').map_or(dts.len(), |at| hi + at + 1);
+        let before = &dts[line_start..lo];
+        let after = dts[hi..line_end].trim();
+        if before.trim().is_empty() && (after.is_empty() || after.starts_with("//")) {
+            ranges.push((line_start, line_end));
+        } else {
+            ranges.push((lo, hi));
+        }
+    }
+    ranges.sort_unstable();
+    let mut out = String::with_capacity(dts.len());
+    let mut at = 0;
+    for (lo, hi) in &ranges {
+        if *lo < at {
+            continue;
+        }
+        out.push_str(&dts[at..*lo]);
+        at = *hi;
+    }
+    out.push_str(&dts[at..]);
+    Ok((out, ranges.len()))
+}
+
+/// Why a declaration text could not be swept: where the parser stopped and
+/// what it said. The text's own bytes are never quoted, so the line carries
+/// no source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationsUnparsed {
+    pub line: usize,
+    pub column: usize,
+    pub offset: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for DeclarationsUnparsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at line {}, column {} (byte {})",
+            self.message, self.line, self.column, self.offset
+        )
+    }
 }
 
 /// Append `export type <alias> = <type_string>;` to a bundled `.d.ts`.
@@ -646,6 +754,48 @@ mod tests {
 
         assert!(!out.contains("Payment = unknown"), "got: {out}");
         assert!(!dts_alias_is_trivially_unknown(&out, "Payment"));
+    }
+
+    #[test]
+    fn drop_alias_declarations_keeps_held_bytes_and_drops_the_rest() {
+        let held_text =
+            "export type Endpoint_a_Response = {\n  id: string;\n  tags: string[];\n};\n";
+        let dts = format!(
+            "{held_text}\
+             export interface Endpoint_b_Response {{\n  n: number;\n}}\n\
+             type Endpoint_c_Request = {{\n  q: string;\n}};\n\
+             export type Endpoint_a_Response_Unwidened = {{ id: string }};\n\
+             export type Support = string; // kept\n"
+        );
+        let held =
+            |name: &str| name == "Endpoint_a_Response" || name == "Endpoint_a_Response_Unwidened";
+        let (out, dropped) = drop_alias_declarations(&dts, &held).expect("parses");
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            out,
+            format!(
+                "{held_text}export type Endpoint_a_Response_Unwidened = {{ id: string }};\n\
+                 export type Support = string; // kept\n"
+            )
+        );
+    }
+
+    #[test]
+    fn drop_alias_declarations_leaves_unparseable_text_alone() {
+        let dts = "export type Endpoint_a_Response = {{{\n";
+        assert!(drop_alias_declarations(dts, &|_| false).is_err());
+    }
+
+    /// An unquoted hyphenated key is not TypeScript: the failure names the
+    /// line and column and quotes none of the text.
+    #[test]
+    fn drop_alias_declarations_names_where_a_hyphenated_key_stops_the_parse() {
+        let dts =
+            "export type Support = string;\nexport type Endpoint_a_Response = { a-b: number };\n";
+        let failure = drop_alias_declarations(dts, &|_| false).expect_err("does not parse");
+        assert_eq!(failure.line, 2);
+        assert!(failure.offset > dts.find('\n').unwrap());
+        assert!(!failure.to_string().contains("a-b"), "{failure}");
     }
 
     fn entry(type_alias: &str) -> crate::cloud_storage::TypeManifestEntry {

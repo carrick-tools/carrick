@@ -152,8 +152,23 @@ fn settled_line() -> &'static str {
     &scan().1
 }
 
-fn scan() -> &'static (Blobs, String) {
-    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+/// The alias names each service's stored type-reach object holds.
+type ReachAliases = BTreeMap<String, Vec<String>>;
+
+fn reach_aliases() -> &'static ReachAliases {
+    &scan().2
+}
+
+/// The run log's lines on which leaf types were asked and on which the fold
+/// took a model row.
+fn leaf_ask_lines() -> &'static [String] {
+    &scan().3
+}
+
+type Scanned = (Blobs, String, ReachAliases, Vec<String>);
+
+fn scan() -> &'static Scanned {
+    static SCAN: OnceLock<Scanned> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -166,17 +181,25 @@ fn scan() -> &'static (Blobs, String) {
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
             .env("HOME", &home);
         run(cmd);
-        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        let logs: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
             .expect("the scan keeps a run log")
             .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-            .flat_map(|log| {
-                log.lines()
-                    .filter(|line| line.contains("Call-through rows settled"))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+            .collect();
+        let settled = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .find(|line| line.contains("Call-through rows settled"))
+            .expect("the pass logs what it settled")
+            .to_string();
+        let asks: Vec<String> = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .filter(|line| {
+                line.contains("Call-through leaf type asked at")
+                    || line.contains("Call-through fold took a model row at")
             })
-            .next()
-            .expect("the pass logs what it settled");
+            .map(str::to_string)
+            .collect();
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -186,7 +209,22 @@ fn scan() -> &'static (Blobs, String) {
             SERVICES,
             "every service uploads one blob"
         );
-        (blobs, settled)
+        let reach: ReachAliases = SERVICES
+            .iter()
+            .filter_map(|service| {
+                use std::io::Read;
+                let object =
+                    std::fs::read(storage.join(format!("{service}.type-reach.json.gz"))).ok()?;
+                let mut json = String::new();
+                flate2::read::GzDecoder::new(&object[..])
+                    .read_to_string(&mut json)
+                    .ok()?;
+                let record: serde_json::Value = serde_json::from_str(&json).ok()?;
+                let names = record["aliases"].as_object()?.keys().cloned().collect();
+                Some((service.to_string(), names))
+            })
+            .collect();
+        (blobs, settled, reach, asks)
     })
 }
 
@@ -463,7 +501,8 @@ fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() 
         row_at("cli", COMMANDS, 145),
         Row {
             method: "GET".to_string(),
-            target: "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string(),
+            // The env base is the row's `base` (carrick#4434).
+            target: "/api/v1/runs/:id".to_string(),
             path: "/api/v1/runs/:id".to_string(),
             source: "request_summary".to_string(),
             role: Some("wrapper_call".to_string()),
@@ -646,8 +685,10 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
         row_at("cli", COMMANDS, 139),
         as_stated("GET", "/tokened", "/tokened")
     );
+    // `showPing`'s `ping()` reaches a `fetch` the fact states (carrick#4078),
+    // so only this row is counted.
     assert!(
-        settled_line().contains("2 reach a request only the model states"),
+        settled_line().contains("1 reach a request only the model states"),
         "{}",
         settled_line()
     );
@@ -658,7 +699,20 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
 /// what the request returns. Those entries go, and are counted.
 #[test]
 fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
-    for (file, line) in [(HOOKS, 9), (HOOKS, 14), (HOOKS, 19)] {
+    // `chained.ts` lines 9, 20 and 21: a callback's call and a call a promise
+    // method is read off carry no type either (carrick#2832). With the fetch
+    // claim (carrick#4078) the fold takes the model's rows there and a leaf
+    // row states each at the call inside; the type asked at that call goes,
+    // as the client function does not hand back the request's body
+    // (carrick#4113).
+    for (file, line) in [
+        (HOOKS, 9),
+        (HOOKS, 14),
+        (HOOKS, 19),
+        (CHAINED, 9),
+        (CHAINED, 20),
+        (CHAINED, 21),
+    ] {
         let entries = consumer_entries_at("web", file, line);
         assert!(
             entries.is_empty(),
@@ -666,15 +720,16 @@ fn a_type_anchored_at_a_call_that_is_not_the_requests_is_dropped_and_counted() {
         );
         assert_eq!(response_verdicts_at(file, line), []);
     }
-    // With `chained.ts` lines 9, 20 and 21: a callback's call and a call a
-    // promise method is read off carry no type either (carrick#2832). With
-    // `inline-commands.ts` lines 9, 13, 22 and `inline-hooks.ts:6` too: every
-    // scan walks with the compiler's rows (`position_rows::destination` has
-    // no switch), which correct those four (carrick#2822), and a corrected
-    // call through drops the type anchored at the caller's call there as at
-    // the other eighteen.
+    // The corrected rows that lost their type. With `inline-commands.ts`
+    // lines 9, 13, 22 and `inline-hooks.ts:6`: every scan walks with the
+    // compiler's rows (`position_rows::destination` has no switch), which
+    // correct those four (carrick#2822), and a corrected call through drops
+    // the type anchored at the caller's call there as at the others. The
+    // `chained.ts` rows are leaf rows now, not corrected ones, and are not
+    // counted here; the fact row at `typed-commands.ts:54`, whose chain does
+    // not hand back the body, is (carrick#4078).
     assert!(
-        settled_line().contains("(22 lost the types anchored at a call that is not the request's,"),
+        settled_line().contains("(20 lost the types anchored at a call that is not the request's,"),
         "{}",
         settled_line()
     );
@@ -707,8 +762,9 @@ fn a_corrected_row_never_carries_a_request_entry() {
             "no request type is checked at a call through ({file}:{line}): {requests:#?}"
         );
     }
-    // Lines 145 and 157 of `commands.ts` and line 15 of `typed-commands.ts`
-    // keep their response entry.
+    // Lines 145 and 157 of `commands.ts` and the fact row at
+    // `typed-client.ts:34` keep their response entry. `typed-commands.ts:15`
+    // is a leaf row, which asks only a response (carrick#4113).
     assert!(
         settled_line().contains("3 kept the response type and lost the request type)"),
         "{}",
@@ -754,17 +810,14 @@ fn a_hook_with_two_callbacks_and_a_promise_chain_take_the_request_they_reach() {
             (9, corrected("PUT", "/api/v1/runs/:id", 11)),
             (20, corrected("GET", "/api/v1/runs", 8)),
             (21, corrected("GET", "/api/v1/status", 23)),
-            // The other callback calls what nothing resolves.
-            (
-                14,
-                as_stated("POST", "/api/v1/save-run-cached", "/api/v1/save-run-cached"),
-            ),
+            // `mutationFn` calls `saveRun`, a proven PUT; the other callback
+            // calls a `declare const` with no network evidence, so the
+            // model's path was invented (carrick#4078 R7).
+            (14, corrected("PUT", "/api/v1/runs/:id", 11)),
             // The factory the method is read off requests something, then
-            // returns an object of its own.
-            (
-                27,
-                as_stated("POST", "/api/v1/session/run", "/api/v1/session/run"),
-            ),
+            // returns an object of its own: `.run()` is no request, and the
+            // call into the factory states the one it makes (carrick#4078).
+            (27, corrected("POST", "/api/v1/audit", 17)),
         ] {
             assert_eq!(
                 rows_in(blobs, "web", CHAINED, line),
@@ -808,20 +861,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         ("cli", COMMANDS, 76, as_stated("GET", "/reply", "/reply")),
         // The site writes the route itself.
         ("cli", COMMANDS, 82, as_stated("GET", "/orders", "/orders")),
-        // The site also writes a request of its own.
-        (
-            "cli",
-            COMMANDS,
-            88,
-            as_stated("GET", "/api/v1/notified/${id}", "/api/v1/notified/:id"),
-        ),
-        // Only the model states the request the function called makes.
-        (
-            "cli",
-            COMMANDS,
-            94,
-            as_stated("GET", "/api/v1/pings", "/api/v1/pings"),
-        ),
         // The site writes the route, and the function it calls reaches one
         // request of its own (a token). The row is the one the scanner reads
         // off the site's own source, which this pass never touches.
@@ -864,6 +903,25 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         changed.is_empty(),
         "each of these must stay as the model stated it: {changed:#?}"
     );
+    // The site also writes a request of its own, `fetch("/api/v1/audit")`:
+    // the fact states it there, not the model's invented path.
+    assert_eq!(
+        row_at("cli", COMMANDS, 88),
+        Row {
+            method: "GET".to_string(),
+            target: "/api/v1/audit".to_string(),
+            path: "/api/v1/audit".to_string(),
+            source: "request_summary".to_string(),
+            role: None,
+            reaches: None,
+        }
+    );
+    // `ping()` makes a literal `fetch` the fact states, and the walk links
+    // the call through to it (carrick#4078).
+    assert_eq!(
+        row_at("cli", COMMANDS, 94),
+        corrected("GET", "/api/v1/ping", 27)
+    );
 }
 
 #[test]
@@ -903,21 +961,25 @@ fn every_request_row_is_unchanged() {
             spec(17, "POST /api/v1/audit"),
             spec(20, "GET /health"),
             spec(23, "GET /api/v1/status"),
+            // A literal `fetch`: the fact states it.
             (
                 format!("{REQUESTS}:27"),
                 "GET /api/v1/ping".to_string(),
-                "model".to_string()
+                "request_summary".to_string()
             ),
             spec(39, "POST /api/v1/runs/:id/archive"),
+            // A `fetch` on the declared env base: the fetch claim makes it
+            // the fact's, and the fact replaces the same-key base-path row
+            // (carrick#4434), keeping the env base as its `base`.
             (
                 format!("{REQUESTS}:45"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
             (
                 format!("{REQUESTS}:51"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
             // `typed.ts`: two specs and a `fetch` on the declared base.
             (
@@ -933,7 +995,7 @@ fn every_request_row_is_unchanged() {
             (
                 format!("{TYPED}:24"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
         ]
     );
@@ -1153,17 +1215,30 @@ fn a_call_straight_into_another_services_function_states_the_request_it_reaches(
         ("cli", COMMANDS, 157, "GET", "/api/v1/runs/:id", 45),
         // `authorizedRun` is called from its own file, so it is no wrapper.
         ("cli", COMMANDS, 171, "GET", "/api/v1/runs/:id", 5),
+        // `ping()` makes a literal `fetch`: the fact states it, and the walk
+        // links the call through to it (carrick#4078).
+        ("cli", COMMANDS, 94, "GET", "/api/v1/ping", 27),
     ] {
-        let mut row = corrected(method, path, request_line);
-        // The two requests written on a declared environment base keep it in
-        // their target.
-        if request_line == 45 || request_line == 51 {
-            row.target = "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string();
-        }
+        let row = corrected(method, path, request_line);
         assert_eq!(rows_in(blobs, service, file, line), [row], "{file}:{line}");
+        // The two requests written on a declared environment base are the
+        // fact's rows (the fetch claim, carrick#4078; a fact replaces a
+        // same-key base-path row, carrick#4434): the base is the row's
+        // `base`, not its target, and the call through takes it.
+        if request_line == 45 || request_line == 51 {
+            let site = format!("{file}:{line}");
+            let call = blobs[service]["mount_graph"]["data_calls"]
+                .as_array()
+                .expect("the blob holds a mount graph")
+                .iter()
+                .find(|call| call["file_location"] == site.as_str())
+                .expect("the row is stored");
+            assert_eq!(call["base"]["kind"], "env", "{site}");
+            assert_eq!(call["base"]["env_var"], "RUNS_ORIGIN", "{site}");
+        }
     }
-    // The request is written from the parameters, or only the model states it.
-    for line in [76, 82, 94] {
+    // The request is written from the parameters.
+    for line in [76, 82] {
         assert_eq!(
             rows_in(blobs, "cli", COMMANDS, line),
             [],
@@ -1600,5 +1675,125 @@ fn a_carried_blob_without_call_through_facts_reads_as_one_with_none() {
     assert!(
         carried.get("call_through").is_none(),
         "a carried blob states no facts it was not stored with"
+    );
+}
+
+/// The alias a derived capture name goes with (`_Unwidened`, `_ModeOther`,
+/// `_Mode<16 hex>`).
+fn base_of(alias: &str) -> &str {
+    if let Some(base) = alias
+        .strip_suffix("_Unwidened")
+        .or_else(|| alias.strip_suffix("_ModeOther"))
+    {
+        return base;
+    }
+    match alias.rsplit_once("_Mode") {
+        Some((base, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            base
+        }
+        _ => alias,
+    }
+}
+
+/// Every type name a blob saves, in the bundle, the stub and its manifest
+/// records and the type-reach object, has a manifest entry behind it. The
+/// passes that drop entries after capture (call-through, route boundaries,
+/// GraphQL documents) must not leave their declarations stored.
+#[test]
+fn every_saved_type_name_has_a_manifest_entry() {
+    let declared = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .filter(|word| word.starts_with("Endpoint_"))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut checked = 0;
+    for (service, blob) in blobs() {
+        let held: Vec<&str> = blob["type_manifest"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e["type_alias"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut saved: Vec<(&str, String)> = Vec::new();
+        if let Some(bundle) = blob["bundled_types"].as_str() {
+            // Declarations only: a declaration starts a line after
+            // `type`/`interface`.
+            for line in bundle.lines() {
+                let line = line.trim_start().trim_start_matches("export ");
+                if let Some(rest) = line
+                    .strip_prefix("type ")
+                    .or_else(|| line.strip_prefix("interface "))
+                {
+                    saved.extend(declared(rest).into_iter().take(1).map(|n| ("bundle", n)));
+                }
+            }
+        }
+        let files = &blob["capture_stub"]["files"];
+        if let Some(stub) = files["types/surface.d.ts"].as_str() {
+            for line in stub.lines() {
+                let line = line.trim_start().trim_start_matches("export ");
+                if let Some(rest) = line
+                    .strip_prefix("type ")
+                    .or_else(|| line.strip_prefix("interface "))
+                {
+                    saved.extend(declared(rest).into_iter().take(1).map(|n| ("stub", n)));
+                }
+            }
+        }
+        if let Some(manifest) = files["carrick-manifest.json"].as_str() {
+            let manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+            for record in manifest["aliases"].as_array().into_iter().flatten() {
+                if let Some(alias) = record["alias"].as_str() {
+                    saved.push(("stub records", alias.to_string()));
+                }
+            }
+        }
+        for alias in reach_aliases().get(service).into_iter().flatten() {
+            saved.push(("reach", alias.clone()));
+        }
+        for (place, name) in &saved {
+            if name.starts_with("Endpoint_") {
+                checked += 1;
+                assert!(
+                    held.contains(&base_of(name)),
+                    "{service}: {name} saved in the {place} with no manifest entry"
+                );
+            }
+        }
+    }
+    assert!(checked > 0, "the scan saved no type names to check");
+}
+
+/// carrick#4113: a leaf call's type is asked only where the fold took a model
+/// row at its line, the one place a leaf row would otherwise lose the type.
+/// Anywhere else the ask costs a compiler answer and no row carries it.
+#[test]
+fn leaf_types_are_asked_only_where_the_fold_took_a_model_row() {
+    let at = |marker: &str| -> std::collections::BTreeSet<String> {
+        leaf_ask_lines()
+            .iter()
+            .filter_map(|line| {
+                line.split_once(marker)
+                    .map(|(_, rest)| rest.trim().to_string())
+            })
+            .collect()
+    };
+    let asked = at("Call-through leaf type asked at ");
+    let folded = at("Call-through fold took a model row at ");
+    assert!(
+        asked.contains(&format!("{TYPED_COMMANDS}:15")),
+        "the leaf at a folded line is asked: {asked:#?}"
+    );
+    // The fixture asked 72 leaf calls before the gate, 67 distinct lines of
+    // them off a folded line; the one fold-taken leaf is all that is asked.
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    let elsewhere: Vec<&String> = asked.difference(&folded).collect();
+    assert!(
+        elsewhere.is_empty(),
+        "leaf types asked off a folded line: {elsewhere:#?}"
     );
 }

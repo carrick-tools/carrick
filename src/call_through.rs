@@ -109,6 +109,14 @@ pub struct SiteRow {
     /// of them decides only where every other is known to request nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub callbacks: Vec<CallbackCalls>,
+    /// The row is a fact site row the fold mirrored as a call through (its
+    /// decided call reaches the labelled call through a function), not the
+    /// model's: [`settle`] decides it with the same walk and [`apply`]
+    /// re-keys it to the request it reaches (carrick#4078). Read only in the
+    /// run that analyses the service, so never stored: a carried service's
+    /// blob already holds what it decided.
+    #[serde(skip)]
+    pub fact: bool,
 }
 
 /// The calls written in one of a site's function-valued arguments.
@@ -155,12 +163,26 @@ pub struct CallThroughSites {
     /// run that analyses the service, so never stored, like
     /// [`Self::written`].
     pub direct: HashSet<(String, u32)>,
+    /// The fact through-rows read off no call: their file was not walked, no
+    /// one call places them, or their call writes a request of its own. They
+    /// stay as the fact stated them, and [`settle`] counts them as left.
+    /// Never stored, like [`Self::written`].
+    pub facts_unread: usize,
+    /// The model's rows the site fold took off a call above a decided site
+    /// (carrick#2614), as `(file, line)`, one per row: where a leaf row is
+    /// stated at that line, the model's reading there is settled, as a
+    /// corrected row's is (carrick#4113). Never stored, like
+    /// [`Self::written`].
+    pub folded: Vec<(String, u32)>,
 }
 
 impl CallThroughSites {
-    /// Whether there is nothing to store. The leaf calls are never stored.
+    /// Whether there is nothing to store. The leaf calls and the fact
+    /// through-rows are never stored.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.return_shapes.is_empty() && self.side_calls.is_empty()
+        self.rows.iter().all(|row| row.fact)
+            && self.return_shapes.is_empty()
+            && self.side_calls.is_empty()
     }
 }
 
@@ -193,6 +215,10 @@ pub struct LeafCall {
     pub file: String,
     pub line: u32,
     pub last_line: u32,
+    /// The call's span in SWC's numbering: where its type is asked
+    /// ([`Self::anchor`], carrick#4113).
+    pub span_start: u32,
+    pub span_end: u32,
     /// The lines the calls written around this one open on (`useQuery(` in
     /// `useQuery({ queryFn: () => client.getRun(id) })`): where a row of that
     /// outer call sits.
@@ -201,6 +227,72 @@ pub struct LeafCall {
     pub client: String,
     /// The function the call reaches.
     pub callee: LeafCallee,
+}
+
+/// The method word of the key a leaf call's consumer entry is asked under
+/// before [`settle`] knows which operation, if any, its row states
+/// ([`LeafCall::provisional_key`]).
+const LEAF_METHOD: &str = "LEAF";
+
+impl LeafCall {
+    /// The key the leaf call's response entry is written and asked under
+    /// before type capture (carrick#4113): no route, and one per call, so
+    /// two calls on one line keep an alias each. [`settle`] re-keys it to the
+    /// operation the leaf row states, or drops it.
+    pub fn provisional_key(&self) -> OperationKey {
+        OperationKey::http(
+            LEAF_METHOD,
+            format!("leaf:{}-{}", self.span_start, self.span_end),
+        )
+    }
+
+    /// The call, where the compiler is asked what it returns.
+    pub fn anchor(&self) -> crate::request_summary::site_record::AnchorAt {
+        crate::request_summary::site_record::AnchorAt {
+            file: self.file.clone(),
+            line: self.line,
+            span_start: self.span_start,
+            span_end: self.span_end,
+        }
+    }
+}
+
+impl CallThroughSites {
+    /// The leaf calls whose type is asked before capture (carrick#4113): a
+    /// call into another service's function, or into one of the service's
+    /// own whose return is one call's value read one way, on a line where
+    /// the fold took a model row ([`Self::folded`]). Only there did the fold
+    /// drop a model type the leaf row would otherwise lose; at any other line
+    /// the row never had one, and a row stated there never carries it
+    /// ([`ReachGraph::hands_back_body`] reads the callee's return shape
+    /// first), so nothing is asked.
+    pub fn typed_leaves(&self) -> impl Iterator<Item = &LeafCall> {
+        self.leaves.iter().filter(|leaf| {
+            self.folded
+                .iter()
+                .any(|(file, line)| *file == leaf.file && *line == leaf.line)
+                && match &leaf.callee {
+                    LeafCallee::Own(callee) => self.return_shapes.contains_key(callee),
+                    LeafCallee::Sibling { .. } => true,
+                }
+        })
+    }
+
+    /// [`Self::typed_leaves`], each ask and each line the fold took a model
+    /// row at logged at debug: what the scan asked, read from its run log.
+    pub fn asked_leaves(&self) -> Vec<&LeafCall> {
+        for (file, line) in &self.folded {
+            debug!("Call-through fold took a model row at {file}:{line}");
+        }
+        let asked: Vec<&LeafCall> = self.typed_leaves().collect();
+        for leaf in &asked {
+            debug!(
+                "Call-through leaf type asked at {}:{}",
+                leaf.file, leaf.line
+            );
+        }
+        asked
+    }
 }
 
 /// The function a [`LeafCall`] reaches.
@@ -274,7 +366,7 @@ impl StoredCallThrough {
             (&a.file, a.line, &a.definition).cmp(&(&b.file, b.line, &b.definition))
         });
         Some(Self {
-            rows: sites.rows.clone(),
+            rows: sites.rows.iter().filter(|row| !row.fact).cloned().collect(),
             return_shapes,
             side_calls,
         })
@@ -285,6 +377,8 @@ impl StoredCallThrough {
             leaves: Vec::new(),
             written: HashMap::new(),
             direct: HashSet::new(),
+            facts_unread: 0,
+            folded: Vec::new(),
             rows: self.rows.clone(),
             return_shapes: self
                 .return_shapes
@@ -341,26 +435,57 @@ pub enum Outer {
 /// inside it states a verb ([`call_request_verb`]), and no deterministic row
 /// sits inside it. A row whose call cannot be placed is not read either.
 ///
+/// The fact site rows the fold mirrors as a call through
+/// ([`crate::site_rows::SiteRow::through`]) are read the same way, beside the
+/// model's (carrick#4078): the fold writes each with the key the caller's
+/// service spells and no request linked, so this pass is what links it.
+///
 /// `file_results` is the service's joined rows, keyed absolute or relative to
-/// `repo_path`. `definitions` are the service's own: what each returns is read
-/// off its file ([`BodyShape`]).
+/// `repo_path`. `site_rows` are the service's site rows. `definitions` are
+/// the service's own: what each returns is read off its file ([`BodyShape`]).
 pub fn read_sites(
     file_results: &HashMap<String, FileAnalysisResult>,
+    site_rows: &[crate::site_rows::SiteRow],
     inputs: &RequestSummaryInputs,
     repo_path: &str,
     definitions: &HashMap<String, crate::visitor::FunctionDefinition>,
+    through_folded: &[(String, u32, OperationKey)],
 ) -> CallThroughSites {
     let root = repo_path.trim_end_matches('/');
     let (side_calls, return_shapes, written) =
         read_function_facts(file_results, inputs, root, definitions);
     let lines = definition_lines(definitions, root);
     let leaves = read_leaves(inputs, root, &lines);
-    let mut keys: Vec<&String> = file_results
+    let folded: Vec<(String, u32)> = through_folded
+        .iter()
+        .map(|(file, line, _)| (file.clone(), *line))
+        .collect();
+    let mut through: BTreeMap<&str, Vec<&crate::site_rows::SiteRow>> = BTreeMap::new();
+    for row in site_rows.iter().filter(|row| row.is_fact_through_call()) {
+        through.entry(row.file.as_str()).or_default().push(row);
+    }
+    if !through.is_empty() {
+        debug!(
+            "Call-through fact rows read: {} in {} file(s)",
+            through.values().map(Vec::len).sum::<usize>(),
+            through.len()
+        );
+    }
+    // Each file to read, repository-relative, with its joined rows where it
+    // has any.
+    let mut keys: BTreeMap<String, Option<&FileAnalysisResult>> = file_results
         .iter()
         .filter(|(_, result)| result.data_calls.iter().any(is_model_row))
-        .map(|(key, _)| key)
+        .map(|(key, result)| (crate::engine::repo_relative(key, root), Some(result)))
         .collect();
-    keys.sort();
+    for file in through.keys() {
+        keys.entry(file.to_string()).or_insert_with(|| {
+            file_results
+                .iter()
+                .find(|(key, _)| crate::engine::repo_relative(key, root) == *file)
+                .map(|(_, result)| result)
+        });
+    }
     if keys.is_empty() {
         return CallThroughSites {
             rows: Vec::new(),
@@ -369,6 +494,8 @@ pub fn read_sites(
             leaves,
             written,
             direct: HashSet::new(),
+            facts_unread: 0,
+            folded,
         };
     }
 
@@ -377,12 +504,9 @@ pub fn read_sites(
     let mut walked: Option<HashMap<PathBuf, &PathBuf>> = None;
     let mut rows = Vec::new();
     let mut direct = HashSet::new();
-    for key in keys {
-        let absolute = if Path::new(key).is_absolute() {
-            PathBuf::from(key)
-        } else {
-            Path::new(root).join(key)
-        };
+    let mut facts_unread = 0;
+    for (relative, result) in keys {
+        let absolute = Path::new(root).join(&relative);
         let discovered = match inputs.files.get_key_value(&absolute) {
             Some((path, _)) => Some(path),
             None => {
@@ -399,10 +523,16 @@ pub fn read_sites(
                     .and_then(|canonical| table.get(&canonical).copied())
             }
         };
-        let Some(discovered) = discovered else {
-            continue;
-        };
-        let Some(ir) = inputs.files.get(discovered) else {
+        let Some((discovered, ir)) =
+            discovered.and_then(|discovered| Some((discovered, inputs.files.get(discovered)?)))
+        else {
+            if let Some(facts) = through.get(relative.as_str()) {
+                debug!(
+                    "  - {relative}: {} fact through-row(s) in a file discovery did not walk",
+                    facts.len()
+                );
+                facts_unread += facts.len();
+            }
             continue;
         };
         // Span start and end, in the units a row's span carries -> the
@@ -451,16 +581,31 @@ pub fn read_sites(
                 resolved.insert(span, definition);
             }
         }
-        let relative = crate::engine::repo_relative(key, root);
+        let mut wanted: Vec<Wanted> = result
+            .into_iter()
+            .flat_map(|result| &result.data_calls)
+            .filter(|call| is_model_row(call))
+            .filter_map(Wanted::model)
+            .collect();
+        wanted.extend(
+            through
+                .get(relative.as_str())
+                .into_iter()
+                .flatten()
+                .filter_map(|row| Wanted::fact(row)),
+        );
         let (read, lines) = read_file_sites(
             &absolute,
             &relative,
-            &file_results[key],
+            result,
+            &wanted,
             &Resolution {
                 resolved: &resolved,
                 outside: &outside,
             },
         );
+        facts_unread += wanted.iter().filter(|row| row.fact).count()
+            - read.iter().filter(|row| row.fact).count();
         rows.extend(read);
         direct.extend(lines.into_iter().map(|line| (relative.clone(), line)));
     }
@@ -471,6 +616,8 @@ pub fn read_sites(
         leaves,
         written,
         direct,
+        facts_unread,
+        folded,
     }
 }
 
@@ -573,6 +720,8 @@ fn read_leaves(
                 file: file.clone(),
                 line: call.line,
                 last_line,
+                span_start: call.span_start,
+                span_end: call.span_end,
                 enclosing_lines,
                 client: name.rsplit('.').next().unwrap_or(name).to_string(),
                 callee,
@@ -877,12 +1026,54 @@ impl Resolution<'_> {
     }
 }
 
+/// A row [`read_file_sites`] reads: the model's or a fact through-row's.
+struct Wanted {
+    /// The method the row is indexed under.
+    method: String,
+    /// The target the row states.
+    target: String,
+    line: u32,
+    span_start: Option<u32>,
+    span_end: Option<u32>,
+    fact: bool,
+}
+
+impl Wanted {
+    fn model(call: &DataCallResult) -> Option<Self> {
+        Some(Self {
+            method: FileOrchestrator::normalize_consumer_method(call.method.as_deref())?,
+            target: call.target.clone(),
+            line: u32::try_from(call.line_number).ok()?,
+            span_start: call.call_expression_span_start,
+            span_end: call.call_expression_span_end,
+            fact: false,
+        })
+    }
+
+    /// A fact through-row, keyed as the fold writes its graph row.
+    fn fact(row: &crate::site_rows::SiteRow) -> Option<Self> {
+        let (method, path) = row.key.as_http()?;
+        Some(Self {
+            method: method.to_string(),
+            target: path.to_string(),
+            line: row.line,
+            span_start: Some(row.lead.span_start),
+            span_end: Some(row.lead.span_end),
+            fact: true,
+        })
+    }
+}
+
 fn read_file_sites(
     absolute: &Path,
     relative: &str,
-    result: &FileAnalysisResult,
+    result: Option<&FileAnalysisResult>,
+    wanted: &[Wanted],
     resolution: &Resolution<'_>,
 ) -> (Vec<SiteRow>, Vec<u32>) {
+    if wanted.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
     let cm: Lrc<SourceMap> = Default::default();
     let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
     let Some(module) = parse_file(absolute, &cm, &handler) else {
@@ -897,12 +1088,24 @@ fn read_file_sites(
     };
     module.visit_with(&mut every);
 
-    // The call each row was recorded at.
-    let placed: Vec<(&DataCallResult, CallExtent)> = result
-        .data_calls
+    // The call each row was recorded at. A fact row's span is its decided
+    // call's; where no call of this parse sits at it, its line places it.
+    let placed: Vec<(&Wanted, CallExtent)> = wanted
         .iter()
-        .filter(|call| is_model_row(call))
-        .filter_map(|call| Some((call, place(&every.calls, call)?)))
+        .filter_map(|row| {
+            let at = place(&every.calls, row.span_start, row.span_end, row.line);
+            let at = match at {
+                None if row.fact => place(&every.calls, None, None, row.line),
+                at => at,
+            };
+            if at.is_none() && row.fact {
+                debug!(
+                    "  - {relative}:{} {} {}: a fact through-row no one call of its line places",
+                    row.line, row.method, row.target
+                );
+            }
+            Some((row, at?))
+        })
         .collect();
     if placed.is_empty() {
         return (Vec::new(), Vec::new());
@@ -926,16 +1129,24 @@ fn read_file_sites(
         let Some(site) = reader.read.get(&extent.span()) else {
             continue;
         };
-        if site.writes_a_request || holds_a_deterministic_row(result, &extent) {
+        if site.writes_a_request {
+            if call.fact {
+                debug!(
+                    "  - {relative}:{} {} {}: a fact through-row whose call writes a request of its own",
+                    call.line, call.method, call.target
+                );
+            }
             continue;
         }
-        let Some(method) = FileOrchestrator::normalize_consumer_method(call.method.as_deref())
-        else {
+        // A deterministic row inside the call is the request the source
+        // states there: the model's row beside it is not this pass's to
+        // read. A fact through-row is read whatever sits there: the row the
+        // fold replaced at its call (an imported member's reading of the same
+        // request, say) is such a row, and only the walk links the fact.
+        if !call.fact && result.is_some_and(|result| holds_a_deterministic_row(result, &extent)) {
             continue;
-        };
-        let Ok(line) = u32::try_from(call.line_number) else {
-            continue;
-        };
+        }
+        let line = call.line;
         let callbacks = match site.callbacks.as_slice() {
             [_, _, ..] => site
                 .callbacks
@@ -956,7 +1167,7 @@ fn read_file_sites(
         rows.push(SiteRow {
             file: relative.to_string(),
             line,
-            method,
+            method: call.method.clone(),
             target: call.target.clone(),
             steps: vec![
                 resolution.reached(&[extent.span()]),
@@ -965,6 +1176,7 @@ fn read_file_sites(
             ],
             receiver: resolution.receiver(extent.span(), &site.receivers),
             callbacks,
+            fact: call.fact,
         });
         if direct_calls.spans.contains(&extent.span()) {
             direct.push(line);
@@ -1051,10 +1263,15 @@ impl Positions<'_> {
 /// span, the one call that opens on its line and sits inside no other call
 /// opening there. A line that opens two such calls states nothing about which
 /// the row is, and answers `None`.
-fn place(calls: &[CallExtent], row: &DataCallResult) -> Option<CallExtent> {
-    if let Some(start) = row.call_expression_span_start {
+fn place(
+    calls: &[CallExtent],
+    span_start: Option<u32>,
+    span_end: Option<u32>,
+    line: u32,
+) -> Option<CallExtent> {
+    if let Some(start) = span_start {
         let mut at_start = calls.iter().filter(|call| call.lo == start);
-        return match row.call_expression_span_end {
+        return match span_end {
             Some(end) => at_start.find(|call| call.hi == end).copied(),
             None => {
                 let first = at_start.next()?;
@@ -1062,7 +1279,6 @@ fn place(calls: &[CallExtent], row: &DataCallResult) -> Option<CallExtent> {
             }
         };
     }
-    let line = u32::try_from(row.line_number).ok()?;
     let on_line: Vec<&CallExtent> = calls.iter().filter(|call| call.line == line).collect();
     let mut outermost = on_line
         .iter()
@@ -1162,7 +1378,12 @@ impl FileCalls {
         if row.call_expression_span_start.is_some() {
             return None;
         }
-        let call = place(&self.calls, row)?;
+        let call = place(
+            &self.calls,
+            None,
+            None,
+            u32::try_from(row.line_number).ok()?,
+        )?;
         let callee = self.callees.get(&call.span())?;
         let text = squeeze(row.call_expression_text.as_deref()?);
         // A chain (`register(…).then(…)`) opens where its first call does, and
@@ -1462,6 +1683,15 @@ pub struct Settled {
     /// Of those, the rows stated at a call straight into a function another
     /// service declares ([`LeafCallee::Sibling`]).
     pub boundary_rows: usize,
+    /// Leaf rows that kept the response type asked at their own call, and
+    /// leaf rows that lost it ([`type_leaf`], carrick#4113).
+    pub leaf_types_carried: usize,
+    pub leaf_types_dropped: usize,
+    /// Entries asked at a leaf call that states no row, dropped.
+    pub leaf_types_unstated: usize,
+    /// Model rows the fold took at a line a leaf row now states, settled as
+    /// a corrected row is for the boundary's count (carrick#4113).
+    pub folded_restated: usize,
     /// Boundary calls left alone because the function they are written in is
     /// reached by calls of the service that state the row themselves.
     pub boundary_in_wrapper: usize,
@@ -1488,6 +1718,33 @@ pub struct Settled {
     /// reaches writes the row's route and hands back a value of its own, not
     /// the request's parsed body ([`drop_copied_response`], carrick#1801).
     pub responses_dropped: usize,
+    /// Fact through-rows ([`SiteRow::fact`]) that took the one request their
+    /// call reaches, or were confirmed by it (carrick#4078).
+    pub fact_through_settled: usize,
+    /// Fact through-rows left as the fact stated them: their call reaches
+    /// no request, several operations, or one beside a request no fact
+    /// states.
+    pub fact_through_left: usize,
+}
+
+impl Settled {
+    /// Count what [`apply`] did to one row, the model's or a fact's.
+    fn count(&mut self, change: Option<Change>) {
+        match change {
+            Some(Change::Relabelled) => self.relabelled += 1,
+            Some(Change::Corrected {
+                types_dropped,
+                types_unknown,
+                request_dropped,
+            }) => {
+                self.corrected += 1;
+                self.types_not_carried += usize::from(types_dropped);
+                self.types_unknown += usize::from(types_unknown);
+                self.requests_not_carried += usize::from(request_dropped);
+            }
+            None => {}
+        }
+    }
 }
 
 /// Settle every model call row whose call reaches exactly one request
@@ -1541,7 +1798,42 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
     {
         let mut corrected = 0;
         let mut withdrawn_at_helper = 0;
+        let mut fact_settled = 0;
+        settled.fact_through_left += service.sites.facts_unread;
         for row in &service.sites.rows {
+            if row.fact {
+                // A fact through-row: the same walk decides it, and only one
+                // operation re-keys it. Anything else leaves it as the fact
+                // stated it (carrick#4078).
+                match decider.decide(row) {
+                    Reach::One { request, step } => {
+                        let carries = carries_response(&graph, row, request, step);
+                        let change = apply(service.data, row, request, carries);
+                        if change.is_some() {
+                            fact_settled += 1;
+                        } else {
+                            debug!(
+                                "  - {}:{} {} {}: left as the fact stated it, the graph holds no such row",
+                                row.file, row.line, row.method, row.target
+                            );
+                            settled.fact_through_left += 1;
+                        }
+                        settled.count(change);
+                    }
+                    reach => {
+                        debug!(
+                            "  - {}:{} {} {}: left as the fact stated it, {}",
+                            row.file,
+                            row.line,
+                            row.method,
+                            row.target,
+                            reach.why()
+                        );
+                        settled.fact_through_left += 1;
+                    }
+                }
+                continue;
+            }
             let left = |why: &str| {
                 debug!(
                     "  - {}:{} {} {}: left as the model stated it, {why}",
@@ -1596,35 +1888,16 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
                     service.data,
                     row,
                     request,
-                    // What the row's call returns is the request's body only
-                    // where its own callee decided and every definition that
-                    // callee goes through hands back that body, read one way
-                    // (carrick#2377).
-                    step == 0
-                        && row.steps.first().is_some_and(|callee| {
-                            let operation = operation_of(request);
-                            !callee.is_empty()
-                                && callee
-                                    .iter()
-                                    .all(|definition| graph.hands_back_body(definition, &operation))
-                        }),
+                    carries_response(&graph, row, request, step),
                 ) {
-                    Some(Change::Relabelled) => settled.relabelled += 1,
-                    Some(Change::Corrected {
-                        types_dropped,
-                        types_unknown,
-                        request_dropped,
-                    }) => {
+                    change @ Some(Change::Corrected { .. }) => {
                         corrected += 1;
-                        settled.types_not_carried += usize::from(types_dropped);
-                        settled.types_unknown += usize::from(types_unknown);
-                        settled.requests_not_carried += usize::from(request_dropped);
+                        settled.count(change);
                     }
-                    None => {}
+                    change => settled.count(change),
                 },
             }
         }
-        settled.corrected += corrected;
         settled.withdrawn_at_helper += withdrawn_at_helper;
         let corrected = corrected + withdrawn_at_helper;
         let stated = state_leaves(service, index, &owners, &siblings, &graph, &mut decider);
@@ -1635,7 +1908,18 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.boundary_unresolved += stated.unresolved;
         settled.wrapper_rows_withdrawn += stated.withdrawn;
         settled.enclosing_model_rows_withdrawn += stated.enclosing_withdrawn;
-        if (corrected > 0 || stated.own + stated.boundary > 0)
+        settled.fact_through_settled += fact_settled;
+        settled.leaf_types_carried += stated.typed_carried;
+        settled.leaf_types_dropped += stated.typed_dropped;
+        settled.leaf_types_unstated += drop_unstated_leaf_entries(service.data);
+        settled.folded_restated += stated.restated_folded;
+        drop_unlinked_fact_entries(service.data);
+        // The boundary's model-only count falls by the model's rows alone; a
+        // settled fact row still changes which call paths stay unknown. A
+        // model row the fold took whose line a leaf row now states is
+        // settled as a corrected one is (carrick#4113).
+        let corrected = corrected + stated.restated_folded;
+        if (corrected > 0 || fact_settled > 0 || stated.own + stated.boundary > 0)
             && let Some(mut boundary) = service.data.boundary.take()
         {
             boundary.fold_settled_calls(service.data, corrected);
@@ -1655,12 +1939,23 @@ pub fn settle(services: &mut [ServiceRows<'_>]) -> Settled {
         settled.replaced_by_site_row
     );
     debug!(
+        "Call-through fact rows: {} took or confirmed the one request their call reaches, {} left as the fact stated them (carrick#4078)",
+        settled.fact_through_settled, settled.fact_through_left
+    );
+    debug!(
         "Call-through leaf rows stated: {} at calls into a function of the caller's own service that calls into another service and reaches exactly one request there (carrick#1146), and {} at calls straight into a function another service declares (carrick#2773); boundary calls left alone: {} inside a function whose callers state the row, {} whose function reaches a request a third service writes, {} whose function no one definition names",
         settled.leaf_rows - settled.boundary_rows,
         settled.boundary_rows,
         settled.boundary_in_wrapper,
         settled.boundary_third_service,
         settled.boundary_unresolved
+    );
+    debug!(
+        "Call-through leaf row types asked at the leaf's own call (carrick#4113): {} kept, the chain hands back the request's body; {} dropped; {} asked at calls that state no row, dropped; {} model rows the fold took are settled by a leaf row at their line",
+        settled.leaf_types_carried,
+        settled.leaf_types_dropped,
+        settled.leaf_types_unstated,
+        settled.folded_restated
     );
     debug!(
         "Call-through wrapper rows withdrawn: {} at a client wrapper's call into another service, whose caller's leaf row now states the request (carrick#2618); {} model rows at a call written around a leaf call whose row states the same request",
@@ -1903,6 +2198,46 @@ fn drop_copied_response(
     dropped
 }
 
+/// Drop the consumer entries of each fact through-row this pass left
+/// unlinked whose key is no bare route (`${process.env.ORIGIN}/runs/${id}`):
+/// the fold asked their type only so [`apply`] could carry it to the request
+/// the call reaches, and a row keyed so gets no entry otherwise, as a
+/// reader's would not (carrick#4078).
+fn drop_unlinked_fact_entries(data: &mut CloudRepoData) {
+    let unlinked: Vec<(String, u32, String, String)> = data
+        .mount_graph
+        .iter()
+        .flat_map(|graph| &graph.data_calls)
+        .filter(|call| {
+            call.role == Some(ConsumerRole::WrapperCall)
+                && call.reaches_request.is_none()
+                && call
+                    .resolution_source
+                    .is_some_and(|source| source != ResolutionSource::Model)
+                && !call.canonical_path.starts_with('/')
+        })
+        .filter_map(|call| {
+            let (file, line) = site_of(call)?;
+            Some((
+                file.to_string(),
+                line,
+                call.method.clone(),
+                call.canonical_path.clone(),
+            ))
+        })
+        .collect();
+    if unlinked.is_empty() {
+        return;
+    }
+    if let Some(manifest) = data.type_manifest.as_mut() {
+        manifest.retain(|entry| {
+            !unlinked
+                .iter()
+                .any(|(file, line, method, path)| anchored_at(entry, file, *line, method, path))
+        });
+    }
+}
+
 /// Whether `entry` is a consumer entry anchored at `file`:`line` under the
 /// operation `method` `path`.
 fn anchored_at(
@@ -2036,6 +2371,23 @@ struct LeafOutcome {
     /// Model rows withdrawn at a call around a leaf call
     /// ([`withdraw_enclosing_model_rows`]).
     enclosing_withdrawn: usize,
+    /// Leaf rows that kept the type asked at their call, and that lost it
+    /// ([`type_leaf`]).
+    typed_carried: usize,
+    typed_dropped: usize,
+    /// The model's rows the fold took at a line a leaf row now states
+    /// ([`CallThroughSites::folded`]).
+    restated_folded: usize,
+}
+
+impl LeafOutcome {
+    fn typed(&mut self, typed: LeafTyped) {
+        match typed {
+            LeafTyped::None => {}
+            LeafTyped::Carried => self.typed_carried += 1,
+            LeafTyped::Dropped => self.typed_dropped += 1,
+        }
+    }
 }
 
 /// State a row at each of `service`'s leaf calls ([`LeafCall`]) that holds no
@@ -2076,8 +2428,9 @@ struct LeafOutcome {
 ///
 /// The row is the reached request's operation (method, target, base,
 /// dispatch) as a call through, `wrapper_call` with `reaches_request`, from
-/// `request_summary`. It carries no type entry: no capture anchored one at
-/// the call. A fact row the service's site questions stated inside a pass 1
+/// `request_summary`. Its type is the one asked at its own call before
+/// capture, kept where the callee hands back the request's body
+/// ([`type_leaf`]). A fact row the service's site questions stated inside a pass 1
 /// callee for the operation a leaf row was stated through, the wrapper's own
 /// call into the other service, is then withdrawn ([`withdraw_wrapped`]).
 fn state_leaves<'g>(
@@ -2099,6 +2452,7 @@ fn state_leaves<'g>(
                 steps: vec![vec![callee.clone()]],
                 receiver: Vec::new(),
                 callbacks: Vec::new(),
+                fact: false,
             };
             match decider.decide(&row) {
                 Reach::One { request, .. } => Some(request),
@@ -2117,6 +2471,12 @@ fn state_leaves<'g>(
     // The rows held before any leaf row is written: only those can be a
     // wrapper's own.
     let held = service.data.calls.len();
+    // The same, for the graph's twins of those rows.
+    let graph_held = service
+        .data
+        .mount_graph
+        .as_ref()
+        .map_or(0, |graph| graph.data_calls.len());
     // Each leaf row stated, with its operation: the model's rows on the lines
     // of the calls around it go once every leaf is stated, so the rows the
     // passes below index by `held` stay where they are.
@@ -2158,6 +2518,12 @@ fn state_leaves<'g>(
         let filled = filled_request(service.data, held, callee, request);
         let reached = filled.as_ref().unwrap_or(request);
         if state_leaf(service.data, leaf, reached) {
+            outcome.typed(type_leaf(
+                service.data,
+                leaf,
+                reached,
+                graph.hands_back_body(callee, &operation_of(request)),
+            ));
             stated.push((
                 leaf.clone(),
                 OperationKey::http(&reached.method, reached.canonical_path.clone()),
@@ -2251,6 +2617,12 @@ fn state_leaves<'g>(
             continue;
         }
         if state_leaf(service.data, leaf, request) {
+            outcome.typed(type_leaf(
+                service.data,
+                leaf,
+                request,
+                graph.hands_back_body(&callee, &operation_of(request)),
+            ));
             stated.push((
                 leaf.clone(),
                 OperationKey::http(&request.method, request.canonical_path.clone()),
@@ -2258,9 +2630,99 @@ fn state_leaves<'g>(
             outcome.boundary += 1;
         }
     }
-    outcome.withdrawn = withdraw_wrapped(service.data, held, &through);
+    outcome.withdrawn = withdraw_wrapped(service.data, held, graph_held, &through);
     outcome.enclosing_withdrawn = withdraw_enclosing_model_rows(service.data, &stated);
+    let restated: HashSet<(&str, u32)> = stated
+        .iter()
+        .map(|(leaf, _)| (leaf.file.as_str(), leaf.line))
+        .collect();
+    outcome.restated_folded = service
+        .sites
+        .folded
+        .iter()
+        .filter(|(file, line)| restated.contains(&(file.as_str(), *line)))
+        .count();
     outcome
+}
+
+/// What [`type_leaf`] did with the entry asked at a leaf row's call.
+enum LeafTyped {
+    /// No entry was asked there ([`CallThroughSites::typed_leaves`]).
+    None,
+    Carried,
+    Dropped,
+}
+
+/// Key the response entry asked at `leaf`'s call before type capture
+/// (carrick#4113) to the operation its row states, `reached`, where the
+/// callee hands back that request's body and the compiler said what it is;
+/// anywhere else the call's value is the function's own result, and the
+/// entry goes. The type is the compiler's at the leaf's own call, never one
+/// copied from a row the fold took. Leaf calls that state no row lose
+/// theirs in [`drop_unstated_leaf_entries`].
+fn type_leaf(
+    data: &mut CloudRepoData,
+    leaf: &LeafCall,
+    reached: &Reached,
+    hands_back_body: bool,
+) -> LeafTyped {
+    let Some(manifest) = data.type_manifest.as_mut() else {
+        return LeafTyped::None;
+    };
+    let provisional = leaf.provisional_key();
+    let Some((method, path)) = provisional.as_http() else {
+        return LeafTyped::None;
+    };
+    let (method, path) = (method.to_string(), path.to_string());
+    let at_the_leaf = |entry: &crate::cloud_storage::TypeManifestEntry| {
+        anchored_at(entry, &leaf.file, leaf.line, &method, &path)
+    };
+    let asked: Vec<&crate::cloud_storage::TypeManifestEntry> =
+        manifest.iter().filter(|entry| at_the_leaf(entry)).collect();
+    if asked.is_empty() {
+        return LeafTyped::None;
+    }
+    let known = !asked.iter().all(|entry| is_bare_top_type(entry));
+    let location = format!("{}:{}", leaf.file, leaf.line);
+    if hands_back_body && known {
+        let carried = OperationKey::http(
+            &normalize_manifest_method(&reached.method),
+            reached.canonical_path.clone(),
+        );
+        for entry in manifest.iter_mut().filter(|entry| at_the_leaf(entry)) {
+            entry.key = carried.clone();
+        }
+        debug!("  - {location}: the leaf row's type kept, the chain hands back the request's body");
+        LeafTyped::Carried
+    } else {
+        manifest.retain(|entry| !at_the_leaf(entry));
+        debug!(
+            "  - {location}: the leaf row's type dropped, {}",
+            if hands_back_body {
+                "the compiler could not say it"
+            } else {
+                "the chain does not hand back the request's body"
+            }
+        );
+        LeafTyped::Dropped
+    }
+}
+
+/// Drop every entry asked at a leaf call under its provisional key that no
+/// leaf row took ([`type_leaf`]): the call states no row, so its entry
+/// would anchor an operation nothing holds.
+pub(crate) fn drop_unstated_leaf_entries(data: &mut CloudRepoData) -> usize {
+    let Some(manifest) = data.type_manifest.as_mut() else {
+        return 0;
+    };
+    let before = manifest.len();
+    manifest.retain(|entry| {
+        !entry
+            .key
+            .as_http()
+            .is_some_and(|(method, _)| method == LEAF_METHOD)
+    });
+    before - manifest.len()
 }
 
 /// The request a wrapper's own fact row states where it fills the callee's
@@ -2318,12 +2780,13 @@ fn filled_request(
 /// states (carrick#2618, ruled on carrick#2448): the client wrapper's call
 /// into the sibling, whose request its caller in another file now states.
 /// A wrapper no leaf row was stated through keeps its row, so each request
-/// keeps one fact row whichever call states it. Only the first `held` rows,
-/// those held before any leaf row was written, are read. Returns how many
-/// rows went.
+/// keeps one fact row whichever call states it. Only the first `held` rows
+/// of the calls and the first `graph_held` of the graph, those held before
+/// any leaf row was written, are read. Returns how many rows went.
 fn withdraw_wrapped(
     data: &mut CloudRepoData,
     held: usize,
+    graph_held: usize,
     through: &[(DefinitionSite, OperationKey)],
 ) -> usize {
     if through.is_empty() {
@@ -2382,17 +2845,39 @@ fn withdraw_wrapped(
     });
     // The graph holds a twin of each fact row the site fold stated
     // (carrick#2795): it goes with the row, or the graph keeps a request the
-    // blob's calls no longer state.
+    // blob's calls no longer state. A fact through-row the walk linked
+    // (carrick#4078) is such a twin too; the leaf rows written after
+    // `graph_held` are not.
     if let Some(graph) = data.mount_graph.as_mut() {
+        let mut index = 0;
         graph.data_calls.retain(|call| {
-            !(call.resolution_source == Some(ResolutionSource::RequestSummary)
-                && call.reaches_request.is_none()
+            let read = index < graph_held;
+            index += 1;
+            !(read
+                && call.resolution_source == Some(ResolutionSource::RequestSummary)
                 && gone.iter().any(|(place, key)| {
                     *place == call.file_location
                         && key.as_http().is_some_and(|(method, path)| {
                             call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                         })
                 }))
+        });
+    }
+    // Their consumer entries go too: they would anchor an operation no row
+    // at that call holds.
+    if let Some(manifest) = data.type_manifest.as_mut() {
+        manifest.retain(|entry| {
+            !gone.iter().any(|(place, key)| {
+                let (Some((file, line)), Some((method, path))) = (
+                    place
+                        .rsplit_once(':')
+                        .and_then(|(file, line)| Some((file, line.parse::<u32>().ok()?))),
+                    key.as_http(),
+                ) else {
+                    return false;
+                };
+                anchored_at(entry, file, line, method, path)
+            })
         });
     }
     withdrawn
@@ -2581,6 +3066,33 @@ enum Reach<'g> {
         /// the arguments, [`RECEIVER_STEP`] the call the callee is read off.
         step: usize,
     },
+}
+
+impl Reach<'_> {
+    /// Why a row this reach does not settle is left alone, as the debug
+    /// lines say it.
+    fn why(&self) -> &'static str {
+        match self {
+            Reach::None => "reaches no request row",
+            Reach::Several => "reaches several operations",
+            Reach::Unstated => "reaches a request only the model states",
+            Reach::One { .. } => "reaches one operation",
+        }
+    }
+}
+
+/// Whether what `row`'s call returns is `request`'s body: its own callee
+/// decided (`step` 0) and every definition that callee goes through hands
+/// back that body, read one way (carrick#2377).
+fn carries_response(graph: &ReachGraph, row: &SiteRow, request: &Reached, step: usize) -> bool {
+    step == 0
+        && row.steps.first().is_some_and(|callee| {
+            let operation = operation_of(request);
+            !callee.is_empty()
+                && callee
+                    .iter()
+                    .all(|definition| graph.hands_back_body(definition, &operation))
+        })
 }
 
 /// An operation as [`ReachGraph::decide`] tells two requests apart.
@@ -3087,7 +3599,13 @@ struct Decider<'g> {
 impl<'g> Decider<'g> {
     fn new(graph: &'g ReachGraph, sites: &[&'g CallThroughSites]) -> Self {
         let mut through: HashMap<String, Vec<&'g SiteRow>> = HashMap::new();
-        for row in sites.iter().flat_map(|sites| &sites.rows) {
+        // The model's rows only: a row no fact states is one of them, never
+        // a fact's through-row.
+        for row in sites
+            .iter()
+            .flat_map(|sites| &sites.rows)
+            .filter(|row| !row.fact)
+        {
             through
                 .entry(format!("{}:{}", row.file, row.line))
                 .or_default()
@@ -3364,15 +3882,25 @@ fn apply(
 ) -> Option<Change> {
     let location = format!("{}:{}", row.file, row.line);
     let graph = data.mount_graph.as_mut()?;
+    // The model's row, or the fact's through-row the fold mirrored
+    // (carrick#4078): either way one row no pass has linked yet.
     let index = graph.data_calls.iter().position(|call| {
         call.file_location == location
             && call.method == row.method
             && call.target_url == row.target
-            && call.resolution_source == Some(ResolutionSource::Model)
             && call.reaches_request.is_none()
+            && if row.fact {
+                call.resolution_source
+                    .is_some_and(|source| source != ResolutionSource::Model)
+                    && call.role == Some(ConsumerRole::WrapperCall)
+            } else {
+                call.resolution_source == Some(ResolutionSource::Model)
+            }
     })?;
 
     let call = &graph.data_calls[index];
+    let before_source = call.resolution_source;
+    let whose = if row.fact { "fact" } else { "model" };
     let own = call.method.eq_ignore_ascii_case(&reached.method)
         && call.dispatch == reached.dispatch
         && carrick_match::paths_match(&reached.canonical_path, &call.canonical_path);
@@ -3381,7 +3909,7 @@ fn apply(
         call.role = Some(ConsumerRole::WrapperCall);
         call.reaches_request = Some(reached.site.clone());
         debug!(
-            "  - {location}: the model's {} {} is the call through to {}",
+            "  - {location}: the {whose}'s {} {} is the call through to {}",
             call.method, call.canonical_path, reached.site
         );
         return Some(Change::Relabelled);
@@ -3390,7 +3918,7 @@ fn apply(
     let before = OperationKey::http(&call.method, call.canonical_path.clone());
     let before_dispatch = call.dispatch.clone();
     debug!(
-        "  - {location}: the model's {} {} becomes {} {}, the request written at {}",
+        "  - {location}: the {whose}'s {} {} becomes {} {}, the request written at {}",
         call.method, call.target_url, reached.method, reached.target_url, reached.site
     );
     // The site may already hold a row for the reached operation, stated
@@ -3451,7 +3979,7 @@ fn apply(
     let projected = data.calls.iter().position(|operation| {
         operation.key == before
             && operation.dispatch == before_dispatch
-            && operation.resolution_source == Some(ResolutionSource::Model)
+            && operation.resolution_source == before_source
             && operation.file_path == Path::new(&location)
     });
     if let Some(projected) = projected {
@@ -3653,12 +4181,15 @@ mod tests {
                             every_call_resolved: true,
                         },
                     ],
+                    fact: false,
                 }],
                 return_shapes: order.iter().map(|&i| shapes[i].clone()).collect(),
                 side_calls: order.iter().map(|&i| side_calls[i].clone()).collect(),
                 leaves: Vec::new(),
                 written: HashMap::new(),
                 direct: HashSet::new(),
+                facts_unread: 0,
+                folded: Vec::new(),
             }
         };
         let sites = facts(&[0, 1]);
@@ -3680,6 +4211,16 @@ mod tests {
             ..CallThroughSites::default()
         };
         assert!(StoredCallThrough::of(&only_shapes).is_some());
+        // Fact through-rows are read only in the run that analyses the
+        // service: a service with nothing else stores nothing.
+        let only_facts = CallThroughSites {
+            rows: vec![SiteRow {
+                fact: true,
+                ..sites.rows[0].clone()
+            }],
+            ..CallThroughSites::default()
+        };
+        assert_eq!(StoredCallThrough::of(&only_facts), None);
     }
 
     /// A blob written before the return shapes carries the list of definitions
@@ -3784,10 +4325,17 @@ mod tests {
             data_calls: rows,
             ..Default::default()
         };
+        let wanted: Vec<Wanted> = result
+            .data_calls
+            .iter()
+            .filter(|call| is_model_row(call))
+            .filter_map(Wanted::model)
+            .collect();
         read_file_sites(
             &file,
             "src/load.ts",
-            &result,
+            Some(&result),
+            &wanted,
             &Resolution {
                 resolved: &resolved(),
                 outside: &outside(),
@@ -4071,6 +4619,8 @@ mod tests {
             file: "web/a.ts".to_string(),
             line: 3,
             last_line: 3,
+            span_start: 0,
+            span_end: 0,
             enclosing_lines: Vec::new(),
             client: name.to_string(),
             callee: LeafCallee::Sibling {
@@ -4078,6 +4628,49 @@ mod tests {
                 name: name.to_string(),
             },
         }
+    }
+
+    /// carrick#4113: a leaf's type is asked only where the fold took a model
+    /// row at the leaf's own line, the one place a typeless leaf row would
+    /// otherwise lose the model's type.
+    #[test]
+    fn typed_leaves_are_only_the_leaves_at_a_line_the_fold_took() {
+        let at = |line: u32, callee: LeafCallee| LeafCall {
+            line,
+            last_line: line,
+            span_start: line,
+            span_end: line + 1,
+            callee,
+            ..boundary_leaf("lib/q.ts", "load")
+        };
+        let own = DefinitionSite {
+            file: "web/b.ts".to_string(),
+            line: 1,
+        };
+        let sibling = || LeafCallee::Sibling {
+            file: "lib/q.ts".to_string(),
+            name: "load".to_string(),
+        };
+        let sites = CallThroughSites {
+            leaves: vec![
+                at(3, sibling()),
+                at(4, sibling()),
+                at(5, LeafCallee::Own(own.clone())),
+                at(6, LeafCallee::Own(own.clone())),
+            ],
+            return_shapes: HashMap::from([(
+                own,
+                BodyShape {
+                    kind: ShapeKind::Value,
+                    first_line: 2,
+                    last_line: 2,
+                },
+            )]),
+            folded: vec![("web/a.ts".to_string(), 3), ("web/a.ts".to_string(), 5)],
+            ..Default::default()
+        };
+        let asked: Vec<u32> = sites.typed_leaves().map(|leaf| leaf.line).collect();
+        assert_eq!(asked, [3, 5]);
     }
 
     /// Settle three services: `web` calls `load` of `lib/q.ts` at its line 3.
@@ -4562,6 +5155,8 @@ mod tests {
             file: "services/app/src/commands.ts".to_string(),
             line,
             last_line: line,
+            span_start: line,
+            span_end: line,
             enclosing_lines: Vec::new(),
             client: client.to_string(),
             callee: LeafCallee::Own(definition("services/app/src/api.ts", callee)),
@@ -4657,6 +5252,7 @@ mod tests {
             steps: vec![Vec::new(), Vec::new(), Vec::new()],
             receiver: Vec::new(),
             callbacks: Vec::new(),
+            fact: false,
         }
     }
 
