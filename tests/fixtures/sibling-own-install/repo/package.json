@@ -1,0 +1,12 @@
+{
+  "name": "sibling-chained-sends",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "dependencies": {
+    "bullmq": "5.12.0"
+  }
+}
