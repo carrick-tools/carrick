@@ -909,6 +909,8 @@ export class LibraryClaimsVerifier {
           if (other.package !== check.package || other === check) return;
           const made = other.claim;
           if ((made.kind !== 'make' && made.kind !== 'scope') || made.name === undefined) return;
+          // An `of`-make names the object its member returns, not an instance of this export (rule 7).
+          if (made.kind === 'make' && made.of !== undefined) return;
           const judgement = judge(i);
           if (judgement.outcome.verdict !== 'verified' || !judgement.holding) return;
           const builtOther = builtReceiver(other);
@@ -982,6 +984,7 @@ export class LibraryClaimsVerifier {
 
       const judgeCheck = (index: number): Judged => {
         const check = checks[index];
+        if (check.claim.kind === 'make' && ofMakeInvalid(check.claim)) return { outcome: unchecked('claim_invalid') };
         const makeProtocol = makeProtocolRefusal(check);
         if (makeProtocol !== undefined) return { outcome: unchecked(makeProtocol) };
         const rules = rulesFor(check);
@@ -994,6 +997,7 @@ export class LibraryClaimsVerifier {
           if (!ROLE_PROTOCOLS[check.role].has(check.claim.protocol)) return { outcome: unchecked('protocol_role') };
         }
         if (unbuiltPart(check.claim) !== undefined) return { outcome: unchecked('part_unbuilt') };
+        if (rules.http && check.claim.kind === 'make' && check.claim.of !== undefined) return { outcome: unchecked('role_unsupported') };
         if (rules.http && !HTTP_RECEIVER.test(check.receiver)) return { outcome: unchecked('receiver_invalid') };
         if (rules.message && !fitsReceiver(check)) return { outcome: unchecked('receiver_invalid') };
         reader.setPackage(check.package);
@@ -1617,10 +1621,26 @@ function unbuiltPart(claim: LibraryClaim): string | undefined {
  * maker's instances" is two elements, not one.
  */
 function placementInvalid(claim: LibraryClaim): boolean {
-  if (claim.kind === 'make' || claim.of === undefined) return false;
+  if (claim.kind === 'make') return ofMakeInvalid(claim);
+  if (claim.of === undefined) return false;
   if (claim.on !== undefined) return true;
   const of = parseReceiver(claim.of);
   return of === undefined || (of.maker === undefined && of.scope === undefined && of.type === undefined);
+}
+
+/**
+ * Rules 1-3 of amendment 12: a make's `of` is a maker receiver id (never the
+ * export, a scope or a type), the make is a `call` on a named member, and it
+ * takes a `name` at an argument with only `key_labels`, `name_scope` and
+ * `picker` beside it. Rule 4 is read on the member's declared return.
+ */
+function ofMakeInvalid(claim: MakeClaim): boolean {
+  if (claim.of === undefined) return false;
+  const of = parseReceiver(claim.of);
+  if (of?.maker === undefined || of.scope !== undefined) return true;
+  if (claim.form !== 'call' || claim.member === null) return true;
+  if (claim.name === undefined || !('arg' in claim.name)) return true;
+  return [claim.base, claim.prefix, claim.handler, claim.runs, claim.protocol, claim.result].some(part => part !== undefined);
 }
 
 /** The slots a claim's name sits at: one slot, or each of its parts. */
@@ -1745,7 +1765,7 @@ function fitsReceiver(check: LibraryCheck): boolean {
   const claim = check.claim;
   // A type is read only by a claim placed on it, by the same id (carrick#2977, #3046).
   if (receiver.type) return claim.kind !== 'make' && claim.of === check.receiver;
-  if (claim.kind === 'make') return check.receiver === 'export';
+  if (claim.kind === 'make') return claim.of === undefined ? check.receiver === 'export' : check.receiver === claim.of;
   if (claim.of !== undefined) return check.receiver === claim.of;
   if (claim.on === undefined) return true;
   if (receiver.scope !== undefined) return false;
@@ -1763,6 +1783,8 @@ function fitsReceiver(check: LibraryCheck): boolean {
 function builtReceiver(check: LibraryCheck): string | undefined {
   const claim = check.claim;
   if (claim.kind === 'make') {
+    // An `of`-make opens no receiver id on its own export (amendment 12, rule 7).
+    if (claim.of !== undefined) return undefined;
     if (claim.member === null) return claim.form === 'call' ? 'instance:()' : 'instance:new';
     return claim.form === 'call' ? `instance:${claim.member}` : `instance:new:${claim.member}`;
   }
@@ -2709,6 +2731,7 @@ class DeclarationReader {
     built?: ts.Signature,
     collections?: () => readonly ts.Type[] | undefined
   ): Judged {
+    if (claim.of !== undefined) return this.judgeOfMake(receiver, claim);
     const layout = this.layout({
       base: claim.base,
       prefix: claim.prefix,
@@ -2750,6 +2773,42 @@ class DeclarationReader {
     }
     if (holding.length > 0) return { outcome: VERIFIED, holding };
     return { outcome: best!.outcome };
+  }
+
+  /**
+   * An `of`-make (amendment 12): `member` is a home-declared call on the
+   * receiver `of` names, whose name slot takes the name at `name`, and whose
+   * declared return is an object type: not the receiver's own (a fluent
+   * `this`), not a Promise (`claim_invalid`). It opens no receiver, so it
+   * holds no overloads; its verdict carries the member's declarations.
+   */
+  private judgeOfMake(receiver: MessageReceiver, claim: MakeClaim): Judged {
+    const layout = this.layout({ name: claim.name });
+    if ('failure' in layout) return { outcome: layout.failure };
+    const callee = this.ownCallee(receiver, [], claim.member, 'call');
+    if ('failure' in callee) return { outcome: callee.failure };
+    const labels = claim.key_labels ?? {};
+    const holding: ts.Signature[] = [];
+    let best: RankedFailure | undefined;
+    for (const signature of callee.signatures) {
+      let result = this.messageSignatureOutcome(signature, layout.value, labels);
+      if (result.rank === Infinity && !this.makesAnObject(this.checker.getReturnTypeOfSignature(signature), receiver.type)) {
+        result = { rank: 6, outcome: unchecked('claim_invalid') };
+      }
+      if (result.rank === Infinity) holding.push(signature);
+      else best = furthest(best, result.rank, result.outcome);
+    }
+    if (holding.length === 0) return { outcome: best!.outcome };
+    const declarations = this.declarationsOf({ signatures: holding, named: callee.named });
+    return { outcome: declarations.length > 0 ? { verdict: 'verified', declarations } : VERIFIED };
+  }
+
+  /** An `of`-make's return (rule 4): an object type that is neither the receiver's own nor a thenable. */
+  private makesAnObject(returned: ts.Type, receiver: ts.Type): boolean {
+    if (returned.flags & ts.TypeFlags.TypeParameter && (returned as { isThisType?: boolean }).isThisType) return false;
+    if (returned === receiver || sameDeclared(this.checker, returned, receiver)) return false;
+    if (this.checker.getAwaitedType(returned) !== returned) return false;
+    return this.isObjectType(returned);
   }
 
   /**
