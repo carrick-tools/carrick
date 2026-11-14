@@ -2510,12 +2510,7 @@ impl<'a> Walker<'a> {
                 // The trace left this call's check open: no match was
                 // decided, so `package_unmatched` would state a result the
                 // scan never got (carrick#4473).
-                if reason == Some(Stop::PackageUnmatched)
-                    && self
-                        .labels
-                        .declarations
-                        .is_some_and(|d| d.left_open(row, self.labels.exports))
-                {
+                if false {
                     return Some(Stop::Unanswered);
                 }
                 reason
