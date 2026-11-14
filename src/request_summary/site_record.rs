@@ -1962,16 +1962,49 @@ pub fn site_records(
     decided: &Decided,
     labels: &[SiteLabel],
 ) -> Vec<SiteRecord> {
+    records_of(inputs, siblings, root, decided, &decided.sites, labels)
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect()
+}
+
+/// The records of the HTTP sites that yielded to the request summaries
+/// ([`Decided::yield_to_summaries`]), read the way a decided site's is
+/// (carrick#4260). They give the payload slots that type the rows a site
+/// yielded to, and are read by nothing else: never the fold, the site
+/// questions or the sites' ids. `decided` supplies the roles of the sites
+/// that stand.
+pub fn yielded_records(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    root: &Path,
+    decided: &Decided,
+    yielded: &[super::decided_sites::Yielded],
+    labels: &[SiteLabel],
+) -> Vec<(usize, SiteRecord)> {
+    let sites: Vec<DecidedSite> = yielded.iter().map(|y| y.site.clone()).collect();
+    records_of(inputs, siblings, root, decided, &sites, labels)
+}
+
+/// Each record with the index of the site in `sites` it reads.
+fn records_of(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    root: &Path,
+    decided: &Decided,
+    sites: &[DecidedSite],
+    labels: &[SiteLabel],
+) -> Vec<(usize, SiteRecord)> {
     let mut sources = Sources {
         root,
         files: HashMap::new(),
     };
     let roles = roles_by_file(decided);
     let resolver = Resolver::new(inputs, siblings);
-    decided
-        .sites
+    sites
         .iter()
-        .filter_map(|site| {
+        .enumerate()
+        .filter_map(|(index, site)| {
             let label = SiteLabel::find(labels, &site.end)?;
             record(
                 &mut sources,
@@ -1982,6 +2015,7 @@ pub fn site_records(
                 (label, labels),
                 &roles,
             )
+            .map(|record| (index, record))
         })
         .collect()
 }

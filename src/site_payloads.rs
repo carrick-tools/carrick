@@ -58,13 +58,195 @@ struct Site {
     slots: PayloadSlots,
 }
 
+/// The request slot of an HTTP site that yielded to the request summaries'
+/// rows (carrick#4260), and the rows whose own send it is.
+#[derive(Debug, Clone)]
+struct Carried {
+    /// The request the site ends at: its file and line, repo-relative.
+    request: (String, u32),
+    /// The rows (repo-relative file and line) the site's send is.
+    rows: Vec<(String, u32)>,
+    request_slot: PayloadAt,
+}
+
+/// A summary row at a caller a yielded site's slot types: the manifest key
+/// of its request entry, and the row's own call, which the slot is read
+/// through.
+#[derive(Debug, Clone)]
+struct CarriedRow {
+    file_path: String,
+    line: u32,
+    method: String,
+    path: String,
+    site: Site,
+}
+
 /// A service's payload slots by the file and line of each site's call.
 #[derive(Debug, Clone, Default)]
 pub struct SitePayloads {
     by_line: BTreeMap<(String, u32), Vec<Site>>,
+    carried: Vec<Carried>,
+    rows: Vec<CarriedRow>,
 }
 
 impl SitePayloads {
+    /// Take the request slot of each site that yielded to summary rows
+    /// (carrick#4260). `records` are the yielded sites' records, each with the
+    /// index of its site in `yielded`
+    /// ([`crate::request_summary::site_record::yielded_records`]). A site
+    /// that yielded through a saved stop alone has no rows and hands on
+    /// nothing; a site with no request slot (a verb that sends no body)
+    /// hands on nothing. A yielded site's response slot is not carried.
+    pub fn carry(
+        &mut self,
+        yielded: &[crate::request_summary::decided_sites::Yielded],
+        records: Vec<(usize, SiteRecord)>,
+    ) {
+        for (index, record) in records {
+            let Some(site) = yielded.get(index) else {
+                continue;
+            };
+            let Some(slot) = record.payloads.request else {
+                continue;
+            };
+            if site.rows.is_empty() {
+                continue;
+            }
+            self.carried.push(Carried {
+                request: (site.site.end.file.clone(), site.site.end.line),
+                rows: site.rows.clone(),
+                request_slot: slot,
+            });
+        }
+    }
+
+    /// The carried slots joined to the summary rows they type: each row at a
+    /// caller the request summaries stated (`file_results`) whose request is
+    /// the one a yielded site ends at, on the row's own line, and which has no
+    /// typed request of its own (its function builds the body, or its body
+    /// reading is none; a row that sends a parameter unchanged, or states
+    /// its request line's types, keeps them). The row's request entry is
+    /// keyed by its file, line, verb and canonical path, so another row on
+    /// the same line does not join. A row two slots reach takes none.
+    pub fn joined_to_rows(
+        &self,
+        file_results: &std::collections::HashMap<
+            String,
+            crate::agents::file_analyzer_agent::FileAnalysisResult,
+        >,
+        repo_path: &str,
+        normalizer: &crate::url_normalizer::UrlNormalizer,
+    ) -> Self {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::forwarded_body::CallBody;
+        let mut joined = self.clone();
+        joined.rows.clear();
+        if self.carried.is_empty() {
+            return joined;
+        }
+        let root = Path::new(repo_path);
+        for (file_path, result) in file_results {
+            let file = crate::site_rows::relative(root, file_path);
+            for call in &result.data_calls {
+                if call.resolution_source != Some(ResolutionSource::RequestSummary)
+                    || call.request_line.is_some()
+                    || !matches!(call.call_body, Some(CallBody::Built) | None)
+                {
+                    continue;
+                }
+                let (Some(reaches), Some(start), Some(end), Some(method)) = (
+                    call.reaches_request.as_deref(),
+                    call.call_expression_span_start,
+                    call.call_expression_span_end,
+                    call.method.as_deref(),
+                ) else {
+                    continue;
+                };
+                let Some((request_file, request_line)) = reaches.rsplit_once(':') else {
+                    continue;
+                };
+                let Ok(request_line) = request_line.parse::<u32>() else {
+                    continue;
+                };
+                let request = (crate::site_rows::relative(root, request_file), request_line);
+                let line = if call.line_number <= 0 {
+                    1
+                } else {
+                    call.line_number as u32
+                };
+                let mut reaching = self.carried.iter().filter(|carried| {
+                    carried.request == request && carried.rows.contains(&(file.clone(), line))
+                });
+                let (Some(carried), None) = (reaching.next(), reaching.next()) else {
+                    continue;
+                };
+                joined.rows.push(CarriedRow {
+                    file_path: file_path.clone(),
+                    line,
+                    method: crate::type_manifest::normalize_manifest_method(method),
+                    path: crate::agents::file_orchestrator::FileOrchestrator::canonical_call_path(
+                        normalizer, call,
+                    ),
+                    site: Site {
+                        http: true,
+                        side: Side::Call,
+                        call: AnchorAt {
+                            file: file.clone(),
+                            line,
+                            span_start: start,
+                            span_end: end,
+                        },
+                        slots: PayloadSlots {
+                            request: Some(carried.request_slot.clone()),
+                            response: None,
+                        },
+                    },
+                });
+            }
+        }
+        // What the summaries' own request reading still decides (carrick#4260
+        // R8): caller rows typed from a parameter's declaration. When this
+        // reads zero over the fixed corpus, the request half of `CallBody` goes.
+        let param_rows = file_results
+            .values()
+            .flat_map(|result| &result.data_calls)
+            .filter(|call| {
+                call.reaches_request.is_some() && matches!(call.call_body, Some(CallBody::Param(_)))
+            })
+            .count();
+        tracing::debug!(
+            carried = joined.carried.len(),
+            rows = joined.rows.len(),
+            param_rows,
+            "site payloads: slots carried to summary rows, and caller rows still typed by a parameter's declaration"
+        );
+        joined
+    }
+
+    /// The carried row a consumer request `entry` is the entry of.
+    fn carried_row(&self, entry: &TypeManifestEntry) -> Option<&CarriedRow> {
+        if entry.role != ManifestRole::Consumer || entry.type_kind != ManifestTypeKind::Request {
+            return None;
+        }
+        let (method, path) = entry.key.as_http()?;
+        let mut matching = self.rows.iter().filter(|row| {
+            row.file_path == entry.file_path
+                && row.line == entry.line_number
+                && row.method == method
+                && row.path == path
+        });
+        match (matching.next(), matching.next()) {
+            (Some(row), None) => Some(row),
+            _ => None,
+        }
+    }
+
+    /// A slot types `entry`: a request entry of a row a yielded site's send
+    /// is, which [`drop_call_through_entries`](crate::engine) keeps.
+    pub fn types_row(&self, entry: &TypeManifestEntry) -> bool {
+        self.carried_row(entry).is_some()
+    }
+
     /// The slots of `records`, each under its call's file and line.
     pub fn of(records: &[SiteRecord]) -> Self {
         let mut by_line: BTreeMap<(String, u32), Vec<Site>> = BTreeMap::new();
@@ -93,7 +275,10 @@ impl SitePayloads {
                     slots: record.payloads.clone(),
                 });
         }
-        Self { by_line }
+        Self {
+            by_line,
+            ..Self::default()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,14 +321,22 @@ impl SitePayloads {
             {
                 continue;
             }
-            let Some(sites) = self.by_line.get(&(file.clone(), entry.line_number)) else {
-                continue;
-            };
-            let mut joined = sites
-                .iter()
-                .filter(|site| site.http == http && site.side == side);
-            let (Some(site), None) = (joined.next(), joined.next()) else {
-                continue;
+            // A row a yielded site's send is takes that site's slot, read
+            // through the row's own call (carrick#4260).
+            let site = match self.carried_row(entry) {
+                Some(row) => &row.site,
+                None => {
+                    let Some(sites) = self.by_line.get(&(file.clone(), entry.line_number)) else {
+                        continue;
+                    };
+                    let mut joined = sites
+                        .iter()
+                        .filter(|site| site.http == http && site.side == side);
+                    let (Some(site), None) = (joined.next(), joined.next()) else {
+                        continue;
+                    };
+                    site
+                }
             };
             let slot = match (http, entry.type_kind) {
                 (true, ManifestTypeKind::Request) | (false, ManifestTypeKind::Response) => {

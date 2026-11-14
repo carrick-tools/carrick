@@ -21,6 +21,7 @@ type and a payload.
 | `placeOrder` | `checkout.ts:5`, `:6` | the request line's payload and `Order` | request and response compatible |
 | `sendRefund` | `checkout.ts:7` | the request line's payload and `Refund` | request and response compatible |
 | `reorder` | `boot.ts:2` at module level (a fact row), `boot.ts:3` | the request line's payload at each (carrick#4121); `boot.ts:2` keeps its own response | request compatible at each |
+| `orderDraft`, `OrderClient.place`, `orderInline`, `orderAsIs` | `widgetcaller.ts:2` to `:5` | `:2`, `:3` and `:5` take the body the wrapper builds (carrick#4260); `:4` sends its parameter and keeps the declared type | request compatible at `:2`, `:3`, `:5` |
 | `openSession` (also sends a token request) | `checkout.ts:8`, two rows there | none moved: the request line keeps the model's row and its types | none |
 
 A caller whose own call types a side keeps its own type for that side. A

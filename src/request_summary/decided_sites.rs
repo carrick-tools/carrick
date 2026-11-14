@@ -4395,6 +4395,16 @@ fn route_ways(
 /// A request's file and span start, or a row's file and line.
 type At = (PathBuf, u32);
 
+/// An HTTP site that yielded to the request summaries' rows
+/// ([`Decided::yield_to_summaries`]) and the rows whose own send it is, as
+/// repo-relative file and line (carrick#4260). The site's payload slot types
+/// those rows ([`crate::site_payloads::SitePayloads::carry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Yielded {
+    pub site: DecidedSite,
+    pub rows: Vec<(String, u32)>,
+}
+
 /// Where the request summaries state each request's rows
 /// ([`super::RequestSummaryIndex::placements`]): the request's file and span
 /// start to the file and line of every row stated for it, and the calls each
@@ -4720,9 +4730,10 @@ impl Decided {
     /// answered it, with a reason. Any other site stands,
     /// beside the rows (C11 T1): it is a caller the summaries did not
     /// compose, and dropping it would lose its row. A site that sits where
-    /// one of the rows stands also stands. Returns how many sites yielded;
+    /// one of the rows stands also stands. Returns the sites that yielded,
+    /// each with the rows whose own send it is ([`Yielded`], carrick#4260);
     /// the sites kept beside rows are [`Self::kept_beside_summaries`].
-    pub fn yield_to_summaries(&mut self, root: &Path, placed: &SummaryPlacements) -> usize {
+    pub fn yield_to_summaries(&mut self, root: &Path, placed: &SummaryPlacements) -> Vec<Yielded> {
         type Rel = (String, u32);
         let rel = |(file, at): &At| (relative(root, file), *at);
         // Per request: each row's place and the calls it was composed through.
@@ -4752,8 +4763,8 @@ impl Decided {
                 )
             })
             .collect();
-        let before = self.sites.len();
         let mut kept = Vec::new();
+        let mut yielded = Vec::new();
         self.sites.retain(|site| {
             if site.end.role != "http_client" {
                 return true;
@@ -4767,18 +4778,32 @@ impl Decided {
                 return true;
             }
             let at_request = site.file == site.end.file && site.span_start == site.end.span_start;
-            let answered = rows.iter().any(|(_, through)| through.contains(&at))
+            let composed = rows.iter().any(|(_, through)| through.contains(&at));
+            let answered = composed
                 || stopped
                     .get(&request)
                     .is_some_and(|chains| chains.iter().any(|through| through.contains(&at)));
             if at_request || answered {
+                // A row is the site's own send when the site is at the
+                // request, or the row was composed through the site's call.
+                // A site that yielded through a saved stop alone hands on
+                // nothing: the request's rows are not its rows.
+                let own: Vec<(String, u32)> = rows
+                    .iter()
+                    .filter(|(_, through)| at_request || through.contains(&at))
+                    .map(|(row, _)| row.clone())
+                    .collect();
+                yielded.push(Yielded {
+                    site: site.clone(),
+                    rows: own,
+                });
                 return false;
             }
             kept.push(format!("{}:{}", site.file, site.line));
             true
         });
         self.kept_beside_summaries.extend(kept);
-        before - self.sites.len()
+        yielded
     }
 
     /// The base an HTTP request's instance carries rides onto its site's
@@ -7374,7 +7399,7 @@ pub(crate) mod tests {
         )
         .placements();
         let root = decided_fixture();
-        assert_eq!(decided.yield_to_summaries(&root, &placed), 1);
+        assert_eq!(decided.yield_to_summaries(&root, &placed).len(), 1);
         assert_eq!(
             names_at(&decided, PLACEMENT),
             vec![(
@@ -7404,7 +7429,7 @@ pub(crate) mod tests {
             &crate::client_semantics::LibrarySemantics::default(),
         )
         .placements();
-        assert_eq!(paths.yield_to_summaries(&root, &paths_placed), 1);
+        assert_eq!(paths.yield_to_summaries(&root, &paths_placed).len(), 1);
         assert_eq!(paths.sites.len(), before - 1);
         assert!(
             !paths
@@ -7412,6 +7437,58 @@ pub(crate) mod tests {
                 .iter()
                 .any(|site| site.line == line_of(&paths_text, "fetch(`/dashboard?page="))
         );
+    }
+
+    /// carrick#4260: a yielded site hands on the rows whose own send it is.
+    /// A site at the request: every row of the request. A site up the chain
+    /// of a row's composition: that row. A site that yielded through a saved
+    /// stop alone: none, since the request's rows are not its rows.
+    #[test]
+    fn a_yielded_site_hands_on_only_the_rows_whose_send_it_is() {
+        let (mut decided, _, _) =
+            decided_at(PLACEMENT, &["fetch(`/accounts/${id}`)"], &fetch_label());
+        let root = decided_fixture();
+        let mut site = decided.sites[0].clone();
+        // Not at the request: the request is written elsewhere.
+        site.end.span_start += 1000;
+        let request = (root.join(&site.end.file), site.end.span_start);
+        let row = (root.join("elsewhere.ts"), 3);
+        let other = (root.join("elsewhere.ts"), 9);
+        let at = (root.join(&site.file), site.line);
+
+        let mut stopped = SummaryPlacements::default();
+        stopped.place(request.clone(), row.clone(), None);
+        stopped.stop(request.clone(), &BTreeSet::from([at.clone()]));
+        decided.sites = vec![site.clone()];
+        let yielded = decided.yield_to_summaries(&root, &stopped);
+        assert_eq!(yielded.len(), 1);
+        assert!(yielded[0].rows.is_empty(), "{yielded:?}");
+
+        let mut composed = SummaryPlacements::default();
+        composed.place(request.clone(), row.clone(), Some(&BTreeSet::from([at])));
+        composed.place(request, other, None);
+        decided.sites = vec![site];
+        let yielded = decided.yield_to_summaries(&root, &composed);
+        assert_eq!(
+            yielded[0].rows,
+            vec![("elsewhere.ts".to_string(), 3)],
+            "{yielded:?}"
+        );
+
+        // A site at the request hands on every row of it.
+        let (mut at_request, _, inputs) = decided_at(
+            PLACEMENT,
+            &["fetch(`/api/notices?${query}`)"],
+            &fetch_label(),
+        );
+        let placed = crate::request_summary::summarize(
+            &inputs,
+            &crate::client_semantics::LibrarySemantics::default(),
+        )
+        .placements();
+        let yielded = at_request.yield_to_summaries(&root, &placed);
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].rows.len(), 1, "{yielded:?}");
     }
 
     /// The label of the fixture's `@fixture/http` instance member `get`.
