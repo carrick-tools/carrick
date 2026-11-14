@@ -12268,7 +12268,11 @@ fn run_capture_for_service(
         .collect_type_requests_and_body_asks(file_results, repo_path, mount_graph, config, modules);
     // The caller rows whose own call the resolution read a body member out
     // of joined its requests there (carrick#4196); the rest never did.
-    infer.extend(body_asks);
+    infer.extend(body_asks.into_iter().filter(|ask| {
+        ask.alias
+            .as_ref()
+            .is_some_and(|alias| type_resolution.hand_back_bodies.contains(alias))
+    }));
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     crate::site_payloads::take_over(&mut infer, payload_infer);
@@ -14472,7 +14476,7 @@ fn withhold_kept_main(
         .flatten()
         .map(|entry| entry.type_alias.clone())
         .collect();
-    let _ = (manifest, file_results, main_aliases);
+    withhold_unread_hand_backs(manifest, file_results, &main_aliases);
 }
 
 /// A row at a caller whose response no request line reads (carrick#1601,
@@ -14631,6 +14635,7 @@ fn stamp_manifest_anchor_symbols(
             // symbol names the function's value.
             let anchor = match call.request_line.as_deref() {
                 Some(moved) if call.at_caller && moved.response => &moved.call,
+                _ if call.at_caller => continue,
                 _ => call,
             };
             if let Some(symbol) = anchor.primary_type_symbol.as_ref() {
