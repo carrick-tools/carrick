@@ -4381,6 +4381,43 @@ mod tests {
         );
     }
 
+    /// carrick#4266, the message roles: a topic read off a loop head over a
+    /// stated list of objects (`t.topic`) is each element's topic, so the
+    /// name slot holds several texts on one chain and saves
+    /// `several_operations` (#4245 turns that into one row per element),
+    /// never `unread_expression`. A list with a topic the code does not
+    /// state keeps `unread_expression`.
+    #[test]
+    fn a_topic_read_off_a_loop_head_over_stated_objects_is_each_element_s() {
+        let Some((rows, _)) = read_walked(
+            &[(
+                "src/topics.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 declare function make(): string;\n\
+                 const TOPICS = [{ topic: \"orders.created\" }, { topic: \"orders.shipped\" }];\n\
+                 for (const t of TOPICS) bus.publish(t.topic, {});\n\
+                 for (const t of [{ topic: \"a.one\" }, { topic: make() }]) bus.publish(t.topic, {});\n",
+            )],
+            &[bus()],
+            true,
+        ) else {
+            return;
+        };
+        assert!(rows.rows.is_empty(), "{rows:#?}");
+        let mut leads: Vec<(u32, Stop)> = rows
+            .leads
+            .iter()
+            .map(|lead| (lead.line, lead.reason))
+            .collect();
+        leads.sort();
+        assert_eq!(
+            leads,
+            vec![(4, Stop::SeveralOperations), (5, Stop::UnreadExpression)],
+            "{:?}",
+            rows.leads
+        );
+    }
+
     /// Where the walk gave the text reader no compiler rows, today's reading
     /// stands, counted `no_rows`, and no lead is saved (carrick#3504 B10-3,
     /// Q-B3a): a failed walk loses no row.
