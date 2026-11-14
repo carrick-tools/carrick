@@ -88,3 +88,18 @@ function forward(path: string, init: RequestInit) {
 export function forwarded(): Promise<Response> {
   return forward("/absent/forwarded", { method: "POST" });
 }
+
+// A wrapper that hands the options to a helper before it sends them: the
+// helper may write the body onto them.
+function addBody(init: RequestInit) {
+  init.body = "x";
+}
+
+function helped(path: string, init: RequestInit) {
+  addBody(init);
+  return fetch(`${process.env.API}${path}/helped`, init);
+}
+
+export function helpedCaller(): Promise<Response> {
+  return helped("/absent/helped", { method: "POST" });
+}

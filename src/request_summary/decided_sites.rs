@@ -2165,7 +2165,8 @@ enum Walked {
 /// `defaulted(placed, index)` says the function `placed` is written in gives
 /// that parameter a default: a default at any of them fills it, as does one
 /// a closure's parameter may have (not read). `written_onto(placed, index)`
-/// says that function writes onto the parameter's members.
+/// says that function writes onto the parameter's members or hands it to a
+/// call outside `placed`'s own, which may write onto it.
 fn payload_slot(
     down: &[Placed<'_>],
     slot: &ArgSlot,
@@ -2182,9 +2183,9 @@ fn payload_slot(
         }
         Walked::Bound(0, arg, Some(carried), through) => {
             // A function that writes onto the parameter the key is carried
-            // through adds to the object its caller handed it, so the
-            // caller's literal is not what the labelled call sends
-            // (carrick#4324).
+            // through, or hands it to another call that may, adds to the
+            // object its caller handed it, so the caller's literal is not
+            // what the labelled call sends (carrick#4324).
             if through
                 .iter()
                 .any(|&(k, index)| written_onto(&down[k], index))
@@ -2666,9 +2667,17 @@ impl<'a> Walk<'a, '_> {
     }
 
     /// Whether the function `callee` writes onto the members of its
-    /// parameter at `index` (carrick#4324). A function that is not found, or
-    /// a parameter that is not a plain name, may: it reads as written onto.
-    fn writes_onto_param(&self, callee: (&Path, Option<&str>), index: usize) -> bool {
+    /// parameter at `index`, or hands it to a call outside the one at `walked`
+    /// (the call the walk goes through, and what is written inside it), whose
+    /// callee may
+    /// (carrick#4324). A function that is not found, or a parameter that is
+    /// not a plain name, may: it reads as written onto.
+    fn writes_onto_param(
+        &self,
+        callee: (&Path, Option<&str>),
+        index: usize,
+        walked: (u32, u32),
+    ) -> bool {
         let Some((_, function)) = callee
             .1
             .and_then(|key| self.resolver.function(callee.0, key))
@@ -2678,7 +2687,7 @@ impl<'a> Walk<'a, '_> {
         let Some(Some(param)) = function.params.get(index) else {
             return true;
         };
-        param.written_onto()
+        param.written_onto() || param.handed_beyond(walked)
     }
 
     /// `down` is the calls from the site (first) to the labelled call
@@ -2744,7 +2753,13 @@ impl<'a> Walk<'a, '_> {
                     down,
                     slot,
                     &|placed, index| self.defaults_param((placed.file, placed.key), index),
-                    &|placed, index| self.writes_onto_param((placed.file, placed.key), index),
+                    &|placed, index| {
+                        self.writes_onto_param(
+                            (placed.file, placed.key),
+                            index,
+                            (placed.call.site.span_start, placed.call.site.span_end),
+                        )
+                    },
                 )
             });
         let handler = handler_slot
@@ -7133,6 +7148,7 @@ pub(crate) mod tests {
         let calls = [
             "fetch(`${process.env.API}${path}`, init)",
             "fetch(`${process.env.API}${path}/forwarded`, init)",
+            "fetch(`${process.env.API}${path}/helped`, init)",
         ];
         let mut keyed = fetch_label();
         keyed.payload = Some(ArgSlot {
@@ -7150,6 +7166,8 @@ pub(crate) mod tests {
             site.payload_slot.clone()
         };
         assert_eq!(slot_at("stamp(\"/absent/stamped\""), None);
+        // A helper the wrapper hands the options to may write onto them.
+        assert_eq!(slot_at("helped(\"/absent/helped\""), None);
         assert_eq!(
             slot_at("forward(\"/absent/forwarded\""),
             Some(SlotBinding::Unwritten {

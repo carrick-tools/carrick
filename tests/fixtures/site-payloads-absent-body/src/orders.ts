@@ -31,3 +31,8 @@ export function sendEither(order: Order) { return either("/orders/either", order
 // caller's literal lacks `data`, yet the request carries one.
 function stamp(u: string, init: { headers?: object; data?: unknown }) { init.data = "x"; return http.remove(u, init); }
 export function stampNow() { return stamp("/orders/stamp", { headers: {} }); }
+
+// The same through a helper the wrapper hands the options to first.
+function addData(init: { headers?: object; data?: unknown }) { init.data = "x"; }
+function helped(u: string, init: { headers?: object; data?: unknown }) { addData(init); return http.remove(u, init); }
+export function helpedNow() { return helped("/orders/helped", { headers: {} }); }
