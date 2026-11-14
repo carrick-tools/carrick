@@ -998,6 +998,13 @@ export interface VerifyLibraryClaimsRequest extends BaseRequest {
   checks: LibraryCheck[];
   /** Checks not reached in time come back `unchecked` with reason `budget`; null or absent is the default. */
   budget_ms?: number | null;
+  /**
+   * Another service's tsconfig (absolute, or relative to the process's repo
+   * root): the checks are judged in a program built from its compiler options
+   * with only the probe file, released after the request. Absent: judged in
+   * this process's own program (carrick#4472).
+   */
+  tsconfig_path?: string;
 }
 
 /**

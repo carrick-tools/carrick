@@ -2009,6 +2009,10 @@ enum SidecarRequest {
         /// from it, as position rows are.
         #[serde(skip_serializing_if = "Option::is_none")]
         scan_root: Option<String>,
+        /// Another service's tsconfig: the checks are judged in a probe-only
+        /// program under its compiler options (carrick#4472).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tsconfig_path: Option<String>,
     },
     #[serde(rename = "list_program_files")]
     ListProgramFiles { request_id: String },
@@ -4552,13 +4556,19 @@ impl TypeSidecar {
     /// answer would come back the same), for a [`Self::record_only`] process,
     /// or when the run stops on a memory death and this was one
     /// ([`retries_after`]).
+    ///
+    /// `tsconfig` names another service's tsconfig: the checks are then judged
+    /// in a probe-only program under its compiler options, not in this
+    /// service's own program (carrick#4472). `None` is the service's program.
     pub fn verify_library_claims(
         &self,
         from_dir: &Path,
+        tsconfig: Option<&Path>,
         checks: &[LibraryCheck],
     ) -> Result<LibraryClaimsAnswer, SidecarError> {
         self.verify_library_claims_stopping_on_memory(
             from_dir,
+            tsconfig,
             checks,
             crate::scan_health::fail_on_type_memory_from_env(),
         )
@@ -4567,6 +4577,7 @@ impl TypeSidecar {
     fn verify_library_claims_stopping_on_memory(
         &self,
         from_dir: &Path,
+        tsconfig: Option<&Path>,
         checks: &[LibraryCheck],
         fail_on_memory: bool,
     ) -> Result<LibraryClaimsAnswer, SidecarError> {
@@ -4578,7 +4589,7 @@ impl TypeSidecar {
                 duration_ms: None,
             });
         }
-        let error = match self.ask_library_claims(from_dir, checks) {
+        let error = match self.ask_library_claims(from_dir, tsconfig, checks) {
             Err(error) if error.is_process_death() && !self.record_only => error,
             answer => return answer,
         };
@@ -4598,7 +4609,7 @@ impl TypeSidecar {
         self.restart(
             "the sidecar died before or during the library verification, which is retried once",
         )?;
-        let second = self.ask_library_claims(from_dir, checks);
+        let second = self.ask_library_claims(from_dir, tsconfig, checks);
         if matches!(&second, Err(error) if error.is_process_death()) {
             // The scan goes on asking this sidecar: leave a live one.
             let _ = self.restart("the sidecar died during the library verification and its retry");
@@ -4609,6 +4620,7 @@ impl TypeSidecar {
     fn ask_library_claims(
         &self,
         from_dir: &Path,
+        tsconfig: Option<&Path>,
         checks: &[LibraryCheck],
     ) -> Result<LibraryClaimsAnswer, SidecarError> {
         self.ensure_ready()?;
@@ -4618,6 +4630,7 @@ impl TypeSidecar {
             checks: checks.to_vec(),
             budget_ms: None,
             scan_root: self.scan_root_arg(),
+            tsconfig_path: tsconfig.map(|path| path.to_string_lossy().into_owned()),
         };
         self.send_request(&request)?;
         let response = self.operation_response()?;
@@ -7043,6 +7056,7 @@ mod tests {
                 ],
                 budget_ms: Some(500),
                 scan_root: Some("/repo".into()),
+                tsconfig_path: None,
             },
             SidecarRequest::ListProgramFiles { request_id: id() },
             SidecarRequest::ReachGraph { request_id: id() },
@@ -7741,11 +7755,13 @@ mod tests {
             ],
             budget_ms: Some(500),
             scan_root: Some("/repo".into()),
+            tsconfig_path: Some("/repo/packages/kit/tsconfig.json".into()),
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["action"], "verify_library_claims");
         assert_eq!(value["budget_ms"], 500);
         assert_eq!(value["scan_root"], "/repo");
+        assert_eq!(value["tsconfig_path"], "/repo/packages/kit/tsconfig.json");
         let checks = value["checks"].as_array().unwrap();
         assert_eq!(
             checks[0],
@@ -7810,6 +7826,22 @@ mod tests {
             let back: LibraryCheck = serde_json::from_value(json.clone()).unwrap();
             assert_eq!(&back, sent);
         }
+    }
+
+    /// carrick#4472: no tsconfig named is no field on the wire, so a request
+    /// the scanner sends today reads byte for byte as it did.
+    #[test]
+    fn verify_library_claims_request_omits_tsconfig_path_when_none() {
+        let request = SidecarRequest::VerifyLibraryClaims {
+            request_id: "req-12".into(),
+            from_dir: "/svc".into(),
+            checks: vec![],
+            budget_ms: None,
+            scan_root: None,
+            tsconfig_path: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("tsconfig_path").is_none(), "{value}");
     }
 
     fn request_checks(request: &SidecarRequest) -> Vec<LibraryCheck> {
@@ -9561,7 +9593,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         );
         let checks = one_library_check();
         let answer = sidecar
-            .verify_library_claims_stopping_on_memory(&root, &checks, false)
+            .verify_library_claims_stopping_on_memory(&root, None, &checks, false)
             .expect("a fresh process answers");
         assert_eq!(answer.verdicts.len(), checks.len());
         assert_eq!(spawn_count(&spawns), 2);
@@ -9574,7 +9606,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let (sidecar, spawns) = ready_dying_sidecar(&root, "verify_library_claims", false);
         let checks = one_library_check();
         let answer = sidecar
-            .verify_library_claims_stopping_on_memory(&root, &checks, false)
+            .verify_library_claims_stopping_on_memory(&root, None, &checks, false)
             .expect("a fresh process answers");
         assert_eq!(answer.verdicts.len(), checks.len());
         assert_eq!(spawn_count(&spawns), 2);
@@ -9585,8 +9617,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let (sidecar, spawns) = ready_dying_sidecar(&root, "verify_library_claims", false);
-        let result =
-            sidecar.verify_library_claims_stopping_on_memory(&root, &one_library_check(), true);
+        let result = sidecar.verify_library_claims_stopping_on_memory(
+            &root,
+            None,
+            &one_library_check(),
+            true,
+        );
         assert!(result.is_err(), "the death is returned");
         assert_eq!(spawn_count(&spawns), 1, "no second process was started");
     }
@@ -9597,8 +9633,12 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let root = dir.path().canonicalize().unwrap();
         let (sidecar, spawns) = ready_dying_sidecar(&root, "never", true);
         let first = sidecar.pid();
-        let result =
-            sidecar.verify_library_claims_stopping_on_memory(&root, &one_library_check(), false);
+        let result = sidecar.verify_library_claims_stopping_on_memory(
+            &root,
+            None,
+            &one_library_check(),
+            false,
+        );
         assert!(
             matches!(&result, Err(error) if error.is_process_death()),
             "{result:?}"

@@ -539,7 +539,7 @@ mod tests {
             .wait_ready(std::time::Duration::from_secs(300))
             .expect("the sidecar is ready");
         let verdicts = sidecar
-            .verify_library_claims(&on.repo, &ask.checks)
+            .verify_library_claims(&on.repo, None, &ask.checks)
             .expect("the verify request answers")
             .verdicts;
         let index = ResultIndex::of(&ask, &verdicts, &discovery);
@@ -611,7 +611,7 @@ mod tests {
             .wait_ready(std::time::Duration::from_secs(300))
             .expect("the sidecar is ready");
         let verdicts = sidecar
-            .verify_library_claims(&on.repo, &ask.checks)
+            .verify_library_claims(&on.repo, None, &ask.checks)
             .expect("the verify request answers")
             .verdicts;
         let answered = ResultIndex::answered::<&str>(&ask, Ok(&verdicts), &discovery);

@@ -7622,7 +7622,7 @@ export function listen(): void {
             .wait_ready(std::time::Duration::from_secs(120))
             .expect("the sidecar is ready");
         let verdicts = sidecar
-            .verify_library_claims(&on.repo, &ask.checks)
+            .verify_library_claims(&on.repo, None, &ask.checks)
             .expect("the verifier answers")
             .verdicts;
         let verdicts = with_scope_declarations(name, &ask, verdicts);

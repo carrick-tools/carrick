@@ -310,7 +310,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
         ),
     ];
     let answer = sidecar
-        .verify_library_claims(&repo, &checks)
+        .verify_library_claims(&repo, None, &checks)
         .expect("the sidecar answers");
     assert_eq!(
         verdicts(&answer.verdicts),
@@ -337,7 +337,7 @@ fn the_scanner_structs_round_trip_through_the_real_sidecar() {
     // name ambiguous, so the maker builds no instance its sends can be read on.
     let unlabelled = vec![check("job", "export", job(&[])), checks[1].clone()];
     let answer = sidecar
-        .verify_library_claims(&repo, &unlabelled)
+        .verify_library_claims(&repo, None, &unlabelled)
         .expect("the sidecar answers");
     assert_eq!(
         verdicts(&answer.verdicts),

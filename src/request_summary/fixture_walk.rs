@@ -68,7 +68,7 @@ pub(crate) fn census_declarations(
         .expect("the sidecar is ready");
     let ask = super::discovery::declaration_ask(inputs, exports);
     let verdicts = sidecar
-        .verify_library_claims(&service_root, &ask.checks)
+        .verify_library_claims(&service_root, None, &ask.checks)
         .map(|answer| answer.verdicts)
         .unwrap_or_default();
     let declarations = super::discovery::MemberDeclarations::of(&ask, &verdicts);

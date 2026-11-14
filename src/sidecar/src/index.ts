@@ -17,6 +17,7 @@
  *   `progress` frames as it finishes units of work (writeProgress).
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 import { parseRequest } from './validators.js';
@@ -787,6 +788,25 @@ function handleVerifyClientSemantics(
 }
 
 /**
+ * A verifier over a program built from another service's tsconfig: its
+ * compiler options, none of its files (the `scripts` build kind), so the probe
+ * file is the only root. Nothing keeps the program; it is garbage once the
+ * request that asked for it has answered. Module resolution still goes through
+ * this process's loader, as the default program's does.
+ *
+ * @throws if the tsconfig cannot be read
+ */
+function probeOnlyVerifier(tsconfigPath: string): LibraryClaimsVerifier {
+  const loader = initializedLoader();
+  const configPath = path.resolve(loader.getRepoRoot(), tsconfigPath);
+  if (!fs.existsSync(configPath)) throw new Error(`tsconfig_path ${configPath} does not exist`);
+  return new LibraryClaimsVerifier(loader.scriptProjectFor(configPath), {
+    packageDirectoryOf: (file) => loader.packageDirectoryOf(file),
+    resolveModule: (name, from, options) => loader.resolveThroughGraph(name, from, options),
+  });
+}
+
+/**
  * Handle the 'verify_library_claims' action - check library claims of every
  * role against each package's own declarations (carrick#1616). One verdict
  * per check, in request order.
@@ -796,7 +816,11 @@ function handleVerifyLibraryClaims(
 ): VerifyLibraryClaimsResponse {
   const started = performance.now();
   try {
-    const { claimsVerifier } = projectComponents();
+    // A named tsconfig is judged in a probe-only program of its own options,
+    // built for this request and dropped with it (carrick#4472); the service's
+    // own program is not built for it.
+    const claimsVerifier =
+      request.tsconfig_path === undefined ? projectComponents().claimsVerifier : probeOnlyVerifier(request.tsconfig_path);
     // The verifier's budget starts now, and so does the scanner's wait.
     writeProgress(request.request_id, 'verify_library_claims', 'program ready');
     const fromDir = path.resolve(projectLoader!.getRepoRoot(), request.from_dir);
