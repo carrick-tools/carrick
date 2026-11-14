@@ -8535,8 +8535,8 @@ fn withdraw_model_routes_the_code_places_at_definitions(
 ///   method, registers that same function: the identifier S's registration
 ///   call hands in last ([`crate::handler_span::registered_identifiers`]; the
 ///   row's own handler name only when no such call is found) is an import
-///   that resolves, by the walk call edges take, to one binding, R's file
-///   and handler name.
+///   declared, by [`crate::handler_span::declared_through`], as R's handler
+///   name in R's file.
 ///
 /// Path text is never compared, and a name alone never matches: a handler
 /// imported as a whole module, an import that does not resolve, a wrapped
@@ -8550,7 +8550,6 @@ fn withdraw_model_routes_at_their_handlers(
     repo_path: &str,
 ) -> usize {
     use crate::agents::file_analyzer_agent::ResolutionSource;
-    use crate::call_graph::ImportedBinding;
     use crate::handler_span::{Registered, normalize, split_location};
 
     let relative = |file: &str| normalize(crate::utils::repo_relative_source_path(file, repo_path));
@@ -8617,13 +8616,9 @@ fn withdraw_model_routes_at_their_handlers(
         });
 
     // What a registration's identifier names: an import of one binding,
-    // `(declaring file, name)`, both repo-relative.
-    let walked: HashMap<String, &Path> = handlers
-        .inputs
-        .files
-        .keys()
-        .map(|walked| (relative(&walked.to_string_lossy()), walked.as_path()))
-        .collect();
+    // `(declaring file, name)`, both repo-relative, from the one answer to
+    // "where does this imported handler live".
+    let declared = crate::handler_span::declared_through(&handlers.inputs.bindings, repo_path);
     let registered: Vec<Option<(String, String)>> = registrations
         .iter()
         .zip(identifiers)
@@ -8637,14 +8632,7 @@ fn withdraw_model_routes_at_their_handlers(
                     .to_string(),
                 Registered::NotNamed => return None,
             };
-            match handlers.inputs.bindings.get(walked.get(file)?, &local)? {
-                ImportedBinding::Binding { file, name } => {
-                    Some((relative(&file.to_string_lossy()), name.clone()))
-                }
-                ImportedBinding::Module(_)
-                | ImportedBinding::Unfollowable
-                | ImportedBinding::Unresolved => None,
-            }
+            declared(file, &local)
         })
         .collect();
 
