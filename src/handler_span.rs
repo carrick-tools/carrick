@@ -38,6 +38,7 @@
 //! (carrick#2824), and places nothing.
 
 use crate::agents::file_analyzer_agent::FileAnalysisResult;
+use crate::call_graph::ImportedBindings;
 use crate::cloud_storage::CloudRepoData;
 use crate::mount_graph::HandlerSpan;
 use crate::operation::OperationKey;
@@ -85,9 +86,16 @@ struct HandedInByCall {
 /// definition's file are in the same, repo-relative form. `read` returns a
 /// file's text by its repo-relative path. Returns how many mount-graph rows
 /// were placed.
+///
+/// `declared` answers a handler handed in by name that the route's own file
+/// does not declare: given the route's file and that name, the repo-relative
+/// file and name an import of it declares (see [`declared_through`]). A
+/// handler placed there is also stamped with `handler_file`, the file its
+/// span is in (carrick#4244).
 pub fn attach_handler_spans(
     data: &mut CloudRepoData,
     read: impl Fn(&str) -> Option<String>,
+    declared: impl Fn(&str, &str) -> Option<(String, String)>,
 ) -> usize {
     let mut by_file: HashMap<String, Vec<&FunctionDefinition>> = HashMap::new();
     for def in data.function_definitions.values() {
@@ -130,8 +138,10 @@ pub fn attach_handler_spans(
         })
         .collect();
 
-    let mut placed_rows: HashMap<(String, OperationKey, Option<String>), HandlerSpan> =
-        HashMap::new();
+    let mut placed_rows: HashMap<
+        (String, OperationKey, Option<String>),
+        (HandlerSpan, Option<String>),
+    > = HashMap::new();
     let mut placed = 0;
     for endpoint in &mut graph.endpoints {
         let Some((file, line)) = split_location(&endpoint.file_location) else {
@@ -153,8 +163,23 @@ pub fn attach_handler_spans(
             ),
             None => found.and_then(|found| found.by_line.get(&(line, method)).cloned()),
         };
-        let span = place(defs, line, last, endpoint.handler.as_deref());
+        // A name the route's file does not declare, that an import of it
+        // does: the handler sits in the declaring file.
+        let imported = match &last {
+            Some(HandedIn::Named(name)) if !defs.iter().any(|def| def.name == *name) => {
+                declared(&file, name).and_then(|(declaring, name)| {
+                    let span = place_named(by_file.get(&declaring)?, &name, 0)?;
+                    (declaring != file).then_some((span, declaring))
+                })
+            }
+            _ => None,
+        };
+        let (span, handler_file) = match imported {
+            Some((span, declaring)) => (Some(span), Some(declaring)),
+            None => (place(defs, line, last, endpoint.handler.as_deref()), None),
+        };
         endpoint.handler_span = span;
+        endpoint.handler_file = handler_file.clone();
         if let Some(span) = span {
             placed += 1;
             placed_rows.insert(
@@ -163,7 +188,7 @@ pub fn attach_handler_spans(
                     OperationKey::http(&endpoint.method, endpoint.full_path.clone()),
                     endpoint.handler.clone(),
                 ),
-                span,
+                (span, handler_file),
             );
         }
     }
@@ -179,7 +204,9 @@ pub fn attach_handler_spans(
             op.key.clone(),
             op.handler_name.clone(),
         );
-        op.handler_span = placed_rows.get(&identity).copied();
+        let placed = placed_rows.get(&identity);
+        op.handler_span = placed.map(|(span, _)| *span);
+        op.handler_file = placed.and_then(|(_, file)| file.clone());
     }
 
     placed
@@ -340,6 +367,13 @@ fn place(
         Some(HandedIn::Named(name)) => name,
         Some(HandedIn::Other) | None => handler.map(str::trim).unwrap_or_default().to_string(),
     };
+    place_named(defs, &name, line)
+}
+
+/// The span of the one definition of `name` in `defs`, or `None` when there
+/// are none or two. `line` is the registration's line in this file, 0 for a
+/// registration in another file (no definition here contains it).
+fn place_named(defs: &[&FunctionDefinition], name: &str, line: u32) -> Option<HandlerSpan> {
     let mut named = defs.iter().filter(|def| def.name == name);
     let def = named.next()?;
     if named.next().is_some() {
@@ -353,6 +387,29 @@ fn place(
         return None;
     }
     span_of(def)
+}
+
+/// What an import in the route's file declares, as `attach_handler_spans`
+/// asks it: the route's file and the local name in, the repo-relative
+/// declaring file and the name declared there out. The one answer to "where
+/// does this imported handler live"; it reads
+/// [`ImportedBindings::declaration`] and nothing else. A whole-module
+/// import, an anonymous default export and a walk the resolver cut short
+/// answer `None`.
+pub fn declared_through<'a>(
+    bindings: &'a ImportedBindings,
+    repo_path: &'a str,
+) -> impl Fn(&str, &str) -> Option<(String, String)> + 'a {
+    move |file, local| {
+        let importer = Path::new(repo_path).join(file);
+        let (declaring, name) = bindings.declaration(&importer, local)?;
+        if name == "default" {
+            return None;
+        }
+        let declaring = declaring.to_string_lossy();
+        let declaring = crate::utils::repo_relative_source_path(&declaring, repo_path);
+        Some((normalize(declaring), name.to_string()))
+    }
 }
 
 fn valid(span: HandlerSpan) -> Option<HandlerSpan> {
@@ -424,6 +481,7 @@ mod tests {
             view_module: false,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }
@@ -504,6 +562,62 @@ mod tests {
         move |asked: &str| (asked == file).then(|| text.to_string())
     }
 
+    fn no_imports(_: &str, _: &str) -> Option<(String, String)> {
+        None
+    }
+
+    /// carrick#4244: `ping` is handed in last and declared in another file,
+    /// which an import of the route's file reaches. The row takes that
+    /// definition's lines and names its file.
+    #[test]
+    fn an_imported_handler_is_placed_in_its_declaring_file() {
+        const FILE: &str = "src/index.ts";
+        const TEXT: &str = "import { ping } from './handlers';\napp.get('/health', ping);\n";
+        let mut data = payload(
+            vec![def("ping", "src/handlers.ts", 3, 5)],
+            vec![row("GET", "/health", "ping", &format!("{FILE}:2"))],
+        );
+        join_calls(&mut data, FILE, TEXT);
+        let declared = |file: &str, local: &str| {
+            (file == FILE && local == "ping")
+                .then(|| ("src/handlers.ts".to_string(), "ping".to_string()))
+        };
+
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), declared),
+            1
+        );
+        let graph = data.mount_graph.as_ref().unwrap();
+        assert_eq!(graph.endpoints[0].handler_span, span(3, 5));
+        assert_eq!(
+            graph.endpoints[0].handler_file.as_deref(),
+            Some("src/handlers.ts")
+        );
+        assert_eq!(data.endpoints[0].handler_span, span(3, 5));
+        assert_eq!(
+            data.endpoints[0].handler_file.as_deref(),
+            Some("src/handlers.ts")
+        );
+    }
+
+    /// Without an import the same row places nothing and names no file.
+    #[test]
+    fn a_handler_nothing_declares_places_nothing_and_names_no_file() {
+        const FILE: &str = "src/index.ts";
+        const TEXT: &str = "import { ping } from './handlers';\napp.get('/health', ping);\n";
+        let mut data = payload(
+            vec![def("ping", "src/handlers.ts", 3, 5)],
+            vec![row("GET", "/health", "ping", &format!("{FILE}:2"))],
+        );
+        join_calls(&mut data, FILE, TEXT);
+
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports),
+            0
+        );
+        assert_eq!(data.endpoints[0].handler_file, None);
+    }
+
     /// Join each row to the call the candidate scanner records at its line,
     /// as the model-row join does: `file_results` carries the call's span.
     fn join_calls(data: &mut CloudRepoData, file: &str, text: &str) {
@@ -569,7 +683,10 @@ mod tests {
         );
         join_calls(&mut data, FILE, TEXT);
 
-        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports),
+            1
+        );
         assert_eq!(spans(&data), vec![span(5, 7)]);
         assert_eq!(data.endpoints[0].handler_span, span(5, 7));
     }
@@ -590,7 +707,10 @@ mod tests {
         );
         join_calls(&mut data, FILE, TEXT);
 
-        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports),
+            1
+        );
         assert_eq!(spans(&data), vec![span(7, 9)]);
     }
 
@@ -606,7 +726,7 @@ mod tests {
         );
         join_calls(&mut data, FILE, TEXT);
 
-        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports);
         assert_eq!(spans(&data), vec![span(3, 5)]);
     }
 
@@ -628,7 +748,7 @@ mod tests {
             ],
         );
 
-        attach_handler_spans(&mut data, |_: &str| None);
+        attach_handler_spans(&mut data, |_: &str| None, no_imports);
         assert_eq!(spans(&data), vec![span(40, 52), None, None]);
     }
 
@@ -651,7 +771,7 @@ mod tests {
         );
         join_calls(&mut data, FILE, TEXT);
 
-        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports);
         assert_eq!(spans(&data), vec![span(2, 4), span(5, 7)]);
     }
 
@@ -669,7 +789,7 @@ mod tests {
             )],
         );
 
-        attach_handler_spans(&mut data, |_: &str| None);
+        attach_handler_spans(&mut data, |_: &str| None, no_imports);
         assert_eq!(spans(&data), vec![None]);
     }
 
@@ -685,7 +805,7 @@ mod tests {
         );
         join_calls(&mut data, FILE, TEXT);
 
-        attach_handler_spans(&mut data, reader(FILE, TEXT));
+        attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports);
         assert_eq!(spans(&data), vec![span(1, 3)]);
     }
 
@@ -698,7 +818,7 @@ mod tests {
             vec![row("GET", "/health", "anonymous", "src/app.ts:2")],
         );
 
-        attach_handler_spans(&mut data, |_: &str| None);
+        attach_handler_spans(&mut data, |_: &str| None, no_imports);
         assert_eq!(spans(&data), vec![None]);
     }
 
@@ -715,7 +835,10 @@ mod tests {
         );
         assert!(data.file_results.is_none());
 
-        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 1);
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports),
+            1
+        );
         assert_eq!(spans(&data), vec![span(3, 6)]);
         assert_eq!(data.endpoints[0].handler_span, span(3, 6));
     }
@@ -731,7 +854,10 @@ mod tests {
             vec![row("GET", "/orders", "listOrders", &format!("{FILE}:3"))],
         );
 
-        assert_eq!(attach_handler_spans(&mut data, reader(FILE, TEXT)), 0);
+        assert_eq!(
+            attach_handler_spans(&mut data, reader(FILE, TEXT), no_imports),
+            0
+        );
         assert_eq!(spans(&data), vec![None]);
     }
 

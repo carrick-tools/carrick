@@ -12226,6 +12226,7 @@ impl FileOrchestrator {
                     // relative (cloud#948): the function index it is read from
                     // is not merged yet here.
                     handler_span: None,
+                    handler_file: None,
                     address: None,
                 });
                 registration_literals.push(endpoint.registration_literal.clone());
@@ -19685,6 +19686,7 @@ export { routes };
             view_module: false,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }

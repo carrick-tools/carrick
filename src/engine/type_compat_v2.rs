@@ -4634,6 +4634,7 @@ mod tests {
             resolution_source: None,
             dispatch,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }
@@ -10024,6 +10025,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -10256,6 +10258,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: scope.map(|scope| carrick_match::NameScope {
                 scope: scope.to_string(),
                 namespace: None,

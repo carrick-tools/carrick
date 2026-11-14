@@ -962,6 +962,15 @@ impl ImportedBindings {
         self.by_file.get(importer)?.get(local)
     }
 
+    /// The file and name `local`, imported by `importer`, is declared under,
+    /// when it is one module-scope binding (as walked, like [`Self::get`]).
+    pub fn declaration(&self, importer: &Path, local: &str) -> Option<(&Path, &str)> {
+        match self.get(importer, local)? {
+            ImportedBinding::Binding { file, name } => Some((file.as_path(), name.as_str())),
+            _ => None,
+        }
+    }
+
     /// What the module `importer` loads by `specifier` publishes, when it
     /// resolved.
     pub fn load(&self, importer: &Path, specifier: &str) -> Option<&ImportedBinding> {

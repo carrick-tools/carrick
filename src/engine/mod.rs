@@ -6521,9 +6521,11 @@ async fn analyze_current_repo_incremental(
                 repo_path,
                 &served_paths::PathScrub::for_scan(repo_path),
             );
-            let placed = crate::handler_span::attach_handler_spans(&mut cloud_data, |file| {
-                crate::parser::read_source(&Path::new(repo_path).join(file))
-            });
+            let placed = crate::handler_span::attach_handler_spans(
+                &mut cloud_data,
+                |file| crate::parser::read_source(&Path::new(repo_path).join(file)),
+                crate::handler_span::declared_through(&request_inputs.bindings, repo_path),
+            );
             debug!("Handler spans placed on endpoint rows: {placed}");
             crate::unfollowed_calls::attach(
                 &mut cloud_data,
@@ -9004,6 +9006,7 @@ fn write_traced_routes(
                         full_path: full_path.clone(),
                         resolution_source: Some(ResolutionSource::LibraryClaim),
                         handler_span: None,
+                        handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
                         procedure: procedure_at(route, full_path),
                         ..template.clone()
@@ -9039,6 +9042,7 @@ fn write_traced_routes(
                         view_module: false,
                         dispatch: None,
                         handler_span: None,
+                        handler_file: None,
                         address: route.addresses.get(full_path).cloned(),
                         procedure: procedure_at(route, full_path),
                     },
@@ -9350,6 +9354,7 @@ fn append_deterministic_protocol_operations(
         // The handler span is placed from an HTTP route's registration
         // (cloud#948); these rows have none.
         handler_span: None,
+        handler_file: None,
         name_scope: None,
         library_semantics: Vec::new(),
         inference: None,
@@ -15379,9 +15384,11 @@ async fn analyze_current_repo(
     );
     // Each route's handler function, placed once paths are relative so a row's
     // file and a definition's file compare (cloud#948).
-    let placed = crate::handler_span::attach_handler_spans(&mut cloud_data, |file| {
-        crate::parser::read_source(&Path::new(repo_path).join(file))
-    });
+    let placed = crate::handler_span::attach_handler_spans(
+        &mut cloud_data,
+        |file| crate::parser::read_source(&Path::new(repo_path).join(file)),
+        crate::handler_span::declared_through(&request_inputs.bindings, repo_path),
+    );
     debug!("Handler spans placed on endpoint rows: {placed}");
     crate::unfollowed_calls::attach(
         &mut cloud_data,
@@ -18527,6 +18534,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -18560,6 +18568,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         });
         graph.data_calls.push(DataFetchingCall {
@@ -18981,6 +18990,7 @@ unfollowed_member_calls_total: 0,
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -19159,6 +19169,7 @@ unfollowed_member_calls_total: 0,
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -19636,6 +19647,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         let mut mount_graph = MountGraph::new();
@@ -19717,6 +19729,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: None,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }];
         mount_graph.data_calls = vec![crate::mount_graph::DataFetchingCall {
@@ -30520,6 +30533,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: Some(source),
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         };
         let mut mount_graph = crate::mount_graph::MountGraph::new();
@@ -30622,6 +30636,7 @@ unfollowed_member_calls_total: 0,
             resolution_source: Some(source),
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }
@@ -34591,6 +34606,7 @@ io.on("bare:in", (event) => {});
             schema_binding: None,
             undeclared_selection: None,
             handler_span: None,
+            handler_file: None,
             name_scope: None,
             library_semantics: Vec::new(),
             inference: None,
@@ -35382,6 +35398,7 @@ io.on("bare:in", (event) => {});
                 schema_binding: None,
                 undeclared_selection: None,
                 handler_span: None,
+                handler_file: None,
                 name_scope: None,
                 library_semantics: Vec::new(),
                 inference: None,

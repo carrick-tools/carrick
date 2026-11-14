@@ -287,6 +287,7 @@ mod tests {
             resolution_source: source,
             dispatch: None,
             handler_span: None,
+            handler_file: None,
             address: None,
         }
     }
