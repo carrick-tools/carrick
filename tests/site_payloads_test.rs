@@ -568,3 +568,95 @@ fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
         assert_eq!(response(file, line), wanted, "response at {file}:{line}");
     }
 }
+
+/// What the blob holds at `file:line` of the model's row: its call rows,
+/// its graph rows and its consumer manifest entries.
+fn model_row_at(blob: &serde_json::Value, file: &str, line: u64) -> Vec<String> {
+    let place = format!("{file}:{line}");
+    let list = |value: &serde_json::Value| value.as_array().cloned().unwrap_or_default();
+    let mut found: Vec<String> = list(&blob["calls"])
+        .iter()
+        .filter(|row| row["file_path"] == place.as_str() && row["resolution_source"] == "model")
+        .map(|row| format!("calls {}", row["key"]))
+        .collect();
+    found.extend(
+        list(&blob["mount_graph"]["data_calls"])
+            .iter()
+            .filter(|row| row["file_location"] == place.as_str())
+            .map(|row| format!("graph {} {}", row["method"], row["target_url"])),
+    );
+    found.extend(
+        list(&blob["type_manifest"])
+            .iter()
+            .filter(|entry| {
+                entry["role"] == "consumer"
+                    && entry["file_path"] == file
+                    && entry["line_number"] == line
+            })
+            .map(|entry| format!("manifest {}", entry["type_alias"])),
+    );
+    found
+}
+
+/// carrick#4319 T2: `tests/fixtures/site-maker-response/`. Where every
+/// deciding call of a labelled request only makes the function that sends,
+/// each holds the request's fact row, and that row reads the response at
+/// the labelled call (T1), the model's row at the labelled call is the same
+/// request stated again: it goes from the calls, the graph and the manifest.
+/// A maker with a caller left open (a lead), one handed on as a value, a
+/// key with an environment base, and every wrapper that runs the send keep
+/// the model's row. No type is lost: each retired row's type is read at
+/// the site row. The answer key is the fixture's README.
+#[test]
+fn a_model_row_at_a_maker_sites_labelled_call_is_withdrawn() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-maker-response");
+    let on = scan(&repo, &[]);
+
+    for (file, line) in [
+        ("src/gate.ts", 5),
+        ("src/poster.ts", 5),
+        ("src/twice.ts", 4),
+        ("src/typed-maker.ts", 4),
+    ] {
+        let left = model_row_at(&on, file, line);
+        assert!(
+            left.is_empty(),
+            "the model's row at {file}:{line} stays: {left:#?}"
+        );
+    }
+    for (file, line) in [
+        ("src/partial.ts", 4),
+        ("src/handed.ts", 4),
+        ("src/env-maker.ts", 4),
+        ("src/generic.ts", 4),
+        ("src/local-run.ts", 4),
+        ("src/retried.ts", 5),
+        ("src/pinger.ts", 4),
+    ] {
+        let kept = model_row_at(&on, file, line);
+        assert!(
+            kept.iter().any(|row| row.starts_with("calls ")),
+            "the model's row at {file}:{line} goes: {kept:#?}"
+        );
+    }
+
+    // No type is lost: the site rows read what the retired rows read.
+    let response =
+        |file: &str, line: u64| captured_flat(&on, &alias_at(&on, "response", file, line));
+    for (file, line, wanted) in [
+        ("src/gate.ts", 7, "{ ok: boolean; }"),
+        ("src/poster.ts", 7, "{ id: string; }"),
+        ("src/twice.ts", 6, "{ up: boolean; }"),
+        ("src/twice.ts", 7, "{ up: boolean; }"),
+    ] {
+        assert_eq!(response(file, line), wanted, "response at {file}:{line}");
+    }
+    let order = captured_flat(&on, &alias_at(&on, "request", "src/poster.ts", 7));
+    assert_eq!(order, "{ sku: string; qty: number; }");
+    // The environment-based maker's model row keeps the only type it has.
+    assert_eq!(
+        response("src/env-maker.ts", 4),
+        "{ trimmed: number; }",
+        "response at src/env-maker.ts:4"
+    );
+}
