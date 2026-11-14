@@ -5970,6 +5970,187 @@ fn the_probe_times_each_step() {
     }
 }
 
+/// One re-check of `SHOP_CLIENT` with every step timed: the probe
+/// (`--no-rescan`) or the full re-check. Returns the answer and stderr.
+fn timed_recheck(root: &Path, full: bool) -> (serde_json::Value, String) {
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let mut args = vec![
+        "check",
+        SHOP_CLIENT,
+        "--workspace",
+        ".",
+        "--recheck",
+        "--json",
+    ];
+    if !full {
+        args.push("--no-rescan");
+    }
+    let mut command = Command::new(carrick());
+    command
+        .args(&args)
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env(AMPLE[0].0, AMPLE[0].1)
+        .env("TMPDIR", tmpdir)
+        .env("CARRICK_RECHECK_TIMING", "1");
+    as_signed_in(&mut command, &args);
+    let output = command.output().expect("run check");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let answer: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    (answer, stderr)
+}
+
+/// The shop with an edit that adds a near copy of the request helper under a
+/// new name, so the probe's `similar` rows list the helper.
+fn shop_with_a_copied_helper() -> tempfile::TempDir {
+    let workspace = shop_with_tests();
+    let root = workspace.path();
+    index(root);
+    let client = root.join(SHOP_CLIENT);
+    let existing = std::fs::read_to_string(&client).expect("read the client");
+    std::fs::write(
+        &client,
+        format!(
+            "{existing}\nexport async function sendAgain<T>(url: string, options: {{ method: string }}): Promise<T> {{\n  const response = await fetch(url, options);\n  return (await response.json()) as T;\n}}\n"
+        ),
+    )
+    .expect("write the edit");
+    workspace
+}
+
+/// The answer without the one field that is time.
+fn without_elapsed(mut answer: serde_json::Value) -> serde_json::Value {
+    answer["recheck"]
+        .as_object_mut()
+        .expect("a recheck block")
+        .remove("elapsed_ms");
+    answer
+}
+
+fn similar_names(answer: &serde_json::Value) -> Vec<String> {
+    answer["recheck"]["new_functions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|function| function["similar"].as_array().into_iter().flatten())
+        .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// carrick#4034: after `index`, a probe reads the kept probe file and opens no
+/// blob, and answers as the probe that reads the blobs does.
+#[test]
+#[serial]
+fn a_warm_probe_reads_the_kept_file_and_no_blob() {
+    let workspace = shop_with_a_copied_helper();
+    let root = workspace.path();
+    let (warm, stderr) = timed_recheck(root, false);
+    for step in [
+        "probe-kept-read",
+        "probe-kept-similar-read",
+        "added-functions",
+        "similar",
+        "known-miss-read",
+    ] {
+        assert!(
+            stderr.contains(&format!("recheck-timing {step} took ")),
+            "no timing line for {step}:\n{stderr}"
+        );
+    }
+    assert!(!stderr.contains("recheck-timing held-read"), "{stderr}");
+    assert!(
+        similar_names(&warm).contains(&"send".to_string()),
+        "the copy lists the helper:\n{warm:#}"
+    );
+
+    std::fs::remove_dir_all(root.join(".carrick/probe")).expect("remove the kept file");
+    let (cold, stderr) = timed_recheck(root, false);
+    assert!(stderr.contains("recheck-timing held-read"), "{stderr}");
+    assert!(!stderr.contains("probe-kept-read"), "{stderr}");
+    assert!(
+        !root.join(".carrick/probe").exists(),
+        "a probe writes nothing"
+    );
+    assert_eq!(without_elapsed(warm), without_elapsed(cold));
+}
+
+/// A kept file built from other blobs is never read: the blob that holds the
+/// helper is rewritten without it, and the probe reads the blobs.
+#[test]
+#[serial]
+fn a_kept_file_from_other_blobs_is_never_read() {
+    let workspace = shop_with_a_copied_helper();
+    let root = workspace.path();
+    let blobs = root.join(".carrick/repos");
+    let mut rewrote = 0;
+    for entry in std::fs::read_dir(&blobs).expect("the blobs").flatten() {
+        let text = std::fs::read_to_string(entry.path()).expect("read a blob");
+        let mut blob: serde_json::Value = serde_json::from_str(&text).expect("a blob");
+        let Some(definitions) = blob["function_definitions"].as_object_mut() else {
+            continue;
+        };
+        let before = definitions.len();
+        definitions.retain(|_, function| function["name"] != "send");
+        if definitions.len() != before {
+            std::fs::write(entry.path(), serde_json::to_vec(&blob).expect("to JSON"))
+                .expect("rewrite the blob");
+            rewrote += 1;
+        }
+    }
+    assert!(rewrote > 0, "a blob held the helper");
+    let (answer, stderr) = timed_recheck(root, false);
+    assert!(stderr.contains("recheck-timing held-read"), "{stderr}");
+    assert!(!stderr.contains("probe-kept-read"), "{stderr}");
+    assert!(
+        !similar_names(&answer).contains(&"send".to_string()),
+        "the removed helper is not listed:\n{answer:#}"
+    );
+}
+
+/// The full re-check keeps the probe file, so the probe after it is warm.
+#[test]
+#[serial]
+fn the_full_re_check_keeps_the_probe_reads() {
+    let workspace = shop_with_a_copied_helper();
+    let root = workspace.path();
+    std::fs::remove_dir_all(root.join(".carrick/probe")).expect("remove the kept file");
+    let (_, stderr) = timed_recheck(root, true);
+    assert!(
+        stderr.contains("recheck-timing probe-kept-write"),
+        "no write:\n{stderr}"
+    );
+    let (_, stderr) = timed_recheck(root, false);
+    assert!(
+        stderr.contains("recheck-timing probe-kept-read"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("recheck-timing held-read"), "{stderr}");
+}
+
+/// A kept file that cannot be read is a miss, and the answer is the same.
+#[test]
+#[serial]
+fn an_unreadable_kept_file_is_a_miss() {
+    let workspace = shop_with_a_copied_helper();
+    let root = workspace.path();
+    let (warm, _) = timed_recheck(root, false);
+    let dir = std::fs::read_dir(root.join(".carrick/probe"))
+        .expect("the kept folder")
+        .flatten()
+        .next()
+        .expect("one build's folder")
+        .path();
+    std::fs::write(dir.join("reads.json"), "not json").expect("overwrite");
+    let (answer, stderr) = timed_recheck(root, false);
+    assert!(stderr.contains("recheck-timing held-read"), "{stderr}");
+    assert!(!stderr.contains("probe-kept-read"), "{stderr}");
+    assert_eq!(without_elapsed(warm), without_elapsed(answer));
+}
+
 /// A test edit no service reads, beside a source edit the scan reads the same
 /// (a comment), starts no re-scan in `check --changed`, and the answer is the
 /// forced re-scan's. The test file is no changed file of its own (the scan

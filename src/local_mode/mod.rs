@@ -26,6 +26,7 @@ pub(crate) mod hosted;
 pub(crate) mod index;
 pub(crate) mod jobs;
 mod join;
+mod kept_reads;
 pub(crate) mod query;
 mod read_model;
 mod reads_same;

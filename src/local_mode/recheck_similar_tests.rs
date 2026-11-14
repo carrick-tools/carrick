@@ -109,10 +109,12 @@ fn similar(held: &[HeldFile<'_>], edited: &str) -> Vec<(String, Vec<SimilarFunct
     let services = vec![crate::config::Config::default()];
     let none = std::collections::BTreeSet::new();
     let added = additions(&services, dir.path(), "src/b.ts", &none);
-    with_similar(&held, &Tree::at(dir.path()), "src/b.ts", added)
-        .into_iter()
-        .map(|function| (function.name, function.similar))
-        .collect()
+    with_similar(&Tree::at(dir.path()), "src/b.ts", added, || {
+        similar_of(&held)
+    })
+    .into_iter()
+    .map(|function| (function.name, function.similar))
+    .collect()
 }
 
 fn only_rows(found: Vec<(String, Vec<SimilarFunction>)>) -> Vec<SimilarFunction> {
@@ -252,14 +254,15 @@ fn one_probe_call_builds_the_index_once() {
     assert_eq!(BUILDS.with(|builds| builds.get()), 1);
 
     BUILDS.with(|builds| builds.set(0));
+    let held = Held {
+        local: Vec::new(),
+        hosted: Default::default(),
+    };
     let nothing = with_similar(
-        &Held {
-            local: Vec::new(),
-            hosted: Default::default(),
-        },
         &Tree::at(Path::new("/nowhere")),
         "src/b.ts",
         Vec::new(),
+        || similar_of(&held),
     );
     assert!(nothing.is_empty());
     assert_eq!(BUILDS.with(|builds| builds.get()), 0);

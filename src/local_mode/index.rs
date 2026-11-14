@@ -566,6 +566,9 @@ fn run_generation(
     // This index's type-check answers become the ones every re-check against
     // it starts from, and the older index's are dropped.
     super::recheck::adopt_index_state(workspace, &built_judged, &index.indexed_at);
+    // What the edit probe reads, kept beside it so the probe opens no blob.
+    let repo_paths: Vec<PathBuf> = index.repos.iter().map(|r| PathBuf::from(&r.path)).collect();
+    super::kept_reads::keep_index(workspace, &index.indexed_at, &repo_paths);
     // The marker is written last. An interrupted replacement cannot combine a
     // new account's read model with the preceding account's retained blobs.
     std::fs::write(
