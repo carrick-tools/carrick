@@ -408,6 +408,9 @@ enum BetaDies {
     /// Only the compiler walk's record-only process, and only the first: the
     /// one that finds no `died` file. Its second process lives.
     WalkOnce,
+    /// Only the compiler walk's record-only process, every time: it answers
+    /// an error and dies of nothing (carrick#4247). Every other process lives.
+    WalkFails,
     /// Only at type resolution (`infer` or `bundle`), and only while
     /// `home/die` exists: `plain` in it is a plain `exit(1)`, `under <N>` a
     /// full heap in a process started with a heap cap below `N` MB only
@@ -489,7 +492,7 @@ process.stdin.on("data", (chunk) => {{
     }}
     switch (request.action) {{
       case "position_rows":
-        if (!{at_resolution}) {{
+        if (!{walk_answers}) {{
           answer({{ status: "error", errors: ["the stand-in answers nothing else"] }});
           break;
         }}
@@ -520,7 +523,17 @@ process.stdin.resume();
                 BetaDies::WalkOnce => format!("!fs.existsSync({:?})", died.to_string_lossy()),
                 _ => "false".to_string(),
             },
-            walk_only = matches!(beta_dies, BetaDies::Walk | BetaDies::WalkOnce),
+            walk_only = matches!(
+                beta_dies,
+                BetaDies::Walk | BetaDies::WalkOnce | BetaDies::WalkFails
+            ),
+            // The walk modes write rows for every service that lives, so a
+            // walk that did not die is a walk that wrote its rows; the rest
+            // answer the walk with an error (carrick#4247).
+            walk_answers = matches!(
+                beta_dies,
+                BetaDies::Walk | BetaDies::WalkOnce | BetaDies::AtResolution
+            ),
             at_resolution = matches!(beta_dies, BetaDies::AtResolution),
             die = home.join("die").to_string_lossy(),
             argv = home.join("argv").to_string_lossy(),
@@ -534,6 +547,8 @@ process.stdin.resume();
 struct TypedScan {
     code: Option<i32>,
     stderr: String,
+    /// What the run printed to standard output.
+    stdout: String,
     /// Every line of the run's own log (`~/.carrick/logs`).
     log: String,
 }
@@ -636,6 +651,7 @@ fn typed_scan_into(
     TypedScan {
         code: output.status.code(),
         stderr,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         log,
     }
 }
@@ -903,8 +919,9 @@ fn stored_blob_file(store: &Path, service: &str) -> (PathBuf, serde_json::Value)
 /// Scans a two-service repo twice under a run cap of 4,096 MB: first with
 /// nothing dying, so the store holds beta's blob; then, with beta's stored
 /// analysis peak at 1,000 MB (no walk peak), so its walk starts at 2,048 MB,
-/// with `beta_dies` and position rows on. Returns the second scan.
-fn walk_scan_from_a_stored_peak(beta_dies: BetaDies) -> TypedScan {
+/// with `beta_dies` and position rows on. Returns the second scan and the
+/// folder holding its store, which lives as long as the folder does.
+fn walk_scan_from_a_stored_peak(beta_dies: BetaDies) -> (TypedScan, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let repo = service_repo(tmp.path(), &["alpha", "beta"]);
     let home = tmp.path().join("home");
@@ -922,7 +939,13 @@ fn walk_scan_from_a_stored_peak(beta_dies: BetaDies) -> TypedScan {
     sidecar_stand_in(&home, &died, false, beta_dies);
     let run = typed_scan_into(&repo, &home, &died, false, &env, Some(&store));
     assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
-    run
+    (run, tmp)
+}
+
+/// What `service`'s stored blob says about its compiler walk
+/// (`boundary.walk_rows_lost`, carrick#4247).
+fn walk_rows_lost_of(tmp: &tempfile::TempDir, service: &str) -> serde_json::Value {
+    stored_blob_file(&tmp.path().join("store"), service).1["boundary"]["walk_rows_lost"].clone()
 }
 
 /// carrick#3283: a compiler walk that dies of memory at a cap below the
@@ -930,7 +953,7 @@ fn walk_scan_from_a_stored_peak(beta_dies: BetaDies) -> TypedScan {
 /// rows are kept and nothing is counted as a gap.
 #[test]
 fn a_walk_that_dies_below_the_run_s_cap_is_walked_again_and_keeps_its_rows() {
-    let run = walk_scan_from_a_stored_peak(BetaDies::WalkOnce);
+    let (run, tmp) = walk_scan_from_a_stored_peak(BetaDies::WalkOnce);
     assert!(
         run.log.contains(
             "Walk beta died of memory at a heap cap of 2048 MB; walking it again alone at 4096 MB"
@@ -940,9 +963,14 @@ fn a_walk_that_dies_below_the_run_s_cap_is_walked_again_and_keeps_its_rows() {
     );
     assert!(
         !run.log.contains("its rows are lost")
-            && !run.log.contains("no per-position rows in this index"),
+            && !run.stdout.contains("per-position compiler rows"),
         "{}",
         run.log
+    );
+    // Walked again and written: a known zero, not an absent key (carrick#4247).
+    assert_eq!(
+        walk_rows_lost_of(&tmp, "beta"),
+        serde_json::json!({"total": 0})
     );
 }
 
@@ -952,7 +980,7 @@ fn a_walk_that_dies_below_the_run_s_cap_is_walked_again_and_keeps_its_rows() {
 /// the run lands every service.
 #[test]
 fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
-    let run = walk_scan_from_a_stored_peak(BetaDies::Walk);
+    let (run, tmp) = walk_scan_from_a_stored_peak(BetaDies::Walk);
     assert!(
         run.log.contains(
             "Walk beta died of memory at a heap cap of 2048 MB; walking it again alone at 4096 MB"
@@ -962,13 +990,44 @@ fn a_walk_that_dies_of_memory_is_stated_in_the_log() {
         "{}",
         run.log
     );
+    // The one answer is the boundary on the blob, and the CLI's closing
+    // lines read it (carrick#4247).
+    assert_eq!(
+        walk_rows_lost_of(&tmp, "beta"),
+        serde_json::json!({
+            "total": 1,
+            "reasons": ["the compiler walk died of memory at a heap cap of 4096 MB"]
+        })
+    );
+    assert_eq!(
+        walk_rows_lost_of(&tmp, "alpha"),
+        serde_json::json!({"total": 0})
+    );
     assert!(
-        run.log.contains(
-            "1 service(s) have no per-position rows in this index, their compiler walk died of memory at the run's cap: beta."
-        ),
+        run.stdout
+            .contains("No per-position compiler rows for this service: the compiler walk died of memory at a heap cap of 4096 MB."),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.log.contains("service(s) have no per-position rows"),
         "{}",
         run.log
     );
+}
+
+/// carrick#4247: a compiler walk that fails for any other reason also writes
+/// no rows. The blob says so with a reason from a fixed set, never the error
+/// text, which can carry an absolute path.
+#[test]
+fn a_walk_that_fails_is_saved_on_the_boundary() {
+    let (_run, tmp) = walk_scan_from_a_stored_peak(BetaDies::WalkFails);
+    let lost = walk_rows_lost_of(&tmp, "beta");
+    assert_eq!(
+        lost,
+        serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
+    );
+    assert!(!lost.to_string().contains('/'), "{lost}");
 }
 
 /// What a run says when it keeps a service's stored index because it lost
@@ -1380,6 +1439,13 @@ fn a_memory_death_under_the_service_s_cap_is_analysed_again_at_the_run_s_cap() {
     let beta = fixture.blob("beta");
     assert_eq!(beta["commit_hash"], head.as_str(), "{beta}");
     assert!(beta["types_degraded"].is_null(), "{beta}");
+    // Its walk lived; only the checker died. The boundary of the pass that
+    // ran again carries the same known zero (carrick#4247).
+    assert_eq!(
+        beta["boundary"]["walk_rows_lost"],
+        serde_json::json!({"total": 0}),
+        "{beta}"
+    );
 }
 
 /// carrick#4180: the same death, again at the run's cap, is the real loss:
