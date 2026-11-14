@@ -12,7 +12,9 @@
 //! local analyzer read a graph that did not hold what `calls` states.
 //!
 //! The pinned literals at the end are what the scan states today and must
-//! keep stating: mirroring the facts moves no `calls` row and no type.
+//! keep stating: mirroring the facts moves no `calls` row and no type. The
+//! CLI's six calls into the client's wrappers are the fact layer's rows: a
+//! fact replaces the imported-member row of its own request (carrick#4372).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -334,7 +336,7 @@ fn call_through_counts_the_rows_a_fact_replaced() {
 #[test]
 fn the_calls_and_the_types_do_not_move() {
     let cli = &scanned().0["cli"];
-    let calls: Vec<(String, String, String, String)> = cli["calls"]
+    let mut calls: Vec<(String, String, String, String)> = cli["calls"]
         .as_array()
         .unwrap()
         .iter()
@@ -347,13 +349,13 @@ fn the_calls_and_the_types_do_not_move() {
             )
         })
         .collect();
-    let expected: Vec<(String, String, String, String)> = [
-        (17, "GET", "/users/:id", "imported_member"),
-        (29, "GET", "/users/:id/status", "imported_member"),
-        (41, "GET", "/users/:id/page", "imported_member"),
-        (47, "GET", "/users/:id/model", "imported_member"),
-        (59, "GET", "/users/:id/then", "imported_member"),
-        (74, "GET", "/users/:id", "imported_member"),
+    let mut expected: Vec<(String, String, String, String)> = [
+        (17, "GET", "/users/:id", "request_summary"),
+        (29, "GET", "/users/:id/status", "request_summary"),
+        (41, "GET", "/users/:id/page", "request_summary"),
+        (47, "GET", "/users/:id/model", "request_summary"),
+        (59, "GET", "/users/:id/then", "request_summary"),
+        (74, "GET", "/users/:id", "request_summary"),
         (23, "POST", "/users", "request_summary"),
         (35, "GET", "/ping", "request_summary"),
         (53, "POST", "/users/:id/frozen", "request_summary"),
@@ -369,6 +371,10 @@ fn the_calls_and_the_types_do_not_move() {
         )
     })
     .collect();
+    // The fold appends the fact rows it states: the rows are the claim,
+    // not their order.
+    calls.sort();
+    expected.sort();
     assert_eq!(calls, expected);
 
     let mut responses: Vec<(u64, String)> = cli["type_manifest"]

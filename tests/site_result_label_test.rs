@@ -302,9 +302,23 @@ fn a_store_without_labels_leaves_each_row_as_it_was() {
     );
 }
 
+/// The CLI's calls into the client's wrappers that the fact layer states
+/// once the store labels the client (carrick#4372): the fact replaces the
+/// imported-member row of its own request there.
+const CLI_FACT_LINES: [u64; 6] = [17, 29, 41, 47, 59, 74];
+
+/// `entries` sorted by their JSON text, so order does not count.
+fn sorted(mut entries: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    entries.sort_by_key(|entry| entry.to_string());
+    entries
+}
+
 /// The rows other than the labelled calls' responses are the same with and
 /// without the labels: the client's request entries and the CLI's caller
-/// rows, whose anchors are not labelled calls.
+/// rows, whose anchors are not labelled calls. With the labels, the fact
+/// layer states the CLI's six caller rows (carrick#4372): they differ only
+/// in their source, and each, a GET, gains the request entry that says it
+/// sends no body.
 #[test]
 fn only_the_labelled_calls_responses_move() {
     let (with, without) = (labelled(), unlabelled());
@@ -322,9 +336,57 @@ fn only_the_labelled_calls_responses_move() {
                 })
                 .collect()
         };
-        assert_eq!(entries(with), entries(without), "{service}");
+        let calls = |scan: &Scan| -> Vec<serde_json::Value> {
+            scan.blobs[service]["calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let (mut with_entries, mut with_calls) = (entries(with), calls(with));
+        if service == "cli" {
+            let fact_line = |at: &str| {
+                at.rsplit_once(':')
+                    .and_then(|(_, line)| line.parse::<u64>().ok())
+                    .is_some_and(|line| CLI_FACT_LINES.contains(&line))
+            };
+            let mut moved = 0;
+            for call in &mut with_calls {
+                if fact_line(call["file_path"].as_str().unwrap_or_default()) {
+                    assert_eq!(call["resolution_source"], "request_summary", "{call:#}");
+                    call["resolution_source"] = "imported_member".into();
+                    moved += 1;
+                }
+            }
+            assert_eq!(moved, CLI_FACT_LINES.len(), "{with_calls:#?}");
+            let gained: Vec<serde_json::Value> = with_entries
+                .iter()
+                .filter(|entry| {
+                    entry["role"] == "consumer"
+                        && entry["type_kind"] == "request"
+                        && entry["line_number"]
+                            .as_u64()
+                            .is_some_and(|line| CLI_FACT_LINES.contains(&line))
+                })
+                .cloned()
+                .collect();
+            assert_eq!(gained.len(), CLI_FACT_LINES.len(), "{gained:#?}");
+            for entry in &gained {
+                assert_eq!(entry["method"], "GET", "{entry:#}");
+                assert_eq!(entry["type_state"], "unknown", "{entry:#}");
+                let reasons: Vec<&str> = entry["any_provenance"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|finding| finding["reason"].as_str())
+                    .collect();
+                assert_eq!(reasons, ["no_request_body"], "{entry:#}");
+            }
+            with_entries.retain(|entry| !gained.contains(entry));
+        }
+        assert_eq!(sorted(with_entries), sorted(entries(without)), "{service}");
         assert_eq!(
-            with.blobs[service]["calls"], without.blobs[service]["calls"],
+            sorted(with_calls),
+            sorted(calls(without)),
             "{service}: calls"
         );
     }
