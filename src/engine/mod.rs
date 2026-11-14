@@ -30536,6 +30536,103 @@ unfollowed_member_calls_total: 0,
         eprintln!("carrick#4245 asked at the loop: {:?}", record.state.asked);
     }
 
+    /// carrick#4365: a choice handed to a callee that builds the message name
+    /// around it is not the whole name. `sendApp(flag ? "k.one" : "k.two")`
+    /// with `bus.publish(`app.${topic}`)` publishes `app.k.one` and
+    /// `app.k.two`, so the caller's two texts are no row; a callee that
+    /// passes the name through, or a choice written at the labelled call,
+    /// keeps one row per branch.
+    #[tokio::test]
+    async fn a_choice_handed_to_a_callee_that_builds_the_name_is_no_whole_name() {
+        let edit = [
+            (
+                "package.json",
+                r#"{ "name": "web", "version": "1.0.0", "dependencies": { "@fixture/bus": "^1.0.0" } }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/package.json",
+                r#"{ "name": "@fixture/bus", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/index.d.ts",
+                "export interface Bus {\n  publish(topic: string, data: unknown): Promise<void>;\n}\nexport declare const bus: Bus;\n",
+            ),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 function send(topic: string) { return bus.publish(topic, {}); }\n\
+                 function sendApp(topic: string) { return bus.publish(`app.${topic}`, {}); }\n\
+                 export function a(flag: boolean) { send(flag ? \"m.one\" : \"m.two\"); }\n\
+                 export function b(flag: boolean) { sendApp(flag ? \"k.one\" : \"k.two\"); }\n\
+                 export async function c(flag: boolean) { await bus.publish(flag ? \"a.one\" : \"a.two\", {}); }\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"@fixture/bus","version":"1.0.0","status":"answered",
+            "exports":[{"specifier":"@fixture/bus","export":"bus","role":"broker",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        let file = "services/web/src/use.ts";
+        let names_at = |line: u32| -> Vec<String> {
+            let record = of
+                .records
+                .iter()
+                .find(|record| record.anchors.call.file == file && record.anchors.call.line == line)
+                .unwrap_or_else(|| panic!("a decided site at line {line}"));
+            eprintln!("carrick#4365 line {line}: {record:?}");
+            record.names.clone()
+        };
+        assert_eq!(
+            names_at(4),
+            vec!["m.one", "m.two"],
+            "a pass-through callee keeps the caller's choice"
+        );
+        assert_eq!(
+            names_at(6),
+            vec!["a.one", "a.two"],
+            "a choice at the labelled call keeps both branches"
+        );
+        let built = names_at(5);
+        assert!(
+            built.is_empty(),
+            "the callee builds `app.${{topic}}`: the choice is not the name: {built:?}"
+        );
+        let unanswered = crate::site_rows::of(
+            &of.decided,
+            &of.records,
+            &of.labels,
+            &crate::site_questions::SiteAnswers::default(),
+        );
+        let lead_at = |line: u32| {
+            unanswered
+                .leads
+                .iter()
+                .find(|lead| lead.file_path == file && lead.line_number == line)
+        };
+        let lead = lead_at(5).expect("the site is saved as a lead, never lost");
+        assert_eq!(
+            format!("{:?}", lead.unread.reason),
+            "UnreadExpression",
+            "{lead:?}"
+        );
+    }
+
     /// carrick#2538: a message listener on a forked child process is an
     /// in-process end. The row it writes stays in its service, so it never
     /// pairs with a publisher of the same name in another service, whatever
