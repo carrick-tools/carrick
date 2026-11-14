@@ -1496,6 +1496,90 @@ test("a JSX container's first `(` is never a call of what came before the contai
   assert.deepEqual(scan.calls.map((call) => src.slice(call.from, call.start)), ["Row"]);
 });
 
+test("a `/` after a non-null assertion is division, and a `!` that starts an operand still lets a regex follow", () => {
+  const share = "function share(total: number | null, n: number) {\n  return total! / n;\n}\n";
+  assert.deepEqual(spansOf(share), [`share: ${share.trimEnd()}`]);
+  const avg = "function Avg({ sum, n }) {\n  const v = sum! / n!;\n  return <b>{v}</b>;\n}\n";
+  assert.deepEqual(spansOf(avg, true), [`Avg: ${avg.trimEnd()}`]);
+  const scan = scanSource("function t(a, s) {\n  if (a) !/x/.test(s);\n  return api.get('/t');\n}\n");
+  assert.deepEqual(scan.calls.map((call) => call.member), ["t", "test", "get"]);
+});
+
+test("an attribute string that runs over a line break reads", () => {
+  const src = 'function Note() {\n  return <Hint text="first part\n    second part" onShow={() => api.post("/seen")} />;\n}\n';
+  assert.deepEqual(spansOf(src, true), [`Note: ${src.trimEnd()}`]);
+  assert.deepEqual(scanSource(src, true).calls.map((call) => call.member), ["Note", "post"]);
+});
+
+test("an element with type arguments reads", () => {
+  const src = 'function Grid() {\n  return <Table<Row> rows={rows} onPick={() => api.get("/pick")} />;\n}\n';
+  assert.deepEqual(spansOf(src, true), [`Grid: ${src.trimEnd()}`]);
+});
+
+test("an element whose name starts with an underscore reads", () => {
+  const src = "function Shell({ kids }) {\n  return <_Frame>{kids}</_Frame>;\n}\n";
+  assert.deepEqual(spansOf(src, true), [`Shell: ${src.trimEnd()}`]);
+});
+
+test("a generic arrow with a default type parameter in a component file is an arrow", () => {
+  assert.deepEqual(spansOf("const wait = <M = unknown>(a: M): M => a;\nfunction load() {\n  return <div>{1}</div>;\n}\n", true), [
+    "wait: const wait = <M = unknown>(a: M): M => a",
+    "load: function load() {\n  return <div>{1}</div>;\n}",
+  ]);
+});
+
+test("a member named like a modifier before `?` or `!` is a member", () => {
+  assert.deepEqual(spansOf('class Hooks {\n  get?(): void {}\n  load() { return api.get("/h") }\n}\n'), [
+    "Hooks.get: get?(): void {}",
+    'Hooks.load: load() { return api.get("/h") }',
+  ]);
+  assert.deepEqual(spansOf('class Row {\n  @Column()\n  public!: boolean;\n  private?: string;\n  save() { return api.post("/row") }\n}\n'), [
+    'Row.save: save() { return api.post("/row") }',
+  ]);
+});
+
+test("a decorator with no arguments ends at its name, and one with type arguments reads", () => {
+  assert.deepEqual(spansOf('class Port {\n  @logged\n  async send(body: unknown) { return api.post("/send", body) }\n}\n'), [
+    'Port.send: @logged\n  async send(body: unknown) { return api.post("/send", body) }',
+  ]);
+  assert.deepEqual(spansOf('class Repo {\n  @Cached<string>({ ttl: 60 })\n  find(id: string) { return api.get("/repo") }\n}\n'), [
+    'Repo.find: @Cached<string>({ ttl: 60 })\n  find(id: string) { return api.get("/repo") }',
+  ]);
+});
+
+test("a property type whose type arguments span lines reads", () => {
+  assert.deepEqual(spansOf('class Pool {\n  private waiting: Map<\n    string,\n    { done: () => void }\n  >;\n  drain() { return api.post("/drain") }\n}\n'), [
+    'Pool.drain: drain() { return api.post("/drain") }',
+  ]);
+});
+
+test("the commas of a type after `as` do not end the entry", () => {
+  assert.deepEqual(spansOf('class Cache {\n  private hits = {} as Record<string, number>;\n  load() { return api.get("/c") }\n}\n'), [
+    'Cache.load: load() { return api.get("/c") }',
+  ]);
+  assert.deepEqual(spansOf('const job = {\n  run: handler as Runner<Input, Map<string, number>>,\n  stop() { return api.post("/stop") },\n};\n'), [
+    'job.stop: stop() { return api.post("/stop") }',
+  ]);
+  // The arrow ends at the type's `>`, before the next statement.
+  assert.deepEqual(spansOf("const read = () => load() as Record<string, unknown>\n\nrun('x')\n"), [
+    "read: const read = () => load() as Record<string, unknown>",
+  ]);
+});
+
+test("a value named `async` and a `<T>value` assertion are values", () => {
+  const send = 'function send(async: boolean) {\n  const out = async ? api.post("/q") : api.post("/now");\n  return out;\n}\n';
+  assert.deepEqual(spansOf(send), [`send: ${send.trimEnd()}`]);
+  const read = 'async function read() {\n  const body = <Reply>await api.get("/r");\n  return body;\n}\n';
+  assert.deepEqual(spansOf(read), [`read: ${read.trimEnd()}`]);
+  // An `async` arrow the scanner cannot follow still makes the file unread.
+  assert.equal(spansOf("const f = async (a: number): Weird<{ => {};\n"), null);
+});
+
+test("`function` as a member name is not a declaration", () => {
+  const src = "function Form({ errors }) {\n  return <Input error={errors.function} style={base} required />;\n}\n";
+  assert.deepEqual(spansOf(src, true), [`Form: ${src.trimEnd()}`]);
+});
+
 test("a declaration the scanner cannot place makes the file unread, never its outer function", () => {
   assert.equal(spansOf("function outer() {\n  function inner<T(a) { api.get('/x') }\n}\n"), null);
   assert.equal(spansOf("class A { find<T(a) { return 1 } }"), null);
