@@ -1,0 +1,23 @@
+{
+ "compilerOptions": {
+  "target": "es2022",
+  "module": "esnext",
+  "moduleResolution": "bundler",
+  "strict": true,
+  "skipLibCheck": true,
+  "allowJs": true,
+  "checkJs": false,
+  "experimentalDecorators": true,
+  "resolveJsonModule": true,
+  "types": [],
+  "baseUrl": ".",
+  "paths": {
+   "@consts/*": [
+    "src/consts/*"
+   ]
+  }
+ },
+ "include": [
+  "src/**/*"
+ ]
+}
