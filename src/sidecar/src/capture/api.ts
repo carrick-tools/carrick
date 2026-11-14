@@ -564,6 +564,19 @@ export type ProbeProtocol = 'http' | 'graphql' | 'socket' | 'pubsub';
  */
 export type ProbeTypeKind = 'request' | 'response' | 'both';
 
+/**
+ * The representation a type is printed in.
+ *
+ * `'declared'` prints the type the source declares. `'json'` prints what a
+ * JSON serialiser puts on the wire for a value of that type (carrick#1163):
+ * `JSON.stringify` calls a value's `toJSON()` and serialises its RESULT, so a
+ * `Date` travels as the string its `toJSON` returns, and so does any other
+ * type that declares one. The mapping is read from the compiler's own
+ * signature, never from a list of type names. Which payloads travel in which
+ * form is `wireFormFor` (check-probe.ts), the one rule.
+ */
+export type WireFormat = 'declared' | 'json';
+
 /** One capture stub package to assemble into the check workspace. */
 export interface CheckStubInput {
   /** Service name (used for scrub labels + pair endpoints). */

@@ -36,8 +36,8 @@ import type {
   CheckPairSpec,
   ProbeProtocol,
   ProbeTypeKind,
+  WireFormat,
 } from './api.js';
-import type { WireFormat } from '../type-structural-expander.js';
 
 /** Which pair endpoint supplies the `sent` value / the `expected` binding. */
 export type Side = 'producer' | 'consumer';

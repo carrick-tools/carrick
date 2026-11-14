@@ -36,6 +36,7 @@ import {
 } from './type-text-canonicalizer.js';
 import { isExternalOrigin, type ExternalImports } from './origin.js';
 import { notePrintedType } from './printed-names.js';
+import type { WireFormat } from './types.js';
 
 /**
  * Bound on the structural-expansion recursion. Deep enough for every realistic
@@ -105,17 +106,6 @@ function childCursor(
   return { overrides: cursor.overrides, position };
 }
 
-/**
- * The representation a type is printed in.
- *
- * `'declared'` prints the type the source declares. `'json'` prints what a
- * JSON serialiser puts on the wire for a value of that type (carrick#1163):
- * `JSON.stringify` calls a value's `toJSON()` and serialises its RESULT, so a
- * `Date` travels as the string its `toJSON` returns, and so does any other
- * type that declares one. The mapping is read from the compiler's own
- * signature, never from a list of type names.
- */
-export type WireFormat = 'declared' | 'json';
 
 /**
  * The program the walked type belongs to, and the service root inside it.

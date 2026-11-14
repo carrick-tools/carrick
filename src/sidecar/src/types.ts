@@ -1980,6 +1980,8 @@ export type TypeProvenance = import('./capture/api.js').TypeProvenance;
 /** carrick#1836: declared in the capture bundle, which reads it on a literal anchor. */
 export type PrintedName = import('./capture/api.js').PrintedName;
 export type TypeProvenanceReason = import('./capture/api.js').TypeProvenanceReason;
+/** carrick#4275: declared in the capture bundle, where `wireFormFor` answers it. */
+export type WireFormat = import('./capture/api.js').WireFormat;
 
 /**
  * Source location information for a type
