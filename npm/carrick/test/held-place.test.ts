@@ -26,7 +26,7 @@ test("a row places on the call that starts on its line", () => {
 test("lines moved by three still place through the site-literal fallback", () => {
   const moved = "// a\n// b\n// c\n" + TEXT;
   const found = findSite(source(moved), row(0));
-  assert.ok("node" in found, JSON.stringify(found));
+  assert.ok("node" in found);
   const ov = overlay("routes.ts", moved, [row(0)], "clean");
   assert.equal(ov.checks.length, 1);
   assert.deepEqual(ov.unplaced, []);
@@ -47,7 +47,8 @@ test("the chained call wraps the whole chain, and both rows nest into valid synt
   const ov = overlay("routes.ts", TEXT, [row(1), row(2)], "clean");
   assert.deepEqual(ov.unplaced, []);
   const post = ov.checks.find((c) => c.id === 2 && c.group === 0)!;
-  assert.match(ov.text.slice(post.span[0], post.span[1]), /app\.get\("\/a", readA\)\.post\("\/b", writeB\), \(o\) => o\)$/);
+  const postText = ov.text.slice(post.span[0], post.span[1]);
+  assert.ok(postText.includes('app.get("/a", readA), (o) => o).post("/b", writeB), (o) => o)'), postText);
   const get = ov.checks.find((c) => c.id === 1)!;
   assert.ok(ov.text.slice(get.span[0], get.span[1]).includes('app.get("/a", readA)'));
   assert.ok(!ov.text.slice(get.span[0], get.span[1]).includes('post("/b"'));
