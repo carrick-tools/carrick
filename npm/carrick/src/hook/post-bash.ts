@@ -18,13 +18,16 @@
 // starts nothing and prints only the background re-check answers that landed
 // since the last hook spoke (`late.ts`): the Stop hook never waits for them,
 // so this is often the first hook after one lands (hook-wording audit T2).
-// Whatever happens it exits 0 and prints at most the one JSON object.
+// Every run writes one `post-bash` timing row through `timed`, as the other
+// hooks do (carrick#4415). Whatever happens it exits 0 and prints at most the
+// one JSON object.
 
 import { readStdin } from "./stdin.ts";
 import { sessionKey } from "./session-key.ts";
 import { factsEnabled } from "../facts/enabled.ts";
 import path from "node:path";
 import fs from "node:fs";
+import { timed, type Timing } from "./timings.ts";
 import { bashTargets, MENTIONS_FACT_SOURCE, movesTreeInBulk, searchedNames } from "./bash-targets.ts";
 
 /** At most this many files are asked about for one command. */
@@ -53,7 +56,7 @@ async function lateOnly(session: string | undefined): Promise<void> {
   printLateOnly(session);
 }
 
-async function main(): Promise<void> {
+async function main(timing: Timing): Promise<void> {
   let payload: Payload;
   try {
     payload = JSON.parse((await readStdin()) || "{}") as Payload;
@@ -108,7 +111,10 @@ async function main(): Promise<void> {
   const { answerReads } = await import("./read-answer.ts");
   // A command that also writes keeps the binary's read answer (the edit flow's
   // own fact lines share no cap with it).
+  const waitStarted = Date.now();
   const read = await answerReads(fresh, payload.cwd, session, { facts: capped.length === 0 });
+  timing.waitedMs = Date.now() - waitStarted;
+  if (read.factsMs !== undefined) timing.factsMs = read.factsMs;
   const answers = [...read.contexts];
 
   const response = payload.tool_response;
@@ -135,8 +141,10 @@ async function main(): Promise<void> {
         if (found) changes.set(file, found);
       }
     }
+    // The row names the first written file, as the edit hook's does.
+    timing.file = capped[0]!;
     await editFlow(
-      { cwd: payload.cwd ?? null, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, shell: true, changes, factOnly },
+      { cwd: payload.cwd ?? null, session, subAgent: Boolean(payload.agent_id), channel: channel.channel, shell: true, timing, changes, factOnly },
       toEdit,
       answers,
     );
@@ -148,5 +156,5 @@ async function main(): Promise<void> {
   if (session) reuse.markFacts(session, read.claims);
 }
 
-await main();
+await timed("post-bash", main);
 process.exit(0);

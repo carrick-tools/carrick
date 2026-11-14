@@ -21,6 +21,7 @@ export type TimedHook =
   | "session-start"
   | "post-read"
   | "post-edit"
+  | "post-bash"
   | "recheck"
   | "prompt-submit"
   | "stop"
@@ -37,7 +38,7 @@ export type TimingRecord = {
   /** Time spent blocking on a check or re-check, inside `duration_ms`. */
   waited_ms: number;
   outcome: Outcome;
-  /** Post-edit only: the edited file, relative to the workspace. */
+  /** Post-edit and post-bash: the edited file, relative to the workspace. */
   file?: string;
   /** Post-edit and post-read: time spent opening the fact file and matching (`facts/lines.ts`), inside `duration_ms`. */
   facts_ms?: number;
@@ -63,7 +64,7 @@ export const WINDOW_MS = 7 * 24 * 60 * 60_000;
 export const SLOW_HOOK_MS = 1000;
 
 /** The hooks whose own duration `carrick status` and the session start report; a `recheck` row runs in the background, so the agent never waits on it. */
-const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "prompt-submit", "stop", "subagent-stop"];
+const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "post-bash", "prompt-submit", "stop", "subagent-stop"];
 
 export function timingsPath(root: string): string {
   return path.join(root, ".carrick", "hook-timings.jsonl");
