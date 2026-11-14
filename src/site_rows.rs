@@ -78,7 +78,7 @@ use crate::request_summary::Stop;
 use crate::request_summary::decided_sites::{
     Decided, DecidedSite, SiteLabel, Through, origin_side,
 };
-use crate::request_summary::site_record::{Basis, Bucket, SiteRecord, TypeAnchors};
+use crate::request_summary::site_record::{AnchorAt, Basis, Bucket, SiteRecord, TypeAnchors};
 use crate::site_questions::{Answered, SiteAnswers, SiteQuestion, Slot, SlotAnswer, SlotValue};
 
 /// The fold band (RULED by David, 2026-10-16): an answer replaces the
@@ -153,6 +153,12 @@ pub struct SiteRow {
     pub in_band: bool,
     pub name_scope: Option<carrick_match::NameScope>,
     pub anchors: TypeAnchors,
+    /// Where the row's response is read: its record's response slot, which
+    /// states it once for every asker (carrick#4319). The deciding call,
+    /// except where that call only makes the function that sends: there the
+    /// labelled call, whose result is what the send answers. `None` where
+    /// nothing is a response (a receive, a built request's literal).
+    pub response_at: Option<AnchorAt>,
     /// The possible call the site is when it stands nowhere.
     pub lead: PossibleCall,
     /// Whether the row rests on a slot only the label forced and the code
@@ -1183,6 +1189,11 @@ pub fn of(
                 in_band: fact || (confidence >= BAND && orders_agree),
                 name_scope,
                 anchors: record.anchors.clone(),
+                response_at: record
+                    .payloads
+                    .response
+                    .as_ref()
+                    .map(|slot| slot.at().clone()),
                 lead: lead(Stop::BelowBand),
                 needs_reader: needs_reader(record),
                 through: is_through(site),
@@ -1227,6 +1238,9 @@ pub fn descriptor_rows(decided: &Decided) -> Vec<SiteRow> {
                     handler: None,
                     key: None,
                 },
+                // The literal is no call: nothing there is a response
+                // (carrick#3470).
+                response_at: None,
                 lead: PossibleCall {
                     file_path: at.file.clone(),
                     line_number: at.line,

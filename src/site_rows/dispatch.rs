@@ -169,6 +169,7 @@ fn row(
             handler: None,
             key: None,
         },
+        response_at: None,
         lead: lead(place, Stop::BelowBand),
         needs_reader: false,
         through: false,

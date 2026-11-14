@@ -87,6 +87,7 @@ fn site(file: &str, role: &str, op: &str, export: &str) -> DecidedSite {
         composed: Vec::new(),
         composed_trimmed: false,
         procedure: None,
+        makes_end: false,
     }
 }
 
