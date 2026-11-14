@@ -322,6 +322,7 @@ impl InferRequestItem {
             model_symbol_relation: None,
             machinery: false,
             anchor_machinery: false,
+            body_member: None,
         })
     }
 }

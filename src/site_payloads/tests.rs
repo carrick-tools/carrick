@@ -648,6 +648,7 @@ fn an_absent_slot_is_answered_here_and_never_asked() {
         &[entry(http(), "consumer", "request", "Req", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert_eq!(requests.len(), 1, "{requests:?}");
     let request = &requests[0];
@@ -678,6 +679,7 @@ fn an_absent_slot_is_answered_here_and_never_asked() {
         &[entry(http(), "consumer", "request", "Req", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert!(!asked[0].answered_no_body());
     assert!(asked[0].no_body_answer().is_none());
@@ -726,6 +728,7 @@ fn an_absent_slot_is_answered_here_and_never_asked() {
         &[entry(socket, "consumer", "response", "Pub", 2)],
         &root,
         &ResultIndex::default(),
+        &HashSet::new(),
     );
     assert!(none.is_empty(), "{none:?}");
 }
