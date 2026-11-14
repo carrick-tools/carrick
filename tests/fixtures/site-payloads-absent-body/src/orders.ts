@@ -26,3 +26,8 @@ export function create(order: Order) { return http.post("/orders", order); }
 
 function either(u: string, b?: Order) { return b ? http.post(u, b) : http.post(u); }
 export function sendEither(order: Order) { return either("/orders/either", order); }
+
+// A wrapper that writes the body onto the options its caller hands it: the
+// caller's literal lacks `data`, yet the request carries one.
+function stamp(u: string, init: { headers?: object; data?: unknown }) { init.data = "x"; return http.remove(u, init); }
+export function stampNow() { return stamp("/orders/stamp", { headers: {} }); }

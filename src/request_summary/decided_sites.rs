@@ -2136,7 +2136,7 @@ fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<P
 /// call that writes it, and that call's argument and option key.
 fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option<String>)> {
     match walk_bound(down, slot, false)? {
-        Walked::Bound(at, arg, key) => Some((at, arg, key)),
+        Walked::Bound(at, arg, key, _) => Some((at, arg, key)),
         Walked::Omitted { .. } => None,
     }
 }
@@ -2147,7 +2147,7 @@ fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option
 /// below it hand on whole: `(k, index)`, the parameter at `index` of the
 /// function `down[k]` is written in.
 enum Walked {
-    Bound(usize, usize, Option<String>),
+    Bound(usize, usize, Option<String>, Vec<(usize, usize)>),
     Omitted { through: Vec<(usize, usize)> },
 }
 
@@ -2164,11 +2164,13 @@ enum Walked {
 /// the argument is a parameter each call below hands on whole.
 /// `defaulted(placed, index)` says the function `placed` is written in gives
 /// that parameter a default: a default at any of them fills it, as does one
-/// a closure's parameter may have (not read).
+/// a closure's parameter may have (not read). `written_onto(placed, index)`
+/// says that function writes onto the parameter's members.
 fn payload_slot(
     down: &[Placed<'_>],
     slot: &ArgSlot,
     defaulted: &dyn Fn(&Placed<'_>, usize) -> bool,
+    written_onto: &dyn Fn(&Placed<'_>, usize) -> bool,
 ) -> Option<SlotBinding> {
     let (arg, carried) = match walk_bound(down, slot, true)? {
         Walked::Omitted { through } => {
@@ -2178,7 +2180,19 @@ fn payload_slot(
             });
             return (!filled).then_some(SlotBinding::Absent);
         }
-        Walked::Bound(0, arg, Some(carried)) => (arg, carried),
+        Walked::Bound(0, arg, Some(carried), through) => {
+            // A function that writes onto the parameter the key is carried
+            // through adds to the object its caller handed it, so the
+            // caller's literal is not what the labelled call sends
+            // (carrick#4324).
+            if through
+                .iter()
+                .any(|&(k, index)| written_onto(&down[k], index))
+            {
+                return None;
+            }
+            (arg, carried)
+        }
         Walked::Bound(..) => return None,
     };
     let key = slot.key.as_ref()?;
@@ -2240,7 +2254,7 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
                 through.push((k, index));
                 continue;
             }
-            None if !options => return Some(Walked::Bound(k, arg, key)),
+            None if !options => return Some(Walked::Bound(k, arg, key, through)),
             None => {}
         }
         // The caller's options under a spread or a rest, with the key not
@@ -2268,7 +2282,7 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
     if first.call.site_args.is_some() && first.call.args.get(arg).is_none() {
         return omitted(first.call).then_some(Walked::Omitted { through });
     }
-    Some(Walked::Bound(0, arg, key))
+    Some(Walked::Bound(0, arg, key, through))
 }
 
 /// What a label's method slot holds at a decided site (label v2,
@@ -2651,6 +2665,22 @@ impl<'a> Walk<'a, '_> {
                 .any(|(position, keys, _)| *position == index && keys.is_empty())
     }
 
+    /// Whether the function `callee` writes onto the members of its
+    /// parameter at `index` (carrick#4324). A function that is not found, or
+    /// a parameter that is not a plain name, may: it reads as written onto.
+    fn writes_onto_param(&self, callee: (&Path, Option<&str>), index: usize) -> bool {
+        let Some((_, function)) = callee
+            .1
+            .and_then(|key| self.resolver.function(callee.0, key))
+        else {
+            return true;
+        };
+        let Some(Some(param)) = function.params.get(index) else {
+            return true;
+        };
+        param.written_onto()
+    }
+
     /// `down` is the calls from the site (first) to the labelled call
     /// (last).
     fn site(
@@ -2710,9 +2740,12 @@ impl<'a> Walk<'a, '_> {
         let payload_slot = label
             .and_then(|label| label.payload.as_ref())
             .and_then(|slot| {
-                payload_slot(down, slot, &|placed, index| {
-                    self.defaults_param((placed.file, placed.key), index)
-                })
+                payload_slot(
+                    down,
+                    slot,
+                    &|placed, index| self.defaults_param((placed.file, placed.key), index),
+                    &|placed, index| self.writes_onto_param((placed.file, placed.key), index),
+                )
             });
         let handler = handler_slot
             .and_then(|slot| bound_at(down, slot))
@@ -7090,6 +7123,40 @@ pub(crate) mod tests {
 
         let slot_at = slots(&fetch_label());
         assert_eq!(slot_at("/absent/ping`)"), None);
+    }
+
+    /// carrick#4324: the key carried up through a parameter its function
+    /// writes onto (`init.body = x`) is not unwritten: the function adds to
+    /// the caller's literal. One that only hands the parameter on is.
+    #[test]
+    fn a_key_carried_through_a_parameter_its_function_writes_onto_is_not_unwritten() {
+        let calls = [
+            "fetch(`${process.env.API}${path}`, init)",
+            "fetch(`${process.env.API}${path}/forwarded`, init)",
+        ];
+        let mut keyed = fetch_label();
+        keyed.payload = Some(ArgSlot {
+            arg: 1,
+            key: Some("body".into()),
+        });
+        let (decided, text, _) = decided_at("src/slots/absent.ts", &calls, &keyed);
+        let slot_at = |needle: &str| {
+            let line = line_of(&text, needle);
+            let site = decided
+                .sites
+                .iter()
+                .find(|site| site.line == line)
+                .unwrap_or_else(|| panic!("no site at {needle}"));
+            site.payload_slot.clone()
+        };
+        assert_eq!(slot_at("stamp(\"/absent/stamped\""), None);
+        assert_eq!(
+            slot_at("forward(\"/absent/forwarded\""),
+            Some(SlotBinding::Unwritten {
+                arg: 1,
+                key: "body".into(),
+            })
+        );
     }
 
     // -----------------------------------------------------------------------
