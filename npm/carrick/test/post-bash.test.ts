@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { bashTargets, movesTreeInBulk } from "../src/hook/bash-targets.ts";
+import { bashTargets, movesTreeInBulk, searchedNames } from "../src/hook/bash-targets.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
@@ -326,6 +326,66 @@ test("bashTargets reads the write shapes the agents use", (t) => {
   assert.ok(movesTreeInBulk("git -C x checkout main", w.worktree));
   assert.ok(movesTreeInBulk("cd a && npm ci", w.worktree));
   assert.ok(!movesTreeInBulk("git diff && npm test", w.worktree));
+});
+
+// The payload's `cwd` is the directory after the command when a `cd` persisted (#4425).
+
+/** A tree `<root>/a/src/x.ts` for the shell-write-after-cd tests. */
+function cdTree(t: { after: (fn: () => void) => void }) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-cd-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "a", "src"), { recursive: true });
+  const x = path.join(root, "a", "src", "x.ts");
+  fs.writeFileSync(x, "export {};\n");
+  return { root, a: path.join(root, "a"), x };
+}
+
+test("a write after a cd is found whether cwd is the directory before or after the command", (t) => {
+  const d = cdTree(t);
+  const heredoc = "cd a; cat > src/x.ts <<'EOF'\nexport const y = 1;\nEOF";
+  assert.deepEqual(bashTargets("cd a && echo hi > src/x.ts", d.a).writes, [d.x], "after directory");
+  assert.deepEqual(bashTargets("cd a && echo hi > src/x.ts", d.root).writes, [d.x], "start directory");
+  assert.deepEqual(bashTargets(heredoc, d.a).writes, [d.x], "heredoc, after directory");
+  assert.deepEqual(bashTargets(heredoc, d.root).writes, [d.x], "heredoc, start directory");
+  assert.deepEqual(bashTargets("(cd a && echo hi > src/x.ts)", d.root).writes, [d.x], "subshell");
+  assert.deepEqual(bashTargets("cd a && cat src/x.ts", d.a).reads, [d.x], "a read after the cd");
+  assert.deepEqual(searchedNames("cd a && grep -n widgetName src/x.ts", d.a).operands, [d.x]);
+});
+
+test("a write with no cd resolves as before", (t) => {
+  const d = cdTree(t);
+  assert.deepEqual(bashTargets("echo hi > a/src/x.ts", d.root).writes, [d.x]);
+  assert.deepEqual(bashTargets("echo hi > src/x.ts", d.a).writes, [d.x]);
+  assert.deepEqual(bashTargets("echo hi > src/x.ts", d.root).writes, []);
+});
+
+test("a file present under both readings: the one changed in the call's window wins", (t) => {
+  const d = cdTree(t);
+  // `<root>/a/a/src/x.ts` exists too: cwd = <root>/a is read as after (a/src/x.ts... start <root>) and as start.
+  const nested = path.join(d.a, "a", "src", "x.ts");
+  fs.mkdirSync(path.dirname(nested), { recursive: true });
+  fs.writeFileSync(nested, "export {};\n");
+  const old = new Date(Date.now() - 3_600_000);
+  const command = "cd a && echo hi > src/x.ts";
+  fs.utimesSync(nested, old, old);
+  assert.deepEqual(bashTargets(command, d.a, { durationMs: 500 }).writes, [d.x], "only the after-reading file changed");
+  fs.utimesSync(nested, new Date(), new Date());
+  fs.utimesSync(d.x, old, old);
+  assert.deepEqual(bashTargets(command, d.a, { durationMs: 500 }).writes, [nested], "only the start-reading file changed");
+  fs.utimesSync(d.x, new Date(), new Date());
+  assert.deepEqual(bashTargets(command, d.a, { durationMs: 500 }).writes.sort(), [d.x, nested].sort(), "both changed: both kept");
+});
+
+test("a shell write after a cd, with the after directory, gets its after-write check", async (t) => {
+  const w = repoWithWorktree(t);
+  const sub = path.join(w.worktree, "src");
+  fs.writeFileSync(w.file, "export const b = 2;\n");
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(sub, "cd src && echo 'export const b = 2;' > capture/backfill.ts", "sess-cd1"),
+    env: writeEnv(w),
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/capture/backfill.ts"]);
 });
 
 // A grep for an indexed function names the sites its output did not print.
