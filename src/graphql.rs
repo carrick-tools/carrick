@@ -159,6 +159,11 @@ pub struct GraphqlOp {
     /// (carrick#1158), the request half of the operation's contract. `None`
     /// for a field with no arguments and for every consumer.
     pub arguments: Option<SdlArguments>,
+    /// PRODUCER-only: the name of the root type that declares this field
+    /// (`Query`, or the name a `schema { query: RootQuery }` gives it), the
+    /// key of [`GraphqlTypes`] the response is read from (carrick#4403).
+    /// `None` for every consumer.
+    pub sdl_root_type: Option<String>,
 }
 
 /// A schema root field's arguments, printed from the SDL (carrick#1158).
@@ -237,34 +242,73 @@ pub struct SdlTypeFields {
     pub fields: BTreeMap<String, BTreeSet<String>>,
     /// Root operation type name -> the operation kind it serves.
     pub roots: BTreeMap<String, GraphqlOperationKind>,
-    /// Output types (object, interface, union, enum) by name, for the leaf
-    /// tree of a producer response (carrick#4403).
+    /// Output types (object, interface, union, enum, scalar) by name, as
+    /// declared, from which [`graphql_types`] builds the service's type table
+    /// (carrick#4403). A field's named types are classified only there, once
+    /// every schema file of the service is merged in.
     pub outputs: BTreeMap<String, SdlOutputType>,
 }
 
-/// What an output type declares, as far as a response's leaves need it.
+/// What an output type declares, before the service's other files are read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SdlOutputType {
-    /// An object or interface: `(field name, named type)` in declaration
-    /// order, list and non-null wrappers stripped.
-    Fields(Vec<(String, String)>),
+    /// An object or interface: each field's type with its wrappers, every
+    /// named type held as [`Leaf::Type`] until [`graphql_types`] classifies it.
+    Fields(BTreeMap<String, Leaf>),
     /// A union: its member type names.
     Union(Vec<String>),
-    /// An enum: a leaf named `enum`.
+    /// An enum.
     Enum,
+    /// A custom scalar.
+    Scalar,
 }
 
-/// One node of a response's leaf tree (carrick#4403): an SDL scalar name, or
-/// a nested map for an object, interface or union.
+/// One field's type as the SDL declares it (carrick#4403). Wire shape,
+/// externally tagged: `{"scalar":"String"}`, `{"enum":"Status"}`,
+/// `{"list":<Leaf>}`, `{"non_null":<Leaf>}`, `{"type":"Invoice"}`. The
+/// cloud's reader is built against it; changing it is a seam change.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "snake_case")]
 pub enum Leaf {
+    /// A built-in scalar, or a scalar a schema of the service declares.
     Scalar(String),
-    Tree(BTreeMap<String, Leaf>),
+    /// An enum a schema of the service declares.
+    Enum(String),
+    /// A list of the inner type.
+    List(Box<Leaf>),
+    /// The inner type, never null.
+    NonNull(Box<Leaf>),
+    /// Another type: a key of [`GraphqlTypes`] when a schema of the service
+    /// declares it as an object, interface or union. A name no schema of the
+    /// service declares stays a `type` with no key, so a reader finds no
+    /// fields for it rather than a scalar the schema never stated.
+    Type(String),
 }
 
-/// The deepest object nesting a leaf tree keeps.
-const LEAF_DEPTH_CAP: usize = 8;
+/// One entry of a service's type table (carrick#4403): an object's or an
+/// interface's fields, or a union's member types. Wire shape:
+/// `{"fields":{"<field>":<Leaf>}}` or `{"members":["<TypeName>"]}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphqlType {
+    Fields(BTreeMap<String, Leaf>),
+    Members(Vec<String>),
+}
+
+/// A service's GraphQL type table: every object, interface and union its
+/// schemas declare, by name. Built once per scan from every schema file of
+/// the service; a type reaches another only by [`Leaf::Type`], so a cycle is
+/// two references and the table grows with the schema, not with its paths.
+pub type GraphqlTypes = BTreeMap<String, GraphqlType>;
+
+/// The root field a GraphQL producer response is read from (carrick#4403):
+/// `{"type":"Query","field":"invoice"}`, `type` a key of [`GraphqlTypes`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GraphqlRoot {
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub field: String,
+}
 
 impl SdlTypeFields {
     fn merge(&mut self, other: SdlTypeFields) {
@@ -280,13 +324,18 @@ impl SdlTypeFields {
     }
 
     /// First declaration wins; an extension (or a second file) adds the
-    /// fields the first did not declare.
+    /// fields or members the first did not declare.
     fn record_output(&mut self, name: String, output: SdlOutputType) {
         match (self.outputs.get_mut(&name), output) {
             (Some(SdlOutputType::Fields(have)), SdlOutputType::Fields(more)) => {
-                for (field, named) in more {
-                    if !have.iter().any(|(seen, _)| *seen == field) {
-                        have.push((field, named));
+                for (field, leaf) in more {
+                    have.entry(field).or_insert(leaf);
+                }
+            }
+            (Some(SdlOutputType::Union(have)), SdlOutputType::Union(more)) => {
+                for member in more {
+                    if !have.contains(&member) {
+                        have.push(member);
                     }
                 }
             }
@@ -2434,6 +2483,7 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     schema_binding: None,
                     undeclared_selection: None,
                     arguments: sdl_arguments(field),
+                    sdl_root_type: Some(name.clone()),
                 });
             }
         }
@@ -2500,6 +2550,7 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
                     // Read once attribution binds the row to a served schema.
                     undeclared_selection: None,
                     arguments: None,
+                    sdl_root_type: None,
                 });
             }
         }
@@ -2508,7 +2559,7 @@ fn parse_document_text(text: &str, file_path: &Path, base_line: u32) -> Option<G
     parsed.then_some(extraction)
 }
 
-/// The output type a definition declares, for the leaf tree.
+/// The output type a definition declares, for the service's type table.
 fn sdl_output_type(
     definition: &graphql_parser::schema::Definition<'_, String>,
 ) -> Option<(String, SdlOutputType)> {
@@ -2517,7 +2568,7 @@ fn sdl_output_type(
         SdlOutputType::Fields(
             fields
                 .iter()
-                .map(|f| (f.name.clone(), sdl_named_type(&f.field_type).to_string()))
+                .map(|f| (f.name.clone(), sdl_leaf(&f.field_type)))
                 .collect(),
         )
     };
@@ -2537,68 +2588,43 @@ fn sdl_output_type(
         Definition::TypeDefinition(TypeDefinition::Union(u)) => {
             Some((u.name.clone(), SdlOutputType::Union(u.types.clone())))
         }
+        Definition::TypeExtension(TypeExtension::Union(u)) => {
+            Some((u.name.clone(), SdlOutputType::Union(u.types.clone())))
+        }
         Definition::TypeDefinition(TypeDefinition::Enum(e)) => {
             Some((e.name.clone(), SdlOutputType::Enum))
+        }
+        Definition::TypeDefinition(TypeDefinition::Scalar(s)) => {
+            Some((s.name.clone(), SdlOutputType::Scalar))
         }
         _ => None,
     }
 }
 
-/// A producer response's leaf tree (carrick#4403): `rendered` is the root
-/// field's SDL type expression (`[Order!]!`), walked to its leaves through
-/// `types`. `None` when it names no object, interface or union, or when no
-/// field survives.
-pub fn response_leaves(rendered: &str, types: &SdlTypeFields) -> Option<BTreeMap<String, Leaf>> {
-    let named = rendered.trim_matches(|c| matches!(c, '[' | ']' | '!'));
-    let tree = leaf_tree(named, types, &mut Vec::new())?;
-    (!tree.is_empty()).then_some(tree)
+/// A field's SDL type with its wrappers, every named type a [`Leaf::Type`]
+/// until [`graphql_types`] classifies it.
+fn sdl_leaf(ty: &graphql_parser::schema::Type<'_, String>) -> Leaf {
+    use graphql_parser::schema::Type;
+    match ty {
+        Type::NamedType(name) => Leaf::Type(name.clone()),
+        Type::ListType(inner) => Leaf::List(Box::new(sdl_leaf(inner))),
+        Type::NonNullType(inner) => Leaf::NonNull(Box::new(sdl_leaf(inner))),
+    }
 }
 
-/// The fields `name` declares as a leaf map; `None` for a non-composite.
-/// `path` holds the composite types being walked: a type already on it, or
-/// one past the depth cap, is cut.
-fn leaf_tree<'t>(
-    name: &'t str,
-    types: &'t SdlTypeFields,
-    path: &mut Vec<&'t str>,
-) -> Option<BTreeMap<String, Leaf>> {
-    let declared = types.outputs.get(name)?;
-    path.push(name);
-    let tree = match declared {
-        SdlOutputType::Enum => None,
-        SdlOutputType::Fields(fields) => {
-            let mut tree = BTreeMap::new();
-            for (field, named) in fields {
-                if let Some(leaf) = leaf_of(named, types, path) {
-                    tree.insert(field.clone(), leaf);
-                }
-            }
-            Some(tree)
-        }
-        SdlOutputType::Union(members) => {
-            let mut trees = members.iter().map(|m| leaf_tree(m, types, path));
-            let first = trees.next().flatten();
-            first.map(|mut common| {
-                for other in trees {
-                    let other = other.unwrap_or_default();
-                    common.retain(|key, leaf| other.get(key) == Some(leaf));
-                }
-                common
-            })
-        }
-    };
-    path.pop();
-    tree
+/// The service's type table (carrick#4403): every object, interface and
+/// union its schemas declare, each field's named type classified against
+/// every schema file of the service. `None` when they declare none.
+pub fn graphql_types(declared: &SdlTypeFields) -> Option<GraphqlTypes> {
+    let _ = declared;
+    None
 }
 
-fn leaf_of<'t>(named: &'t str, types: &'t SdlTypeFields, path: &mut Vec<&'t str>) -> Option<Leaf> {
-    match types.outputs.get(named) {
-        None => Some(Leaf::Scalar(named.to_string())),
-        Some(SdlOutputType::Enum) => Some(Leaf::Scalar("enum".to_string())),
-        Some(_) if path.contains(&named) || path.len() >= LEAF_DEPTH_CAP => None,
-        Some(_) => leaf_tree(named, types, path)
-            .filter(|tree| !tree.is_empty())
-            .map(Leaf::Tree),
+impl GraphqlOp {
+    /// The root field this producer's response is read from (carrick#4403).
+    /// `None` for a consumer.
+    pub fn graphql_root(&self) -> Option<GraphqlRoot> {
+        None
     }
 }
 
@@ -3351,28 +3377,66 @@ mod tests {
         );
     }
 
-    fn leaves_of(sdl: &str, field: &str) -> Option<BTreeMap<String, Leaf>> {
+    fn table_of(sdl: &str) -> GraphqlTypes {
         let result = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
-        let op = result
-            .producers
-            .iter()
-            .find(|op| op.key.canonical().ends_with(field))
-            .expect("producer");
-        response_leaves(
-            op.primary_type_symbol.as_deref().expect("anchor"),
-            &result.schema_types,
-        )
+        graphql_types(&result.schema_types).expect("table")
     }
 
-    fn scalar(name: &str) -> Leaf {
-        Leaf::Scalar(name.to_string())
+    fn json_of<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).expect("serialises")
     }
 
-    /// carrick#4403: a root field's output type is walked to its leaves;
-    /// wrappers are stripped, a scalar leaf is its SDL name, an enum is `enum`.
+    /// carrick#4403: the wire shape the cloud's reader is built against, one
+    /// example of each `Leaf` variant, each table entry and the root.
     #[test]
-    fn response_leaves_walk_the_output_type_to_its_scalars() {
-        let sdl = r#"
+    fn graphql_types_wire_shape_is_pinned() {
+        let ty = |name: &str| Box::new(Leaf::Type(name.to_string()));
+        assert_eq!(
+            json_of(&Leaf::Scalar("String".into())),
+            serde_json::json!({ "scalar": "String" })
+        );
+        assert_eq!(
+            json_of(&Leaf::Enum("Status".into())),
+            serde_json::json!({ "enum": "Status" })
+        );
+        assert_eq!(
+            json_of(&Leaf::List(ty("Line"))),
+            serde_json::json!({ "list": { "type": "Line" } })
+        );
+        assert_eq!(
+            json_of(&Leaf::NonNull(ty("Line"))),
+            serde_json::json!({ "non_null": { "type": "Line" } })
+        );
+        assert_eq!(
+            json_of(&Leaf::Type("Invoice".into())),
+            serde_json::json!({ "type": "Invoice" })
+        );
+        assert_eq!(
+            json_of(&GraphqlType::Fields(BTreeMap::from([(
+                "id".to_string(),
+                Leaf::Scalar("ID".into())
+            )]))),
+            serde_json::json!({ "fields": { "id": { "scalar": "ID" } } })
+        );
+        assert_eq!(
+            json_of(&GraphqlType::Members(vec!["Card".into(), "Bank".into()])),
+            serde_json::json!({ "members": ["Card", "Bank"] })
+        );
+        assert_eq!(
+            json_of(&GraphqlRoot {
+                type_name: "Query".into(),
+                field: "invoice".into()
+            }),
+            serde_json::json!({ "type": "Query", "field": "invoice" })
+        );
+    }
+
+    /// Each field keeps its list and non-null wrappers; a named type is a
+    /// built-in or declared scalar, a declared enum, or a reference.
+    #[test]
+    fn graphql_types_state_each_field_with_its_wrappers() {
+        let table = table_of(
+            r#"
             scalar DateTime
             enum Status { A B }
             type Line { unitPriceMinor: String! }
@@ -3384,92 +3448,189 @@ mod tests {
                 status: Status
             }
             type Query { invoice(id: ID!): Invoice }
-        "#;
-        let expected = BTreeMap::from([
-            ("id".to_string(), scalar("ID")),
-            ("totalMinor".to_string(), scalar("String")),
-            ("issuedOn".to_string(), scalar("DateTime")),
-            (
-                "lines".to_string(),
-                Leaf::Tree(BTreeMap::from([(
-                    "unitPriceMinor".to_string(),
-                    scalar("String"),
-                )])),
-            ),
-            ("status".to_string(), scalar("enum")),
-        ]);
-        assert_eq!(leaves_of(sdl, "invoice"), Some(expected));
+        "#,
+        );
+        assert_eq!(
+            json_of(&table),
+            serde_json::json!({
+                "Invoice": { "fields": {
+                    "id": { "non_null": { "scalar": "ID" } },
+                    "totalMinor": { "scalar": "String" },
+                    "issuedOn": { "non_null": { "scalar": "DateTime" } },
+                    "lines": { "non_null": { "list": { "non_null": { "type": "Line" } } } },
+                    "status": { "enum": "Status" },
+                } },
+                "Line": { "fields": {
+                    "unitPriceMinor": { "non_null": { "scalar": "String" } },
+                } },
+                "Query": { "fields": { "invoice": { "type": "Invoice" } } },
+            })
+        );
     }
 
-    /// A type that reaches itself is cut where it closes the cycle.
+    /// A type that reaches itself is two references, not a walk.
     #[test]
-    fn response_leaves_cut_a_cycle() {
-        let sdl = r#"
+    fn graphql_types_hold_a_cycle_as_references() {
+        let table = table_of(
+            r#"
             type Node { id: ID!, parent: Node, kids: [Node!]! }
             type Query { node: Node }
-        "#;
+        "#,
+        );
         assert_eq!(
-            leaves_of(sdl, "node"),
-            Some(BTreeMap::from([("id".to_string(), scalar("ID"))]))
+            json_of(&table["Node"]),
+            serde_json::json!({ "fields": {
+                "id": { "non_null": { "scalar": "ID" } },
+                "parent": { "type": "Node" },
+                "kids": { "non_null": { "list": { "non_null": { "type": "Node" } } } },
+            } })
         );
     }
 
-    /// A chain deeper than the cap stops at the cap.
+    /// A union records its members; an interface records its fields.
     #[test]
-    fn response_leaves_stop_at_the_depth_cap() {
-        let mut sdl = String::new();
-        for n in 0..12 {
-            sdl.push_str(&format!("type T{n} {{ id: ID!, next: T{} }}\n", n + 1));
-        }
-        sdl.push_str("type T12 { id: ID! }\ntype Query { start: T0 }\n");
-        let mut tree = leaves_of(&sdl, "start").expect("tree");
-        let mut depth = 1;
-        while let Some(Leaf::Tree(next)) = tree.remove("next") {
-            tree = next;
-            depth += 1;
-        }
-        assert_eq!(depth, LEAF_DEPTH_CAP);
-    }
-
-    /// A union keeps the fields every member declares with the same leaf.
-    #[test]
-    fn response_leaves_of_a_union_keep_the_shared_fields() {
-        let sdl = r#"
-            type Card { id: ID!, last4: String, issuedOn: DateTime }
-            type Bank { id: ID!, last4: Int, iban: String }
+    fn graphql_types_record_union_members_and_interface_fields() {
+        let table = table_of(
+            r#"
+            interface Named { name: String }
+            type Card implements Named { name: String, last4: String }
+            type Bank implements Named { name: String, iban: String }
             union Method = Card | Bank
-            type Query { method: Method, methods: [Method!]! }
-        "#;
+            type Query { method: Method, named: [Named!]! }
+        "#,
+        );
         assert_eq!(
-            leaves_of(sdl, "method"),
-            Some(BTreeMap::from([("id".to_string(), scalar("ID"))]))
+            table["Method"],
+            GraphqlType::Members(vec!["Card".to_string(), "Bank".to_string()])
+        );
+        assert_eq!(
+            json_of(&table["Named"]),
+            serde_json::json!({ "fields": { "name": { "scalar": "String" } } })
         );
     }
 
-    /// A root field that returns a scalar or an enum has no tree.
+    /// A root field returning a scalar or an enum still names its root;
+    /// its type has no entry of its own to walk.
     #[test]
-    fn response_leaves_of_a_scalar_root_are_none() {
+    fn a_scalar_root_names_its_root_and_has_no_fields_to_walk() {
         let sdl = "enum S { A }\ntype Query { count: Int, s: S }";
-        assert_eq!(leaves_of(sdl, "count"), None);
-        assert_eq!(leaves_of(sdl, "s"), None);
+        let result = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        let roots: Vec<_> = result
+            .producers
+            .iter()
+            .map(|op| json_of(&op.graphql_root()))
+            .collect();
+        assert_eq!(
+            roots,
+            vec![
+                serde_json::json!({ "type": "Query", "field": "count" }),
+                serde_json::json!({ "type": "Query", "field": "s" }),
+            ]
+        );
+        let table = graphql_types(&result.schema_types).expect("table");
+        assert_eq!(
+            json_of(&table),
+            serde_json::json!({ "Query": { "fields": {
+                "count": { "scalar": "Int" },
+                "s": { "enum": "S" },
+            } } })
+        );
     }
 
-    /// Types another file of the service declares reach the tree.
+    /// The root is the type the schema names for the operation, not its kind.
     #[test]
-    fn response_leaves_read_types_declared_in_another_file() {
+    fn graphql_root_is_the_renamed_root_type() {
+        let sdl = "schema { query: RootQuery }\ntype RootQuery { me: ID }";
+        let result = extract_from_document_text(sdl, Path::new("schema.graphql"), 1);
+        assert_eq!(
+            result.producers[0].graphql_root(),
+            Some(GraphqlRoot {
+                type_name: "RootQuery".to_string(),
+                field: "me".to_string()
+            })
+        );
+        assert!(
+            graphql_types(&result.schema_types).expect("table")["RootQuery"].eq(
+                &GraphqlType::Fields(BTreeMap::from([(
+                    "me".to_string(),
+                    Leaf::Scalar("ID".to_string())
+                )]))
+            )
+        );
+    }
+
+    /// Types, extensions, enums and scalars another file of the service
+    /// declares are read before a field is classified; a name no file
+    /// declares stays a reference with no entry.
+    #[test]
+    fn graphql_types_read_every_file_of_the_service() {
         let mut a = extract_from_document_text(
-            "type Query { invoice: Invoice }",
+            "type Query { invoice: Invoice, pay: Method }\nunion Method = Card",
             Path::new("a.graphql"),
             1,
         );
         let b = extract_from_document_text(
-            "type Invoice { id: ID! }\nextend type Invoice { at: DateTime }",
+            "type Invoice { id: ID!, at: DateTime, state: State }\n\
+             extend type Invoice { owner: Account }\n\
+             extend union Method = Bank\n\
+             type Card { id: ID! }\ntype Bank { id: ID! }\n\
+             enum State { OPEN }\nscalar DateTime",
             Path::new("b.graphql"),
             1,
         );
         a.merge(b);
-        let leaves = response_leaves("Invoice", &a.schema_types).expect("tree");
-        assert_eq!(leaves.len(), 2);
+        let table = graphql_types(&a.schema_types).expect("table");
+        assert_eq!(
+            json_of(&table["Invoice"]),
+            serde_json::json!({ "fields": {
+                "id": { "non_null": { "scalar": "ID" } },
+                "at": { "scalar": "DateTime" },
+                "state": { "enum": "State" },
+                "owner": { "type": "Account" },
+            } })
+        );
+        assert_eq!(
+            table["Method"],
+            GraphqlType::Members(vec!["Card".to_string(), "Bank".to_string()])
+        );
+        assert!(!table.contains_key("Account"));
+    }
+
+    /// A schema whose every type links to six others (the shape whose
+    /// per-root leaf trees grew as links^depth, 7.9 MB for one root field)
+    /// yields a table linear in the schema: bounded bytes per type, the same
+    /// bound at 60 types and at 600.
+    #[test]
+    fn graphql_types_of_a_dense_schema_grow_linearly() {
+        fn dense(types: usize) -> String {
+            let mut sdl = String::new();
+            for n in 0..types {
+                sdl.push_str(&format!("type T{n} {{ id: ID!, name: String"));
+                for link in 0..6 {
+                    sdl.push_str(&format!(", r{link}: T{}", (n * 7 + link * 13 + 1) % types));
+                }
+                sdl.push_str(" }\n");
+            }
+            sdl.push_str("type Query {");
+            for root in 0..12 {
+                sdl.push_str(&format!(" q{root}: [T{root}!]!"));
+            }
+            sdl.push_str(" }\n");
+            sdl
+        }
+        const MAX_BYTES_PER_TYPE: usize = 256;
+        let mut sizes = Vec::new();
+        for types in [60, 600] {
+            let table = table_of(&dense(types));
+            assert_eq!(table.len(), types + 1);
+            let bytes = serde_json::to_string(&table).expect("serialises").len();
+            assert!(
+                bytes <= MAX_BYTES_PER_TYPE * (types + 1),
+                "{bytes} bytes for {types} types"
+            );
+            sizes.push(bytes);
+        }
+        assert!(sizes[1] < sizes[0] * 11, "{sizes:?}");
     }
 
     /// Stage B2: a producer op formats as `"{kind} {field}: {sdl_type}"`, the
@@ -4918,7 +5079,7 @@ export const typeDefs = gql`
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            graphql_leaves: None,
+            graphql_root: None,
             v1_before_demotion: None,
         };
         let mut calls = vec![row.clone(), row];

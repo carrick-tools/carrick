@@ -216,17 +216,12 @@ pub struct TypeManifestEntry {
     /// request summaries. Empty on every call they did not state.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub stated_values: StatedValues,
-    /// A GraphQL producer response's leaves as the SDL declares them
-    /// (carrick#4403): the root field's output type walked to its leaves, as
-    /// a nested map from field name to the leaf's SDL scalar name (`enum` for
-    /// an enum). List and non-null wrappers are stripped; a union keeps the
-    /// fields every member declares with the same leaf; a field that closes a
-    /// cycle or sits past the depth cap is omitted. Stamped by
-    /// [`crate::graphql::response_leaves`] on the producer Response entry
-    /// only. `None` on every other entry, and on a root field whose type is
-    /// no object, interface or union.
+    /// The root field a GraphQL producer response is read from
+    /// (carrick#4403): `{"type":"Query","field":"invoice"}`, where `type` is
+    /// a key of the service's [`CloudRepoData::graphql_types`]. Stamped on
+    /// the SDL producer's Response entry only; `None` on every other entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphql_leaves: Option<std::collections::BTreeMap<String, crate::graphql::Leaf>>,
+    pub graphql_root: Option<crate::graphql::GraphqlRoot>,
     /// What v1 printed for this entry before a top type inside its printed
     /// shape demoted it to `Unknown` (carrick#1752). `None` on every entry
     /// v1 did not answer with a shape. Scan-local: never written to the blob.
@@ -954,6 +949,17 @@ pub struct CloudRepoData {
     /// does not state dispatch tables", never as "this service has none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_tables: Option<Vec<crate::dispatch::DispatchTable>>,
+    /// The service's GraphQL type table (carrick#4403): every object,
+    /// interface and union its schemas declare, by name, each field's type
+    /// with its wrappers. A producer Response entry's `graphql_root` names
+    /// the root type and field it is read from. One table per service, built
+    /// by [`crate::graphql::graphql_types`] on every scan from all its schema
+    /// files, so it grows with the schema and not with its paths.
+    ///
+    /// Additive and optional: `None` on a service whose schemas declare no
+    /// output type, and on blobs written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_types: Option<crate::graphql::GraphqlTypes>,
     /// Calls the scan saw but could not name (carrick#2438): a library call
     /// whose path, event name or method the code does not state. Labelled
     /// leads for the agent, never rows; nothing in matching, the type check,
@@ -1288,6 +1294,7 @@ impl CloudRepoData {
             // see `crate::boundary::ServiceBoundary::collect`.
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -2512,7 +2519,7 @@ mod tests {
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            graphql_leaves: None,
+            graphql_root: None,
             v1_before_demotion: None,
         };
 
@@ -2923,6 +2930,7 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,

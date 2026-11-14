@@ -9614,6 +9614,9 @@ fn append_deterministic_protocol_operations(
     };
 
     let graphql = &extractions.graphql;
+    // One type table per service, from every schema file it reads; the
+    // producer Response entries name their root in it (carrick#4403).
+    cloud_data.graphql_types = crate::graphql::graphql_types(&graphql.schema_types);
     if !graphql.is_empty() {
         debug!(
             producers = graphql.producers.len(),
@@ -10871,11 +10874,11 @@ fn append_protocol_manifest_entries(
             op.primary_type_symbol.clone(),
             None,
         );
-        // The SDL states the response's leaves; the entry just pushed is the
-        // producer Response (carrick#4403).
-        if let (Some(entry), Some(rendered)) = (entries.last_mut(), &op.primary_type_symbol) {
-            entry.graphql_leaves =
-                crate::graphql::response_leaves(rendered, &extractions.graphql.schema_types);
+        // The entry just pushed is the producer Response: it names the root
+        // field its type is read from in the service's `graphql_types`
+        // (carrick#4403).
+        if let Some(entry) = entries.last_mut() {
+            entry.graphql_root = op.graphql_root();
         }
         if let Some(arguments) = &op.arguments {
             add_graphql_request_entry(
@@ -11024,7 +11027,7 @@ fn add_graphql_request_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        graphql_leaves: None,
+        graphql_root: None,
         v1_before_demotion: None,
     });
 }
@@ -11281,7 +11284,7 @@ fn add_protocol_manifest_entry(
         unwidened_out_of_budget: false,
         response_modes: None,
         stated_values: Default::default(),
-        graphql_leaves: None,
+        graphql_root: None,
         v1_before_demotion: None,
     });
 }
@@ -11724,6 +11727,7 @@ fn build_cloud_data_from_mount_graph(
         scanner_build: crate::cloud_storage::ScannerBuild::current(),
         boundary: None,
         dispatch_tables: None,
+        graphql_types: None,
         possible_calls: None,
         possible_calls_omitted: None,
         unread_sites: None,
@@ -14876,7 +14880,7 @@ fn add_manifest_pair(
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            graphql_leaves: None,
+            graphql_root: None,
             v1_before_demotion: None,
         });
     }
@@ -18218,6 +18222,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -19134,7 +19139,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 unwidened_out_of_budget: false,
                 response_modes: None,
                 stated_values: Default::default(),
-                graphql_leaves: None,
+                graphql_root: None,
                 v1_before_demotion: None,
             }]),
             file_results: Some(file_results),
@@ -19219,6 +19224,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -19435,6 +19441,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -19500,6 +19507,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -19597,6 +19605,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -20432,6 +20441,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -20502,6 +20512,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -20585,6 +20596,7 @@ unfollowed_member_calls_total: 0,
                 scanner_build: None,
                 boundary: None,
                 dispatch_tables: None,
+                graphql_types: None,
                 possible_calls: None,
                 possible_calls_omitted: None,
                 unread_sites: None,
@@ -20677,6 +20689,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -20916,6 +20929,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -21155,6 +21169,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -21304,6 +21319,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -21436,6 +21452,7 @@ unfollowed_member_calls_total: 0,
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
@@ -25670,7 +25687,7 @@ unfollowed_member_calls_total: 0,
             unwidened_out_of_budget: false,
             response_modes: None,
             stated_values: Default::default(),
-            graphql_leaves: None,
+            graphql_root: None,
             v1_before_demotion: None,
         }
     }
@@ -28617,6 +28634,7 @@ unfollowed_member_calls_total: 0,
             schema_binding: None,
             undeclared_selection: None,
             arguments: None,
+            sdl_root_type: None,
         }
     }
 
@@ -28648,6 +28666,7 @@ unfollowed_member_calls_total: 0,
             schema_binding: None,
             undeclared_selection: None,
             arguments: None,
+            sdl_root_type: None,
         }
     }
 
@@ -29072,6 +29091,7 @@ unfollowed_member_calls_total: 0,
             schema_binding: None,
             undeclared_selection: None,
             arguments: None,
+            sdl_root_type: None,
         }
     }
 
@@ -34738,10 +34758,11 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
     }
 
-    /// carrick#4403: the SDL producer's Response entry carries its leaf tree;
-    /// its Request entry, a consumer's entry and every other entry do not.
+    /// carrick#4403: the SDL producer's Response entry names its root field,
+    /// its Request entry does not, and the service's record carries the one
+    /// type table the root is read from.
     #[test]
-    fn graphql_producer_response_entry_carries_the_sdl_leaf_tree() {
+    fn graphql_producer_response_entry_names_its_root_in_the_service_table() {
         let sdl = "type Invoice { id: ID!, at: DateTime! }\n\
                    type Query { invoice(id: ID!): Invoice }";
         let graphql = crate::graphql::extract_from_document_text(
@@ -34762,7 +34783,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         append_protocol_manifest_entries(&mut entries, &extractions, &LibrarySiteIndex::default());
         let stamped: Vec<(ManifestTypeKind, bool)> = entries
             .iter()
-            .map(|e| (e.type_kind, e.graphql_leaves.is_some()))
+            .map(|e| (e.type_kind, e.graphql_root.is_some()))
             .collect();
         assert_eq!(
             stamped,
@@ -34773,11 +34794,33 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         );
         let json = serde_json::to_value(&entries[0]).expect("serialises");
         assert_eq!(
-            json["graphql_leaves"],
-            serde_json::json!({ "id": "ID", "at": "DateTime" })
+            json["graphql_root"],
+            serde_json::json!({ "type": "Query", "field": "invoice" })
         );
         let request = serde_json::to_value(&entries[1]).expect("serialises");
-        assert!(request.get("graphql_leaves").is_none());
+        assert!(request.get("graphql_root").is_none());
+
+        let mut cloud_data = repo_with_bundle("repo", Some("svc"), "");
+        append_deterministic_protocol_operations(
+            &mut cloud_data,
+            &extractions,
+            &HashMap::new(),
+            &crate::in_process_pubsub::InProcessPubsub::default(),
+            "/repo",
+            &Config::default(),
+        );
+        let record = serde_json::to_value(&cloud_data).expect("serialises");
+        assert_eq!(
+            record["graphql_types"]["Invoice"],
+            serde_json::json!({ "fields": {
+                "id": { "non_null": { "scalar": "ID" } },
+                "at": { "non_null": { "type": "DateTime" } },
+            } })
+        );
+        assert_eq!(
+            record["graphql_types"]["Query"],
+            serde_json::json!({ "fields": { "invoice": { "type": "Invoice" } } })
+        );
     }
 
     /// A minimal endpoint the file-analyzer would emit alongside a
@@ -37564,6 +37607,7 @@ io.on("bare:in", (event) => {});
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,

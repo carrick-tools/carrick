@@ -751,6 +751,7 @@ mod tests {
             scanner_build: None,
             boundary: None,
             dispatch_tables: None,
+            graphql_types: None,
             possible_calls: None,
             possible_calls_omitted: None,
             unread_sites: None,
