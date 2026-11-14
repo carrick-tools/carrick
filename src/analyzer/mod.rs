@@ -382,6 +382,44 @@ pub struct ApiEndpointDetails {
     pub inference: Option<crate::site_rows::Inference>,
 }
 
+/// Every optional field absent, every flag off. `key` and `file_path` have no
+/// honest default, so this fills them with placeholders: a literal sets them
+/// and takes the rest from here with `..Default::default()`, which keeps a
+/// field added later from breaking it.
+impl Default for ApiEndpointDetails {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            key: OperationKey::Http {
+                method: String::new(),
+                path: String::new(),
+            },
+            params: Vec::new(),
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: PathBuf::new(),
+            repo_name: None,
+            service_name: None,
+            provenance: crate::operation::EndpointProvenance::default(),
+            resolution_source: None,
+            view_module: false,
+            dispatch: None,
+            procedure: None,
+            schema_binding: None,
+            undeclared_selection: None,
+            handler_span: None,
+            handler_file: None,
+            declared_at: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+            inference: None,
+        }
+    }
+}
+
 /// `name_scope` off a row, read exactly as the cloud's `readNameScope`
 /// (carrick-cloud `lambdas/mcp-server/src/utils/name-scope.ts`) reads it: an
 /// object with a non-empty string `scope` is a scope, and its `namespace` is
@@ -5069,30 +5107,9 @@ mod tests {
 
     fn graphql_details(key: OperationKey, file: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key,
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(file),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         }
     }
 
@@ -6002,30 +6019,9 @@ mod tests {
             "https://undeclared.test/v1/orders",
         ] {
             analyzer.calls.push(ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
-                owner: None,
                 key: OperationKey::http("GET", route),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from("src/client.ts"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             });
         }
 
@@ -6051,30 +6047,9 @@ mod tests {
     /// A call-site fixture for the host tests below.
     fn host_test_call(method: &str, url: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http(method, url),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("src/client.ts"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         }
     }
 
@@ -6174,53 +6149,21 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/api/orders"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("client.ts:12"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "server.ts:10".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("api".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let (findings, verified, _edges) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -6277,53 +6220,23 @@ mod tests {
         for (consumer_source, producer_source, expected) in cases {
             let mut analyzer = Analyzer::new(Config::default());
             analyzer.calls.push(ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
-                owner: None,
                 key: OperationKey::http("GET", "/api/orders"),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from("client.ts:12"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
                 resolution_source: consumer_source,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             });
 
             let mut mount_graph = MountGraph::new();
             mount_graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
                 full_path: "/api/orders".to_string(),
-                handler: None,
                 owner: "app".to_string(),
                 file_location: "server.ts:10".to_string(),
-                middleware_chain: vec![],
                 repo_name: Some("api".to_string()),
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
                 resolution_source: producer_source,
-                dispatch: None,
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
             mount_graph.data_calls.push(DataFetchingCall {
                 procedure: None,
@@ -6448,30 +6361,11 @@ mod tests {
         resolution_source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
     ) -> ApiEndpointDetails {
         ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key,
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(file_path),
-            repo_name: None,
             service_name: Some(service.to_string()),
-            provenance: Default::default(),
             resolution_source,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         }
     }
 
@@ -6678,25 +6572,15 @@ mod tests {
         // The HTTP request on the same line is a fact, and so is its route.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "orders-svc/src/routes.ts:10".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("orders-svc".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(FileBasedRoute),
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         mount_graph.data_calls.push(DataFetchingCall {
             procedure: None,
@@ -6767,25 +6651,15 @@ mod tests {
         ));
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "orders-svc/src/routes.ts:10".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("orders-svc".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(FileBasedRoute),
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         // The one call row the scan holds in that file is on another line,
         // and there is no pub/sub call row at all.
@@ -7129,30 +7003,10 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/api/orders"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("client.ts:12"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             resolution_source: Some(ResolutionSource::ImportedMember),
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
@@ -7167,25 +7021,15 @@ mod tests {
             ),
         ] {
             mount_graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "POST".to_string(),
                 path: "/api/orders".to_string(),
                 full_path: "/api/orders".to_string(),
-                handler: None,
                 owner: "app".to_string(),
                 file_location: "server.ts:10".to_string(),
-                middleware_chain: vec![],
                 repo_name: Some("api".to_string()),
-                service_name: None,
-                provenance: Default::default(),
                 evidence,
                 resolution_source: source,
-                dispatch: None,
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7233,25 +7077,15 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for (path, is_view_module) in [("/dashboard", true), ("/api/orders", false)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
                 view_module: is_view_module,
                 method: "GET".to_string(),
                 path: path.to_string(),
                 full_path: path.to_string(),
-                handler: None,
                 owner: "app".to_string(),
                 file_location: format!("app{path}/route.tsx:1"),
-                middleware_chain: vec![],
                 repo_name: Some("web".to_string()),
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
-                resolution_source: None,
-                dispatch: None,
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
 
@@ -7300,30 +7134,11 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
         let mut call = |value: Option<&str>, line: u32| {
             analyzer.calls.push(ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
-                owner: None,
                 key: OperationKey::http("POST", ROUTE),
-                params: vec![],
-                request_body: None,
-                response_body: None,
-                handler_name: None,
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from(format!("api-client.ts:{line}")),
                 repo_name: Some("mcp".to_string()),
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
                 dispatch: value.map(case),
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             });
         };
         call(Some("search-by-intent"), 115);
@@ -7333,25 +7148,16 @@ mod tests {
         let mut mount_graph = MountGraph::new();
         for value in CASES {
             mount_graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "POST".to_string(),
                 path: ROUTE.to_string(),
                 full_path: ROUTE.to_string(),
                 handler: Some(format!("handle-{value}")),
                 owner: "app".to_string(),
                 file_location: "index.ts:400".to_string(),
-                middleware_chain: vec![],
                 repo_name: Some("cloud".to_string()),
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
-                resolution_source: None,
                 dispatch: Some(case(value)),
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
 
@@ -7396,54 +7202,26 @@ mod tests {
 
         let mut analyzer = Analyzer::new(Config::default());
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("POST", ROUTE),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("api-client.ts:115"),
             repo_name: Some("mcp".to_string()),
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
             dispatch: sends.map(case),
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
         for (value, line) in [("search-by-intent", 400), ("list-external-calls", 412)] {
             mount_graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "POST".to_string(),
                 path: ROUTE.to_string(),
                 full_path: ROUTE.to_string(),
                 handler: Some(format!("handle-{value}")),
                 owner: "app".to_string(),
                 file_location: format!("index.ts:{line}"),
-                middleware_chain: vec![],
                 repo_name: Some("cloud".to_string()),
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
-                resolution_source: None,
                 dispatch: Some(case(value)),
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7535,53 +7313,21 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/api/missing"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("client.ts:3"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "server.ts:10".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("api".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -7607,55 +7353,23 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/api/missing"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(
                 "/home/runner/work/acme-app/acme-app/src/providers/search.ts:313",
             ),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "server.ts:10".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("api".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let (findings, _, _) = analyzer.analyze_matches_with_mount_graph(&mount_graph);
@@ -7683,76 +7397,36 @@ mod tests {
         let mut analyzer = Analyzer::new(Config::default());
 
         analyzer.calls.push(ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", "/api/widgets"),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("client.ts:12"),
             repo_name: Some("consumer-repo".to_string()),
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         });
 
         let mut mount_graph = MountGraph::new();
         // The matched producer: an MSW-style handler under a mock tree.
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
-            handler: None,
             owner: "http".to_string(),
             file_location: "src/mocks/handlers.ts:5".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("producer-repo".to_string()),
-            service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         // An unmatched mock producer: must orphan WITH the mock tag.
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/api/widgets".to_string(),
             full_path: "/api/widgets".to_string(),
-            handler: None,
             owner: "http".to_string(),
             file_location: "src/mocks/handlers.ts:9".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("producer-repo".to_string()),
-            service_name: None,
             provenance: EndpointProvenance::Mock,
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         mount_graph.data_calls.push(DataFetchingCall {
             procedure: None,
@@ -7856,25 +7530,14 @@ mod tests {
         // reclassified to call-site evidence at scan time.
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "operations/create-widget.ts:14".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("repo-alpha".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         // repo-beta: the identical call to the same external endpoint.
         mount_graph.data_calls.push(DataFetchingCall {
@@ -7949,25 +7612,15 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
             handler: Some("createWidget".to_string()),
             owner: "app".to_string(),
             file_location: "src/server.ts:14".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("repo-alpha".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         mount_graph.data_calls.push(DataFetchingCall {
             procedure: None,
@@ -8024,25 +7677,14 @@ mod tests {
 
         let mut mount_graph = MountGraph::new();
         mount_graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/v2/widgets".to_string(),
             full_path: "/v2/widgets".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "operations/create-widget.ts:14".to_string(),
-            middleware_chain: vec![],
             repo_name: Some("repo-alpha".to_string()),
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::CallSite,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         mount_graph.data_calls.push(DataFetchingCall {
             procedure: None,

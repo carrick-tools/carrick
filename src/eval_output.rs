@@ -715,59 +715,19 @@ mod tests {
 
     fn endpoint(method: &str, path: &str, file_line: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http(method, path.to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
             handler_name: Some("getOrder".to_string()),
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(file_line),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         }
     }
 
     fn pubsub_op(topic: &str, file_line: &str, repo: &str) -> ApiEndpointDetails {
         ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::pubsub(topic),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(file_line),
             repo_name: Some(repo.to_string()),
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         }
     }
 
@@ -1209,30 +1169,9 @@ mod tests {
         let socket_key = OperationKey::socket("payment:settled", SocketDirection::ServerToClient);
         // A socket emitter lands on `calls` (consumer side).
         let call = ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: socket_key.clone(),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("src/socket.ts:12"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
 
         let result = ApiAnalysisResult {
@@ -1305,30 +1244,10 @@ mod tests {
             // SAME canonical key, the collapse trap.
             endpoints: vec![endpoint("GET", "/orders/:param", "src/orders.ts:12")],
             calls: vec![ApiEndpointDetails {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
-                owner: None,
                 key: shared_key.clone(),
-                params: vec![],
-                request_body: None,
-                response_body: None,
                 handler_name: Some("fetchOrder".to_string()),
-                request_type: None,
-                response_type: None,
                 file_path: PathBuf::from("web/src/orders.ts:7"),
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
-                resolution_source: None,
-                dispatch: None,
-                schema_binding: None,
-                undeclared_selection: None,
-                handler_span: None,
-                handler_file: None,
-                name_scope: None,
-                library_semantics: Vec::new(),
-                inference: None,
+                ..Default::default()
             }],
             findings: vec![],
             dependency_conflicts: vec![],
@@ -1479,30 +1398,9 @@ mod tests {
     fn request_only_op_still_surfaces_request_definition() {
         let key = OperationKey::http("POST", "/billing/charge");
         let call = ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: key.clone(),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from("src/billing.client.ts:19"),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],
@@ -1563,30 +1461,9 @@ mod tests {
     fn fan_in_consumer_calls_join_their_own_site_records() {
         let key = OperationKey::pubsub("order.placed");
         let call_at = |file_line: &str| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: key.clone(),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: PathBuf::from(file_line),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let result = ApiAnalysisResult {
             endpoints: vec![],

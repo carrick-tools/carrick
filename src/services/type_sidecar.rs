@@ -301,29 +301,13 @@ impl InferRequestItem {
                 end_column: None,
             },
             infer_kind: InferKind::RequestConfig,
-            primary_type_symbol: None,
-            array_depth: None,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
             any_provenance: vec![TypeProvenance {
                 path: String::new(),
                 kind: "unknown".to_string(),
                 reason: "no_request_body".to_string(),
                 detail: None,
             }],
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            body_member: None,
-            read_spans: Vec::new(),
+            ..Default::default()
         })
     }
 }
@@ -2142,7 +2126,7 @@ pub struct ReadSpan {
 }
 
 /// Source location information for a type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceLocation {
     /// File path relative to repo root
     pub file_path: String,
@@ -2326,6 +2310,40 @@ pub struct InferredType {
     /// nothing. Read by `demote_witnessed_borrowed_anchors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_symbol_relation: Option<ModelSymbolRelation>,
+}
+
+/// Every optional field absent, every flag off. The five identity fields have
+/// no honest default (`infer_kind` has no neutral variant), so this fills them
+/// with placeholders: a literal sets them and takes the rest from here with
+/// `..Default::default()`, which keeps a field added later from breaking it.
+impl Default for InferredType {
+    fn default() -> Self {
+        Self {
+            alias: String::new(),
+            type_string: String::new(),
+            is_explicit: false,
+            source_location: SourceLocation::default(),
+            infer_kind: InferKind::Expression,
+            read_spans: Vec::new(),
+            primary_type_symbol: None,
+            array_depth: None,
+            primary_type_symbol_source: None,
+            machinery: false,
+            anchor_machinery: false,
+            any_provenance: Vec::new(),
+            body_member: None,
+            declaring_package: None,
+            member_return_type: None,
+            unwidened_type_string: None,
+            unwidened_out_of_budget: false,
+            stated_body: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+            absent_body_tolerated: false,
+            response_modes: None,
+            model_symbol_relation: None,
+        }
+    }
 }
 
 /// A type the model named for a producer's response, sent beside the infer
@@ -8062,7 +8080,6 @@ mod tests {
 
     fn inferred(alias: &str, symbol: Option<&str>, array_depth: Option<u32>) -> InferredType {
         InferredType {
-            body_member: None,
             alias: alias.to_string(),
             type_string: "{ at: string; }[]".to_string(),
             is_explicit: false,
@@ -8076,21 +8093,7 @@ mod tests {
             infer_kind: InferKind::FunctionReturn,
             primary_type_symbol: symbol.map(str::to_string),
             array_depth,
-            type_home: None,
-            declaring_package: None,
-            member_return_type: None,
-            any_provenance: Vec::new(),
-            unwidened_type_string: None,
-            unwidened_out_of_budget: false,
-            stated_body: None,
-            printed_names: Vec::new(),
-            raw_text_read: false,
-            absent_body_tolerated: false,
-            response_modes: None,
-            model_symbol_relation: None,
-            machinery: false,
-            anchor_machinery: false,
-            read_spans: Vec::new(),
+            ..Default::default()
         }
     }
 

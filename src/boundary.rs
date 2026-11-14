@@ -1302,30 +1302,9 @@ mod tests {
 
         let repo_path = "/work/acme";
         let endpoint = |method: &str, path: &str, site: &str| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http(method, path.to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: std::path::PathBuf::from(site),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let data = CloudRepoData {
             endpoints: vec![
@@ -1388,30 +1367,9 @@ mod tests {
         use crate::operation::OperationKey;
 
         let call = |method: &str, path: &str, site: &str| ApiEndpointDetails {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
-            owner: None,
             key: OperationKey::http(method, path.to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: std::path::PathBuf::from(site),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let mut graph = MountGraph::new();
         graph.data_calls.push(DataFetchingCall {
@@ -1484,30 +1442,10 @@ mod tests {
         use crate::operation::OperationKey;
 
         let call = |path: &str, site: &str, procedure| ApiEndpointDetails {
-            declared_at: None,
             procedure,
-            view_module: false,
-            owner: None,
             key: OperationKey::http("GET", path.to_string()),
-            params: vec![],
-            request_body: None,
-            response_body: None,
-            handler_name: None,
-            request_type: None,
-            response_type: None,
             file_path: std::path::PathBuf::from(site),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
-            resolution_source: None,
-            dispatch: None,
-            schema_binding: None,
-            undeclared_selection: None,
-            handler_span: None,
-            handler_file: None,
-            name_scope: None,
-            library_semantics: Vec::new(),
-            inference: None,
+            ..Default::default()
         };
         let procedure = carrick_match::ProcedureKey {
             path: "orders.list".to_string(),

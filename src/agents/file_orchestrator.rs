@@ -12359,17 +12359,12 @@ impl FileOrchestrator {
                 };
 
                 graph.endpoints.push(ResolvedEndpoint {
-                    declared_at: None,
-                    procedure: None,
                     method,
                     path: endpoint.path.clone(),
                     full_path: endpoint.path.clone(), // Will be resolved later
                     handler: Some(endpoint.handler_name.clone()),
                     owner: resolved_owner,
                     file_location: format!("{}:{}", file_path, endpoint.line_number),
-                    middleware_chain: Vec::new(),
-                    repo_name: None,
-                    service_name: None,
                     // Structural classification from the source path: mock
                     // trees keep producing endpoints, tagged as such (#380).
                     provenance: crate::file_finder::endpoint_provenance(
@@ -12392,8 +12387,7 @@ impl FileOrchestrator {
                     // relative (cloud#948): the function index it is read from
                     // is not merged yet here.
                     handler_span: None,
-                    handler_file: None,
-                    address: None,
+                    ..Default::default()
                 });
                 registration_literals.push(endpoint.registration_literal.clone());
             }
@@ -19837,25 +19831,15 @@ export { routes };
         source: ResolutionSource,
     ) -> ResolvedEndpoint {
         ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
             method: method.to_string(),
             path: path.to_string(),
             full_path: path.to_string(),
             handler: Some(handler.to_string()),
             owner: "app".to_string(),
             file_location: format!("src/routes.ts:{line}"),
-            middleware_chain: Vec::new(),
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
             resolution_source: Some(source),
-            view_module: false,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         }
     }
 

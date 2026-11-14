@@ -28,7 +28,7 @@ pub struct MountEdge {
 }
 
 /// Represents an HTTP endpoint with its full computed path
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolvedEndpoint {
     pub method: String,
     pub path: String,
@@ -798,25 +798,13 @@ mod tests {
             ("/orders/list", "c"),
         ] {
             graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "POST".to_string(),
                 path: path.to_string(),
                 full_path: path.to_string(),
-                handler: None,
                 owner: owner.to_string(),
                 file_location: "server.ts:1".to_string(),
-                middleware_chain: vec![],
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
-                resolution_source: None,
-                dispatch: None,
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
         let normalizer = UrlNormalizer::new(&Config::default());
@@ -836,25 +824,13 @@ mod tests {
     #[test]
     fn a_row_written_before_addresses_reads_as_not_recorded() {
         let row = ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/orders".to_string(),
             full_path: "/api/orders".to_string(),
-            handler: None,
             owner: "app".to_string(),
             file_location: "src/server.ts:8".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         };
         let old = serde_json::to_value(&row).unwrap();
         assert!(old.get("address").is_none(), "{old}");
@@ -1115,25 +1091,14 @@ mod tests {
 
         // Add an endpoint
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/users/:id".to_string(),
             full_path: "/users/:id".to_string(),
             handler: Some("getUser".to_string()),
             owner: "userRouter".to_string(),
             file_location: "routes/users.js:10:1".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         // Create config with internal domain
@@ -1400,25 +1365,14 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "POST".to_string(),
             path: "/orders".to_string(),
             full_path: "/orders".to_string(),
             handler: Some("createOrder".to_string()),
             owner: "orderRouter".to_string(),
             file_location: "routes/orders.js:15:1".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let config = Config {
@@ -1454,25 +1408,14 @@ mod tests {
         // method a client sends.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "ALL".to_string(),
             path: "/rpc".to_string(),
             full_path: "/rpc".to_string(),
             handler: Some("handleRpc".to_string()),
             owner: "app".to_string(),
             file_location: "src/index.ts:12".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         let normalizer = UrlNormalizer::new(&Config::default());
         for method in ["GET", "POST"] {
@@ -1493,25 +1436,14 @@ mod tests {
         // endpoint; keeping `${this.apiUrl}` on the key made the join impossible.
         let mut graph = MountGraph::new();
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/api/v1/widgets/:id".to_string(),
             full_path: "/api/v1/widgets/:id".to_string(),
             handler: Some("getWidget".to_string()),
             owner: "widgetRouter".to_string(),
             file_location: "services/widget-plane/src/routes.ts:12:1".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         // No env vars declared: the injected base cannot be classified through
@@ -1534,25 +1466,14 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/users/:userId/orders/:orderId".to_string(),
             full_path: "/users/:userId/orders/:orderId".to_string(),
             handler: Some("getUserOrder".to_string()),
             owner: "orderRouter".to_string(),
             file_location: "routes/orders.js:20:1".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let config = Config {
@@ -1577,25 +1498,14 @@ mod tests {
         let mut graph = MountGraph::new();
 
         graph.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/users".to_string(),
             full_path: "/users".to_string(),
             handler: Some("listUsers".to_string()),
             owner: "userRouter".to_string(),
             file_location: "routes/users.js:5:1".to_string(),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
 
         let config = Config::default();
@@ -1615,25 +1525,13 @@ mod tests {
         let mut graph = MountGraph::new();
         for full_path in ["/api/**", "/api/v1/chat/new"] {
             graph.endpoints.push(ResolvedEndpoint {
-                declared_at: None,
-                procedure: None,
-                view_module: false,
                 method: "GET".to_string(),
                 path: full_path.to_string(),
                 full_path: full_path.to_string(),
-                handler: None,
                 owner: "app".to_string(),
                 file_location: "server.ts:1".to_string(),
-                middleware_chain: vec![],
-                repo_name: None,
-                service_name: None,
-                provenance: Default::default(),
                 evidence: carrick_match::MatchEvidence::RouteDefinition,
-                resolution_source: None,
-                dispatch: None,
-                handler_span: None,
-                handler_file: None,
-                address: None,
+                ..Default::default()
             });
         }
         let normalizer = UrlNormalizer::default_permissive();
@@ -1703,25 +1601,13 @@ mod tests {
     ) -> crate::cloud_storage::CloudRepoData {
         let mut mg = MountGraph::new();
         mg.endpoints.push(ResolvedEndpoint {
-            declared_at: None,
-            procedure: None,
-            view_module: false,
             method: "GET".to_string(),
             path: "/health".to_string(),
             full_path: "/health".to_string(),
-            handler: None,
             owner: repo.to_string(),
             file_location: format!("{}/health.ts:1", repo),
-            middleware_chain: vec![],
-            repo_name: None,
-            service_name: None,
-            provenance: Default::default(),
             evidence: carrick_match::MatchEvidence::RouteDefinition,
-            resolution_source: None,
-            dispatch: None,
-            handler_span: None,
-            handler_file: None,
-            address: None,
+            ..Default::default()
         });
         crate::cloud_storage::CloudRepoData {
             repo_name: repo.to_string(),
