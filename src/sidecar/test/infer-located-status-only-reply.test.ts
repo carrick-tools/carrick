@@ -7,11 +7,12 @@
  * asks abstain there: the call hands the reply back and states only a status,
  * so it names no body. A located call that hands back the reply of the
  * handler it sits in, and is handed a status-shaped value (read as a chain's
- * status call is read, never by method name), abstains the same way.
+ * status call is read, never by method name) in a slot that does not take
+ * any value, abstains the same way.
  *
  * A send of a value keeps its reading: a typed send after a status call, the
- * send branch of a send-or-status conditional, a text send and a send of a
- * value declared `unknown`.
+ * send branch of a send-or-status conditional, a text send, a send of a
+ * number and a send of a value declared `unknown`.
  *
  * The server packages are installed under `node_modules`, so their reply
  * types are declared outside the repository.
@@ -45,6 +46,7 @@ import type { App } from 'fixture-express';
 interface Item { id: string }
 declare const item: Item;
 declare const found: boolean;
+declare const count: number;
 
 export function serverRoutes(app: ServerInstance) {
   app.post('/code', async (_request, reply) => reply.code(204));
@@ -52,10 +54,13 @@ export function serverRoutes(app: ServerInstance) {
   app.post('/cond', async (_request, reply) => (found ? reply.send([item]) : reply.code(204)));
   app.post('/text', async (_request, reply) => reply.send('ok'));
   app.post('/unknown', async (request, reply) => reply.send(request.body));
+  app.post('/count', async (_request, reply) => reply.send(count));
+  app.post('/ok', async (_request, reply) => reply.send(200));
 }
 
 export function expressRoutes(app: App) {
   app.post('/status', async (_req, res) => res.status(204));
+  app.post('/total', async (_req, res) => res.json(count));
 }
 `;
 
@@ -190,6 +195,18 @@ describe('carrick#4300: a located status-only call on the reply names no body', 
     assert.ok(send, '/text must answer');
     assert.strictEqual(send.type_string, '"ok"');
   });
+
+  for (const [route, call, type] of [
+    ['/count', 'reply.send(count)', 'number'],
+    ['/ok', 'reply.send(200)', '200'],
+    ['/total', 'res.json(count)', 'number'],
+  ] as const) {
+    it(`${route}: a send of a number into a slot that takes any value keeps its reading`, async () => {
+      const send = await bySend(route, call);
+      assert.ok(send, `${route} must answer`);
+      assert.strictEqual(send.type_string, type);
+    });
+  }
 
   it('/unknown: a send of a value declared unknown keeps its answer', async () => {
     const send = await bySend('/unknown', 'reply.send(request.body)');
