@@ -1152,28 +1152,102 @@ fn callers_above(
     out
 }
 
-/// The span of each name a call's arguments (what each may hold, by
-/// position) hand on as a value: an argument itself, or a value of an
-/// object literal's key, at any depth (`{ g: gate }`). A member read
-/// (`deps.g`) is no name.
-fn named_values(args: &[Vec<super::resolve::ValueAt>]) -> Vec<(u32, u32)> {
+/// The value a call hands on at an argument, and the keys down to it
+/// inside an object or array literal, where the compiler's row there names
+/// what it holds.
+enum RowRead {
+    /// The row names a definition of the service: its file and key.
+    Function(PathBuf, String),
+    /// The row says the value is no definition of the service.
+    Other,
+}
+
+/// Each definition `call`, written in `file`, hands on as a value
+/// (carrick#4176), with the argument and the keys down to it: an argument
+/// itself, or a value of an object literal's key or an array's element, at
+/// any depth (`{ g: gate }`). Per argument and keys, the compiler's row
+/// decides where it gives a read there; where it gives none, the name the
+/// syntax reads stands ([`CallIr::handed_names`]). A member read (`deps.g`)
+/// is no name.
+fn handed_by(
+    source: &RequestSummaryInputs,
+    file: &Path,
+    call: &CallIr,
+) -> Vec<(PathBuf, String, usize, Vec<String>)> {
     use super::resolve::ValueAt;
-    let mut spans = Vec::new();
-    let mut stack: Vec<&ValueAt> = args.iter().flatten().collect();
-    while let Some(value) = stack.pop() {
+    fn reads(
+        source: &RequestSummaryInputs,
+        file: &Path,
+        value: &ValueAt,
+        keys: &mut Vec<String>,
+        out: &mut Vec<(Vec<String>, RowRead)>,
+    ) {
+        if keys.len() > MAX_HANDED_DEPTH {
+            return;
+        }
         match value {
             ValueAt::Read {
                 lo,
                 hi,
                 member: false,
                 ..
-            } => spans.push((*lo, *hi)),
-            ValueAt::Object { fields, .. } => stack.extend(fields.values().flatten()),
+            } => match source.row_names(file, *lo, *hi, Kind::Ident) {
+                Reach::Function(def, key) => out.push((keys.clone(), RowRead::Function(def, key))),
+                Reach::NoFunction | Reach::OutsideService(..) => {
+                    out.push((keys.clone(), RowRead::Other))
+                }
+                Reach::Unknown(_) => {}
+            },
+            ValueAt::Object { fields, .. } => {
+                for (key, values) in fields {
+                    keys.push(key.clone());
+                    for inner in values {
+                        reads(source, file, inner, keys, out);
+                    }
+                    keys.pop();
+                }
+            }
+            ValueAt::Elements(elements) => {
+                for (index, inner) in elements.iter().enumerate() {
+                    keys.push(index.to_string());
+                    reads(source, file, inner, keys, out);
+                    keys.pop();
+                }
+            }
             _ => {}
         }
     }
-    spans
+    let mut out: Vec<(PathBuf, String, usize, Vec<String>)> = Vec::new();
+    let mut answered: HashSet<(usize, Vec<String>)> = HashSet::new();
+    for (arg, values) in call.arg_values.iter().enumerate() {
+        let mut found = Vec::new();
+        for value in values {
+            reads(source, file, value, &mut Vec::new(), &mut found);
+        }
+        for (keys, read) in found {
+            if let RowRead::Function(def, key) = read {
+                let entry = (def, key, arg, keys.clone());
+                if !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+            answered.insert((arg, keys));
+        }
+    }
+    for (arg, keys, name) in &call.handed_names {
+        if answered.contains(&(*arg, keys.clone())) {
+            continue;
+        }
+        let entry = (file.to_path_buf(), name.clone(), *arg, keys.clone());
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out
 }
+
+/// How many keys down inside an argument [`handed_by`] reads.
+const MAX_HANDED_DEPTH: usize = 8;
 
 /// One call, where it is written: its file, the definition key of the
 /// function whose body holds it (`None` at module level), how many functions
@@ -1198,11 +1272,17 @@ pub(super) struct Placed<'a> {
 /// One call that hands a definition on as a value (carrick#4176): the call,
 /// the argument, and the keys down to the definition inside it.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(super) struct HandedOn<'a> {
     pub(super) placed: Placed<'a>,
     pub(super) arg: usize,
     pub(super) keys: Vec<String>,
+    /// The call is optional (`run?.(gate)`).
+    pub(super) optional: bool,
+    /// The call reaches a function of the service, as the index's callers
+    /// edge reads it: what runs the definition may be the call that reads
+    /// it off that argument (`deps.g(args)`), which no row names
+    /// (carrick#4025).
+    pub(super) inward: bool,
 }
 
 /// The definition a call reaches, as a callers index reads it: its file and
@@ -1225,12 +1305,10 @@ pub(super) struct Calls<'a> {
     aside: HashMap<(&'a Path, u32, u32), Placed<'a>>,
     by_owner: HashMap<(&'a Path, &'a str), Vec<Placed<'a>>>,
     callers: HashMap<(PathBuf, String), Vec<Placed<'a>>>,
-    /// The definitions an argument of a call into a function of the service
-    /// hands on as a value, by name, whole or as a value in an object
-    /// literal (`outer({ g: gate })`), as the rows name them: what runs
-    /// such a definition may be the call that reads it off that argument
-    /// (`deps.g(args)`), which no row names (carrick#4025).
-    handed_inward: HashSet<(PathBuf, String)>,
+    /// Each call that hands a definition on as a value, by the
+    /// definition's file and key ([`handed_by`], carrick#4176): the one
+    /// record the value walk, the guard chains and the instance walk read.
+    handed_on: HashMap<(PathBuf, String), Vec<HandedOn<'a>>>,
     /// The definition of a sibling a call of this service reaches, by the
     /// call's file and span (carrick#2618).
     cross: HashMap<(&'a Path, u32, u32), (PathBuf, String)>,
@@ -1385,14 +1463,32 @@ impl<'a> Calls<'a> {
                 if let Some(key) = key {
                     out.by_owner.entry((file, key)).or_default().push(placed);
                 }
-                if !is_optional && let Some(target) = target_of(at, file, call, in_constructor) {
+                let target = if is_optional {
+                    None
+                } else {
+                    target_of(at, file, call, in_constructor)
+                };
+                let inward = target.is_some();
+                if let Some(target) = target {
                     out.callers.entry(target).or_default().push(placed);
-                    for (lo, hi) in named_values(&call.arg_values) {
-                        if let Reach::Function(handed, key) =
-                            at.source.row_names(file, lo, hi, Kind::Ident)
-                        {
-                            out.handed_inward.insert((handed, key));
-                        }
+                }
+                for (def, def_key, arg, keys) in handed_by(at.source, file, call) {
+                    let handed = out.handed_on.entry((def, def_key)).or_default();
+                    let again = handed.iter().any(|known| {
+                        known.placed.file == file
+                            && known.placed.call.site.span_start == call.site.span_start
+                            && known.placed.call.site.span_end == call.site.span_end
+                            && known.arg == arg
+                            && known.keys == keys
+                    });
+                    if !again {
+                        handed.push(HandedOn {
+                            placed,
+                            arg,
+                            keys,
+                            optional: is_optional,
+                            inward,
+                        });
                     }
                 }
             }
@@ -1446,7 +1542,7 @@ impl<'a> Calls<'a> {
             aside: HashMap::new(),
             by_owner: HashMap::new(),
             callers: HashMap::new(),
-            handed_inward: HashSet::new(),
+            handed_on: HashMap::new(),
             cross: HashMap::new(),
         };
         for (position, source) in std::iter::once(inputs)
@@ -1556,17 +1652,28 @@ impl<'a> Calls<'a> {
     }
 
     /// Whether the definition `key` of `file` is handed on as a value to a
-    /// function of the service ([`Self::handed_inward`]): what runs it may
-    /// be a call [`Self::callers_of`] does not list.
+    /// function of the service ([`HandedOn::inward`]): what runs it may be
+    /// a call [`Self::callers_of`] does not list.
     pub(super) fn handed_inward(&self, file: &Path, key: &str) -> bool {
-        self.handed_inward
-            .contains(&(file.to_path_buf(), key.to_string()))
+        self.handed_on(file, key).iter().any(|handed| handed.inward)
     }
 
-    /// Each call that hands the definition `key` of `file` on as a value.
-    #[allow(dead_code)]
-    pub(super) fn handed_on(&self, _file: &Path, _key: &str) -> &[HandedOn<'a>] {
-        &[]
+    /// Each call that hands the definition `key` of `file` on as a value
+    /// ([`handed_by`]).
+    pub(super) fn handed_on(&self, file: &Path, key: &str) -> &[HandedOn<'a>] {
+        self.handed_on
+            .get(&(file.to_path_buf(), key.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Every call that hands a definition on as a value, with the
+    /// definition's file and key.
+    pub(super) fn every_handed_on(
+        &self,
+    ) -> impl Iterator<Item = (&(PathBuf, String), &HandedOn<'a>)> {
+        self.handed_on
+            .iter()
+            .flat_map(|(def, handed)| handed.iter().map(move |one| (def, one)))
     }
 
     /// What this service or the sibling that holds `file` read of it.

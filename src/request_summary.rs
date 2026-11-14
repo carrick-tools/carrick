@@ -1083,8 +1083,11 @@ struct CallIr {
     /// result guards.
     tested: Option<Tested>,
     /// Each name of a function this module declares that an argument hands
-    /// on, by position, with the keys down to it inside the argument.
-    handed: Vec<(usize, Vec<String>, String)>,
+    /// on, by position, with the keys down to it inside the argument, as
+    /// the syntax reads it. Read only by [`decided_sites::Calls`]'s build,
+    /// where the compiler's rows give no read at that argument and key
+    /// (carrick#4176): every other reader reads that one record.
+    handed_names: Vec<(usize, Vec<String>, String)>,
     /// The text each argument before any spread states, or a field of an
     /// object-literal argument does, as the value flow reads names
     /// (carrick#2386): what a call that names an operation names. Read by
@@ -8752,7 +8755,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             Callee::Expr(callee) => Some(self.reader.subject(callee, self.scope, bound)),
             _ => None,
         };
-        let handed = self.reader.handed(&call.args, self.scope, bound);
+        let handed_names = self.reader.handed(&call.args, self.scope, bound);
         let names = self.reader.arg_names(&call.args, self.scope);
         let spread_args = self.reader.spread_args(&call.args, self.scope);
         let callee_values = match &call.callee {
@@ -8794,7 +8797,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             rest_values: self.reader.rest_values(&call.args, self.scope, bound),
             arg_spans: arg_spans(&call.args),
             tested: self.guard.tested(call.span),
-            handed,
+            handed_names,
             names,
             spread_args,
             receiver_spans: match &call.callee {
@@ -8884,7 +8887,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 rest_values: Vec::new(),
                 arg_spans: Vec::new(),
                 tested: None,
-                handed: Vec::new(),
+                handed_names: Vec::new(),
                 names: Vec::new(),
                 spread_args: Vec::new(),
                 receiver_spans: Vec::new(),
