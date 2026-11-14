@@ -2016,6 +2016,33 @@ fn a_build_states_its_phases_and_counts_to_a_parent_that_is_reading() {
         "the routes the map prints are the routes the summary carries:\n{stderr}"
     );
     assert!(summary.elapsed_secs > 0.0, "{stderr}");
+
+    // The answer's boundary rides stdout, once, before the map (carrick#4357):
+    // the wrapper tells the two apart by it and not by which pipe it read first.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let boundaries: Vec<usize> = stdout
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| carrick::progress::parse_answered(line))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        boundaries.len(),
+        1,
+        "exactly one answer boundary on stdout:\n{stdout}"
+    );
+    let map = stdout
+        .lines()
+        .position(|line| line.contains("indexed 2 repo(s)"))
+        .unwrap_or_else(|| panic!("the map is missing from stdout:\n{stdout}"));
+    assert!(
+        boundaries[0] < map,
+        "the boundary comes before the map:\n{stdout}"
+    );
+    assert!(
+        !stderr.lines().any(carrick::progress::parse_answered),
+        "the boundary is never written on stderr:\n{stderr}"
+    );
 }
 
 /// Rewrite a file with the bytes it already has, and push its mtime forward so

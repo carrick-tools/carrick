@@ -5,7 +5,9 @@
 // `carrick refresh` with CARRICK_PROGRESS set: the markers on stderr, the
 // binary's own plain lines beside them, and the map on stdout. The renderer
 // has to keep the first and drop the second and third, so the fake carries
-// all three rather than the markers alone.
+// all three rather than the markers alone. Like the binary, it closes the
+// answer on stdout (`@carrick-answered {}`) immediately before its first phase
+// marker, and writes no boundary in "silent" (carrick#4357).
 //
 // Env it honours:
 //   CARRICK_FAKE_SCAN   which stream to write:
@@ -40,6 +42,7 @@ err(
 out("Reading the tree: 1204 files across 5 services; last time 2m13s.");
 
 if (mode === "dispatch") {
+  out("@carrick-answered {}");
   err('@carrick-phase {"label":"indexing api","state":"started"}');
   err('@carrick-progress {"service":"api","service_index":1,"service_total":1,"phase":"files","done":95,"total":95}');
   err("✓ indexed api");
@@ -51,6 +54,7 @@ if (mode === "dispatch") {
   process.exit(Number(process.env.CARRICK_FAKE_EXIT ?? 0));
 }
 
+out("@carrick-answered {}");
 err('@carrick-phase {"label":"indexing api","state":"started"}');
 err('@carrick-progress {"service":"api","service_index":1,"service_total":1,"phase":"files","done":40,"total":95}');
 err('@carrick-notice {"text":"model busy: slowing analyze-file to 4 requests at a time"}');

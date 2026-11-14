@@ -367,6 +367,24 @@ pub fn parse(line: &str) -> Option<Update> {
     serde_json::from_str(payload).ok()
 }
 
+/// The prefix of the one marker that goes on stdout: the line that closes the
+/// command's own answer (carrick#4357).
+///
+/// The npm wrapper reads the two pipes separately and cannot tell which line
+/// arrived first, so the answer (stdout before this line) and the map (stdout
+/// after it) are told apart on the pipe they share, not by the phase markers on
+/// the other one. Written once, just before the first phase or summary marker,
+/// and only when [`PROGRESS_ENV`] is set; the wrapper never draws it.
+const ANSWERED_MARKER: &str = "@carrick-answered ";
+
+/// Read the answer's boundary out of a line of a build's stdout.
+#[allow(dead_code)] // As [`parse_phase`]: the reader is the npm wrapper's.
+pub fn parse_answered(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(ANSWERED_MARKER)
+        .is_some_and(|payload| payload.trim() == "{}")
+}
+
 /// The prefix a build names the phase it is entering or leaving on.
 const PHASE_MARKER: &str = "@carrick-phase ";
 
@@ -710,6 +728,27 @@ mod tests {
         assert!(parse("Analyzing service api (1/3)").is_none());
         assert!(parse("@carrick-progress not json").is_none());
         assert!(parse("").is_none());
+    }
+
+    /// The boundary is its own marker: no other family reads it, and it reads
+    /// none of theirs (carrick#4357).
+    #[test]
+    fn the_answer_boundary_is_not_another_marker() {
+        let line = format!("{ANSWERED_MARKER}{{}}");
+        assert!(parse_answered(&line));
+        assert!(parse_phase(&line).is_none());
+        assert!(parse_summary(&line).is_none());
+        assert!(parse_notice(&line).is_none());
+        assert!(parse(&line).is_none());
+        for other in [
+            r#"@carrick-phase {"label":"indexing api","state":"started"}"#,
+            r#"@carrick-notice {"text":"x"}"#,
+            "@carrick-progress {}",
+            "@carrick-summary {}",
+            "indexed 2 repo(s)",
+        ] {
+            assert!(!parse_answered(other), "{other}");
+        }
     }
 
     #[test]
