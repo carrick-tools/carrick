@@ -417,18 +417,9 @@ jobs:
       - name: Run sidecar tests
         working-directory: src/sidecar
         run: |
-          heavy='deno-project|check-v2-corpus|capture-v2-installed-pin|sidecar\.test\.js'
-          shard="${{ matrix.shard }}"
-          if [ "$shard" = "heavy" ]; then
-            files=$(ls dist/test/*.test.js | grep -E "dist/test/($heavy)")
-          else
-            n="${shard#rest-}"
-            files=$(ls dist/test/*.test.js | grep -v -E "dist/test/($heavy)" | awk -v n="$n" 'NR % 3 == n % 3')
-          fi
-          echo "$shard: $(echo "$files" | wc -l | tr -d ' ') files"
-          echo "$files" | tr ' ' '\n'
-          # shellcheck disable=SC2086
-          node --test $files
+          # The shard lists live in scripts/test-files.mjs, the same file
+          # `npm test` reads (carrick#4310).
+          node scripts/test-files.mjs run "${{ matrix.shard }}"
 
   # The surface lister carrick-cloud's library store runs (carrick#1660): the
   # sidecar bundled into one file, on the store's Node 22 runtime. The listing
