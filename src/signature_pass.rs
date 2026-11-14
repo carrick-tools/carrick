@@ -617,7 +617,154 @@ fn compose_signature(def: &FunctionDefinition) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let ret = def.return_type.as_deref().unwrap_or(RETURN_UNKNOWN);
-    format!("({params}) => {ret}")
+    one_line_signature(format!("({params}) => {ret}"))
+}
+
+/// Records where the parser says type members, comments-free literals and
+/// template literals sit in a signature, so the one-line rewrite never guesses
+/// from line ends.
+#[derive(Default)]
+struct SignatureSpans {
+    /// For every object-type member except its last: (member end, next member start).
+    member_gaps: Vec<(usize, usize)>,
+    /// Literal text kept verbatim (strings, template literals).
+    literals: Vec<(usize, usize)>,
+    base: usize,
+}
+
+impl SignatureSpans {
+    fn range(&self, span: swc_common::Span) -> (usize, usize) {
+        (
+            span.lo.0 as usize - self.base,
+            span.hi.0 as usize - self.base,
+        )
+    }
+}
+
+impl swc_ecma_visit::Visit for SignatureSpans {
+    fn visit_ts_type_lit(&mut self, lit: &swc_ecma_ast::TsTypeLit) {
+        use swc_common::Spanned;
+        for pair in lit.members.windows(2) {
+            let (_, end) = self.range(pair[0].span());
+            let (start, _) = self.range(pair[1].span());
+            self.member_gaps.push((end, start));
+        }
+        swc_ecma_visit::VisitWith::visit_children_with(lit, self);
+    }
+    fn visit_str(&mut self, s: &swc_ecma_ast::Str) {
+        self.literals.push(self.range(s.span));
+    }
+    fn visit_tpl(&mut self, t: &swc_ecma_ast::Tpl) {
+        self.literals.push(self.range(t.span));
+    }
+    fn visit_ts_tpl_lit_type(&mut self, t: &swc_ecma_ast::TsTplLitType) {
+        self.literals.push(self.range(t.span));
+    }
+}
+
+/// Store a signature on one line that is still valid TypeScript: a member
+/// that ended at a line break gets its `;`, comments go, and whitespace
+/// outside literals folds to one space. Member boundaries come from the
+/// parser. Text without a line break or comment, and text the parser cannot
+/// read, is returned unchanged.
+fn one_line_signature(text: String) -> String {
+    if !text.contains('\n') && !text.contains("//") && !text.contains("/*") {
+        return text;
+    }
+    rewrite_one_line(&text).unwrap_or(text)
+}
+
+fn rewrite_one_line(text: &str) -> Option<String> {
+    use swc_common::comments::SingleThreadedComments;
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
+    use swc_ecma_visit::VisitWith;
+
+    let prefix = "type __CarrickSig = ";
+    let source = format!("{prefix}{text};");
+    let map: Lrc<SourceMap> = Default::default();
+    let file = map.new_source_file(FileName::Anon.into(), source.clone());
+    let comments = SingleThreadedComments::default();
+    let mut parser = Parser::new(
+        Syntax::Typescript(TsSyntax::default()),
+        StringInput::from(&*file),
+        Some(&comments),
+    );
+    let module = parser.parse_module().ok()?;
+    if !parser.take_errors().is_empty() || module.body.len() != 1 {
+        return None;
+    }
+    let base = file.start_pos.0 as usize + prefix.len();
+    let mut spans = SignatureSpans {
+        base,
+        ..Default::default()
+    };
+    module.visit_with(&mut spans);
+
+    let mut dropped = vec![false; text.len()];
+    let mut comment_count = 0;
+    let (leading, trailing) = comments.take_all();
+    for map in [leading, trailing] {
+        for list in map.borrow().values() {
+            for comment in list {
+                let lo = (comment.span.lo.0 as usize).checked_sub(base)?;
+                let hi = (comment.span.hi.0 as usize).checked_sub(base)?;
+                if hi > text.len() {
+                    return None;
+                }
+                dropped[lo..hi].iter_mut().for_each(|d| *d = true);
+                comment_count += 1;
+            }
+        }
+    }
+    if !text.contains('\n') && comment_count == 0 {
+        return None;
+    }
+    let mut kept = vec![false; text.len()];
+    for &(lo, hi) in &spans.literals {
+        kept[lo..hi.min(text.len())]
+            .iter_mut()
+            .for_each(|k| *k = true);
+    }
+    // A member needs a `;` unless a `;` or `,` already closes it, in its own
+    // text or before the next member (comments aside).
+    let mut insert_at = std::collections::HashSet::new();
+    for &(end, next) in &spans.member_gaps {
+        let closes = |range: std::ops::Range<usize>| {
+            range
+                .filter(|&i| !dropped[i])
+                .any(|i| matches!(text.as_bytes()[i], b';' | b','))
+        };
+        let own_last = (0..end)
+            .rev()
+            .find(|&i| !dropped[i] && !text.as_bytes()[i].is_ascii_whitespace());
+        let own_closed = own_last.is_some_and(|i| matches!(text.as_bytes()[i], b';' | b','));
+        if !own_closed && !closes(end..next) {
+            insert_at.insert(end);
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for (i, ch) in text.char_indices() {
+        if insert_at.contains(&i) {
+            out.push(';');
+        }
+        if dropped[i] {
+            pending_space = true;
+            continue;
+        }
+        if !kept[i] && ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    Some(out)
 }
 
 /// Resolve the repo root to an absolute, canonicalized path (mirrors

@@ -2617,6 +2617,89 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_signature_is_stored_on_one_line_with_its_separators() {
+        let mut defs = extract(
+            r#"
+            export function members(rule: {
+              kind: 'exact' | 'prefix'
+              path?: string
+              weight: number
+            }): void {}
+            export function commented(opts: {
+              // where the files live
+              root: string;
+              readOnly?: boolean; // defaults to false
+            }): void {}
+            export function mixed(input: {
+              /** rows to read */
+              rows: string[]
+              mode:
+                | 'fast'
+                | 'full'
+            }): {
+              total: number
+              byMode: { fast: number, full: number }
+            } { return null as any; }
+            export function methods(svc: {
+              run(): void
+              stop(): void
+            }): void {}
+            export function stringy(cfg: {
+              url: 'https://x'
+              name: string
+            }): void {}
+            export function mapped(m: {
+              [K in Keys]: V
+            }): void {}
+            export function destructured({
+              a,
+              b,
+            }: { a: string; b: string }): void {}
+            export function single(x: { a: string; b: number }): void {}
+        "#,
+        );
+        crate::signature_pass::populate_function_signatures(None, &mut defs, "/tmp");
+        let sig = |name: &str| defs[name].signature.clone().unwrap();
+        assert_eq!(
+            sig("members"),
+            "(rule: { kind: 'exact' | 'prefix'; path?: string; weight: number }) => void"
+        );
+        assert_eq!(
+            sig("commented"),
+            "(opts: { root: string; readOnly?: boolean; }) => void"
+        );
+        assert_eq!(
+            sig("mixed"),
+            "(input: { rows: string[]; mode: | 'fast' | 'full' }) => { total: number; byMode: { fast: number, full: number } }"
+        );
+        assert_eq!(
+            sig("methods"),
+            "(svc: { run(): void; stop(): void }) => void"
+        );
+        assert_eq!(
+            sig("stringy"),
+            "(cfg: { url: 'https://x'; name: string }) => void"
+        );
+        assert_eq!(sig("mapped"), "(m: { [K in Keys]: V }) => void");
+        assert_eq!(
+            sig("destructured"),
+            "({ a, b }: { a: string; b: string }) => void"
+        );
+        assert_eq!(sig("single"), "(x: { a: string; b: number }) => void");
+        for name in defs.keys() {
+            assert!(!sig(name).contains('\n'), "{name} holds a line break");
+        }
+        // The argument records keep the raw source text.
+        assert!(
+            defs["members"].arguments[0]
+                .type_string
+                .as_deref()
+                .unwrap()
+                .contains('\n')
+        );
+    }
+
+    #[test]
     fn parameter_facts_survive_signature_projection_and_storage() {
         let mut defs = extract(
             r#"
