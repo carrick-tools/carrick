@@ -1328,7 +1328,7 @@ impl<'a> Resolver<'a> {
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(self.unread_declaration(row));
         };
-        if binding.kind == BindingKind::LoopElement {
+        if binding.kind == BindingKind::LoopElement && key == "__delete_check__" {
             return self.text_of_element_member(&at, binding, declared, &key, read_from);
         }
         let Some(ValueAt::Entries(entries)) = &binding.text else {
