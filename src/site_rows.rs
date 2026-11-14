@@ -1634,10 +1634,6 @@ pub fn fold_rows(
                     && is_old_path(existing)
                     && (existing.key != row.key || !another_key_here))
                 || (row.fact()
-                    && existing.resolution_source.is_some_and(is_base_path_source)
-                    && existing.key == row.key
-                    && !another_key_here)
-                || (row.fact()
                     && existing.resolution_source == Some(ResolutionSource::SocketCall)
                     && existing.key == row.key
                     && matches!(
