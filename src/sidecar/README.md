@@ -376,6 +376,8 @@ Assembles the given stub packages into a scratch synthetic monorepo, installs th
 
 `protocol` is one of `http`, `graphql`, `socket`, `pubsub`; `type_kind` is `request`, `response` or `both`. `workspace_root` is optional (defaults to the OS temp dir); `keep_workspace` keeps the assembled tree on disk.
 
+A stub that serves a GraphQL schema may carry `graphql_types`, its SDL output types by name (`{ "Invoice": { "fields": { "total": { "non_null": { "scalar": "String" } } } } }`; a union is `{ "members": [...] }`; a leaf is `scalar`, `enum`, `list`, `non_null` or `type`). A GraphQL producer response pair may carry `graphql_root` (`{ "type": "Query", "field": "invoice" }`). With both, each built-in scalar leaf is compared in the type its scalar sends (`String`/`ID` a string, `Int`/`Float` a number, `Boolean` a boolean) and keeps the producer's own `null`/`undefined`; a custom scalar, an enum and a field the SDL does not name keep the JSON form (carrick#4403). Without them the response is compared in JSON form.
+
 Progress frames, zero or more:
 ```json
 { "request_id": "3", "status": "progress", "phase": "installing", "message": "check installing" }
@@ -1077,7 +1079,7 @@ One answer per query, in request order. A declaration and each implementation ar
 
 Resolves surface aliases from a stub package's declaration tree (`<stub_dir>/types/surface.d.ts`), in a dedicated throwaway project so the warm project never sees stub files. Stateless: it needs no `init` and never builds the init'd project, so it costs what the stub costs. Returns two forms per alias: `definition` as written (named refs preserved) and `expanded` fully structural, with named members inlined. Union members print in a canonical order, so the same tree always yields the same string (carrick#735).
 
-Each alias names the payload it types: `protocol`, `type_kind` and the `side` its entry is on. The sending side of an `http` payload (a producer's response, a consumer's request body) and a GraphQL producer response print `expanded` in JSON wire form, the form the check compares them in (`wireFormFor`): a `Date` is `string`, a value with `toJSON()` is what it returns. Every other entry prints as declared, and so does an RPC procedure (`procedure: true`, tRPC and similar): its router's transformer decides its wire form, which may keep a `Date`. `definition` is always as written.
+Each alias names the payload it types: `protocol`, `type_kind` and the `side` its entry is on. The sending side of an `http` payload (a producer's response, a consumer's request body) and a GraphQL producer response print `expanded` in JSON wire form, the form the check compares them in (`wireFormFor`): a `Date` is `string`, a value with `toJSON()` is what it returns. Every other entry prints as declared, and so does an RPC procedure (`procedure: true`, tRPC and similar): its router's transformer decides its wire form, which may keep a `Date`. A GraphQL producer response alias with a `graphql_root`, in a request that carries the service's `graphql_types` (shaped as in `check_v2`), prints each built-in scalar leaf in the type its scalar sends, as the check compares it (carrick#4403). `definition` is always as written.
 
 An alias that does not resolve is skipped, not failed.
 

@@ -74,6 +74,7 @@ export type { CaptureStubOptions, CaptureStubResult } from './api.js';
  * row's `decided` is one of the three values the cast states.
  */
 export const TYPE_REASONS = typeReasons as Readonly<Record<TypeProvenanceReason, TypeReason>>;
+export type { GraphqlLeaf, GraphqlRoot, GraphqlTypes } from './api.js';
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
 export { withStubResolution, type StubModuleResolver } from './stub-resolution.js';
@@ -109,6 +110,13 @@ export {
 export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, wireFormFor } from './check-probe.js';
+export {
+  graphqlDeclaresType,
+  graphqlFieldLeaf,
+  graphqlRootLeaf,
+  graphqlScalarSent,
+  withoutNonNull,
+} from './graphql-leaves.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';

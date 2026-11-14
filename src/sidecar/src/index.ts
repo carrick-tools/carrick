@@ -886,7 +886,11 @@ function handleResolveDefinitions(
   try {
     log(`Resolving ${request.aliases.length} type alias(es) from ${request.stub_dir}`);
 
-    const results = definitionResolver.resolveFromStub(request.stub_dir, request.aliases);
+    const results = definitionResolver.resolveFromStub(
+      request.stub_dir,
+      request.aliases,
+      request.graphql_types,
+    );
 
     return {
       request_id: request.request_id,

@@ -1559,6 +1559,10 @@ pub(crate) struct BuiltPair {
     /// side's stub records no hash for an alias the probe reads.
     pub producer_surface_hash: Option<String>,
     pub consumer_surface_hash: Option<String>,
+    /// SHA-256 of the producer service's GraphQL type table, when the pair
+    /// reads it (carrick#4403): the table rides on the stub input, outside the
+    /// spec, and a kept verdict must not outlive a change to it.
+    pub producer_graphql_types: Option<String>,
 }
 
 /// What a call's stated message picks from a producer response's modes
@@ -1689,6 +1693,8 @@ struct ServiceEntry<'a> {
     /// Where the entry's name means something, read off the repo's operation
     /// row at the entry's site (carrick#3520). `None`: the site states none.
     name_scope: Option<carrick_match::NameScope>,
+    /// The service's GraphQL type table (carrick#4403), when it has one.
+    graphql_types: Option<&'a crate::graphql::GraphqlTypes>,
 }
 
 /// The name scope each of a repo's non-HTTP operation rows states, by
@@ -1822,6 +1828,7 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
                 service_id,
                 has_surface,
                 types_degraded: repo.types_degraded.as_ref(),
+                graphql_types: repo.graphql_types.as_ref(),
                 entry,
                 name_scope: scopes
                     .get(&(
@@ -2141,6 +2148,23 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         unwidened_out_of_budget = consumer.entry.unwidened_out_of_budget;
     }
 
+    // carrick#4403: a GraphQL producer response is read with its service's
+    // SDL type table, from the root field its entry names.
+    let graphql_root = (protocol == ProbeProtocol::Graphql
+        && producer.entry.type_kind == ManifestTypeKind::Response)
+        .then(|| producer.entry.graphql_root.clone())
+        .flatten();
+    let producer_graphql_types = graphql_root
+        .as_ref()
+        .and(producer.graphql_types)
+        .map(|types| {
+            use sha2::{Digest, Sha256};
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(types).unwrap_or_default())
+            )
+        });
+
     Some(BuiltPair {
         spec: CheckPairSpec {
             pair_key,
@@ -2158,6 +2182,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
                 OperationKey::Pubsub { topic } => Some(topic.clone()),
                 _ => None,
             },
+            graphql_root: graphql_root.clone(),
         },
         pseudo_method,
         identity,
@@ -2177,6 +2202,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         unwidened_out_of_budget,
         producer_surface_hash: None,
         consumer_surface_hash: None,
+        producer_graphql_types,
     })
 }
 
@@ -2262,6 +2288,7 @@ pub(crate) fn materialize_stubs(
         stubs.push(CheckStubInput {
             service_name: service_id.to_string(),
             stub_dir: dest.to_string_lossy().into_owned(),
+            graphql_types: repo.graphql_types.clone(),
         });
     }
     stubs
@@ -2313,6 +2340,8 @@ fn judge_key(build_key: &str, stubs: &[CheckStubInput], specs: &[CheckPairSpec])
             put(rel.as_bytes());
             put(&std::fs::read(&file).ok()?);
         }
+        // The GraphQL type table rides beside the stub, not in it (carrick#4403).
+        put(serde_json::to_string(&stub.graphql_types).ok()?.as_bytes());
     }
     put(serde_json::to_string(specs).ok()?.as_bytes());
     Some(format!("{:x}", h.finalize()))
@@ -7181,6 +7210,85 @@ mod tests {
         assert_eq!(request.spec.producer.alias, "P");
         assert_eq!(request.unstated_mode, None);
     }
+
+    /// carrick#4403: a GraphQL producer response's root travels on the pair
+    /// spec and its service's type table on that service's stub input, in
+    /// the shape the sidecar's validator reads; a pair that reads no table
+    /// sends neither key. Two tables under one root are two kept answers.
+    #[test]
+    fn a_graphql_producer_s_root_and_type_table_reach_the_judge() {
+        let table = |amount: &str| -> crate::graphql::GraphqlTypes {
+            serde_json::from_value(serde_json::json!({
+                "Query": { "fields": { "invoice": { "type": "Invoice" } } },
+                "Invoice": { "fields": { "amountMinor": { "non_null": { "scalar": amount } } } },
+            }))
+            .unwrap()
+        };
+        let built = |key: OperationKey, types: Option<crate::graphql::GraphqlTypes>| {
+            let mut producer = entry(
+                key.clone(),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+                "P",
+                "src/schema.ts",
+                3,
+                ManifestTypeState::Implicit,
+            );
+            if key.as_http().is_none() {
+                producer.graphql_root = Some(crate::graphql::GraphqlRoot {
+                    type_name: "Query".to_string(),
+                    field: "invoice".to_string(),
+                });
+            }
+            let consumer = entry(
+                key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+                "C",
+                "src/client.ts",
+                8,
+                ManifestTypeState::Unknown,
+            );
+            let mut api = repo("api", None, vec![producer], Some(fake_artifact()));
+            api.graphql_types = types;
+            let repos = vec![
+                api,
+                repo("web", None, vec![consumer], Some(fake_artifact())),
+            ];
+            let mut pairs = build_check_pairs(&repos);
+            assert_eq!(pairs.len(), 1);
+            let dir = tempfile::tempdir().unwrap();
+            let stubs = materialize_stubs(&repos, dir.path());
+            let api_stub = stubs.iter().find(|s| s.service_name == "api").unwrap();
+            (pairs.remove(0), serde_json::to_value(api_stub).unwrap())
+        };
+        let graphql =
+            OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, "invoice");
+
+        let (pair, stub) = built(graphql.clone(), Some(table("String")));
+        assert_eq!(
+            serde_json::to_value(&pair.spec).unwrap()["graphql_root"],
+            serde_json::json!({ "type": "Query", "field": "invoice" })
+        );
+        assert_eq!(
+            stub["graphql_types"]["Invoice"],
+            serde_json::json!({ "fields": { "amountMinor": { "non_null": { "scalar": "String" } } } })
+        );
+        assert!(pair.producer_graphql_types.is_some());
+
+        let (other, _) = built(graphql, Some(table("Int")));
+        assert_ne!(
+            super::super::pair_settle::spec_hash(&pair),
+            super::super::pair_settle::spec_hash(&other),
+            "a changed table is a changed pair"
+        );
+
+        let (plain, plain_stub) = built(OperationKey::http("GET", "/invoice"), None);
+        let spec = serde_json::to_value(&plain.spec).unwrap();
+        assert!(spec.get("graphql_root").is_none(), "{spec}");
+        assert!(plain_stub.get("graphql_types").is_none(), "{plain_stub}");
+        assert_eq!(plain.producer_graphql_types, None);
+    }
     /// carrick#2100: a pair whose producer response lost its unwidened
     /// reading to the time budget is published unverifiable when the check
     /// found it incompatible, and kept when compatible. A pair whose producer
@@ -10801,6 +10909,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         std::fs::create_dir_all(dir.join("types")).unwrap();
         std::fs::write(dir.join("types/a.d.ts"), body).unwrap();
         CheckStubInput {
+            graphql_types: None,
             service_name: name.to_string(),
             stub_dir: dir.to_string_lossy().into_owned(),
         }
@@ -10808,6 +10917,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
 
     fn one_spec(key: &str) -> CheckPairSpec {
         CheckPairSpec {
+            graphql_root: None,
             pair_key: key.to_string(),
             protocol: ProbeProtocol::Http,
             type_kind: ProbeTypeKind::Response,
@@ -10902,6 +11012,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             unwidened_out_of_budget: false,
             producer_surface_hash: None,
             consumer_surface_hash: None,
+            producer_graphql_types: None,
         }
     }
 
@@ -11707,12 +11818,14 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 .resolve_definitions(
                     dir.to_str().unwrap(),
                     &[crate::services::type_sidecar::DefinitionAlias {
+                        graphql_root: None,
                         alias: producer_alias.clone(),
                         protocol: ProbeProtocol::Http,
                         type_kind: ManifestTypeKind::Response,
                         side: ManifestRole::Producer,
                         procedure: false,
                     }],
+                    None,
                 )
                 .expect("definitions")
                 .remove(0)
@@ -12206,12 +12319,14 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 .resolve_definitions(
                     dir.to_str().unwrap(),
                     &[crate::services::type_sidecar::DefinitionAlias {
+                        graphql_root: None,
                         alias: producer_alias.clone(),
                         protocol: ProbeProtocol::Http,
                         type_kind: ManifestTypeKind::Response,
                         side: ManifestRole::Producer,
                         procedure: false,
                     }],
+                    None,
                 )
                 .expect("definitions")
                 .remove(0)
@@ -12659,7 +12774,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         let records = crate::engine::read_capture_records(&api_stub);
         let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records, &[]);
         let resolved = api_sidecar
-            .resolve_definitions(api_stub.to_str().unwrap(), &aliases)
+            .resolve_definitions(api_stub.to_str().unwrap(), &aliases, None)
             .expect("definitions");
         crate::engine::apply_resolved_definitions(&mut api_manifest, resolved, &records);
         let _ = std::fs::remove_dir_all(&api_stub);

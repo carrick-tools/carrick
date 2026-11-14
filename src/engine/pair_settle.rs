@@ -64,6 +64,9 @@ struct SpecPreimage<'a> {
     consumer_expanded: Option<&'a str>,
     unstated_mode: Option<&'a str>,
     unwidened_out_of_budget: bool,
+    /// carrick#4403: absent on every pair that reads no GraphQL type table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    producer_graphql_types: Option<&'a str>,
 }
 
 /// Lowercase hex SHA-256 of `"carrick-pair-spec/<version>\n"` and the pair's
@@ -91,6 +94,7 @@ pub(crate) fn spec_hash(pair: &BuiltPair) -> String {
         consumer_expanded: pair.consumer_expanded.as_deref(),
         unstated_mode: pair.unstated_mode.as_deref(),
         unwidened_out_of_budget: pair.unwidened_out_of_budget,
+        producer_graphql_types: pair.producer_graphql_types.as_deref(),
     };
     let mut hasher = Sha256::new();
     hasher.update(format!("carrick-pair-spec/{PAIR_OUTCOMES_VERSION}\n").as_bytes());

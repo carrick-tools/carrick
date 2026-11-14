@@ -51,6 +51,7 @@ import {
   type ExpandOrigin,
 } from './type-structural-expander.js';
 import type { DefinitionAlias } from './types.js';
+import type { GraphqlTypes } from './capture/index.js';
 
 export interface ResolvedDefinition {
   type_alias: string;
@@ -72,7 +73,11 @@ export class DefinitionResolver {
    * both extensionless and `.js`-suffixed specifiers — the same policy the
    * check-phase workspace uses.
    */
-  resolveFromStub(stubDir: string, aliases: DefinitionAlias[]): ResolvedDefinition[] {
+  resolveFromStub(
+    stubDir: string,
+    aliases: DefinitionAlias[],
+    graphqlTypes?: GraphqlTypes,
+  ): ResolvedDefinition[] {
     const typesDir = path.join(stubDir, 'types');
     const surfacePath = path.join(typesDir, 'surface.d.ts');
     if (!fs.existsSync(surfacePath)) {
@@ -111,10 +116,15 @@ export class DefinitionResolver {
 
         const results: ResolvedDefinition[] = [];
         for (const alias of aliases) {
-          const result = this.resolveAlias(surface, alias, {
-            program: stubProject.getProgram().compilerObject,
-            repoRoot: stubDir,
-          });
+          const result = this.resolveAlias(
+            surface,
+            alias,
+            {
+              program: stubProject.getProgram().compilerObject,
+              repoRoot: stubDir,
+            },
+            graphqlTypes,
+          );
           if (result) {
             results.push(result);
           } else {
@@ -138,6 +148,7 @@ export class DefinitionResolver {
     sourceFile: SourceFile,
     payload: DefinitionAlias,
     origin: ExpandOrigin,
+    graphqlTypes: GraphqlTypes | undefined,
   ): ResolvedDefinition | null {
     const alias = payload.alias;
     const decl =
@@ -184,10 +195,16 @@ export class DefinitionResolver {
       // form the payload travels in where the judge compares that form. An
       // RPC procedure fails closed to the declared form: its router's
       // transformer, not JSON, decides what travels (carrick#4275).
+      // A GraphQL producer response prints each built-in scalar leaf in the
+      // type its scalar sends, read from the service's SDL types (carrick#4403).
+      const graphql =
+        graphqlTypes !== undefined && payload.graphql_root !== undefined
+          ? { types: graphqlTypes, root: payload.graphql_root }
+          : undefined;
       const wire = payload.procedure
         ? 'declared'
-        : wireFormFor(payload.protocol, payload.type_kind, payload.side);
-      const expanded = expandTypeStructural(type, origin, { wire });
+        : wireFormFor(payload.protocol, payload.type_kind, payload.side, { graphql });
+      const expanded = expandTypeStructural(type, origin, { wire, graphql });
 
       return { type_alias: alias, definition, expanded };
     } catch (err) {

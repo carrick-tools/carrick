@@ -517,6 +517,8 @@ export interface ResolveDefinitionsRequest extends BaseRequest {
   stub_dir: string;
   /** Surface type aliases to resolve, each with the payload it types. */
   aliases: DefinitionAlias[];
+  /** The service's SDL output types (carrick#4403), when it serves a schema. */
+  graphql_types?: import('./capture/api.js').GraphqlTypes;
 }
 
 /**
@@ -539,6 +541,13 @@ export interface DefinitionAlias {
    * (carrick#4275), so it prints as declared until that is a known fact.
    */
   procedure: boolean;
+  /**
+   * The root field a GraphQL producer response answers (carrick#4403), from
+   * its manifest entry. With the request's `graphql_types`, the stored text
+   * prints each built-in scalar leaf in the type that scalar sends
+   * (`wireFormFor`).
+   */
+  graphql_root?: import('./capture/api.js').GraphqlRoot;
 }
 
 /**

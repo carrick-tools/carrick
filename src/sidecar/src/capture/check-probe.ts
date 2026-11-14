@@ -34,10 +34,17 @@
 import type {
   CheckPairEndpoint,
   CheckPairSpec,
+  GraphqlTypes,
   ProbeProtocol,
   ProbeTypeKind,
+  WireFacts,
   WireFormat,
 } from './api.js';
+import {
+  GRAPHQL_SCALAR_SENT,
+  graphqlReachableFields,
+  graphqlRootLeaf,
+} from './graphql-leaves.js';
 
 /** Which pair endpoint supplies the `sent` value / the `expected` binding. */
 export type Side = 'producer' | 'consumer';
@@ -81,19 +88,29 @@ export function directionFor(
  *    value's `toJSON()` result, so the producer of a response and the
  *    consumer of a request body send their JSON form;
  *  - `graphql` response: the server sends each leaf through its scalar's
- *    `serialize`, so a resolver's `Date` reaches the client as a string. The
- *    request (variables) is read by the server as declared;
+ *    `serialize`, so a resolver's `Date` reaches the client as a string. With
+ *    the producer's SDL types and the root field the response answers
+ *    (`facts.graphql`, carrick#4403) a built-in scalar leaf is compared in the
+ *    type its scalar sends (`'graphql_scalars'`); without them, and for a
+ *    custom scalar or an enum, in the JSON form. The request (variables) is
+ *    read by the server as declared;
  *  - socket and pub/sub payloads stay declared until the codec each library
  *    uses is a known fact: the codec belongs to the client, not the protocol.
  */
 export function wireFormFor(
   protocol: ProbeProtocol,
   typeKind: ProbeTypeKind,
-  side: Side
+  side: Side,
+  facts: WireFacts = {}
 ): WireFormat {
   if (directionFor(protocol, typeKind).sent !== side) return 'declared';
   if (protocol === 'http') return 'json';
-  if (protocol === 'graphql' && typeKind === 'response') return 'json';
+  if (protocol === 'graphql' && typeKind === 'response') {
+    const graphql = facts.graphql;
+    return graphql !== undefined && graphqlRootLeaf(graphql.types, graphql.root) !== undefined
+      ? 'graphql_scalars'
+      : 'json';
+  }
   return 'declared';
 }
 
@@ -229,6 +246,41 @@ export function jsonWireDeclarations(prefix: string): string[] {
   ];
 }
 
+/**
+ * The probe's GraphQL leaf walk (carrick#4403), over the SDL types reachable
+ * from the root field (`graphqlReachableFields`, which reads the table only
+ * through `graphqlFieldLeaf`). `GqlLeafSent<C, F>` is the type the server
+ * sends for a value `C` declared as `F`:
+ *
+ *  - `any` and `unknown` stay what they are, so a top type is never laundered
+ *    into a scalar; non-null is read through; `null` and `undefined` stay;
+ *  - a list maps its elements; a non-array under a list keeps the JSON form;
+ *  - a built-in scalar is the type it sends (`GRAPHQL_SCALAR_SENT`); any
+ *    other scalar, an enum and a field the table does not name are JSON;
+ *  - an object type the table holds maps each field through its own leaf;
+ *    a type reference it does not hold (an undeclared scalar) is JSON.
+ *
+ * Every test on `F` is wrapped (`[F] extends [...]`) so a missing leaf never
+ * distributes to `never`. Needs `JsonWire`, `GqlDepth` and the comparand's
+ * helpers declared before it.
+ */
+export function graphqlScalarDeclarations(
+  reachable: Record<string, Record<string, unknown>>,
+  rootLeaf: unknown
+): string[] {
+  const sent = Object.entries(GRAPHQL_SCALAR_SENT)
+    .map(([name, type]) => `${name}: ${type}`)
+    .join('; ');
+  return [
+    `type GqlScalarSent = { ${sent} };`,
+    `type GqlTypes = ${JSON.stringify(reachable)};`,
+    `type GqlRootLeaf = ${JSON.stringify(rootLeaf)};`,
+    `type GqlTypeOf<F> = [F] extends [{ non_null: infer I }] ? GqlTypeOf<I> : [F] extends [{ type: infer T }] ? T : never;`,
+    `type GqlFieldOf<T, K> = [T] extends [never] ? unknown : [T] extends [keyof GqlTypes] ? ([K] extends [keyof GqlTypes[T]] ? GqlTypes[T][K] : unknown) : unknown;`,
+    `type GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlLeafSent<C[K], I, GqlDepth[D]> } : JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof GqlScalarSent ? GqlScalarSent[N] : JsonWire<C>) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlLeafSent<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } : JsonWire<C>) : JsonWire<C>) : JsonWire<C>;`,
+  ];
+}
+
 export function decisiveAssignmentLine(plan: ProbePlan): number {
   return plan.wireAssignmentLine ?? plan.assignmentLine;
 }
@@ -253,7 +305,8 @@ export function buildProbe(
   spec: CheckPairSpec,
   packageOf: (serviceName: string) => string,
   unwidenedAliasFor?: (sent: CheckPairEndpoint) => string | undefined,
-  expectedToleratesAbsence?: (expected: CheckPairEndpoint) => boolean
+  expectedToleratesAbsence?: (expected: CheckPairEndpoint) => boolean,
+  graphqlTypesOf?: (serviceName: string) => GraphqlTypes | undefined
 ): ProbePlan {
   const id = pairId(spec);
   const direction = directionFor(spec.protocol, spec.type_kind);
@@ -393,7 +446,12 @@ export function buildProbe(
   const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
   push(`declare const sent: ${sentBody};`);
 
-  const wire = wireFormFor(spec.protocol, spec.type_kind, direction.sent);
+  const graphqlTypes = graphqlTypesOf?.(spec.producer.service_name);
+  const graphqlFacts: WireFacts =
+    graphqlTypes !== undefined && spec.graphql_root !== undefined
+      ? { graphql: { types: graphqlTypes, root: spec.graphql_root } }
+      : {};
+  const wire = wireFormFor(spec.protocol, spec.type_kind, direction.sent, graphqlFacts);
   let assignmentLine: number;
   let wireAssignmentLine: number | undefined;
   if (spec.protocol === 'graphql') {
@@ -499,6 +557,32 @@ export function buildProbe(
       for (const line of jsonWireDeclarations('')) push(line);
       push(
         `type GqlWire = [GqlComparand] extends [GqlExpected] ? GqlComparand : (JsonWireSame<JsonWire<GqlComparand>, GqlComparand> extends true ? GqlComparand : JsonWire<GqlComparand>);`
+      );
+      push(`declare const sentWire: GqlWire;`);
+      wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
+    } else if (wire === 'graphql_scalars') {
+      // carrick#4403: each leaf in the type its scalar sends, read from the
+      // SDL from the root field down. The walk follows the producer's own
+      // type, so it ends where that type ends; the depth bound backs it up.
+      // A field the SDL does not name, a custom scalar and an enum keep the
+      // JSON form; a leaf keeps the producer's own null and undefined.
+      const { graphql } = graphqlFacts;
+      const rootLeaf = graphqlRootLeaf(graphql!.types, graphql!.root)!;
+      for (const line of jsonWireDeclarations('')) push(line);
+      for (const line of graphqlScalarDeclarations(
+        graphqlReachableFields(graphql!.types, rootLeaf),
+        rootLeaf
+      )) {
+        push(line);
+      }
+      // After a single-payload unwrap the comparand is the payload: its leaf
+      // is the envelope field's, when the SDL declares the envelope. When it
+      // does not, the root leaf already describes the payload.
+      push(
+        `type GqlComparandLeaf = [Sent] extends [GqlExpected] ? GqlRootLeaf : ([GqlPayloadOf<Sent>] extends [never] ? GqlRootLeaf : [GqlReadsOuter<Sent, Expected>] extends [true] ? GqlRootLeaf : ([unknown] extends [GqlFieldOf<GqlTypeOf<GqlRootLeaf>, GqlSingleKey<GqlPayloadKeys<Sent>>>] ? GqlRootLeaf : GqlFieldOf<GqlTypeOf<GqlRootLeaf>, GqlSingleKey<GqlPayloadKeys<Sent>>>));`
+      );
+      push(
+        `type GqlWire = [GqlComparand] extends [GqlExpected] ? GqlComparand : (JsonWireSame<GqlLeafSent<GqlComparand, GqlComparandLeaf>, GqlComparand> extends true ? GqlComparand : GqlLeafSent<GqlComparand, GqlComparandLeaf>);`
       );
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
