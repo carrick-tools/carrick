@@ -920,3 +920,92 @@ fn a_send_a_sibling_makes_on_a_value_nothing_reads_is_saved_as_missed_inside() {
         );
     }
 }
+
+/// The `stop_at` an unread site of `blob` at `file:line` names, when it has one.
+fn stop_at(blob: &serde_json::Value, file: &str, line: u64) -> Option<String> {
+    blob["unread_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|site| site["file"] == file && site["line"] == line)
+        .and_then(|site| site["stop_at"].as_str().map(str::to_string))
+}
+
+/// carrick#4474: a sibling's function sends a request and also runs a value
+/// nothing binds (a parameter the app hands in, a callback, a `let` never
+/// assigned). The request is the app's row; the stop is saved at the same
+/// call, as a call whose sibling function sends nothing saves it, with the
+/// function it stopped in. The recursion and the written callback beside an
+/// end hold nothing, and the app's misses (keyed and field values, a `let`
+/// handed in) are not this ticket's. The answer key is
+/// `tests/fixtures/stop-beside-end/README.md`.
+#[test]
+fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "stop-beside-end", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/relay.ts";
+    let mixed = "packages/client/src/mixed.ts";
+    // The call, the sibling function line the stop was read in.
+    for (line, at) in [(4, 5), (22, 5), (44, 19), (56, 30)] {
+        assert_eq!(
+            unread_at(app, relay, line).as_deref(),
+            Some("value_never_bound callee"),
+            "{line}: {}",
+            app["unread_sites"]
+        );
+        assert_eq!(
+            stop_at(app, relay, line),
+            Some(format!("{mixed}:{at}")),
+            "{line}: {}",
+            app["unread_sites"]
+        );
+    }
+    // The twins that send nothing beside the stop already saved it.
+    for line in [8, 26, 48, 60] {
+        assert_eq!(
+            unread_at(app, relay, line).as_deref(),
+            Some("value_never_bound callee"),
+            "twin {line}: {}",
+            app["unread_sites"]
+        );
+    }
+    // Controls: recursion beside the end, a callback written at the call, and
+    // the misses (keyed value, field, `let` handed in) are no stop.
+    for line in [14, 32, 40, 52, 66] {
+        assert_eq!(
+            unread_at(app, relay, line),
+            None,
+            "{line}: {}",
+            app["unread_sites"]
+        );
+    }
+    assert_eq!(
+        unread_at(app, relay, 70).as_deref(),
+        Some("missed_inside callee")
+    );
+    // The nine calls with an end keep their rows.
+    let rows = call_rows(app);
+    for line in [4, 14, 22, 32, 40, 44, 52, 56, 66] {
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("relay.ts:{line} "))),
+            "row at {line}: {rows:?}"
+        );
+    }
+    // The client's own stops are saved at its own calls, as before.
+    let client = blob_of(&scanned, "client");
+    for line in [7, 11, 21, 25, 32, 36] {
+        assert_eq!(
+            unread_at(client, mixed, line).as_deref(),
+            Some("value_never_bound callee"),
+            "client {line}: {}",
+            client["unread_sites"]
+        );
+    }
+}
