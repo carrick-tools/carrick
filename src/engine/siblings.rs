@@ -176,7 +176,6 @@ impl SiblingRegistry {
         let owners = self.owners();
         positions
             .call_rows()
-            .chain(positions.value_reads())
             .filter_map(|row| row.decl_file())
             .filter(|file| !file.starts_with("lib:") && !file.starts_with("pkg:"))
             .collect::<BTreeSet<&str>>()
