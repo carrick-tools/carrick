@@ -92,7 +92,8 @@ describe('verify_library_claims: an of-make (carrick-cloud#3534 T1)', () => {
 
   it('judges a make without of as before: verified, no declarations', () => {
     const [exported] = run([exportMake()]);
-    assert.deepStrictEqual(exported, { claim_id: exported.claim_id, verdict: 'verified' });
+    assert.strictEqual(exported.verdict, 'verified');
+    assert.strictEqual(exported.declarations, undefined);
   });
 
   it('refuses a receiver id that is not a maker (rule 1)', () => {
