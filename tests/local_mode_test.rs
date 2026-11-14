@@ -7535,6 +7535,348 @@ fn a_types_file_edit_names_the_route_and_the_consumer_it_breaks() {
     );
 }
 
+// --- carrick#4412: an edited file in no service's directory ---
+
+const SHARED_TYPES: &str = "shop/shared/types.ts";
+const COMMON_FORMAT: &str = "shop/common/format.ts";
+const SHOP_SCRIPT: &str = "shop/scripts/seed.ts";
+const SHOP_NOTES: &str = "shop/NOTES.md";
+
+/// The timing line the full walk of "which services read this edit" states.
+const SHARED_WALK: &str = "recheck-timing no-service-reads";
+
+/// The shop with files in no service's directory. `shared/` is an `include`
+/// root of catalog and ledger and holds `Widget`, which catalog's route sends.
+/// `common/` is no service's root and holds `widgetLabel`, which inventory
+/// imports by relative path. `scripts/seed.ts` and `NOTES.md` are read by
+/// nothing.
+fn shop_with_shared_folders() -> tempfile::TempDir {
+    workspace_prepared(SHOP, &["shop"], |repo| {
+        std::fs::write(
+            repo.join("carrick.json"),
+            "{ \"services\": [\n  { \"name\": \"catalog\", \"directory\": \"catalog\", \"include\": [\"shared\"] },\n  { \"name\": \"inventory\", \"directory\": \"inventory\" },\n  { \"name\": \"ledger\", \"directory\": \"ledger\", \"include\": [\"shared\"] }\n] }\n",
+        )
+        .expect("write carrick.json");
+        let route = repo.join("catalog/app/routes/api.v1.widgets.$widgetId.ts");
+        let text = std::fs::read_to_string(&route).expect("read the route");
+        let (_, rest) = text
+            .split_once("export type Widget = {")
+            .expect("the route declares Widget");
+        let (body, rest) = rest.split_once("};\n").expect("the type ends");
+        std::fs::create_dir_all(repo.join("shared")).expect("make shared/");
+        std::fs::write(
+            repo.join("shared/types.ts"),
+            format!("export type Widget = {{{body}}};\n"),
+        )
+        .expect("write the shared type");
+        std::fs::write(
+            &route,
+            format!("import type {{ Widget }} from \"../../../shared/types\";\nexport type {{ Widget }};\n{rest}"),
+        )
+        .expect("rewrite the route");
+        std::fs::create_dir_all(repo.join("common")).expect("make common/");
+        std::fs::write(
+            repo.join("common/format.ts"),
+            "export function widgetLabel(name: string): string {\n  return name.toUpperCase();\n}\n",
+        )
+        .expect("write the helper");
+        let caller = repo.join("inventory/src/inventory.ts");
+        let text = std::fs::read_to_string(&caller).expect("read inventory.ts");
+        std::fs::write(
+            &caller,
+            format!("import {{ widgetLabel }} from \"../../common/format.js\";\n{text}\nexport async function labelOf(\n  widgetId: string,\n  client: CatalogClient\n): Promise<string> {{\n  const widget = await client.readWidget(widgetId);\n  return widgetLabel(widget.name);\n}}\n"),
+        )
+        .expect("rewrite inventory.ts");
+        std::fs::create_dir_all(repo.join("scripts")).expect("make scripts/");
+        std::fs::write(repo.join("scripts/seed.ts"), "export const seed = 1;\n")
+            .expect("write the script");
+        std::fs::write(repo.join("NOTES.md"), "# Notes\n").expect("write the notes");
+    })
+}
+
+/// One `check <file> --recheck [--no-rescan] --json` with the timing lines on:
+/// the answer, the stderr and the exit code. `budget` is the re-check budget
+/// and `tmpdir` is where it stages.
+fn shared_check(
+    root: &Path,
+    tmpdir: &str,
+    budget: (&str, &str),
+    file: &str,
+    probe: bool,
+) -> (serde_json::Value, String, Option<i32>) {
+    let mut args = vec!["check", file, "--workspace", ".", "--recheck"];
+    if probe {
+        args.push("--no-rescan");
+    }
+    args.push("--json");
+    let mut command = Command::new(carrick());
+    command
+        .args(&args)
+        .current_dir(root)
+        .env_remove("CARRICK_TOKEN")
+        .env("XDG_CONFIG_HOME", root.join(".test-credentials"))
+        .env(budget.0, budget.1)
+        .env("TMPDIR", tmpdir)
+        .env("CARRICK_RECHECK_TIMING", "1");
+    as_signed_in(&mut command, &args);
+    let output = command.output().expect("run check");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let answer = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    (answer, stderr, output.status.code())
+}
+
+/// A shared type outside every service's directory, which two services include
+/// as a root, is re-checked for both of them, and the route it types moves.
+#[test]
+#[serial]
+fn a_shared_type_in_no_services_directory_is_re_checked_for_every_service_that_reads_it() {
+    let workspace = shop_with_shared_folders();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+
+    // (0) the route still pairs once its type sits outside the directory.
+    let before = check_json(root, SHOP_ROUTE);
+    assert!(
+        before["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["verdict"]["result"] == "compatible")),
+        "the route does not pair with its type in shared/:\n{before:#}"
+    );
+
+    // (1) a comment moves nothing the scan reads: answered in hand.
+    edit(
+        &root.join(SHARED_TYPES),
+        "export type Widget",
+        "// shared\nexport type Widget",
+    );
+    let (comment, said, code) = shared_check(root, tmpdir, AMPLE[0], SHARED_TYPES, true);
+    assert_eq!(code, Some(0), "{comment:#}");
+    assert_eq!(
+        comment["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{comment:#}"
+    );
+    assert!(
+        comment["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("changed nothing the scan reads")),
+        "{comment:#}"
+    );
+    assert!(comment["recheck"].get("deferred").is_none(), "{comment:#}");
+    assert!(!said.contains(SHARED_WALK), "the probe walked:\n{said}");
+    edit(
+        &root.join(SHARED_TYPES),
+        "// shared\nexport type Widget",
+        "export type Widget",
+    );
+
+    // (2) a type change: the probe defers it, and never walks.
+    edit(
+        &root.join(SHARED_TYPES),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let (deferred, said, _) = shared_check(root, tmpdir, AMPLE[0], SHARED_TYPES, true);
+    assert_eq!(
+        deferred["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{deferred:#}"
+    );
+    assert!(
+        deferred["recheck"]["reason"]
+            .as_str()
+            .is_none_or(|r| !r.contains("no service reads this file")),
+        "{deferred:#}"
+    );
+    assert!(!said.contains(SHARED_WALK), "the probe walked:\n{said}");
+
+    // (3) the full re-check reads both including services and names the
+    // route it broke.
+    let answer = recheck_json(root, SHARED_TYPES, &[AMPLE[0], ("TMPDIR", tmpdir)]);
+    assert_eq!(reread(&answer), vec!["catalog", "ledger"], "{answer:#}");
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+    let moved = moved_of(&answer);
+    let route = moved
+        .iter()
+        .find(|row| row["role"] == "route")
+        .unwrap_or_else(|| panic!("the route is named:\n{answer:#}"));
+    assert_eq!(
+        route["before"],
+        serde_json::json!("compatible"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        route["after"],
+        serde_json::json!("type_mismatch"),
+        "{answer:#}"
+    );
+    assert!(
+        route["counterparts"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n
+                .as_str()
+                .is_some_and(|n| n.contains("inventory") && n.contains("client.ts")))),
+        "the consumer it breaks is named:\n{answer:#}"
+    );
+}
+
+/// A helper in no service's directory that one service imports by path is
+/// re-checked for that service. Its missed budget is the file's own: it
+/// silences later edits of that file and no service.
+#[test]
+#[serial]
+fn a_shared_helper_imported_by_path_is_re_checked_for_its_caller_and_its_miss_is_its_own() {
+    let workspace = shop_with_shared_folders();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+
+    // (1) the full re-check reads the one importer.
+    statement_in(&root.join(COMMON_FORMAT), "format edit");
+    let answer = recheck_json(root, COMMON_FORMAT, &[AMPLE[0], ("TMPDIR", tmpdir)]);
+    assert_eq!(reread(&answer), vec!["inventory"], "{answer:#}");
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{answer:#}"
+    );
+
+    // (2) a one-millisecond budget misses, and the miss is the file's.
+    let one = ("CARRICK_RECHECK_BUDGET_MS", "1");
+    let missed = recheck_json(root, COMMON_FORMAT, &[one, ("TMPDIR", tmpdir)]);
+    assert_eq!(
+        missed["recheck"]["deadline"],
+        serde_json::json!(true),
+        "{missed:#}"
+    );
+    let text = std::fs::read_to_string(root.join(".carrick/recheck-misses.json"))
+        .expect("the miss was recorded");
+    let misses: serde_json::Value = serde_json::from_str(&text).expect("misses JSON");
+    assert!(
+        misses["files"]["shop/common/format.ts"].is_object(),
+        "the file's miss is recorded:\n{text}"
+    );
+    assert!(
+        misses["services"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty),
+        "no service is silenced:\n{text}"
+    );
+
+    // (3) a later probe of the file is a known miss at once (exit 2).
+    let (known, _, code) = shared_check(root, tmpdir, one, COMMON_FORMAT, true);
+    assert_eq!(code, Some(2), "{known:#}");
+    assert_eq!(
+        known["recheck"]["known_miss"],
+        serde_json::json!(true),
+        "{known:#}"
+    );
+    assert!(
+        known["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("common/format.ts")),
+        "{known:#}"
+    );
+
+    // (4) inventory itself is not silenced.
+    edit(
+        &root.join(SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let (other, _, _) = shared_check(root, tmpdir, one, SHOP_CLIENT, true);
+    assert_eq!(
+        other["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{other:#}"
+    );
+    assert!(other["recheck"].get("known_miss").is_none(), "{other:#}");
+}
+
+/// A file in no service that nothing reads stays cheap: a note is answered in
+/// hand on both paths, a script the probe defers and the full re-check answers
+/// from the walk with nothing staged.
+#[test]
+#[serial]
+fn a_file_in_no_service_that_nothing_reads_stays_cheap() {
+    let workspace = shop_with_shared_folders();
+    let root = workspace.path();
+    index(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+
+    // (1) a note no scan reads.
+    edit(&root.join(SHOP_NOTES), "# Notes", "# Notes\nmore");
+    let (probe, said, code) = shared_check(root, tmpdir, AMPLE[0], SHOP_NOTES, true);
+    assert_eq!(code, Some(0), "{probe:#}");
+    assert_eq!(
+        probe["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{probe:#}"
+    );
+    assert!(
+        probe["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("changed nothing the scan reads")),
+        "{probe:#}"
+    );
+    assert!(probe["recheck"].get("deferred").is_none(), "{probe:#}");
+    assert_eq!(probe["stale"], serde_json::json!(false), "{probe:#}");
+    assert!(!said.contains(SHARED_WALK), "the probe walked:\n{said}");
+    let (full, said, code) = shared_check(root, tmpdir, AMPLE[0], SHOP_NOTES, false);
+    assert_eq!(code, Some(0), "{full:#}");
+    assert!(
+        full["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("changed nothing the scan reads")),
+        "{full:#}"
+    );
+    assert!(
+        !said.contains(SHARED_WALK),
+        "the full re-check walked:\n{said}"
+    );
+
+    // (2) a script nothing imports.
+    statement_in(&root.join(SHOP_SCRIPT), "seed edit");
+    let (probe, said, _) = shared_check(root, tmpdir, AMPLE[0], SHOP_SCRIPT, true);
+    assert_eq!(
+        probe["recheck"]["deferred"],
+        serde_json::json!(true),
+        "{probe:#}"
+    );
+    assert!(!said.contains(SHARED_WALK), "the probe walked:\n{said}");
+    let before = recheck_temp_dirs(temp.path());
+    let (full, said, code) = shared_check(root, tmpdir, AMPLE[0], SHOP_SCRIPT, false);
+    assert_eq!(code, Some(0), "{full:#}");
+    assert_eq!(
+        full["recheck"]["ran"],
+        serde_json::json!("none"),
+        "{full:#}"
+    );
+    assert!(
+        full["recheck"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no service reads the file")),
+        "{full:#}"
+    );
+    assert!(full["recheck"].get("deferred").is_none(), "{full:#}");
+    assert!(full["recheck"].get("scope").is_none(), "{full:#}");
+    assert!(
+        said.contains(SHARED_WALK),
+        "the full re-check asks who reads it:\n{said}"
+    );
+    assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
+}
+
 /// The index was written by another carrick build, so a verdict that moved
 /// may have moved because of the build and not the edit: the row says so.
 #[test]
