@@ -8121,6 +8121,77 @@ mod tests {
         assert!(!kept[0].payload_borrow_witness, "witness consumed");
     }
 
+    /// A consumer call's read that abstained at the type's root, as decided.
+    fn root_abstain(alias: &str, reason: &str) -> InferredType {
+        let mut inf = inferred(alias, None, None);
+        inf.infer_kind = InferKind::CallResult;
+        inf.type_string = "unknown".to_string();
+        inf.any_provenance = vec![TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: reason.to_string(),
+            detail: None,
+        }];
+        inf
+    }
+
+    /// carrick#4306: the compiler's read of a consumer call decided the site
+    /// states no type (the call result is still the enclosing generic
+    /// function's type parameter). The model's symbol for the same alias is
+    /// dropped before the bundle and the capture run, so neither defines the
+    /// alias from it, and the drop is reported for the manifest row.
+    #[test]
+    fn arbitration_drops_a_model_symbol_beside_a_root_abstain() {
+        let mut request = symbol_request("Feed", "Feed_Consumer_Response", None);
+        request.consumer_response = true;
+        let explicit = vec![request];
+        let inferred = vec![root_abstain("Feed_Consumer_Response", "bound_by_callers")];
+
+        let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+
+        assert!(arbitrated.requests.is_empty(), "{:?}", arbitrated.requests);
+        assert_eq!(
+            arbitrated.changed,
+            vec![AnchorChange {
+                alias: "Feed_Consumer_Response".to_string(),
+                rejected: "Feed".to_string(),
+                reaimed: None,
+            }]
+        );
+    }
+
+    /// carrick#4306 bounds: the abstain decides the alias only when no read of
+    /// it saw a shape (a sibling call site that read the body owns the alias,
+    /// carrick#1375), and only for a decided reason: a root reason that is
+    /// not an abstain, or a blind read with no reason, keeps the symbol.
+    #[test]
+    fn arbitration_keeps_a_model_symbol_a_root_abstain_does_not_decide() {
+        let explicit = vec![symbol_request("Feed", "Feed_Consumer_Response", None)];
+        let mut sighted = inferred("Feed_Consumer_Response", Some("Feed"), None);
+        sighted.infer_kind = InferKind::CallResult;
+        sighted.type_string = "Feed".to_string();
+        let mut undecided = root_abstain("Feed_Consumer_Response", "not_recorded");
+        undecided.infer_kind = InferKind::CallResult;
+        let mut blind = root_abstain("Feed_Consumer_Response", "bound_by_callers");
+        blind.any_provenance.clear();
+
+        for (case, inferred) in [
+            (
+                "sighted sibling",
+                vec![
+                    root_abstain("Feed_Consumer_Response", "bound_by_callers"),
+                    sighted,
+                ],
+            ),
+            ("undecided reason", vec![undecided]),
+            ("blind read", vec![blind]),
+        ] {
+            let arbitrated = demote_witnessed_borrowed_anchors(&explicit, &inferred);
+            assert_eq!(arbitrated.requests, explicit, "{case}");
+            assert!(arbitrated.changed.is_empty(), "{case}");
+        }
+    }
+
     /// An array-form inference (`Root[]`) demotes with the inferred depth so
     /// the bundler's array wrap restores the `[]` levels.
     #[test]
