@@ -14041,7 +14041,11 @@ fn resolve_per_endpoint_definitions(
             "Resolving {} type definition(s) via compiler",
             aliases.len()
         );
-        match sidecar.resolve_definitions(&stub_dir.to_string_lossy(), &aliases) {
+        match sidecar.resolve_definitions(
+            &stub_dir.to_string_lossy(),
+            &aliases,
+            cloud_data.graphql_types.as_ref(),
+        ) {
             Ok(resolved) => resolved,
             Err(e) => {
                 warn!("Per-endpoint definition resolution failed: {}", e);
@@ -14133,6 +14137,7 @@ fn aliases_to_resolve(
                     type_kind: e.type_kind,
                     side: e.role,
                     procedure,
+                    graphql_root: e.graphql_root.clone(),
                 }
             });
         }
@@ -28068,6 +28073,18 @@ unfollowed_member_calls_total: 0,
                 expanded: None,
             }],
         });
+        // carrick#4403: a GraphQL producer response names its root.
+        let root = crate::graphql::GraphqlRoot {
+            type_name: "Query".to_string(),
+            field: "rows".to_string(),
+        };
+        let mut graphql_response = entry(
+            "C_GraphqlResponse",
+            OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, "rows"),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+        );
+        graphql_response.graphql_root = Some(root.clone());
         let manifest = vec![
             producer,
             entry(
@@ -28076,16 +28093,12 @@ unfollowed_member_calls_total: 0,
                 ManifestRole::Consumer,
                 ManifestTypeKind::Request,
             ),
-            entry(
-                "C_GraphqlResponse",
-                OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, "rows"),
-                ManifestRole::Producer,
-                ManifestTypeKind::Response,
-            ),
+            graphql_response,
         ];
         let mut records = read_records_with(&unwidened_alias("A_ProducerResponse"));
         records.extend(read_records_with("A_ProducerResponse_Case"));
         let http_producer_response = |alias: String| DefinitionAlias {
+            graphql_root: None,
             alias,
             protocol: ProbeProtocol::Http,
             type_kind: ManifestTypeKind::Response,
@@ -28097,6 +28110,7 @@ unfollowed_member_calls_total: 0,
             http_producer_response(unwidened_alias("A_ProducerResponse")),
             http_producer_response("A_ProducerResponse_Case".to_string()),
             DefinitionAlias {
+                graphql_root: None,
                 alias: "B_ConsumerRequest".to_string(),
                 protocol: ProbeProtocol::Http,
                 type_kind: ManifestTypeKind::Request,
@@ -28109,6 +28123,7 @@ unfollowed_member_calls_total: 0,
                 type_kind: ManifestTypeKind::Response,
                 side: ManifestRole::Producer,
                 procedure: false,
+                graphql_root: Some(root),
             },
         ];
         expected.sort_by(|a, b| a.alias.cmp(&b.alias));
@@ -28123,6 +28138,11 @@ unfollowed_member_calls_total: 0,
                 "procedure": false
             }),
             "the request carries the names the compiler engine's validator reads"
+        );
+        assert_eq!(
+            serde_json::to_value(&expected[expected.len() - 1]).unwrap()["graphql_root"],
+            serde_json::json!({ "type": "Query", "field": "rows" }),
+            "a GraphQL producer response carries its root as the validator reads it"
         );
     }
 
