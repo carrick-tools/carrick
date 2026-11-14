@@ -187,7 +187,7 @@ impl UnknownWord {
 
 impl Stop {
     /// Every word, in the order of the enum.
-    pub const ALL: [Stop; 57] = [
+    pub const ALL: [Stop; 58] = [
         Stop::ValueCallee,
         Stop::OutsideService,
         Stop::PackageUnmatched,
