@@ -26,6 +26,17 @@ import path from "node:path";
 import { binary, check, checkChanged } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
+import {
+  alive,
+  createExclusive,
+  lockHeld,
+  readJson,
+  releaseLock,
+  STALE_SLACK_MS,
+  takeLock,
+  touchLock,
+  type Lock,
+} from "./lock.ts";
 import { scriptBeside, startDetached } from "./refresh.ts";
 import { sessionsDir, writeAtomic } from "./reuse.ts";
 import { safeId } from "./session-key.ts";
@@ -51,8 +62,6 @@ export const STOP_TIMEOUT_S = 10;
 const CALL_SLACK_MS = 15_000;
 
 /** A lock or an entry this far past 2 x cap is not waited for any longer. */
-const STALE_SLACK_MS = 60_000;
-
 export function backgroundCapMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env["CARRICK_RECHECK_BACKGROUND_MS"];
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
@@ -180,40 +189,6 @@ function nextSeq(now: number): string {
   return `${String(now).padStart(13, "0")}-${process.pid}-${String(counter).padStart(4, "0")}`;
 }
 
-/**
- * Create `file` holding `body`, only if it does not exist yet, and complete
- * when it does: written beside it, then hard-linked into place (the one
- * operation two processes cannot both win).
- */
-function createExclusive(file: string, body: string): boolean {
-  const temp = `${file}.${process.pid}.${counter}.tmp`;
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(temp, body, { flag: "wx", mode: 0o600 });
-  } catch {
-    return false;
-  }
-  try {
-    fs.linkSync(temp, file);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    try {
-      fs.unlinkSync(temp);
-    } catch {
-      // Already gone.
-    }
-  }
-}
-
-function readJson<T>(file: string): T | null {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
-  } catch {
-    return null;
-  }
-}
 
 function names(dir: string): string[] {
   try {
@@ -325,78 +300,7 @@ export function answerInHand(
 
 // --- the runner's lock -----------------------------------------------------
 
-type Lock = { pid: number; started: string; touched: string };
-
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM: the process exists and is somebody else's.
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function lockBody(pid: number, started: string, now: number): string {
-  return `${JSON.stringify({ pid, started, touched: new Date(now).toISOString() })}\n`;
-}
-
-/** Whether the lock's holder is a live process that has touched it lately. */
-function lockHeld(lock: Lock | null, now: number, cap: number): boolean {
-  if (lock === null || typeof lock.pid !== "number") return false;
-  if (!alive(lock.pid)) return false;
-  const touched = Date.parse(lock.touched);
-  return Number.isFinite(touched) && now - touched <= cap + STALE_SLACK_MS;
-}
-
-/**
- * Take the lock for `pid`, replacing one nobody holds. The dead lock is
- * re-read before it is removed, so a lock another process just replaced is
- * never unlinked from under it (the `claimRefresh` step).
- */
-function takeLock(root: string, pid: number, now: number, cap: number, takeOver?: number): boolean {
-  const file = lockPath(root);
-  const body = lockBody(pid, new Date(now).toISOString(), now);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (createExclusive(file, body)) return true;
-    const seen = readJson<Lock>(file);
-    if (seen !== null && seen.pid === pid) {
-      writeAtomic(file, body);
-      return true;
-    }
-    // The hook that started this runner holds the lock until it takes over.
-    if (seen !== null && takeOver !== undefined && seen.pid === takeOver) {
-      writeAtomic(file, body);
-      return true;
-    }
-    if (lockHeld(seen, now, cap)) return false;
-    const again = readJson<Lock>(file);
-    if ((again?.pid ?? null) !== (seen?.pid ?? null)) return false;
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      // Another process removed it first; the retry decides between us.
-    }
-  }
-  return false;
-}
-
-function releaseLock(root: string, pid: number): void {
-  const file = lockPath(root);
-  if (readJson<Lock>(file)?.pid !== pid) return;
-  try {
-    fs.unlinkSync(file);
-  } catch {
-    // Already gone.
-  }
-}
-
-function touchLock(root: string, pid: number, now: number): void {
-  const file = lockPath(root);
-  const held = readJson<Lock>(file);
-  if (held?.pid !== pid) return;
-  writeAtomic(file, lockBody(pid, held.started, now));
-}
+// The lock itself is `lock.ts`; this runner's lock file is `lockPath(root)`.
 
 export type EnsureOptions = {
   env?: NodeJS.ProcessEnv;
@@ -424,7 +328,7 @@ export function ensureRunner(root: string, options: EnsureOptions = {}): boolean
   // A live, recently touched holder (a runner, or a hook that is starting
   // one) is the runner: this process's own earlier claim counts too.
   if (lockHeld(readJson<Lock>(lockPath(root)), now, cap)) return false;
-  if (!takeLock(root, process.pid, now, cap)) return false;
+  if (!takeLock(lockPath(root), process.pid, now, cap)) return false;
   const { command, args } = runnerCommand(root);
   // The runner is nobody's foreground work: it keeps no one awake (carrick#1889).
   const runnerEnv = {
@@ -435,7 +339,7 @@ export function ensureRunner(root: string, options: EnsureOptions = {}): boolean
   try {
     (options.start ?? startDetached)(command, args, runnerEnv);
   } catch (error) {
-    releaseLock(root, process.pid);
+    releaseLock(lockPath(root), process.pid);
     log("could not start the re-check runner", String(error));
     return false;
   }
@@ -593,7 +497,7 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
   const clock = options.now ?? Date.now;
   const cap = backgroundCapMs(env);
   const pid = process.pid;
-  if (!takeLock(root, pid, clock(), cap, options.spawner)) return;
+  if (!takeLock(lockPath(root), pid, clock(), cap, options.spawner)) return;
   const callEnv: NodeJS.ProcessEnv = {
     ...env,
     CARRICK_RECHECK_BUDGET_MS: String(cap),
@@ -625,12 +529,12 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         }
         continue;
       }
-      touchLock(root, pid, clock());
+      touchLock(lockPath(root), pid, clock());
       const startedAt = clock();
       if (isChanged(entry)) {
         // Longer than the per-file cap, so the lock is kept fresh while it
         // runs: a lock older than cap + 60 s reads as dead to `ensureRunner`.
-        const keep = setInterval(() => touchLock(root, pid, clock()), LOCK_TOUCH_MS);
+        const keep = setInterval(() => touchLock(lockPath(root), pid, clock()), LOCK_TOUCH_MS);
         const outcome = await checkChanged({ cwd: root, limitMs: CHANGED_BUDGET_MS + CALL_SLACK_MS, env: changedEnv, bin });
         clearInterval(keep);
         const failure = outcome.failure ?? "the check gave no answer";
@@ -674,12 +578,12 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       }
       remove(taken);
     }
-    releaseLock(root, pid);
+    releaseLock(lockPath(root), pid);
     await options.afterRelease?.();
     // Anything queued between the last look and the release would otherwise
     // wait for the next hook to notice: look once more, and go on if so.
     if (waiting().length === 0) return;
-    if (!takeLock(root, pid, clock(), cap)) return;
+    if (!takeLock(lockPath(root), pid, clock(), cap)) return;
   }
 }
 
