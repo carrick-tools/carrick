@@ -1,0 +1,19 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "${prefix}/orders",
+      "method": "DELETE",
+      "pattern_matched": "http.remove<{ id: string }>(",
+      "call_expression_text": null,
+      "call_expression_line": null,
+      "payload_expression_text": "{ data: order }",
+      "payload_expression_line": 5,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ]
+}
