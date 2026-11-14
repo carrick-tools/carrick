@@ -1685,14 +1685,16 @@ impl Reading<'_, '_> {
                     return None;
                 }
                 self.noted(match today_read {
-                    Some(SlotName::Today(NameFallback::NoRows)) => NameOutcome::NoRows,
+                    Some(SlotName::Today(NameFallback::NoRows(_))) => NameOutcome::NoRows,
                     _ => site_outcome(self.site, arg, key),
                 });
                 let name = today();
                 if name.is_none() {
                     self.unnamed(
                         match today_read {
-                            Some(SlotName::Today(NameFallback::NoRows)) => Stop::RowsMissing,
+                            Some(SlotName::Today(NameFallback::NoRows(reason))) => {
+                                Stop::from(reason)
+                            }
                             _ => slot_stop(&self.site.args, arg, key),
                         },
                         op,

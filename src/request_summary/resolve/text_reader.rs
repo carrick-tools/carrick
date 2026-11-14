@@ -533,7 +533,7 @@ impl<'a> Resolver<'a> {
                     lo: *lo,
                     hi: *hi,
                 };
-                if let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident) {
+                if let Ok(row) = self.row_at(file, *lo, *hi, Kind::Ident) {
                     if let Some((at, param)) = self.declared_param(row) {
                         return self.param_pieces(at, param, &[], read, Vec::new());
                     }
@@ -555,7 +555,7 @@ impl<'a> Resolver<'a> {
                     member: false,
                     ..
                 } = &**object
-                    && let Some(row) = self.row_at(file, *object_lo, *object_hi, Kind::Ident)
+                    && let Ok(row) = self.row_at(file, *object_lo, *object_hi, Kind::Ident)
                     && let Some((at, param)) = self.declared_param(row)
                 {
                     let key = {
@@ -894,9 +894,7 @@ impl<'a> Resolver<'a> {
                 member: false,
                 ..
             } => {
-                let row = self
-                    .row_at(file, *lo, *hi, Kind::Ident)
-                    .ok_or(RowsMissing)?;
+                let row = self.row_at(file, *lo, *hi, Kind::Ident)?;
                 let Some((at, binding, declared)) = self.declared_entry(row) else {
                     return Err(if self.declared_param(row).is_some() {
                         ParameterUnread
@@ -961,7 +959,7 @@ impl<'a> Resolver<'a> {
             member: false,
             ..
         } = branch
-            && let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident)
+            && let Ok(row) = self.row_at(file, *lo, *hi, Kind::Ident)
         {
             let literals = row
                 .type_text()
@@ -1185,8 +1183,9 @@ impl<'a> Resolver<'a> {
     fn text_of_name(&self, file: &Path, lo: u32, hi: u32) -> Vec<TextValue> {
         use guards::HoleReason::*;
         let hole = |reason| vec![TextValue::hole(reason)];
-        let Some(row) = self.row_at(file, lo, hi, Kind::Ident) else {
-            return hole(RowsMissing);
+        let row = match self.row_at(file, lo, hi, Kind::Ident) {
+            Ok(row) => row,
+            Err(reason) => return hole(reason),
         };
         if let Some(text) = typed_as_one_text(row) {
             return vec![TextValue::stated(
@@ -1341,8 +1340,9 @@ impl<'a> Resolver<'a> {
         else {
             return hole(UnreadExpression);
         };
-        let Some(row) = self.row_at(file, *lo, *hi, Kind::Ident) else {
-            return hole(RowsMissing);
+        let row = match self.row_at(file, *lo, *hi, Kind::Ident) {
+            Ok(row) => row,
+            Err(reason) => return hole(reason),
         };
         // Read through callers, an entry of a parameter (`opts.topic`) is
         // what each caller passes at that key (carrick#3504 B10-1b).
@@ -1425,7 +1425,7 @@ impl<'a> Resolver<'a> {
     ) -> Option<Vec<TextValue>> {
         use guards::HoleReason::*;
         let hole = |reason| Some(vec![TextValue::hole(reason)]);
-        let row = self.row_at(file, lo, hi, Kind::Member)?;
+        let row = self.row_at(file, lo, hi, Kind::Member).ok()?;
         if let Some(text) = typed_as_one_text(row) {
             note_all(read_from, in_repo_declaration(row).into_iter().collect());
             return Some(vec![TextValue::stated(text, read_from.clone())]);
@@ -1583,6 +1583,7 @@ impl<'a> Resolver<'a> {
         let hole = |reason| vec![TextValue::hole(reason)];
         let library = self
             .row_at(file, lo, hi, Kind::Call)
+            .ok()
             .and_then(|row| row.decl_file())
             .is_some_and(|declared| declared.starts_with("lib:"));
         if !library {
@@ -1792,7 +1793,7 @@ impl<'a> Resolver<'a> {
         else {
             return None;
         };
-        let row = self.row_at(file, *lo, *hi, Kind::Ident)?;
+        let row = self.row_at(file, *lo, *hi, Kind::Ident).ok()?;
         let ((path, line, symbol), _) = self.declared_param(row)?;
         Some((path.to_path_buf(), line, symbol))
     }
@@ -1892,7 +1893,7 @@ impl Resolver<'_> {
         else {
             return None;
         };
-        let row = self.row_at(path, *lo, *hi, Kind::Ident)?;
+        let row = self.row_at(path, *lo, *hi, Kind::Ident).ok()?;
         let (at, binding, _) = self.declared_entry(row)?;
         let Some(ValueAt::Entries(entries)) = &binding.text else {
             return None;

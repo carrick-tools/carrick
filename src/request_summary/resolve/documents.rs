@@ -102,7 +102,7 @@ impl<'a> Follow<'a> for Documents<'_, 'a> {
         _: Invoke<'a>,
     ) -> Option<Found> {
         let inputs = self.resolver.inputs_for(file);
-        let row = self.resolver.row_at(file, lo, hi, kind);
+        let row = self.resolver.row_at(file, lo, hi, kind).ok();
         if let Some(row) = row
             && let (Some(decl), Some(line), Some(symbol)) =
                 (row.decl_file(), row.decl_line(), row.symbol())
@@ -440,9 +440,11 @@ fn callee_key(resolver: &Resolver<'_>, file: &Path, call: &CallIr) -> Option<(St
         return None;
     }
     let row = match member {
-        None => resolver.row_at(file, call.site.lo, call.site.hi, Kind::Call),
+        None => resolver
+            .row_at(file, call.site.lo, call.site.hi, Kind::Call)
+            .ok(),
         Some(_) => match call.receiver_spans.as_slice() {
-            [(lo, hi, false, _)] => resolver.row_at(file, *lo, *hi, Kind::Ident),
+            [(lo, hi, false, _)] => resolver.row_at(file, *lo, *hi, Kind::Ident).ok(),
             _ => return None,
         },
     };
