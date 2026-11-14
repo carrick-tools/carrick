@@ -614,13 +614,73 @@ fn have(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The Yarn releases the pinned-Yarn cases use (carrick#4349), one per line.
+/// CI warms the same list (`.github/workflows/ci.yml`, "Prepare Yarn releases").
+const YARN_VERSIONS: &str = include_str!("fixtures/action-install/yarn-versions");
+
+/// Where the Yarn releases are kept so the cases run with no network.
+///
+/// CI sets `CARRICK_TEST_COREPACK_HOME` to a folder its setup step has already
+/// filled. Without it, the first run fetches every release once into
+/// `$XDG_CACHE_HOME/carrick-tests/corepack` (or `~/.cache/carrick-tests/corepack`)
+/// and every later run, in this process or another, finds it there and never
+/// touches the network. To refill by hand, delete that folder.
+fn corepack_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::var_os("CARRICK_TEST_COREPACK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let cache = std::env::var_os("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache")
+                    });
+                cache.join("carrick-tests/corepack")
+            });
+        for version in YARN_VERSIONS.split_whitespace() {
+            if home.join("v1/yarn").join(version).is_dir() {
+                continue;
+            }
+            let output = Command::new("corepack")
+                .args(["prepare", &format!("yarn@{version}")])
+                .env("COREPACK_HOME", &home)
+                .env("COREPACK_ENABLE_AUTO_PIN", "0")
+                .output()
+                .expect("run corepack prepare");
+            assert!(
+                output.status.success(),
+                "corepack prepare yarn@{version} into {} failed: {}",
+                home.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        home
+    })
+}
+
+/// A tree that pins one of the prepared Yarn releases runs it from the
+/// prepared folder with corepack's network switched off.
+fn use_prepared_yarn(command: &mut Command, dir: &Path) {
+    let manifest = fs::read_to_string(dir.join("package.json")).unwrap_or_default();
+    if YARN_VERSIONS
+        .split_whitespace()
+        .any(|version| manifest.contains(&format!("\"packageManager\":\"yarn@{version}\"")))
+    {
+        command
+            .env("COREPACK_HOME", corepack_home())
+            .env("COREPACK_ENABLE_NETWORK", "0");
+    }
+}
+
 fn sh(dir: &Path, command: &str) {
-    let output = Command::new("bash")
+    let mut shell = Command::new("bash");
+    shell
         .args(["-c", command])
         .current_dir(dir)
-        .env("COREPACK_ENABLE_AUTO_PIN", "0")
-        .output()
-        .expect("run shell");
+        .env("COREPACK_ENABLE_AUTO_PIN", "0");
+    use_prepared_yarn(&mut shell, dir);
+    let output = shell.output().expect("run shell");
     assert!(
         output.status.success(),
         "`{command}` in {} failed: {}{}",
@@ -691,6 +751,7 @@ impl Untrusted {
             .env_remove("CARRICK_CLI")
             .env_remove("CARRICK_INSTALL_UNTRUSTED")
             .env_remove("CARRICK_INSTALL_LOCKFILE_RETRY");
+        use_prepared_yarn(&mut command, &dir);
         if retry {
             command.env("CARRICK_INSTALL_LOCKFILE_RETRY", "1");
         }
