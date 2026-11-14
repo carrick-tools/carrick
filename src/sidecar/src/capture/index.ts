@@ -112,6 +112,7 @@ export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, jsonWireRule, judgeTolerances, wireFormFor, type JudgeTolerances } from './check-probe.js';
 export { nodeByExpressionText, isPreferredTarget } from './anchors.js';
 export {
+  graphqlDeclaresType,
   graphqlFieldLeaf,
   graphqlRootLeaf,
   graphqlScalarSent,

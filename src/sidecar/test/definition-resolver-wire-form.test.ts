@@ -39,6 +39,7 @@ export interface Receipt {
   lines: { amountMinor: bigint | null }[];
   note?: bigint;
   extra: unknown;
+  due: Date;
 }
 export type Endpoint_row = Row;
 export type Endpoint_priced = Priced;
@@ -103,6 +104,7 @@ describe('resolve_definitions prints the sending side of an http payload in wire
           lines: { list: { type: 'Line' } },
           note: { scalar: 'String' },
           extra: { scalar: 'String' },
+          due: { non_null: { type: 'Moment' } },
         },
       },
       Line: { fields: { amountMinor: { scalar: 'String' } } },
@@ -130,6 +132,8 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(d.expanded, /note\?: string;/, d.expanded);
     // A deep unknown is not laundered into its scalar.
     assert.match(d.expanded, /extra: unknown;/, d.expanded);
+    // A type reference the table does not hold keeps the JSON form.
+    assert.match(d.expanded, /due: string;/, d.expanded);
     assert.doesNotMatch(d.expanded, /bigint|Date/, d.expanded);
     assert.match(d.definition, /totalMinor: bigint/, 'the as-written form keeps the declared type');
 

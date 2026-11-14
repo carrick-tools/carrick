@@ -98,11 +98,15 @@ const BILLING_TYPES: GraphqlTypes = {
       split: ref('Split'),
       agreed: ref('Agreed'),
       node: ref('Node'),
+      loan: ref('Loan'),
     },
   },
   Receipt: { fields: { id: nn(scalar('ID')), totalMinor: scalar('String'), at: nn(scalar('DateTime')) } },
   Reading: { fields: { id: nn(scalar('ID')), takenAt: nn(scalar('Float')) } },
   Stamp: { fields: { id: nn(scalar('ID')), at: nn(scalar('DateTime')) } },
+  // A type no schema file declares (an undeclared custom scalar): a dangling
+  // reference with no table entry.
+  Loan: { fields: { id: nn(scalar('ID')), dueOn: nn(ref('Moment')) } },
   ReceiptEnvelope: { fields: { receipt: ref('Receipt'), warnings: nn(list(nn(scalar('String')))) } },
   Batch: { fields: { codes: nn(list(nn(scalar('String')))), rows: nn(list(ref('Row'))) } },
   Row: { fields: { amountMinor: nn(scalar('String')) } },
@@ -162,6 +166,8 @@ const PAIRS: CheckPairSpec[] = [
   gql('leaf-union-agreed', 'Tender_Sent', 'Tender_Exp', 'agreed'),
   // A self-referring type ends.
   gql('leaf-cycle', 'Node_Sent', 'Node_Exp', 'node'),
+  // A dangling type reference is read as #4275 reads it: the JSON form.
+  gql('leaf-dangling', 'Loan_Sent', 'Loan_Exp', 'loan'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -189,6 +195,7 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
         'export type Opt_Sent = { totalMinor?: bigint };',
         'export type Tender_Sent = { id: string; amountMinor: bigint };',
         'export interface Node_Sent { parent: Node_Sent | null; at: Date }',
+        'export type Loan_Sent = { id: string; dueOn: Date };',
       ].join('\n') + '\n'
     );
     writeStub(root, 'archive', 'export type Reading_Sent = { id: string; takenAt: Date };\n');
@@ -209,6 +216,7 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
         'export type Opt_Exp = { totalMinor?: string };',
         'export type Tender_Exp = { id: string; amountMinor: string };',
         'export interface Node_Exp { parent: Node_Exp | null; at: number }',
+        'export type Loan_Exp = { id: string; dueOn: string };',
       ].join('\n') + '\n'
     );
     stubs = [
@@ -292,6 +300,10 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
     );
   });
 
+  it('a type reference the table does not hold keeps the JSON form', () => {
+    assert.strictEqual(bucket('leaf-dangling').bucket, 'compatible', JSON.stringify(bucket('leaf-dangling')));
+  });
+
   it('a self-referring type is walked and ends', () => {
     assert.strictEqual(bucket('leaf-cycle').bucket, 'compatible', JSON.stringify(bucket('leaf-cycle')));
   });
@@ -351,6 +363,8 @@ describe('the one lookup over the type table (carrick#4403)', () => {
       'Order',
     ]);
     assert.deepStrictEqual(Object.keys(graphqlReachableFields(BILLING_TYPES, ref('Node'))), ['Node']);
+    // A dangling reference adds no entry.
+    assert.deepStrictEqual(Object.keys(graphqlReachableFields(BILLING_TYPES, ref('Loan'))), ['Loan']);
     assert.deepStrictEqual(graphqlReachableFields(BILLING_TYPES, ref('Split')), {
       Split: { id: nn(scalar('ID')) },
     });
