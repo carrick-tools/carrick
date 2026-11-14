@@ -231,19 +231,19 @@ fn a_fact_replaces_the_same_key_base_path_row_at_its_call() {
 }
 
 #[test]
-fn a_line_with_two_calls_keeps_its_base_path_rows() {
+fn a_line_with_two_calls_replaces_each_base_path_row_with_its_fact() {
     assert_eq!(
         calls_at("src/two-literal.ts:3"),
         [
-            "POST https://api.example.com/t/a literal_base_path",
-            "POST https://api.example.com/t/b literal_base_path"
+            "POST https://api.example.com/t/a request_summary",
+            "POST https://api.example.com/t/b request_summary"
         ]
     );
     assert_eq!(
         calls_at("src/two-env.ts:3"),
         [
-            "POST ${process.env.API_URL}/te/a env_base_path",
-            "POST ${process.env.API_URL}/te/b env_base_path"
+            "POST ${process.env.API_URL}/te/a request_summary",
+            "POST ${process.env.API_URL}/te/b request_summary"
         ]
     );
 }
@@ -259,10 +259,7 @@ fn a_path_base_has_no_base_path_row() {
 #[test]
 fn the_fold_line_counts_what_is_kept_out() {
     let line = fold_line();
-    assert!(
-        line.contains(
-            r#"kept_out={"env_base_path": 2, "literal_base_path": 2, "request_summary": 1}"#
-        ),
-        "{line}"
-    );
+    // Every base-path row stated its own operation, so each gave way
+    // (carrick#4434, #4433): nothing is kept out.
+    assert!(line.contains("kept_out={}"), "{line}");
 }
