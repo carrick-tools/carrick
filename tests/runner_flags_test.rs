@@ -1312,6 +1312,9 @@ fn the_local_indexer_keeps_the_typed_service_and_exits_0() {
         &[
             ("CARRICK_NO_MODEL", "1"),
             ("CARRICK_LOCAL_HOSTED_PREVIOUS", previous_path.as_str()),
+            // One service at a time: a death beside alpha would not stop the
+            // run, so nothing would be held.
+            ("CARRICK_SERVICE_CONCURRENCY", "1"),
         ],
     );
     assert_eq!(run.code, Some(0), "{}\n{}", run.stderr, run.log);
