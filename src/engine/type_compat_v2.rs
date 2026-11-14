@@ -6590,7 +6590,7 @@ mod tests {
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: primary_type_symbol.map(str::to_string),
             array_depth,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -8335,7 +8335,7 @@ mod tests {
             infer_kind: InferKind::Expression,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -8503,7 +8503,7 @@ mod tests {
             infer_kind: InferKind::Expression,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),
@@ -9107,6 +9107,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             source_file: types_file(),
             type_string: "{ id: string; total: number; }".to_string(),
             is_explicit: true,
+            home: None,
         };
         let manifest = vec![
             entry("Untyped"),
@@ -9152,6 +9153,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             source_file: types_file(),
             type_string: text.to_string(),
             is_explicit: true,
+            home: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             body_member: None,
@@ -9168,7 +9170,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             infer_kind: InferKind::ResponseBody,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),

@@ -26,6 +26,7 @@ interface Inferred {
   primary_type_symbol?: string;
   machinery?: boolean;
   anchor_machinery?: boolean;
+  type_home?: { symbol: string; file_path: string; line: number };
 }
 
 interface InferResponseShape {
@@ -158,11 +159,16 @@ describe('framework machinery is decided by where a type is declared (N8)', () =
     const inferred = await infer('reply: Reply = server.reply()', 'variable', ['fixture-server']);
     assert.strictEqual(inferred.type_string, 'Reply');
     assert.strictEqual(inferred.machinery, true);
+    assert.strictEqual(inferred.type_home, undefined, 'machinery has no declared home (carrick#2148)');
   });
 
   it('does not mark the same type when the store labels no server framework', async () => {
     const inferred = await infer('reply: Reply = server.reply()', 'variable');
     assert.strictEqual(inferred.machinery, undefined);
+    // An installed package's own type keeps its home (carrick#2148).
+    assert.strictEqual(inferred.type_home?.symbol, 'Reply');
+    assert.match(inferred.type_home?.file_path ?? '', /fixture-server\/index\.d\.ts$/);
+    assert.strictEqual(inferred.type_home?.line, 1);
   });
 
   it("marks the platform library's Response by its declaration and members", async () => {

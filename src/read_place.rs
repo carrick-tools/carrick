@@ -298,7 +298,7 @@ mod tests {
             infer_kind: InferKind::CallResult,
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             declaring_package: None,
             member_return_type: None,
             any_provenance: Vec::new(),

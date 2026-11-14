@@ -1720,6 +1720,16 @@ export type SidecarResponse =
 /**
  * An entry in the type manifest
  */
+/**
+ * carrick#2148: where a named type is declared: its name, the declaring file
+ * (absolute) and the 1-based line of the declaration's name.
+ */
+export interface TypeHome {
+  symbol: string;
+  file_path: string;
+  line: number;
+}
+
 export interface ManifestEntry {
   /** The alias or original name of the type */
   alias: string;
@@ -1731,6 +1741,8 @@ export interface ManifestEntry {
   type_string: string;
   /** Whether this was an explicit annotation or inferred */
   is_explicit: boolean;
+  /** carrick#2148: where the bundled declaration is, past any barrel. */
+  home?: TypeHome;
 }
 
 /**
@@ -1795,21 +1807,21 @@ export interface InferredType {
    */
   array_depth?: number;
   /**
-   * Declaration file of `primary_type_symbol` (absolute path), when the
-   * anchor symbol has a resolvable source declaration. Reported by every
-   * infer kind that reports the symbol (carrick#1819): it is where a reader
-   * finds the type an anchor names, and the scanner writes an anchor's home
-   * from it. The file is the one that declares the symbol the type resolves
-   * to, never a barrel that re-exports it.
+   * carrick#2148: where the type `type_string` was printed from is declared.
+   * Where `primary_type_symbol` is reported, the home is that symbol's (its
+   * `symbol` equals it); otherwise it is the printed type's, with array levels
+   * and a `| null`/`| undefined` around exactly one named type peeled. The
+   * file is the one that declares the type, never a barrel that re-exports
+   * it, and the line is the declaration's name. Absent for a shape nobody
+   * named, a TypeScript lib type, framework machinery, a type declared inside
+   * an ambient `declare module "<specifier>"` block (a package's type,
+   * wherever the stub sits) and a decided abstain.
    *
-   * The scanner's pub/sub two-anchor arbitration (carrick#413) also reads it,
-   * for a borrowed-anchor request only, to re-aim a demoted explicit
-   * `SymbolRequest` at the tsc-witnessed payload type: the bundler requires
-   * the symbol to be declared in, or re-exported by, the request's
-   * `source_file`, and the inference is the only party that knows where that
-   * is.
+   * The scanner's pub/sub two-anchor arbitration (carrick#413) reads its file
+   * to re-aim a demoted explicit `SymbolRequest` at the tsc-witnessed payload
+   * type.
    */
-  primary_type_symbol_source?: string;
+  type_home?: TypeHome;
   /**
    * Blueprint row N8: the type `type_string` prints is framework machinery,
    * decided by where it is declared (a library or installed package with the
@@ -1932,8 +1944,8 @@ export interface StatedBody {
    * is not a named type (an object literal type, a union of several types).
    */
   root?: string;
-  /** Declaration file (absolute path) of `root`, when it resolves to one. */
-  root_source?: string;
+  /** Where `root` is declared (carrick#2148), by `InferredType.type_home`'s rule. */
+  root_home?: TypeHome;
   /** Array levels peeled on the way to `root`. Omitted when 0. */
   array_depth?: number;
   /**

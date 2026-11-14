@@ -108,7 +108,7 @@ interface InferShape {
     type_string: string;
     is_explicit: boolean;
     primary_type_symbol?: string;
-    primary_type_symbol_source?: string;
+    type_home?: { symbol: string; file_path: string; line: number };
     array_depth?: number;
   }>;
   errors?: string[];
@@ -185,8 +185,8 @@ describe('carrick#768 stated-annotation anchor symbol', () => {
     // The NAME is the point of carrick#768.
     assert.strictEqual(inferred.primary_type_symbol, 'OrderBody');
     assert.ok(
-      inferred.primary_type_symbol_source?.endsWith('contracts.ts'),
-      `the anchor must point at its declaring file, got: ${inferred.primary_type_symbol_source}`
+      inferred.type_home?.file_path.endsWith('contracts.ts'),
+      `the anchor must point at its declaring file, got: ${JSON.stringify(inferred.type_home)}`
     );
   });
 

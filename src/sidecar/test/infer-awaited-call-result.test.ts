@@ -169,7 +169,7 @@ interface Inferred {
   type_string: string;
   is_explicit: boolean;
   primary_type_symbol?: string;
-  primary_type_symbol_source?: string;
+  type_home?: { symbol: string; file_path: string; line: number };
   array_depth?: number;
 }
 
@@ -254,7 +254,7 @@ describe("carrick#1877: a call's result holds what await yields for the call's t
   const answer = (inferred: Inferred) => [
     collapse(inferred.type_string),
     inferred.primary_type_symbol,
-    inferred.primary_type_symbol_source,
+    inferred.type_home,
     inferred.array_depth,
   ];
 
@@ -263,7 +263,7 @@ describe("carrick#1877: a call's result holds what await yields for the call's t
       const inferred = await infer('/awaited');
       assert.strictEqual(collapse(inferred.type_string), 'Invoice');
       assert.strictEqual(inferred.primary_type_symbol, 'Invoice');
-      assert.strictEqual(inferred.primary_type_symbol_source, clientPath);
+      assert.strictEqual(inferred.type_home?.file_path, clientPath);
     });
 
     it('publishes the payload of a call returned without await, and anchors on it', async () => {
@@ -324,7 +324,7 @@ describe("carrick#1877: a call's result holds what await yields for the call's t
         const inferred = await infer(url);
         assert.strictEqual(collapse(inferred.type_string), written);
         assert.strictEqual(inferred.primary_type_symbol, undefined);
-        assert.strictEqual(inferred.primary_type_symbol_source, undefined);
+        assert.strictEqual(inferred.type_home, undefined);
       });
     }
   });

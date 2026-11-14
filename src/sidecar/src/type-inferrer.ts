@@ -57,6 +57,7 @@ import type {
   StatedBody,
   ExtractionConfig,
   ExtractionRule,
+  TypeHome,
   TypeProvenance,
 } from './types.js';
 import { validateInferRequestItem } from './validators.js';
@@ -78,6 +79,7 @@ import { callInto, calledFunction, narrowByArguments } from './argument-modes.js
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
+import { homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
 import {
   callsOf,
   descendantsOf,
@@ -428,6 +430,12 @@ const BODY_MEMBER_NAMES = new Set(['data', 'body', 'json']);
 
 interface DeclaredContract {
   text: string;
+  /**
+   * carrick#2148: the type `text` was printed from, where one type was, so
+   * the answer can report where it is declared. Absent for a contract read
+   * off a schema value or joined from several reads.
+   */
+  type?: Type;
   provenance?: TypeProvenance[];
   /**
    * carrick#4244: the nodes `text` was read from (a schema value, an
@@ -1899,7 +1907,7 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element),
+      undefined,
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : awaitedType,
       anchor.element
     );
@@ -2014,7 +2022,7 @@ export class TypeInferrer {
       undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element),
+      undefined,
       paramType,
       anchor.element
     );
@@ -2397,7 +2405,7 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element),
+      undefined,
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
       anchor.element
     );
@@ -2743,12 +2751,6 @@ export class TypeInferrer {
     const stated = recovered.statedTypeNode;
     const writtenAnchor =
       resolvedSymbol === undefined && stated ? this.writtenAnchorOf(stated) : undefined;
-    // carrick#1819: a symbol the resolved type carries has a declaration file
-    // as much as one read off the annotation does.
-    const resolvedSource =
-      resolvedSymbol !== undefined && recoveredAnchor
-        ? this.primaryTypeSymbolSource(recoveredAnchor.element)
-        : undefined;
     const inferred = this.createInferredType(
       request,
       recovered.typeString,
@@ -2757,7 +2759,7 @@ export class TypeInferrer {
       undefined,
       resolvedSymbol ?? writtenAnchor?.symbol,
       writtenAnchor ? writtenAnchor.depth : recoveredAnchor?.depth,
-      writtenAnchor ? writtenAnchor.source : resolvedSource,
+      writtenAnchor?.home,
       recovered.anchorType,
       resolvedSymbol !== undefined ? recoveredAnchor?.element : undefined
     );
@@ -3434,7 +3436,7 @@ export class TypeInferrer {
       undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      undefined,
       read.length === 1 ? this.unwrapPromiseType(read[0]) : undefined,
       anchor?.element
     );
@@ -3920,9 +3922,12 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      undefined,
       printedType,
-      anchor?.element
+      anchor?.element,
+      // carrick#2148: a carrier the call's reading left (carrick#1376) is the
+      // transport's bookkeeping, not the body, so it has no home either.
+      leftCarrier && !anchor ? null : undefined
     );
     // carrick#1749: say when the text is the source's own statement of the
     // body, and what that statement is rooted at, so the scanner can tell a
@@ -4201,16 +4206,17 @@ export class TypeInferrer {
     if (symbol?.isAlias()) {
       symbol = symbol.getAliasedSymbol() ?? symbol;
     }
-    const source = symbol?.getDeclarations()[0]?.getSourceFile().getFilePath();
+    const machinery = this.isFrameworkMachinery(node.getType());
+    const home = symbol && !machinery ? this.homeOfSymbol(nameNode.getText(), symbol) : undefined;
     const typeArguments = node.getTypeArguments().length;
     const rootRelation = symbol ? this.statedRootRelation(symbol, typeNode) : undefined;
     return {
       root: nameNode.getText(),
-      ...(source ? { root_source: source } : {}),
+      ...(home ? { root_home: home } : {}),
       ...depthField,
       ...(typeArguments > 0 ? { root_type_arguments: typeArguments } : {}),
       ...(rootRelation ? { root_relation: rootRelation } : {}),
-      ...(this.isFrameworkMachinery(node.getType()) ? { machinery: true as const } : {}),
+      ...(machinery ? { machinery: true as const } : {}),
     };
   }
 
@@ -4326,7 +4332,7 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.typeString : undefined,
       this.primaryTypeSymbol(anchor.element),
       anchor.depth,
-      this.primaryTypeSymbolSource(anchor.element),
+      undefined,
       this.unwrapPromiseType(anchorSource),
       anchor.element
     ));
@@ -4837,7 +4843,8 @@ export class TypeInferrer {
     // so an ancestor walk from `located` would miss it. `node` is the inner
     // expression whose ancestors include the `as T`, so the cast is recovered;
     // the typed-binding and untyped-control cases are unaffected.
-    const explicitType = this.extractExplicitTypeFromAncestor(node);
+    const explicitTypeNode = this.explicitTypeNodeFromAncestor(node);
+    const explicitType = explicitTypeNode ? this.expandAnnotationTypeNode(explicitTypeNode) : null;
     if (explicitType) {
       typeString = explicitType;
       isExplicit = true;
@@ -4906,7 +4913,9 @@ export class TypeInferrer {
         ? undefined
         : unwrapResult.wasUnwrapped
           ? unwrapResult.payloadType
-          : this.unwrapPromiseType(payloadType)
+          : this.unwrapPromiseType(payloadType),
+      undefined,
+      explicitType && explicitTypeNode ? this.unwrapPromiseType(explicitTypeNode.getType()) : undefined
     ), [node]));
   }
 
@@ -5926,7 +5935,7 @@ export class TypeInferrer {
       undefined,
       anchor ? this.primaryTypeSymbol(anchor.element) : undefined,
       anchor?.depth,
-      anchor ? this.primaryTypeSymbolSource(anchor.element) : undefined,
+      undefined,
       stated.typeNode ? this.unwrapPromiseType(stated.typeNode.getType()) : undefined,
       anchor?.element
     );
@@ -8824,47 +8833,62 @@ export class TypeInferrer {
   }
 
   /**
-   * Declaration file (absolute path) of the anchor symbol
-   * `primaryTypeSymbol` reports for this type, or `undefined` when the type
-   * has no user-facing anchor or no source declaration. Every path that
-   * reports the symbol reports this beside it (carrick#1819): it is where a
-   * reader finds the type an anchor names. The scanner's pub/sub two-anchor
-   * arbitration (carrick#413) also uses it to re-aim a demoted explicit
-   * bundle request: the bundler resolves a `SymbolRequest` only against
-   * declarations IN its `source_file`, so the request must point at the file
-   * that actually declares the tsc-witnessed payload type.
+   * carrick#2148: where `type` is declared, as a reader would open it: the
+   * name, the declaring file (absolute) and the 1-based line of the
+   * declaration's name. Every answer's `type_home` comes from here.
    *
-   * The declarations read are those of the symbol the anchor is named from
-   * (`anchorSymbolOf`: the type's own symbol, or its alias's), so a name
-   * imported through a barrel reports the file that declares it, and a name
-   * two files declare reports the one this type resolves to. A declaration in
-   * an installed package or a TypeScript lib is reported as it is found, as
-   * an absolute path; what a reader is shown for it is the scanner's call.
+   * The type read is the named one: array levels are peeled, and so is a
+   * `| null`/`| undefined` around exactly one other type (`Invoice | null`
+   * is homed at `Invoice`). A type that already has a name is not peeled, so
+   * an alias of a union keeps its own home. A union of several types has no
+   * one home.
    *
-   * Only declaration kinds the bundler's `validateSymbols` can resolve
-   * (interface, type alias, class, enum, function, variable) count. A
-   * symbol's declaration list can also contain re-export machinery — a
-   * barrel's `ExportSpecifier` (`export { Foo } from './foo'`) points at a
-   * file that does not DECLARE the type, and a request re-aimed there would
-   * fail validation, turning a resolvable explicit type into `unknown`.
-   * With no declaring node, no source is reported and the arbitration
-   * fails closed to the explicit anchor.
+   * The symbol is the one `primaryTypeSymbol` names (`anchorSymbolOf`), so a
+   * name imported through a barrel is homed at the file that declares it and
+   * an instantiated generic alias (`Page<Order>`) at `Page`. There is no home
+   * for framework machinery, a `BUILTIN_ANCHOR_SYMBOLS` name, or where
+   * `homeOfDeclaration` gives none.
    */
-  private primaryTypeSymbolSource(type: Type): string | undefined {
-    if (this.primaryTypeSymbol(type) === undefined) {
-      return undefined;
+  private typeHomeOf(type: Type | undefined): TypeHome | undefined {
+    if (!type) return undefined;
+    const MAX_HOME_PEELS = 10;
+    let current = type;
+    for (let peeled = 0; peeled < MAX_HOME_PEELS; peeled++) {
+      if (this.primaryTypeSymbol(current) !== undefined) break;
+      const element = current.getArrayElementType();
+      if (element) {
+        current = element;
+        continue;
+      }
+      if (current.isUnion()) {
+        const members = current.getUnionTypes();
+        const named = members.filter((member) => !member.isNull() && !member.isUndefined());
+        if (named.length === 1 && named.length < members.length) {
+          current = named[0];
+          continue;
+        }
+      }
+      break;
     }
-    const decls = this.anchorSymbolOf(type)?.getDeclarations() ?? [];
-    const declaring = decls.find(
-      (d) =>
-        Node.isInterfaceDeclaration(d) ||
-        Node.isTypeAliasDeclaration(d) ||
-        Node.isClassDeclaration(d) ||
-        Node.isEnumDeclaration(d) ||
-        Node.isFunctionDeclaration(d) ||
-        Node.isVariableDeclaration(d)
-    );
-    return declaring?.getSourceFile().getFilePath();
+    const name = this.primaryTypeSymbol(current);
+    const symbol = this.anchorSymbolOf(current);
+    if (name === undefined || !symbol || this.isFrameworkMachinery(current)) return undefined;
+    return this.homeOfSymbol(name, symbol);
+  }
+
+  /**
+   * The home of `symbol` under the name a reader knows it by: its first
+   * type-space declaration (interface, type alias, class, enum), by
+   * `homeOfDeclaration`'s rule. A symbol declared only as a value has none.
+   */
+  private homeOfSymbol(name: string, symbol: TsSymbol): TypeHome | undefined {
+    const declaration = symbol.getDeclarations().find(isTypeSpaceDeclaration);
+    return declaration ? this.homeOfDeclaration(name, declaration) : undefined;
+  }
+
+  /** `homeOfTypeDeclaration` in this service's program. */
+  private homeOfDeclaration(name: string, declaration: Node): TypeHome | undefined {
+    return homeOfTypeDeclaration(name, declaration, this.project.getProgram().compilerObject);
   }
 
   /**
@@ -8898,7 +8922,7 @@ export class TypeInferrer {
    */
   private writtenAnchorOf(
     typeNode: Node
-  ): { symbol: string; source: string; depth: number } | undefined {
+  ): { symbol: string; home: TypeHome | undefined; depth: number } | undefined {
     const MAX_ANCHOR_ARRAY_DEPTH = 10;
     let current = typeNode;
     let depth = 0;
@@ -8924,21 +8948,16 @@ export class TypeInferrer {
     const symbol = identifier.getSymbol();
     if (!symbol) return undefined;
     const resolved = symbol.getAliasedSymbol() ?? symbol;
-    const declaration = resolved
-      .getDeclarations()
-      .find(
-        (d) =>
-          Node.isTypeAliasDeclaration(d) ||
-          Node.isInterfaceDeclaration(d) ||
-          Node.isClassDeclaration(d) ||
-          Node.isEnumDeclaration(d)
-      );
+    const declaration = resolved.getDeclarations().find(isTypeSpaceDeclaration);
     if (!declaration) return undefined;
 
     const sourceFile = declaration.getSourceFile();
     if (sourceFile.compilerNode.hasNoDefaultLib) return undefined;
 
-    return { symbol: name, source: sourceFile.getFilePath(), depth };
+    const home = this.isFrameworkMachinery(declaration.getType())
+      ? undefined
+      : this.homeOfDeclaration(name, declaration);
+    return { symbol: name, home, depth };
   }
 
   /**
@@ -9685,7 +9704,7 @@ export class TypeInferrer {
         if (typeArgs.length > 0) {
           const resolved = this.structuralTextFromTypeNode(typeArgs[0]);
           if (resolved) {
-            found = { text: resolved, reads: [descendant] };
+            found = { text: resolved, type: typeArgs[0].getType(), reads: [descendant] };
             traversal.stop();
             return;
           }
@@ -9706,7 +9725,7 @@ export class TypeInferrer {
             ? this.structuralTextFromTypeNode(typeNode)
             : null;
         if (resolved) {
-          found = { text: resolved, reads: [member ?? descendant] };
+          found = { text: resolved, type: (member ?? typeNode)?.getType(), reads: [member ?? descendant] };
           traversal.stop();
           return;
         }
@@ -9855,7 +9874,19 @@ export class TypeInferrer {
           'reads off the platform request, as the source types that read'
       );
       return this.withReads(
-        this.createInferredType(request, statedText, true, this.getNodeLocation(read)),
+        this.createInferredType(
+          request,
+          statedText,
+          true,
+          this.getNodeLocation(read),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          statedNode?.getType()
+        ),
         [read]
       );
     }
@@ -9991,7 +10022,12 @@ export class TypeInferrer {
         true,
         this.getNodeLocation(registration),
         undefined,
-        undefined
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        declared.type
       ),
       declared.reads ?? []
     );
@@ -10880,7 +10916,12 @@ export class TypeInferrer {
       true,
       location,
       undefined,
-      undefined
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      contract.type
     );
     if (contract.provenance && contract.provenance.length > 0) {
       inferred.any_provenance = contract.provenance;
@@ -10910,7 +10951,7 @@ export class TypeInferrer {
     if (stated?.kind === 'body') {
       const text = this.structuralTextFromType(stated.type, stated.at);
       if (text) {
-        return { text, reads: [stated.at] };
+        return { text, type: stated.type, reads: [stated.at] };
       }
     }
     const annotated = this.requestBodyFromHandlerParams(handler);
@@ -11004,7 +11045,19 @@ export class TypeInferrer {
     if (today && today.type_string === printed) return today;
     this.log(`Route at ${request.file_path}:${request.line_number}: ${why}`);
     return this.withReads(
-      this.createInferredType(request, printed, true, this.getNodeLocation(handler)),
+      this.createInferredType(
+        request,
+        printed,
+        true,
+        this.getNodeLocation(handler),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        stated.variants.length === 1 ? stated.variants[0] : undefined
+      ),
       [stated.at]
     );
   }
@@ -11058,7 +11111,7 @@ export class TypeInferrer {
       }
       const text = this.structuralTextFromType(bodyType, param);
       if (text) {
-        return { text, reads: [param.getTypeNode() ?? param] };
+        return { text, type: bodyType, reads: [param.getTypeNode() ?? param] };
       }
     }
     return null;
@@ -11356,7 +11409,14 @@ export class TypeInferrer {
       return null;
     }
     const [first] = decided;
-    return { text: first.text, provenance: first.provenance, at: first.at, how: first.how, typeNode: first.typeNode };
+    return {
+      text: first.text,
+      type: first.typeNode?.getType(),
+      provenance: first.provenance,
+      at: first.at,
+      how: first.how,
+      typeNode: first.typeNode,
+    };
   }
 
   /**
@@ -12448,9 +12508,10 @@ export class TypeInferrer {
     payloadTypeString?: string,
     primaryTypeSymbol?: string,
     arrayDepth?: number,
-    primaryTypeSymbolSource?: string,
+    writtenHome?: TypeHome,
     printedType?: Type,
-    anchorType?: Type
+    anchorType?: Type,
+    homeType?: Type | null
   ): InferredType {
     const alias =
       request.alias ||
@@ -12469,9 +12530,7 @@ export class TypeInferrer {
       // depth join copies it onto the model's symbol when the symbols agree,
       // or, at a handler's send, when the element has no symbol to disagree.
       array_depth: arrayDepth !== undefined && arrayDepth > 0 ? arrayDepth : undefined,
-      // Same gate: a declaration source without an anchor symbol is useless.
-      primary_type_symbol_source:
-        primaryTypeSymbol !== undefined ? primaryTypeSymbolSource : undefined,
+      ...this.homeField(primaryTypeSymbol, writtenHome, anchorType, homeType === undefined ? printedType : homeType),
       ...(printedType && this.isFrameworkMachinery(printedType) ? { machinery: true as const } : {}),
       ...(primaryTypeSymbol !== undefined && anchorType && this.isFrameworkMachinery(anchorType)
         ? { anchor_machinery: true as const }
@@ -12479,6 +12538,30 @@ export class TypeInferrer {
     };
     if (printedType) this.printedTypes.set(inferred, printedType);
     return inferred;
+  }
+
+  /**
+   * carrick#2148: the `type_home` of an answer. Where the builder reports
+   * `primary_type_symbol`, the home is that symbol's: read off the anchor
+   * type the symbol was named from, or the annotation it was read off as
+   * written (`writtenHome`), so it is that symbol's declaration and never
+   * another type's. Where no symbol is reported, the home is the printed
+   * type's (`typeHomeOf`), unless the builder passes `null`: the printed type
+   * is one it deliberately anchors nothing on.
+   */
+  private homeField(
+    primaryTypeSymbol: string | undefined,
+    writtenHome: TypeHome | undefined,
+    anchorType: Type | undefined,
+    printedType: Type | null | undefined
+  ): { type_home?: TypeHome } {
+    const home =
+      primaryTypeSymbol === undefined
+        ? this.typeHomeOf(printedType ?? undefined)
+        : anchorType
+          ? this.typeHomeOf(anchorType)
+          : writtenHome;
+    return home ? { type_home: home } : {};
   }
 
   private generateAlias(

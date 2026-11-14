@@ -190,7 +190,7 @@ interface InferShape {
     any_provenance?: Array<{ path: string; reason: string }>;
     stated_body?: {
       root?: string;
-      root_source?: string;
+      root_home?: { symbol: string; file_path: string; line: number };
       array_depth?: number;
       root_type_arguments?: number;
     };
@@ -285,7 +285,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
     it('reports the named root of a stated body, with where it is declared', async () => {
       const inferred = await infer('Member_Response', 'fetchReply("/v1/member")');
       assert.strictEqual(inferred.stated_body?.root, 'Member');
-      assert.strictEqual(inferred.stated_body?.root_source, servicePath);
+      assert.strictEqual(inferred.stated_body?.root_home?.file_path, servicePath);
       assert.strictEqual(inferred.stated_body?.array_depth, undefined);
       assert.strictEqual(inferred.stated_body?.root_type_arguments, undefined);
     });
@@ -295,7 +295,7 @@ describe('carrick#1749: the body a caller reads, stated by the source', () => {
       // is, so the scanner must be able to tell the two apart.
       const inferred = await infer('Enveloped_Response', 'fetchReply("/v1/members-enveloped")');
       assert.strictEqual(inferred.stated_body?.root, 'Envelope');
-      assert.strictEqual(inferred.stated_body?.root_source, servicePath);
+      assert.strictEqual(inferred.stated_body?.root_home?.file_path, servicePath);
       assert.strictEqual(inferred.stated_body?.root_type_arguments, 1);
       assert.strictEqual(
         inferred.stated_body?.array_depth,

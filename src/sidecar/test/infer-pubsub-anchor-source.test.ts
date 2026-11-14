@@ -2,7 +2,7 @@
  * carrick#413 (two-anchor arbitration): the pub/sub infer kinds
  * (`function_param` for subscribers, `expression` for publishers) must report
  * the deterministic anchor of the resolved payload — `primary_type_symbol`
- * plus its declaration file (`primary_type_symbol_source`) — so the scanner
+ * plus its declaration (`type_home`) — so the scanner
  * can compare the tsc-resolved root against an LLM-emitted explicit symbol
  * and, on a witnessed borrow, re-aim the explicit bundle request at the real
  * payload type. The type STRING keeps ts-morph's default named form; the
@@ -28,7 +28,7 @@ interface InferResponseShape {
     is_explicit: boolean;
     infer_kind: string;
     primary_type_symbol?: string;
-    primary_type_symbol_source?: string;
+    type_home?: { symbol: string; file_path: string; line: number };
     array_depth?: number;
   }>;
   errors?: string[];
@@ -75,9 +75,9 @@ describe('pub/sub infer kinds report the payload anchor and its declaration sour
     assert.strictEqual(inferred.is_explicit, true);
     assert.strictEqual(inferred.primary_type_symbol, 'OrderPlacedPayload');
     assert.ok(
-      inferred.primary_type_symbol_source?.endsWith('pubsub-handlers.ts'),
+      inferred.type_home?.file_path.endsWith('pubsub-handlers.ts'),
       `anchor source must be the declaration file, got ${JSON.stringify(
-        inferred.primary_type_symbol_source
+        inferred.type_home
       )}`
     );
   });
@@ -106,9 +106,9 @@ describe('pub/sub infer kinds report the payload anchor and its declaration sour
     assert.strictEqual(inferred.type_string, 'OrderPlacedPayload');
     assert.strictEqual(inferred.primary_type_symbol, 'OrderPlacedPayload');
     assert.ok(
-      inferred.primary_type_symbol_source?.endsWith('pubsub-handlers.ts'),
+      inferred.type_home?.file_path.endsWith('pubsub-handlers.ts'),
       `anchor source must be the declaration file, got ${JSON.stringify(
-        inferred.primary_type_symbol_source
+        inferred.type_home
       )}`
     );
   });
@@ -135,9 +135,9 @@ describe('pub/sub infer kinds report the payload anchor and its declaration sour
     const inferred = response.inferred_types[0];
     assert.strictEqual(inferred.primary_type_symbol, 'ReExportedPayload');
     assert.ok(
-      inferred.primary_type_symbol_source?.endsWith('pubsub-barrel-types.ts'),
+      inferred.type_home?.file_path.endsWith('pubsub-barrel-types.ts'),
       `anchor source must be the declaring file, got ${JSON.stringify(
-        inferred.primary_type_symbol_source
+        inferred.type_home
       )}`
     );
   });
@@ -163,6 +163,6 @@ describe('pub/sub infer kinds report the payload anchor and its declaration sour
     );
     const inferred = response.inferred_types[0];
     assert.strictEqual(inferred.primary_type_symbol, undefined);
-    assert.strictEqual(inferred.primary_type_symbol_source, undefined);
+    assert.strictEqual(inferred.type_home, undefined);
   });
 });

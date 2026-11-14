@@ -72,7 +72,11 @@ const FILES: Record<string, string> = {
 interface BundleShape {
   status: string;
   dts_content?: string;
-  manifest?: Array<{ alias: string; type_string: string }>;
+  manifest?: Array<{
+    alias: string;
+    type_string: string;
+    home?: { symbol: string; file_path: string; line: number };
+  }>;
   symbol_failures?: Array<{ symbol_name: string; source_file: string; reason: string }>;
   errors?: string[];
 }
@@ -119,6 +123,18 @@ describe('carrick#1605: the bundle follows a name through its re-exports', () =>
     const res = await bundle('Me', 'src/core/index.ts', { alias: 'Me_Barrel' });
     assert.strictEqual(res.symbol_failures, undefined, JSON.stringify(res.symbol_failures));
     assert.match(collapse(res.dts_content ?? ''), /export type Me_Barrel = \{ id: string; email: string; \};/);
+  });
+
+  it('reports the declaring file and line of a name requested from a barrel (carrick#2148)', async () => {
+    const res = await bundle('AccountView', 'src/core/index.ts', { alias: 'Account_Home' });
+    assert.strictEqual(res.symbol_failures, undefined, JSON.stringify(res.symbol_failures));
+    const entry = res.manifest?.find((e) => e.alias === 'Account_Home');
+    assert.ok(entry, JSON.stringify(res.manifest));
+    assert.ok(entry.home, JSON.stringify(entry));
+    assert.deepStrictEqual(
+      { ...entry.home, file_path: fs.realpathSync(entry.home.file_path) },
+      { symbol: 'Account', file_path: path.join(fs.realpathSync(repo), 'src', 'core', 'api.ts'), line: 2 }
+    );
   });
 
   it('resolves a type through `export { Me } from`', async () => {
