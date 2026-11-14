@@ -116,7 +116,7 @@ test("Stop's own work with a pending re-check takes under 1 s", (t) => {
   const result = stopAnswers(SESSION, { home });
   const ms = performance.now() - started;
   assert.ok(ms < 1000, `Stop never waits (${Math.round(ms)} ms)`);
-  assert.match(result.lines.join("\n"), /users\.ts: its re-check is still running/);
+  assert.deepEqual(result.lines, [], "a re-check still running is not Stop's to say");
 });
 
 /** The hook events after a Stop that carry late answers, as Claude Code runs them. */
@@ -159,11 +159,8 @@ test("Stop with a pending re-check returns at once, ignores an older --wait-s, a
   assert.equal(parsed["decision"], undefined);
   assert.equal(parsed["continue"], undefined);
   assert.equal(parsed["systemMessage"], undefined);
-  assert.match(
-    context(run.stdout),
-    /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: its re-check is still running after \d+ s\. A background `carrick check --changed` is queued; its answer comes with the next Carrick line\.$/,
-  );
-  assert.equal(changedQueued(workspace.root).length, 1, "the whole-change check is still queued");
+  assert.equal(run.stdout, "", "a re-check still running prints nothing at Stop");
+  assert.equal(changedQueued(workspace.root).length, 0, "the running re-check's answer rides the next hook event: no check --changed");
 });
 
 test("a finding that lands after Stop is printed once, by the next prompt", async (t) => {
@@ -399,20 +396,30 @@ test("stop says a re-check is still running, once, without waiting, and delivers
 
   const first = await stopWith(home);
   assert.ok(first.ms < SPAWNED_MS, `no wait (${first.ms} ms)`);
-  assert.match(
-    context(first.stdout),
-    /^Carrick: the re-check of user-service\/src\/routes\/users\.ts is still running after \d+ s\.$/,
-  );
+  assert.equal(first.stdout, "", "still running: Stop says nothing");
 
   const second = await stopWith(home, { stop_hook_active: true });
   assert.ok(second.ms < SPAWNED_MS, `no wait (${second.ms} ms)`);
   assert.equal(second.stdout, "");
 
   answer(home, entry, problem());
-  const third = await stopWith(home);
-  assert.match(context(third.stdout), /contract problem/);
-  const fourth = await stopWith(home);
-  assert.equal(fourth.stdout, "", "delivered once");
+  const prompt = await promptHook(home, workspace.root);
+  assert.match(context(prompt.stdout), /contract problem/);
+  assert.equal((await stopWith(home)).stdout, "", "delivered once");
+});
+
+// A Stop where every gap is a re-check still running prints nothing and leaves
+// the problem to the next hook event once the re-check has answered it.
+test("a problem found by a re-check that was running at Stop is delivered by the next hook event, not Stop", async (t) => {
+  const { workspace, home } = setup(t);
+  liveRunner(workspace.root);
+  edit(workspace.root, home, workspace.file, Date.now() - 1000);
+  const entry = queue(workspace.root, home, workspace.file);
+  assert.equal((await stopWith(home)).stdout, "", "running at Stop: silent");
+  answer(home, entry, problem());
+  const bash = await bashHook(home, workspace.root);
+  assert.match(context(bash.stdout), /contract problem/);
+  assert.equal((await bashHook(home, workspace.root)).stdout, "", "once");
 });
 
 // R46.2: an answer queued in place of the probe is delivered whole or not at
@@ -579,8 +586,7 @@ test("stop never carries the check clause: rule 5 and the post-edit line say it 
   queue(workspace.root, home, workspace.file);
   recordEdit(SESSION, workspace.root, 3_000_000, home);
   const running = (stopAnswers(SESSION, { home })).lines.join("\n");
-  assert.match(running, /is still running after \d+ s\.$/);
-  assert.doesNotMatch(running, CLAUSE);
+  assert.equal(running, "", "a re-check still running prints nothing");
 });
 
 // The Stop hook states the session's contract check from the per-file
@@ -843,18 +849,16 @@ test("an edit after the answer is not covered: Stop names the file and queues ch
   assert.equal(changedQueued(workspace.root).length, 1);
 });
 
-test("a Stop over a pending re-check does not wait for the check --changed it queues, and names the file once", (t) => {
+test("a Stop over a pending re-check prints nothing and queues no check --changed", (t) => {
   const { workspace, home } = setup(t);
   liveRunner(workspace.root);
   edit(workspace.root, home, workspace.file, Date.now() - 5000);
   queue(workspace.root, home, workspace.file);
   const first = stopAnswers(SESSION, { home, ensure: () => false });
-  assert.equal(first.lines.length, 1);
-  assert.match(first.lines[0]!, /^Carrick did not check the whole change: user-service\/src\/routes\/users\.ts: its re-check is still running after \d+ s\./);
-  assert.equal(changedQueued(workspace.root).length, 1);
+  assert.deepEqual(first.lines, [], "still running: nothing at Stop");
+  assert.equal(changedQueued(workspace.root).length, 0, "the running re-check delivers its own answer: no check --changed");
   const second = stopAnswers(SESSION, { home, ensure: () => false });
-  assert.deepEqual(second.lines, [], "once");
-  assert.equal(changedQueued(workspace.root).length, 1, "one changed entry, not one per Stop");
+  assert.deepEqual(second.lines, []);
 });
 
 for (const [name, arrange, reason] of [
