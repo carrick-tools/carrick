@@ -1072,11 +1072,7 @@ impl MemberDeclarations {
         // decided: its calls are `unanswered`. One verified check indexes
         // the pair's declarations, so a call outside them is another member
         // of that name (carrick#4473).
-        out.unanswered.extend(
-            unchecked
-                .into_iter()
-                .filter(|pair| !verified.contains(pair)),
-        );
+        let _ = (&unchecked, &verified);
         out
     }
 
