@@ -35,7 +35,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use tokio::sync::oneshot;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::boundary::Counted;
 
 use super::service_workers::{self, Reached, ServiceMemory, WalkEnd};
 use crate::config::Config;
@@ -73,9 +75,42 @@ pub(super) struct Walked {
     /// nothing was walked, the walk failed, kept rows were reused, or the
     /// platform could not say.
     peak_mb: Option<u64>,
+    /// Whether a walk was asked for: false only when the run has no compiler
+    /// engine to ask (carrick#4247).
+    asked: bool,
+    /// Why an asked walk wrote no rows, when it did not (carrick#4247).
+    lost: Option<WalkLoss>,
+}
+
+/// Why a walk wrote no rows. Rust-only: the blob carries a fixed sentence,
+/// never a value of this type and never the raw error (carrick#4247).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkLoss {
+    /// Its compiler process died of memory at this heap cap, in MB.
+    Memory { heap_cap_mb: Option<u64> },
+    /// Any other failure.
+    Failed,
 }
 
 impl Walked {
+    /// What `boundary.walk_rows_lost` says for this service, `None` when no
+    /// walk was asked: `total` 0 when the service has rows, 1 with one
+    /// reason when its walk wrote none (carrick#4247).
+    pub(super) fn rows_lost(&self) -> Option<Counted> {
+        if !self.asked {
+            return None;
+        }
+        let reasons = match self.lost {
+            None => Vec::new(),
+            Some(WalkLoss::Memory { heap_cap_mb }) => vec![format!(
+                "the compiler walk died of memory at a heap cap of {}",
+                cap_text(heap_cap_mb)
+            )],
+            Some(WalkLoss::Failed) => vec!["the compiler walk failed".to_string()],
+        };
+        Some(Counted::new(reasons.len(), reasons))
+    }
+
     pub(super) fn peak_mb(&self) -> Option<u64> {
         self.peak_mb
     }
@@ -296,7 +331,12 @@ impl Lane {
     /// `service`'s walk ended with `done`: walked again once at the run's
     /// cap when it died of memory below it, otherwise in its slot, its setup
     /// told.
-    pub(super) fn walk_ended(&mut self, service: usize, again: bool, done: WalkDone) -> WalkEnd {
+    pub(super) fn walk_ended(
+        &mut self,
+        service: usize,
+        again: bool,
+        mut done: WalkDone,
+    ) -> WalkEnd {
         let label = self.label(service).to_string();
         info!(
             "Walk {label} ended: {:.1} s, peak {}",
@@ -324,9 +364,11 @@ impl Lane {
                 "Walk {label} died of memory at a heap cap of {}; its rows are lost",
                 cap_text(walked_at)
             );
-            crate::scan_health::record_walk_rows_lost(
-                self.services[service].service_name.as_deref(),
-            );
+            // The walk's `Err` branch called it a failure; the death is
+            // what the boundary says (carrick#4247).
+            done.walked.lost = Some(WalkLoss::Memory {
+                heap_cap_mb: walked_at,
+            });
         }
         if let Some(by) = self.reached_by[service] {
             info!(
@@ -417,6 +459,8 @@ pub(super) fn reuse(
         scan_root,
         label,
         peak_mb: None,
+        asked: true,
+        lost: None,
     })
 }
 
@@ -443,16 +487,21 @@ fn walk(
         .as_deref()
         .unwrap_or("(root)")
         .to_string();
-    let no_rows = |scan_root: PathBuf, label: String, lands_at: Option<PathBuf>| Walked {
+    let no_rows = |scan_root: PathBuf,
+                   label: String,
+                   lands_at: Option<PathBuf>,
+                   lost: Option<WalkLoss>| Walked {
         rows: None,
         lands_at,
         service: service.service_name.clone(),
         scan_root,
         label,
         peak_mb: None,
+        asked: lost.is_some(),
+        lost,
     };
     let Some(recipe) = recipe else {
-        return no_rows(scan_root, label, None);
+        return no_rows(scan_root, label, None, None);
     };
     let out = place(
         &super::get_repository_name(&canonical),
@@ -471,8 +520,15 @@ fn walk(
     let peak_mb = match crate::position_rows::record_service_rows(recipe, &walk) {
         Ok((_, peak_mb)) => peak_mb,
         Err(error) => {
-            debug!("Position rows for service {label} were not written: {error}");
-            return no_rows(scan_root, label, out.lands_at().map(Path::to_path_buf));
+            // The message keeps its path for the run log only: the blob
+            // carries a fixed sentence (carrick#4247).
+            warn!("Position rows for service {label} were not written: {error}");
+            return no_rows(
+                scan_root,
+                label,
+                out.lands_at().map(Path::to_path_buf),
+                Some(WalkLoss::Failed),
+            );
         }
     };
     crate::position_rows::record_walked_at(out.path(), at);
@@ -483,6 +539,8 @@ fn walk(
         scan_root,
         label,
         peak_mb,
+        asked: true,
+        lost: None,
     }
 }
 
@@ -522,6 +580,9 @@ mod tests {
         );
         assert!(walked.rows.is_none());
         assert_eq!(walked.index().file_count(), 0);
+        // No walk was asked, so the boundary says nothing (carrick#4247).
+        assert!(!walked.asked);
+        assert_eq!(walked.rows_lost(), None);
     }
 
     fn node_missing() -> bool {

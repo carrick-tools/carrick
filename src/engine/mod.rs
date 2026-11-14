@@ -2141,12 +2141,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     if let Some(line) = crate::scan_health::in_process_pubsub_line() {
         crate::progress::announce(&line);
     }
-    // Walks that died of memory at the run's cap (carrick#3283): their rows
-    // are a gap in the index, never silence.
-    if let Some(line) = crate::scan_health::walk_rows_lost_line() {
-        warn!("{line}");
-        crate::progress::announce(&line);
-    }
     // Library packages the store had not built by the end of the wait
     // (carrick#2496): named, so a gap in the library rows is not silent.
     for line in crate::scan_health::library_pending_lines() {
@@ -3946,6 +3940,11 @@ impl ServiceScan {
             walk_mb: walk_peak_mb,
             heap_cap_mb,
         });
+        // Whether the walk wrote this service's rows, the one place it is
+        // saved (carrick#4247). Never creates a boundary.
+        if let Some(boundary) = data.boundary.as_mut() {
+            boundary.walk_rows_lost = walked.and_then(walk_lane::Walked::rows_lost);
+        }
         if data.bundled_types.is_some() {
             debug!(
                 "Type resolution ({}): {} bundled types, {} manifest entries",

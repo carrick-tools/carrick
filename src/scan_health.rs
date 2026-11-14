@@ -131,10 +131,6 @@ struct Registry {
     /// (carrick#2208). With [`FAIL_ON_TYPE_MEMORY_ENV`] the first one ends
     /// the run.
     type_memory_deaths: Vec<TypeMemoryDeath>,
-    /// The services whose compiler walk died of memory at the run's cap, so
-    /// their per-position rows are missing from the index. Its own count: a
-    /// walk death never stops a run, as `type_memory_deaths` can.
-    walk_rows_lost: std::collections::BTreeSet<Scope>,
     /// The source files each service's analysis could not read, by path as
     /// the walk named them, and why (carrick#3233). Not a loss of the model's
     /// answer and never a reason to hold a service back: no scan of those
@@ -576,23 +572,6 @@ impl Registry {
         lines
     }
 
-    /// One line naming the services whose walk rows were lost, or `None`.
-    fn walk_rows_lost_line(&self) -> Option<String> {
-        if self.walk_rows_lost.is_empty() {
-            return None;
-        }
-        let names: Vec<&str> = self
-            .walk_rows_lost
-            .iter()
-            .map(|scope| scope.as_deref().unwrap_or("(root)"))
-            .collect();
-        Some(format!(
-            "{} service(s) have no per-position rows in this index, their compiler walk died of memory at the run's cap: {}.",
-            names.len(),
-            names.join(", ")
-        ))
-    }
-
     /// One line saying how many pub/sub calls were left out, or `None`.
     fn in_process_pubsub_line(&self) -> Option<String> {
         let total: usize = self.in_process_pubsub.values().sum();
@@ -922,24 +901,6 @@ pub fn record_in_process_pubsub(count: usize) {
         .lock()
         .expect("scan health lock")
         .record_in_process_pubsub(&crate::current_service::name(), count);
-}
-
-/// Records that `service`'s compiler walk died of memory at the run's cap and
-/// its per-position rows are lost (carrick#3283). Not a type memory death.
-pub fn record_walk_rows_lost(service: Option<&str>) {
-    registry()
-        .lock()
-        .expect("scan health lock")
-        .walk_rows_lost
-        .insert(service.map(str::to_string));
-}
-
-/// One line naming the services whose walk rows were lost, or `None`.
-pub fn walk_rows_lost_line() -> Option<String> {
-    registry()
-        .lock()
-        .expect("scan health lock")
-        .walk_rows_lost_line()
 }
 
 /// One line saying how many pub/sub calls the run left out as in-process, or
@@ -1378,22 +1339,6 @@ mod tests {
             analysis_failure_reason(&untyped),
             LossReason::owed("unparseable_response")
         );
-    }
-
-    /// carrick#3283: a walk death at the run's cap is its own gap line, named
-    /// per service, and is not a type memory death or a lost file.
-    #[test]
-    fn walk_rows_lost_are_named_apart_from_memory_deaths() {
-        let mut run = run();
-        assert_eq!(run.walk_rows_lost_line(), None);
-        run.walk_rows_lost.insert(Some("beta".to_string()));
-        run.walk_rows_lost.insert(Some("beta".to_string()));
-        assert!(
-            run.walk_rows_lost_line()
-                .is_some_and(|line| line.starts_with("1 service(s)") && line.ends_with("beta.")),
-        );
-        assert!(run.type_memory_deaths.is_empty());
-        assert_eq!(run.summary_line(), None);
     }
 
     /// A run that lost nothing says nothing and passes.

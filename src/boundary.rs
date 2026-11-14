@@ -286,6 +286,15 @@ pub struct ServiceBoundary {
     /// that did not write the field: absent is not the same as counting none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread_sites: Option<Counted>,
+    /// Whether this service's compiler walk wrote its per-position rows
+    /// (carrick#4247). `Some` with `total` 0 when the service has rows;
+    /// `total` 1 with one reason from a fixed set (the walk died of memory,
+    /// or failed) when it was asked and wrote none; `None` when no walk was
+    /// asked, and on a blob from a scanner that did not write the field. With
+    /// no rows, every site that needs them reads `rows_missing`; the model
+    /// and route rows stand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_rows_lost: Option<Counted>,
 }
 
 fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) -> bool {
@@ -406,6 +415,8 @@ impl ServiceBoundary {
             library_packages_failed: library_counts.map(|(_, failed)| failed),
             unprepared: crate::preflight::recorded_for(data.service_name.as_deref()),
             unread_sites: unread_sites(data),
+            // Written by the service's job, which holds its walk.
+            walk_rows_lost: None,
         }
     }
 
@@ -488,6 +499,13 @@ impl ServiceBoundary {
         );
         if let Some(unread) = &self.unread_sites {
             push(unread, "call site(s) Carrick could not read");
+        }
+        if let Some(lost) = &self.walk_rows_lost
+            && let Some(reason) = lost.reasons.first()
+        {
+            out.push(format!(
+                "  No compiler rows for this service because {reason}. Calls that needed them are listed as unread (rows_missing)."
+            ));
         }
         if self.model_only_rows > 0 {
             out.push(format!(
@@ -1221,6 +1239,49 @@ mod tests {
         older.as_object_mut().unwrap().remove("files_not_parsed");
         let older: ServiceBoundary = serde_json::from_value(older).unwrap();
         assert_eq!(older.files_not_parsed, None);
+    }
+
+    /// carrick#4247: a walk that wrote no rows is on the blob as one counted
+    /// reason, a walk that wrote them as a known zero, and a blob without the
+    /// key reads as `None`. Only a loss prints.
+    #[test]
+    fn a_walk_that_wrote_no_rows_is_counted_on_the_blob() {
+        let mut boundary = ServiceBoundary::default();
+        assert_eq!(boundary.walk_rows_lost, None);
+        assert!(
+            serde_json::to_value(&boundary)
+                .unwrap()
+                .get("walk_rows_lost")
+                .is_none()
+        );
+        boundary.walk_rows_lost = Some(Counted::default());
+        assert!(
+            boundary
+                .lines("app")
+                .iter()
+                .all(|line| !line.contains("No compiler rows")),
+            "{:?}",
+            boundary.lines("app")
+        );
+        boundary.walk_rows_lost = Some(Counted::new(
+            1,
+            vec!["the compiler walk failed".to_string()],
+        ));
+        let written = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(
+            written["walk_rows_lost"],
+            serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
+        );
+        assert!(
+            boundary.lines("app").iter().any(|line| line
+                .contains("No compiler rows for this service because the compiler walk failed.")),
+            "{:?}",
+            boundary.lines("app")
+        );
+        let mut older = written;
+        older.as_object_mut().unwrap().remove("walk_rows_lost");
+        let older: ServiceBoundary = serde_json::from_value(older).unwrap();
+        assert_eq!(older.walk_rows_lost, None);
     }
 
     /// carrick#2488: a file lost for good is named apart on the blob, by its
