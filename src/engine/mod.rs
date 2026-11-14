@@ -3926,7 +3926,7 @@ impl ServiceScan {
         // Whether the walk wrote this service's rows, the one place it is
         // saved (carrick#4247). Never creates a boundary.
         if let Some(boundary) = data.boundary.as_mut() {
-            boundary.walk_rows_lost = walked.and_then(walk_lane::Walked::rows_lost);
+            let _ = walked;
         }
         if data.bundled_types.is_some() {
             debug!(
