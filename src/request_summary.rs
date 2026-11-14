@@ -9321,6 +9321,10 @@ impl CallWalker<'_, '_, '_> {
     /// or key the pattern reads. Keyed by its declaration line, as every
     /// entry is: two loops that reuse a name are two entries.
     fn push_loop_entries(&mut self, head: &ForHead, list: Option<&Expr>, loop_at: u32) {
+        // DELETE-CHECK (carrick#2093): no loop entry is pushed.
+        if loop_at != u32::MAX {
+            return;
+        }
         let kind = match head {
             ForHead::VarDecl(var) => var.kind,
             _ => return,
