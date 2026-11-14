@@ -40,6 +40,7 @@
   "fan_out_cap": "there are more callers than Carrick follows",
   "recursion": "the calls loop back to a function already passed",
   "rows_missing": "the compiler engine has no reading of this position",
+  "walk_lost": "the compiler engine's walk of the service holding this code wrote no rows",
   "rows_stale": "the file changed since the compiler engine read it",
   "not_in_program": "the compiler engine did not read this file",
   "checker_threw": "the type checker failed at this position",
