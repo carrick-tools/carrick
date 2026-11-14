@@ -79,6 +79,7 @@ import { callInto, calledFunction, narrowByArguments } from './argument-modes.js
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
+import { homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
 import {
   callsOf,
   descendantsOf,
@@ -357,16 +358,6 @@ interface RecoveredPayload {
  * (carrick#2590). The walk stops there rather than reaching for an assertion
  * further out, which describes a larger value than the read.
  */
-/** A declaration that names a type: an interface, a type alias, a class or an enum. */
-function isTypeSpaceDeclaration(declaration: Node): boolean {
-  return (
-    Node.isInterfaceDeclaration(declaration) ||
-    Node.isTypeAliasDeclaration(declaration) ||
-    Node.isClassDeclaration(declaration) ||
-    Node.isEnumDeclaration(declaration)
-  );
-}
-
 function statedAssertionType(typeNode: Node | undefined): Node | undefined {
   if (!typeNode || ts.isConstTypeReference(typeNode.compilerNode)) return undefined;
   return typeNode;
@@ -8780,34 +8771,9 @@ export class TypeInferrer {
     return declaration ? this.homeOfDeclaration(name, declaration) : undefined;
   }
 
-  /**
-   * The home a type declaration gives, or none where the declaration is not
-   * the repository's or a package's own contract:
-   *  - a TypeScript lib file (`Uint8Array`, `Blob`);
-   *  - a declaration inside an ambient `declare module "<specifier>"` block,
-   *    which states a package's types wherever the stub file sits;
-   *  - a declaration with no name to point at (`export default class {}`).
-   * The line is the name's, never a JSDoc block's above it. A default export
-   * is named by the name it declares, not `default`.
-   */
+  /** `homeOfTypeDeclaration` in this service's program. */
   private homeOfDeclaration(name: string, declaration: Node): TypeHome | undefined {
-    const sourceFile = declaration.getSourceFile();
-    if (
-      sourceFile.compilerNode.hasNoDefaultLib ||
-      this.project.getProgram().compilerObject.isSourceFileDefaultLibrary(sourceFile.compilerNode)
-    ) {
-      return undefined;
-    }
-    const inAmbientModule = declaration
-      .getAncestors()
-      .some((ancestor) => Node.isModuleDeclaration(ancestor) && Node.isStringLiteral(ancestor.getNameNode()));
-    if (inAmbientModule) return undefined;
-    const nameNode = (declaration as { getNameNode?: () => Node | undefined }).getNameNode?.();
-    if (!nameNode) return undefined;
-    // `export default interface Ticket` is the symbol `default`; a reader
-    // knows it by the name it declares.
-    const symbol = name === 'default' ? nameNode.getText() : name;
-    return { symbol, file_path: sourceFile.getFilePath(), line: nameNode.getStartLineNumber() };
+    return homeOfTypeDeclaration(name, declaration, this.project.getProgram().compilerObject);
   }
 
   /**

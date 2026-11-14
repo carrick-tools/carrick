@@ -550,6 +550,10 @@ export function libraryHome() {
   return new Uint8Array(2);
 }
 
+export function libraryBlobHome() {
+  return new Blob([]);
+}
+
 export async function stubHome() {
   return get<Invoice>("/invoices");
 }
@@ -706,6 +710,12 @@ describe('carrick#2148 H1: an answer reports the declared home of the type it pr
   it('a library type has none', async () => {
     const got = await returnOf('libraryHome');
     assert.match(got.type_string, /Uint8Array/);
+    assert.strictEqual(got.type_home, undefined);
+  });
+
+  it('a TypeScript lib type that is no builtin anchor has none', async () => {
+    const got = await returnOf('libraryBlobHome');
+    assert.strictEqual(got.primary_type_symbol, 'Blob', JSON.stringify(got));
     assert.strictEqual(got.type_home, undefined);
   });
 

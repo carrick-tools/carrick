@@ -26,6 +26,7 @@ import {
 } from './type-structural-expander.js';
 import { expandOriginOf, isExternalOrigin } from './origin.js';
 import { statusTableBody } from './capture/index.js';
+import { homeOfTypeDeclaration } from './type-home.js';
 
 /**
  * #248: upper bound on `SymbolRequest.array_depth`. SDL list nesting is
@@ -380,9 +381,10 @@ export class TypeBundler {
       sourceFile.getTypeAlias(name) ??
       sourceFile.getClass(name) ??
       sourceFile.getEnum(name);
-    const nameNode = declaration?.getNameNode();
-    if (!nameNode) return {};
-    return { home: { symbol: name, file_path: sourceFile.getFilePath(), line: nameNode.getStartLineNumber() } };
+    const home = declaration
+      ? homeOfTypeDeclaration(name, declaration, this.project.getProgram().compilerObject)
+      : undefined;
+    return home ? { home } : {};
   }
 
   /** Where a requested symbol is declared, or undefined when it cannot be found. */
