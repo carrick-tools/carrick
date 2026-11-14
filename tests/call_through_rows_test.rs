@@ -501,7 +501,8 @@ fn a_corrected_row_keeps_its_type_and_is_judged_against_the_reached_operation() 
         row_at("cli", COMMANDS, 145),
         Row {
             method: "GET".to_string(),
-            target: "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string(),
+            // The env base is the row's `base` (carrick#4434).
+            target: "/api/v1/runs/:id".to_string(),
             path: "/api/v1/runs/:id".to_string(),
             source: "request_summary".to_string(),
             role: Some("wrapper_call".to_string()),
@@ -967,15 +968,18 @@ fn every_request_row_is_unchanged() {
                 "request_summary".to_string()
             ),
             spec(39, "POST /api/v1/runs/:id/archive"),
+            // A `fetch` on the declared env base: the fetch claim makes it
+            // the fact's, and the fact replaces the same-key base-path row
+            // (carrick#4434), keeping the env base as its `base`.
             (
                 format!("{REQUESTS}:45"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
             (
                 format!("{REQUESTS}:51"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
             // `typed.ts`: two specs and a `fetch` on the declared base.
             (
@@ -991,7 +995,7 @@ fn every_request_row_is_unchanged() {
             (
                 format!("{TYPED}:24"),
                 "GET /api/v1/runs/:id".to_string(),
-                "env_base_path".to_string()
+                "request_summary".to_string()
             ),
         ]
     );
@@ -1215,13 +1219,23 @@ fn a_call_straight_into_another_services_function_states_the_request_it_reaches(
         // links the call through to it (carrick#4078).
         ("cli", COMMANDS, 94, "GET", "/api/v1/ping", 27),
     ] {
-        let mut row = corrected(method, path, request_line);
-        // The two requests written on a declared environment base keep it in
-        // their target.
-        if request_line == 45 || request_line == 51 {
-            row.target = "${process.env.RUNS_ORIGIN}/api/v1/runs/${id}".to_string();
-        }
+        let row = corrected(method, path, request_line);
         assert_eq!(rows_in(blobs, service, file, line), [row], "{file}:{line}");
+        // The two requests written on a declared environment base are the
+        // fact's rows (the fetch claim, carrick#4078; a fact replaces a
+        // same-key base-path row, carrick#4434): the base is the row's
+        // `base`, not its target, and the call through takes it.
+        if request_line == 45 || request_line == 51 {
+            let site = format!("{file}:{line}");
+            let call = blobs[service]["mount_graph"]["data_calls"]
+                .as_array()
+                .expect("the blob holds a mount graph")
+                .iter()
+                .find(|call| call["file_location"] == site.as_str())
+                .expect("the row is stored");
+            assert_eq!(call["base"]["kind"], "env", "{site}");
+            assert_eq!(call["base"]["env_var"], "RUNS_ORIGIN", "{site}");
+        }
     }
     // The request is written from the parameters.
     for line in [76, 82] {
