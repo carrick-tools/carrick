@@ -63,11 +63,16 @@
 
 mod name_scope;
 mod pairing;
+mod similar;
 
 pub use name_scope::{GLOBAL_SCOPE, NameScope, SERVICE_SCOPE, ScopedRow, names_pair};
 pub use pairing::{
     Call, PairOutcome, Pairing, PairingPool, ProcedureKey, Producer, Routed, RouterId, Winner,
     canonical_path, pair_winners,
+};
+pub use similar::{
+    Bag, SIMILAR_ROWS, SimilarDoc, SimilarIndex, SimilarQuery, SimilarRow, bag as similar_bag,
+    tokenize as similar_tokenize,
 };
 
 /// The kind of source evidence backing one side of a match: a route

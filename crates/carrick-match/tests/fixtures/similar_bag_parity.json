@@ -1,0 +1,832 @@
+{
+  "header": {
+    "note": "Frozen output of carrick-cloud lambdas/check-or-upload/lexical.ts definitionBag (which runs tokenize) over 30 invented inputs. Do not edit by hand; regenerate with the command below and keep the inputs.",
+    "command": "Run definitionBag(name, intent, tokens, signature) from lexical.ts (carrick-cloud 5acc3ce4b) over each input with node 24 (it strips types), and write the inputs with their bag and described_length. The inputs below are all invented."
+  },
+  "cases": [
+    {
+      "name": "parseDuration",
+      "intent": "Turns a text like 5m into milliseconds.",
+      "tokens": [
+        "input",
+        "unit",
+        "60000"
+      ],
+      "signature": "(input: string) => number",
+      "bag": [
+        "parse",
+        "duration",
+        "turns",
+        "a",
+        "text",
+        "like",
+        "5",
+        "m",
+        "into",
+        "milliseconds",
+        "input",
+        "unit",
+        "60000",
+        "input",
+        "string",
+        "number"
+      ],
+      "described_length": 13
+    },
+    {
+      "name": "Cart.addLineItem",
+      "intent": null,
+      "tokens": [
+        "sku",
+        "qty",
+        "lineItems"
+      ],
+      "signature": "(sku: string, qty?: number) => void",
+      "bag": [
+        "cart",
+        "add",
+        "line",
+        "item",
+        "sku",
+        "qty",
+        "line",
+        "items",
+        "sku",
+        "string",
+        "qty",
+        "number",
+        "void"
+      ],
+      "described_length": 8
+    },
+    {
+      "name": "XMLHttpRequestBuilder",
+      "intent": "Builds a request",
+      "tokens": [],
+      "signature": null,
+      "bag": [
+        "xml",
+        "http",
+        "request",
+        "builder",
+        "builds",
+        "a",
+        "request"
+      ],
+      "described_length": 7
+    },
+    {
+      "name": "parseHTMLString",
+      "intent": "",
+      "tokens": [
+        "htmlString",
+        "DOMParser"
+      ],
+      "signature": "(s: string) => Document",
+      "bag": [
+        "parse",
+        "html",
+        "string",
+        "html",
+        "string",
+        "dom",
+        "parser",
+        "s",
+        "string",
+        "document"
+      ],
+      "described_length": 7
+    },
+    {
+      "name": "getUserID2Name",
+      "intent": "Looks up the 2nd name.",
+      "tokens": [
+        "userID2",
+        "name_2"
+      ],
+      "signature": null,
+      "bag": [
+        "get",
+        "user",
+        "id",
+        "2",
+        "name",
+        "looks",
+        "up",
+        "the",
+        "2",
+        "nd",
+        "name",
+        "user",
+        "id",
+        "2",
+        "name",
+        "2"
+      ],
+      "described_length": 16
+    },
+    {
+      "name": "isBase64Encoded",
+      "intent": null,
+      "tokens": [
+        "Buffer",
+        "base64"
+      ],
+      "signature": "(v: unknown) => v is string",
+      "bag": [
+        "is",
+        "base",
+        "64",
+        "encoded",
+        "buffer",
+        "base",
+        "64",
+        "v",
+        "unknown",
+        "is",
+        "string"
+      ],
+      "described_length": 7
+    },
+    {
+      "name": "slugify",
+      "intent": "Lower-cases a title and joins words with dashes.",
+      "tokens": [
+        "title",
+        "-",
+        "toLowerCase",
+        "replace"
+      ],
+      "signature": "(title: string, sep?: string) => string",
+      "bag": [
+        "slugify",
+        "lower",
+        "cases",
+        "a",
+        "title",
+        "and",
+        "joins",
+        "words",
+        "with",
+        "dashes",
+        "title",
+        "to",
+        "lower",
+        "case",
+        "replace",
+        "title",
+        "string",
+        "sep"
+      ],
+      "described_length": 15
+    },
+    {
+      "name": "retryWithBackoff",
+      "intent": "Runs a task again after a growing pause.",
+      "tokens": [
+        "attempts",
+        "delayMs",
+        "1500",
+        "setTimeout"
+      ],
+      "signature": "<T>(task: () => Promise<T>, attempts?: number) => Promise<T>",
+      "bag": [
+        "retry",
+        "with",
+        "backoff",
+        "runs",
+        "a",
+        "task",
+        "again",
+        "after",
+        "a",
+        "growing",
+        "pause",
+        "attempts",
+        "delay",
+        "ms",
+        "1500",
+        "set",
+        "timeout",
+        "t",
+        "task",
+        "promise",
+        "attempts",
+        "number"
+      ],
+      "described_length": 17
+    },
+    {
+      "name": "RateLimiter.tryTake",
+      "intent": "Takes a token from the bucket when one is free.",
+      "tokens": [
+        "bucket",
+        "tokens",
+        "refillPerSec"
+      ],
+      "signature": "(n?: number) => boolean",
+      "bag": [
+        "rate",
+        "limiter",
+        "try",
+        "take",
+        "takes",
+        "a",
+        "token",
+        "from",
+        "the",
+        "bucket",
+        "when",
+        "one",
+        "is",
+        "free",
+        "bucket",
+        "tokens",
+        "refill",
+        "per",
+        "sec",
+        "n",
+        "number",
+        "boolean"
+      ],
+      "described_length": 19
+    },
+    {
+      "name": "formatBytes",
+      "intent": "Prints a size in KB, MB or GB.",
+      "tokens": [
+        "bytes",
+        "KB",
+        "MB",
+        "GB",
+        "toFixed"
+      ],
+      "signature": "(bytes: number, digits = 1) => string",
+      "bag": [
+        "format",
+        "bytes",
+        "prints",
+        "a",
+        "size",
+        "in",
+        "kb",
+        "mb",
+        "or",
+        "gb",
+        "bytes",
+        "kb",
+        "mb",
+        "gb",
+        "to",
+        "fixed",
+        "bytes",
+        "number",
+        "digits",
+        "1",
+        "string"
+      ],
+      "described_length": 16
+    },
+    {
+      "name": "chunkArray",
+      "intent": "Cuts a list into pieces of a fixed size.",
+      "tokens": [
+        "items",
+        "size",
+        "slice"
+      ],
+      "signature": "<T>(items: T[], size: number) => T[][]",
+      "bag": [
+        "chunk",
+        "array",
+        "cuts",
+        "a",
+        "list",
+        "into",
+        "pieces",
+        "of",
+        "a",
+        "fixed",
+        "size",
+        "items",
+        "size",
+        "slice",
+        "t",
+        "items",
+        "size",
+        "number"
+      ],
+      "described_length": 14
+    },
+    {
+      "name": "a",
+      "intent": "x",
+      "tokens": [
+        "b"
+      ],
+      "signature": "() => void",
+      "bag": [
+        "a",
+        "x",
+        "b",
+        "void"
+      ],
+      "described_length": 3
+    },
+    {
+      "name": "HTTPServerID",
+      "intent": "",
+      "tokens": [],
+      "signature": "(): HTTPServerID",
+      "bag": [
+        "http",
+        "server",
+        "id",
+        "http",
+        "server",
+        "id"
+      ],
+      "described_length": 3
+    },
+    {
+      "name": "__private_helper#v2",
+      "intent": "Internal; do not call.",
+      "tokens": [
+        "_x",
+        "_y"
+      ],
+      "signature": null,
+      "bag": [
+        "private",
+        "helper",
+        "v",
+        "2",
+        "internal",
+        "do",
+        "not",
+        "call",
+        "x",
+        "y"
+      ],
+      "described_length": 10
+    },
+    {
+      "name": "toSnake_case.value",
+      "intent": "snake_case and camelCase both appear: fooBar_baz.",
+      "tokens": [
+        "fooBar_baz"
+      ],
+      "signature": "(fooBar_baz: string) => string",
+      "bag": [
+        "to",
+        "snake",
+        "case",
+        "value",
+        "snake",
+        "case",
+        "and",
+        "camel",
+        "case",
+        "both",
+        "appear",
+        "foo",
+        "bar",
+        "baz",
+        "foo",
+        "bar",
+        "baz",
+        "foo",
+        "bar",
+        "baz",
+        "string"
+      ],
+      "described_length": 17
+    },
+    {
+      "name": "debounce",
+      "intent": "Delays a call until input stops.",
+      "tokens": [
+        "wait",
+        "timer",
+        "clearTimeout",
+        "250"
+      ],
+      "signature": "(fn: Function, wait: number) => Function",
+      "bag": [
+        "debounce",
+        "delays",
+        "a",
+        "call",
+        "until",
+        "input",
+        "stops",
+        "wait",
+        "timer",
+        "clear",
+        "timeout",
+        "250",
+        "fn",
+        "function",
+        "wait",
+        "number"
+      ],
+      "described_length": 12
+    },
+    {
+      "name": "clampNumber",
+      "intent": "Keeps a value between a low and a high bound.",
+      "tokens": [
+        "lo",
+        "hi",
+        "Math",
+        "min",
+        "max"
+      ],
+      "signature": "(n: number, lo: number, hi: number) => number",
+      "bag": [
+        "clamp",
+        "number",
+        "keeps",
+        "a",
+        "value",
+        "between",
+        "a",
+        "low",
+        "and",
+        "a",
+        "high",
+        "bound",
+        "lo",
+        "hi",
+        "math",
+        "min",
+        "max",
+        "n",
+        "number",
+        "lo",
+        "hi"
+      ],
+      "described_length": 17
+    },
+    {
+      "name": "Ünïcode.naïve",
+      "intent": "Café déjà vu, 5 stars ★★★★★.",
+      "tokens": [
+        "café",
+        "naïveté"
+      ],
+      "signature": "(s: string): string",
+      "bag": [
+        "n",
+        "code",
+        "na",
+        "ve",
+        "caf",
+        "d",
+        "j",
+        "vu",
+        "5",
+        "stars",
+        "caf",
+        "na",
+        "vet",
+        "s",
+        "string"
+      ],
+      "described_length": 13
+    },
+    {
+      "name": "readJsonFile",
+      "intent": "Loads a JSON file from disk and parses it.",
+      "tokens": [
+        "path",
+        "readFile",
+        "JSON",
+        "parse",
+        "utf8"
+      ],
+      "signature": "(path: string) => Promise<unknown>",
+      "bag": [
+        "read",
+        "json",
+        "file",
+        "loads",
+        "a",
+        "json",
+        "file",
+        "from",
+        "disk",
+        "and",
+        "parses",
+        "it",
+        "path",
+        "read",
+        "file",
+        "json",
+        "parse",
+        "utf",
+        "8",
+        "path",
+        "string",
+        "promise",
+        "unknown"
+      ],
+      "described_length": 19
+    },
+    {
+      "name": "buildQueryString",
+      "intent": "Joins keys and values into a URL query.",
+      "tokens": [
+        "params",
+        "encodeURIComponent",
+        "&",
+        "="
+      ],
+      "signature": "(params: Record<string, string>) => string",
+      "bag": [
+        "build",
+        "query",
+        "string",
+        "joins",
+        "keys",
+        "and",
+        "values",
+        "into",
+        "a",
+        "url",
+        "query",
+        "params",
+        "encode",
+        "uri",
+        "component",
+        "params",
+        "record",
+        "string"
+      ],
+      "described_length": 15
+    },
+    {
+      "name": "uuidV4",
+      "intent": "",
+      "tokens": [
+        "crypto",
+        "randomUUID"
+      ],
+      "signature": "() => string",
+      "bag": [
+        "uuid",
+        "v",
+        "4",
+        "crypto",
+        "random",
+        "uuid",
+        "string"
+      ],
+      "described_length": 6
+    },
+    {
+      "name": "isEmail",
+      "intent": "Checks the shape of an e-mail address.",
+      "tokens": [
+        "@",
+        "regex",
+        "test"
+      ],
+      "signature": "(s: string) => boolean",
+      "bag": [
+        "is",
+        "email",
+        "checks",
+        "the",
+        "shape",
+        "of",
+        "an",
+        "e",
+        "mail",
+        "address",
+        "regex",
+        "test",
+        "s",
+        "string",
+        "boolean"
+      ],
+      "described_length": 12
+    },
+    {
+      "name": "groupBy",
+      "intent": "Buckets items by a key function.",
+      "tokens": [
+        "items",
+        "key",
+        "reduce",
+        "Map"
+      ],
+      "signature": "<T, K>(items: T[], key: (t: T) => K) => Map<K, T[]>",
+      "bag": [
+        "group",
+        "by",
+        "buckets",
+        "items",
+        "by",
+        "a",
+        "key",
+        "function",
+        "items",
+        "key",
+        "reduce",
+        "map",
+        "t",
+        "k",
+        "items",
+        "key",
+        "map"
+      ],
+      "described_length": 12
+    },
+    {
+      "name": "ABCDef",
+      "intent": "ABCDef and abcDEF and ABC123def.",
+      "tokens": [
+        "ABC123def",
+        "abcDEF"
+      ],
+      "signature": "(a: ABCDef, b: abcDEF): ABC123def",
+      "bag": [
+        "abc",
+        "def",
+        "abc",
+        "def",
+        "and",
+        "abc",
+        "def",
+        "and",
+        "abc",
+        "123",
+        "def",
+        "abc",
+        "123",
+        "def",
+        "abc",
+        "def",
+        "a",
+        "abc",
+        "def",
+        "b",
+        "123"
+      ],
+      "described_length": 16
+    },
+    {
+      "name": "sleepMs",
+      "intent": "Waits for some milliseconds.",
+      "tokens": [
+        "ms",
+        "Promise",
+        "setTimeout"
+      ],
+      "signature": "(ms: number) => Promise<void>",
+      "bag": [
+        "sleep",
+        "ms",
+        "waits",
+        "for",
+        "some",
+        "milliseconds",
+        "ms",
+        "promise",
+        "set",
+        "timeout",
+        "ms",
+        "number",
+        "promise",
+        "void"
+      ],
+      "described_length": 10
+    },
+    {
+      "name": "Queue.drainAll",
+      "intent": "Empties the queue and hands each job on.",
+      "tokens": [
+        "jobs",
+        "shift",
+        "handler"
+      ],
+      "signature": "() => Promise<number>",
+      "bag": [
+        "queue",
+        "drain",
+        "all",
+        "empties",
+        "the",
+        "queue",
+        "and",
+        "hands",
+        "each",
+        "job",
+        "on",
+        "jobs",
+        "shift",
+        "handler",
+        "promise",
+        "number"
+      ],
+      "described_length": 14
+    },
+    {
+      "name": "escapeHtml",
+      "intent": "Swaps <, >, & and quotes for entities.",
+      "tokens": [
+        "&amp;",
+        "&lt;",
+        "&gt;",
+        "replace"
+      ],
+      "signature": "(s: string) => string",
+      "bag": [
+        "escape",
+        "html",
+        "swaps",
+        "and",
+        "quotes",
+        "for",
+        "entities",
+        "amp",
+        "lt",
+        "gt",
+        "replace",
+        "s",
+        "string"
+      ],
+      "described_length": 11
+    },
+    {
+      "name": "hashPassword",
+      "intent": "Salts and hashes a password.",
+      "tokens": [
+        "scrypt",
+        "salt",
+        "32",
+        "password"
+      ],
+      "signature": "(password: string, salt?: Buffer) => Promise<string>",
+      "bag": [
+        "hash",
+        "password",
+        "salts",
+        "and",
+        "hashes",
+        "a",
+        "password",
+        "scrypt",
+        "salt",
+        "32",
+        "password",
+        "password",
+        "string",
+        "salt",
+        "buffer",
+        "promise"
+      ],
+      "described_length": 11
+    },
+    {
+      "name": "weekNumber",
+      "intent": "ISO week of a date.",
+      "tokens": [
+        "getUTCDay",
+        "86400000",
+        "date"
+      ],
+      "signature": "(d: Date) => number",
+      "bag": [
+        "week",
+        "number",
+        "iso",
+        "week",
+        "of",
+        "a",
+        "date",
+        "get",
+        "utc",
+        "day",
+        "86400000",
+        "date",
+        "d",
+        "date",
+        "number"
+      ],
+      "described_length": 12
+    },
+    {
+      "name": "noText",
+      "intent": "",
+      "tokens": [],
+      "signature": "",
+      "bag": [
+        "no",
+        "text"
+      ],
+      "described_length": 2
+    }
+  ]
+}
