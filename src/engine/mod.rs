@@ -11102,8 +11102,9 @@ fn apply_site_fold_to_manifest(
 
 /// The type requests for the site rows the fold stated (carrick#2472 C3),
 /// each at its record's anchor by span: a send's payload expression (an
-/// HTTP request's as its request body), an HTTP request's result at its
-/// call, and a handler's first parameter. A
+/// HTTP request's as its request body), an HTTP request's result where its
+/// record's response slot reads it ([`crate::site_rows::SiteRow::response_at`]),
+/// and a handler's first parameter. A
 /// row whose record has no such anchor asks nothing for that type; an HTTP
 /// route's handler is not asked (its request and response are read off the
 /// route, not the parameter).
@@ -11180,23 +11181,21 @@ fn site_infer_requests(
                         None,
                     ));
                 }
-                // A built request's anchor is its object literal, not a
-                // call: nothing there is a response (carrick#3470).
-                if row.source
-                    == crate::agents::file_analyzer_agent::ResolutionSource::RequestDescriptor
-                {
+                // The response is read where the row's record states it
+                // (carrick#4319): a built request's literal states none
+                // (carrick#3470).
+                let Some(response) = &row.response_at else {
                     continue;
-                }
+                };
                 let mut call_result = at(
-                    &anchors.call,
+                    response,
                     InferKind::CallResult,
                     alias(ManifestTypeKind::Response),
                     None,
                 );
                 // The store's label for the call's result (carrick#2910).
-                call_result.result = results.at_anchor(&anchors.call, repo_path);
-                call_result.result_unanswered =
-                    results.unanswered_at_anchor(&anchors.call, repo_path);
+                call_result.result = results.at_anchor(response, repo_path);
+                call_result.result_unanswered = results.unanswered_at_anchor(response, repo_path);
                 requests.push(call_result);
             }
             (OperationKey::Http { .. }, _) => {}
@@ -29245,6 +29244,7 @@ unfollowed_member_calls_total: 0,
                 }),
                 key: None,
             },
+            response_at: Some(at(100, 130)),
             lead: crate::possible_calls::PossibleCall {
                 file_path: file.to_string(),
                 line_number: 7,

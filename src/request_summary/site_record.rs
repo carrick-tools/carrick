@@ -310,9 +310,16 @@ impl PayloadAt {
 
 /// The payload slots a site's own call or handler fills ([`PayloadSlots`]):
 /// a send's body at the argument its label names (`payload_at`), a call's
-/// result at the call, a receive's parameter at its handler.
+/// result at `result`, a receive's parameter at its handler.
+///
+/// `result` is the one statement of where a site's response is read, and
+/// both askers read it: the payload slots ([`crate::site_payloads`]) and the
+/// fold's own rows ([`crate::site_rows::SiteRow::response_at`]). It is the
+/// deciding call, except where that call only makes the function that sends
+/// ([`DecidedSite::makes_end`], carrick#4319): its result is then that
+/// function, and what the send answers is read at the labelled call.
 fn payload_slots(
-    call: &AnchorAt,
+    result: &AnchorAt,
     payload_at: Option<&AnchorAt>,
     carried: Option<PayloadAt>,
     handler: Option<&HandlerAnchor>,
@@ -332,7 +339,7 @@ fn payload_slots(
             // rest) takes over from the locator where it names a place; the
             // locator's slot stands wherever it filled one.
             request: carried.or_else(|| payload_at.cloned().map(PayloadAt::Value)),
-            response: Some(PayloadAt::Result(call.clone())),
+            response: Some(PayloadAt::Result(result.clone())),
         },
     }
 }
@@ -2663,8 +2670,20 @@ fn record(
     } else {
         None
     };
+    // A maker's call returns the function that sends (carrick#4319): what
+    // the send answers is read at the labelled call.
+    let result = if site.makes_end {
+        AnchorAt {
+            file: site.end.file.clone(),
+            line: site.end.line,
+            span_start: site.end.span_start,
+            span_end: site.end.span_end,
+        }
+    } else {
+        anchors.call.clone()
+    };
     let payloads = payload_slots(
-        &anchors.call,
+        &result,
         anchors.payload_at.as_ref(),
         carried.or(built),
         anchors.handler.as_ref(),

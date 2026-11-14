@@ -864,6 +864,13 @@ pub struct DecidedSite {
     /// serve its router serve it at ([`procedures`]); `None` for every
     /// other site. Never part of a record's state.
     pub procedure: Option<Procedure>,
+    /// Whether this call only makes the function that sends: it calls a
+    /// maker that returns the function the labelled call is written in, and
+    /// nothing on the chain runs it (carrick#4319, [`Walk::makes_end`]). Its
+    /// result is that function, so the site's response is read at the
+    /// labelled call ([`super::site_record`]'s payload slots). Scanner-only;
+    /// never part of a record's state.
+    pub makes_end: bool,
 }
 
 impl DecidedSite {
@@ -1177,7 +1184,7 @@ fn callers_above(
         let Some(key) = placed.key else {
             continue;
         };
-        if placed.depth > 0 && placed.host.is_none() {
+        if placed.in_unrun_function() {
             continue;
         }
         for caller in calls.callers_of(placed.file, key) {
@@ -1305,6 +1312,15 @@ pub(super) struct Placed<'a> {
     /// call's argument (carrick#2474 R2b): the argument, and the keys down
     /// to it. `None` at depth 0, and for a function written anywhere else.
     pub(super) written_in: Option<&'a super::guards::WrittenIn>,
+}
+
+impl Placed<'_> {
+    /// Whether the call is written in a function nested in its owner that
+    /// is no call's argument: one the owner returns or stores, which calling
+    /// the owner does not run.
+    pub(super) fn in_unrun_function(&self) -> bool {
+        self.depth > 0 && self.host.is_none()
+    }
 }
 
 /// One call that hands a definition on as a value (carrick#4176): the call,
@@ -2764,6 +2780,48 @@ impl<'a> Walk<'a, '_> {
         param.written_onto() || param.handed_beyond(walked)
     }
 
+    /// Whether the deciding call of `down` only makes the function that
+    /// sends (carrick#4319): it calls a maker straight into the labelled call,
+    /// the labelled call is written in a function the maker does not run,
+    /// and every value the maker returns is that very function. Its result
+    /// is that function, so what the send answers is read at the labelled
+    /// call. Fails closed: a longer chain, a value hop, a function nested
+    /// deeper, or a maker that runs the function or hands it on rather than
+    /// only returning it (a wrapper running a local closure) reads false.
+    fn makes_end(&self, down: &[Placed<'a>]) -> bool {
+        use super::resolve::{ValueAt, written_in};
+        let [_, end] = down else {
+            return false;
+        };
+        if !self.value_hops.is_empty() || end.depth != 1 || !end.in_unrun_function() {
+            return false;
+        }
+        let Some((file, maker)) = end
+            .key
+            .and_then(|key| self.resolver.function(end.file, key))
+        else {
+            return false;
+        };
+        let at = (end.call.site.span_start, end.call.site.span_end);
+        // Every value it returns is that function: one that may also return
+        // the function's result (`return dry ? run : run()`) runs it.
+        !maker.returned_values.is_empty()
+            && maker.returned_values.iter().all(|value| {
+                let ValueAt::Function(start) = value else {
+                    return false;
+                };
+                self.resolver
+                    .written_function(file, *start)
+                    .filter(|function| written_in(maker, function))
+                    .is_some_and(|function| {
+                        function
+                            .calls
+                            .iter()
+                            .any(|call| (call.site.span_start, call.site.span_end) == at)
+                    })
+            })
+    }
+
     /// `down` is the calls from the site (first) to the labelled call
     /// (last).
     fn site(
@@ -2844,6 +2902,7 @@ impl<'a> Walk<'a, '_> {
             .and_then(|slot| bound_at(down, slot))
             .and_then(|(at, arg, _)| handler_at(self.root, &down[at], arg));
         let instances = self.instances(down);
+        let makes_end = self.makes_end(down);
         self.kept.insert(id, self.out.sites.len());
         self.out.sites.push(DecidedSite {
             file,
@@ -2866,6 +2925,7 @@ impl<'a> Walk<'a, '_> {
             composed: Vec::new(),
             composed_trimmed: false,
             procedure: None,
+            makes_end,
         });
     }
 
@@ -3722,6 +3782,7 @@ impl<'a> Walk<'a, '_> {
                 composed: Vec::new(),
                 composed_trimmed: false,
                 procedure: None,
+                makes_end: false,
             });
         }
     }
@@ -8165,5 +8226,85 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(got, vec![("load".to_string(), 14, 1, Vec::new())]);
+    }
+
+    /// carrick#4319: a deciding call that only makes the function that
+    /// sends (`makeGate("/svc")` returns a closure that calls `fetch`)
+    /// `makes_end`; one that runs the send, a local closure it runs or hands
+    /// to a call, or a function that may return either the closure or its
+    /// result does not.
+    #[test]
+    fn a_call_that_only_makes_the_sending_function_makes_its_end() {
+        const MAKER: &str = "export function makeGate(base: string) {\n\
+             \x20 return async (tag: string) => fetch(`${base}/gate/${tag}`);\n\
+             }\n\
+             export const gate = makeGate(\"/svc\");\n";
+        const WRAPPER: &str = "function send(base: string) {\n\
+             \x20 return fetch(`${base}/wrap`);\n\
+             }\n\
+             export const wrapped = () => send(\"/w\");\n";
+        const LOCAL_RUN: &str = "function runJob(base: string) {\n\
+             \x20 const run = () => fetch(`${base}/run`);\n\
+             \x20 return run();\n\
+             }\n\
+             export const job = () => runJob(\"/jobs\");\n";
+        const HANDED: &str = "function retry<R>(attempt: () => R): R { return attempt(); }\n\
+             function retried(base: string) {\n\
+             \x20 const run = () => fetch(`${base}/retry`);\n\
+             \x20 return retry(run);\n\
+             }\n\
+             export const again = () => retried(\"/tasks\");\n";
+        const EITHER: &str = "function either(base: string, dry: boolean) {\n\
+             \x20 const run = () => fetch(`${base}/either`);\n\
+             \x20 return dry ? run : run();\n\
+             }\n\
+             export const maybe = either(\"/e\", true);\n";
+        let on = super::super::fixture_walk::walked(
+            "discovery-factory-function",
+            "services/web",
+            "web",
+            &[
+                ("src/m-maker.ts", MAKER),
+                ("src/m-wrapper.ts", WRAPPER),
+                ("src/m-local-run.ts", LOCAL_RUN),
+                ("src/m-handed.ts", HANDED),
+                ("src/m-either.ts", EITHER),
+            ],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        let text = std::fs::read_to_string(
+            manifest().join("tests/fixtures/discovery-factory-function/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let discovery = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let sites: Vec<DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &sites,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        let makes = |file: &str| -> Vec<(u32, bool)> {
+            decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file))
+                .map(|site| (site.line, site.makes_end))
+                .collect()
+        };
+        assert_eq!(makes("m-maker.ts"), vec![(4, true)]);
+        assert_eq!(makes("m-wrapper.ts"), vec![(4, false)]);
+        assert_eq!(makes("m-local-run.ts"), vec![(5, false)]);
+        assert_eq!(makes("m-handed.ts"), vec![(6, false)]);
+        assert_eq!(makes("m-either.ts"), vec![(5, false)]);
     }
 }
