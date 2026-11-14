@@ -22,15 +22,15 @@ change bumps it to `carrick.check/1` and both are emitted for one release.
 
 | command | reads | writes | budget |
 |---|---|---|---|
-| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/`, plus `.carrick/last-scan.json` | the scan that builds the index, and the one a first run makes; minutes, cold |
+| `carrick index --workspace <dir>` | detected local repos, optional workspace overrides, authenticated hosted indexes, and Carrick Cloud, which classifies what the deterministic passes could not | `<dir>/.carrick/` (including `.carrick/probe/`), plus `.carrick/last-scan.json` | the scan that builds the index, and the one a first run makes; minutes, cold |
 | `carrick index --detach` | the same | the same, plus `.carrick/scan-<id>.log` and `.carrick/scan-<id>.json` | returns at once |
 | `carrick index --dispatch` | the same | `.carrick/jobs.json`, and no index — unless there was nothing to hand over, in which case it indexes here and says so (carrick#1251) | returns when the prompts are built, minutes on a large repo |
 | `carrick resume` | `.carrick/jobs.json`, Carrick Cloud, local source | `<dir>/.carrick/` | minutes; the analysis is already done |
 | `carrick status [--json]` | local index, credential identity, and Carrick Cloud when a job is recorded | nothing | < 300 ms, plus one network read for each job recorded, in turn |
 | `carrick touch <file> [--json]` | local index, credential identity | nothing | < 300 ms |
 | `carrick check <file> [--json]` | local index, credential identity | nothing | < 300 ms |
-| `carrick check <file> --recheck` | the same, plus the file's service in this repo's working tree and the blobs already on disk | `.carrick/working/` and `.carrick/judged/` (replaced by the next index) and a temp directory it deletes | 10 s budget |
-| `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` | seconds |
+| `carrick check <file> --recheck` | the same, plus the file's service in this repo's working tree and the blobs already on disk | `.carrick/working/`, `.carrick/judged/`, `.carrick/probe/` (replaced by the next index), and a temporary directory it deletes | 10 s budget |
+| `carrick refresh [--service <name>]` | local source and authenticated hosted indexes | `<dir>/.carrick/` (including `.carrick/probe/`) | seconds |
 
 `status` answers about the workspace and takes no file; it is what a surface
 opening a session asks. `touch` and `check` never call a model and never call
@@ -68,7 +68,7 @@ the commit and every file's hash are the ones they were walked at (carrick#3245)
 checker's finished answers are kept per index in
 `.carrick/judged/<index generation>/`, written by `index` and `refresh` and
 read by every re-check, so an edit that moves no type skips the checker's
-dependency install. A new index replaces both folders. The whole re-check has a
+dependency install. A new index replaces these folders. The whole re-check has a
 budget (10 s, `CARRICK_RECHECK_BUDGET_MS`); past it the answer is the indexed
 one, and the `recheck` block below says so (`deadline: true`). That answer is
 not a check of the edit, so it is never a clean result (carrick#3860): the
@@ -94,6 +94,15 @@ records the budget it ran under (`budget_ms`) and silences only a re-check
 whose own budget is no longer: a miss at ten seconds does not switch off a
 re-check given three minutes. A misses file written before that field existed
 reads as no misses.
+`.carrick/probe/` lets `--no-rescan` run without opening an index blob. It holds
+the functions each file of the repo declares, and the lookup that finds existing
+functions a new one resembles. `index`, `refresh` and a full `--recheck` write
+it. `--no-rescan` only reads it. Each folder inside is named for the index and
+the Carrick build that wrote it. The files are used only while the blobs, the
+hosted snapshot, your sign-in and the workspace's repo list are unchanged since
+they were written. Otherwise `--no-rescan` ignores them and reads the blobs,
+which is slower and gives the same answer. Deleting `.carrick/probe/` is safe,
+because the next `index`, `refresh` or full `--recheck` writes it again.
 `--no-rescan` (with `--recheck`, on one file or on `--each`) asks the question
 "does this edit need a re-scan" and never starts one. A file that is unchanged
 or gone, an edit that reads the same, and a known miss are answered at once. A
