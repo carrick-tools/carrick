@@ -1,0 +1,35 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:3",
+      "line_number": 3,
+      "target": "/orders",
+      "method": "POST",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch('/orders', { method: 'POST', body: JSON.stringify({ sku, qty: 1 }) })",
+      "call_expression_text": "fetch('/orders', { method: 'POST', body: JSON.stringify({ sku, qty: 1 }) })",
+      "call_expression_line": 3,
+      "payload_expression_text": "{ sku, qty: 1 }",
+      "payload_expression_line": 3,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    },
+    {
+      "candidate_id": "@line:8",
+      "line_number": 8,
+      "target": "/orders",
+      "method": "GET",
+      "call_kind": "internal_http",
+      "pattern_matched": "fetch('/orders')",
+      "call_expression_text": "fetch('/orders')",
+      "call_expression_line": 8,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": null,
+      "type_import_source": null
+    }
+  ],
+  "pubsub_operations": []
+}

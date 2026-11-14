@@ -1,0 +1,55 @@
+[
+  {
+    "role": "consumer",
+    "type_kind": "request",
+    "protocol": "http",
+    "method": "POST",
+    "file": "src/client.ts",
+    "text": "{ sku, qty: 1 }",
+    "start": 247,
+    "end": 262,
+    "name": "/orders"
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "http",
+    "method": "POST",
+    "file": "src/client.ts",
+    "text": "res.json()",
+    "start": 277,
+    "end": 287,
+    "name": "/orders"
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "http",
+    "method": "GET",
+    "file": "src/client.ts",
+    "text": "res.json()",
+    "start": 394,
+    "end": 404,
+    "name": "/orders"
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "pubsub",
+    "file": "src/orders.ts",
+    "text": "{ topic: 'orders.created', sku, quantity }",
+    "start": 156,
+    "end": 198,
+    "name": "orders.created"
+  },
+  {
+    "role": "consumer",
+    "type_kind": "response",
+    "protocol": "socket",
+    "file": "src/live.ts",
+    "text": "{ text: \"hi\" }",
+    "start": 115,
+    "end": 129,
+    "name": "chat.in"
+  }
+]

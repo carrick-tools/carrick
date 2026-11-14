@@ -12110,9 +12110,15 @@ fn run_capture_for_service(
     // process (carrick#3132).
     type_compat_v2::prescreen_calls(sidecar, &service_id, &mut calls);
     // Stored with the blob, so a run that carries this service retypes the
-    // same calls (carrick#2567).
+    // same calls (carrick#2567), and with the place of every value ask
+    // (carrick#4244).
     if let Some(manifest) = cloud_data.type_manifest.as_mut() {
-        type_compat_v2::store_call_locators(manifest, &calls);
+        crate::read_place::store_read_places(
+            manifest,
+            &infer,
+            &type_resolution.inferred_types,
+            &|path| std::fs::read_to_string(path).ok(),
+        );
     }
     type_compat_v2::record_local_consumer(
         &service_id,
