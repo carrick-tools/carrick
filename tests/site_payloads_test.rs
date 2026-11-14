@@ -490,3 +490,81 @@ fn a_loop_over_a_stated_list_of_topics_writes_a_row_per_element_that_pairs() {
     assert_eq!(topics_in("calls", "src/publish.ts"), elements, "{on:#}");
     assert_eq!(topics_in("endpoints", "src/listen.ts"), elements, "{on:#}");
 }
+
+/// The type the stub captures for `alias`, its whitespace collapsed and its
+/// closing `;` dropped.
+fn captured_flat(blob: &serde_json::Value, alias: &str) -> String {
+    captured_block(blob, alias)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_string()
+}
+
+/// carrick#4319 T1: `tests/fixtures/site-maker-response/`. Where the
+/// deciding call only makes the function that sends (`makeGate({ base })`
+/// returns a closure that calls `http.remove`), the site row's response is
+/// read at the labelled call: what the request answers, never the closure.
+/// Where the deciding call runs the send, it stays read there. The answer
+/// key is the fixture's README.
+#[test]
+fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-maker-response");
+    let on = scan(&repo, &[]);
+    let response =
+        |file: &str, line: u64| captured_flat(&on, &alias_at(&on, "response", file, line));
+
+    // Maker sites: read at the labelled call.
+    for (file, line, wanted) in [
+        ("src/gate.ts", 7, "{ ok: boolean; }"),
+        ("src/poster.ts", 7, "{ id: string; }"),
+        ("src/twice.ts", 6, "{ up: boolean; }"),
+        ("src/twice.ts", 7, "{ up: boolean; }"),
+        ("src/partial.ts", 6, "{ swept: number; }"),
+        ("src/handed.ts", 6, "{ flushed: boolean; }"),
+        ("src/pinger.ts", 6, "{ up: boolean; }"),
+        ("src/pinger.ts", 7, "{ up: boolean; }"),
+    ] {
+        assert_eq!(response(file, line), wanted, "response at {file}:{line}");
+    }
+    // The maker's own type parameter is open at the labelled call: a decided
+    // abstain, not the closure.
+    let typed = entry_at(&on, "response", "src/typed-maker.ts", 6);
+    assert_eq!(
+        captured_flat(&on, typed["type_alias"].as_str().unwrap()),
+        "unknown",
+        "{typed:#?}"
+    );
+    let reasons: Vec<&str> = typed["any_provenance"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["reason"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(reasons, vec!["bound_by_callers"], "{typed:#?}");
+    // The request slot does not move.
+    let order = captured_flat(&on, &alias_at(&on, "request", "src/poster.ts", 7));
+    assert_eq!(order, "{ sku: string; qty: number; }");
+    // A key with an environment base has no entry, before and after.
+    assert!(
+        on["type_manifest"]
+            .as_array()
+            .expect("type_manifest")
+            .iter()
+            .all(|entry| !(entry["file_path"] == "src/env-maker.ts" && entry["line_number"] == 6)),
+        "no entry at src/env-maker.ts:6"
+    );
+
+    // Wrappers that run the send, and the labelled call itself: unchanged.
+    for (file, line, wanted) in [
+        ("src/generic.ts", 6, "{ rows: number; }"),
+        ("src/local-run.ts", 7, "{ done: boolean; }"),
+        ("src/retried.ts", 8, "{ n: number; }"),
+        ("src/direct.ts", 3, "{ ok: boolean; }"),
+    ] {
+        assert_eq!(response(file, line), wanted, "response at {file}:{line}");
+    }
+}
