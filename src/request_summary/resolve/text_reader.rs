@@ -1883,6 +1883,72 @@ impl Resolver<'_> {
         Some(ArgTexts::Values(self.text_values(path, &member)))
     }
 
+    /// Every text each entry of the object literal the name `expr` (written
+    /// in `file`, as `inputs` keys it) is declared as states, read whatever
+    /// else may write the object: `export const route = { path, method }`
+    /// gives the texts `path` and `method` hold, though the object is
+    /// exported and spread, where [`Self::keyed_text_set`] answers
+    /// `unread_expression` (an importer may write it). `None` where `expr`
+    /// names no declaration of the run that is an object literal.
+    ///
+    /// Evidence for KEEPING a row only (carrick#4218): a text here says the
+    /// code hands the text on, never that the object holds it when it is
+    /// read, so no reader decides a value from it.
+    pub(in crate::request_summary) fn declared_entry_texts(
+        &self,
+        file: &Path,
+        expr: &Expr,
+    ) -> Option<Vec<TextValue>> {
+        let ir = self.inputs_for(file).files.get(file)?;
+        let ValueAt::Read {
+            lo,
+            hi,
+            member: false,
+            ..
+        } = text_of(expr, &|lo| ir.discovery_start(lo))
+        else {
+            return None;
+        };
+        let row = self.row_at(file, lo, hi, Kind::Ident)?;
+        let (at, binding, _) = self.declared_entry(row)?;
+        let Some(ValueAt::Entries(entries)) = &binding.text else {
+            return None;
+        };
+        let Some(_reading) = self.reading_text(&at) else {
+            return Some(vec![TextValue::hole(guards::HoleReason::Recursion)]);
+        };
+        Some(
+            entries
+                .iter()
+                .flat_map(|(_, value)| self.text_values(at.0, value))
+                .collect(),
+        )
+    }
+
+    /// Every text the argument `expr` (written in `file`, as `inputs` keys
+    /// it) hands on: each entry's of an object literal written in place, the
+    /// declared entries' of a name declared as one
+    /// ([`Self::declared_entry_texts`]), else the texts the value may be
+    /// ([`Self::text_values`]). Keep evidence only, as there.
+    pub(in crate::request_summary) fn handed_texts(
+        &self,
+        file: &Path,
+        expr: &Expr,
+    ) -> Vec<TextValue> {
+        let Some(ir) = self.inputs_for(file).files.get(file) else {
+            return Vec::new();
+        };
+        match text_of(expr, &|lo| ir.discovery_start(lo)) {
+            ValueAt::Entries(entries) => entries
+                .iter()
+                .flat_map(|(_, value)| self.text_values(file, value))
+                .collect(),
+            value => self
+                .declared_entry_texts(file, expr)
+                .unwrap_or_else(|| self.text_values(file, &value)),
+        }
+    }
+
     /// The parts of the text `expr`, written in the repo file `file`
     /// (relative to `root`), states: a template's or a `+` chain's pieces in
     /// order, each with the file of the outermost declaration it was read
@@ -3098,5 +3164,84 @@ mod tests {
                 "{callee}: {got:?}"
             );
         }
+    }
+
+    /// The first argument of the one call of `callee` in `path`, parsed on
+    /// its own as the call-through pass parses a file.
+    fn first_arg_of(path: &Path, callee: &str) -> (Expr, u32) {
+        use swc_common::{
+            SourceMap,
+            errors::{ColorConfig, Handler},
+            sync::Lrc,
+        };
+        use swc_ecma_visit::{Visit, VisitWith};
+        struct Find<'c>(&'c str, Option<(Expr, u32)>);
+        impl Visit for Find<'_> {
+            fn visit_call_expr(&mut self, node: &swc_ecma_ast::CallExpr) {
+                if let swc_ecma_ast::Callee::Expr(callee) = &node.callee
+                    && let Expr::Ident(name) = &**callee
+                    && name.sym == *self.0
+                {
+                    self.1 = Some((*node.args[0].expr.clone(), node.span.lo.0));
+                }
+                node.visit_children_with(self);
+            }
+        }
+        let cm: Lrc<SourceMap> = Default::default();
+        let handler = Handler::with_tty_emitter(ColorConfig::Never, false, false, Some(cm.clone()));
+        let module = crate::parser::parse_file(path, &cm, &handler).expect("the file parses");
+        let mut find = Find(callee, None);
+        module.visit_with(&mut find);
+        find.1
+            .unwrap_or_else(|| panic!("a call of {callee} in {}", path.display()))
+    }
+
+    /// carrick#4218: an object a module exports and spreads is not read for
+    /// a decided value ([`Resolver::keyed_text_set`] answers
+    /// `unread_expression`), and its declared entries are still read as keep
+    /// evidence ([`Resolver::declared_entry_texts`]), through an import
+    /// alias and the shorthand consts it is written from.
+    #[test]
+    fn the_declared_entries_of_an_exported_spread_object_are_read_as_evidence_only() {
+        let edit = [
+            (
+                "src/routes/claim.ts",
+                "const path = \"/api/v1/jobs/claim\";\nconst method = \"POST\";\nexport const route = { path, method };\nexport const describe = { ...route, summary: \"claim\" };\n",
+            ),
+            (
+                "src/claimer.ts",
+                "import { route as claimRoute } from \"./routes/claim\";\nfunction call(route: { path: string; method: string }) {\n  return route;\n}\nexport function claim() {\n  return call(claimRoute);\n}\n",
+            ),
+        ];
+        let Some(on) = walked("resolve-text", "services/web", "web", &edit, true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let path = on.path("services/web/src/claimer.ts");
+        let (expr, call) = first_arg_of(&path, "call");
+        let mut texts: Vec<String> = resolver
+            .declared_entry_texts(&path, &expr)
+            .expect("the name is declared as an object literal")
+            .into_iter()
+            .map(|value| match value {
+                TextValue::Text { text, .. } => text,
+                other => panic!("a stated text, got {other:?}"),
+            })
+            .collect();
+        texts.sort();
+        assert_eq!(texts, ["/api/v1/jobs/claim", "POST"]);
+        assert!(
+            matches!(
+                resolver.keyed_text_set(
+                    &on.repo,
+                    "services/web/src/claimer.ts",
+                    &expr,
+                    "path",
+                    call
+                ),
+                Some(ArgTexts::Unread(Stop::UnreadExpression))
+            ),
+            "the decided reading is unchanged"
+        );
     }
 }

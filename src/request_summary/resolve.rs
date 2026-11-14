@@ -3223,6 +3223,41 @@ impl Drop for Query<'_, '_> {
     }
 }
 
+/// The texts a function hands on in its calls' arguments, read for the
+/// call-through guard (carrick#4218, [`crate::call_through::read_sites`]):
+/// one resolver per service run. Evidence for KEEPING a model row only
+/// ([`Resolver::declared_entry_texts`]), never a decided value.
+pub(crate) struct HandedTexts<'a>(Resolver<'a>);
+
+impl<'a> HandedTexts<'a> {
+    pub(crate) fn new(
+        inputs: &'a RequestSummaryInputs,
+        siblings: &'a [&'a RequestSummaryInputs],
+    ) -> Self {
+        HandedTexts(Resolver::new(inputs, siblings))
+    }
+
+    /// Every text the argument `expr`, written in `file` (as the run's
+    /// inputs key it, parsed on its own), is stated to hand on
+    /// ([`Resolver::handed_texts`]). A value the code does not state adds
+    /// nothing: a hole is never evidence.
+    pub(crate) fn texts(&self, file: &Path, expr: &Expr) -> Vec<String> {
+        self.0
+            .handed_texts(file, expr)
+            .into_iter()
+            .filter_map(|value| match value {
+                text_reader::TextValue::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many resolver queries the reads above made.
+    pub(crate) fn queries(&self) -> usize {
+        self.0.census().queries
+    }
+}
+
 impl<'a> Resolver<'a> {
     pub(super) fn new(
         inputs: &'a RequestSummaryInputs,

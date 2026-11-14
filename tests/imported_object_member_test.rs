@@ -95,10 +95,15 @@ fn a_site_the_join_cannot_prove_keeps_the_model_s_answer() {
     assert_eq!(download["resolution_source"], "model");
 
     // The receiver is a parameter, not an import of the object, so the
-    // member's name alone joins nothing.
-    let via = call_at(&calls, "src/viaParam.ts", 3);
-    assert_eq!(via["path"], "/v1/orders/:orderId/note");
-    assert_eq!(via["resolution_source"], "model");
+    // member's name alone joins nothing. The model's `/v1/orders/:orderId/note`
+    // is read off that name: nothing in the code writes `note`, so the row is
+    // withdrawn and the site saved unread (carrick#4206).
+    assert!(
+        calls
+            .iter()
+            .all(|call| !(call["file"] == "src/viaParam.ts" && call["line"].as_i64() == Some(3))),
+        "{calls:#?}"
+    );
 
     // The client modules' own request rows are untouched.
     for (file, line, method, path) in [

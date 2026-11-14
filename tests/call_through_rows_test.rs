@@ -152,8 +152,15 @@ fn settled_line() -> &'static str {
     &scan().1
 }
 
-fn scan() -> &'static (Blobs, String) {
-    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+/// The aliases the pass logs taking out of the bundled types (carrick#4218).
+fn aliases_taken_out() -> &'static [String] {
+    &scan().2
+}
+
+type Scanned = (Blobs, String, Vec<String>);
+
+fn scan() -> &'static Scanned {
+    static SCAN: OnceLock<Scanned> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -166,17 +173,23 @@ fn scan() -> &'static (Blobs, String) {
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
             .env("HOME", &home);
         run(cmd);
-        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        let logs: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
             .expect("the scan keeps a run log")
             .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-            .flat_map(|log| {
-                log.lines()
-                    .filter(|line| line.contains("Call-through rows settled"))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .next()
-            .expect("the pass logs what it settled");
+            .collect();
+        let settled = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .find(|line| line.contains("Call-through rows settled"))
+            .expect("the pass logs what it settled")
+            .to_string();
+        let taken_out: Vec<String> = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .filter_map(|line| line.split("  - alias ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -186,7 +199,7 @@ fn scan() -> &'static (Blobs, String) {
             SERVICES,
             "every service uploads one blob"
         );
-        (blobs, settled)
+        (blobs, settled, taken_out)
     })
 }
 
@@ -640,6 +653,9 @@ fn a_token_handed_to_the_returned_request_is_not_the_request_reached() {
 /// The function called asks for a token, a request a fact states, and then
 /// makes a `fetch` only the model reads. The token is not the one operation
 /// the call reaches, so the row stays as the model stated it, and is counted.
+/// The function is in the call's own file, so the row is not withdrawn
+/// (carrick#4206 withdraws `commands.ts:94`, the other such row, whose function
+/// is in another file).
 #[test]
 fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_it() {
     assert_eq!(
@@ -647,7 +663,7 @@ fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_i
         as_stated("GET", "/tokened", "/tokened")
     );
     assert!(
-        settled_line().contains("2 reach a request only the model states"),
+        settled_line().contains("1 reach a request only the model states"),
         "{}",
         settled_line()
     );
@@ -803,9 +819,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             70,
             as_stated("GET", "/api/v1/injected/${id}", "/api/v1/injected/:id"),
         ),
-        // The function called writes its URL from its parameters alone, so
-        // no row states its request.
-        ("cli", COMMANDS, 76, as_stated("GET", "/reply", "/reply")),
         // The site writes the route itself.
         ("cli", COMMANDS, 82, as_stated("GET", "/orders", "/orders")),
         // The site also writes a request of its own.
@@ -814,13 +827,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             COMMANDS,
             88,
             as_stated("GET", "/api/v1/notified/${id}", "/api/v1/notified/:id"),
-        ),
-        // Only the model states the request the function called makes.
-        (
-            "cli",
-            COMMANDS,
-            94,
-            as_stated("GET", "/api/v1/pings", "/api/v1/pings"),
         ),
         // The site writes the route, and the function it calls reaches one
         // request of its own (a token). The row is the one the scanner reads
@@ -846,14 +852,6 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
             127,
             as_stated("POST", "/api/v1/audited", "/api/v1/audited"),
         ),
-        // Two callbacks: one through a client nothing resolves, one that
-        // reaches a request.
-        (
-            "web",
-            HOOKS,
-            24,
-            as_stated("POST", "/vendor/send", "/vendor/send"),
-        ),
     ] {
         let row = row_at(service, file, line);
         if row != stated {
@@ -864,6 +862,191 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
         changed.is_empty(),
         "each of these must stay as the model stated it: {changed:#?}"
     );
+}
+
+/// carrick#4206: the rows above that called a function of another file of the
+/// repository, whose walk settled no one request, lose the model's key and
+/// are saved unread. `commands.ts:76` (`send(base, path)` writes its URL from
+/// its parameters) and `:94` (`ping()` makes a `fetch` only the model reads,
+/// and the model's `/api/v1/pings` is not its `/api/v1/ping`) hold no row.
+/// `hooks.ts:24` hands two callbacks to `retry` (`spinner.ts`): the model's
+/// `POST /vendor/send` goes, and the call into the client inside the other
+/// callback, which the model's row held, states its request.
+#[test]
+fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
+    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+        assert_eq!(rows_in(blobs(), service, file, line), [], "{file}:{line}");
+    }
+    assert_eq!(
+        row_at("web", HOOKS, 24),
+        Row {
+            method: "POST".to_string(),
+            target: "/api/v1/audit".to_string(),
+            path: "/api/v1/audit".to_string(),
+            source: "request_summary".to_string(),
+            role: Some("wrapper_call".to_string()),
+            reaches: Some(format!("{REQUESTS}:17")),
+        }
+    );
+    // `hooks.ts:24` holds the leaf row, so it is not saved unread.
+    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+        let named = blobs()[service]["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == file && site["line"] == line)
+            .any(|site| reasons(site).contains(&"own_function".to_string()));
+        assert!(named, "{file}:{line} is saved unread as withdrawn");
+    }
+}
+
+const UNSETTLED: &str = "packages/cli/src/unsettled.ts";
+
+/// The unread site the blob of `service` lists at `file:line`.
+fn unread_at(service: &str, file: &str, line: u32) -> Option<&'static serde_json::Value> {
+    blobs()[service]["unread_sites"]
+        .as_array()?
+        .iter()
+        .find(|site| site["file"] == file && site["line"] == line)
+}
+
+/// carrick#4206: a client method whose request sits in another file, and
+/// whose walk reaches no request row. The model read its path off the
+/// method's name (`POST /v1/jobs/close`), which nothing in the code states,
+/// so the row goes and the call is saved unread: it goes to a function of the
+/// repository, and what that function requests is not read.
+#[test]
+fn a_call_into_a_function_in_another_file_that_settles_no_request_is_saved_unread() {
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 6), []);
+    let site = unread_at("cli", UNSETTLED, 6).unwrap_or_else(|| {
+        panic!(
+            "the call is saved unread: {:#}",
+            blobs()["cli"]["unread_sites"]
+        )
+    });
+    // The walk below the call already saved it (nothing binds the client's
+    // `send`), so the site keeps that reason and names the withdrawal beside
+    // it; a site no walk saved takes `own_function` as its reason (unit test
+    // in `src/unread_sites.rs`).
+    assert_eq!(text(&site["callee"]).as_deref(), Some("client.close"));
+    assert!(
+        reasons(site).contains(&"own_function".to_string()),
+        "{site:#}"
+    );
+}
+
+/// A site's reason and the reasons `also` names beside it.
+fn reasons(site: &serde_json::Value) -> Vec<String> {
+    std::iter::once(&site["reason"])
+        .chain(site["also"].as_array().into_iter().flatten())
+        .filter_map(text)
+        .collect()
+}
+
+/// carrick#4206's control: the same call into another file's function, handed
+/// a URL the calling code builds, keeps the model's row. The path is read off
+/// the call's own file, not off a name.
+#[test]
+fn a_call_handed_a_url_its_own_file_builds_keeps_the_models_row() {
+    for (line, target, path) in [
+        (13, "${base}/api/v1/accounts", "/api/v1/accounts"),
+        (20, "${base}/api/v1/accounts/${id}", "/api/v1/accounts/:id"),
+    ] {
+        assert_eq!(
+            row_at("cli", UNSETTLED, line),
+            as_stated("GET", target, path)
+        );
+        // The walk below the call saves it unread (`missed_inside`); no row
+        // was withdrawn there.
+        assert!(
+            unread_at("cli", UNSETTLED, line)
+                .is_none_or(|site| !reasons(site).contains(&"own_function".to_string())),
+            "{UNSETTLED}:{line} holds its row and is not saved as withdrawn"
+        );
+    }
+}
+
+/// Whether `file:line` of `service` is saved unread as a withdrawn row.
+fn saved_as_withdrawn(service: &str, file: &str, line: u32) -> bool {
+    unread_at(service, file, line)
+        .is_some_and(|site| reasons(site).contains(&"own_function".to_string()))
+}
+
+/// carrick#4218 T1: a client method that hands on a text writing the row's
+/// path keeps the model's row, though its request sits behind a function it
+/// was handed: `claim` hands `call` an imported route object
+/// (`export const route = { path, method }`, exported and spread), and
+/// `ping` hands `get` an imported string constant. The model's path is the
+/// code's, not a name's.
+#[test]
+fn a_call_into_a_function_that_hands_on_the_rows_path_keeps_the_models_row() {
+    for (line, method, path) in [
+        (30, "POST", "/api/v1/jobs/claim"),
+        (32, "GET", "/api/v1/jobs/ping"),
+    ] {
+        assert_eq!(
+            row_at("cli", UNSETTLED, line),
+            as_stated(method, path, path)
+        );
+        assert!(
+            !saved_as_withdrawn("cli", UNSETTLED, line),
+            "{UNSETTLED}:{line} holds its row and is not saved as withdrawn"
+        );
+    }
+}
+
+/// carrick#4218 T1's control: `release` hands on `/api/v1/jobs/release`, and
+/// the model read `/api/v1/jobs/close` off nothing the code writes, so the row
+/// is still withdrawn and saved unread.
+#[test]
+fn a_call_whose_function_hands_on_another_path_is_still_withdrawn() {
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 31), []);
+    assert!(saved_as_withdrawn("cli", UNSETTLED, 31));
+}
+
+/// carrick#4218 T2: the request is made by the call written in the row
+/// call's argument (`report(await readHealth(port))`), whose function hands
+/// its reader a path a sibling service exports: the row naming that path
+/// stays, and its twin, which the model keyed by the outer function's name,
+/// is withdrawn.
+#[test]
+fn a_call_whose_argument_call_hands_on_the_rows_path_keeps_the_models_row() {
+    assert_eq!(
+        row_at("cli", UNSETTLED, 38),
+        as_stated("GET", "/livez", "/livez")
+    );
+    assert!(!saved_as_withdrawn("cli", UNSETTLED, 38));
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 43), []);
+    assert!(saved_as_withdrawn("cli", UNSETTLED, 43));
+}
+
+/// carrick#4218 T3: the aliases of the type entries anchored at withdrawn
+/// rows leave the bundled types, which serve definitions by alias: 14
+/// aliases of the rows `cli` withdraws in `commands.ts` (76, 94) and
+/// `unsettled.ts` (6, 31, 43) and of `web`'s at `hooks.ts:24`. No manifest
+/// entry names them any more, and no bundle declares them.
+#[test]
+fn a_withdrawn_rows_aliases_leave_the_bundled_types() {
+    let taken_out = aliases_taken_out();
+    assert_eq!(taken_out.len(), 14, "{taken_out:#?}");
+    for blob in blobs().values() {
+        let bundle = blob["bundled_types"].as_str().unwrap_or_default();
+        let named: Vec<&str> = blob["type_manifest"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["type_alias"].as_str())
+            .collect();
+        for alias in taken_out {
+            assert!(
+                !bundle.contains(&format!("type {alias} "))
+                    && !bundle.contains(&format!("interface {alias} ")),
+                "{alias} is still declared in {}",
+                blob["service_name"]
+            );
+            assert!(!named.contains(&alias.as_str()), "{alias} is still named");
+        }
+    }
 }
 
 #[test]
@@ -980,13 +1163,16 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Eleven rows in `commands.ts` the model alone states and the one at
-    // `nested.ts:7`. The three in `inline-commands.ts` (lines 9, 13, 22) are
+    // Nine rows in `commands.ts` the model alone states, the one at
+    // `nested.ts:7` and the five at `unsettled.ts` lines 13, 20, 30, 32 and
+    // 38 (carrick#4218 keeps the last three). `commands.ts` lines 76 and 94
+    // and `unsettled.ts` lines 6, 31 and 43 are withdrawn (carrick#4206).
+    // The three in `inline-commands.ts` (lines 9, 13, 22) are
     // corrected, not the model's alone: every scan now walks with the
     // compiler's rows (`position_rows::destination` has no switch), which
     // follow them (carrick#2822), as `a_method_called_on_a_factorys_value_…`
     // and `a_wrapper_over_a_factorys_value_…` assert.
-    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
+    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
@@ -1528,11 +1714,81 @@ fn scanned_then_cli_edited(tmp: &Path) -> (PathBuf, PathBuf) {
     (repo, storage)
 }
 
+/// The two calls of `cli` into a function of `client` whose walk settles no
+/// request: a full scan withdraws their model rows (carrick#4206); a scan
+/// that carries `client` keeps them, because what `client`'s functions write
+/// and hand on is read only in the run that analyses it (carrick#4218 T0,
+/// fail closed).
+const INTO_CARRIED: [(u32, &str); 2] = [(76, "/reply"), (94, "/api/v1/pings")];
+
+/// Whether `entry` (a type entry or an unread site, by its `file` key and
+/// `line` key) is at one of [`INTO_CARRIED`].
+fn is_into_carried(entry: &serde_json::Value, file: &str, line: &str) -> bool {
+    entry[file] == COMMANDS && INTO_CARRIED.iter().any(|(at, _)| entry[line] == *at)
+}
+
+/// `blob` with everything the rows at [`INTO_CARRIED`] state taken out: the
+/// rows and their projection, their type entries, their boundary reasons and
+/// counts, the withdrawal named on their unread sites, and the declarations
+/// of `aliases` in the bundle.
+fn without_into_carried(mut blob: serde_json::Value, aliases: &[String]) -> serde_json::Value {
+    let at = |value: &serde_json::Value| {
+        INTO_CARRIED
+            .iter()
+            .any(|(line, _)| value.as_str() == Some(&format!("{COMMANDS}:{line}")))
+    };
+    blob["last_updated"] = serde_json::Value::Null;
+    if let Some(calls) = blob["mount_graph"]["data_calls"].as_array_mut() {
+        calls.retain(|call| !at(&call["file_location"]));
+    }
+    if let Some(calls) = blob["calls"].as_array_mut() {
+        calls.retain(|call| !at(&call["file_path"]));
+    }
+    if let Some(entries) = blob["type_manifest"].as_array_mut() {
+        entries.retain(|entry| !is_into_carried(entry, "file_path", "line_number"));
+    }
+    let boundary = &mut blob["boundary"];
+    boundary["model_only_rows"] = serde_json::Value::Null;
+    boundary["calls_without_expected_type"]["total"] = serde_json::Value::Null;
+    if let Some(reasons) = boundary["calls_without_expected_type"]["reasons"].as_array_mut() {
+        reasons.retain(|reason| {
+            !INTO_CARRIED.iter().any(|(line, _)| {
+                reason
+                    .as_str()
+                    .is_some_and(|text| text.ends_with(&format!("({COMMANDS}:{line})")))
+            })
+        });
+    }
+    if let Some(sites) = blob["unread_sites"].as_array_mut() {
+        for site in sites
+            .iter_mut()
+            .filter(|site| is_into_carried(site, "file", "line"))
+        {
+            site.as_object_mut().unwrap().remove("also");
+        }
+    }
+    if let Some(bundle) = blob["bundled_types"].as_str() {
+        let kept: String = bundle
+            .split_inclusive('\n')
+            .filter(|line| {
+                !aliases.iter().any(|alias| {
+                    line.contains(&format!("type {alias} "))
+                        || line.contains(&format!("interface {alias} "))
+                })
+            })
+            .collect();
+        blob["bundled_types"] = serde_json::Value::String(kept);
+    }
+    blob
+}
+
 /// carrick#2378: a service `--changed-only` carries states what the
 /// call-through pass reads of it (the definitions that hand back a request's
 /// parsed body, the calls whose value is not handed back, its own call-through
-/// rows), so the rows of the service analysed beside it settle exactly as a
-/// full scan settles them.
+/// rows), so the rows of the service analysed beside it settle as a full scan
+/// settles them, with one known gap: the rows at [`INTO_CARRIED`], which a
+/// full scan withdraws and the scoped scan keeps (carrick#4218 T0) until the
+/// facts that decide them are stored with the carried service.
 #[test]
 fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -1556,15 +1812,82 @@ fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     // rows of the services the scoped one carries.
     rescan(&repo, &full_storage, &tmp.path().join("home"), &[]);
 
-    let pinned = |mut blob: serde_json::Value| {
-        blob["last_updated"] = serde_json::Value::Null;
-        serde_json::to_string_pretty(&blob).unwrap()
+    let scoped_cli = read_blobs(&storage)["cli"].1.clone();
+    let full_cli = read_blobs(&full_storage)["cli"].1.clone();
+
+    // The known gap, exactly: the scoped scan keeps the two rows into the
+    // carried `client`, with their type entries, aliases and boundary
+    // counts; the full scan withdraws them and saves each site unread as
+    // withdrawn.
+    let rows_at = |blob: &serde_json::Value, line: u32| -> Vec<(String, String)> {
+        let site = format!("{COMMANDS}:{line}");
+        blob["mount_graph"]["data_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| call["file_location"] == site.as_str())
+            .map(|call| {
+                (
+                    text(&call["method"]).unwrap_or_default(),
+                    text(&call["canonical_path"]).unwrap_or_default(),
+                )
+            })
+            .collect()
     };
-    let scoped_blobs = read_blobs(&storage);
-    let full_blobs = read_blobs(&full_storage);
+    let withdrawn_at = |blob: &serde_json::Value, line: u32| {
+        blob["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == COMMANDS && site["line"] == line)
+            .any(|site| reasons(site).contains(&"own_function".to_string()))
+    };
+    for (line, path) in INTO_CARRIED {
+        assert_eq!(
+            rows_at(&scoped_cli, line),
+            [("GET".to_string(), path.to_string())],
+            "{COMMANDS}:{line} kept by the scoped scan"
+        );
+        assert_eq!(rows_at(&full_cli, line), [], "{COMMANDS}:{line} withdrawn");
+        assert!(!withdrawn_at(&scoped_cli, line), "{COMMANDS}:{line}");
+        assert!(withdrawn_at(&full_cli, line), "{COMMANDS}:{line}");
+    }
+    let aliases: Vec<String> = scoped_cli["type_manifest"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| is_into_carried(entry, "file_path", "line_number"))
+        .filter_map(|entry| text(&entry["type_alias"]))
+        .collect();
+    assert_eq!(aliases.len(), 4, "a request and a response entry each");
+    let scoped_bundle = scoped_cli["bundled_types"].as_str().unwrap_or_default();
+    let full_bundle = full_cli["bundled_types"].as_str().unwrap_or_default();
+    for alias in &aliases {
+        let declared = |bundle: &str| {
+            bundle.contains(&format!("type {alias} "))
+                || bundle.contains(&format!("interface {alias} "))
+        };
+        assert!(declared(scoped_bundle) && !declared(full_bundle), "{alias}");
+    }
+    let count = |blob: &serde_json::Value, key: &str| match key {
+        "model_only_rows" => blob["boundary"]["model_only_rows"].as_u64(),
+        _ => blob["boundary"]["calls_without_expected_type"]["total"].as_u64(),
+    };
+    for key in ["model_only_rows", "calls_without_expected_type"] {
+        assert_eq!(
+            count(&scoped_cli, key).map(|scoped| scoped - 2),
+            count(&full_cli, key),
+            "{key}"
+        );
+    }
+
+    // Everything else agrees.
+    let pinned = |blob: serde_json::Value| {
+        serde_json::to_string_pretty(&without_into_carried(blob, &aliases)).unwrap()
+    };
     assert_eq!(
-        pinned(scoped_blobs["cli"].1.clone()),
-        pinned(full_blobs["cli"].1.clone()),
+        pinned(scoped_cli),
+        pinned(full_cli),
         "the analysed service's blob"
     );
 }

@@ -20,7 +20,7 @@
 //! | `src/client.ts:12` | `POST /api/login` | a row |
 //! | `src/client.ts:16`, `:17` | `POST /api/logout`, `POST /api/audit` | a row each |
 //! | `src/page.ts:4` (calls `login`) | `POST /api/login` | folded: no row |
-//! | `src/page.ts:9` (calls `logout`) | `DELETE /api/session` | the reader's row: the callee states other operations |
+//! | `src/page.ts:9` (calls `logout`) | `DELETE /api/session` | withdrawn, saved unread: the callee states other operations and writes nothing of this one (carrick#4206) |
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -172,13 +172,13 @@ fn a_reader_row_at_a_call_of_a_function_that_states_the_request_folds_onto_it() 
     // The caller's copy of the same request is folded onto it.
     assert!(at(&on, "src/page.ts:4").is_empty(), "{on:#?}");
     // A caller whose reader row names another operation than any its callee
-    // states keeps its row.
-    let logout_caller = at(&on, "src/page.ts:9");
-    assert_eq!(logout_caller.len(), 1, "{on:#?}");
-    assert!(logout_caller[0].1.ends_with("/api/session"), "{on:#?}");
+    // states: the callee reaches two requests and writes nothing of
+    // `/api/session`, so the reader's row is withdrawn and the site saved
+    // unread (carrick#4206).
+    assert!(at(&on, "src/page.ts:9").is_empty(), "{on:#?}");
     assert_eq!(at(&on, "src/client.ts:16").len(), 1, "{on:#?}");
     assert_eq!(at(&on, "src/client.ts:17").len(), 1, "{on:#?}");
-    assert_eq!(on.len(), places.len() - 1, "{on:#?}");
+    assert_eq!(on.len(), places.len() - 2, "{on:#?}");
 }
 
 /// Every graph call row's `file:line`: the rows the cross-service pass reads.
@@ -226,7 +226,7 @@ fn graph_calls(blob: &serde_json::Value) -> Vec<String> {
 /// | `src/screens.ts:5` (hook, `listItems`) | `GET /api/list` | folded: no row |
 /// | `src/screens.ts:9` (`replaceItem`) | `PATCH /api/items/:id` | folded: no row |
 /// | `src/screens.ts:13` (`saveItem`) | `POST /api/save` | folded: no row |
-/// | `src/screens.ts:17` (`fetchPath`) | `GET /api/all` | the reader's row: no fact states the request |
+/// | `src/screens.ts:17` (`fetchPath`) | `GET /api/all` | withdrawn, saved unread: no fact states the request and the callee writes nothing of it (carrick#4206) |
 /// | `src/screens.ts:25` (`listItems` and `tag` on one line) | `GET /api/list`, `GET /api/tag` | the `tag` row stands |
 #[test]
 fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
@@ -253,14 +253,10 @@ fn a_reader_row_that_disagrees_with_the_fact_its_callee_states_folds_onto_it() {
         assert!(at(&on, place).is_empty(), "{place}: {on:#?}");
         assert!(!graph.contains(&place.to_string()), "{place}: {graph:#?}");
     }
-    // A caller whose request no fact states keeps the reader's row.
-    let unstated = at(&on, "src/screens.ts:17");
-    assert_eq!(unstated.len(), 1, "{on:#?}");
-    assert_eq!(
-        (unstated[0].1.as_str(), unstated[0].2.as_str()),
-        ("GET /api/all", "model"),
-        "{on:#?}"
-    );
+    // A caller whose request no fact states: `fetchPath(path)` is handed its
+    // path by a parameter and writes nothing of `/api/all`, so the reader's
+    // row is withdrawn and the site saved unread (carrick#4206).
+    assert!(at(&on, "src/screens.ts:17").is_empty(), "{on:#?}");
     // A caller line that holds a second call (`src/screens.ts:25` calls
     // `listItems` and the unrelated `tag`) is not the callee's request alone:
     // the reader's row for the other call stands.
