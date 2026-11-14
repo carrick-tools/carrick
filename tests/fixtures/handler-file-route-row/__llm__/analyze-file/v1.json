@@ -11,8 +11,8 @@
       "pattern_matched": "reply.send(",
       "payload_expression_text": null,
       "payload_expression_line": null,
-      "response_expression_text": null,
-      "response_expression_line": null,
+      "response_expression_text": "reply.send({ rest: request.params })",
+      "response_expression_line": 5,
       "primary_type_symbol": null,
       "type_import_source": null
     }

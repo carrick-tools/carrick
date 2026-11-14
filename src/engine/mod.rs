@@ -31044,6 +31044,19 @@ unfollowed_member_calls_total: 0,
                 "src/gql-handler.ts",
                 "export function gql(request: any, reply: any) {\n  reply.send(6);\n}\n",
             ),
+            // A handler the scan places no definition for: a value a call
+            // returns.
+            (
+                "src/controllers/made.ts",
+                "const makeHandler = () => (request: any, reply: any) => reply.send(7);\n\
+                 export const made = makeHandler();\n",
+            ),
+            // Two definitions of one name in one file.
+            (
+                "src/controllers/dup.ts",
+                "export function dup(request: any, reply: any) {\n  reply.send(8);\n}\n\
+                 export namespace again {\n  export function dup(request: any, reply: any) {\n    reply.send(9);\n  }\n}\n",
+            ),
             (
                 "src/routes.ts",
                 "import { router } from \"./router\";\n\
@@ -31061,7 +31074,11 @@ unfollowed_member_calls_total: 0,
                  router.get(\"/twice\", twice);\n\
                  router.get(\"/m\", missing);\n\
                  router.get(\"/mod\", mod.modh);\n\
-                 router.get(\"/w\", wrap(wrapped));\n",
+                 router.get(\"/w\", wrap(wrapped));\n\
+                 import { made } from \"./controllers/made\";\n\
+                 import { dup } from \"./controllers/dup\";\n\
+                 router.get(\"/made\", made);\n\
+                 router.get(\"/dup\", dup);\n",
             ),
             (
                 "src/other.ts",
@@ -31104,7 +31121,8 @@ unfollowed_member_calls_total: 0,
     /// (catch-all, same path, no mount prefix, a path made up from the
     /// name). Every other row keeps its place: a handler no one registers,
     /// one registered twice, another method, an import that does not
-    /// resolve, a whole-module import, a wrapped handler, a row outside the
+    /// resolve, a whole-module import, a wrapped handler, a handler with no
+    /// definition the scan places or with two, a row outside the
     /// handler's body, a row a pass stated, and two real registrations of
     /// one handler (golden-a's `ALL /graphql` shape).
     #[test]
@@ -31143,6 +31161,8 @@ unfollowed_member_calls_total: 0,
                 row("src/routes.ts", 14, "GET", "/api/m", "missing", Model),
                 row("src/routes.ts", 15, "GET", "/api/mod", "modh", Model),
                 row("src/routes.ts", 16, "GET", "/api/w", "wrapped", Model),
+                row("src/routes.ts", 19, "GET", "/api/made", "made", Model),
+                row("src/routes.ts", 20, "GET", "/api/dup", "dup", Model),
                 row("src/graphql.ts", 3, "ALL", "/graphql", "gql", Model),
                 row("src/test-helper.ts", 3, "ALL", "/graphql", "gql", Model),
                 row("src/controllers/self.ts", 5, "GET", "/a", "h", Model),
@@ -31214,6 +31234,8 @@ unfollowed_member_calls_total: 0,
                     "wrapped",
                     Model,
                 ),
+                row("src/controllers/made.ts", 2, "GET", "/made", "made", Model),
+                row("src/controllers/dup.ts", 2, "GET", "/dup", "dup", Model),
                 row(
                     "src/controllers/v1.ts",
                     2,
@@ -31252,6 +31274,8 @@ unfollowed_member_calls_total: 0,
             "src/routes.ts:14 GET /api/m",
             "src/routes.ts:15 GET /api/mod",
             "src/routes.ts:16 GET /api/w",
+            "src/routes.ts:19 GET /api/made",
+            "src/routes.ts:20 GET /api/dup",
             "src/graphql.ts:3 ALL /graphql",
             "src/test-helper.ts:3 ALL /graphql",
             "src/controllers/self.ts:5 GET /a",
@@ -31261,6 +31285,8 @@ unfollowed_member_calls_total: 0,
             "src/controllers/missing.ts:2 GET /m",
             "src/controllers/modh.ts:2 GET /mod",
             "src/controllers/wrapped.ts:2 GET /w",
+            "src/controllers/made.ts:2 GET /made",
+            "src/controllers/dup.ts:2 GET /dup",
             "src/controllers/v1.ts:2 ALL /v1/stated/*",
         ]
         .map(str::to_string)

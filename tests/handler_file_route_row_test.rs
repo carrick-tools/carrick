@@ -140,3 +140,21 @@ fn the_withdrawn_rows_leave_nothing_behind_in_the_blob() {
         );
     }
 }
+
+/// Both withdrawn rows carry a response anchor in their answers, so each
+/// would be asked a type. Withdrawn, neither leaves a type-manifest entry.
+#[test]
+fn the_withdrawn_rows_leave_no_type_ask() {
+    let asked: Vec<String> = blobs()
+        .iter()
+        .flat_map(|blob| blob["type_manifest"].as_array().into_iter().flatten())
+        .filter(|entry| {
+            matches!(
+                entry["file_path"].as_str(),
+                Some("src/controllers/v1.ts" | "src/controllers/items.ts")
+            )
+        })
+        .map(|entry| entry.to_string())
+        .collect();
+    assert!(asked.is_empty(), "type asks left behind: {asked:?}");
+}

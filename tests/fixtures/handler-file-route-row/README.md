@@ -18,6 +18,8 @@ hands in that function through an import.
   line 4, inside `allV1`. Withdrawn.
 - `src/controllers/items.ts` defines `getItem`; its answer states
   `GET /items/:id` with no mount prefix at line 4, inside `getItem`. Withdrawn.
+- Both withdrawn answers carry a response anchor (`reply.send(...)`, line
+  5), so each would be asked a type: withdrawn, neither leaves one.
 - `src/controllers/self.ts` defines `h` and registers it itself at `/a`
   (line 8, outside `h`'s body), while `src/routes.ts` registers it at `/b`.
   Both rows stay.
