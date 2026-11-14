@@ -8,7 +8,7 @@
       "method": "ALL",
       "path": "/v1/*",
       "handler_name": "allV1",
-      "pattern_matched": "reply.forward(",
+      "pattern_matched": "reply.send(",
       "payload_expression_text": null,
       "payload_expression_line": null,
       "response_expression_text": null,
