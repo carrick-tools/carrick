@@ -79,10 +79,13 @@ pub(crate) fn store_read_places(
         if entry.role == ManifestRole::Producer {
             // The precedence of `enrich_manifest_with_type_resolution`: an
             // explicit symbol entry's text wins, so no read made it.
-            if !explicit.contains(entry.type_alias.as_str()) {
-                if let Some(answer) = answered.get(entry.type_alias.as_str()) {
-                    entry.evidence.value_spans = value_spans(answer, repo_root);
-                }
+            let alias = entry.type_alias.as_str();
+            let read = answered
+                .get(alias)
+                .filter(|_| !explicit.contains(alias))
+                .map(|answer| value_spans(answer, repo_root));
+            if let Some(spans) = read {
+                entry.evidence.value_spans = spans;
             }
             continue;
         }
