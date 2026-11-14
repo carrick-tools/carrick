@@ -942,6 +942,7 @@ impl<'a> Resolver<'a> {
             return false;
         };
         self.row_at(file, *lo, *hi, Kind::Ident)
+            .ok()
             .and_then(Row::type_text)
             .is_some_and(|text| {
                 text.trim() == "string"
