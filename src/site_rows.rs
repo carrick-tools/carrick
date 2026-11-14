@@ -1534,6 +1534,23 @@ pub fn fold(
                 None => read.and_then(|call| call.base.clone()),
             };
             let host = host.or_else(|| read.and_then(|call| call.host.clone()));
+            // A fact restating the operation of the old-path row it replaced
+            // (carrick#4372) is that row's request read again: its graph row
+            // keeps what that row read off the call, whether the call is the
+            // request or a call through to one. The call-through walk reads
+            // the role (`call_through::is_request_row`): a helper call the
+            // fact marked as a call through, reaching no request, left the
+            // calls into the helper's callers with no request to state.
+            let restated = read.filter(|call| {
+                row.fact()
+                    && call.resolution_source.is_some_and(is_old_path_source)
+                    && call.method.eq_ignore_ascii_case(method)
+                    && call.canonical_path == path
+            });
+            let (role, reaches_request) = match restated {
+                Some(call) => (call.role, call.reaches_request.clone()),
+                None => (row.through.then_some(ConsumerRole::WrapperCall), None),
+            };
             graph.data_calls.push(DataFetchingCall {
                 method: method.to_string(),
                 target_url: path.to_string(),
@@ -1549,8 +1566,8 @@ pub fn fold(
                 consumers_not_resolved: None,
                 resolution_source: Some(row.source),
                 dispatch: read.and_then(|call| call.dispatch.clone()),
-                role: row.through.then_some(ConsumerRole::WrapperCall),
-                reaches_request: None,
+                role,
+                reaches_request,
                 library_semantics: Vec::new(),
                 own_route,
                 static_asset: None,

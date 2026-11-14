@@ -233,11 +233,11 @@ fn a_fact_replaces_the_same_key_old_path_row_at_its_call() {
     );
     assert_eq!(
         graph_at("src/two-lines.ts:3"),
-        ["POST /z/a wrapper_call client=send host=none base=relative"]
+        ["POST /z/a network_request client=send host=none base=relative"]
     );
     assert_eq!(
         graph_at("src/two-lines.ts:4"),
-        ["POST /z/b wrapper_call client=send host=none base=relative"]
+        ["POST /z/b network_request client=send host=none base=relative"]
     );
     assert_eq!(requests_at("src/two-lines.ts", 3, "/z/a"), ["implicit 1"]);
     assert_eq!(requests_at("src/two-lines.ts", 4, "/z/b"), ["implicit 2"]);
@@ -248,7 +248,7 @@ fn a_fact_replaces_the_same_key_old_path_row_at_its_call() {
     );
     assert_eq!(
         graph_at("src/same-twice.ts:3"),
-        ["POST /w/a wrapper_call client=send host=none base=relative"]
+        ["POST /w/a network_request client=send host=none base=relative"]
     );
     assert_eq!(requests_at("src/same-twice.ts", 3, "/w/a"), ["implicit 1"]);
     // Kept out by a wrapper row, under the mixed guard: mixed-plain (1,
@@ -277,8 +277,8 @@ fn both_calls_on_one_line_state_their_own_rows() {
     assert_eq!(
         graph_at("src/two-same.ts:3"),
         [
-            "POST /x/a wrapper_call client=send host=none base=relative",
-            "POST /x/b wrapper_call client=send host=none base=relative"
+            "POST /x/a network_request client=send host=none base=relative",
+            "POST /x/b network_request client=send host=none base=relative"
         ]
     );
     assert_eq!(requests_at("src/two-same.ts", 3, "/x/a"), ["implicit 1"]);
@@ -299,8 +299,8 @@ fn two_wrappers_on_one_line_keep_their_own_client_host_and_base() {
     assert_eq!(
         graph_at("src/two-wrappers.ts:4"),
         [
-            "POST ${process.env.B_BASE}/y/b wrapper_call client=sendB host=none base=env",
-            "POST https://a.example.test/y/a wrapper_call client=sendA host=a.example.test base=none"
+            "POST ${process.env.B_BASE}/y/b network_request client=sendB host=none base=env",
+            "POST https://a.example.test/y/a network_request client=sendA host=a.example.test base=none"
         ]
     );
 }
