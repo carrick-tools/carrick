@@ -19,6 +19,17 @@ export function isTypeSpaceDeclaration(declaration: Node): boolean {
 }
 
 /**
+ * The name a reader knows a type declaration by. The compiler names a default
+ * export `default`; the name it declares (`export default interface Ticket`)
+ * is the one a reader can import. `undefined` for a default export with no
+ * name (`export default class {}`).
+ */
+export function declaredTypeName(name: string, declaration: Node): string | undefined {
+  if (name !== 'default') return name;
+  return (declaration as { getNameNode?: () => Node | undefined }).getNameNode?.()?.getText();
+}
+
+/**
  * The home a type declaration gives under the name `name`: the declaring
  * file (absolute) and the 1-based line of the declaration's name, never of a
  * JSDoc block above it. A default export (`export default interface
@@ -45,7 +56,7 @@ export function homeOfTypeDeclaration(
     .some((ancestor) => Node.isModuleDeclaration(ancestor) && Node.isStringLiteral(ancestor.getNameNode()));
   if (inAmbientModule) return undefined;
   const nameNode = (declaration as { getNameNode?: () => Node | undefined }).getNameNode?.();
-  if (!nameNode) return undefined;
-  const symbol = name === 'default' ? nameNode.getText() : name;
+  const symbol = declaredTypeName(name, declaration);
+  if (!nameNode || symbol === undefined) return undefined;
   return { symbol, file_path: sourceFile.getFilePath(), line: startLineOf(nameNode) };
 }

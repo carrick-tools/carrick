@@ -79,7 +79,7 @@ import { callInto, calledFunction, narrowByArguments } from './argument-modes.js
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
-import { homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
+import { declaredTypeName, homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
 import {
   callsOf,
   descendantsOf,
@@ -8822,7 +8822,13 @@ export class TypeInferrer {
    * `primary_type_symbol` so the manifest anchor no longer depends on the LLM.
    */
   private primaryTypeSymbol(type: Type): string | undefined {
-    const name = this.anchorSymbolOf(type)?.getName();
+    const symbol = this.anchorSymbolOf(type);
+    let name = symbol?.getName();
+    // A default export is named by the name it declares (carrick#4359).
+    if (symbol && name === 'default') {
+      const declaration = symbol.getDeclarations().find(isTypeSpaceDeclaration);
+      name = declaration ? declaredTypeName(name, declaration) : undefined;
+    }
     // Reject the compiler's synthetic names for anonymous shapes (`__type`,
     // `__object`, `__function`, …). They are not user-facing type names, so
     // they would be a meaningless — and non-resolvable — anchor.
