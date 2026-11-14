@@ -45,10 +45,11 @@
 //! answer and says how old it is; the re-check never blocks an edit and never
 //! leaves a scan running behind one.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -56,7 +57,9 @@ use std::time::{Duration, Instant};
 use super::checkout::Tree;
 use super::contract::{NotReread, RecheckScope};
 use super::index::{build, join_command, read_blobs, repo_label, scan_command, service_id};
+use super::kept_reads::{self, Built, Inputs, RepoReads, similar_of};
 use super::read_model::{IndexedItem, IndexedRepo, IndexedService};
+use super::similar::Similar;
 use super::workspace::Workspace;
 use crate::engine::type_compat_v2::JUDGE_ANSWERS_ENV;
 
@@ -374,7 +377,10 @@ pub(super) fn took(phase: &str, began: Instant) {
 /// `rescan: false` is the probe: after the known-miss gate and before
 /// [`Plan::make`] it returns a [`Degraded`] marked `deferred`, so it reads the
 /// index and parses the one file and starts no scan, no temporary generation
-/// and records no miss. A miss that holds still answers as a known miss.
+/// and records no miss. A miss that holds still answers as a known miss. The
+/// probe reads the kept probe file ([`super::kept_reads`]) when it is current,
+/// and the blobs when it is not; it writes nothing. The full re-check writes
+/// the file when it is not current, after its blob read.
 pub fn run(
     workspace: &Workspace,
     tree: &Tree,
@@ -391,28 +397,91 @@ pub fn run(
     // and for the re-join. What the edit added does not wait on the re-scan
     // (carrick#2849): on a large repo the re-scan alone outlasts the budget,
     // and the reuse nudge would then never hear of a function the edit wrote.
-    let held = match Held::read(workspace) {
-        Ok(held) => {
-            took("held-read", started);
-            held
+    //
+    // A probe reads the kept probe file instead when it is current, and no
+    // blob (carrick#4034). The inputs are taken before any blob is read, so a
+    // file written from this read is only kept when nothing moved under it.
+    let inputs = Inputs::now(workspace);
+    let kept = match (&inputs, rescan) {
+        (Some(now), false) => kept_reads::read(workspace, index_generation, now, &tree.repo),
+        _ => None,
+    };
+    let source = match kept {
+        Some(reads) => Source::Kept(reads),
+        None => match Held::read(workspace) {
+            Ok(held) => {
+                took("held-read", started);
+                Source::Read(held)
+            }
+            Err(reason) => {
+                return Err(Box::new(Degraded {
+                    reason,
+                    new_functions: Vec::new(),
+                    elapsed: started.elapsed(),
+                    known_miss: false,
+                    deferred: false,
+                    deadline: false,
+                    scope: None,
+                }));
+            }
+        },
+    };
+    // The full re-check keeps the probe file when it is not current: it has
+    // just read every blob, and a probe never writes.
+    let built = match (&source, &inputs) {
+        (Source::Read(held), Some(now))
+            if rescan && !kept_reads::is_current(workspace, index_generation, now, &tree.repo) =>
+        {
+            let paths: Vec<PathBuf> = before
+                .repos
+                .iter()
+                .map(|repo| PathBuf::from(&repo.path))
+                .collect();
+            let built = Built::of(held, &paths);
+            kept_reads::keep(
+                workspace,
+                index_generation,
+                now,
+                &built.repos,
+                &built.similar,
+            );
+            Some(built)
         }
-        Err(reason) => {
-            return Err(Box::new(Degraded {
-                reason,
-                new_functions: Vec::new(),
-                elapsed: started.elapsed(),
-                known_miss: false,
-                deferred: false,
-                deadline: false,
-                scope: None,
-            }));
-        }
+        _ => None,
+    };
+    let (built_repos, built_similar) = match built {
+        Some(built) => (built.repos, Some(built.similar)),
+        None => (Vec::new(), None),
     };
     let began = Instant::now();
-    let added = added_functions(&held, tree, relative);
+    let reads: Cow<RepoReads> = match &source {
+        Source::Kept(reads) => Cow::Borrowed(reads),
+        Source::Read(held) => built_repos
+            .iter()
+            .find(|reads| reads.path() == tree.repo)
+            .map_or_else(
+                || Cow::Owned(RepoReads::of(held, &tree.repo)),
+                Cow::Borrowed,
+            ),
+    };
+    let added = added_functions(&reads, tree, relative);
     took("added-functions", began);
     let began = Instant::now();
-    let new_functions = with_similar(&held, tree, relative, added);
+    let new_functions = with_similar(tree, relative, added, || match (built_similar, &source) {
+        (Some(similar), _) => similar,
+        (None, Source::Read(held)) => similar_of(held),
+        // A kept probe file read, and the ranker beside it is not current:
+        // the blobs give it, as they did before the probe kept anything.
+        (None, Source::Kept(_)) => inputs
+            .as_ref()
+            .and_then(|now| kept_reads::read_similar(workspace, index_generation, now))
+            .unwrap_or_else(|| {
+                Held::read(workspace).map_or_else(
+                    |_| Similar::build(std::iter::empty()),
+                    |held| similar_of(&held),
+                )
+            }),
+    });
     took("similar", began);
     let began = Instant::now();
     let misses = ServiceMisses::path(workspace);
@@ -429,16 +498,13 @@ pub fn run(
             scope: None,
         }));
     }
+    // A probe stops here, and only a probe can hold the kept probe file
+    // instead of the blobs.
+    let Source::Read(held) = source else {
+        return Err(Box::new(deferred(new_functions, started)));
+    };
     if !rescan {
-        return Err(Box::new(Degraded {
-            reason: DEFERRED_REASON.to_string(),
-            new_functions,
-            elapsed: started.elapsed(),
-            known_miss: false,
-            deferred: true,
-            deadline: false,
-            scope: None,
-        }));
+        return Err(Box::new(deferred(new_functions, started)));
     }
     let began = Instant::now();
     let plan = Plan::make(workspace, &tree.checkout, reach, index_generation, &held);
@@ -491,6 +557,26 @@ pub fn run(
                 scope: Some(plan.scope.clone()),
             }))
         }
+    }
+}
+
+/// What a call read of the index: the blobs, or (a probe only) the kept probe
+/// file standing in for them.
+enum Source {
+    Kept(RepoReads),
+    Read(Held),
+}
+
+/// What a probe answers for an edit that needs a re-scan.
+fn deferred(new_functions: Vec<super::contract::NewFunction>, started: Instant) -> Degraded {
+    Degraded {
+        reason: DEFERRED_REASON.to_string(),
+        new_functions,
+        elapsed: started.elapsed(),
+        known_miss: false,
+        deferred: true,
+        deadline: false,
+        scope: None,
     }
 }
 
@@ -622,7 +708,18 @@ pub(super) fn kept_dir(
     if generation.is_empty() {
         return None;
     }
-    let name: String = generation
+    Some(kept_dir_of(
+        &workspace.index_dir(),
+        kind,
+        &generation_name(generation),
+        &build_id(),
+    ))
+}
+
+/// The folder-name form of an index generation: anything a path should not
+/// carry becomes `_`.
+pub(super) fn generation_name(generation: &str) -> String {
+    generation
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
@@ -631,13 +728,7 @@ pub(super) fn kept_dir(
                 '_'
             }
         })
-        .collect();
-    Some(kept_dir_of(
-        &workspace.index_dir(),
-        kind,
-        &name,
-        &build_id(),
-    ))
+        .collect()
 }
 
 /// `.carrick/<kind>/<generation>.<build>/`. Kept state is only ever read by
@@ -1055,13 +1146,13 @@ fn service_digest(
 /// blobs (`.carrick/repos`) and the cached hosted snapshot. Nothing is
 /// downloaded: a re-check that waited on the network would miss its budget on
 /// the wire rather than on the work.
-struct Held {
-    local: Vec<crate::cloud_storage::CloudRepoData>,
-    hosted: super::hosted::HostedInput,
+pub(super) struct Held {
+    pub(super) local: Vec<crate::cloud_storage::CloudRepoData>,
+    pub(super) hosted: super::hosted::HostedInput,
 }
 
 impl Held {
-    fn read(workspace: &Workspace) -> Result<Self, String> {
+    pub(super) fn read(workspace: &Workspace) -> Result<Self, String> {
         Ok(Self {
             local: read_blobs(&workspace.blobs_dir())?,
             hosted: super::hosted::cached(workspace),
@@ -1083,27 +1174,16 @@ impl Held {
 /// this tells the agent it was compared against. Either one alone would
 /// report every function in an edited file as new on the install the other
 /// covers.
-fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<Added> {
-    let name = repo_label(&tree.repo);
-    let hosted = held.hosted.local_blobs(&tree.repo);
+fn added_functions(reads: &RepoReads, tree: &Tree, relative: &str) -> Vec<Added> {
     let repo = tree.checkout.as_path();
-    let blobs: Vec<&crate::cloud_storage::CloudRepoData> = held
-        .local
-        .iter()
-        .filter(|blob| blob.repo_name == name)
-        .chain(hosted.iter())
-        .collect();
-    let configs: Vec<Option<&str>> = blobs
-        .iter()
-        .map(|blob| blob.config_json.as_deref())
-        .collect();
+    let configs = reads.configs();
     // The services the scan would resolve for this repo, the way `index`
     // resolves them. A repo they cannot be resolved for names nothing: the
     // question "would the scan read this file" has no answer.
     let Ok(services) = crate::service_derivation::resolve_with_configs(repo, Some(&configs)) else {
         return Vec::new();
     };
-    let indexed = functions_in(blobs.iter().copied(), relative);
+    let indexed = reads.declared_in(relative);
     additions(&services, repo, relative, &indexed)
 }
 
@@ -1111,24 +1191,20 @@ fn added_functions(held: &Held, tree: &Tree, relative: &str) -> Vec<Added> {
 type Added = (super::contract::NewFunction, super::similar::Query);
 
 /// Attach to each added function the indexed functions it looks like
-/// ([`super::similar`]), read from every blob `held` has, in every repo. The
-/// index is built once per call and only when the edit added a function: an
-/// edit that adds none pays nothing here.
+/// ([`super::similar`]). `ranker` gives the ranker over every blob, in every
+/// repo: built from the blobs, or read from the kept probe file
+/// ([`super::kept_reads`]). It is asked once per call and only when the edit
+/// added a function: an edit that adds none pays nothing here.
 fn with_similar(
-    held: &Held,
     tree: &Tree,
     relative: &str,
     added: Vec<Added>,
+    ranker: impl FnOnce() -> super::similar::Similar,
 ) -> Vec<super::contract::NewFunction> {
     if added.is_empty() {
         return Vec::new();
     }
-    let index = super::similar::Similar::build(
-        held.local
-            .iter()
-            .map(|blob| (blob.repo_name.clone(), blob))
-            .chain(held.hosted.every_blob()),
-    );
+    let index = ranker();
     let repo = repo_label(&tree.repo);
     added
         .into_iter()
@@ -1743,34 +1819,6 @@ fn rescan_command(exe: &Path, tree: &Tree, scan_dir: &Path, previous: &Path) -> 
 /// it off) itself.
 fn rescan_heap_cap(caller: Option<&std::ffi::OsStr>) -> Option<String> {
     caller.is_none().then(|| RESCAN_HEAP_CAP_MB.to_string())
-}
-
-/// Whether a blob's record of a function is about the file being re-checked.
-///
-/// `file_path` in a blob is repo-relative, and so is `relative`; the separator
-/// is normalised on both sides because a blob written on Windows spells it
-/// with a backslash and the index's own paths use `/`.
-fn declared_in(function: &crate::visitor::FunctionDefinition, relative: &str) -> bool {
-    // `<module>` is the file's own top-level call sites recorded under a
-    // synthetic definition (carrick#965). It is not a function anybody wrote,
-    // so a file that gains its first import would otherwise report one.
-    if function.name == crate::visitor::MODULE_SCOPE_KEY {
-        return false;
-    }
-    let declared = function.file_path.to_string_lossy().replace('\\', "/");
-    declared == relative.replace('\\', "/")
-}
-
-/// The names one set of blobs records for this file.
-fn functions_in<'a>(
-    blobs: impl Iterator<Item = &'a crate::cloud_storage::CloudRepoData>,
-    relative: &str,
-) -> std::collections::BTreeSet<String> {
-    blobs
-        .flat_map(|blob| blob.function_definitions.values())
-        .filter(|function| declared_in(function, relative))
-        .map(|function| function.name.clone())
-        .collect()
 }
 
 /// What the parse states in this file that `indexed` does not name.

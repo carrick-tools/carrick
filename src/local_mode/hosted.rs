@@ -1194,7 +1194,7 @@ pub(super) fn refresh(workspace: &Workspace) -> HostedInput {
 /// What each repo of the workspace is called, split by whether this machine
 /// could read a name at all: the `owner/repo` names, and the repos that gave
 /// none with the remote they carry.
-fn origins_of(
+pub(super) fn origins_of(
     workspace: &Workspace,
 ) -> (BTreeMap<PathBuf, String>, BTreeMap<PathBuf, Option<String>>) {
     let mut named = BTreeMap::new();
