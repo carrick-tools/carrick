@@ -2327,7 +2327,7 @@ impl Default for InferredType {
             read_spans: Vec::new(),
             primary_type_symbol: None,
             array_depth: None,
-            primary_type_symbol_source: None,
+            type_home: None,
             machinery: false,
             anchor_machinery: false,
             any_provenance: Vec::new(),
