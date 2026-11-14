@@ -57,6 +57,8 @@ struct Scan {
     named: BTreeMap<String, BTreeSet<String>>,
     /// The files holding a possible call.
     leads: BTreeSet<String>,
+    /// The files whose call row is the request summary's (a fact row).
+    facts: BTreeSet<String>,
 }
 
 fn scan() -> Scan {
@@ -115,6 +117,7 @@ fn scan() -> Scan {
     );
     let mut named: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut leads = BTreeSet::new();
+    let mut facts = BTreeSet::new();
     let mut blobs = 0;
     for entry in std::fs::read_dir(&storage).expect("the store reads") {
         let path = entry.expect("dir entry").path();
@@ -136,6 +139,9 @@ fn scan() -> Scan {
                     .unwrap_or_default();
                 let file = row["file_path"].as_str().unwrap_or_default();
                 let file = file.rsplit_once(':').map_or(file, |(file, _)| file);
+                if side == "calls" && row["resolution_source"] == "request_summary" {
+                    facts.insert(file.to_string());
+                }
                 named
                     .entry(file.to_string())
                     .or_default()
@@ -147,7 +153,11 @@ fn scan() -> Scan {
         }
     }
     assert_eq!(blobs, 1, "the scan stored one blob");
-    Scan { named, leads }
+    Scan {
+        named,
+        leads,
+        facts,
+    }
 }
 
 fn key() -> serde_json::Value {
@@ -191,6 +201,13 @@ fn a_name_stated_through_constants_is_a_fact_row() {
         let got = scan.named.get(file).cloned().unwrap_or_default();
         if got != BTreeSet::from([want.to_string()]) {
             wrong.push(format!("{file}: want {want}, got {got:?}"));
+        }
+    }
+    // A host base the base-path pass also reads gives way to the fact
+    // (carrick#4434): the row is the fact's, not the pass's.
+    for file in ["src/c-const-host.ts", "src/c-let-host.ts"] {
+        if !scan.facts.contains(file) {
+            wrong.push(format!("{file}: want the request summary's row"));
         }
     }
     // A `let` written again holds its initialiser and every value written
