@@ -308,6 +308,7 @@ class HeldService implements ServiceEngine {
           file: row.file,
           line: lineOf(view.ov.text, first.start),
           message: first.message,
+          symbol: row.groups[g]!.symbol,
         });
       }
     }

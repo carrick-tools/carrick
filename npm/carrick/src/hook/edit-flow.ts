@@ -12,7 +12,7 @@ import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { factsSaid, markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
@@ -23,11 +23,15 @@ import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
-import type { FactEdit } from "../facts/lines.ts";
+import type { FactEdit, FactOutcome } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
-import { chainLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
+import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
+import { askHeld } from "../held/client.ts";
+import { renderHeldLine } from "../held/line.ts";
 
 const log = createLogger("carrick-hook");
+/** D13: at most this many compiler lines in one action. */
+const MAX_HELD_LINES = 2;
 
 /**
  * Check `edited` (absolute paths, at least one) as the post-edit hook does and
@@ -100,17 +104,29 @@ export async function editFlow(
   // (`facts/lines.ts`), read locally. Read before any probe answer is
   // rendered: a file the fact file covers gets its callers from there, not
   // the uses-count line.
+  const factFiles = [...edited, ...(input.factOnly ?? [])].filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())));
+  // The held compiler (part 3, D10): asked in parallel with the fact lines, for
+  // the files this session changed in its own checkout, and waited for at most
+  // `HELD_WAIT_MS`. Off, nothing is asked and nothing below changes.
+  const heldFiles = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd()));
+  const heldAsked =
+    channel.channel === "hook" && session && heldFiles.length > 0 && compilerLinesEnabled()
+      ? askHeld(choice.root, heldFiles, { session, kind: "edit", editedAt })
+      : null;
   const facts =
     channel.channel === "hook"
       ? await factLines(
           choice.root,
-          [...edited, ...(input.factOnly ?? [])]
-            .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
-            .map((file) => ({ file, ...input.changes?.get(file) })),
+          factFiles.map((file) => ({ file, ...input.changes?.get(file) })),
           session,
           { contract: contractLinesEnabled(), chain: chainLinesEnabled() },
         )
       : null;
+  const held = heldAsked ? await heldAsked : null;
+  if (input.timing && held && held.state !== "off") {
+    input.timing.heldMs = held.ms;
+    input.timing.heldState = held.state;
+  }
   const covered = new Set(facts?.callersRead ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
   // The edit just landed, so the index describes the file as it was before
@@ -234,6 +250,7 @@ export async function editFlow(
     return;
   }
   if (input.timing) input.timing.factsMs = facts.ms;
+  contexts.push(...heldContexts(facts, held, session));
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.
   if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);
@@ -252,4 +269,34 @@ export async function editFlow(
   if (session) markFacts(session, facts.claims);
   contexts.unshift(...extra);
   emitPostToolUse(contexts);
+}
+
+/**
+ * The compiler's lines for this action (D13): each said once per session, at
+ * most two. Each one replaces part 1's contract line for the same row and
+ * group (D11a): that line leaves `facts.lines` and its claim is not taken, so
+ * the facts mutated here are what `markFacts` and the print read afterwards.
+ */
+function heldContexts(facts: FactOutcome, held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): string[] {
+  if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
+  const said = factsSaid(session);
+  const out: string[] = [];
+  const claims: Record<string, { at: number; named: string[] }> = {};
+  const replaced = new Set<string>();
+  for (const line of held.lines) {
+    const rendered = renderHeldLine(line);
+    if (!rendered) continue;
+    replaced.add(line.row_key);
+    if (said.has(rendered.claim) || rendered.claim in claims || out.length >= MAX_HELD_LINES) continue;
+    out.push(rendered.text);
+    claims[rendered.claim] = { at: Date.now(), named: [line.file] };
+  }
+  if (replaced.size > 0 && facts.used.length === facts.lines.length) {
+    const keep = facts.used.map((key) => !replaced.has(key));
+    facts.lines = facts.lines.filter((_, at) => keep[at]);
+    facts.used = facts.used.filter((_, at) => keep[at]);
+    for (const key of replaced) delete facts.claims[key];
+  }
+  Object.assign(facts.claims, claims);
+  return out;
 }

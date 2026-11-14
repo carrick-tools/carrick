@@ -56,6 +56,8 @@ export type HeldLine = {
   file: string;
   line: number;
   message: string;
+  /** The group's named type, when the row has one (the line says it in place of the check's alias). */
+  symbol?: string | null;
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";

@@ -24,7 +24,14 @@ import { deliverLate, emitPostToolUse as emit } from "./late.ts";
 import { answerReads } from "./read-answer.ts";
 import { timed, type Timing } from "./timings.ts";
 
+import { resolveRoot } from "../root.ts";
+import { compilerLinesEnabled } from "../facts/enabled.ts";
+import { askHeld } from "../held/client.ts";
+import { inOtherWorktree } from "./worktree.ts";
+
 const log = createLogger("carrick-hook");
+/** A Read only starts engines: the daemon answers `cold` at once, so a short wait is enough. */
+const HELD_READ_WAIT_MS = 300;
 /** The files the index has rows for. */
 const CHECKED = /\.(ts|tsx|mts|cts)$/;
 
@@ -61,7 +68,15 @@ async function main(timing: Timing): Promise<void> {
   if (session && wasRead(session, file)) return emit(late);
 
   const waitStarted = Date.now();
+  // Part 3: tell the daemon this file was read so it can start the service's
+  // compiler. Nothing is printed from the answer; it runs beside the read's own
+  // work and is only joined so the request is sent before the hook exits.
+  const heldRoot = compilerLinesEnabled() && session && !inOtherWorktree(file, payload.cwd ?? process.cwd())
+    ? resolveRoot({ clientRoot: payload.cwd ?? null, projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null, filePath: file }).root
+    : null;
+  const heldAsked = heldRoot && session ? askHeld(heldRoot, [file], { session, kind: "read", waitMs: HELD_READ_WAIT_MS }) : null;
   const answers = await answerReads([file], payload.cwd, session);
+  await heldAsked;
   timing.waitedMs = Date.now() - waitStarted;
   if (answers.factsMs !== undefined) timing.factsMs = answers.factsMs;
   emit([...late, ...answers.contexts]);
