@@ -2410,9 +2410,23 @@ export class TypeInferrer {
       unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
       anchor.element
     );
-    this.relateModelSymbol(request, inferred, [
-      unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
-    ]);
+    // carrick#2111: a located expression inside a callback an array or a
+    // promise is handed (`row` in `rows.find((row) => …)`) reads the callback,
+    // not the route, and a read of the wrong function must never displace the
+    // symbol the model named. Such a callback was once read as a registration,
+    // which decided the answer before this point (carrick#4379); it is asked
+    // only where the callback is the function the row's line names.
+    const owner = this.findContainingFunctionForNode(payloadNode);
+    const ownerCall = owner?.getParent();
+    const inIteration =
+      owner !== undefined &&
+      Node.isCallExpression(ownerCall) &&
+      this.calledOnCollectionOrPromise(ownerCall);
+    if (!inIteration || this.isTheRowsOwnFunction(request, owner)) {
+      this.relateModelSymbol(request, inferred, [
+        unwrapResult.wasUnwrapped ? unwrapResult.payloadType : this.unwrapPromiseType(payloadType),
+      ]);
+    }
     if (byArguments && !byArguments.type && byArguments.tested.length > 0) {
       this.addArgumentReads(inferred, byArguments.tested);
     }
