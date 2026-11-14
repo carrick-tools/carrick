@@ -27,3 +27,8 @@ export async function callEitherPlain(url: string, early: boolean) {
   }
   return { res, second: (await res.json()) as Reply };
 }
+
+export async function fetchText(url: string) {
+  const res = await fetch(new URL(url, BASE));
+  return { res, body: await res.text() };
+}

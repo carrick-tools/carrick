@@ -1,4 +1,4 @@
-import { call, callEither, callPlain, callEitherPlain } from './call';
+import { call, callEither, callPlain, callEitherPlain, fetchText } from './call';
 
 export async function latestName(): Promise<string> {
   const out = await call('/v1/replies/latest');
@@ -18,4 +18,9 @@ export async function plainName(): Promise<string> {
 export async function plainFirstOk(): Promise<boolean> {
   const out = await callEitherPlain('/v1/replies/first', true);
   return out.res.ok;
+}
+
+export async function latestText(): Promise<string> {
+  const out = await fetchText('/v1/replies/latest');
+  return out.body;
 }

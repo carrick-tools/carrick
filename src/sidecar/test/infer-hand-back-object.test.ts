@@ -82,6 +82,16 @@ export async function onSaveBody() {
   const out = await callBody("/api/reply");
   return out.data.name;
 }
+
+export async function callText(url: string) {
+  const res = await fetch(url);
+  return { res, body: await res.text() };
+}
+
+export async function onSaveText() {
+  const out = await callText("/api/reply");
+  return out.body;
+}
 `;
 
 /** 1-based lines in SERVICE_TS, read off the source above. */
@@ -91,6 +101,7 @@ const TWO_WAYS_LINE = 37;
 const LIBRARY_LINE = 42;
 const HOOK_LINE = 50;
 const BODY_LINE = 60;
+const TEXT_LINE = 70;
 
 const REPLY_TEXT = '{ data: { id: number; name: string; }; }';
 
@@ -100,6 +111,7 @@ interface InferShape {
     type_string: string;
     any_provenance?: Array<{ path: string; kind: string; reason: string }>;
     body_member?: string;
+    raw_text_read?: true;
   }>;
 }
 
@@ -136,6 +148,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     assert.match(lines[LIBRARY_LINE - 1], /await fromLibrary\(/);
     assert.match(lines[HOOK_LINE - 1], /await action\.run\(/);
     assert.match(lines[BODY_LINE - 1], /await callBody\(/);
+    assert.match(lines[TEXT_LINE - 1], /await callText\(/);
 
     client = new SidecarClient();
     await client.start();
@@ -181,6 +194,7 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     // carrick#4196: the answer names the member it read, so a caller row the
     // request summaries own takes it and no other reading of the call.
     assert.strictEqual(inferred.body_member, 'json');
+    assert.strictEqual(inferred.raw_text_read, undefined, 'a json read is not raw text');
   });
 
   it('reads the member through a local that holds the body read', async () => {
@@ -242,5 +256,17 @@ describe('carrick#4185: a hand-back object is not the response body', () => {
     assert.ok(inferred, 'the wrapper hands back the body');
     assert.strictEqual(collapse(inferred.type_string), 'Reply');
     assert.strictEqual(inferred.body_member, undefined);
+  });
+
+  // carrick#4288: a member filled from a text read takes any body, so it
+  // states no JSON contract. The row carries the same raw-text mark a direct
+  // `res.text()` read does (carrick#1842), and the pair reads unverifiable
+  // instead of comparing `string` with the producer's body.
+  it('marks a member filled from a text read as raw text', async () => {
+    const inferred = await infer('Endpoint_Reply_Response_Text', TEXT_LINE, 'callText("/api/reply")');
+    assert.ok(inferred, 'the wrapper states the member and the site must publish it');
+    assert.strictEqual(collapse(inferred.type_string), 'string');
+    assert.strictEqual(inferred.body_member, 'body');
+    assert.strictEqual(inferred.raw_text_read, true);
   });
 });

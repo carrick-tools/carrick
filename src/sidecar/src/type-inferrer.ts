@@ -486,6 +486,17 @@ function isBareStringText(text: string): boolean {
 }
 
 /**
+ * carrick#1842: `string` cannot tell a body read as raw text from a JSON body
+ * that is a string, and raw text states no structural contract. The row says
+ * which it is, so the check phase reads the pair unverifiable instead of
+ * comparing `string` with the other side's body. `rawText` is the caller's
+ * decision that this body is a bare string filled by a text read.
+ */
+function markRawTextRead(inferred: InferredType, rawText: boolean): void {
+  if (rawText) inferred.raw_text_read = true;
+}
+
+/**
  * Union of all function-like nodes in ts-morph
  */
 type FunctionLike =
@@ -3537,16 +3548,19 @@ export class TypeInferrer {
         if (member) {
           this.log(
             `Call result at ${where} is a hand-back object around the response; ` +
-              `its body is the member '${member}' the called function fills from the body read`
+              `its body is the member '${member.name}' the called function fills from the body read`
           );
-          const read = this.labelledCallResult(request, callExpr, { member: [member] });
+          const read = this.labelledCallResult(request, callExpr, { member: [member.name] });
+          // carrick#4288: a member filled from a text read is raw text, as a
+          // direct text read of the response is.
+          markRawTextRead(read, member.textRead && isBareStringText(read.type_string));
           // carrick#4196: the answer names the member it read, so a caller
           // row whose owner never asked for a body reads this answer and no
           // other reading of the call.
           const decided = !(read.any_provenance ?? []).some(
             (finding) => finding.path === '' && finding.reason === 'result_member_missing'
           );
-          return decided ? { ...read, body_member: member } : read;
+          return decided ? { ...read, body_member: member.name } : read;
         }
         this.log(
           `Call result at ${where} holds transport machinery as a member and no member of ` +
@@ -3745,16 +3759,11 @@ export class TypeInferrer {
     } else {
       this.relateModelSymbolToArguments(request, inferred, callExpr, printedType);
     }
-    // carrick#1842: `string` cannot tell a body read as raw text from a JSON
-    // body that is a string, and raw text states no structural contract. The
-    // row says which it is, so the check phase can read the pair unverifiable
-    // instead of comparing `string` with the other side's body.
-    if (
+    markRawTextRead(
+      inferred,
       isBareStringText(typeString) &&
-      (this.textReadAtTerminal(callExpr, terminalNode) || this.callChoosesTextBody(callExpr))
-    ) {
-      inferred.raw_text_read = true;
-    }
+        (this.textReadAtTerminal(callExpr, terminalNode) || this.callChoosesTextBody(callExpr))
+    );
     return inferred;
   }
 
@@ -5824,14 +5833,18 @@ export class TypeInferrer {
    * Reply`), itself or through a `const` it initialises, and every return
    * names the same member. The member's name never decides it. A function
    * the service does not declare (a library, a declaration with no body)
-   * decides nothing.
+   * decides nothing. `textRead` says every return fills it from a text read
+   * (carrick#4288).
    */
-  private handBackBodyMember(callExpr: CallExpression): string | undefined {
+  private handBackBodyMember(
+    callExpr: CallExpression
+  ): { name: string; textRead: boolean } | undefined {
     const callee = calledFunction(callExpr) as FunctionLike | undefined;
     if (!callee || this.runtimeFile(callee.getSourceFile().compilerNode)) return undefined;
     const returned = this.returnedExpressions(callee);
     if (returned.length === 0) return undefined;
 
+    let textRead = true;
     const readsBody = (value: Node): boolean => {
       let inner = this.unwrapExpressionNode(value);
       if (Node.isIdentifier(inner) || Node.isShorthandPropertyAssignment(inner)) {
@@ -5848,10 +5861,14 @@ export class TypeInferrer {
         }
         inner = this.unwrapExpressionNode(local.getInitializer());
       }
-      return (
-        Node.isCallExpression(inner) &&
-        this.isPlatformBodyRead(inner, WHOLE_BODY_READS, 'platform_only')
-      );
+      if (
+        !Node.isCallExpression(inner) ||
+        !this.isPlatformBodyRead(inner, WHOLE_BODY_READS, 'platform_only')
+      ) {
+        return false;
+      }
+      textRead &&= this.isPlatformBodyRead(inner, TEXT_READ, 'platform_only');
+      return true;
     };
 
     let decided: string | undefined;
@@ -5872,7 +5889,7 @@ export class TypeInferrer {
       if (decided !== undefined && decided !== holding[0]) return undefined;
       decided = holding[0];
     }
-    return decided;
+    return decided === undefined ? undefined : { name: decided, textRead };
   }
 
   private transportAbstain(
