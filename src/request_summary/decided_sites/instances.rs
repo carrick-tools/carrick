@@ -2649,4 +2649,64 @@ mod tests {
         )));
         assert!(!library_row(&row(Some("src/server.ts"), 0)));
     }
+
+    /// carrick#4176: the library calls that may run a function list a call
+    /// in another file that hands it by name (`app.get('/health', ping)`,
+    /// `ping` imported), each once, as they list a call in its own file;
+    /// a `runs` member's call the compiler resolves to the function
+    /// (`app.register(catalogPlugin, …)`) is listed once, though both
+    /// reads find it.
+    #[test]
+    fn the_receiver_scopes_hosts_list_an_imported_function_once() {
+        let on = super::super::super::fixture_walk::walked(
+            "receiver-scopes-aliased",
+            ".",
+            "web",
+            &[],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        let calls = Calls::index(&on.inputs);
+        let scopes = vec![ScopeLabel {
+            package: "fixture-aliased-server".into(),
+            export: "default".into(),
+            member: "register".into(),
+            verified_on: Vec::new(),
+            name: None,
+            binds: ScopeBinds::Runs {
+                arg: 0,
+                key: None,
+                param: 0,
+            },
+            open: false,
+        }];
+        let index = WalkIndex::of(&calls, &on.inputs, &scopes, Vec::new(), HashMap::new());
+        let walk = InstanceWalk::new(&calls, &on.inputs, &on.repo, &[], &scopes, &index);
+        let hosts = |file: &str, key: &str| -> Vec<String> {
+            walk.hosts_of(&on.repo.join(file), key)
+                .iter()
+                .map(|(placed, arg)| {
+                    format!(
+                        "{}:{} {} {arg}",
+                        relative(&on.repo, placed.file),
+                        placed.call.site.line,
+                        placed.call.callee_text
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            hosts("src/handlers.ts", "ping"),
+            vec![
+                "src/catalog.ts:11 instance.get 1",
+                "src/catalog.ts:14 inner.post 1",
+                "src/index.ts:7 app.get 1",
+                "src/index.ts:12 scope.get 1",
+            ]
+        );
+        assert_eq!(
+            hosts("src/catalog.ts", "catalogPlugin"),
+            vec!["src/index.ts:18 app.register 0"]
+        );
+    }
 }

@@ -1195,6 +1195,16 @@ pub(super) struct Placed<'a> {
     pub(super) written_in: Option<&'a super::guards::WrittenIn>,
 }
 
+/// One call that hands a definition on as a value (carrick#4176): the call,
+/// the argument, and the keys down to the definition inside it.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(super) struct HandedOn<'a> {
+    pub(super) placed: Placed<'a>,
+    pub(super) arg: usize,
+    pub(super) keys: Vec<String>,
+}
+
 /// The definition a call reaches, as a callers index reads it: its file and
 /// key.
 type Target = Option<(PathBuf, String)>;
@@ -1551,6 +1561,12 @@ impl<'a> Calls<'a> {
     pub(super) fn handed_inward(&self, file: &Path, key: &str) -> bool {
         self.handed_inward
             .contains(&(file.to_path_buf(), key.to_string()))
+    }
+
+    /// Each call that hands the definition `key` of `file` on as a value.
+    #[allow(dead_code)]
+    pub(super) fn handed_on(&self, _file: &Path, _key: &str) -> &[HandedOn<'a>] {
+        &[]
     }
 
     /// What this service or the sibling that holds `file` read of it.
@@ -7512,5 +7528,43 @@ pub(crate) mod tests {
             "{:?}",
             decided.sites
         );
+    }
+
+    /// carrick#4176 (D2): a function held in a local and handed on by name
+    /// (`load(…, stub)`) has no compiler read at the argument (what the
+    /// argument holds is the function's value), so the name the syntax
+    /// reads there stands in the one record of what a call hands on.
+    #[test]
+    fn a_function_held_in_a_local_is_still_handed() {
+        let on = super::super::fixture_walk::walked(
+            "discovery-default-function",
+            "services/web",
+            "web",
+            &[],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        assert!(on.inputs.positions.is_some(), "the walk has rows");
+        let file = on
+            .inputs
+            .files
+            .keys()
+            .find(|file| file.ends_with("src/several.ts"))
+            .expect("several.ts is walked")
+            .clone();
+        let calls = Calls::through_reach(&on.inputs);
+        let got: Vec<(String, u32, usize, Vec<String>)> = calls
+            .handed_on(&file, "stub")
+            .iter()
+            .map(|handed| {
+                (
+                    handed.placed.call.callee_text.clone(),
+                    handed.placed.call.site.line,
+                    handed.arg,
+                    handed.keys.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(got, vec![("load".to_string(), 14, 1, Vec::new())]);
     }
 }

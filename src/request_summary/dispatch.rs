@@ -582,6 +582,58 @@ mod tests {
         walked("dispatch-routes", ".", "web", &[], true)
     }
 
+    /// carrick#4176: a handler another file imports and hands to a labelled
+    /// registration by name (`route("/admin", stats)`) is that
+    /// registration's, as the same handler written in the registering file
+    /// is (`dispatch-routes` `src/mounted.ts`): the compiler's row at the
+    /// name says which definition it hands on, which the registering
+    /// file's syntax cannot. Its record carries the label, not an entry.
+    #[test]
+    fn an_imported_handler_registered_by_name_is_its_registrations() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/handed-imported-handler");
+        let on = walked("handed-imported-handler", ".", "web", &[], true)
+            .expect("the fixture walks with rows: a skipped test proves nothing");
+        let answer: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.join("library-claims.json")).unwrap(),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&answer.to_string());
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let got = records_of(&on, &answer.exports, HoleReach::Nested);
+        let subjects: Vec<serde_json::Value> = got["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "at": record["subject"]["at"],
+                    "key": record["subject"]["key"],
+                    "kind": record["subject"]["kind"],
+                    "label": record["subject"]["label"],
+                    "literals": record["comparisons"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| c["literal"].clone())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![serde_json::json!({
+                "at": "src/handlers.ts:3",
+                "key": "stats",
+                "kind": "label",
+                "label": { "export": "route", "member": null, "package": "fixture-router" },
+                "literals": ["/stats"],
+            })],
+            "records:\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
+    }
+
     /// Two reads of one tree state the same records.
     #[test]
     fn two_reads_of_one_tree_state_the_same_records() {
