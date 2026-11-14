@@ -1972,7 +1972,13 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
     let Some(root) = super::workspace::locate(root, Some(file)) else {
         return refuse(ReadFailure::new(ReadError::NotIndexed));
     };
-    match super::query::answer(&root, file, mode, freshness) {
+    match super::query::answer(
+        &mut super::query::Asked::default(),
+        &root,
+        file,
+        mode,
+        freshness,
+    ) {
         Ok(output) => {
             if json {
                 match serde_json::to_string_pretty(&output) {
@@ -2024,13 +2030,23 @@ fn read(file: &Path, root: Option<&Path>, json: bool, mode: Mode, freshness: Fre
 /// The files are answered in turn, so a re-check that misses its budget on the
 /// first is remembered before the second asks ([`super::recheck::run`]): on a
 /// repo whose re-check does not fit, a patch waits out one budget at most.
+/// The probe (`--no-rescan`) shares what it reads across the files, so the
+/// index, the workspace, git's list of changes and the blobs are read once
+/// (carrick#4389); the full re-check reads once per file, as it consumes its
+/// read and relies on that miss.
 fn read_each(files: &[PathBuf], root: Option<&Path>, json: bool, freshness: Freshness) -> i32 {
     let mut bodies: Vec<serde_json::Value> = Vec::new();
     let mut answered = 0usize;
+    let mut shared = super::query::Asked::default();
     for file in files {
+        if freshness != (Freshness::Recheck { rescan: false }) {
+            shared = super::query::Asked::default();
+        }
         let outcome = super::workspace::locate(root, Some(file))
             .ok_or_else(|| ReadFailure::new(ReadError::NotIndexed))
-            .and_then(|located| super::query::answer(&located, file, Mode::Check, freshness));
+            .and_then(|located| {
+                super::query::answer(&mut shared, &located, file, Mode::Check, freshness)
+            });
         match outcome {
             Ok(output) => {
                 answered += 1;

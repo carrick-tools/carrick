@@ -45,12 +45,12 @@
 //! answer and says how old it is; the re-check never blocks an edit and never
 //! leaves a scan running behind one.
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -389,6 +389,7 @@ pub fn run(
     reach: &Reach,
     before: &super::read_model::LocalIndex,
     rescan: bool,
+    probe: &mut ProbeReads,
 ) -> Result<Fresh, Box<Degraded>> {
     let started = Instant::now();
     let budget = budget();
@@ -401,29 +402,26 @@ pub fn run(
     // A probe reads the kept probe file instead when it is current, and no
     // blob (carrick#4034). The inputs are taken before any blob is read, so a
     // file written from this read is only kept when nothing moved under it.
-    let inputs = Inputs::now(workspace);
+    let inputs = probe
+        .inputs
+        .get_or_insert_with(|| Inputs::now(workspace))
+        .clone();
     let kept = match (&inputs, rescan) {
-        (Some(now), false) => kept_reads::read(workspace, index_generation, now, &tree.repo),
+        (Some(now), false) => probe.kept_of(workspace, index_generation, now, &tree.repo),
         _ => None,
     };
     let source = match kept {
         Some(reads) => Source::Kept(reads),
+        None if !rescan => match probe.held_of(workspace, started) {
+            Ok(held) => Source::Shared(held),
+            Err(reason) => return Err(Box::new(unread(reason, started))),
+        },
         None => match Held::read(workspace) {
             Ok(held) => {
                 took("held-read", started);
                 Source::Read(Box::new(held))
             }
-            Err(reason) => {
-                return Err(Box::new(Degraded {
-                    reason,
-                    new_functions: Vec::new(),
-                    elapsed: started.elapsed(),
-                    known_miss: false,
-                    deferred: false,
-                    deadline: false,
-                    scope: None,
-                }));
-            }
+            Err(reason) => return Err(Box::new(unread(reason, started))),
         },
     };
     // The full re-check keeps the probe file when it is not current: it has
@@ -454,33 +452,27 @@ pub fn run(
         None => (Vec::new(), None),
     };
     let began = Instant::now();
-    let reads: Cow<RepoReads> = match &source {
-        Source::Kept(reads) => Cow::Borrowed(reads),
-        Source::Read(held) => built_repos
-            .iter()
-            .find(|reads| reads.path() == tree.repo)
-            .map_or_else(
-                || Cow::Owned(RepoReads::of(held, &tree.repo)),
-                Cow::Borrowed,
-            ),
+    let reads: Rc<RepoReads> = match &source {
+        Source::Kept(reads) => Rc::clone(reads),
+        Source::Shared(held) => probe.reads_of(held, &tree.repo),
+        Source::Read(held) => Rc::new(
+            built_repos
+                .iter()
+                .find(|reads| reads.path() == tree.repo)
+                .cloned()
+                .unwrap_or_else(|| RepoReads::of(held, &tree.repo)),
+        ),
     };
     let added = added_functions(&reads, tree, relative);
     took("added-functions", began);
     let began = Instant::now();
     let new_functions = with_similar(tree, relative, added, || match (built_similar, &source) {
-        (Some(similar), _) => similar,
-        (None, Source::Read(held)) => similar_of(held),
+        (Some(similar), _) => Rc::new(similar),
+        (None, Source::Read(held)) => Rc::new(similar_of(held)),
+        (None, Source::Shared(held)) => probe.similar_of(held),
         // A kept probe file read, and the ranker beside it is not current:
         // the blobs give it, as they did before the probe kept anything.
-        (None, Source::Kept(_)) => inputs
-            .as_ref()
-            .and_then(|now| kept_reads::read_similar(workspace, index_generation, now))
-            .unwrap_or_else(|| {
-                Held::read(workspace).map_or_else(
-                    |_| Similar::build(std::iter::empty()),
-                    |held| similar_of(&held),
-                )
-            }),
+        (None, Source::Kept(_)) => probe.kept_similar(workspace, index_generation, inputs.as_ref()),
     });
     took("similar", began);
     let began = Instant::now();
@@ -503,9 +495,6 @@ pub fn run(
     let Source::Read(held) = source else {
         return Err(Box::new(deferred(new_functions, started)));
     };
-    if !rescan {
-        return Err(Box::new(deferred(new_functions, started)));
-    }
     let began = Instant::now();
     let plan = Plan::make(workspace, &tree.checkout, reach, index_generation, &held);
     took("plan-make", began);
@@ -563,8 +552,101 @@ pub fn run(
 /// What a call read of the index: the blobs, or (a probe only) the kept probe
 /// file standing in for them.
 enum Source {
-    Kept(RepoReads),
+    Kept(Rc<RepoReads>),
+    /// A probe's blob read, shared by every file of one `--each` call.
+    Shared(Rc<Held>),
+    /// The full re-check's own read: consumed by the re-scan.
     Read(Box<Held>),
+}
+
+/// What one `--each` probe call reads once and hands to every file it answers
+/// (carrick#4389): the kept file's inputs and repo reads, the blobs when the
+/// kept file is not current, and the ranker. A fresh value reads as the
+/// single-file probe does. The full re-check never shares one: it consumes its
+/// read, and a miss recorded by one file must stand before the next asks.
+#[derive(Default)]
+pub struct ProbeReads {
+    inputs: Option<Option<Inputs>>,
+    kept: std::collections::HashMap<PathBuf, Option<Rc<RepoReads>>>,
+    held: Option<Result<Rc<Held>, String>>,
+    reads: std::collections::HashMap<PathBuf, Rc<RepoReads>>,
+    similar: Option<Rc<Similar>>,
+}
+
+impl ProbeReads {
+    fn kept_of(
+        &mut self,
+        workspace: &Workspace,
+        generation: &str,
+        now: &Inputs,
+        repo: &Path,
+    ) -> Option<Rc<RepoReads>> {
+        self.kept
+            .entry(repo.to_path_buf())
+            .or_insert_with(|| kept_reads::read(workspace, generation, now, repo).map(Rc::new))
+            .clone()
+    }
+
+    fn held_of(&mut self, workspace: &Workspace, started: Instant) -> Result<Rc<Held>, String> {
+        self.held
+            .get_or_insert_with(|| {
+                let read = Held::read(workspace);
+                if read.is_ok() {
+                    took("held-read", started);
+                }
+                read.map(Rc::new)
+            })
+            .clone()
+    }
+
+    fn reads_of(&mut self, held: &Held, repo: &Path) -> Rc<RepoReads> {
+        Rc::clone(
+            self.reads
+                .entry(repo.to_path_buf())
+                .or_insert_with(|| Rc::new(RepoReads::of(held, repo))),
+        )
+    }
+
+    fn similar_of(&mut self, held: &Held) -> Rc<Similar> {
+        Rc::clone(
+            self.similar
+                .get_or_insert_with(|| Rc::new(similar_of(held))),
+        )
+    }
+
+    /// The ranker beside a current kept file, else the blobs' (read once).
+    fn kept_similar(
+        &mut self,
+        workspace: &Workspace,
+        generation: &str,
+        inputs: Option<&Inputs>,
+    ) -> Rc<Similar> {
+        if let Some(similar) = &self.similar {
+            return Rc::clone(similar);
+        }
+        let kept = inputs
+            .and_then(|now| kept_reads::read_similar(workspace, generation, now))
+            .map(Rc::new);
+        let similar = kept.unwrap_or_else(|| match self.held_of(workspace, Instant::now()) {
+            Ok(held) => Rc::new(similar_of(&held)),
+            Err(_) => Rc::new(Similar::build(std::iter::empty())),
+        });
+        self.similar = Some(Rc::clone(&similar));
+        similar
+    }
+}
+
+/// The refusal when the blobs could not be read.
+fn unread(reason: String, started: Instant) -> Degraded {
+    Degraded {
+        reason,
+        new_functions: Vec::new(),
+        elapsed: started.elapsed(),
+        known_miss: false,
+        deferred: false,
+        deadline: false,
+        scope: None,
+    }
 }
 
 /// What a probe answers for an edit that needs a re-scan.
@@ -1195,16 +1277,17 @@ type Added = (super::contract::NewFunction, super::similar::Query);
 /// repo: built from the blobs, or read from the kept probe file
 /// ([`super::kept_reads`]). It is asked once per call and only when the edit
 /// added a function: an edit that adds none pays nothing here.
-fn with_similar(
+fn with_similar<R: std::borrow::Borrow<Similar>>(
     tree: &Tree,
     relative: &str,
     added: Vec<Added>,
-    ranker: impl FnOnce() -> super::similar::Similar,
+    ranker: impl FnOnce() -> R,
 ) -> Vec<super::contract::NewFunction> {
     if added.is_empty() {
         return Vec::new();
     }
     let index = ranker();
+    let index: &Similar = index.borrow();
     let repo = repo_label(&tree.repo);
     added
         .into_iter()

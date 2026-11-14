@@ -50,8 +50,26 @@ pub enum Freshness {
     },
 }
 
+/// What one call reads once and every file it answers shares (carrick#4389).
+///
+/// One per call: `check <file>` makes a fresh one, and `check --each` shares
+/// one across its files only for the probe (`--recheck --no-rescan`). The
+/// full re-check consumes what it reads and records a miss that the next file
+/// must see, so it takes a fresh value per file. A value is for one workspace
+/// root: another root empties it ([`answer`]).
+#[derive(Default)]
+pub struct Asked {
+    root: Option<PathBuf>,
+    index: Option<LocalIndex>,
+    workspace: Option<super::workspace::Workspace>,
+    /// Git's list of changed paths per checkout and commit.
+    changed: std::collections::HashMap<(PathBuf, String), Option<std::rc::Rc<HashSet<String>>>>,
+    probe: super::recheck::ProbeReads,
+}
+
 /// Answer about one file.
 pub fn answer(
+    asked: &mut Asked,
     workspace_root: &Path,
     file: &Path,
     mode: Mode,
@@ -61,9 +79,29 @@ pub fn answer(
     // counts its `ended at` from here, the steps before the re-check included.
     let started = std::time::Instant::now();
     super::recheck::start_timing(started);
-    let began = std::time::Instant::now();
-    let index = read_index(workspace_root)?;
-    super::recheck::took("check/read-index", began);
+    if asked.root.as_deref() != Some(workspace_root) {
+        *asked = Asked {
+            root: Some(workspace_root.to_path_buf()),
+            ..Asked::default()
+        };
+    }
+    let Asked {
+        index: index_slot,
+        workspace: workspace_slot,
+        changed: changed_slot,
+        probe,
+        ..
+    } = asked;
+    let held = match index_slot.take() {
+        Some(index) => index,
+        None => {
+            let began = std::time::Instant::now();
+            let read = read_index(workspace_root)?;
+            super::recheck::took("check/read-index", began);
+            read
+        }
+    };
+    let index: &LocalIndex = index_slot.insert(held);
 
     let (repo, relative, tree) = index
         .locate_file(file)
@@ -110,14 +148,21 @@ pub fn answer(
     // same set rather than OR-ed on top of it, so `stale` and
     // `changed_since_index` can never contradict each other (carrick#857).
     let began = std::time::Instant::now();
-    let changed = changed_since(&repo_root, &commit).unwrap_or_else(|| {
+    let listed = changed_slot
+        .entry((repo_root.clone(), commit.clone()))
+        .or_insert_with(|| {
+            let listed = changed_since(&repo_root, &commit).map(std::rc::Rc::new);
+            super::recheck::took("check/changed-files", began);
+            listed
+        })
+        .clone();
+    let changed: std::rc::Rc<HashSet<String>> = listed.unwrap_or_else(|| {
         let mut changed = HashSet::new();
         if newer_than_index(&repo_root, &relative, &indexed_at) {
             changed.insert(relative.clone());
         }
-        changed
+        std::rc::Rc::new(changed)
     });
-    super::recheck::took("check/changed-files", began);
     let stale = changed.contains(&relative);
     let deleted = !repo_root.join(&relative).exists();
 
@@ -229,13 +274,13 @@ pub fn answer(
                     readers.as_deref(),
                 ) {
                     Some(reach) => rechecked(
-                        workspace_root,
+                        (workspace_root, workspace_slot),
                         &tree,
                         &relative,
                         &indexed_at,
                         &reach,
-                        &index,
-                        rescan,
+                        index,
+                        (rescan, probe),
                     ),
                     // A repo the index holds with no service: none can read
                     // the file.
@@ -537,20 +582,26 @@ const UNREAD_EDIT_REASON: &str = "the edit changed nothing the scan reads (comme
 /// when they were computed, because half a re-check is not a fresher answer,
 /// it is an answer of unknown age (carrick#1036).
 fn rechecked(
-    workspace_root: &Path,
+    (workspace_root, workspace_slot): (&Path, &mut Option<super::workspace::Workspace>),
     tree: &super::checkout::Tree,
     relative: &str,
     indexed_at: &str,
     reach: &super::recheck::Reach,
     before: &LocalIndex,
-    rescan: bool,
+    (rescan, probe): (bool, &mut super::recheck::ProbeReads),
 ) -> (Option<Rechecked>, Recheck) {
     let started = std::time::Instant::now();
-    let began = std::time::Instant::now();
-    let loaded = super::workspace::Workspace::load(workspace_root);
-    super::recheck::took("check/load-workspace", began);
+    let loaded = match workspace_slot.take() {
+        Some(workspace) => Ok(workspace),
+        None => {
+            let began = std::time::Instant::now();
+            let loaded = super::workspace::Workspace::load(workspace_root);
+            super::recheck::took("check/load-workspace", began);
+            loaded
+        }
+    };
     let workspace = match loaded {
-        Ok(workspace) => workspace,
+        Ok(workspace) => &*workspace_slot.insert(workspace),
         Err(reason) => {
             return (
                 None,
@@ -571,13 +622,14 @@ fn rechecked(
         }
     };
     match super::recheck::run(
-        &workspace,
+        workspace,
         tree,
         relative,
         &before.indexed_at,
         reach,
         before,
         rescan,
+        probe,
     ) {
         Ok(fresh) => (
             Some((fresh.items, fresh.type_check, fresh.unread)),
