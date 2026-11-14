@@ -138,6 +138,11 @@ pub(super) struct ModuleBinding {
     /// The module never changes the list the binding holds
     /// ([`WriteCensus::list_kept`]).
     pub(super) list_kept: bool,
+    /// The module never changes the list or any element it holds
+    /// ([`WriteCensus::elements_kept`], carrick#4266): what a key read off an
+    /// element of a loop over it needs, since an object element may change
+    /// where a string cannot.
+    pub(super) elements_kept: bool,
 }
 
 impl ModuleBinding {
@@ -672,6 +677,17 @@ impl WriteCensus {
             && count(&self.references) == count(&self.member_bases) + count(&self.loop_lists) + 1
     }
 
+    /// [`Self::list_kept`], and nothing can reach an element but the one
+    /// loop over the list (carrick#4266): its only reference besides its
+    /// declaration is one `for…of`. A member read (`LIST[0]`, `LIST.find`)
+    /// may hand an element on, and a second loop may change one through its
+    /// head; the head of the one loop is the reader's to judge
+    /// ([`ModuleBinding::entries_kept`]).
+    fn elements_kept(&self, key: &BindingKey) -> bool {
+        let count = |counts: &HashMap<BindingKey, usize>| counts.get(key).copied().unwrap_or(0);
+        self.list_kept(key) && count(&self.loop_lists) == 1 && count(&self.references) == 2
+    }
+
     /// Notes each binding `expr` only tests for truthiness: a name, or
     /// either side of `&&`, `||` or `??` or the operand of `!`, in a test.
     fn test_use(&mut self, expr: &Expr) {
@@ -1155,6 +1171,7 @@ pub(super) fn module_bindings(
                         elements: None,
                         list_frozen: false,
                         list_kept: false,
+                        elements_kept: false,
                     };
                     out.insert((line, member.bound.id.sym.to_string()), binding);
                 }
@@ -1188,6 +1205,7 @@ pub(super) fn module_bindings(
                     .and_then(|init| text::list_of(init, &identity)),
                 list_frozen: init.is_some_and(text::written_as_const),
                 list_kept: census.list_kept(&key),
+                elements_kept: census.elements_kept(&key),
             };
             out.insert((line, ident.id.sym.to_string()), binding);
         }
@@ -1247,6 +1265,7 @@ pub(super) fn module_bindings(
                     .filter(|_| local.kind == BindingKind::Const),
                 list_frozen: local.list_frozen,
                 list_kept: census.list_kept(&local.key),
+                elements_kept: census.elements_kept(&local.key),
             };
             match out.entry((local.line, local.key.0.clone())) {
                 std::collections::hash_map::Entry::Occupied(mut held) => {

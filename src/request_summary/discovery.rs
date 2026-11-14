@@ -8576,10 +8576,15 @@ export function listen(): void {
 
     /// Ruling on PR #3182 (2026-11-02): a route whose own path the code
     /// writes in no whole way (a base joined with text, a base rewritten by
-    /// a call, a local holding a value read at runtime, a loop over values
-    /// the compiler types as `string`) is a guessed site: no route is
-    /// served there, and the reader's row of its method is withdrawn. A
-    /// literal route beside them is served as before.
+    /// a call, a local holding a value read at runtime) is a guessed site:
+    /// no route is served there, and the reader's row of its method is
+    /// withdrawn. A literal route beside them is served as before.
+    ///
+    /// carrick#4266: `table.ts:17` registers `route.path` in a loop over a
+    /// list of route objects the module writes whole and changes nowhere,
+    /// so the value resolver reads each element's path (the compiler's
+    /// `string` type no longer decides it): one route per element, no
+    /// longer a guessed site.
     #[test]
     fn a_route_path_written_in_no_whole_way_is_a_guessed_site() {
         let Some((on, exports, declarations)) = traced_fixture_named("receiver-route-guessed")
@@ -8608,7 +8613,12 @@ export function listen(): void {
             .collect();
         assert_eq!(
             served,
-            texts(&["src/index.ts:19 GET /", "src/index.ts:21 GET /ready"]),
+            texts(&[
+                "src/index.ts:19 GET /",
+                "src/index.ts:21 GET /ready",
+                "src/table.ts:17 GET /items",
+                "src/table.ts:17 GET /orders",
+            ]),
             "{served:#?}"
         );
         let mut guessed: Vec<String> = routes
@@ -8619,11 +8629,7 @@ export function listen(): void {
         guessed.sort();
         assert_eq!(
             guessed,
-            texts(&[
-                "src/index.ts:14 GET",
-                "src/index.ts:16 POST",
-                "src/table.ts:17 GET",
-            ]),
+            texts(&["src/index.ts:14 GET", "src/index.ts:16 POST"]),
             "{guessed:#?}"
         );
     }
