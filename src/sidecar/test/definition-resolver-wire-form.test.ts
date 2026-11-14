@@ -38,6 +38,7 @@ export interface Receipt {
   stamp: Date;
   lines: { amountMinor: bigint | null }[];
   note?: bigint;
+  extra: unknown;
 }
 export type Endpoint_row = Row;
 export type Endpoint_priced = Priced;
@@ -101,6 +102,7 @@ describe('resolve_definitions prints the sending side of an http payload in wire
           stamp: { scalar: 'DateTime' },
           lines: { list: { type: 'Line' } },
           note: { scalar: 'String' },
+          extra: { scalar: 'String' },
         },
       },
       Line: { fields: { amountMinor: { scalar: 'String' } } },
@@ -126,6 +128,8 @@ describe('resolve_definitions prints the sending side of an http payload in wire
     assert.match(d.expanded, /stamp: string;/, d.expanded);
     assert.match(d.expanded, /lines: \{ amountMinor: null \| string; \}\[\]/, d.expanded);
     assert.match(d.expanded, /note\?: string;/, d.expanded);
+    // A deep unknown is not laundered into its scalar.
+    assert.match(d.expanded, /extra: unknown;/, d.expanded);
     assert.doesNotMatch(d.expanded, /bigint|Date/, d.expanded);
     assert.match(d.definition, /totalMinor: bigint/, 'the as-written form keeps the declared type');
 

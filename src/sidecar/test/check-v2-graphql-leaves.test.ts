@@ -150,6 +150,9 @@ const PAIRS: CheckPairSpec[] = [
   // A deep `any` under a built-in leaf is not laundered into its scalar.
   gql('leaf-any', 'Loose_Sent', 'Loose_Exp', 'loose'),
   gql('leaf-any-none', 'Loose_Sent', 'Loose_Exp'),
+  // A deep `unknown` under a built-in leaf is not laundered either.
+  gql('leaf-unknown', 'Vague_Sent', 'Vague_Exp', 'loose'),
+  gql('leaf-unknown-none', 'Vague_Sent', 'Vague_Exp'),
   // An enum leaf keeps the JSON form; an optional field keeps its undefined.
   gql('leaf-enum', 'Flagged_Sent', 'Flagged_Exp', 'flagged'),
   gql('leaf-optional', 'Opt_Sent', 'Opt_Exp', 'opt'),
@@ -181,6 +184,7 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
         'export type Batch_Sent = { codes: bigint[]; rows: ({ amountMinor: bigint } | null)[] };',
         'export type Order_Sent = { id: string; buyer: { since: Date; name: bigint } | null };',
         'export type Loose_Sent = { id: string; note: any };',
+        'export type Vague_Sent = { id: string; note: unknown };',
         'export type Flagged_Sent = { state: "OPEN" | "SHUT" };',
         'export type Opt_Sent = { totalMinor?: bigint };',
         'export type Tender_Sent = { id: string; amountMinor: bigint };',
@@ -200,6 +204,7 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
         'export type Batch_Flat_Exp = { codes: string; rows: ({ amountMinor: string } | null)[] };',
         'export type Order_Exp = { id: string; buyer: { since: number; name: string } | null };',
         'export type Loose_Exp = { id: string; note: number };',
+        'export type Vague_Exp = { id: string; note: string };',
         'export type Flagged_Exp = { state: "OPEN" | "SHUT" };',
         'export type Opt_Exp = { totalMinor?: string };',
         'export type Tender_Exp = { id: string; amountMinor: string };',
@@ -291,8 +296,10 @@ describe('check_v2 compares a GraphQL leaf in its scalar\'s sent type (carrick#4
     assert.strictEqual(bucket('leaf-cycle').bucket, 'compatible', JSON.stringify(bucket('leaf-cycle')));
   });
 
-  it('a deep any under a built-in leaf keeps the verdict it had without leaves', () => {
+  it('a deep any or unknown under a built-in leaf keeps the verdict it had without leaves', () => {
     assert.strictEqual(bucket('leaf-any').bucket, bucket('leaf-any-none').bucket);
+    assert.strictEqual(bucket('leaf-unknown').bucket, bucket('leaf-unknown-none').bucket);
+    assert.notStrictEqual(bucket('leaf-unknown').bucket, 'compatible');
   });
 
   it('an enum leaf and an optional field keep their form', () => {

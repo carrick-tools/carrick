@@ -222,7 +222,8 @@ function memberWalk(wire: WireWalk, name: string): WireWalk {
 
 /**
  * A value at a GraphQL leaf, printed as the server sends it (carrick#4403),
- * mirroring the probe's `GqlLeafSent`: `null`, `undefined` and `any` stay;
+ * mirroring the probe's `GqlLeafSent`: `null`, `undefined`, `any` and
+ * `unknown` stay;
  * a union maps each member; a list maps its elements; a built-in scalar is
  * the type it sends; any other scalar, an enum, and a shape the leaf does not
  * describe print in the JSON form. `undefined` means an object type over an
@@ -238,7 +239,9 @@ function graphqlLeafText(
 ): string | undefined {
   const leaf = withoutNonNull(wire.leaf);
   const here: GraphqlWalk = { leaf, types: wire.types };
-  if (type.isNull() || type.isUndefined() || type.isAny()) return namedText(type);
+  if (type.isNull() || type.isUndefined() || type.isAny() || type.isUnknown()) {
+    return namedText(type);
+  }
   if (type.isUnion()) {
     const members = canonicalMembers(type.getUnionTypes(), seen, depth, cursor, here, origin);
     return [...new Set(members)].join(' | ');

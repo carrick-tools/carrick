@@ -252,7 +252,8 @@ export function jsonWireDeclarations(prefix: string): string[] {
  * through `graphqlFieldLeaf`). `GqlLeafSent<C, F>` is the type the server
  * sends for a value `C` declared as `F`:
  *
- *  - non-null is read through; `null` and `undefined` stay what they are;
+ *  - `any` and `unknown` stay what they are, so a top type is never laundered
+ *    into a scalar; non-null is read through; `null` and `undefined` stay;
  *  - a list maps its elements; a non-array under a list keeps the JSON form;
  *  - a built-in scalar is the type it sends (`GRAPHQL_SCALAR_SENT`); any
  *    other scalar, an enum and a field the table does not name are JSON;
@@ -275,7 +276,7 @@ export function graphqlScalarDeclarations(
     `type GqlRootLeaf = ${JSON.stringify(rootLeaf)};`,
     `type GqlTypeOf<F> = [F] extends [{ non_null: infer I }] ? GqlTypeOf<I> : [F] extends [{ type: infer T }] ? T : never;`,
     `type GqlFieldOf<T, K> = [T] extends [never] ? unknown : [T] extends [keyof GqlTypes] ? ([K] extends [keyof GqlTypes[T]] ? GqlTypes[T][K] : unknown) : unknown;`,
-    `type GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? JsonWire<C> : [F] extends [{ non_null: infer I }] ? GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlLeafSent<C[K], I, GqlDepth[D]> } : JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof GqlScalarSent ? GqlScalarSent[N] : JsonWire<C>) : [F] extends [{ type: infer T }] ? (C extends readonly unknown[] ? JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlLeafSent<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } : JsonWire<C>) : JsonWire<C>;`,
+    `type GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlLeafSent<C[K], I, GqlDepth[D]> } : JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof GqlScalarSent ? GqlScalarSent[N] : JsonWire<C>) : [F] extends [{ type: infer T }] ? (C extends readonly unknown[] ? JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlLeafSent<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } : JsonWire<C>) : JsonWire<C>;`,
   ];
 }
 
