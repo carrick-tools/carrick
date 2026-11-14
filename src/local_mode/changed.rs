@@ -867,7 +867,7 @@ pub(super) fn answers_lost<'a>(
 /// and hold the same type-bearing comments in the same places; a manifest, a
 /// lockfile, a config, an added or deleted file, or a commit this clone lacks
 /// takes the re-scan (carrick#3245), unless no service reads the file
-/// ([`super::recheck::no_service_reads`]: a test file that loads what it
+/// ([`super::recheck::services_reading`]: a test file that loads what it
 /// loaded).
 fn reads_the_same(
     workspace_root: &Path,
@@ -878,15 +878,7 @@ fn reads_the_same(
     // A repo the hosted index stood in for (`read_from_hosted`) is covered
     // too: its blobs were written beside the scanned ones, so the join below
     // retains them, and they describe the hosted commit from a clean tree.
-    let commit = &indexed.services.first()?.commit;
-    if commit.is_empty()
-        || indexed
-            .services
-            .iter()
-            .any(|service| &service.commit != commit || service.dirty)
-    {
-        return None;
-    }
+    let commit = indexed.clean_commit()?;
     let mut lines = BTreeMap::new();
     let mut unmapped = std::collections::HashSet::new();
     for file in super::query::changed_since(repo, commit)? {
@@ -905,7 +897,8 @@ fn reads_the_same(
     // A change the scan reads differently is still no change when no service
     // reads the file (the carry rule `--changed-only` uses, one walk for all).
     if !unmapped.is_empty()
-        && !super::recheck::no_service_reads(workspace_root, tree, indexed, &unmapped)
+        && !super::recheck::services_reading(workspace_root, tree, indexed, &unmapped)
+            .is_some_and(|readers| readers.is_empty())
     {
         return None;
     }

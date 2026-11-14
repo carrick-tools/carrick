@@ -145,28 +145,44 @@ pub fn answer(
             // the rows stand where they were. That second exit is the full
             // re-check's only; the probe never walks to find it. Every other
             // edit takes the re-scan below.
-            let unchanged = service_row
-                .filter(|service| !service.dirty && !service.commit.is_empty())
-                .and_then(|service| {
-                    let began = std::time::Instant::now();
-                    let same =
-                        super::reads_same::reads_same_since(&repo_root, &service.commit, &relative);
-                    super::recheck::took("check/reads-the-same", began);
-                    same.map(Some)
-                })
-                .or_else(|| {
-                    // The probe never walks every service's imports to learn
-                    // that no service reads the edit: on a large workspace
-                    // that walk took 1-25 s, past the hook's limit. Such an
-                    // edit comes back deferred and the full re-check answers
-                    // it (carrick#4034).
-                    if !rescan {
-                        return None;
-                    }
-                    let only = HashSet::from([relative.clone()]);
-                    super::recheck::no_service_reads(workspace_root, &tree, repo, &only)
-                        .then_some(None)
-                });
+            //
+            // A path the published input rule does not read (a README, a
+            // workflow) is read by no scan: answered here on both paths, with
+            // no walk (carrick#4412). A file in no service's directory reads
+            // the same against the commit every service of its repo was
+            // indexed at.
+            let mut readers: Option<Vec<String>> = None;
+            let unchanged = if !crate::change_scope::read_by_input_rule(&relative) {
+                Some(None)
+            } else {
+                let clean = match service_row {
+                    Some(service) => (!service.dirty && !service.commit.is_empty())
+                        .then_some(service.commit.as_str()),
+                    None => repo.clean_commit(),
+                };
+                clean
+                    .and_then(|commit| {
+                        let began = std::time::Instant::now();
+                        let same =
+                            super::reads_same::reads_same_since(&repo_root, commit, &relative);
+                        super::recheck::took("check/reads-the-same", began);
+                        same.map(Some)
+                    })
+                    .or_else(|| {
+                        // The probe never walks every service's imports to
+                        // learn that no service reads the edit: on a large
+                        // workspace that walk took 1-25 s, past the hook's
+                        // limit. Such an edit comes back deferred and the
+                        // full re-check answers it (carrick#4034).
+                        if !rescan {
+                            return None;
+                        }
+                        let only = HashSet::from([relative.clone()]);
+                        readers =
+                            super::recheck::services_reading(workspace_root, &tree, repo, &only);
+                        readers.as_ref().is_some_and(Vec::is_empty).then_some(None)
+                    })
+            };
             reads_same = unchanged.is_some();
             Some(match unchanged {
                 Some(lines) => {
@@ -206,7 +222,12 @@ pub fn answer(
                         },
                     )
                 }
-                None => match super::recheck::Reach::of(repo, &relative, &service) {
+                None => match super::recheck::Reach::for_edit(
+                    repo,
+                    &relative,
+                    service_row,
+                    readers.as_deref(),
+                ) {
                     Some(reach) => rechecked(
                         workspace_root,
                         &tree,
@@ -216,6 +237,8 @@ pub fn answer(
                         &index,
                         rescan,
                     ),
+                    // A repo the index holds with no service: none can read
+                    // the file.
                     None => (None, not_run("no service reads this file", &indexed_at)),
                 },
             })

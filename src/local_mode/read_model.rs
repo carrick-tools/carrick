@@ -351,6 +351,20 @@ impl IndexedRepo {
         }
         best
     }
+
+    /// The commit every indexed service of this repo was read at, from a clean
+    /// tree: the one commit an edit since the index is listed against. `None`
+    /// when a service recorded no commit, the services disagree, or one was
+    /// read from a dirty tree (carrick#3245, carrick#4412).
+    pub fn clean_commit(&self) -> Option<&str> {
+        let commit = self.services.first()?.commit.as_str();
+        (!commit.is_empty()
+            && self
+                .services
+                .iter()
+                .all(|service| service.commit == commit && !service.dirty))
+        .then_some(commit)
+    }
 }
 
 /// The whole read model.
