@@ -444,6 +444,27 @@ mod tests {
         assert_eq!(stored["T"].expression_line, scanned["T"].expression_line);
     }
 
+    /// A call result asked by line alone (no span, no text) is not located
+    /// on main, and stays out of the replay: an answer-derived span would aim
+    /// the replay at the result node, not the call.
+    #[test]
+    fn a_line_only_call_result_stays_unplaced_and_unreplayed() {
+        use crate::engine::type_compat_v2::stored_call_locators;
+        let mut manifest = vec![entry(
+            OperationKey::http("GET", "/x"),
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            "LineOnly",
+            InferKind::CallResult,
+        )];
+        let line_only = ask("LineOnly", InferKind::CallResult, None);
+        let read = |_: &str| Some("\n    api.go();\n".to_string());
+        let answers = [answer("LineOnly", at(2, 4, 12))];
+        store_read_places(&mut manifest, &[line_only], &answers, &read);
+        assert_eq!(manifest[0].evidence.span_start, None);
+        assert!(stored_call_locators(&manifest, Path::new("/repo")).is_empty());
+    }
+
     #[test]
     fn an_unanswered_call_result_is_not_placed() {
         let mut manifest = vec![entry(
