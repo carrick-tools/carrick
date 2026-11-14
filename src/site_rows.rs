@@ -273,8 +273,8 @@ pub struct HeldOpen {
     pub file: String,
     pub line: u32,
     pub span_start: u32,
-    /// The deciding calls, by repo-relative file and line: each holds a
-    /// decided HTTP site that ends at this request.
+    /// The deciding calls, by repo-relative file and line: each holds
+    /// exactly one decided HTTP site, which ends at this request.
     pub fact_calls: Vec<(String, u32)>,
 }
 
@@ -1067,7 +1067,10 @@ pub fn key_requests_canonically(
 /// - (d) a request the summaries state rows for (`summarized`, by file and
 ///   span start): they own its rows;
 /// - (e) a deciding call whose own name is not a bare path: its row gets no
-///   manifest pair, so the model's row holds the only type.
+///   manifest pair, so the model's row holds the only type;
+/// - a deciding call that does not hold exactly one decided HTTP site on its
+///   line, as [`SiteRows::held_open`]'s other producer requires: the fold
+///   reads each call's fact row by its line.
 pub fn held_at_maker_sites(
     decided: &Decided,
     summarized: impl Fn(&str, u32) -> bool,
@@ -1097,15 +1100,28 @@ pub fn held_at_maker_sites(
                     .is_some_and(|own| own.starts_with('/'))
             })
     };
+    // The fold finds a call's fact row by its line: a second HTTP site there
+    // (another request, a lead-bucket record) could stand in for this one.
+    let alone_on_its_line = |site: &DecidedSite| {
+        decided
+            .sites
+            .iter()
+            .filter(|other| {
+                other.end.role == "http_client"
+                    && other.file == site.file
+                    && other.line == site.line
+            })
+            .count()
+            == 1
+    };
     ends.into_iter()
         .filter(|((file, span_start), (_, sites))| {
-            sites
+            sites.iter().all(|site| {
+                site.makes_end && !site.chain_handed_on && bare(site) && alone_on_its_line(site)
+            }) && !decided
+                .leads
                 .iter()
-                .all(|site| site.makes_end && !site.chain_handed_on && bare(site))
-                && !decided
-                    .leads
-                    .iter()
-                    .any(|lead| names(file, *span_start, &lead.end))
+                .any(|lead| names(file, *span_start, &lead.end))
                 && !decided
                     .stops
                     .iter()

@@ -2271,6 +2271,35 @@ fn a_maker_end_with_a_name_that_is_not_a_bare_path_is_not_held() {
     assert!(held_at_makers(&makers(vec![site])).is_empty());
 }
 
+/// A deciding call's line holds a second HTTP site, ending elsewhere: the
+/// fold reads the call's fact row by its line, so the other site's row could
+/// stand in for this one. Neither end is held.
+#[test]
+fn a_maker_call_sharing_its_line_with_another_http_site_is_not_held() {
+    let mut other = maker_site("src/a.ts", "/beta/cache");
+    other.end.file = "src/other.ts".to_string();
+    other.span_start = 140;
+    other.span_end = 170;
+    let decided = makers(vec![maker_site("src/a.ts", "/alpha/cache"), other]);
+    assert!(held_at_makers(&decided).is_empty());
+}
+
+/// Gate (d)'s reader: a request the summaries place is found by its
+/// repo-relative file and span start, and only by those.
+#[test]
+fn the_summaries_placement_of_a_request_is_read_by_its_relative_file_and_span() {
+    let root = Path::new("/repo");
+    let mut placed = crate::request_summary::decided_sites::SummaryPlacements::default();
+    placed.place(
+        (root.join(MAKER_FILE), 40),
+        (root.join("src/a.ts"), LINE),
+        None,
+    );
+    assert!(placed.places_request(root, MAKER_FILE, 40));
+    assert!(!placed.places_request(root, MAKER_FILE, 41));
+    assert!(!placed.places_request(root, "src/a.ts", 40));
+}
+
 /// Only HTTP requests are held: a message send through a maker is a gap.
 #[test]
 fn a_maker_end_of_another_role_is_not_held() {
