@@ -152,8 +152,15 @@ fn settled_line() -> &'static str {
     &scan().1
 }
 
-fn scan() -> &'static (Blobs, String) {
-    static SCAN: OnceLock<(Blobs, String)> = OnceLock::new();
+/// The aliases the pass logs taking out of the bundled types (carrick#4218).
+fn aliases_taken_out() -> &'static [String] {
+    &scan().2
+}
+
+type Scanned = (Blobs, String, Vec<String>);
+
+fn scan() -> &'static Scanned {
+    static SCAN: OnceLock<Scanned> = OnceLock::new();
     SCAN.get_or_init(|| {
         let tmp = tempfile::tempdir().expect("temp dir");
         let repo = committed_copy(tmp.path());
@@ -166,17 +173,23 @@ fn scan() -> &'static (Blobs, String) {
             .env("CARRICK_CACHE_DIR", tmp.path().join("cache"))
             .env("HOME", &home);
         run(cmd);
-        let settled = std::fs::read_dir(home.join(".carrick/logs/runs"))
+        let logs: Vec<String> = std::fs::read_dir(home.join(".carrick/logs/runs"))
             .expect("the scan keeps a run log")
             .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
-            .flat_map(|log| {
-                log.lines()
-                    .filter(|line| line.contains("Call-through rows settled"))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .next()
-            .expect("the pass logs what it settled");
+            .collect();
+        let settled = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .find(|line| line.contains("Call-through rows settled"))
+            .expect("the pass logs what it settled")
+            .to_string();
+        let taken_out: Vec<String> = logs
+            .iter()
+            .flat_map(|log| log.lines())
+            .filter_map(|line| line.split("  - alias ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
         let blobs: Blobs = read_blobs(&storage)
             .into_iter()
             .map(|(service, (_, blob))| (service, blob))
@@ -186,7 +199,7 @@ fn scan() -> &'static (Blobs, String) {
             SERVICES,
             "every service uploads one blob"
         );
-        (blobs, settled)
+        (blobs, settled, taken_out)
     })
 }
 
@@ -953,6 +966,89 @@ fn a_call_handed_a_url_its_own_file_builds_keeps_the_models_row() {
     }
 }
 
+/// Whether `file:line` of `service` is saved unread as a withdrawn row.
+fn saved_as_withdrawn(service: &str, file: &str, line: u32) -> bool {
+    unread_at(service, file, line)
+        .is_some_and(|site| reasons(site).contains(&"own_function".to_string()))
+}
+
+/// carrick#4218 T1: a client method that hands on a text writing the row's
+/// path keeps the model's row, though its request sits behind a function it
+/// was handed: `claim` hands `call` an imported route object
+/// (`export const route = { path, method }`, exported and spread), and
+/// `ping` hands `get` an imported string constant. The model's path is the
+/// code's, not a name's.
+#[test]
+fn a_call_into_a_function_that_hands_on_the_rows_path_keeps_the_models_row() {
+    for (line, method, path) in [
+        (30, "POST", "/api/v1/jobs/claim"),
+        (32, "GET", "/api/v1/jobs/ping"),
+    ] {
+        assert_eq!(
+            row_at("cli", UNSETTLED, line),
+            as_stated(method, path, path)
+        );
+        assert!(
+            !saved_as_withdrawn("cli", UNSETTLED, line),
+            "{UNSETTLED}:{line} holds its row and is not saved as withdrawn"
+        );
+    }
+}
+
+/// carrick#4218 T1's control: `release` hands on `/api/v1/jobs/release`, and
+/// the model read `/api/v1/jobs/close` off nothing the code writes, so the row
+/// is still withdrawn and saved unread.
+#[test]
+fn a_call_whose_function_hands_on_another_path_is_still_withdrawn() {
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 31), []);
+    assert!(saved_as_withdrawn("cli", UNSETTLED, 31));
+}
+
+/// carrick#4218 T2: the request is made by the call written in the row
+/// call's argument (`report(await readHealth(port))`), whose function hands
+/// its reader a path a sibling service exports: the row naming that path
+/// stays, and its twin, which the model keyed by the outer function's name,
+/// is withdrawn.
+#[test]
+fn a_call_whose_argument_call_hands_on_the_rows_path_keeps_the_models_row() {
+    assert_eq!(
+        row_at("cli", UNSETTLED, 38),
+        as_stated("GET", "/livez", "/livez")
+    );
+    assert!(!saved_as_withdrawn("cli", UNSETTLED, 38));
+    assert_eq!(rows_in(blobs(), "cli", UNSETTLED, 43), []);
+    assert!(saved_as_withdrawn("cli", UNSETTLED, 43));
+}
+
+/// carrick#4218 T3: the aliases of the type entries anchored at withdrawn
+/// rows leave the bundled types, which serve definitions by alias: 14
+/// aliases of the rows `cli` withdraws in `commands.ts` (76, 94) and
+/// `unsettled.ts` (6, 31, 43) and of `web`'s at `hooks.ts:24`. No manifest
+/// entry names them any more, and no bundle declares them.
+#[test]
+fn a_withdrawn_rows_aliases_leave_the_bundled_types() {
+    let taken_out = aliases_taken_out();
+    assert_eq!(taken_out.len(), 14, "{taken_out:#?}");
+    for blob in blobs().values() {
+        let bundle = blob["bundled_types"].as_str().unwrap_or_default();
+        let named: Vec<&str> = blob["type_manifest"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["type_alias"].as_str())
+            .collect();
+        for alias in taken_out {
+            assert!(
+                !bundle.contains(&format!("type {alias} "))
+                    && !bundle.contains(&format!("interface {alias} ")),
+                "{alias} is still declared in {}",
+                blob["service_name"]
+            );
+            assert!(!named.contains(&alias.as_str()), "{alias} is still named");
+        }
+    }
+}
+
 #[test]
 fn every_request_row_is_unchanged() {
     let mut requests: Vec<(String, String, String)> = data_calls("client")
@@ -1068,14 +1164,15 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
     // Nine rows in `commands.ts` the model alone states, the one at
-    // `nested.ts:7` and the two at `unsettled.ts` lines 13 and 20.
-    // `commands.ts` lines 76 and 94 and `unsettled.ts:6` are withdrawn
-    // (carrick#4206). The three in `inline-commands.ts` (lines 9, 13, 22) are
+    // `nested.ts:7` and the five at `unsettled.ts` lines 13, 20, 30, 32 and
+    // 38 (carrick#4218 keeps the last three). `commands.ts` lines 76 and 94
+    // and `unsettled.ts` lines 6, 31 and 43 are withdrawn (carrick#4206).
+    // The three in `inline-commands.ts` (lines 9, 13, 22) are
     // corrected, not the model's alone: every scan now walks with the
     // compiler's rows (`position_rows::destination` has no switch), which
     // follow them (carrick#2822), as `a_method_called_on_a_factorys_value_…`
     // and `a_wrapper_over_a_factorys_value_…` assert.
-    assert_eq!(boundary["model_only_rows"], 12, "{boundary}");
+    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()

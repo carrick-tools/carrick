@@ -106,6 +106,11 @@ settles no one request.
 |---|---|
 | `unsettled.ts:6` (`client.close(path)`) | withdrawn; the walk below the call already saved the site unread (`value_never_bound`), and it gains `own_function` beside that: the method is in `job-client.ts` and writes nothing of the path, its request is `send` with a path it is given, so the walk reaches no request row, and the model's `POST /v1/jobs/close` is read off the method's name |
 | `unsettled.ts:13`, `:20` | as stated: the same callee is handed a URL the file builds (`const url = `${base}/api/v1/accounts``, and `url.toString()` of a `new URL`) |
+| `unsettled.ts:30` (`jobs.claim(5)`) | as stated (carrick#4218): `claim` (`job-queue.ts`) hands `call` the route object `routes/claim.ts` exports and spreads, written from the consts `path` and `method`; its request goes through a function the queue was handed, so the walk reaches no row, and the code still writes the model's path |
+| `unsettled.ts:31` (`jobs.release(id)`) | withdrawn: `release` hands on `/api/v1/jobs/release`, and the model's `/api/v1/jobs/close` is read off nothing the code writes |
+| `unsettled.ts:32` (`jobs.ping()`) | as stated: `ping` hands `get` the imported constant `PING_URL` |
+| `unsettled.ts:38` (`report(await readHealth(port))`) | as stated: the request is the argument's call; `readHealth` (`probe.ts`) hands its reader `{ path: wait ? `${HEALTH_PROBE_PATH}?wait=1` : HEALTH_PROBE_PATH }`, a constant `routes/urls.ts` exports (the fixture's packages are not linked for the compiler, so a constant another package exports types as `any` here) |
+| `unsettled.ts:43` | withdrawn: the same call, which the model keyed `GET /report` off the outer function's name |
 
 `commands.ts:113` writes its route into a function of the same file; the
 scanner reads that row off the source and this pass never touches it.
