@@ -291,7 +291,7 @@ pub struct ServiceBoundary {
     /// `total` 1 with one reason from a fixed set (the walk died of memory,
     /// or failed) when it was asked and wrote none; `None` when no walk was
     /// asked, and on a blob from a scanner that did not write the field. With
-    /// no rows, every site that needs them reads `rows_missing`; the model
+    /// no rows, every site that needs them reads `walk_lost`; the model
     /// and route rows stand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_rows_lost: Option<Counted>,
@@ -504,7 +504,7 @@ impl ServiceBoundary {
             && let Some(reason) = lost.reasons.first()
         {
             out.push(format!(
-                "  No compiler rows for this service because {reason}. Calls that needed them are listed as unread (rows_missing)."
+                "  No compiler rows for this service because {reason}. Calls that needed them are listed as unread (walk_lost)."
             ));
         }
         if self.model_only_rows > 0 {

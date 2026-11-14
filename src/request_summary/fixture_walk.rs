@@ -125,6 +125,9 @@ pub(crate) fn walked(
     )
 }
 
+/// Builds an index over a copied repo's root.
+pub(crate) type IndexOf = fn(&Path) -> PositionIndex;
+
 /// Where a fixture service's rows come from.
 #[derive(Clone, Copy)]
 pub(crate) enum Rows {
@@ -134,7 +137,7 @@ pub(crate) enum Rows {
     Absent,
     /// An index built over the copied repo's root, as a lost walk or no walk
     /// leaves one (carrick#4256).
-    Index(fn(&Path) -> PositionIndex),
+    Index(IndexOf),
 }
 
 impl Rows {
@@ -304,7 +307,7 @@ pub(crate) fn walked_services_over(
     fixture: &str,
     services: &[(&str, &str)],
     with_rows: bool,
-    instead: Option<(&str, fn(&Path) -> PositionIndex)>,
+    instead: Option<(&str, IndexOf)>,
 ) -> Option<WalkedServices> {
     let script = sidecar()?;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

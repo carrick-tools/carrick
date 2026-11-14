@@ -2360,13 +2360,11 @@ impl<'a> SiteNames<'a> {
             super::resolve::TextValue::Hole { reason, .. } => Some(*reason),
             super::resolve::TextValue::Pieced(_) => Some(HoleReason::UnreadExpression),
         };
-        if values
-            .iter()
-            .any(|value| hole(value) == Some(HoleReason::RowsMissing))
-        {
-            return Some(SlotName::Today(NameFallback::NoRows(
-                HoleReason::RowsMissing,
-            )));
+        if let Some(no_rows) = values.iter().find_map(|value| {
+            hole(value)
+                .filter(|reason| matches!(reason, HoleReason::RowsMissing | HoleReason::WalkLost))
+        }) {
+            return Some(SlotName::Today(NameFallback::NoRows(no_rows)));
         }
         // One group per caller chain, in the order read.
         let mut chains: Vec<(&[_], Vec<&super::resolve::TextValue>)> = Vec::new();

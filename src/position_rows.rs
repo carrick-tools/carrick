@@ -579,6 +579,9 @@ pub struct PositionIndex {
     /// declares, by the library file (`lib.dom.d.ts`): the symbol of each
     /// identifier row whose declaration is a `lib:` file.
     library_globals: BTreeMap<String, BTreeSet<String>>,
+    /// Whether the walk was asked and wrote no rows: a file the index does
+    /// not hold is then [`HoleReason::WalkLost`] (carrick#4256).
+    walk_lost: bool,
     /// How many lookups converted a span, for the tests that a reader asks
     /// once per position.
     #[cfg(test)]
@@ -623,7 +626,10 @@ impl PositionIndex {
     /// An index with no rows, for a service whose walk was asked and wrote
     /// none: every lookup is [`HoleReason::WalkLost`] (carrick#4256).
     pub fn walk_lost(scan_root: &Path) -> Self {
-        Self::missing(scan_root)
+        Self {
+            walk_lost: true,
+            ..Self::missing(scan_root)
+        }
     }
 
     /// The index over a rows file read for the repo rooted at `scan_root`.
@@ -794,7 +800,11 @@ impl PositionIndex {
         let indexed = self
             .relative(file)
             .and_then(|relative| self.files.get(&relative))
-            .ok_or(HoleReason::RowsMissing)?;
+            .ok_or(if self.walk_lost {
+                HoleReason::WalkLost
+            } else {
+                HoleReason::RowsMissing
+            })?;
         if indexed.skip.is_some() {
             return Err(HoleReason::NotInProgram);
         }
