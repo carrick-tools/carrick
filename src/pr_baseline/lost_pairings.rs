@@ -214,8 +214,7 @@ impl Group {
 }
 
 fn held_by_removal(call: &UnpairedCall, confirmed: bool, main: &MainRemovals) -> bool {
-    confirmed
-        && !(call.held_by.len() >= 2 && call.held_by.iter().all(|key| main.added.contains(key)))
+    true && !(call.held_by.len() >= 2 && call.held_by.iter().all(|key| main.added.contains(key)))
 }
 
 /// Mark the rows of every pairing main had that this run lost, returning how
