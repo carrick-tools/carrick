@@ -1685,14 +1685,14 @@ impl Reading<'_, '_> {
                     return None;
                 }
                 self.noted(match today_read {
-                    Some(SlotName::Today(NameFallback::NoRows(_))) => NameOutcome::NoRows,
+                    Some(SlotName::Today(NameFallback::NoRows)) => NameOutcome::NoRows,
                     _ => site_outcome(self.site, arg, key),
                 });
                 let name = today();
                 if name.is_none() {
                     self.unnamed(
                         match today_read {
-                            Some(SlotName::Today(NameFallback::NoRows(hole))) => Stop::from(hole),
+                            Some(SlotName::Today(NameFallback::NoRows)) => Stop::RowsMissing,
                             _ => slot_stop(&self.site.args, arg, key),
                         },
                         op,
@@ -4447,8 +4447,7 @@ mod tests {
 
     /// carrick#4256: a service whose walk was asked and wrote no rows keeps
     /// today's reading of a name slot exactly as one with no walk does: the
-    /// same rows and the same `no_rows` count. Only the stop an unnamed slot is
-    /// saved with differs (`walk_lost`).
+    /// same rows, the same `no_rows` count and the same leads.
     #[test]
     fn a_slot_over_a_lost_walk_keeps_the_same_names_as_over_a_missing_one() {
         use crate::request_summary::fixture_walk::Rows;
@@ -4487,17 +4486,14 @@ mod tests {
             "{:?}",
             lost.names
         );
-        // The slot no name is stated for is saved as a lead either way, with
-        // the stop that says why there are no rows.
+        // The text reader gives its own `rows_missing` at a position it has
+        // no row for, so a lead over a lost walk still reads `rows_missing`
+        // (carrick#4256 leaves that reader as it is).
         let reasons = |rows: &LibraryRows| -> Vec<Stop> {
             rows.leads.iter().map(|lead| lead.reason).collect()
         };
         assert!(!missing.leads.is_empty(), "{:?}", missing.leads);
-        assert_eq!(
-            reasons(&missing),
-            vec![Stop::RowsMissing; missing.leads.len()]
-        );
-        assert_eq!(reasons(&lost), vec![Stop::WalkLost; missing.leads.len()]);
+        assert_eq!(reasons(&lost), reasons(&missing));
     }
 
     /// A name the maker that made the receiver was handed stays on the maker
