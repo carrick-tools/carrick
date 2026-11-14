@@ -7877,6 +7877,75 @@ fn a_file_in_no_service_that_nothing_reads_stays_cheap() {
     assert_eq!(recheck_temp_dirs(temp.path()), before, "nothing was staged");
 }
 
+/// `check --changed` and `check <files>` check a changed source file in no
+/// service's roots when a service imports it, and keep today's line for one
+/// nothing reads.
+#[test]
+#[serial]
+fn check_changed_checks_a_file_in_no_service_that_a_service_imports() {
+    let workspace = shop_with_shared_folders();
+    let root = workspace.path();
+    index(root);
+    let repo_entry = |json: &serde_json::Value| -> serde_json::Value {
+        json["repos"]
+            .as_array()
+            .and_then(|repos| {
+                repos
+                    .iter()
+                    .find(|repo| repo["repo"].as_str().is_some_and(|r| r.ends_with("shop")))
+            })
+            .unwrap_or_else(|| panic!("the shop entry:\n{json:#}"))
+            .clone()
+    };
+    let lists = |entry: &serde_json::Value, file: &str| {
+        entry["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|f| f == file))
+    };
+
+    // (1) `check --changed`: the imported helper is checked, the repo re-scans.
+    statement_in(&root.join(COMMON_FORMAT), "format edit");
+    let (_, json, stderr) = check_changed_json_with(root, &[]);
+    let entry = repo_entry(&json);
+    assert!(lists(&entry, "common/format.ts"), "{json:#}\n{stderr}");
+    assert!(entry.get("skipped").is_none_or(|s| s.is_null()), "{json:#}");
+    assert_eq!(rescan_of(&json, "shop").as_deref(), Some("ran"), "{json:#}");
+
+    // (2) `check <files>`: the same file, named beside one a service covers.
+    let (_, body) = check_files(root, &[COMMON_FORMAT, SHOP_CLIENT, "--json"]);
+    let named: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    let entry = repo_entry(&named);
+    assert!(lists(&entry, "common/format.ts"), "{named:#}");
+    assert!(
+        entry.get("skipped").is_none_or(|s| s.is_null()),
+        "{named:#}"
+    );
+
+    // (3) a script nothing imports keeps today's line, and exits 2 alone.
+    git(&root.join("shop"), &["checkout", "--", "common/format.ts"]);
+    statement_in(&root.join(SHOP_SCRIPT), "seed edit");
+    let (code, json, stderr) = check_changed_json_with(root, &[]);
+    let entry = repo_entry(&json);
+    assert!(
+        entry["skipped"]
+            .as_str()
+            .is_some_and(|s| s.contains("in no indexed service")),
+        "{json:#}\n{stderr}"
+    );
+    assert_eq!(entry["unchecked"], serde_json::json!(1), "{json:#}");
+    assert_eq!(code, Some(2), "{json:#}");
+    let (_, body) = check_files(root, &[SHOP_SCRIPT, SHOP_CLIENT, "--json"]);
+    let named: serde_json::Value = serde_json::from_str(&body).expect("--json is JSON");
+    assert!(
+        named["repos"]
+            .as_array()
+            .is_some_and(|repos| repos.iter().any(|repo| repo["skipped"]
+                .as_str()
+                .is_some_and(|s| s.contains("no indexed service covers it")))),
+        "{named:#}"
+    );
+}
+
 /// The index was written by another carrick build, so a verdict that moved
 /// may have moved because of the build and not the edit: the row says so.
 #[test]
