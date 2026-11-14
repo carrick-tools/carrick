@@ -8,6 +8,15 @@
 # sent, only when it built and passed its tests: a lister failure must never
 # stop the matcher, whose pin bump every cloud deploy waits on.
 #
+# The one list of type reasons (src/sidecar/src/capture/type-reasons.json,
+# carrick#4231) rides with the matcher: copied byte for byte beside it, listed
+# in carrick_match.sha256, attached, and announced by its sha256, so the cloud
+# pins it in wasm-pin.json with the matcher's files and reads each reason's
+# sentence and `decided` value from it. A tag from before the list has none;
+# the matcher then ships alone, as before.
+#
+#   release-artifacts.sh checksums             copies the reasons list in when the tag has it, then
+#                                              writes wasm-artifact/carrick_match.sha256
 #   release-artifacts.sh upload-matcher <tag>  runs `gh release upload` (first, before the lister builds)
 #   release-artifacts.sh lister-status         reads BUILD_OUTCOME, BUILT, TEST_OUTCOME;
 #                                              writes ok= and status= to $GITHUB_OUTPUT
@@ -26,6 +35,8 @@ set -euo pipefail
 GH="${GH:-gh}"
 LISTER_ENTRY="lister-artifact/carrick-lister.mjs"
 LISTER_MANIFEST="lister-artifact/carrick-lister.manifest.json"
+REASONS_SOURCE="src/sidecar/src/capture/type-reasons.json"
+REASONS_ASSET="type-reasons.json"
 
 # The lister ships when the caller says it passed and both files are there.
 lister_ships() {
@@ -48,13 +59,28 @@ case "${1:-}" in
     echo "status=$status" >> "${GITHUB_OUTPUT:-/dev/null}"
     echo "surface lister: $status"
     ;;
+  checksums)
+    matcher_files=(carrick_match.js carrick_match.d.ts carrick_match_bg.wasm)
+    if [ -f "$REASONS_SOURCE" ]; then
+      cp "$REASONS_SOURCE" "wasm-artifact/$REASONS_ASSET"
+      matcher_files+=("$REASONS_ASSET")
+    else
+      echo "No $REASONS_SOURCE at this tag; the matcher ships without the type reasons list."
+    fi
+    (cd wasm-artifact && sha256sum "${matcher_files[@]}" > carrick_match.sha256)
+    ;;
   upload-matcher)
     tag="${2:?usage: release-artifacts.sh upload-matcher <tag>}"
+    reasons=()
+    if [ -f "wasm-artifact/$REASONS_ASSET" ]; then
+      reasons=("wasm-artifact/$REASONS_ASSET")
+    fi
     "$GH" release upload "$tag" \
       wasm-artifact/carrick_match.js \
       wasm-artifact/carrick_match.d.ts \
       wasm-artifact/carrick_match_bg.wasm \
       wasm-artifact/carrick_match.sha256 \
+      ${reasons[@]+"${reasons[@]}"} \
       --clobber --repo "${GITHUB_REPOSITORY:-carrick-tools/carrick}"
     ;;
   upload-lister)
@@ -71,6 +97,11 @@ case "${1:-}" in
     js_sha="$(awk '$2 == "carrick_match.js" {print $1}' wasm-artifact/carrick_match.sha256)"
     dts_sha="$(awk '$2 == "carrick_match.d.ts" {print $1}' wasm-artifact/carrick_match.sha256)"
     wasm_sha="$(awk '$2 == "carrick_match_bg.wasm" {print $1}' wasm-artifact/carrick_match.sha256)"
+    reasons_sha="$(awk -v f="$REASONS_ASSET" '$2 == f {print $1}' wasm-artifact/carrick_match.sha256)"
+    reasons=()
+    if [ -n "$reasons_sha" ]; then
+      reasons=(-f "client_payload[type_reasons_sha256]=$reasons_sha")
+    fi
     lister=()
     # Announced only when it is attached: the cloud fetches what it is told.
     if lister_ships && [ "${LISTER_ATTACHED:-}" = "success" ]; then
@@ -84,6 +115,7 @@ case "${1:-}" in
       -f "client_payload[js_sha256]=$js_sha" \
       -f "client_payload[dts_sha256]=$dts_sha" \
       -f "client_payload[wasm_sha256]=$wasm_sha" \
+      ${reasons[@]+"${reasons[@]}"} \
       ${lister[@]+"${lister[@]}"}
     ;;
   announce-cli)
@@ -106,7 +138,7 @@ case "${1:-}" in
       -f "client_payload[key]=$key"
     ;;
   *)
-    echo "usage: release-artifacts.sh upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag> | announce-cli <tag> | main-check <sha> <key>" >&2
+    echo "usage: release-artifacts.sh checksums | upload-matcher <tag> | lister-status | upload-lister <tag> | dispatch <tag> | announce-cli <tag> | main-check <sha> <key>" >&2
     exit 2
     ;;
 esac

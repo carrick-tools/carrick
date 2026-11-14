@@ -41,6 +41,8 @@ import type {
   CaptureStubResult,
   SelfCheckOutcome,
   SerializationTier,
+  TypeProvenanceReason,
+  TypeReason,
 } from './api.js';
 import { entryRelativeSpecifier, resolveAnchor, resolveSourceFile, type ResolvedAnchor } from './anchors.js';
 import { findAugmentationFiles } from './augmentations.js';
@@ -61,9 +63,17 @@ import { findServiceTsconfig } from './service-config.js';
 import { placeEmittedTree, surfaceModuleInTree } from './outside-root.js';
 import { WriteGuard } from './guarded-fs.js';
 import { sidecarCompilerOptions } from './compiler-options.js';
+import typeReasons from './type-reasons.json' with { type: 'json' };
 import { boundedCompilerHost, boundedSys, isInsideCheckout, untrustedReadBound, type ReadBound } from './checkout.js';
 
 export type { CaptureStubOptions, CaptureStubResult } from './api.js';
+
+/**
+ * The one list of type reasons (carrick#4231), keyed by word. The Rust driver
+ * embeds the same file; `test/type-reasons-one-source.test.ts` checks every
+ * row's `decided` is one of the three values the cast states.
+ */
+export const TYPE_REASONS = typeReasons as Readonly<Record<TypeProvenanceReason, TypeReason>>;
 export { DenoProject, findDenoConfig } from './deno-project.js';
 export { sidecarCompilerOptions } from './compiler-options.js';
 export { withStubResolution, type StubModuleResolver } from './stub-resolution.js';

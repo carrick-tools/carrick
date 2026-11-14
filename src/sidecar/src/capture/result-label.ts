@@ -20,6 +20,7 @@
  */
 
 import ts from 'typescript';
+import type { TypeProvenanceReason } from './api.js';
 
 /** The wire form of a result label. Exactly one key is set. */
 export type ResultLabel =
@@ -36,8 +37,11 @@ export function constituentsOf(type: ts.Type): readonly ts.Type[] {
   return type.isUnion() ? type.types : [type];
 }
 
+/** The abstain's word, checked against the one list of reasons. */
+const RESULT_MEMBER_MISSING: TypeProvenanceReason = 'result_member_missing';
+
 function missing(what: string): ResultRead {
-  return { abstain: `result_member_missing: ${what}` };
+  return { abstain: `${RESULT_MEMBER_MISSING}: ${what}` };
 }
 
 /**

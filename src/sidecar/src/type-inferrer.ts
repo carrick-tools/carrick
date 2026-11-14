@@ -116,6 +116,7 @@ import {
   statusKeyCode,
   statusTableOf,
   successEntries,
+  TYPE_REASONS,
 } from './capture/index.js';
 import {
   addedDiagnostics,
@@ -271,21 +272,16 @@ const isDroppedResponseStatus = (status: ResponseSiteStatus): boolean =>
   status === 'error' || status === 'redirect';
 
 /**
- * The reasons an `unknown` answer is a decision, not a failure to read: the
- * list `DECIDED_ABSTAIN_REASONS` in `src/engine/type_compat_v2.rs` holds
- * final. A stated reply never replaces one (carrick#2674).
+ * The reasons an `unknown` answer is a decision, not a failure to read, on the
+ * response path that reads this set: the words `capture/type-reasons.json`
+ * marks `always` (carrick#4231). A stated reply never replaces one
+ * (carrick#2674).
  */
-export const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set([
-  'no_success_payload',
-  'no_request_body',
-  'projected_value_only',
-  'serialised_body_unread',
-  'body_built_by_callee',
-  'result_member_missing',
-  'reshaped_by_callback',
-  'body_member_undecided',
-  'bound_by_callers',
-]);
+export const DECIDED_ABSTAIN_REASONS: ReadonlySet<string> = new Set(
+  Object.entries(TYPE_REASONS)
+    .filter(([, reason]) => reason.decided === 'always')
+    .map(([word]) => word)
+);
 
 /** One response branch's payload, before branches are joined. */
 interface PayloadCandidate {

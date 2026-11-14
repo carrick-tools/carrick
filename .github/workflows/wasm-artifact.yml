@@ -111,9 +111,10 @@ jobs:
             console.log('wasm artifact smoke ok');
           "
 
+      # The checksums cover the type reasons list too when the tag has one
+      # (carrick#4231): it rides with the matcher to carrick-cloud's pin.
       - name: Write checksums
-        working-directory: wasm-artifact
-        run: sha256sum carrick_match.js carrick_match.d.ts carrick_match_bg.wasm > carrick_match.sha256
+        run: bash release-tools/scripts/release-artifacts.sh checksums
 
       # The matcher first: whatever happens to the lister below, the matcher
       # is attached and announced, because its pin bump is what every cloud

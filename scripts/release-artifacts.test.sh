@@ -104,6 +104,58 @@ release true
 refuse_call "carrick-lister" "missing lister files: not attached"
 refuse_call "lister_manifest_sha256" "missing lister files: not announced"
 
+# The type reasons list (carrick#4231) rides with the matcher: a tag that has
+# it ships it byte for byte, in the checksums, attached and announced by its
+# sha256; a tag from before it ships the matcher alone, as before.
+reasons_tag="$work/reasons-tag"
+mkdir -p "$reasons_tag/wasm-artifact" "$reasons_tag/src/sidecar/src/capture"
+for f in carrick_match.js carrick_match.d.ts carrick_match_bg.wasm; do echo "$f" > "$reasons_tag/wasm-artifact/$f"; done
+printf '{\n  "declared": { "sentence": "declared that way", "decided": "never" }\n}\n' \
+  > "$reasons_tag/src/sidecar/src/capture/type-reasons.json"
+reasons_sha="$(sha256sum "$reasons_tag/src/sidecar/src/capture/type-reasons.json" | awk '{print $1}')"
+(
+  cd "$reasons_tag"
+  : > "$calls"
+  "$script" checksums > /dev/null 2>&1 || true
+  "$script" upload-matcher carrick-v0.0.0 > /dev/null || true
+  "$script" dispatch carrick-v0.0.0 > /dev/null || true
+)
+if cmp -s "$reasons_tag/src/sidecar/src/capture/type-reasons.json" "$reasons_tag/wasm-artifact/type-reasons.json"; then
+  pass "reasons list: copied byte for byte beside the matcher"
+else
+  fail "reasons list: not copied byte for byte into wasm-artifact/"
+fi
+if grep -qx "$reasons_sha  type-reasons.json" "$reasons_tag/wasm-artifact/carrick_match.sha256" \
+  && [ "$(wc -l < "$reasons_tag/wasm-artifact/carrick_match.sha256" | tr -d ' ')" = 4 ]; then
+  pass "reasons list: in carrick_match.sha256 with the three matcher files"
+else
+  fail "reasons list: checksums are: $(cat "$reasons_tag/wasm-artifact/carrick_match.sha256" 2>/dev/null)"
+fi
+expect_call "$matcher_upload wasm-artifact/type-reasons.json --clobber" "reasons list: attached with the matcher"
+expect_call "client_payload[type_reasons_sha256]=$reasons_sha" "reasons list: announced by its sha256"
+expect_call "client_payload[wasm_sha256]=" "reasons list: the matcher is still announced"
+
+# A tag from before the list: the checksums, upload and dispatch are the matcher's alone.
+old_tag="$work/old-tag"
+mkdir -p "$old_tag/wasm-artifact"
+for f in carrick_match.js carrick_match.d.ts carrick_match_bg.wasm; do echo "$f" > "$old_tag/wasm-artifact/$f"; done
+(
+  cd "$old_tag"
+  : > "$calls"
+  "$script" checksums > "$work/old-log" 2>&1 || true
+  "$script" upload-matcher carrick-v0.0.0 > /dev/null || true
+  "$script" dispatch carrick-v0.0.0 > /dev/null || true
+)
+if [ "$(wc -l < "$old_tag/wasm-artifact/carrick_match.sha256" | tr -d ' ')" = 3 ] && grep -q "type-reasons.json" "$work/old-log"; then
+  pass "no reasons list: three checksums, and the log says the list is absent"
+else
+  fail "no reasons list: checksums $(cat "$old_tag/wasm-artifact/carrick_match.sha256" 2>/dev/null); log $(cat "$work/old-log")"
+fi
+expect_call "$matcher_upload --clobber" "no reasons list: the matcher attached alone"
+refuse_call "type-reasons" "no reasons list: nothing of it attached"
+refuse_call "type_reasons_sha256" "no reasons list: nothing of it announced"
+expect_call "client_payload[wasm_sha256]=" "no reasons list: the matcher announced"
+
 # The workflow runs the steps in that order, and no lister step can stop it.
 if python3 - "$workflow" <<'PY'
 import re, sys
@@ -120,6 +172,7 @@ def step(name):
         problems.append(f"no step named {name!r}")
         return (None, "")
     return by_name[name]
+checksums = step("Write checksums")
 matcher = step("Attach the matcher to the release")
 build = step("Build the surface lister")
 test = step("Test the surface lister on Node 22")
@@ -128,6 +181,10 @@ attach = step("Attach the surface lister to the release")
 dispatch = step("Dispatch pin bump to carrick-cloud")
 failed = step("Surface lister failed")
 if not problems:
+    if not checksums[0] < matcher[0]:
+        problems.append("the checksums are not written before the matcher is attached")
+    if "release-artifacts.sh checksums" not in checksums[1] or re.search(r"^\s+if:", checksums[1], re.M):
+        problems.append("the checksums step does not run the checksums arm unconditionally")
     if not matcher[0] < build[0] < test[0] < decide[0] < attach[0] < dispatch[0] < failed[0]:
         problems.append("steps out of order: matcher upload, lister build, test, decide, lister upload, dispatch, lister failure")
     for name, (_, body) in (("build", build), ("test", test), ("upload", attach)):
