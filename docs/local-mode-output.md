@@ -54,8 +54,8 @@ and the services that hold an operation reading a type declared in that file
 capture, no model, nothing on the wire — and re-runs the join over the blobs
 already in `.carrick/repos` plus the cached hosted snapshot, so the verdicts it
 prints are about the working tree rather than the tree the index was built on.
-A file in no service's directory has no own service, so it re-scans every
-service that reads it through its roots (`include` roots too) or an import, and
+A file in no service's directory has no service of its own. It re-scans every
+service that reads it through its roots (`include` roots too) or an import, or
 every service of the repo when that cannot be worked out.
 Every other service is judged at its newest known version: the copy the last
 re-check of it left in `.carrick/working/<index generation>/`, when its edits
@@ -87,8 +87,8 @@ A re-check that missed its budget is remembered in
 the indexed verdicts and the new functions from the parse, and its block
 carries `known_miss: true`. A miss on a file in no service's directory is
 recorded under `files`, keyed by repo and path. It silences later re-checks of
-that file only, never the services that read it. Another service of the same repo is still
-re-checked. On such a service `carrick check --changed` is the fresh read. A
+that file only, never the services that read it. Another service of the same
+repo is still re-checked. On such a service `carrick check --changed` is the fresh read. A
 service where the re-check fits never misses and is never recorded. A miss
 records the budget it ran under (`budget_ms`) and silences only a re-check
 whose own budget is no longer: a miss at ten seconds does not switch off a
@@ -96,10 +96,11 @@ re-check given three minutes. A misses file written before that field existed
 reads as no misses.
 `--no-rescan` (with `--recheck`, on one file or on `--each`) asks the question
 "does this edit need a re-scan" and never starts one. A file that is unchanged
-or gone, an edit that reads the same, and a known miss are answered at once. So is a
-path no scan reads (a README, a workflow) in any directory. So is a file in no
-service's directory whose edit reads the same, once every service of its repo
-was indexed at one clean commit. Any other edit comes back with `ran: none`, the indexed rows,
+or gone, an edit that reads the same, and a known miss are answered at once. A
+path that no scan reads, such as a README or a workflow, is answered at once in
+any directory. A file in no service's directory whose edit reads the same is
+answered at once when every service of its repo was indexed at one clean commit.
+Any other edit comes back with `ran: none`, the indexed rows,
 `new_functions`, and `deferred: true`. Nothing is staged and no miss is
 recorded. Run `--recheck` alone for the fresh answer.
 `carrick check --each <file>... --recheck --json` answers several files in one
@@ -681,9 +682,10 @@ that only adds request builders exits 0, and so does one that only changes a
 route those builders alone call (carrick#3532).
 
 A changed source file in no
-service's directory is checked when a service imports it: the repo is scanned
-and that service re-read. When no service imports it, the file is skipped and
-counted as "in no indexed service".
+service's directory is checked when a service imports it, or when that cannot
+be worked out. The repo is then scanned, and the services that read it are
+re-read. When no service imports it, the file is skipped and counted as "in no
+indexed service".
 
 A check that
 covered none of the files it was asked about exits 2, which no verdict uses:
