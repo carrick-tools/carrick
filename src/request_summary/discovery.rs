@@ -448,8 +448,8 @@ impl<'a> Labels<'a> {
     }
 
     /// The labelled global the language's own library declares as `name`,
-    /// as the store keys one: under a default-library key (`lib.dom`,
-    /// `lib:<file>`), whichever declaration file the compiler read it from.
+    /// as the store keys one: under a default-library key
+    /// (`lib:<file>`), whichever declaration file the compiler read it from.
     /// The first such key, in order, when several label it.
     fn global(&self, name: &str) -> Option<&'a ExportClaims> {
         self.by_name
@@ -4091,20 +4091,20 @@ mod tests {
         let with = walk(Some(&asked));
         assert_eq!(
             records(&with, "one-impl.ts", "notifier.notify"),
-            ["lib.dom.fetch @7 / site"],
+            ["lib:lib.dom.d.ts.fetch @7 / site"],
             "one implementation sending to a labelled end is a site"
         );
         assert_eq!(
             records(&with, "two-impls.ts", "channels[kind].push"),
             [
                 "fixture-socket.Socket.send @17 / several_implementations",
-                "lib.dom.fetch @9 / several_implementations",
+                "lib:lib.dom.d.ts.fetch @9 / several_implementations",
             ],
             "two implementations reaching different ends are a lead, each end kept"
         );
         assert_eq!(
             records(&with, "handler-table.ts", "live.send"),
-            ["lib.dom.fetch @7 / site"],
+            ["lib:lib.dom.d.ts.fetch @7 / site"],
             "a table entry's call through an interface member is followed"
         );
         let without = walk(None);
@@ -5443,7 +5443,7 @@ mod tests {
             let end = site.end.as_ref().expect("the call reaches fetch");
             assert_eq!(
                 (end.package.as_str(), end.export.as_str()),
-                ("lib.dom", "fetch")
+                ("lib:lib.dom.d.ts", "fetch")
             );
             assert!(end.file.ends_with("http.ts"), "{end:?}");
             let hops: Vec<(&str, u32)> = site
@@ -6514,7 +6514,7 @@ mod tests {
             let end = site.end.as_ref().expect("the call reaches fetch");
             assert_eq!(
                 (end.package.as_str(), end.export.as_str()),
-                ("lib.dom", "fetch"),
+                ("lib:lib.dom.d.ts", "fetch"),
                 "{file}"
             );
             assert_eq!(end.line, default, "{file}: the end is the default's call");
@@ -6609,7 +6609,7 @@ mod tests {
             let end = site.end.as_ref().expect("the call reaches fetch");
             assert_eq!(
                 (end.package.as_str(), end.export.as_str()),
-                ("lib.dom", "fetch")
+                ("lib:lib.dom.d.ts", "fetch")
             );
         }
         let [site] = at("events.ts", 13)[..] else {
@@ -7063,7 +7063,7 @@ export function listen(): void {
         let discovery = discover(&on.inputs, &Labels::of(&exports), &on.repo);
         assert_eq!(
             records_in(&discovery, "services/web/src/node-fetch.ts"),
-            texts(&["2 fetch -> lib.dom fetch -"])
+            texts(&["2 fetch -> lib:lib.dom.d.ts fetch -"])
         );
     }
 
@@ -7093,10 +7093,10 @@ export function listen(): void {
         assert_eq!(
             records_in(&discovery, "services/web/src/table.ts"),
             texts(&[
-                "3 fetch -> lib.dom fetch -",
-                "5 loadInner -> lib.dom fetch -",
-                "10 fetch -> lib.dom fetch -",
-                "15 table.load -> lib.dom fetch -",
+                "3 fetch -> lib:lib.dom.d.ts fetch -",
+                "5 loadInner -> lib:lib.dom.d.ts fetch -",
+                "10 fetch -> lib:lib.dom.d.ts fetch -",
+                "15 table.load -> lib:lib.dom.d.ts fetch -",
             ])
         );
         assert_eq!(
@@ -7214,7 +7214,7 @@ export function listen(): void {
             texts(&[
                 &format!("getItem {http}"),
                 &format!("send {http}"),
-                &format!("lib.dom fetch {http}")
+                &format!("lib:lib.dom.d.ts fetch {http}")
             ])
         );
         assert_eq!(
@@ -7222,7 +7222,7 @@ export function listen(): void {
             texts(&[
                 &format!("postTo {http}"),
                 &format!("send {http}"),
-                &format!("lib.dom fetch {http}")
+                &format!("lib:lib.dom.d.ts fetch {http}")
             ])
         );
         assert_eq!(
@@ -7230,7 +7230,7 @@ export function listen(): void {
             texts(&[
                 &format!("ItemsClient.remove {http}"),
                 &format!("send {http}"),
-                &format!("lib.dom fetch {http}")
+                &format!("lib:lib.dom.d.ts fetch {http}")
             ])
         );
         assert!(
@@ -7276,7 +7276,7 @@ export function listen(): void {
         // The sibling's own walk records its own call.
         let own = discover_with(client, &[app], &labels, &on.repo);
         assert!(
-            records_in(&own, http).contains(&"4 fetch -> lib.dom fetch -".to_string()),
+            records_in(&own, http).contains(&"4 fetch -> lib:lib.dom.d.ts fetch -".to_string()),
             "{:?}",
             records_in(&own, http)
         );

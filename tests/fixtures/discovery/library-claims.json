@@ -22,12 +22,12 @@
       ]
     },
     {
-      "package": "lib.dom",
-      "version": "0.0.0",
+      "package": "lib:lib.dom.d.ts",
+      "version": "6.0.2",
       "status": "answered",
       "exports": [
         {
-          "specifier": "lib.dom",
+          "specifier": "lib:lib.dom.d.ts",
           "export": "fetch",
           "role": "http_client",
           "side": "client",
