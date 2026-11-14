@@ -312,6 +312,7 @@ mod tests {
                 infer_kind: InferKind::FunctionReturn,
                 is_explicit: true,
                 type_state: ManifestTypeState::Explicit,
+                value_spans: Vec::new(),
             },
             resolved_definition: Some("User[]".to_string()),
             expanded_definition: Some("User[]".to_string()),

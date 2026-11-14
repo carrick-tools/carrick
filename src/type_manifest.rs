@@ -756,6 +756,7 @@ mod tests {
             infer_kind: crate::services::type_sidecar::InferKind::CallResult,
             is_explicit: false,
             type_state: ManifestTypeState::Unknown,
+            value_spans: Vec::new(),
         };
         TypeManifestEntry {
             key: OperationKey::http("GET", "/orders/:id"),

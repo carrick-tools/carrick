@@ -1,0 +1,8 @@
+{
+  "name": "producer-value-spans-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "res-kit": "^1.0.0"
+  }
+}
