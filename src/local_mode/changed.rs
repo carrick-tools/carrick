@@ -804,7 +804,10 @@ fn named_files(root: &Path, index: &LocalIndex, files: &[PathBuf]) -> (Vec<Chang
             rescan: None,
         });
     };
-    let mut outside: BTreeMap<String, (&IndexedRepo, Tree, Vec<(&Path, String)>)> = BTreeMap::new();
+    /// Per repo: the indexed repo, its tree, and the named files no service
+    /// covers, each with its repo-relative path.
+    type Outside<'a> = BTreeMap<String, (&'a IndexedRepo, Tree, Vec<(&'a Path, String)>)>;
+    let mut outside = Outside::new();
     for file in files {
         let Some((repo, relative, tree)) = index.locate_file(file) else {
             skip(&mut listed, file, "not in a repo of this workspace");
