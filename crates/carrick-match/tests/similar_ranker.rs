@@ -286,3 +286,58 @@ fn the_score_is_bm25_over_the_bag_less_the_query_idf_mass() {
     assert!((got("beta") - want_beta).abs() < 1e-9);
     assert_eq!(rows.len(), 2);
 }
+
+/// A deterministic shuffle (xorshift), so a failure names a seed that repeats.
+fn shuffled<T>(mut items: Vec<T>, seed: u64) -> Vec<T> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for at in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(at, (state % (at as u64 + 1)) as usize);
+    }
+    items
+}
+
+/// Eight functions with the same words score the same; the rows that fit the
+/// cut must not depend on the order the index was fed.
+#[test]
+fn equal_scores_rank_the_same_whatever_order_the_index_was_built_in() {
+    let tokens = ["window", "span", "clamp", "bucket"];
+    let files = [
+        "a/one.ts",
+        "b/two.ts",
+        "c/three.ts",
+        "d/four.ts",
+        "e/five.ts",
+        "f/six.ts",
+        "g/seven.ts",
+        "h/eight.ts",
+    ];
+    let names = [
+        "pickAlpha",
+        "pickBravo",
+        "pickCharlie",
+        "pickDelta",
+        "pickEcho",
+        "pickFoxtrot",
+        "pickGolf",
+        "pickHotel",
+    ];
+    let query_tokens = texts(&tokens);
+    for seed in 0..20u64 {
+        let mut corpus = filler();
+        corpus.extend(
+            files
+                .iter()
+                .zip(names)
+                .map(|(file, name)| function(name, file, &tokens)),
+        );
+        let corpus = shuffled(corpus, seed);
+        let ranked = index(&corpus).rank(&query("clampWindow", "z/mine.ts", &query_tokens, &[]));
+        assert_eq!(ranked.len(), SIMILAR_ROWS);
+        let got: Vec<&str> = ranked.iter().map(|row| corpus[row.doc].file).collect();
+        // Scores tie, so the file path breaks it: the first six paths, in order.
+        assert_eq!(got, files[..SIMILAR_ROWS], "seed {seed}");
+    }
+}
