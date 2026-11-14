@@ -2201,8 +2201,12 @@ pub(super) struct Chains<'a> {
     /// (file, whether a construction, span start, span end) of a call ->
     /// each definition it hands on by name: the argument, the keys down to
     /// it and its key, read off [`Calls::handed_on`] (carrick#4176).
-    handed_by_call: HashMap<(&'a Path, bool, u32, u32), Vec<(usize, Vec<String>, String)>>,
+    handed_by_call: HashMap<(&'a Path, bool, u32, u32), Vec<HandedName>>,
 }
+
+/// A definition a call hands on by name: the argument, the keys down to it
+/// and its key.
+type HandedName = (usize, Vec<String>, String);
 
 /// One call or construction of a node, by its index in [`FnIr::calls`] or
 /// [`FnIr::constructions`].
@@ -2296,7 +2300,7 @@ impl<'a> Chains<'a> {
                 map.insert((node.file, call.site.lo, call.site.hi), (index, i));
             }
         }
-        let mut handed_by_call: HashMap<_, Vec<(usize, Vec<String>, String)>> = HashMap::new();
+        let mut handed_by_call: HashMap<_, Vec<HandedName>> = HashMap::new();
         for ((_, key), handed) in chains.callers.every_handed_on() {
             if handed.optional {
                 continue;
