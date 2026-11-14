@@ -992,7 +992,7 @@ fn a_fact_replaces_a_base_path_row_stating_its_operation() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, same)],
+            vec![(file.to_string(), LINE, same.clone(), Some(same))],
             "{source:?}"
         );
         assert!(fold.kept_out.is_empty(), "{source:?}: {:?}", fold.kept_out);
