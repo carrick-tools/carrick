@@ -9636,7 +9636,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                     .map(|(_, inputs)| inputs)
                     .collect();
                 let declarations = super::super::fixture_walk::census_declarations(
-                    &script, &on.repo, config, own, &exports,
+                    &script, &on.repo, config, own, &siblings, &exports,
                 );
                 use super::super::decided_sites::{
                     MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
