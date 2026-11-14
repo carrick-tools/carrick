@@ -4217,6 +4217,7 @@ impl<'a> Resolver<'a> {
             .as_ref()
             .ok_or(guards::HoleReason::RowsMissing)?
             .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
+            .map_err(|_| guards::HoleReason::RowsMissing)
     }
 
     /// The module binding `row` names, when its declaration is one a file
