@@ -71,6 +71,23 @@ export async function itemRoutes(app: ServerInstance) {
     return reply.send(request.body);
   });
 }
+
+interface OwnRequest { body: unknown }
+interface OwnReply { send(value?: unknown): OwnReply; code(status: number): OwnReply }
+interface OwnServer { post(path: string, handler: (request: OwnRequest, reply: OwnReply) => unknown): OwnServer }
+
+export function ownRoutes(own: OwnServer) {
+  own.post('/own-typed', async (_request, reply) => reply.send([item]));
+  own.post('/own-unknown', async (request, reply) => reply.code(201).send(request.body));
+  own.post('/own-block', async (_request, reply) => {
+    return reply.send([item]);
+  });
+}
+
+interface Builder { name: string; set(value: string): Builder }
+export function configure(builder: Builder): Builder {
+  return builder.set('x');
+}
 `;
 
 interface InferShape {
@@ -83,7 +100,7 @@ interface InferShape {
 
 /** The span of the registration call for `route`, as the scanner sends it. */
 function registration(route: string): { start: number; end: number; line: number } {
-  const start = ROUTES_TS.search(new RegExp(`app\\.(get|post)\\('${route}'`));
+  const start = ROUTES_TS.search(new RegExp(`(app|own)\\.(get|post)\\('${route}'`));
   assert.ok(start >= 0, `fixture must register ${route}`);
   let depth = 0;
   for (let i = start; i < ROUTES_TS.length; i += 1) {
@@ -96,6 +113,31 @@ function registration(route: string): { start: number; end: number; line: number
     }
   }
   throw new Error(`unbalanced registration for ${route}`);
+}
+
+/**
+ * The span of the send a route's handler returns, as the scanner sends it
+ * when it names the send: from the receiver to the send's closing paren, on
+ * the send's own line.
+ */
+function returnedSend(route: string): { start: number; end: number; line: number } {
+  const span = registration(route);
+  const arrow = ROUTES_TS.indexOf('=>', span.start);
+  const body = ROUTES_TS.slice(arrow + 2, span.end);
+  const offset = body.search(/reply\./);
+  assert.ok(offset >= 0, `${route} must return a send`);
+  const start = arrow + 2 + offset;
+  let depth = 0;
+  for (let i = start; i < span.end; i += 1) {
+    if (ROUTES_TS[i] === '(') depth += 1;
+    if (ROUTES_TS[i] === ')') {
+      depth -= 1;
+      if (depth === 0 && ROUTES_TS[i + 1] !== '.') {
+        return { start, end: i + 1, line: ROUTES_TS.slice(0, start).split('\n').length };
+      }
+    }
+  }
+  throw new Error(`unbalanced send for ${route}`);
 }
 
 describe('carrick#4269: a returned send of an unknown body never publishes the reply', () => {
@@ -152,8 +194,8 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
   });
 
   /** The response answer for a route, asked by its registration span or by line. */
-  const responseBody = async (route: string, by: 'span' | 'line') => {
-    const span = registration(route);
+  const responseBody = async (route: string, by: 'span' | 'line' | 'send') => {
+    const span = by === 'send' ? returnedSend(route) : registration(route);
     const alias = `Response_${by}_${route.replace(/\W/g, '_')}`;
     const response = await client.send<InferShape>({
       action: 'infer',
@@ -162,7 +204,7 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
         {
           file_path: routesPath,
           line_number: span.line,
-          ...(by === 'span' ? { span_start: span.start, span_end: span.end } : {}),
+          ...(by !== 'line' ? { span_start: span.start, span_end: span.end } : {}),
           infer_kind: 'response_body',
           alias,
         },
@@ -202,6 +244,40 @@ describe('carrick#4269: a returned send of an unknown body never publishes the r
       );
     });
   }
+
+  // carrick#4283: the same reply declared in the repository is transport too,
+  // when the shape says so: the handler a registration hands it to returns a
+  // call on it that hands the reply back and is given the value it sends.
+  for (const by of ['span', 'line', 'send'] as const) {
+    for (const route of ['/own-typed', '/own-block']) {
+      it(`${route}: a repository-declared reply's send reads the value it sends (by ${by})`, async () => {
+        const answer = await responseBody(route, by);
+        assert.ok(answer, `${route} must answer`);
+        assert.doesNotMatch(answer.type_string, /send/);
+        assert.match(answer.type_string, /id: string/);
+      });
+    }
+
+    it(`/own-unknown: a repository-declared reply's unknown send answers unknown, never the reply (by ${by})`, async () => {
+      const answer = await responseBody('/own-unknown', by);
+      assert.ok(answer, '/own-unknown must answer');
+      assert.strictEqual(answer.type_string, 'unknown');
+    });
+  }
+
+  it('a function returning a fluent call on its own repository-declared parameter keeps its answer', async () => {
+    const line = ROUTES_TS.slice(0, ROUTES_TS.indexOf('export function configure')).split('\n').length;
+    const response = await client.send<InferShape>({
+      action: 'infer',
+      request_id: 'infer-configure',
+      requests: [
+        { file_path: routesPath, line_number: line, infer_kind: 'function_return', alias: 'Configure' },
+      ],
+    });
+    const answer = response.inferred_types?.find((t) => t.alias === 'Configure');
+    assert.ok(answer, 'the function return must answer');
+    assert.match(answer.type_string, /name: string/);
+  });
 
   it('a function returning its own repository-declared parameter type keeps its answer', async () => {
     const line = ROUTES_TS.slice(0, ROUTES_TS.indexOf('export function withDefaults')).split('\n').length;
