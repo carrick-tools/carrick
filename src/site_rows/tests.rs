@@ -862,7 +862,12 @@ fn a_fact_replaces_an_old_path_row_at_its_site() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, old)],
+            vec![(
+                file.to_string(),
+                LINE,
+                old,
+                Some(OperationKey::http("POST", "/v1/items"))
+            )],
             "{source:?}"
         );
     }
@@ -889,7 +894,7 @@ fn a_fact_replaces_an_old_path_row_stating_its_operation() {
         );
         assert_eq!(
             fold.replaced_by_fact,
-            vec![(file.to_string(), LINE, same)],
+            vec![(file.to_string(), LINE, same.clone(), Some(same))],
             "{source:?}"
         );
         assert!(fold.kept_out.is_empty(), "{source:?}: {:?}", fold.kept_out);
@@ -1139,8 +1144,8 @@ fn a_row_keyed_as_another_site_row_at_the_call_is_that_rows() {
     assert_eq!(
         fold.replaced_by_fact,
         vec![
-            (file.to_string(), LINE, same),
-            (file.to_string(), LINE, other),
+            (file.to_string(), LINE, same.clone(), Some(same)),
+            (file.to_string(), LINE, other.clone(), Some(other)),
         ]
     );
 }
@@ -1830,6 +1835,61 @@ fn a_fact_reads_its_graph_values_from_the_removed_row_of_its_own_key() {
     assert_eq!(other_row.base, None);
 }
 
+/// carrick#4463: where one line holds two calls and only one call's fact
+/// replaced a row there, the other fact's graph row reads none of it: the
+/// removed row is the first call's, read off a misreading of its spelling.
+#[test]
+fn a_fact_with_no_row_of_its_own_reads_no_graph_values() {
+    let file = "src/forced-http.ts";
+    let other = OperationKey::http("POST", "/v1/other");
+    let site = two_facts_on_one_line(file, &other);
+    // One old-path row of a third operation: the first fact replaces it
+    // (carrick#3283), and the second fact's call held no row.
+    let misread = OperationKey::http("POST", "${HOST}/items");
+    let mut removed = graph_call(
+        "POST",
+        "${HOST}/items",
+        file,
+        ResolutionSource::SameFileWrapper,
+    );
+    removed.client = "sendA".to_string();
+    removed.host = Some("api.example.test".to_string());
+    let mut data = blob_with_graph(
+        vec![blob_row(
+            misread.clone(),
+            file,
+            LINE,
+            Some(ResolutionSource::SameFileWrapper),
+        )],
+        vec![removed],
+    );
+    let fold = fold_into(&mut data, &site);
+    assert_eq!(
+        fold.replaced_by_fact,
+        vec![(
+            file.to_string(),
+            LINE,
+            misread,
+            Some(OperationKey::http("POST", "/v1/items"))
+        )]
+    );
+    let graph = data.mount_graph.unwrap().data_calls;
+    assert_eq!(graph.len(), 2, "{graph:?}");
+    let of = |path: &str| {
+        graph
+            .iter()
+            .find(|call| call.canonical_path == path)
+            .unwrap_or_else(|| panic!("{path} joins the graph: {graph:?}"))
+    };
+    let items = of("/v1/items");
+    assert_eq!(items.client, "sendA");
+    assert_eq!(items.host.as_deref(), Some("api.example.test"));
+    let other_row = of("/v1/other");
+    assert_eq!(other_row.client, "");
+    assert_eq!(other_row.host, None);
+    assert_eq!(other_row.base, None);
+}
+
 /// A candidate replacement (an answer in the band) leaves the graph as it
 /// was: the reader's row stays, and nothing is added.
 #[test]
@@ -2012,7 +2072,7 @@ fn a_module_callers_fact_withdraws_the_reader_row_at_the_request_line() {
     );
     assert!(
         fold.replaced_by_fact
-            .contains(&(HELD_LINE.to_string(), LINE, key))
+            .contains(&(HELD_LINE.to_string(), LINE, key, None))
     );
     assert_eq!(
         fold.stated_at_fact_callers,

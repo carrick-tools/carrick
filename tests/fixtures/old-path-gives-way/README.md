@@ -16,9 +16,11 @@ are invented.
 | `two-wrappers.ts` | 4 | both from the request summary, each with its own graph client, host and base (`sendA`, `a.example.test`, none; `sendB`, none, `env`) | As `two-same.ts`, through two wrappers. Each fact's graph row reads the removed wrapper row of its own operation. |
 | `mixed-plain.ts` | 5 | `POST /q/a` and `POST /q/b`, both from the wrapper pass | `/q/b` goes to an unlabelled client and has no fact or site row, so the fold cannot tell which call its row belongs to. `/q/a`'s fact is kept out, so the `/q/b` row is not lost. |
 | `mixed.ts` | 4 | `POST /v/a` from the wrapper pass beside `GET /v/b` from the request summary | The line also holds the other call's summary row, of another operation, so `/v/a`'s wrapper row keeps its fact out. |
+| `base-mixed.ts` | 3 | `POST https://api.example.com/m/a` from the literal base-path pass beside `POST /m/b` from the request summary, whose graph row names no client, host or base | `/m/b`'s fact is not kept out by `/m/a`'s row: `/m/a` is the other call's site row (carrick#4463). `/m/a`'s own fact is kept out by its base-path row (carrick#4434). `/m/b` reads no graph values: the line held no row of its own. |
 | `unlabelled.ts` | 3 | `POST /u/a` from the wrapper pass | No label, no fact. |
 
 The scan log's fold line reads
-`kept_out={"request_summary": 1, "same_file_wrapper": 2}`: two facts kept
-out by a wrapper row (`mixed-plain.ts` and `mixed.ts` one each) and
+`kept_out={"literal_base_path": 1, "request_summary": 1, "same_file_wrapper": 2}`:
+two facts kept out by a wrapper row (`mixed-plain.ts` and `mixed.ts` one
+each), `base-mixed.ts`'s `/m/a`, kept out by its base-path row, and
 `same-twice.ts`'s second call, kept out by the first call's fact.

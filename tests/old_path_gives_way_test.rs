@@ -254,11 +254,15 @@ fn a_fact_replaces_the_same_key_old_path_row_at_its_call() {
     // Kept out by a wrapper row, under the mixed guard: mixed-plain (1,
     // whose second call states no site row) and mixed.ts (1, whose line
     // also holds the summary row of another request). Kept out by the
-    // first call's fact: same-twice's second call. Two calls on one line
-    // that each state a site row keep none out (carrick#4433).
+    // first call's fact: same-twice's second call. Kept out by a base-path
+    // row of its own operation: base-mixed's `/m/a` (carrick#4434). Two
+    // calls on one line that each state a site row keep none out
+    // (carrick#4433).
     let line = fold_line();
     assert!(
-        line.contains(r#"kept_out={"request_summary": 1, "same_file_wrapper": 2}"#),
+        line.contains(
+            r#"kept_out={"literal_base_path": 1, "request_summary": 1, "same_file_wrapper": 2}"#
+        ),
         "{line}"
     );
 }
@@ -298,6 +302,27 @@ fn two_wrappers_on_one_line_keep_their_own_client_host_and_base() {
         [
             "POST ${process.env.B_BASE}/y/b wrapper_call client=sendB host=none base=env",
             "POST https://a.example.test/y/a wrapper_call client=sendA host=a.example.test base=none"
+        ]
+    );
+}
+
+/// carrick#4463: a call whose neighbour on the line states a base-path row
+/// of another operation states its own row, and reads no graph values off
+/// the neighbour's call: it names no host.
+#[test]
+fn a_plain_call_beside_a_base_path_call_states_its_own_row() {
+    assert_eq!(
+        calls_at("src/base-mixed.ts:3"),
+        [
+            "POST /m/b request_summary",
+            "POST https://api.example.com/m/a literal_base_path"
+        ]
+    );
+    assert_eq!(
+        graph_at("src/base-mixed.ts:3"),
+        [
+            "POST /m/b none client= host=none base=none",
+            "POST https://api.example.com/m/a network_request client=post host=api.example.com base=none"
         ]
     );
 }

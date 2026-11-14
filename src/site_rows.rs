@@ -1289,10 +1289,13 @@ pub struct SiteFold {
     pub through_folded: Vec<(String, u32, OperationKey)>,
     /// Of `withdrawn`, the call-side reader rows a FACT site row replaced,
     /// at its own line or at a request line its module-level callers' facts
-    /// state (carrick#4121), as `(file, line, key)`: the mount graph's copy
-    /// of each goes too (carrick#2795). A row an in-band candidate replaced
-    /// is not here: the graph keeps the reader's row beside the candidate.
-    pub replaced_by_fact: Vec<(String, u32, OperationKey)>,
+    /// state (carrick#4121), as `(file, line, key, by)`: the mount graph's
+    /// copy of each goes too (carrick#2795). `by` is the key of the fact
+    /// that replaced it at its own line, the one whose graph row may read
+    /// it (carrick#4463); `None` at a request line its callers' facts state.
+    /// A row an in-band candidate replaced is not here: the graph keeps the
+    /// reader's row beside the candidate.
+    pub replaced_by_fact: Vec<(String, u32, OperationKey, Option<OperationKey>)>,
     /// The request lines ([`SiteRows::held_open`]) whose reader row went
     /// because a fact row stands at each of their calls the summaries state
     /// no row for (carrick#4121, carrick#4127), as `(file, span start)`. The
@@ -1423,7 +1426,12 @@ pub fn fold(
                 .partition(|call| {
                     fold.through_folded
                         .iter()
-                        .chain(fold.replaced_by_fact.iter())
+                        .map(|(file, line, key)| (file, line, key))
+                        .chain(
+                            fold.replaced_by_fact
+                                .iter()
+                                .map(|(file, line, key, _)| (file, line, key)),
+                        )
                         .any(|(file, line, key)| is_model_row_of(call, file, *line, key))
                 });
         graph.data_calls = kept;
@@ -1463,7 +1471,9 @@ pub fn fold(
             // are read off the call too, so they come from the same row.
             // Two calls on one line are two removed rows there (carrick#4433):
             // the row stating the fact's key is its call's, else the one row
-            // the line held (a misread of the call, carrick#3283), else none.
+            // this fact replaced (a misread of its call, carrick#3283), else
+            // none. A row another call's fact replaced is that call's, so a
+            // fact with no row of its own reads none (carrick#4463).
             let at_line: Vec<&DataFetchingCall> = removed
                 .iter()
                 .filter(|call| {
@@ -1472,12 +1482,27 @@ pub fn fold(
                     })
                 })
                 .collect();
+            let own: Vec<&DataFetchingCall> = at_line
+                .iter()
+                .copied()
+                .filter(|call| {
+                    fold.replaced_by_fact.iter().any(|(file, line, gone, by)| {
+                        *file == row.file
+                            && *line == row.line
+                            && by.as_ref() == Some(&row.key)
+                            && gone.as_http().is_some_and(|(method, path)| {
+                                call.method.eq_ignore_ascii_case(method)
+                                    && call.canonical_path == path
+                            })
+                    })
+                })
+                .collect();
             let read = at_line
                 .iter()
                 .find(|call| {
                     call.method.eq_ignore_ascii_case(method) && call.canonical_path == path
                 })
-                .or_else(|| match at_line.as_slice() {
+                .or_else(|| match own.as_slice() {
                     [one] => Some(one),
                     _ => None,
                 })
@@ -1733,8 +1758,12 @@ pub fn fold_rows(
         for index in withdrawn.into_iter().rev() {
             let gone = rows.remove(index);
             if row.fact() && row.side == RowSide::Call {
-                out.replaced_by_fact
-                    .push((row.file.clone(), row.line, gone.key.clone()));
+                out.replaced_by_fact.push((
+                    row.file.clone(),
+                    row.line,
+                    gone.key.clone(),
+                    Some(row.key.clone()),
+                ));
             }
             out.withdrawn
                 .push((row.file.clone(), row.line, gone.key, row.side));
@@ -1877,7 +1906,7 @@ pub fn fold_rows(
     for (index, held) in stated_at_module {
         let gone = calls.remove(index);
         out.replaced_by_fact
-            .push((held.file.clone(), held.line, gone.key.clone()));
+            .push((held.file.clone(), held.line, gone.key.clone(), None));
         out.withdrawn
             .push((held.file.clone(), held.line, gone.key, RowSide::Call));
         out.stated_at_fact_callers
