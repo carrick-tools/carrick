@@ -82,6 +82,14 @@ pub(crate) struct ParamDecl {
     /// The body assigns the parameter again, so what it sends through it is
     /// not what the caller passed.
     assigned_again: bool,
+    /// The body writes onto the parameter's own members (`init.body = x`,
+    /// `delete init.x`, `init.n++`), so an object a caller hands in is not
+    /// what the function goes on to send (carrick#4324).
+    written_onto: bool,
+    /// The span of every call or construction that takes the parameter as
+    /// an argument, in SWC's numbering: a callee the scan may not see into
+    /// can write onto what it is handed (carrick#4324).
+    handed_to: Vec<(u32, u32)>,
 }
 
 impl ParamDecl {
@@ -97,7 +105,19 @@ impl ParamDecl {
             .into_iter()
             .map(|pat| {
                 let mut decl = Self::of(pat, source_map)?;
-                decl.assigned_again = body.is_some_and(|body| assigns(body, &decl.key));
+                if let Some(body) = body {
+                    let writes = assigns(body, &decl.key);
+                    decl.assigned_again = writes.again;
+                    decl.written_onto = writes.onto;
+                    decl.handed_to = writes
+                        .handed
+                        .iter()
+                        .map(|span| {
+                            let at = declared_at(*span, source_map);
+                            (at.span_start, at.span_end)
+                        })
+                        .collect();
+                }
                 Some(decl)
             })
             .collect()
@@ -124,12 +144,29 @@ impl ParamDecl {
             annotated: annotation.is_some_and(|annotation| !is_top_type(annotation)),
             mentions: mentions.names,
             assigned_again: false,
+            written_onto: false,
+            handed_to: Vec::new(),
         })
     }
 
     /// Whether the function's body assigns the parameter again.
     pub(crate) fn assigned_again(&self) -> bool {
         self.assigned_again
+    }
+
+    /// Whether the function's body writes onto the parameter's members.
+    pub(crate) fn written_onto(&self) -> bool {
+        self.written_onto
+    }
+
+    /// Whether the parameter is handed to a call or construction that is
+    /// not the one at `span` (SWC numbering) or written inside it (a helper
+    /// the walk already reads the value through): that callee may write
+    /// onto it.
+    pub(crate) fn handed_beyond(&self, span: (u32, u32)) -> bool {
+        self.handed_to
+            .iter()
+            .any(|&(start, end)| !(span.0 <= start && end <= span.1))
     }
 
     /// What a call's body is when the function sends this parameter as its
@@ -230,14 +267,28 @@ impl Visit for TypeNames {
     }
 }
 
-/// Whether `node` assigns the binding `key` again.
-pub(crate) fn assigns<N: VisitWith<Assigns>>(node: &N, key: &BindingKey) -> bool {
+/// What a body does to a binding: assigns it again, writes onto its members,
+/// and the calls it is handed to.
+pub(crate) struct Writes {
+    again: bool,
+    onto: bool,
+    handed: Vec<Span>,
+}
+
+/// What `node` does to the binding `key`.
+pub(crate) fn assigns<N: VisitWith<Assigns>>(node: &N, key: &BindingKey) -> Writes {
     let mut assigns = Assigns {
         key: key.clone(),
         found: false,
+        onto: false,
+        handed: Vec::new(),
     };
     node.visit_with(&mut assigns);
-    assigns.found
+    Writes {
+        again: assigns.found,
+        onto: assigns.onto,
+        handed: assigns.handed,
+    }
 }
 
 /// The walk behind [`assigns`]: an assignment whose target is the binding
@@ -245,6 +296,46 @@ pub(crate) fn assigns<N: VisitWith<Assigns>>(node: &N, key: &BindingKey) -> bool
 pub(crate) struct Assigns {
     key: BindingKey,
     found: bool,
+    /// A member of the binding is assigned, updated or deleted.
+    onto: bool,
+    /// The calls and constructions that take the binding as an argument.
+    handed: Vec<Span>,
+}
+
+impl Assigns {
+    /// Whether an argument is the binding itself (through parentheses and
+    /// type assertions).
+    fn is_binding(&self, arg: &ExprOrSpread) -> bool {
+        if arg.spread.is_some() {
+            return false;
+        }
+        let mut at = &*arg.expr;
+        loop {
+            match at {
+                Expr::Paren(inner) => at = &inner.expr,
+                Expr::TsAs(inner) => at = &inner.expr,
+                Expr::TsNonNull(inner) => at = &inner.expr,
+                Expr::TsTypeAssertion(inner) => at = &inner.expr,
+                Expr::TsSatisfies(inner) => at = &inner.expr,
+                Expr::Ident(ident) => return ident_key(ident) == self.key,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether `target` is a member of the binding, at any depth
+    /// (`init.a.b`, `init["x"]`).
+    fn is_member_of_binding(&self, member: &MemberExpr) -> bool {
+        let mut at = &*member.obj;
+        loop {
+            match at {
+                Expr::Member(inner) => at = &inner.obj,
+                Expr::Paren(paren) => at = &paren.expr,
+                Expr::Ident(ident) => return ident_key(ident) == self.key,
+                _ => return false,
+            }
+        }
+    }
 }
 
 impl Visit for Assigns {
@@ -261,6 +352,9 @@ impl Visit for Assigns {
                 pat.visit_with(&mut bound);
                 self.found |= bound.found;
             }
+            AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
+                self.onto |= self.is_member_of_binding(member);
+            }
             _ => {}
         }
         assign.visit_children_with(self);
@@ -269,8 +363,33 @@ impl Visit for Assigns {
     fn visit_update_expr(&mut self, update: &UpdateExpr) {
         if let Expr::Ident(ident) = &*update.arg {
             self.found |= ident_key(ident) == self.key;
+        } else if let Expr::Member(member) = &*update.arg {
+            self.onto |= self.is_member_of_binding(member);
         }
         update.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if call.args.iter().any(|arg| self.is_binding(arg)) {
+            self.handed.push(call.span);
+        }
+        call.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        if new.args.iter().flatten().any(|arg| self.is_binding(arg)) {
+            self.handed.push(new.span);
+        }
+        new.visit_children_with(self);
+    }
+
+    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
+        if unary.op == UnaryOp::Delete
+            && let Expr::Member(member) = &*unary.arg
+        {
+            self.onto |= self.is_member_of_binding(member);
+        }
+        unary.visit_children_with(self);
     }
 }
 

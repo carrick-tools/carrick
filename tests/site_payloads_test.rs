@@ -282,6 +282,27 @@ fn a_call_that_writes_no_body_argument_is_decided_no_body() {
     assert!(order.contains("sku: string"), "{order}");
 }
 
+/// carrick#4324: a wrapper that writes the body onto the options its caller
+/// hands it sends a body the caller's literal does not show. Lines 33 and 38 of
+/// `tests/fixtures/site-payloads-absent-body/src/orders.ts`
+/// (`stamp(..., { headers: {} })`, whose `stamp` sets `init.data`) is not
+/// decided "no body".
+#[test]
+fn a_wrapper_that_writes_onto_the_options_it_is_handed_is_not_decided_no_body() {
+    let repo =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/site-payloads-absent-body");
+    let on = scan(&repo, &[]);
+    // Line 38 is the same through a helper the wrapper hands the options to.
+    for line in [33, 38] {
+        let reasons = root_reasons(&on, "src/orders.ts", line);
+        assert_eq!(
+            reasons,
+            vec!["not_located".to_string()],
+            "{line} {reasons:?}"
+        );
+    }
+}
+
 /// carrick#2472 C3: a pub/sub payload a slot types is read there, not at the
 /// symbol the reader named.
 ///

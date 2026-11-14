@@ -68,3 +68,38 @@ export function spread(rest: [RequestInit]): Promise<Response> {
 export function options(): Promise<Response> {
   return fetch(`${process.env.API}/absent/options`, { headers: {} });
 }
+
+// A wrapper that writes the body onto the options its caller hands it: the
+// caller's literal lacks `body`, yet the request carries one (carrick#4324).
+function stamp(path: string, init: RequestInit) {
+  init.body = "x";
+  return fetch(`${process.env.API}${path}`, init);
+}
+
+export function stamped(): Promise<Response> {
+  return stamp("/absent/stamped", { method: "POST" });
+}
+
+// Control: a wrapper that only hands the options on writes nothing onto them.
+function forward(path: string, init: RequestInit) {
+  return fetch(`${process.env.API}${path}/forwarded`, init);
+}
+
+export function forwarded(): Promise<Response> {
+  return forward("/absent/forwarded", { method: "POST" });
+}
+
+// A wrapper that hands the options to a helper before it sends them: the
+// helper may write the body onto them.
+function addBody(init: RequestInit) {
+  init.body = "x";
+}
+
+function helped(path: string, init: RequestInit) {
+  addBody(init);
+  return fetch(`${process.env.API}${path}/helped`, init);
+}
+
+export function helpedCaller(): Promise<Response> {
+  return helped("/absent/helped", { method: "POST" });
+}
