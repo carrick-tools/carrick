@@ -920,3 +920,74 @@ fn a_send_a_sibling_makes_on_a_value_nothing_reads_is_saved_as_missed_inside() {
         );
     }
 }
+
+/// The unread site of `blob` at `file:line`, when it has one.
+fn unread_site_of<'a>(
+    blob: &'a serde_json::Value,
+    file: &str,
+    line: u64,
+) -> Option<&'a serde_json::Value> {
+    blob["unread_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|site| site["file"] == file && site["line"] == line)
+}
+
+/// carrick#4445 T1: the kit sends through a value another call made, and the
+/// app never calls those members itself. The declaration ask lists the
+/// members the kit's rows call, so the queue send the app relays at line 2
+/// (`new Queue('kit-literal').add`) is read through its declaration: a
+/// possible call with its reason, and an unread site naming the labelled end.
+/// The controls and the HTTP rows do not move. The answer key is
+/// `tests/fixtures/sibling-chained-sends/README.md`.
+#[test]
+fn a_service_reads_a_send_a_sibling_makes_on_a_call_s_value() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "sibling-chained-sends", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/relay.ts";
+    let lead_at = |line: u64| {
+        app["possible_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|lead| lead["file_path"] == relay && lead["line_number"] == line)
+    };
+    let lead = lead_at(2).unwrap_or_else(|| panic!("no lead at line 2: {}", app["possible_calls"]));
+    assert_eq!(lead["kind"], "pubsub", "{lead}");
+    assert_eq!(lead["role"], "producer", "{lead}");
+    assert_eq!(lead["unread"]["reason"], "unanswered", "{lead}");
+    let site = unread_site_of(app, relay, 2)
+        .unwrap_or_else(|| panic!("no unread site at line 2: {}", app["unread_sites"]));
+    assert_eq!(site["reason"], "unanswered", "{site}");
+    assert_eq!(site["slot"], "kind", "{site}");
+    assert_eq!(site["labelled_end"]["export"], "Queue", "{site}");
+    assert_eq!(site["labelled_end"]["member"], "add", "{site}");
+    for line in [3, 4] {
+        let site = unread_site_of(app, relay, line)
+            .unwrap_or_else(|| panic!("{line}: {}", app["unread_sites"]));
+        assert_eq!(site["reason"], "unanswered", "{line}: {site}");
+        assert_eq!(site["slot"], "kind", "{line}: {site}");
+    }
+    for line in [5, 6] {
+        assert!(unread_site_of(app, relay, line).is_none(), "{line}");
+        assert!(lead_at(line).is_none(), "{line}");
+    }
+    for path in ["/kit/chained", "/kit/held"] {
+        assert!(
+            app["calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|row| row["key"]["path"] == path && row["key"]["method"] == "GET"),
+            "{path}: {}",
+            app["calls"]
+        );
+    }
+}

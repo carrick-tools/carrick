@@ -826,96 +826,123 @@ pub(crate) fn claim_receivers(
 
 /// The ask for the service `inputs` reads, under the store's answer
 /// `exports`. Nothing without rows, or with no member any op names.
-pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) -> DeclarationAsk {
+///
+/// `siblings` are the services the walk may enter. A send in a sibling's
+/// function on a call's value is read through its declaration, and a member
+/// only the sibling's rows call is not one the own rows name (carrick#4445),
+/// the way the store ask already merges the siblings' packages (#2618). The
+/// own service's op checks come first and the siblings-only ones follow, so
+/// the verifier's time limit cuts a sibling's check before an own one.
+pub fn declaration_ask(
+    inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
+    exports: &[ExportClaims],
+) -> DeclarationAsk {
     let mut ask = DeclarationAsk::default();
     let Some(positions) = inputs.positions.as_ref() else {
         return ask;
     };
-    let called: HashSet<(String, String)> = positions
-        .call_rows()
-        .chain(positions.member_rows())
-        .filter(|row| !in_repo(row))
-        .flat_map(|row| {
-            let symbol = row.symbol().map(str::to_string);
-            store_keys(row, exports)
-                .into_iter()
-                .filter_map(move |key| Some((key, symbol.clone()?)))
-        })
+    let called_by = |positions: &crate::position_rows::PositionIndex| -> HashSet<(String, String)> {
+        positions
+            .call_rows()
+            .chain(positions.member_rows())
+            .filter(|row| !in_repo(row))
+            .flat_map(|row| {
+                let symbol = row.symbol().map(str::to_string);
+                store_keys(row, exports)
+                    .into_iter()
+                    .filter_map(move |key| Some((key, symbol.clone()?)))
+            })
+            .collect()
+    };
+    let own = called_by(positions);
+    let sibling_only: HashSet<(String, String)> = siblings
+        .iter()
+        .take(0)
+        .filter_map(|sibling| sibling.positions.as_ref())
+        .flat_map(called_by)
+        .filter(|pair| !own.contains(pair))
         .collect();
     // The scope checks, asked once every export's op checks are in.
     let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
-    for export in exports
-        .iter()
-        .filter(|export| export.role != LibraryRole::None)
-    {
-        let claims = export.claims_with_scopes_by_id();
-        let wanted: Vec<&(String, &LibraryClaim)> = claims
+    let mut made: HashSet<(String, String)> = HashSet::new();
+    for called in [&own, &sibling_only] {
+        for export in exports
             .iter()
-            .filter(|(_, claim)| match claim {
-                LibraryClaim::Op {
-                    member: Some(member),
-                    ..
-                }
-                | LibraryClaim::Scope { member, .. } => {
-                    called.contains(&(export.package.clone(), member.clone()))
-                }
-                _ => false,
-            })
-            .collect();
-        if wanted.is_empty() {
-            continue;
-        }
-        let check = |id: &str, receiver: &str, claim: &LibraryClaim| LibraryCheck {
-            claim_id: id.to_string(),
-            package: export.specifier.clone(),
-            export: export.export.clone(),
-            role: export.role,
-            receiver: receiver.to_string(),
-            claim: claim.without_result(),
-        };
-        for (id, claim) in &claims {
-            if matches!(claim, LibraryClaim::Make { .. }) {
-                ask.checks.push(check(id, "export", claim));
-                ask.ops.push(None);
-                ask.scopes.push(None);
+            .filter(|export| export.role != LibraryRole::None)
+        {
+            let claims = export.claims_with_scopes_by_id();
+            let wanted: Vec<&(String, &LibraryClaim)> = claims
+                .iter()
+                .filter(|(_, claim)| match claim {
+                    LibraryClaim::Op {
+                        member: Some(member),
+                        ..
+                    }
+                    | LibraryClaim::Scope { member, .. } => {
+                        called.contains(&(export.package.clone(), member.clone()))
+                    }
+                    _ => false,
+                })
+                .collect();
+            if wanted.is_empty() {
+                continue;
             }
-        }
-        let on_receivers = |on: Option<ClaimOn>, of: Option<&str>| claim_receivers(&claims, on, of);
-        for (id, claim) in wanted {
-            match claim {
-                LibraryClaim::Op {
-                    op,
-                    member: Some(member),
-                    on,
-                    of,
-                    ..
-                } => {
-                    for receiver in on_receivers(*on, of.as_deref()) {
-                        ask.checks.push(check(id, &receiver, claim));
-                        ask.ops.push(Some(DeclaredOp {
-                            package: export.package.clone(),
-                            export: export.export.clone(),
-                            member: member.clone(),
-                            op: *op,
-                            scope: scope_step(&receiver).map(|(_, step)| step.to_string()),
-                        }));
+            let check = |id: &str, receiver: &str, claim: &LibraryClaim| LibraryCheck {
+                claim_id: id.to_string(),
+                package: export.specifier.clone(),
+                export: export.export.clone(),
+                role: export.role,
+                receiver: receiver.to_string(),
+                claim: claim.without_result(),
+            };
+            if made.insert((export.package.clone(), export.export.clone())) {
+                for (id, claim) in &claims {
+                    if matches!(claim, LibraryClaim::Make { .. }) {
+                        ask.checks.push(check(id, "export", claim));
+                        ask.ops.push(None);
                         ask.scopes.push(None);
                     }
                 }
-                LibraryClaim::Scope { on, of, .. } => {
-                    for receiver in on_receivers(*on, of.as_deref()) {
-                        scope_checks.push((
-                            check(id, &receiver, claim),
-                            AskedScope {
+            }
+            let on_receivers =
+                |on: Option<ClaimOn>, of: Option<&str>| claim_receivers(&claims, on, of);
+            for (id, claim) in wanted {
+                match claim {
+                    LibraryClaim::Op {
+                        op,
+                        member: Some(member),
+                        on,
+                        of,
+                        ..
+                    } => {
+                        for receiver in on_receivers(*on, of.as_deref()) {
+                            ask.checks.push(check(id, &receiver, claim));
+                            ask.ops.push(Some(DeclaredOp {
                                 package: export.package.clone(),
                                 export: export.export.clone(),
-                                claim_id: id.clone(),
-                                receiver,
-                            },
-                        ));
+                                member: member.clone(),
+                                op: *op,
+                                scope: scope_step(&receiver).map(|(_, step)| step.to_string()),
+                            }));
+                            ask.scopes.push(None);
+                        }
                     }
+                    LibraryClaim::Scope { on, of, .. } => {
+                        for receiver in on_receivers(*on, of.as_deref()) {
+                            scope_checks.push((
+                                check(id, &receiver, claim),
+                                AskedScope {
+                                    package: export.package.clone(),
+                                    export: export.export.clone(),
+                                    claim_id: id.clone(),
+                                    receiver,
+                                },
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -4335,7 +4362,7 @@ mod tests {
     ) {
         let (on, exports, declarations) = traced_fixture()
             .expect("the receiver-trace fixture walks: a skipped test proves nothing");
-        let ask = declaration_ask(&on.inputs, &exports);
+        let ask = declaration_ask(&on.inputs, &[], &exports);
         assert!(
             ask.ops.iter().flatten().count() > 0,
             "the fixture asks op checks"
@@ -4356,7 +4383,7 @@ mod tests {
         exports: &[ExportClaims],
         answered: &MemberDeclarations,
     ) -> (Vec<crate::unread_sites::UnreadSite>, Vec<String>) {
-        let ask = declaration_ask(&on.inputs, exports);
+        let ask = declaration_ask(&on.inputs, &[], exports);
         let failed = MemberDeclarations::answered(&ask, Err::<Vec<_>, _>("process died"));
         let read = unread_traced(on, exports, answered);
         let unread = unread_traced(on, exports, &failed);
@@ -4571,7 +4598,7 @@ mod tests {
         exports: &[ExportClaims],
         answered: &MemberDeclarations,
     ) -> (Vec<String>, Vec<String>) {
-        let ask = declaration_ask(&on.inputs, exports);
+        let ask = declaration_ask(&on.inputs, &[], exports);
         assert!(
             ask.scopes.iter().flatten().count() > 0,
             "the fixture asks scope checks"
@@ -7614,7 +7641,7 @@ export function listen(): void {
         assert_eq!(answer.dropped, 0, "every fixture claim parses");
         let mut exports = answer.exports;
         edit(&mut exports);
-        let ask = declaration_ask(&on.inputs, &exports);
+        let ask = declaration_ask(&on.inputs, &[], &exports);
         let script = super::super::fixture_walk::sidecar()?;
         let sidecar = crate::services::TypeSidecar::spawn(&script).expect("spawn the sidecar");
         sidecar.start_init(&on.repo, None);
@@ -9505,7 +9532,12 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             panic!("three services");
         };
         let declarations = super::super::fixture_walk::census_declarations(
-            &script, &on.repo, config, own, &exports,
+            &script,
+            &on.repo,
+            config,
+            own,
+            &[],
+            &exports,
         );
         let siblings: Vec<&RequestSummaryInputs> = if with_topics {
             vec![kit, topics]
@@ -9744,6 +9776,225 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                 record.names
             );
         }
+    }
+
+    /// The sibling-chained-sends fixture: the app and the kit it relays
+    /// through, the store's answer for it and the app's config.
+    fn sibling_chained_sends() -> (
+        super::super::fixture_walk::WalkedServices,
+        Vec<ExportClaims>,
+        crate::config::Config,
+    ) {
+        let services = [("services/app", "app"), ("packages/kit", "kit")];
+        let Some(on) =
+            super::super::fixture_walk::walked_services("sibling-chained-sends", &services, true)
+        else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        let text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sibling-chained-sends/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        assert_eq!(answer.dropped, 0, "every fixture claim parses");
+        let configs =
+            crate::config::Config::load_services(vec![on.repo.join("carrick.json")]).unwrap();
+        let config = configs
+            .into_iter()
+            .find(|config| config.service_name.as_deref() == Some("app"))
+            .expect("carrick.json declares the app");
+        (on, answer.exports, config)
+    }
+
+    /// carrick#4445 T1: the app never calls `.add`, `.get` or `.postMessage`
+    /// itself, so its own rows name none of them. The declaration ask lists
+    /// the ops the kit's rows call as well, and the kit's own ask lists no
+    /// more for a sibling that calls nothing new.
+    #[test]
+    fn the_declaration_ask_names_the_ops_a_sibling_calls() {
+        let (on, exports, _) = sibling_chained_sends();
+        let [app, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let ops = |ask: &DeclarationAsk| -> Vec<String> {
+            ask.ops
+                .iter()
+                .flatten()
+                .map(|op| format!("{}.{}", op.export, op.member))
+                .collect()
+        };
+        let own = ops(&declaration_ask(app, &[], &exports));
+        let wide = ops(&declaration_ask(app, &[kit], &exports));
+        for op in ["Queue.add", "default.get"] {
+            assert!(!own.iter().any(|held| held == op), "{op}: {own:?}");
+            assert!(wide.iter().any(|held| held == op), "{op}: {wide:?}");
+        }
+        let kit_alone = declaration_ask(kit, &[], &exports);
+        let kit_wide = declaration_ask(kit, &[app], &exports);
+        assert_eq!(
+            format!("{:?}", kit_alone.checks),
+            format!("{:?}", kit_wide.checks),
+            "a sibling that calls nothing new changes nothing"
+        );
+    }
+
+    /// carrick#4445 T1 (R7): the own service's checks come first, so the
+    /// verifier's time limit cuts a sibling's check before an own one. With
+    /// the kit as the walking service and the app as its sibling, the app's
+    /// rows add no member, and the order is the kit's own. With the app as the
+    /// walking service, the sibling-only ops follow its own checks.
+    #[test]
+    fn the_declaration_ask_keeps_the_own_checks_first() {
+        let (on, exports, _) = sibling_chained_sends();
+        let [app, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let own = declaration_ask(kit, &[], &exports);
+        let wide = declaration_ask(kit, &[app], &exports);
+        assert!(!own.checks.is_empty(), "the kit asks its own ops");
+        assert_eq!(
+            format!("{:?}", &wide.checks[..own.checks.len()]),
+            format!("{:?}", own.checks),
+            "the own checks lead the ask"
+        );
+        let widest = declaration_ask(app, &[kit], &exports);
+        let first_sibling_only = widest
+            .ops
+            .iter()
+            .position(|op| op.as_ref().is_some_and(|op| op.member == "add"))
+            .expect("the kit's `add` is asked");
+        let own_ops = declaration_ask(app, &[], &exports)
+            .ops
+            .iter()
+            .flatten()
+            .count();
+        assert!(
+            widest.ops[..first_sibling_only].iter().flatten().count() >= own_ops,
+            "every own op check precedes the sibling-only ones"
+        );
+    }
+
+    /// carrick#4445 T1 (R7): when both the own service and a sibling call a
+    /// member, the own service's check stands in its own place and the
+    /// sibling's adds nothing. The kit as its own sibling calls every member
+    /// the kit calls, so the ask is the kit's own ask byte for byte, and no
+    /// check is asked twice.
+    #[test]
+    fn the_declaration_ask_keeps_the_own_check_when_a_sibling_calls_the_same_member() {
+        let (on, exports, _) = sibling_chained_sends();
+        let [_, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let own = declaration_ask(kit, &[], &exports);
+        let both = declaration_ask(kit, &[kit], &exports);
+        assert!(!own.checks.is_empty(), "the kit asks its own ops");
+        assert_eq!(format!("{:?}", own.checks), format!("{:?}", both.checks));
+        assert_eq!(own.ops.len(), both.ops.len());
+    }
+
+    /// carrick#4445 T1: a send in a sibling's function on a call's value
+    /// (`new Queue('kit-literal').add`, `createClient(…).get`) is read through
+    /// its declaration once the ask lists the sibling's members. Hand-picked
+    /// siblings: a guard; the binary test runs the engine's own set.
+    #[test]
+    fn a_send_on_a_call_s_value_in_a_sibling_is_read_through_its_declaration() {
+        let (on, exports, config) = sibling_chained_sends();
+        let [app, kit] = on.inputs.as_slice() else {
+            panic!("two services");
+        };
+        let siblings = [kit];
+        let script = super::super::fixture_walk::sidecar().expect("the compiler engine is built");
+        let declarations = super::super::fixture_walk::census_declarations(
+            &script, &on.repo, &config, app, &siblings, &exports,
+        );
+        use super::super::decided_sites::{
+            MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
+        };
+        let discovery = discover_with(
+            app,
+            &siblings,
+            &Labels::of(&exports).tracing(&declarations),
+            &on.repo,
+        );
+        let relay = "services/app/src/relay.ts";
+        let reached = |line: u32| -> Vec<(String, Option<String>, Option<ReachedBy>)> {
+            discovery
+                .sites
+                .iter()
+                .filter(|site| site.file == relay && site.line == line)
+                .filter_map(|site| {
+                    let end = site.end.as_ref()?;
+                    Some((
+                        format!("{}.{:?}", end.export, end.member),
+                        end.op.map(|op| format!("{op:?}")),
+                        site.reached,
+                    ))
+                })
+                .collect()
+        };
+        for line in [2, 4, 7, 8] {
+            assert!(
+                reached(line).iter().any(|(_, op, _)| op.is_some()),
+                "{line}: {:#?}",
+                discovery.sites
+            );
+        }
+        assert!(
+            reached(2)
+                .iter()
+                .any(|(end, _, by)| end == "Queue.Some(\"add\")"
+                    && *by == Some(ReachedBy::Declaration)),
+            "{:#?}",
+            reached(2)
+        );
+        let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap())
+            .collect();
+        let labels = SiteLabel::from_exports(&exports);
+        let decided = decided_sites_traced_with(
+            app,
+            &siblings,
+            &on.repo,
+            &discovered,
+            &labels,
+            &MakerLabel::from_exports(&exports),
+            &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
+            &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
+        );
+        let records =
+            super::super::site_record::site_records(app, &siblings, &on.repo, &decided, &labels);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in &records {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        let at = |line: u32| forced.get(&format!("{relay}:{line}")).cloned();
+        assert_eq!(
+            at(2),
+            Some(vec![Some("kit-literal".to_string())]),
+            "{forced:#?}"
+        );
+        let mut both = at(4).expect("line 4 holds records");
+        both.sort();
+        assert_eq!(
+            both,
+            vec![
+                Some("kit-chained".to_string()),
+                Some("kit-kept".to_string())
+            ],
+            "{forced:#?}"
+        );
     }
 
     /// carrick#3527: the walk up a maker-bound name's callers is capped
@@ -10830,7 +11081,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         )
         .unwrap();
         let exports = crate::library_store::parse_answer(&text).exports;
-        let ask = declaration_ask(&on.inputs, &exports);
+        let ask = declaration_ask(&on.inputs, &[], &exports);
         let got: Vec<String> = ask
             .checks
             .iter()
@@ -10864,7 +11115,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         )
         .unwrap();
         let exports = crate::library_store::parse_answer(&text).exports;
-        let ask = declaration_ask(&on.inputs, &exports);
+        let ask = declaration_ask(&on.inputs, &[], &exports);
         let last_op = ask.ops.iter().rposition(Option::is_some);
         let first_scope = ask.scopes.iter().position(Option::is_some);
         assert!(
@@ -11012,6 +11263,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                         &root,
                         service,
                         inputs,
+                        &[],
                         &answer.exports,
                     )
                 });
