@@ -117,11 +117,20 @@ fn a_model_row_at_a_handler_another_file_registers_is_withdrawn() {
     assert_eq!(rows(), key_rows("routes"));
 }
 
+/// No route row, projected endpoint or type ask names a withdrawn row's
+/// place. The mount graph's owner nodes are left out: the model named each
+/// handler as its row's owner, and a node owns no route by itself.
 #[test]
 fn the_withdrawn_rows_leave_nothing_behind_in_the_blob() {
     let blob = blobs()
         .iter()
-        .map(|blob| blob.to_string())
+        .map(|blob| {
+            let mut blob = blob.clone();
+            if let Some(graph) = blob["mount_graph"].as_object_mut() {
+                graph.remove("nodes");
+            }
+            blob.to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n");
     for place in ["src/controllers/v1.ts:4", "src/controllers/items.ts:4"] {
