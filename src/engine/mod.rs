@@ -25995,6 +25995,7 @@ unfollowed_member_calls_total: 0,
                     source_file: "lib/api.ts".to_string(),
                     type_string: "{ cursor: string }".to_string(),
                     is_explicit: true,
+                    home: None,
                 });
             let mut abstain = inferred_with_symbol("Feed");
             abstain.alias = "FeedView".to_string();
@@ -26048,6 +26049,7 @@ unfollowed_member_calls_total: 0,
                 source_file: "routes/reply.ts".to_string(),
                 type_string: "{ ok: boolean; id: string }".to_string(),
                 is_explicit: true,
+                home: None,
             });
         let mut read = inferred_with_symbol("Reply");
         read.alias = "ReplyView".to_string();
@@ -26084,6 +26086,7 @@ unfollowed_member_calls_total: 0,
                 source_file: "lib/api.ts".to_string(),
                 type_string: "{ cursor: string }".to_string(),
                 is_explicit: true,
+                home: None,
             });
         let mut abstain = inferred_with_symbol("Feed");
         abstain.alias = "FeedView".to_string();
