@@ -1535,7 +1535,16 @@ pub struct Checked {
     /// absent value is a scanner that predates it. Zero when main stored no
     /// verdicts to compare with.
     pub pairs_left_uncompared: usize,
+    /// Removals this PR's diff places that main's side could not be run
+    /// against, so no row says whether a caller broke (carrick#4292). Omitted
+    /// when zero, so a run whose main side held is unchanged.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub removals_not_checked: usize,
     pub dependencies: DependencyCounts,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// Operation pairs (HTTP, GraphQL, socket, pub/sub) with a producer or a
@@ -2228,6 +2237,7 @@ mod tests {
                 not_compared: 2,
             }),
             pairs_left_uncompared: 1,
+            removals_not_checked: 0,
             dependencies: DependencyCounts {
                 shared: 41,
                 changed: Some(2),
@@ -2268,6 +2278,13 @@ mod tests {
         checked.sdk_pairs = None;
         let v = serde_json::to_value(&payload).unwrap();
         assert!(v["checked"].get("sdk_pairs").is_none(), "{v:#}");
+        assert!(v["checked"].get("removals_not_checked").is_none(), "{v:#}");
+        let Some(checked) = &mut payload.checked else {
+            unreachable!()
+        };
+        checked.removals_not_checked = 3;
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["checked"]["removals_not_checked"], json!(3), "{v:#}");
         assert_eq!(v["baseline"]["base_sha"], serde_json::Value::Null);
         assert_eq!(v["baseline"]["copy"], "none");
         assert_eq!(v["checked"]["dependencies"], json!({ "shared": 41 }));
