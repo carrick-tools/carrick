@@ -282,7 +282,7 @@ pub(crate) fn inferred_response_modes(
 /// reports the depth of the call's result even where its text is a decayed
 /// read of something after it, and a depth with no element named says nothing
 /// of the symbol this is asked about (carrick#1967).
-fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
+pub(crate) fn inference_read_no_shape(inf: &crate::services::type_sidecar::InferredType) -> bool {
     let peeled_a_named_list = inf.primary_type_symbol.is_some() && inf.array_depth.is_some();
     !peeled_a_named_list && text_is_bare_top_type(&inf.type_string)
 }
@@ -475,7 +475,9 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
 /// (carrick#1841). The capture's re-run would publish the carrier. A handler
 /// return with that reason states that some of its union branches were unread
 /// (carrick#166), and keeps the capture's own read as its recovery.
-fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredType) -> bool {
+pub(crate) fn inference_decided_no_contract(
+    inf: &crate::services::type_sidecar::InferredType,
+) -> bool {
     text_is_bare_top_type(&inf.type_string)
         && inf.any_provenance.iter().any(|p| {
             p.path.is_empty()

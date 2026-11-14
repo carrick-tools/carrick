@@ -5157,6 +5157,13 @@ fn frame_errors(value: &serde_json::Value) -> String {
 /// because the read adds `null` or `undefined` to it is not reported in
 /// `changed`: it still names the body.
 ///
+/// Before any witness, the compiler's own decision that a site states no type
+/// (carrick#4306): when a read of the alias abstained with a decided reason
+/// at the type's root (`inference_decided_no_contract`, such as
+/// `bound_by_callers`) and no read of it saw a shape, the model's symbol is
+/// dropped, so neither the bundle nor the capture answers the alias from it.
+/// The fan-in keep above still applies.
+///
 /// Every request the arbitration did not keep as it came in is reported in
 /// `changed` (carrick#1779): the manifest stamped the rejected symbol onto the
 /// alias's row before any of this ran, and only this function knows the row
@@ -5171,6 +5178,28 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
     for inf in inferred {
         inferred_by_alias.entry(inf.alias.as_str()).or_insert(inf);
     }
+
+    let mut reads_by_alias: HashMap<&str, Vec<&InferredType>> = HashMap::new();
+    for inf in inferred {
+        reads_by_alias
+            .entry(inf.alias.as_str())
+            .or_default()
+            .push(inf);
+    }
+    // carrick#4306: the compiler engine read the site and decided it states
+    // no type (a reason at the type's root), and no other read of the alias
+    // saw a shape. The model's symbol is no answer then: dropped here, before
+    // the bundle and the capture run, so neither defines the alias from it.
+    let decided_no_type = |alias: &str| {
+        reads_by_alias.get(alias).is_some_and(|reads| {
+            reads
+                .iter()
+                .any(|inf| crate::engine::type_compat_v2::inference_decided_no_contract(inf))
+                && reads
+                    .iter()
+                    .all(|inf| crate::engine::type_compat_v2::inference_read_no_shape(inf))
+        })
+    };
 
     let mut alias_counts: HashMap<&str, usize> = HashMap::new();
     for req in explicit {
@@ -5187,6 +5216,15 @@ pub(crate) fn demote_witnessed_borrowed_anchors(
             };
             if alias_counts.get(alias).copied().unwrap_or(0) > 1 {
                 return Some(req.clone());
+            }
+            if decided_no_type(alias) {
+                info!(
+                    alias = %alias,
+                    explicit_symbol = %req.symbol_name,
+                    "[type_sidecar] anchor arbitration: the compiler read decided \
+                     the site states no type; dropping the model's symbol"
+                );
+                return None;
             }
             let Some(inf) = inferred_by_alias.get(alias) else {
                 return Some(req.clone());
