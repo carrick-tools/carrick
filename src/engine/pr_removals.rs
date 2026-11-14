@@ -299,6 +299,7 @@ fn removed_operations(
                     .into_iter()
                     .map(|(service, place, source)| RemovedOperation {
                         service,
+                        service_name: None,
                         key: key.clone(),
                         method: method.clone(),
                         path: path.clone(),
@@ -367,6 +368,7 @@ fn removed_sends(
                 .push(Place::parse(&repo.service_name, &place));
             removal.rows.push(RemovedSend {
                 service: service_id(&repo.service_name, &repo.repo_name),
+                service_name: None,
                 key: id.1.clone(),
                 file: id.2.clone(),
                 method,
@@ -465,6 +467,77 @@ mod tests {
             pairing.consumer.key,
             OperationKey::http("GET", "/orders/:encoded").canonical()
         );
+    }
+
+    fn row(method: &str, path: &str, file: &str) -> crate::analyzer::ApiEndpointDetails {
+        crate::analyzer::ApiEndpointDetails {
+            declared_at: None,
+            procedure: None,
+            view_module: false,
+            owner: None,
+            key: OperationKey::http(method, path.to_string()),
+            params: vec![],
+            request_body: None,
+            response_body: None,
+            handler_name: None,
+            request_type: None,
+            response_type: None,
+            file_path: std::path::PathBuf::from(file),
+            repo_name: None,
+            service_name: None,
+            provenance: Default::default(),
+            resolution_source: None,
+            dispatch: None,
+            schema_binding: None,
+            undeclared_selection: None,
+            handler_span: None,
+            handler_file: None,
+            name_scope: None,
+            library_semantics: Vec::new(),
+            inference: None,
+        }
+    }
+
+    fn blob(
+        service_name: Option<&str>,
+        endpoints: Vec<crate::analyzer::ApiEndpointDetails>,
+    ) -> CloudRepoData {
+        let mut data: CloudRepoData = serde_json::from_value(serde_json::json!({
+            "repo_name": "orders-repo",
+            "endpoints": [],
+            "calls": [],
+            "mounts": [],
+            "apps": {},
+            "imported_handlers": [],
+            "function_definitions": {},
+            "last_updated": "2026-01-01T00:00:00Z",
+            "commit_hash": "deadbeef"
+        }))
+        .expect("a minimal blob deserializes");
+        data.service_name = service_name.map(str::to_string);
+        data.endpoints = endpoints;
+        data
+    }
+
+    /// carrick#4292: a removal carries the service name as the delta row
+    /// spells it, and none for a root service.
+    #[test]
+    fn a_removal_carries_the_service_name_of_its_row() {
+        let main = |name| vec![blob(name, vec![row("GET", "/orders", "src/orders.ts:9")])];
+        let current = |name| vec![blob(name, vec![])];
+        let named = Removals::of(
+            "/nowhere",
+            None,
+            &main(Some("routes")),
+            &current(Some("routes")),
+            &[],
+            None,
+        );
+        assert_eq!(named.operations.len(), 1);
+        assert_eq!(named.operations[0].service_name.as_deref(), Some("routes"));
+        let root = Removals::of("/nowhere", None, &main(None), &current(None), &[], None);
+        assert_eq!(root.operations.len(), 1);
+        assert_eq!(root.operations[0].service_name, None);
     }
 
     /// A shared external contract names no producer, so it is no pairing.

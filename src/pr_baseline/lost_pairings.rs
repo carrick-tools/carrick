@@ -62,6 +62,9 @@ pub struct MainConsumer {
 #[derive(Clone, Debug)]
 pub struct RemovedOperation {
     pub service: String,
+    /// The producer's `service_name` as the delta row spells it; `None` for a
+    /// root service. Written to the marked row's `removed.service`.
+    pub service_name: Option<String>,
     pub key: String,
     /// Main's spelling, for the row's `removed` object.
     pub method: String,
@@ -78,6 +81,8 @@ pub struct RemovedOperation {
 #[derive(Clone, Debug)]
 pub struct RemovedSend {
     pub service: String,
+    /// The sender's `service_name`; `None` for a root service.
+    pub service_name: Option<String>,
     pub key: String,
     pub file: String,
     pub method: String,
@@ -467,6 +472,7 @@ mod tests {
     fn removed_route(placed: bool) -> RemovedOperation {
         RemovedOperation {
             service: "orders-api".into(),
+            service_name: None,
             key: "GET /orders/:param".into(),
             method: "GET".into(),
             path: "/orders/:orderId".into(),
@@ -625,6 +631,43 @@ mod tests {
         assert_eq!(v["edge_source"], json!("fact"));
         assert_eq!(v["verdict_state"], json!("not_checked"));
         assert_eq!(v["on_main"], json!(false));
+    }
+
+    /// carrick#4292: the marked row names the removed producer's service, as
+    /// the delta row spells it.
+    #[test]
+    fn a_marked_producer_row_names_the_removed_service() {
+        let (mut main, run) = http_break(true);
+        main.operations[0].service_name = Some("routes".into());
+        let mut pr = vec![unmarked_missing()];
+        assert_eq!(
+            mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None),
+            1
+        );
+        let v = serde_json::to_value(&pr[0]).unwrap();
+        assert_eq!(v["removed"]["service"], json!("routes"));
+    }
+
+    /// carrick#4292: a removed sender's marked row names the sender's service.
+    #[test]
+    fn a_marked_sender_row_names_the_removed_service() {
+        let main = MainRemovals {
+            pairings: vec![message_pairing(Protocol::Websocket)],
+            operations: vec![],
+            sends: vec![RemovedSend {
+                service_name: Some("realtime".into()),
+                ..removed_send(true)
+            }],
+            ..Default::default()
+        };
+        let run = RunUnpaired {
+            calls: vec![],
+            receivers: vec![receiver()],
+        };
+        let mut pr = vec![orphan_row()];
+        mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
+        let v = serde_json::to_value(&pr[0]).unwrap();
+        assert_eq!(v["removed"]["service"], json!("realtime"));
     }
 
     /// Branch 2: placed, a stale or other-scanner copy -> unknown, with the
@@ -830,6 +873,7 @@ mod tests {
     fn removed_send(placed: bool) -> RemovedSend {
         RemovedSend {
             service: "orders-api".into(),
+            service_name: None,
             key: "SERVER->CLIENT order:shipped".into(),
             file: "src/realtime.ts".into(),
             method: "SERVER->CLIENT".into(),
