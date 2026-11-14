@@ -737,15 +737,30 @@ pub enum PayloadBinding {
 pub enum SlotBinding {
     /// The deciding call's argument `arg` writes `key` as a plain property.
     Written { arg: usize, key: String },
-    /// The deciding call's argument `arg` is an object literal that states
-    /// `key` absent (no spread, no computed key, no method): the call sends
-    /// nothing there.
-    Unwritten { arg: usize, key: String },
+    /// The argument `arg` of `call` is an object literal that states `key`
+    /// absent (no spread, no computed key, no method): the call sends
+    /// nothing there. `call` is the deciding call, or one below it that
+    /// writes the literal the deciding call's own parameters hand on
+    /// (carrick#4294).
+    Unwritten {
+        arg: usize,
+        key: String,
+        call: CallPlace,
+    },
     /// No call from the labelled one up to the deciding call writes the
     /// label's payload argument (carrick#4165): each leaves it out, or hands
     /// on whole a parameter of its own that has no default and that its
     /// caller leaves out. The call sends no payload there.
     Absent,
+}
+
+/// Where a call is written: its repo-relative file, line and SWC span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallPlace {
+    pub file: String,
+    pub line: u32,
+    pub span_start: u32,
+    pub span_end: u32,
 }
 
 /// The function that handles a receive site or one key of a handler table:
@@ -2137,7 +2152,7 @@ fn payload_binding(root: &Path, down: &[Placed<'_>], slot: &ArgSlot) -> Option<P
 fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option<String>)> {
     match walk_bound(down, slot, false)? {
         Walked::Bound(at, arg, key, _) => Some((at, arg, key)),
-        Walked::Omitted { .. } => None,
+        Walked::Omitted { .. } | Walked::Unwritten { .. } => None,
     }
 }
 
@@ -2148,7 +2163,17 @@ fn bound_at(down: &[Placed<'_>], slot: &ArgSlot) -> Option<(usize, usize, Option
 /// function `down[k]` is written in.
 enum Walked {
     Bound(usize, usize, Option<String>, Vec<(usize, usize)>),
-    Omitted { through: Vec<(usize, usize)> },
+    Omitted {
+        through: Vec<(usize, usize)>,
+    },
+    /// A call below the deciding call writes the caller's options as a
+    /// closed literal that lacks the key (carrick#4294): the call (its index
+    /// in `down`) and its argument.
+    Unwritten {
+        at: usize,
+        arg: usize,
+        through: Vec<(usize, usize)>,
+    },
 }
 
 /// The option key `slot` names, read at the deciding call (`down[0]`) by
@@ -2168,11 +2193,27 @@ enum Walked {
 /// says that function writes onto the parameter's members or hands it to a
 /// call outside `placed`'s own, which may write onto it.
 fn payload_slot(
+    root: &Path,
     down: &[Placed<'_>],
     slot: &ArgSlot,
     defaulted: &dyn Fn(&Placed<'_>, usize) -> bool,
     written_onto: &dyn Fn(&Placed<'_>, usize) -> bool,
 ) -> Option<SlotBinding> {
+    let place = |at: usize| CallPlace {
+        file: relative(root, down[at].file),
+        line: down[at].call.site.line,
+        span_start: down[at].call.site.span_start,
+        span_end: down[at].call.site.span_end,
+    };
+    // A function that writes onto a parameter the key is carried through,
+    // or hands it to another call that may, adds to the object its caller
+    // handed it, so the caller's literal is not what the labelled call
+    // sends (carrick#4324).
+    let writes_onto = |through: &[(usize, usize)]| {
+        through
+            .iter()
+            .any(|&(k, index)| written_onto(&down[k], index))
+    };
     let (arg, carried) = match walk_bound(down, slot, true)? {
         Walked::Omitted { through } => {
             let filled = through.iter().any(|&(k, index)| {
@@ -2181,15 +2222,18 @@ fn payload_slot(
             });
             return (!filled).then_some(SlotBinding::Absent);
         }
+        Walked::Unwritten { at, arg, through } => {
+            if writes_onto(&through) {
+                return None;
+            }
+            return Some(SlotBinding::Unwritten {
+                arg,
+                key: slot.key.clone()?,
+                call: place(at),
+            });
+        }
         Walked::Bound(0, arg, Some(carried), through) => {
-            // A function that writes onto the parameter the key is carried
-            // through, or hands it to another call that may, adds to the
-            // object its caller handed it, so the caller's literal is not
-            // what the labelled call sends (carrick#4324).
-            if through
-                .iter()
-                .any(|&(k, index)| written_onto(&down[k], index))
-            {
+            if writes_onto(&through) {
                 return None;
             }
             (arg, carried)
@@ -2208,6 +2252,7 @@ fn payload_slot(
         KeyState::Absent => Some(SlotBinding::Unwritten {
             arg,
             key: key.clone(),
+            call: place(0),
         }),
         KeyState::Unread | KeyState::Function => None,
     }
@@ -2275,7 +2320,18 @@ fn walk_bound(down: &[Placed<'_>], slot: &ArgSlot, options: bool) -> Option<Walk
             {
                 *index
             }
-            _ => return None,
+            // No spread or rest carries the caller's options: the literal is
+            // all the callee receives. Closed and without the key, it states
+            // the key absent here (carrick#4294).
+            _ => {
+                return matches!(object.key(field), KeyState::Absent).then_some(
+                    Walked::Unwritten {
+                        at: k,
+                        arg,
+                        through,
+                    },
+                );
+            }
         };
         through.push((k, arg));
     }
@@ -2750,6 +2806,7 @@ impl<'a> Walk<'a, '_> {
             .and_then(|label| label.payload.as_ref())
             .and_then(|slot| {
                 payload_slot(
+                    self.root,
                     down,
                     slot,
                     &|placed, index| self.defaults_param((placed.file, placed.key), index),
@@ -6916,6 +6973,28 @@ pub(crate) mod tests {
         label
     }
 
+    /// `slot` with the place of an unwritten slot's call blanked, for the
+    /// tests that compare what a slot names, not where its call is.
+    fn placeless(slot: Option<SlotBinding>) -> Option<SlotBinding> {
+        match slot {
+            Some(SlotBinding::Unwritten { arg, key, .. }) => Some(SlotBinding::Unwritten {
+                arg,
+                key,
+                call: unplaced(),
+            }),
+            other => other,
+        }
+    }
+
+    fn unplaced() -> CallPlace {
+        CallPlace {
+            file: String::new(),
+            line: 0,
+            span_start: 0,
+            span_end: 0,
+        }
+    }
+
     fn payloads_decided() -> (Decided, String) {
         let (decided, text, _) = decided_at(PAYLOADS, &PAYLOAD_CALLS, &payloads_label());
         (decided, text)
@@ -6937,7 +7016,7 @@ pub(crate) mod tests {
             let mut here = decided.sites.iter().filter(|site| site.line == line);
             let site = here.next().unwrap_or_else(|| panic!("no site at {needle}"));
             assert!(here.next().is_none(), "{needle}");
-            site.payload_slot.clone()
+            placeless(site.payload_slot.clone())
         };
         let written = |arg| {
             Some(SlotBinding::Written {
@@ -6949,6 +7028,7 @@ pub(crate) mod tests {
             Some(SlotBinding::Unwritten {
                 arg,
                 key: "body".into(),
+                call: unplaced(),
             })
         };
         // The rest of a destructured parameter.
@@ -7059,10 +7139,11 @@ pub(crate) mod tests {
         let copy = sites_at("sendCopy({ path");
         assert_eq!(copy.len(), 1);
         assert_eq!(
-            copy[0].payload_slot,
+            placeless(copy[0].payload_slot.clone()),
             Some(SlotBinding::Unwritten {
                 arg: 0,
                 key: "body".into(),
+                call: unplaced(),
             })
         );
     }
@@ -7129,10 +7210,11 @@ pub(crate) mod tests {
         let slot_at = slots(&keyed);
         assert_eq!(slot_at("/absent/ping`)"), Some(SlotBinding::Absent));
         assert_eq!(
-            slot_at("/absent/options`, {"),
+            placeless(slot_at("/absent/options`, {")),
             Some(SlotBinding::Unwritten {
                 arg: 1,
                 key: "data".into(),
+                call: unplaced(),
             })
         );
 
@@ -7169,12 +7251,60 @@ pub(crate) mod tests {
         // A helper the wrapper hands the options to may write onto them.
         assert_eq!(slot_at("helped(\"/absent/helped\""), None);
         assert_eq!(
-            slot_at("forward(\"/absent/forwarded\""),
+            placeless(slot_at("forward(\"/absent/forwarded\"")),
             Some(SlotBinding::Unwritten {
+                arg: 1,
+                key: "body".into(),
+                call: unplaced(),
+            })
+        );
+    }
+
+    /// carrick#4294: a closed options literal a call below the deciding call
+    /// writes, with no key of the slot's name, states the key unwritten at
+    /// that call. A literal that spreads its caller's options is read at the
+    /// caller; options built in a local, and a literal handed to a hop that
+    /// writes onto it, state nothing.
+    #[test]
+    fn a_closed_literal_below_the_deciding_call_states_the_key_unwritten() {
+        let calls = [
+            "fetch(`${process.env.API}${path}/wiped`, { method: \"DELETE\", headers: {} })",
+            "fetch(`${process.env.API}${path}/wipe-with`, { method: \"DELETE\", ...extra })",
+            "fetch(`${process.env.API}${path}/wipe-built`, init)",
+            "fetch(`${process.env.API}${path}`, init)",
+        ];
+        let mut keyed = fetch_label();
+        keyed.payload = Some(ArgSlot {
+            arg: 1,
+            key: Some("body".into()),
+        });
+        let (decided, text, _) = decided_at("src/slots/absent.ts", &calls, &keyed);
+        let slot_at = |needle: &str| {
+            let line = line_of(&text, needle);
+            let site = decided
+                .sites
+                .iter()
+                .find(|site| site.line == line)
+                .unwrap_or_else(|| panic!("no site at {needle} {line}"));
+            site.payload_slot.clone()
+        };
+        let Some(SlotBinding::Unwritten { arg, key, call }) = slot_at("wipe(\"/absent/wiped\"")
+        else {
+            panic!("the closed literal states the key unwritten");
+        };
+        assert_eq!((arg, key.as_str()), (1, "body"));
+        assert_eq!(call.file, "src/slots/absent.ts");
+        assert_eq!(call.line, line_of(&text, "/wiped`, { method"));
+        // The spread carries the caller's options: its `body` is written.
+        assert_eq!(
+            slot_at("wipeWith(\"/absent/wipe-with\""),
+            Some(SlotBinding::Written {
                 arg: 1,
                 key: "body".into(),
             })
         );
+        assert_eq!(slot_at("wipeBuilt(\"/absent/wipe-built\""), None);
+        assert_eq!(slot_at("wipeStamped(\"/absent/wipe-stamped\""), None);
     }
 
     // -----------------------------------------------------------------------
