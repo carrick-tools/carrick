@@ -890,7 +890,7 @@ impl<'a> Resolver<'a> {
                 if binding.kind != BindingKind::Const
                     || !binding.list_kept
                     || (binding.exported && !binding.list_frozen)
-                    || (objects && (binding.exported || !binding.elements_kept))
+                    || (objects && binding.kind == BindingKind::Enum && binding.elements_kept)
                 {
                     return Err(UnreadExpression);
                 }
