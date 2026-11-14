@@ -3165,8 +3165,8 @@ fn a_hooks_proxy_imported_into_tsx_pairs_each_procedure() {
 
 /// carrick#4244: a handler handed in by name that the route's file imports is
 /// placed at its declaring file's definition, and the row names that file.
-/// `ping` is declared at `src/handlers.ts` lines 3-5 and handed in by three
-/// routes of two files; a handler declared in the route's own file carries no
+/// `ping` is declared at `src/handlers.ts` lines 3-5 and handed in by four
+/// routes of two files (one inside a plugin written in place); a handler declared in the route's own file carries no
 /// `handler_file`.
 #[test]
 fn an_imported_handler_is_placed_in_its_declaring_file() {
@@ -3219,6 +3219,7 @@ fn an_imported_handler_is_placed_in_its_declaring_file() {
             "src/catalog.ts:11 3-5 in src/handlers.ts",
             "src/catalog.ts:14 3-5 in src/handlers.ts",
             "src/index.ts:12 3-5 in src/handlers.ts",
+            "src/index.ts:7 3-5 in src/handlers.ts",
         ],
         "{graph:#?}"
     );
@@ -3226,7 +3227,7 @@ fn an_imported_handler_is_placed_in_its_declaring_file() {
         flat.iter()
             .filter(|row| row.ends_with("handlers.ts"))
             .count(),
-        3,
+        4,
         "{flat:#?}"
     );
 }

@@ -66,6 +66,10 @@ type CallSpan = (u32, u32);
 /// A registration named by a row's own place: its line and lower-cased method.
 type CallLine = (u32, String);
 
+/// A row's location, operation and handler name: the key a mount-graph row
+/// shares with the top-level row projected from it.
+type RowIdentity = (String, OperationKey, Option<String>);
+
 /// The registration calls one file is asked about.
 #[derive(Default)]
 struct Wanted {
@@ -138,10 +142,7 @@ pub fn attach_handler_spans(
         })
         .collect();
 
-    let mut placed_rows: HashMap<
-        (String, OperationKey, Option<String>),
-        (HandlerSpan, Option<String>),
-    > = HashMap::new();
+    let mut placed_rows: HashMap<RowIdentity, (HandlerSpan, Option<String>)> = HashMap::new();
     let mut placed = 0;
     for endpoint in &mut graph.endpoints {
         let Some((file, line)) = split_location(&endpoint.file_location) else {
