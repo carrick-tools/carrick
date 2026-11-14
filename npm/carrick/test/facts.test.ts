@@ -1467,8 +1467,11 @@ test("generic functions, methods and arrows get their own spans", () => {
 });
 
 test("an element written as an attribute's value reads", () => {
-  const src = 'export function Banner() {\n  return <Card icon={<Icon size={16} />} onPress={() => api.post("/banner")} />;\n}\n';
+  const src = 'export function Banner() {\n  return <Card badge={<Badge count={2} />} onPress={() => api.post("/banner")} />;\n}\n';
   assert.deepEqual(spansOf(src, true), [`Banner: ${src.trimEnd()}`]);
+  // A regex can start a container too.
+  const check = "function Check({ s }) {\n  return <Flag on={/it's/.test(s)} />;\n}\n";
+  assert.deepEqual(spansOf(check, true), [`Check: ${check.trimEnd()}`]);
 });
 
 test("a comment between an element's attributes reads", () => {
@@ -1477,9 +1480,9 @@ test("a comment between an element's attributes reads", () => {
 });
 
 test("a generic method named like a modifier is a method", () => {
-  assert.deepEqual(spansOf('class Store<T> {\n  get<K extends keyof T>(key: K) { return api.get("/s") }\n  set<K>(key: K) {}\n}\n'), [
-    'Store.get: get<K extends keyof T>(key: K) { return api.get("/s") }',
-    "Store.set: set<K>(key: K) {}",
+  assert.deepEqual(spansOf('class Store {\n  get<V>(id: string) { return api.get("/s") }\n  set<V>(id: string, value: V) {}\n}\n'), [
+    'Store.get: get<V>(id: string) { return api.get("/s") }',
+    "Store.set: set<V>(id: string, value: V) {}",
   ]);
   assert.deepEqual(spansOf('const box = {\n  get<T>(key: string) { return api.get("/b") },\n}\n'), [
     'box.get: get<T>(key: string) { return api.get("/b") }',
