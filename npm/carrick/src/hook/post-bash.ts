@@ -38,6 +38,8 @@ const SEARCH_WORD = /\b(grep|rg|egrep|fgrep)\b/;
 
 type Payload = {
   cwd?: string;
+  /** How long the command ran; the window a written file's mtime falls in. */
+  duration_ms?: number;
   session_id?: string;
   agent_id?: string;
   tool_input?: { command?: string };
@@ -61,7 +63,7 @@ async function main(): Promise<void> {
   const command = payload.tool_input?.command;
   if (!command || !(MENTIONS_FACT_SOURCE.test(command) || SEARCH_WORD.test(command))) return lateOnly(sessionKey(payload));
   const cwd = payload.cwd ?? process.cwd();
-  const { reads, writes, factWrites } = bashTargets(command, path.resolve(cwd));
+  const { reads, writes, factWrites } = bashTargets(command, path.resolve(cwd), { durationMs: payload.duration_ms });
   const candidates = writes.length + factWrites.length > 0 && !movesTreeInBulk(command, path.resolve(cwd)) ? [...writes, ...factWrites] : [];
   // A search for a function's name: the index sites its output did not print.
   const searched = SEARCH_WORD.test(command) ? searchedNames(command, path.resolve(cwd)) : { names: [], operands: [] };

@@ -221,10 +221,60 @@ export function movesTreeInBulk(command: string, cwd: string): boolean {
   return false;
 }
 
-function sourceWords(words: string[], cwd: string, kind: RegExp = SOURCE_FILE): string[] {
+/** One target named by a command: its path under each reading of the directory (`startReadings`). */
+type Group = string[];
+
+function sourceWords(words: string[], cwds: string[], kind: RegExp = SOURCE_FILE): Group[] {
   return words
     .filter((word) => kind.test(word) && !/[*?[{]/.test(word))
-    .map((word) => path.resolve(cwd, word));
+    .map((word) => [...new Set(cwds.map((cwd) => path.resolve(cwd, word)))]);
+}
+
+/** A file changed this much before the call started still counts as changed in its window. */
+const WINDOW_SLACK_MS = 2000;
+
+/** What the Bash hook knows about the call besides the command: how long it ran. */
+export type CallInfo = { durationMs?: number; now?: number };
+
+/**
+ * The directories the command may have started in, given the payload's `cwd`.
+ * The payload holds the directory AFTER the command when a `cd` persisted, and
+ * the start directory when it ran in a subshell or did not persist. So: `cwd`
+ * itself (reading a), and `cwd` with the command's net relative `cd` taken off
+ * its end (reading b). A net move that is absolute or climbs out cannot be undone.
+ */
+function startReadings(command: string, cwd: string): string[] {
+  const marker = path.join(path.parse(cwd).root, "carrick-start-marker");
+  const all = steps(command, marker);
+  const last = all[all.length - 1];
+  const out = [cwd];
+  if (!last || last.cwd === marker || !last.cwd.startsWith(`${marker}${path.sep}`)) return out;
+  const net = path.relative(marker, last.cwd);
+  if (cwd === net || !cwd.endsWith(`${path.sep}${net}`)) return out;
+  const start = cwd.slice(0, cwd.length - net.length - 1) || path.parse(cwd).root;
+  if (start !== cwd) out.push(start);
+  return out;
+}
+
+/**
+ * The paths of `group` that exist. A word that exists under both readings is
+ * the one this command wrote when only one of them changed inside the call's
+ * window; when that does not decide, both stay (a missed write is the worse error).
+ */
+function existing(group: Group, call: CallInfo): string[] {
+  const found = group.filter(isFile);
+  if (found.length < 2 || call.durationMs === undefined) return found;
+  const now = call.now ?? Date.now();
+  const from = now - call.durationMs - WINDOW_SLACK_MS;
+  const changed = found.filter((file) => {
+    try {
+      const mtime = fs.statSync(file).mtimeMs;
+      return mtime >= from && mtime <= now + WINDOW_SLACK_MS;
+    } catch {
+      return false;
+    }
+  });
+  return changed.length === 1 ? changed : found;
 }
 
 /**
@@ -232,14 +282,22 @@ function sourceWords(words: string[], cwd: string, kind: RegExp = SOURCE_FILE): 
  * that exist. A file the same command writes (`>`, `>>`, `sed -i`, `tee`) is
  * not in `reads`; the write is the other branch of the hook.
  */
-export function bashTargets(command: string, cwd: string): { reads: string[]; writes: string[]; factWrites: string[] } {
-  const reads: string[] = [];
-  const writes: string[] = [];
-  for (const step of steps(command, cwd)) {
-    writes.push(...sourceWords(step.writes, step.cwd, FACT_FILE));
+export function bashTargets(
+  command: string,
+  cwd: string,
+  call: CallInfo = {},
+): { reads: string[]; writes: string[]; factWrites: string[] } {
+  const reads: Group[] = [];
+  const writes: Group[] = [];
+  // Each reading of the start directory gives the same steps, so they zip.
+  const readings = startReadings(command, cwd).map((start) => steps(command, start));
+  for (const [n, first] of readings[0]!.entries()) {
+    const step = first;
+    const cwds = readings.map((one) => one[n]!.cwd);
+    writes.push(...sourceWords(step.writes, cwds, FACT_FILE));
     // `apply_patch <<EOF` through the shell: the patch names its files.
     if (step.body.includes("*** Begin Patch")) {
-      writes.push(...sourceWords(patchedFiles(step.body), step.cwd, FACT_FILE));
+      writes.push(...sourceWords(patchedFiles(step.body), cwds, FACT_FILE));
     }
     let at = 0;
     while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(step.words[at] ?? "")) at += 1;
@@ -249,53 +307,53 @@ export function bashTargets(command: string, cwd: string): { reads: string[]; wr
       // A script's text is the only place its target is named; whether it
       // wrote that file is decided by the file's mtime, not here.
       const text = `${step.body}\n${args.join("\n")}`;
-      writes.push(...sourceWords(text.match(PATH_IN_TEXT) ?? [], step.cwd, FACT_FILE));
+      writes.push(...sourceWords(text.match(PATH_IN_TEXT) ?? [], cwds, FACT_FILE));
     } else if (name === "cp" || name === "mv" || name === "install") {
       const rest = positionals(args, new Set(["-t", "--target-directory"])).rest;
       // The destination is the last word; `-t dir` and a directory target name no file.
-      writes.push(...sourceWords(rest.slice(-1), step.cwd, FACT_FILE));
+      writes.push(...sourceWords(rest.slice(-1), cwds, FACT_FILE));
     } else if (name === "tee") {
-      writes.push(...sourceWords(positionals(args).rest, step.cwd, FACT_FILE));
+      writes.push(...sourceWords(positionals(args).rest, cwds, FACT_FILE));
     } else if (name === "sed") {
       const { rest, flags } = positionals(args, new Set(["-e", "-f", "--expression", "--file"]));
       const inPlace = [...flags].some((flag) => /^-[a-zA-Z]*i/.test(flag) || flag.startsWith("--in-place"));
       const scripted = ["-e", "-f", "--expression", "--file"].some((flag) => flags.has(flag));
       const operands = scripted ? rest : rest.slice(1);
-      if (inPlace) writes.push(...sourceWords(operands, step.cwd, FACT_FILE));
-      else reads.push(...sourceWords(operands, step.cwd));
+      if (inPlace) writes.push(...sourceWords(operands, cwds, FACT_FILE));
+      else reads.push(...sourceWords(operands, cwds));
     } else if (name === "awk") {
-      reads.push(...sourceWords(positionals(args, new Set(["-f"])).rest.slice(1), step.cwd));
+      reads.push(...sourceWords(positionals(args, new Set(["-f"])).rest.slice(1), cwds));
     } else if (READERS.has(name)) {
-      reads.push(...sourceWords(positionals(args).rest, step.cwd));
+      reads.push(...sourceWords(positionals(args).rest, cwds));
     } else if (SEARCHERS.has(name)) {
       const { rest, flags } = positionals(args, SEARCH_VALUE_FLAGS);
       const patterned = [...flags].some((flag) => PATTERN_FLAGS.has(flag));
-      reads.push(...sourceWords(patterned ? rest : rest.slice(1), step.cwd));
+      reads.push(...sourceWords(patterned ? rest : rest.slice(1), cwds));
     } else if (name === "git") {
       // `git [-C dir] show <ref>:<path>`: the path is from the repo root and
       // the current tree answers.
-      let dir = step.cwd;
+      let dirs = cwds;
       let i = 0;
       while (i < args.length && args[i]!.startsWith("-")) {
-        if (args[i] === "-C" && args[i + 1]) dir = path.resolve(dir, args[i + 1]!);
+        if (args[i] === "-C" && args[i + 1]) dirs = dirs.map((dir) => path.resolve(dir, args[i + 1]!));
         i += args[i] === "-C" || args[i] === "-c" ? 2 : 1;
       }
       if (args[i] !== "show") continue;
-      const top = repoTop(dir);
-      if (top === null) continue;
+      const tops = [...new Set(dirs.map(repoTop).filter((top): top is string => top !== null))];
+      if (tops.length === 0) continue;
       for (const arg of args.slice(i + 1)) {
         const split = arg.indexOf(":");
         const named = split > 0 ? arg.slice(split + 1) : "";
-        if (named && SOURCE_FILE.test(named)) reads.push(path.join(top, named));
+        if (named && SOURCE_FILE.test(named)) reads.push(tops.map((top) => path.join(top, named)));
       }
     }
   }
-  const written = new Set(writes);
+  const written = new Set(writes.flatMap((group) => existing(group, call)));
   return {
-    reads: [...new Set(reads)].filter((file) => !written.has(file) && isFile(file)),
-    writes: [...written].filter((file) => SOURCE_FILE.test(file) && isFile(file)),
+    reads: [...new Set(reads.flatMap((group) => existing(group, call)))].filter((file) => !written.has(file)),
+    writes: [...written].filter((file) => SOURCE_FILE.test(file)),
     // JavaScript writes: fact lines only, never the probe (`FACT_FILE`).
-    factWrites: [...written].filter((file) => !SOURCE_FILE.test(file) && isFile(file)),
+    factWrites: [...written].filter((file) => !SOURCE_FILE.test(file)),
   };
 }
 
@@ -309,10 +367,11 @@ const DECLARING = new Set(["function", "const", "let", "var", "export", "async",
  * identifier of at least five characters (after dropping `function`, `const`
  * ...), so a phrase or a regex with structure names nothing.
  */
-export function searchedNames(command: string, cwd: string): { names: string[]; operands: string[] } {
+export function searchedNames(command: string, cwd: string, _call: CallInfo = {}): { names: string[]; operands: string[] } {
   const names: string[] = [];
   const operands: string[] = [];
-  for (const step of steps(command, cwd)) {
+  const readings = startReadings(command, cwd).map((start) => steps(command, start));
+  for (const [n, step] of readings[0]!.entries()) {
     if (step.piped) continue;
     let at = 0;
     while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(step.words[at] ?? "")) at += 1;
@@ -332,7 +391,12 @@ export function searchedNames(command: string, cwd: string): { names: string[]; 
     }
     const patterned = patterns.length > 0 || [...flags].some((flag) => PATTERN_FLAGS.has(flag));
     if (!patterned && rest[0] !== undefined) patterns.push(rest[0]);
-    for (const operand of patterned ? rest : rest.slice(1)) operands.push(path.resolve(step.cwd, operand));
+    for (const operand of patterned ? rest : rest.slice(1)) {
+      // An operand that exists under only one reading of the start directory is that one.
+      const found = [...new Set(readings.map((one) => path.resolve(one[n]!.cwd, operand)))];
+      const there = found.filter((file) => fs.existsSync(file));
+      operands.push(...(there.length > 0 ? there : [found[0]!]));
+    }
     for (const pattern of patterns) {
       for (const alt of pattern.split(/\\\||\|/)) {
         const tokens = alt
