@@ -145,6 +145,16 @@ export async function drainRunner(root: string): Promise<boolean> {
 }
 
 /**
+ * Wait until the background re-check runner a hook started has finished, so a
+ * snapshot of the folders taken next sees its end state and not whichever step
+ * (queued, claimed under `taken/<pid>/`, answered) a loaded machine had reached
+ * (carrick#4314). Throws when it has not finished.
+ */
+export async function settleRunner(root: string): Promise<void> {
+  if (!(await drainRunner(root))) throw new Error("the re-check runner did not finish in 20 s");
+}
+
+/**
  * A counted wait (at most 50 x 100 ms) until the runner has written `count`
  * answers for `session` under `home`. Throws when it has not.
  */
