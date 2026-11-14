@@ -17,7 +17,8 @@
 
 type TokenKind = "id" | "str" | "tpl" | "num" | "punc" | "regex";
 
-type Token = { kind: TokenKind; value: string; start: number; end: number; line: number };
+/** `opens` marks the first token of a JSX `{...}` container: what came before it is not its operand or callee. */
+type Token = { kind: TokenKind; value: string; start: number; end: number; line: number; opens?: true };
 
 /** A named function-like thing and the text span it covers. */
 /** A named thing: its span (from its modifiers and decorators) and the 1-based line of its name token. */
@@ -94,7 +95,13 @@ function lexAll(text: string, jsx: boolean): Token[] {
   let i = 0;
   let line = 1;
   const n = text.length;
-  const prevSignificant = (): Token | undefined => tokens[tokens.length - 1];
+  // Where the open JSX `{...}` container's tokens begin: its first token is
+  // in operand position (`a={<Icon />}`, `{/x/.test(s)}`), whatever the
+  // tokens before the container were.
+  let containerFrom = -1;
+  const CONTAINER_OPEN: Token = { kind: "punc", value: "{", start: 0, end: 0, line: 0 };
+  const prevSignificant = (): Token | undefined =>
+    tokens.length === containerFrom ? CONTAINER_OPEN : tokens[tokens.length - 1];
 
   // Skips a template literal starting at the backtick at `at`; returns the
   // index after it and whether it had substitutions, or null if unterminated.
@@ -160,6 +167,17 @@ function lexAll(text: string, jsx: boolean): Token[] {
     );
   };
 
+  // A JSX `{...}` container from its `{` to after its `}`; its code is tokenized.
+  const container = (): void => {
+    const outer = containerFrom;
+    containerFrom = tokens.length;
+    i += 1;
+    lex(true);
+    if (tokens.length > containerFrom) tokens[containerFrom]!.opens = true;
+    i += 1;
+    containerFrom = outer;
+  };
+
   // A tag's inside, from after `<` to after its `>`; true when it closed itself (`/>`).
   const jsxTag = (): boolean => {
     while (i < n) {
@@ -176,9 +194,19 @@ function lexAll(text: string, jsx: boolean): Token[] {
         continue;
       }
       if (c === "{") {
-        i += 1;
-        lex(true);
-        i += 1;
+        container();
+        continue;
+      }
+      // A comment between attributes; in the element's children it is text.
+      if (c === "/" && text[i + 1] === "/") {
+        while (i < n && text[i] !== "\n") i += 1;
+        continue;
+      }
+      if (c === "/" && text[i + 1] === "*") {
+        const close = text.indexOf("*/", i + 2);
+        if (close < 0) throw BAIL;
+        for (let k = i; k < close; k += 1) if (text[k] === "\n") line += 1;
+        i = close + 2;
         continue;
       }
       if (c === "/" && text[i + 1] === ">") {
@@ -207,9 +235,7 @@ function lexAll(text: string, jsx: boolean): Token[] {
         continue;
       }
       if (c === "{") {
-        i += 1;
-        lex(true);
-        i += 1;
+        container();
         continue;
       }
       if (c === "<") {
@@ -467,7 +493,7 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
 
   // Every call's direct string arguments.
   for (const [index, token] of tokens.entries()) {
-    if (token.kind !== "punc" || token.value !== "(") continue;
+    if (token.kind !== "punc" || token.value !== "(" || token.opens) continue;
     const prev = t(index - 1);
     const callee =
       prev !== undefined &&
@@ -782,7 +808,8 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
         continue;
       }
       let k = i;
-      while ((is(k, "id", "async") || is(k, "id", "get") || is(k, "id", "set")) && !punc(k + 1, ":") && !punc(k + 1, "(") && !punc(k + 1, ",")) {
+      // A modifier word followed by what follows a key (`get<T>()`) is the key.
+      while ((is(k, "id", "async") || is(k, "id", "get") || is(k, "id", "set")) && !punc(k + 1, ":") && !punc(k + 1, "(") && !punc(k + 1, ",") && !punc(k + 1, "<")) {
         k += 1;
       }
       if (punc(k, "*")) k += 1;
@@ -849,7 +876,8 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
         while (is(k, "id") || punc(k, ".")) k += 1;
         if (punc(k, "(")) k = match.get(k)! + 1;
       }
-      while (is(k, "id") && CLASS_MODIFIERS.has(t(k)!.value) && !punc(k + 1, "(") && !punc(k + 1, "=") && !punc(k + 1, ";") && !punc(k + 1, ":")) {
+      // A modifier word followed by what follows a name (`get<T>()`) is the name.
+      while (is(k, "id") && CLASS_MODIFIERS.has(t(k)!.value) && !punc(k + 1, "(") && !punc(k + 1, "=") && !punc(k + 1, ";") && !punc(k + 1, ":") && !punc(k + 1, "<")) {
         k += 1;
       }
       if (punc(k, "*")) k += 1;

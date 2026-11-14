@@ -1466,6 +1466,33 @@ test("generic functions, methods and arrows get their own spans", () => {
   assert.notEqual(spansOf("declare function d(a: string): void;\nexport function o(a: string): void;\nexport function o(a: any) { return a }\ntype F = <T>(a: T) => T;\n"), null);
 });
 
+test("an element written as an attribute's value reads", () => {
+  const src = 'export function Banner() {\n  return <Card icon={<Icon size={16} />} onPress={() => api.post("/banner")} />;\n}\n';
+  assert.deepEqual(spansOf(src, true), [`Banner: ${src.trimEnd()}`]);
+});
+
+test("a comment between an element's attributes reads", () => {
+  const src = "function Form() {\n  return (\n    <Field\n      // the user's name\n      name=\"title\"\n      /* it's required */\n      required\n    />\n  );\n}\n";
+  assert.deepEqual(spansOf(src, true), [`Form: ${src.trimEnd()}`]);
+});
+
+test("a generic method named like a modifier is a method", () => {
+  assert.deepEqual(spansOf('class Store<T> {\n  get<K extends keyof T>(key: K) { return api.get("/s") }\n  set<K>(key: K) {}\n}\n'), [
+    'Store.get: get<K extends keyof T>(key: K) { return api.get("/s") }',
+    "Store.set: set<K>(key: K) {}",
+  ]);
+  assert.deepEqual(spansOf('const box = {\n  get<T>(key: string) { return api.get("/b") },\n}\n'), [
+    'box.get: get<T>(key: string) { return api.get("/b") }',
+  ]);
+});
+
+test("a JSX container's first `(` is never a call of what came before the container", () => {
+  const src = "function Row({ title }) {\n  return <Line label={title} render={(x) => <Cell value={x} />} />;\n}\n";
+  const scan = scanSource(src, true);
+  assert.equal(scan.ok, true);
+  assert.deepEqual(scan.calls.map((call) => src.slice(call.from, call.start)), ["Row"]);
+});
+
 test("a declaration the scanner cannot place makes the file unread, never its outer function", () => {
   assert.equal(spansOf("function outer() {\n  function inner<T(a) { api.get('/x') }\n}\n"), null);
   assert.equal(spansOf("class A { find<T(a) { return 1 } }"), null);
