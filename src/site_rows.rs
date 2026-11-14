@@ -975,7 +975,11 @@ pub fn site_names(decided: &Decided, records: &[SiteRecord]) -> crate::name_cens
             || (!site.name.is_empty()
                 && site.name.iter().all(|piece| matches!(piece, Piece::Lit(_))));
         out.note(if record.bucket == Bucket::Lead {
-            NameSource::Unstated
+            if record.unread.is_none() {
+                NameSource::NoReason
+            } else {
+                NameSource::Unstated
+            }
         } else if record.state.asked.contains(&Slot::Name) {
             NameSource::Asked
         } else if !record.names.is_empty() {

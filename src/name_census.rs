@@ -154,8 +154,14 @@ pub enum NameSource {
     ResolverFold,
     /// The name is a slot the model is asked.
     Asked,
-    /// The code states no whole name and nothing is asked: a lead.
+    /// The code states no whole name and nothing is asked: a lead, with the
+    /// reason the resolver gave.
     Unstated,
+    /// A lead whose record holds no reason (`unread: None`):
+    /// `possible_calls::reason_of` saves it as `unanswered`, although nothing
+    /// was asked (carrick#4446). Every one is a path into that fallback
+    /// that has no reason of its own yet.
+    NoReason,
 }
 
 impl Word for NameSource {
@@ -165,6 +171,7 @@ impl Word for NameSource {
         NameSource::ResolverFold,
         NameSource::Asked,
         NameSource::Unstated,
+        NameSource::NoReason,
     ];
 
     fn word(self) -> &'static str {
@@ -174,6 +181,7 @@ impl Word for NameSource {
             NameSource::ResolverFold => "resolver_fold",
             NameSource::Asked => "asked",
             NameSource::Unstated => "unstated",
+            NameSource::NoReason => "no_reason",
         }
     }
 }

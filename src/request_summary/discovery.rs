@@ -9407,6 +9407,115 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         (decided, records)
     }
 
+    /// carrick#4446: a lead record with no reason (`unread: None`) is saved
+    /// as `unanswered` by `possible_calls::reason_of`, although nothing was
+    /// asked. Every service of every fixture with a store answer is walked,
+    /// each with the fixture's other services as siblings, and no lead
+    /// record may hold none. #4418 and #4419 were two paths into the
+    /// fallback; a failure here is a new one, named by fixture, file and
+    /// line.
+    ///
+    /// Ignored until v1-agent rules: on main after #4418 and #4419 the walk
+    /// still finds four leads with no reason, each a new path to file:
+    /// `name-forms` `src/c-default-spread.ts:3`, `queue-enum-base-class`
+    /// `services/runner/src/run.ts:4` and `:5`, and `receiver-scopes-chain`
+    /// `src/items.ts:56`. Run with `-- --ignored` (about 14 minutes).
+    #[test]
+    #[ignore = "finds 4 no-reason leads (carrick#4446); each is a new path to file"]
+    fn no_lead_record_in_the_fixture_suite_holds_no_reason() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().join("library-claims.json").is_file())
+            .filter(|entry| entry.path().join("repo/carrick.json").is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert!(names.len() > 50, "{names:?}");
+        let mut found: Vec<String> = Vec::new();
+        for name in &names {
+            let configs = crate::config::Config::load_services(vec![
+                root.join(name).join("repo/carrick.json"),
+            ])
+            .unwrap();
+            let services: Vec<(String, String)> = configs
+                .iter()
+                .map(|config| {
+                    (
+                        config.directory.clone().unwrap_or_else(|| ".".to_string()),
+                        config.service_name.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let named: Vec<(&str, &str)> = services
+                .iter()
+                .map(|(dir, service)| (dir.as_str(), service.as_str()))
+                .collect();
+            let Some(on) = super::super::fixture_walk::walked_services(name, &named, true) else {
+                panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+            };
+            let text =
+                std::fs::read_to_string(root.join(name).join("library-claims.json")).unwrap();
+            let answer = crate::library_store::parse_answer(&text);
+            let exports = answer.exports;
+            let script =
+                super::super::fixture_walk::sidecar().expect("the compiler engine is built");
+            for (at, (config, own)) in configs.iter().zip(&on.inputs).enumerate() {
+                let siblings: Vec<&RequestSummaryInputs> = on
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != at)
+                    .map(|(_, inputs)| inputs)
+                    .collect();
+                let declarations = super::super::fixture_walk::census_declarations(
+                    &script, &on.repo, config, own, &exports,
+                );
+                use super::super::decided_sites::{
+                    MakerLabel, ProcedureLabels, ScopeLabel, SiteLabel, decided_sites_traced_with,
+                };
+                let discovery = discover_with(
+                    own,
+                    &siblings,
+                    &Labels::of(&exports).tracing(&declarations),
+                    &on.repo,
+                );
+                let discovered: Vec<super::super::decided_sites::DiscoverySite> = discovery
+                    .sites
+                    .iter()
+                    .map(|site| {
+                        serde_json::from_value(serde_json::to_value(site).unwrap()).unwrap()
+                    })
+                    .collect();
+                let labels = SiteLabel::from_exports(&exports);
+                let decided = decided_sites_traced_with(
+                    own,
+                    &siblings,
+                    &on.repo,
+                    &discovered,
+                    &labels,
+                    &MakerLabel::from_exports(&exports),
+                    &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
+                    &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
+                );
+                let records = super::super::site_record::site_records(
+                    own, &siblings, &on.repo, &decided, &labels,
+                );
+                for record in records.iter().filter(|record| {
+                    record.bucket == super::super::site_record::Bucket::Lead
+                        && record.unread.is_none()
+                }) {
+                    found.push(format!("{name}: {}", record.state.point.at));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "lead records with no reason (each a path into `unanswered` that asked nothing): {found:#?}"
+        );
+    }
+
     /// carrick#3527 S5: the instance walk reads the service that holds each
     /// file, so a send through a wrapper declared as a sibling service
     /// (`new AlphaProducer().add(...)`, the queue made two files away in the
