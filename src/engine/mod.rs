@@ -30137,6 +30137,104 @@ unfollowed_member_calls_total: 0,
         );
     }
 
+    /// carrick#4245, the pub/sub and queue half (open): a broker call in a
+    /// loop over a stated list states no library row and saves no library
+    /// lead; the site path asks its kind, and unanswered the site is a
+    /// possible call, so the site is never lost.
+    #[tokio::test]
+    async fn a_broker_call_in_a_loop_over_a_stated_list_is_asked_by_the_site_path() {
+        let edit = [
+            (
+                "package.json",
+                r#"{ "name": "web", "version": "1.0.0", "dependencies": { "@fixture/bus": "^1.0.0" } }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/package.json",
+                r#"{ "name": "@fixture/bus", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@fixture/bus/index.d.ts",
+                "export interface Bus {\n  publish(topic: string, data: unknown): Promise<void>;\n}\nexport declare const bus: Bus;\n",
+            ),
+            (
+                "src/use.ts",
+                "import { bus } from \"@fixture/bus\";\n\
+                 const TOPICS = [\"orders.created\", \"orders.shipped\"] as const;\n\
+                 export async function a() {\n\
+                 \x20 for (const t of TOPICS) await bus.publish(t, {});\n\
+                 }\n",
+            ),
+        ];
+        let Some(on) = crate::request_summary::fixture_walk::walked(
+            "resolve-text",
+            "services/web",
+            "web",
+            &edit,
+            true,
+        ) else {
+            return;
+        };
+        let answer = r#"{"library_claims":[{"package":"@fixture/bus","version":"1.0.0","status":"answered",
+            "exports":[{"specifier":"@fixture/bus","export":"bus","role":"broker",
+            "makes":[],"scopes":[],
+            "ops":[{"op":"send","member":"publish","on":"export","name":{"arg":0},"payload":{"arg":1}}],
+            "reserved":[],"calls":[],"patterns":[]}]}]}"#;
+        let exports = crate::library_store::parse_answer(answer).exports;
+        let file = "services/web/src/use.ts";
+        let sites = crate::request_summary::library_sites(&on.inputs);
+        let names = crate::request_summary::SiteNames::of(&on.inputs);
+        let library = crate::library_claims::read(&sites, &exports, Some(&names), |checks| {
+            Ok(checks
+                .iter()
+                .map(|check| crate::services::type_sidecar::SemanticsResult {
+                    claim_id: check.claim_id.clone(),
+                    receiver: check.receiver.clone(),
+                    verdict: crate::services::type_sidecar::SemanticsVerdict::Verified,
+                    reason: None,
+                    declarations: Vec::new(),
+                })
+                .collect())
+        });
+        assert!(library.rows.is_empty(), "{library:#?}");
+        assert!(library.leads.is_empty(), "{:?}", library.leads);
+        let of = super::site_records_of(
+            &on.inputs,
+            &on.repo,
+            &exports,
+            super::SiteContext::default(),
+        );
+        let record = of
+            .records
+            .iter()
+            .find(|record| record.anchors.call.file == file && record.anchors.call.line == 4)
+            .expect("the loop's call is a decided site");
+        assert!(
+            record
+                .state
+                .asked
+                .contains(&crate::site_questions::Slot::Kind),
+            "{:?}",
+            record.state
+        );
+        let unanswered = crate::site_rows::of(
+            &of.decided,
+            &of.records,
+            &of.labels,
+            &crate::site_questions::SiteAnswers::default(),
+        );
+        assert!(
+            unanswered
+                .leads
+                .iter()
+                .any(|lead| lead.file_path == file && lead.line_number == 4),
+            "unanswered, the site is a possible call: {:#?}",
+            unanswered.leads
+        );
+        // Recorded for whoever scopes this half: the slots the site path
+        // asks at the loop's call.
+        eprintln!("carrick#4245 asked at the loop: {:?}", record.state.asked);
+    }
+
     /// carrick#2538: a message listener on a forked child process is an
     /// in-process end. The row it writes stays in its service, so it never
     /// pairs with a publisher of the same name in another service, whatever

@@ -2335,7 +2335,7 @@ impl<'a> SiteNames<'a> {
         {
             return read.clone();
         }
-        let read = self.read_slot(&at.0, &term);
+        let read = self.read_slot(&at.0, at.1, &term);
         self.read
             .borrow_mut()
             .entry(at)
@@ -2344,7 +2344,11 @@ impl<'a> SiteNames<'a> {
         read
     }
 
-    fn read_slot(&self, file: &Path, term: &ValueAt) -> Option<SlotName> {
+    /// The slot `term` of the library call at `span_start` of `file`, read
+    /// through callers: one value per caller chain, or, where every text of
+    /// a chain is one element of the loops it was read through, one value
+    /// per element (carrick#4245).
+    fn read_slot(&self, file: &Path, span_start: u32, term: &ValueAt) -> Option<SlotName> {
         use super::guards::HoleReason;
         let values = self.resolver.texts_through_callers(file, term);
         if values.is_empty() {
@@ -2412,7 +2416,27 @@ impl<'a> SiteNames<'a> {
                     }
                     match texts.as_slice() {
                         [one] => Ok(one.to_string()),
-                        _ => Err(super::Stop::SeveralOperations),
+                        _ => {
+                            // One text per element of a stated list the
+                            // chain was read through: one name per element,
+                            // each stated where the chain settles (the
+                            // library call itself on an empty chain).
+                            let here = match &place {
+                                Some(place) => Some(place.clone()),
+                                None => self.place_at(file, span_start),
+                            };
+                            if let Some(here) = here.filter(|_| per_element(&held)) {
+                                for text in texts {
+                                    out.push(PlacedName {
+                                        place: Some(here.clone()),
+                                        chain: chain.clone(),
+                                        name: Ok(text.to_string()),
+                                    });
+                                }
+                                continue;
+                            }
+                            Err(super::Stop::SeveralOperations)
+                        }
                     }
                 }
             };
@@ -2423,15 +2447,29 @@ impl<'a> SiteNames<'a> {
 
     /// The call at `lo..hi` (discovery numbering) of `file`, as a place.
     fn place(&self, file: &Path, lo: u32, hi: u32) -> Option<NamePlace> {
-        fn find(body: &FnIr, lo: u32, hi: u32) -> Option<&super::CallIr> {
+        self.place_of(file, &|site: &super::Site| site.lo == lo && site.hi == hi)
+    }
+
+    /// The call of `file` whose SWC span starts at `span_start` (a library
+    /// call, as [`LibrarySite`] places it), as a place.
+    fn place_at(&self, file: &Path, span_start: u32) -> Option<NamePlace> {
+        self.place_of(file, &|site: &super::Site| site.span_start == span_start)
+    }
+
+    /// The first call of `file` whose site `is` answers, as a place.
+    fn place_of(&self, file: &Path, is: &dyn Fn(&super::Site) -> bool) -> Option<NamePlace> {
+        fn find<'b>(
+            body: &'b FnIr,
+            is: &dyn Fn(&super::Site) -> bool,
+        ) -> Option<&'b super::CallIr> {
             body.read_calls()
                 .map(|(call, _)| call)
-                .find(|call| call.site.lo == lo && call.site.hi == hi)
+                .find(|call| is(&call.site))
                 .or_else(|| {
                     body.nested
                         .iter()
                         .chain(&body.detached)
-                        .find_map(|inner| find(inner, lo, hi))
+                        .find_map(|inner| find(inner, is))
                 })
         }
         let ir = self.inputs.files.get(file)?;
@@ -2439,7 +2477,7 @@ impl<'a> SiteNames<'a> {
             .functions
             .values()
             .chain(std::iter::once(&ir.module_level))
-            .find_map(|body| find(body, lo, hi))?;
+            .find_map(|body| find(body, is))?;
         Some(NamePlace {
             file: file.to_path_buf(),
             span_start: call.site.span_start,
@@ -2447,6 +2485,30 @@ impl<'a> SiteNames<'a> {
             line: call.name_line,
         })
     }
+}
+
+/// Whether every value of one caller chain is a text read through a loop
+/// over a stated list (carrick#2093), each from its own element: then the
+/// texts are one name per element, never a choice between them. A text read
+/// through no loop, or two texts from one element (a choice written inside
+/// the loop), keeps the several names a choice (carrick#4245).
+fn per_element(held: &[&super::resolve::TextValue]) -> bool {
+    let mut seen: Vec<&[(u32, usize)]> = Vec::new();
+    for value in held {
+        let super::resolve::TextValue::Text {
+            elements,
+            from_type: false,
+            ..
+        } = value
+        else {
+            return false;
+        };
+        if elements.is_empty() || seen.contains(&elements.as_slice()) {
+            return false;
+        }
+        seen.push(elements);
+    }
+    true
 }
 
 /// A call or construction made through a library client, as one function
