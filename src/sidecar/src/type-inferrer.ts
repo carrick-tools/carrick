@@ -107,7 +107,7 @@ import { StatedParams } from './stated-params.js';
 import { bindingToleratesAbsence, handlerToleratesAbsentBody } from './absent-body.js';
 import { replaceFileText } from './program-files.js';
 import { enclosingTypeParameterIn, instantiatedAtCall } from './type-parameters.js';
-import { loopElementPick, type LoopPick } from './loop-element.js';
+import { endsWithPath, loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
   httpStatus,
@@ -1049,7 +1049,7 @@ export class TypeInferrer {
    */
   private isTheRowsOwnFunction(request: InferRequestItem, func: FunctionLike): boolean {
     if (startLineOf(func) === request.line_number) return true;
-    return this.registrationAtLine(func.getSourceFile(), request.line_number)?.handler === func;
+    return this.registrationAtLine(func.getSourceFile(), request.line_number, request.route_path)?.handler === func;
   }
 
   /**
@@ -1596,7 +1596,7 @@ export class TypeInferrer {
   ): InferRequestItem {
     const node = this.resolveTargetNode(sourceFile, request);
     if (!node) return request;
-    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     if (!atLine) return request;
     const within = (inner: Node, outer: Node): boolean =>
       inner.getPos() >= outer.getPos() && inner.getEnd() <= outer.getEnd();
@@ -1651,7 +1651,7 @@ export class TypeInferrer {
       // function at its line; the handler follows the options object. Where a
       // registration sits on the line, read the handler it hands in, as the
       // line-only `response_body` path does.
-      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
       if (atLine) {
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
@@ -2052,7 +2052,7 @@ export class TypeInferrer {
     inferred: InferredType | null
   ): InferredType | null {
     if (!inferred) return inferred;
-    const atLine = this.registrationAtLine(sourceFile, request.line_number);
+    const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     let registration: Node | undefined = atLine?.registration;
     let handler: FunctionLike | undefined = atLine?.handler;
     if (!handler) {
@@ -2144,7 +2144,7 @@ export class TypeInferrer {
       // away from the registration line. Follow the handler at that line before
       // the generic function-return fallback, which can't reach a handler more
       // than a couple of lines from the registration.
-      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
       if (atLine) {
         this.log(
           `Line ${request.line_number} is a route registration; following handler return`
@@ -2616,7 +2616,7 @@ export class TypeInferrer {
     if (owners.length === 0) return false;
     const sourceFile = this.project.getSourceFile(request.file_path);
     if (!sourceFile) return false;
-    const handler = this.registrationAtLine(sourceFile, request.line_number)?.handler;
+    const handler = this.registrationAtLine(sourceFile, request.line_number, request.route_path)?.handler;
     return handler !== undefined && owners.includes(handler.compilerNode);
   }
 
@@ -2829,7 +2829,7 @@ export class TypeInferrer {
     // is "untied" (carrick#2463): only a located error or redirect send is
     // walked then, and only when a send survives the drop.
     const tied =
-      !!this.registrationAtLine(sourceFile, request.line_number) ||
+      !!this.registrationAtLine(sourceFile, request.line_number, request.route_path) ||
       (func.getStartLineNumber() <= request.line_number &&
         request.line_number <= func.getEndLineNumber());
 
@@ -2904,7 +2904,7 @@ export class TypeInferrer {
     // carrick#2372: the sends sit in an executor the route's handler calls,
     // and other routes may call it with other arguments. Keep only the sends
     // this route's arguments leave reachable.
-    const registered = this.registrationAtLine(sourceFile, request.line_number)?.handler;
+    const registered = this.registrationAtLine(sourceFile, request.line_number, request.route_path)?.handler;
     const routeCall = registered && registered !== func ? callInto(registered, func) : undefined;
     let argumentReads: string[] = [];
     let narrowed = false;
@@ -4479,7 +4479,7 @@ export class TypeInferrer {
       // read the route's declared request contract — the handler's parameter
       // annotation, the registration's schema, or the first typed request
       // expression in the body (`c.req.json<T>()`, `req.body as T`).
-      const atLine = this.registrationAtLine(sourceFile, request.line_number);
+      const atLine = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
       if (atLine) {
         const declared = this.declaredRequestContract(
           atLine.registration,
@@ -4597,7 +4597,7 @@ export class TypeInferrer {
     // the typed request READ inside the handler body — is deliberately not
     // consulted here: that one is itself an expression, so the locator's own
     // expression stays authoritative when nothing is declared.
-    const declaredAt = this.registrationAtLine(sourceFile, request.line_number);
+    const declaredAt = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     if (declaredAt) {
       const declared = this.declaredRequestContract(
         declaredAt.registration,
@@ -9267,10 +9267,33 @@ export class TypeInferrer {
    */
   private registrationAtLine(
     sourceFile: SourceFile,
-    line: number
+    line: number,
+    routePath?: string
   ): { registration: Node; handler: FunctionLike } | undefined {
-    for (const found of this.registrationsOnLine(sourceFile, line)) return found;
-    return undefined;
+    let first: { registration: Node; handler: FunctionLike } | undefined;
+    for (const found of this.registrationsOnLine(sourceFile, line)) {
+      first ??= found;
+      if (routePath === undefined) break;
+      // carrick#4381: a line that registers several routes serves the one
+      // whose own path the row's path ends with (the row's path holds the
+      // mounts' prefix), compared by `endsWithPath` as a loop's element is.
+      // A line none of whose registrations states that path as a literal
+      // keeps the first.
+      if (this.registrationStatesPath(found.registration, routePath)) return found;
+    }
+    return first;
+  }
+
+  /** Whether a registration call's first argument is a string literal the route path ends with. */
+  private registrationStatesPath(registration: Node, routePath: string): boolean {
+    if (!Node.isCallExpression(registration)) return false;
+    const arg = registration.getArguments()[0];
+    if (!arg) return false;
+    const literal = peelValueWrappers(arg);
+    return (
+      (Node.isStringLiteral(literal) || Node.isNoSubstitutionTemplateLiteral(literal)) &&
+      endsWithPath(routePath, literal.getLiteralValue())
+    );
   }
 
   /** Every registration that starts on `line`, in source order. */
@@ -10025,7 +10048,7 @@ export class TypeInferrer {
       const node = this.unwrapExpressionNode(located);
       return this.registrationHandlerAt(node) ? node : undefined;
     }
-    return this.registrationAtLine(sourceFile, request.line_number)?.registration;
+    return this.registrationAtLine(sourceFile, request.line_number, request.route_path)?.registration;
   }
 
   /**
@@ -11040,7 +11063,7 @@ export class TypeInferrer {
     if (!reads && !this.statedParams.readsReturns) return today;
     const empty = !today || this.isEmptyResponseReading(today);
     if (reads && !empty && !this.statedParams.readsReturns) return today;
-    const at = this.registrationAtLine(sourceFile, request.line_number);
+    const at = this.registrationAtLine(sourceFile, request.line_number, request.route_path);
     const handler = at?.handler ?? this.exportedFunctionOpeningOn(sourceFile, request.line_number);
     if (!handler) return today;
     const sent = reads ? this.statedParams.reply(handler) : undefined;
