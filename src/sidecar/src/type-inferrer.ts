@@ -2318,6 +2318,15 @@ export class TypeInferrer {
         args.length > 0 &&
         (!this.callResultIsPayload(node) || this.locatedSendHandsBackReply(node, request))
       ) {
+        // carrick#4300: a call that hands back the handler's reply and is
+        // handed only a status (`reply.code(204)`) names no body.
+        if (this.locatedStatusHandsBackReply(node, request)) {
+          this.log(
+            `Response payload at ${request.file_path}:${request.line_number} is a call that ` +
+              'hands back the reply and states only a status; it names no body'
+          );
+          return null;
+        }
         payloadNode = args[0];
       }
     }
@@ -2600,6 +2609,27 @@ export class TypeInferrer {
     if (!sourceFile) return false;
     const handler = this.registrationAtLine(sourceFile, request.line_number)?.handler;
     return handler !== undefined && owners.includes(handler.compilerNode);
+  }
+
+  /**
+   * True when a located call hands back the reply of the registration handler
+   * it sits in (`handsBackHandlerParameter`, `isRegisteredHandler`), is
+   * handed a status-shaped value, read as a chain's status call is read
+   * (`statusOfValue`, as `chainStatus` reads it), and does not take any
+   * value in that slot (`takesAnyValue`): `reply.code(204)`,
+   * `res.status(204)`. Such a call states a status and names no body
+   * (carrick#4300); a send of a number (`reply.send(count)`) keeps its
+   * reading. No method name is read.
+   */
+  private locatedStatusHandsBackReply(call: CallExpression, request: InferRequestItem): boolean {
+    if (this.statusOfValue(call.getArguments()[0]) === 'undecided') return false;
+    if (this.takesAnyValue(call)) return false;
+    const handler = this.findContainingFunctionForNode(call);
+    return (
+      handler !== undefined &&
+      this.handsBackHandlerParameter(call, handler) &&
+      this.isRegisteredHandler(request, handler)
+    );
   }
 
   /**
