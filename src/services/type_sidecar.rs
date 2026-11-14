@@ -323,6 +323,7 @@ impl InferRequestItem {
             machinery: false,
             anchor_machinery: false,
             body_member: None,
+            read_spans: Vec::new(),
         })
     }
 }
