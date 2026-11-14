@@ -946,7 +946,8 @@ type ListedByCommit = HashMap<String, Result<Vec<ChangedPath>, String>>;
 type ListedByPair = HashMap<(String, String), Result<Vec<ChangedPath>, String>>;
 /// One file's hunks, by (from, to or the working tree, file).
 type HunksByFile = HashMap<(String, Option<String>, String), Result<Vec<Hunk>, String>>;
-type DroppedPaths = Box<dyn Fn(&str) -> bool + Send + Sync>;
+/// Asked of a listed path relative to the scan root, `None` for one outside it.
+type DroppedPaths = Box<dyn Fn(Option<&str>) -> bool + Send + Sync>;
 
 /// The paths changed since each stored commit, listed once per commit for the
 /// whole run: [`plan`] reads them, and so does a pull request scan's type-reach
@@ -966,6 +967,9 @@ pub struct ChangedSince {
     scaffold_config: Option<String>,
     /// Paths this listing leaves out ([`ChangedSince::without`]).
     dropped: Option<std::sync::Arc<DroppedPaths>>,
+    /// The scan root beside the git top level ([`crate::git_state::RootPaths`]),
+    /// read when a view first filters and shared by every view (carrick#4390).
+    scan_root: std::sync::Arc<std::sync::OnceLock<Option<crate::git_state::RootPaths>>>,
     /// The listing per commit before `dropped` applies, shared by every
     /// [`ChangedSince::view`] of this one.
     listed: std::sync::Arc<std::sync::Mutex<ListedByCommit>>,
@@ -992,6 +996,7 @@ impl ChangedSince {
                 .then(|| crate::git_state::untracked_root_config(repo_path))
                 .flatten(),
             dropped: None,
+            scan_root: Default::default(),
             listed: Default::default(),
             pairs: Default::default(),
             hunks: Default::default(),
@@ -1005,11 +1010,20 @@ impl ChangedSince {
     /// git listings: a caller that asks what each service reads of the
     /// changes other than its own (the per-edit re-check,
     /// `local_mode::recheck`) asks git once, not once per service.
-    pub fn view(&self, dropped: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+    ///
+    /// `dropped` is asked each listed path relative to the scan root
+    /// (`repo_path`), the form a local query holds
+    /// ([`crate::git_state::RootPaths`]), and `None` for a path outside it,
+    /// which each caller keeps or drops by its own question. What the view
+    /// lists stays relative to the top level, the form [`untouched_since`]
+    /// reads. A view whose scan root git cannot place is `Err`, never an
+    /// unfiltered listing (carrick#4390).
+    pub fn view(&self, dropped: impl Fn(Option<&str>) -> bool + Send + Sync + 'static) -> Self {
         Self {
             repo_path: self.repo_path.clone(),
             scaffold_config: self.scaffold_config.clone(),
             dropped: Some(std::sync::Arc::new(Box::new(dropped))),
+            scan_root: self.scan_root.clone(),
             listed: self.listed.clone(),
             pairs: self.pairs.clone(),
             hunks: self.hunks.clone(),
@@ -1049,7 +1063,7 @@ impl ChangedSince {
     /// without the runner's own `carrick.json`. `Err` when git could not
     /// compare.
     pub fn since(&self, commit: &str) -> Result<Vec<ChangedPath>, String> {
-        let mut paths = self
+        let paths = self
             .listed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1064,17 +1078,29 @@ impl ChangedSince {
                 paths
             })
             .clone();
-        if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
-            paths.retain(|change| !dropped(&change.path));
-        }
-        paths
+        self.kept(paths)
+    }
+
+    /// `listed` without the paths this view drops (carrick#4390).
+    fn kept(&self, listed: Result<Vec<ChangedPath>, String>) -> Result<Vec<ChangedPath>, String> {
+        let Some(dropped) = &self.dropped else {
+            return listed;
+        };
+        let mut paths = listed?;
+        let root = self
+            .scan_root
+            .get_or_init(|| crate::git_state::RootPaths::of(&self.repo_path).ok())
+            .as_ref()
+            .ok_or_else(|| format!("git named no top level for {}", self.repo_path))?;
+        paths.retain(|change| !dropped(root.scan_relative(&change.path).as_deref()));
+        Ok(paths)
     }
 
     /// Every path that differs between commits `from` and `to`, relative to
     /// the repository's top level, listed once per pair. `Err` when git could
     /// not compare.
     pub fn between(&self, from: &str, to: &str) -> Result<Vec<ChangedPath>, String> {
-        let mut paths = self
+        let paths = self
             .pairs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1085,10 +1111,7 @@ impl ChangedSince {
                 crate::git_state::changed_paths(&self.repo_path, from, Some(to))
             })
             .clone();
-        if let (Ok(paths), Some(dropped)) = (&mut paths, &self.dropped) {
-            paths.retain(|change| !dropped(&change.path));
-        }
-        paths
+        self.kept(paths)
     }
 
     /// The hunks that turn `file` (relative to the scan root) as `from` holds
@@ -4462,9 +4485,12 @@ mod tests {
             names.sort();
             names
         };
-        let without_api = listing.view(|path| path.starts_with("apps/api/"));
-        let without_web = listing.view(|path| path.starts_with("apps/web/"));
-        let without_worker = listing.view(|path| path.starts_with("apps/worker/"));
+        let without_api =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/api/")));
+        let without_web =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/web/")));
+        let without_worker =
+            listing.view(|path| path.is_some_and(|path| path.starts_with("apps/worker/")));
         assert_eq!(names(&without_api), ["apps/web/src/checkout.test.ts"]);
         assert_eq!(names(&without_web), ["apps/api/src/server.ts"]);
         assert_eq!(
@@ -4476,6 +4502,44 @@ mod tests {
             1,
             "one git listing for three services"
         );
+    }
+
+    /// carrick#4390: a view of a folder below the git top asks its predicate by
+    /// the folder's own paths, `None` for a path outside the folder, and lists
+    /// what it keeps relative to the top level.
+    #[test]
+    fn a_view_below_the_git_top_asks_by_the_folders_paths() {
+        let (dir, commit) = crate::git_state::tests::committed_repo(&[
+            ("svc/src/a.ts", "export const value = 1;"),
+            ("shared/b.ts", "export const value = 1;"),
+        ]);
+        std::fs::write(dir.path().join("svc/src/a.ts"), "export const value = 2;").unwrap();
+        std::fs::write(dir.path().join("shared/b.ts"), "export const value = 2;").unwrap();
+        let folder = dir.path().join("svc").to_string_lossy().to_string();
+        let listing = ChangedSince::new(&folder, &[], &[]);
+        let commit = commit.trim().to_string();
+        let names = |view: &ChangedSince| -> Vec<String> {
+            let mut names: Vec<String> = view
+                .since(&commit)
+                .unwrap()
+                .into_iter()
+                .map(|change| change.path)
+                .collect();
+            names.sort();
+            names
+        };
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let seen = asked.clone();
+        let all = listing.view(move |path| {
+            seen.lock().unwrap().push(path.map(str::to_string));
+            false
+        });
+        assert_eq!(names(&all), ["shared/b.ts", "svc/src/a.ts"]);
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, [None, Some("src/a.ts".to_string())]);
+        let own = listing.view(|path| path == Some("src/a.ts"));
+        assert_eq!(names(&own), ["shared/b.ts"]);
     }
 
     /// carrick#3230: which services load a package a pull request moved. A

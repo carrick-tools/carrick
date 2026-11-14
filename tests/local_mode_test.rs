@@ -5700,6 +5700,206 @@ fn the_probe_walks_no_service_imports() {
     );
 }
 
+/// The [`shop`] repo one folder below its git top level: the workspace lists
+/// `./mono/shop`, and the git repository is `mono`, which also holds a file
+/// outside the repo. `mono` itself is excluded, so the workspace covers the
+/// nested folder only.
+fn shop_below_its_git_top() -> tempfile::TempDir {
+    shop_below_its_git_top_with(|_| {})
+}
+
+/// [`shop_below_its_git_top`], with `extra` run on the git top level after the
+/// note is written and before the first commit.
+fn shop_below_its_git_top_with(extra: impl FnOnce(&Path)) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let top = dir.path().join("mono");
+    copy_tree(
+        &repo_root().join("tests/fixtures").join(SHOP).join("shop"),
+        &top.join("shop"),
+    );
+    std::fs::write(top.join("NOTES.txt"), "A file beside the nested repo.\n")
+        .expect("write the note");
+    extra(&top);
+    git(&top, &["init", "-q", "."]);
+    git(&top, &["add", "-A"]);
+    git(
+        &top,
+        &[
+            "-c",
+            "user.email=fixture@carrick.test",
+            "-c",
+            "user.name=fixture",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    std::fs::write(
+        dir.path().join("carrick-workspace.json"),
+        "{ \"repos\": [\"./mono/shop\"], \"exclude\": [\"mono\"] }\n",
+    )
+    .expect("write the workspace file");
+    dir
+}
+
+const NESTED_SHOP_CLIENT: &str = "mono/shop/inventory/src/client.ts";
+const NESTED_SHOP_ROUTE: &str = "mono/shop/catalog/app/routes/api.v1.widgets.$widgetId.ts";
+
+/// carrick#4390: in a repo whose folder sits below its git top level, an edit
+/// a service reads is still read. Neither the full re-check nor
+/// `check --changed` answers "no service reads the file" for it.
+#[test]
+#[serial]
+fn an_edit_in_a_repo_below_its_git_top_is_read_by_its_service() {
+    let edited = |workspace: &Path| {
+        index(workspace);
+        git(&workspace.join("mono"), &["checkout", "-qb", "feature"]);
+        edit(
+            &workspace.join(NESTED_SHOP_CLIENT),
+            "activeCount: number",
+            "activeCount: string",
+        );
+    };
+
+    let workspace = shop_below_its_git_top();
+    let root = workspace.path();
+    edited(root);
+    let temp = private_temp();
+    let tmpdir = temp.path().to_str().expect("a UTF-8 temp path");
+    let full = recheck_json(root, NESTED_SHOP_CLIENT, &[AMPLE[0], ("TMPDIR", tmpdir)]);
+
+    let other = shop_below_its_git_top();
+    edited(other.path());
+    let (_, changed, stderr) = check_changed_json_with(other.path(), &[]);
+
+    // Both answers are read before either is judged, so a failure names both.
+    let both = format!("check --recheck:\n{full:#}\ncheck --changed:\n{changed:#}\n{stderr}");
+    assert!(
+        full["recheck"]["ran"].is_string(),
+        "the re-check answered:\n{both}"
+    );
+    let rescan = rescan_of(&changed, "shop");
+    assert!(rescan.is_some(), "check --changed read the repo:\n{both}");
+    assert!(
+        !(full["recheck"]["ran"] == serde_json::json!("none")
+            && full["recheck"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no service reads the file"))),
+        "the full re-check skipped an edit the inventory service reads:\n{both}"
+    );
+    assert_eq!(reread(&full), ["inventory"], "{both}");
+    assert_eq!(
+        full["items"][0]["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "{both}"
+    );
+    assert_eq!(
+        rescan.as_deref(),
+        Some("ran"),
+        "check --changed re-scanned the edit the inventory service reads:\n{both}"
+    );
+}
+
+/// carrick#4390: in a repo below its git top, a service the re-check does
+/// not re-read is judged at the copy its last re-check left, as at the git
+/// top. Its own edit is not read as an edit another service made.
+#[test]
+#[serial]
+fn a_re_check_below_the_git_top_judges_an_unread_service_at_its_last_re_check() {
+    let workspace = shop_below_its_git_top();
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join(NESTED_SHOP_CLIENT),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let client = recheck_json(root, NESTED_SHOP_CLIENT, &AMPLE);
+    assert_eq!(reread(&client), ["inventory"], "{client:#}");
+    let route = root.join(NESTED_SHOP_ROUTE);
+    edit(&route, "activeCount: number", "activeCount: string");
+    edit(&route, "activeCount: 3", "activeCount: \"3\"");
+    let answer = recheck_json(root, NESTED_SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    assert_eq!(
+        answer["items"][0]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "judged against the client as the last re-check left it:\n{answer:#}"
+    );
+    let not_reread = answer["recheck"]["scope"]["not_reread"]
+        .as_array()
+        .expect("not_reread");
+    let inventory = not_reread
+        .iter()
+        .find(|entry| entry["service"] == "inventory")
+        .unwrap_or_else(|| panic!("inventory is named as not re-read:\n{answer:#}"));
+    assert_eq!(
+        inventory["reason"],
+        serde_json::json!("judged at your last re-check of it"),
+        "{answer:#}"
+    );
+    assert!(
+        answer["recheck"]["scope"]["stale"]
+            .as_array()
+            .is_none_or(|stale| stale.is_empty()),
+        "{answer:#}"
+    );
+}
+
+/// carrick#4390: in a repo below its git top, a changed file outside the
+/// repo's folder that a service reads (a tsconfig its own config extends)
+/// names that service as judged at its indexed version, as a root tsconfig
+/// does at the git top.
+#[test]
+#[serial]
+fn a_re_check_below_the_git_top_names_a_service_that_reads_a_changed_file_outside_the_repo() {
+    let workspace = shop_below_its_git_top_with(|top| {
+        std::fs::write(
+            top.join("tsconfig.base.json"),
+            "{ \"compilerOptions\": { \"strict\": true } }\n",
+        )
+        .expect("write the shared config");
+        std::fs::write(
+            top.join("shop/inventory/tsconfig.json"),
+            "{ \"extends\": \"../../tsconfig.base.json\" }\n",
+        )
+        .expect("write the service config");
+    });
+    let root = workspace.path();
+    index(root);
+    edit(
+        &root.join("mono/tsconfig.base.json"),
+        "\"strict\": true",
+        "\"strict\": false",
+    );
+    edit(
+        &root.join(NESTED_SHOP_ROUTE),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    let answer = recheck_json(root, NESTED_SHOP_ROUTE, &AMPLE);
+    assert_eq!(reread(&answer), ["catalog"], "{answer:#}");
+    let not_reread = answer["recheck"]["scope"]["not_reread"]
+        .as_array()
+        .expect("not_reread");
+    let inventory = not_reread
+        .iter()
+        .find(|entry| entry["service"] == "inventory")
+        .unwrap_or_else(|| panic!("inventory is named as not re-read:\n{answer:#}"));
+    assert!(
+        inventory["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tsconfig.base.json")),
+        "{answer:#}"
+    );
+    assert!(
+        answer["recheck"]["scope"]["stale"]
+            .as_array()
+            .is_some_and(|stale| stale.iter().any(|name| name == "inventory")),
+        "{answer:#}"
+    );
+}
+
 /// A test edit no service reads, beside a source edit the scan reads the same
 /// (a comment), starts no re-scan in `check --changed`, and the answer is the
 /// forced re-scan's. The test file is no changed file of its own (the scan

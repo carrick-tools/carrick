@@ -790,7 +790,8 @@ fn read_working(
 /// it could not trace. The import closure the change scope already walks
 /// ([`crate::change_scope::untouched_since`]) names those. A service's own
 /// edits are left out of the listing: the digest already accounts for them
-/// (its last re-check's copy, or stale). A service whose closure cannot be
+/// (its last re-check's copy, or stale). A change outside the repo's folder is
+/// no service's own edit, so it stays in the listing (carrick#4390). A service whose closure cannot be
 /// walked (no stored config on this machine) is named too: it is not known to
 /// be untouched.
 fn readers_of_the_edit(
@@ -822,7 +823,10 @@ fn readers_of_the_edit(
             continue;
         };
         let own = service.clone();
-        let changes = listing.view(move |path| own.covers(path));
+        // A service's own edits by the repo folder's path. A change outside the
+        // folder is no service's own, so it stays, and the walk names a service
+        // that reads it (carrick#4390).
+        let changes = listing.view(move |path| path.is_some_and(|path| own.covers(path)));
         let read = crate::change_scope::untouched_since(
             &repo_path,
             std::slice::from_ref(&config),
@@ -897,7 +901,11 @@ pub(super) fn no_service_reads(
     let repo_path = tree.checkout.to_string_lossy().to_string();
     let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
     let kept = paths.clone();
-    let only = listing.view(move |path| !kept.contains(path));
+    // The edited paths are the repo folder's (`locate_file`,
+    // `query::changed_since`). Git lists from its top level, and the view
+    // compares by the folder's form. A change outside the folder is not an
+    // edited file (carrick#4390).
+    let only = listing.view(move |path| !path.is_some_and(|path| kept.contains(path)));
     let none = crate::change_scope::untouched_since(&repo_path, &configs, &only, commit)
         .iter()
         .all(Option::is_none);
