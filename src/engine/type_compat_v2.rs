@@ -423,43 +423,49 @@ fn path_names_a_member(path: &str) -> bool {
     })
 }
 
-/// Root `any_provenance` reasons with which the inferrer DECIDED a payload has
-/// no contract, as opposed to failing to see one. `no_success_payload`: every
-/// response the route's handler sends is an error or a redirect (carrick#1161).
-/// `no_request_body`: the located request read is a validated non-body part
-/// (carrick#1166), or a request config that sets no body member
-/// (carrick-cloud#1366). `projected_value_only`: every read of the call's result
-/// takes a member out of it, so the site states a part of a payload and not a
-/// payload (carrick#1375). `serialised_body_unread`: a handler returns a status
-/// and a body string it serialised itself, and a return builds that string in a
-/// way the inferrer cannot read, so the envelope is never the contract
-/// (carrick#2200). `body_built_by_callee`: a request locator names an
-/// argument of a call into a function that builds the body from it, and the
-/// body it builds cannot be typed, so the argument is not the body
-/// (carrick#2628). `result_member_missing`: the library store labels which
-/// part of a call's result holds the body, and the type at the call has no such
-/// part, so the site states no contract (carrick#2818). `reshaped_by_callback`:
-/// a call's untyped result is handed unread to a callback in its chain that
-/// builds a new value from it, and nothing states the body, so the value the
-/// chain ends in is not the response (carrick#3004). `bound_by_callers`: the
-/// type at the site is an open type parameter of a generic function that only
-/// its callers set: a body read with no call that binds it or at a call that
-/// leaves it open (carrick#4128, carrick#4164), or a response, call result,
-/// return or variable read inside that function (carrick#4201).
-/// `body_member_undecided`: a call's result holds the
-/// transport response beside other members and the called function's code does
-/// not settle which member holds the body.
-const DECIDED_ABSTAIN_REASONS: &[&str] = &[
-    "no_success_payload",
-    "no_request_body",
-    "projected_value_only",
-    "serialised_body_unread",
-    "body_built_by_callee",
-    "result_member_missing",
-    "reshaped_by_callback",
-    "bound_by_callers",
-    "body_member_undecided",
-];
+/// The one list of type reasons (carrick#4231): every word a top-type finding
+/// can carry, its reader sentence, and when a root `unknown` with it means the
+/// inferrer DECIDED the payload has no contract rather than failed to see one.
+/// The sidecar's engine reads the same file; each word's meaning is documented
+/// beside `TypeProvenanceReason` in `src/sidecar/src/capture/api.ts`.
+const TYPE_REASONS: &str = include_str!("../sidecar/src/capture/type-reasons.json");
+
+/// When a word is a decision: at every site, only at a consumer call's result,
+/// or never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReasonDecided {
+    Always,
+    AtCallResult,
+    Never,
+}
+
+/// One word's row; the sentence is the readers' and is not read here.
+#[derive(Debug, serde::Deserialize)]
+struct TypeReason {
+    decided: ReasonDecided,
+}
+
+/// The list, parsed once. The file is embedded at build time, so a parse
+/// failure is a broken build, never an empty table that would make every
+/// decided abstain undecided.
+fn type_reasons() -> &'static BTreeMap<String, TypeReason> {
+    static TABLE: std::sync::OnceLock<BTreeMap<String, TypeReason>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        serde_json::from_str(TYPE_REASONS)
+            .expect("src/sidecar/src/capture/type-reasons.json parses")
+    })
+}
+
+/// True when a root finding with `reason` on an inference of `kind` is a
+/// decision. A word the list does not hold is not one.
+fn reason_decided(reason: &str, kind: &InferKind) -> bool {
+    match type_reasons().get(reason).map(|r| r.decided) {
+        Some(ReasonDecided::Always) => true,
+        Some(ReasonDecided::AtCallResult) => *kind == InferKind::CallResult,
+        Some(ReasonDecided::Never) | None => false,
+    }
+}
 
 /// True when an inference answered a bare top type because the inferrer read
 /// the use site and decided nothing there is a contract.
@@ -469,7 +475,7 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
 /// it would read the redirect location back in and publish `string` as the
 /// body, which is the exact answer the inferrer just declined to give.
 ///
-/// A call result's root `machinery_envelope` is a decision too: what the
+/// The list marks `machinery_envelope` decided only at a call result: what the
 /// call's result carrier holds is transport the service's wrapper rules verify
 /// and read no payload out of, such as a request library's own response object
 /// (carrick#1841). The capture's re-run would publish the carrier. A handler
@@ -477,12 +483,10 @@ const DECIDED_ABSTAIN_REASONS: &[&str] = &[
 /// (carrick#166), and keeps the capture's own read as its recovery.
 fn inference_decided_no_contract(inf: &crate::services::type_sidecar::InferredType) -> bool {
     text_is_bare_top_type(&inf.type_string)
-        && inf.any_provenance.iter().any(|p| {
-            p.path.is_empty()
-                && (DECIDED_ABSTAIN_REASONS.contains(&p.reason.as_str())
-                    || (inf.infer_kind == InferKind::CallResult
-                        && p.reason == "machinery_envelope"))
-        })
+        && inf
+            .any_provenance
+            .iter()
+            .any(|p| p.path.is_empty() && reason_decided(&p.reason, &inf.infer_kind))
 }
 
 /// Derive one capture anchor per alias from the collected v1 type requests.
@@ -7966,6 +7970,59 @@ mod tests {
                 assert!(!inference_decided_no_contract(&shaped), "{reason} {kind:?}");
             }
         }
+    }
+
+    /// carrick#4231: the decision reads `type-reasons.json` and nothing else.
+    /// Every word in the list decides a bare root `unknown` exactly as its
+    /// `decided` value says, at a call result and at a response body, and never
+    /// beside a printed shape. Literal pins keep the test from passing on a
+    /// list that reads back what the function reads.
+    #[test]
+    fn every_listed_reason_decides_as_the_list_says() {
+        let list: BTreeMap<String, serde_json::Value> = serde_json::from_str(TYPE_REASONS).unwrap();
+        assert_eq!(list.len(), 19, "{:?}", list.keys());
+        for (reason, row) in &list {
+            let decided = row["decided"].as_str().unwrap();
+            for kind in [InferKind::CallResult, InferKind::ResponseBody] {
+                let finding = || crate::services::type_sidecar::TypeProvenance {
+                    path: String::new(),
+                    kind: "unknown".to_string(),
+                    reason: reason.clone(),
+                    detail: None,
+                };
+                let mut bare = inferred("Endpoint_x_Response", "unknown", None, None);
+                bare.infer_kind = kind.clone();
+                bare.any_provenance = vec![finding()];
+                let want = match decided {
+                    "always" => true,
+                    "at_call_result" => kind == InferKind::CallResult,
+                    "never" => false,
+                    other => panic!("{reason}: decided is {other}"),
+                };
+                assert_eq!(
+                    inference_decided_no_contract(&bare),
+                    want,
+                    "{reason} {kind:?}"
+                );
+
+                let mut shaped = inferred("Endpoint_x_Response", "{ a: string }", None, None);
+                shaped.infer_kind = kind.clone();
+                shaped.any_provenance = vec![finding()];
+                assert!(!inference_decided_no_contract(&shaped), "{reason} {kind:?}");
+            }
+        }
+        assert!(reason_decided(
+            "no_success_payload",
+            &InferKind::ResponseBody
+        ));
+        assert!(reason_decided("no_success_payload", &InferKind::CallResult));
+        assert!(reason_decided("machinery_envelope", &InferKind::CallResult));
+        assert!(!reason_decided(
+            "machinery_envelope",
+            &InferKind::ResponseBody
+        ));
+        assert!(!reason_decided("declared", &InferKind::CallResult));
+        assert!(!reason_decided("not_a_listed_word", &InferKind::CallResult));
     }
 
     /// carrick#2628: a request locator on an argument of a call into a

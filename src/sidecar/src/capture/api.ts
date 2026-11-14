@@ -9,6 +9,7 @@
  */
 
 import type { ResultLabel } from './result-label.js';
+import type TypeReasons from './type-reasons.json';
 
 export type { ResultLabel };
 
@@ -292,27 +293,27 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    layer placed (carrick#3995). Stamped at the entry's root.
  *  - `not_recorded`: the position carries a top type and this layer has no
  *    cause for it.
+ *
+ * The words are the keys of `./type-reasons.json`, the one list of reasons
+ * (carrick#4231): each word's reader sentence and whether it means the scan
+ * DECIDED there is no contract (`always`, `at_call_result`, `never`). The
+ * engine's decided set and the Rust driver's `reason_decided` both read that
+ * file. A word stays in it while any stored index can still carry it.
  */
-export type TypeProvenanceReason =
-  | 'declared'
-  | 'unresolved_import'
-  | 'budget_exhausted'
-  | 'no_payload_evidence'
-  | 'machinery_envelope'
-  | 'coerced_input'
-  | 'no_success_payload'
-  | 'no_request_body'
-  | 'projected_value_only'
-  | 'serialised_body_unread'
-  | 'body_built_by_callee'
-  | 'reshaped_by_callback'
-  | 'result_member_missing'
-  | 'bound_by_callers'
-  | 'body_member_undecided'
-  | 'not_located'
-  | 'site_unreadable'
-  | 'unplaced_top_type'
-  | 'not_recorded';
+export type TypeProvenanceReason = keyof typeof TypeReasons;
+
+/**
+ * When a root `unknown` with this reason is a decision rather than a failed
+ * read: at every site, only at a consumer call's result, or never.
+ */
+export type ReasonDecided = 'always' | 'at_call_result' | 'never';
+
+/** One word's row in `./type-reasons.json`. */
+export interface TypeReason {
+  /** What a reader is told the word means. */
+  sentence: string;
+  decided: ReasonDecided;
+}
 
 /**
  * One `any`/`unknown` finding inside a captured or inferred type, with its

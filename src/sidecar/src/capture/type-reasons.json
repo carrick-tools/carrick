@@ -1,0 +1,78 @@
+{
+  "declared": {
+    "sentence": "declared that way in the code or in a library it calls",
+    "decided": "never"
+  },
+  "unresolved_import": {
+    "sentence": "a dependency or generated module could not be resolved on the scanned checkout",
+    "decided": "never"
+  },
+  "budget_exhausted": {
+    "sentence": "the type walk hit its budget before resolving this",
+    "decided": "never"
+  },
+  "no_payload_evidence": {
+    "sentence": "nothing in the handler states what it returns",
+    "decided": "never"
+  },
+  "machinery_envelope": {
+    "sentence": "the value sits inside framework machinery the walk does not read through",
+    "decided": "at_call_result"
+  },
+  "coerced_input": {
+    "sentence": "the request schema takes this position untyped and coerces it to the type printed here, so the finding is what a caller may send rather than the printed member",
+    "decided": "never"
+  },
+  "no_success_payload": {
+    "sentence": "every response the route sends is an error or a redirect, so the scan found no success body and compared nothing at this site",
+    "decided": "always"
+  },
+  "no_request_body": {
+    "sentence": "the request read located here is a path parameter or a query the route validates rather than a body, so the scan compared nothing at this site",
+    "decided": "always"
+  },
+  "projected_value_only": {
+    "sentence": "every read of the call's result takes a member out of it, so the site states part of a payload rather than a whole one and the scan compared nothing here",
+    "decided": "always"
+  },
+  "serialised_body_unread": {
+    "sentence": "the handler returns a status and a body it serialised to a string, and the scan could not see what it serialised, so nothing was compared at this site. Read the handler for the body's shape rather than this type",
+    "decided": "always"
+  },
+  "body_built_by_callee": {
+    "sentence": "the call hands its argument to a function that builds the request body from it in a way the scan could not type, so the argument is not the body and nothing was compared at this site. Read the called function for the body's shape",
+    "decided": "always"
+  },
+  "bound_by_callers": {
+    "sentence": "the type here is still an open type parameter of a generic function, which only that function's callers set, so this site states no type of its own and nothing was compared here. Read the callers of the function that declares the parameter (the detail names it) for the type",
+    "decided": "always"
+  },
+  "body_member_undecided": {
+    "sentence": "the call's result is an object that holds the transport response beside other members, and the called function's code does not settle which member holds the parsed body, so the site states no contract and nothing was compared here. Read the called function's returns for the member that holds the body",
+    "decided": "always"
+  },
+  "result_member_missing": {
+    "sentence": "the library this call uses says which part of its result holds the response body, and the type at this call has no such part, so the site states no contract and nothing was compared here",
+    "decided": "always"
+  },
+  "reshaped_by_callback": {
+    "sentence": "the call's result is handed unread to a callback in its chain that builds a new value from it, and nothing in the chain states the body, so the site states no contract and nothing was compared here",
+    "decided": "always"
+  },
+  "not_located": {
+    "sentence": "the scan found no value in the code for this payload, so no type was read at this site",
+    "decided": "never"
+  },
+  "site_unreadable": {
+    "sentence": "the scan located the site and the compiler engine could not read a type there",
+    "decided": "never"
+  },
+  "unplaced_top_type": {
+    "sentence": "at a member the scan could not identify",
+    "decided": "never"
+  },
+  "not_recorded": {
+    "sentence": "the layer that produced it recorded no cause",
+    "decided": "never"
+  }
+}
