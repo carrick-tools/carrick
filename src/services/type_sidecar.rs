@@ -1940,7 +1940,7 @@ enum SidecarRequest {
     ResolveDefinitions {
         request_id: String,
         stub_dir: String,
-        aliases: Vec<String>,
+        aliases: Vec<DefinitionAlias>,
     },
     #[serde(rename = "retype_check")]
     RetypeCheck {
@@ -2556,6 +2556,21 @@ pub struct InferTiming {
     /// The request that printed the longest type; `None` when none printed.
     #[serde(default)]
     pub longest_printed: Option<InferSlotTiming>,
+}
+
+/// One surface alias to resolve, and the payload it types: its protocol, its
+/// kind and the side of the operation its entry is on (carrick-cloud#3503).
+/// The compiler engine prints the alias's structural form in JSON wire form
+/// exactly where the check compares that form, the sending side of an http
+/// payload; the rule is the engine's own (`sentInJsonWireForm`), so this
+/// carries the facts and never the answer. A derived alias (an unwidened
+/// reading, a response-mode case) carries its base entry's facts.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DefinitionAlias {
+    pub alias: String,
+    pub protocol: ProbeProtocol,
+    pub type_kind: crate::cloud_storage::ManifestTypeKind,
+    pub side: crate::cloud_storage::ManifestRole,
 }
 
 /// A single resolved type definition from the sidecar
@@ -4166,11 +4181,11 @@ impl TypeSidecar {
     ///
     /// # Arguments
     /// * `stub_dir` - Absolute path to the capture stub dir (types/ tree)
-    /// * `aliases` - Surface type alias names to resolve
+    /// * `aliases` - Surface type aliases to resolve, each with its payload
     pub fn resolve_definitions(
         &self,
         stub_dir: &str,
-        aliases: &[String],
+        aliases: &[DefinitionAlias],
     ) -> Result<Vec<ResolvedDefinitionResult>, SidecarError> {
         self.ensure_ready()?;
 
@@ -6607,7 +6622,12 @@ mod tests {
             SidecarRequest::ResolveDefinitions {
                 request_id: id(),
                 stub_dir: "/tmp/stub".into(),
-                aliases: vec!["A".into()],
+                aliases: vec![DefinitionAlias {
+                    alias: "A".into(),
+                    protocol: ProbeProtocol::Http,
+                    type_kind: crate::cloud_storage::ManifestTypeKind::Response,
+                    side: crate::cloud_storage::ManifestRole::Producer,
+                }],
             },
             SidecarRequest::RetypeCheck {
                 request_id: id(),

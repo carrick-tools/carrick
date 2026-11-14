@@ -27,7 +27,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { SIDECAR_PATH } from './helpers.js';
+import { SIDECAR_PATH, receivedAliases } from './helpers.js';
 
 interface Answer {
   request_id: string;
@@ -187,7 +187,7 @@ describe('resolve_definitions builds no service project (carrick#1927)', () => {
       action: 'resolve_definitions',
       request_id: 'resolve',
       stub_dir: stubDir,
-      aliases: [ORDER, ORDERS],
+      aliases: receivedAliases(ORDER, ORDERS),
     };
   });
 

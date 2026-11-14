@@ -13593,25 +13593,39 @@ fn join_capture_answers(
 /// Beside each entry, the capture aliases that carry its unwidened reading
 /// (carrick#1516) and each case of its response modes (carrick#2054), when
 /// the capture recorded them.
+///
+/// Each alias carries the payload its entry types (protocol, kind, side), so
+/// the compiler engine prints the sending side of an http payload in the JSON
+/// wire form the check compares it in (carrick-cloud#3503). A derived alias
+/// takes its base entry's payload. The order is the alias names' order, as
+/// above: an alias is named from its operation, role and kind, so one name
+/// never carries two payloads.
 fn aliases_to_resolve(
     manifest: &[TypeManifestEntry],
     records: &HashMap<String, crate::services::type_sidecar::CaptureAliasRecord>,
-) -> Vec<String> {
-    manifest
-        .iter()
-        .flat_map(|e| {
-            let unwidened = type_compat_v2::unwidened_alias(&e.type_alias);
-            let cases = e
-                .response_modes
-                .iter()
-                .flat_map(|modes| modes.cases.iter().map(|case| case.alias.clone()));
-            std::iter::once(e.type_alias.clone())
-                .chain(std::iter::once(unwidened).chain(cases))
-                .filter(move |alias| *alias == e.type_alias || records.contains_key(alias))
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
+) -> Vec<crate::services::type_sidecar::DefinitionAlias> {
+    let mut aliases = std::collections::BTreeMap::new();
+    for e in manifest {
+        let unwidened = type_compat_v2::unwidened_alias(&e.type_alias);
+        let cases = e
+            .response_modes
+            .iter()
+            .flat_map(|modes| modes.cases.iter().map(|case| case.alias.clone()));
+        for alias in std::iter::once(e.type_alias.clone())
+            .chain(std::iter::once(unwidened).chain(cases))
+            .filter(|alias| *alias == e.type_alias || records.contains_key(alias))
+        {
+            aliases.entry(alias.clone()).or_insert_with(|| {
+                crate::services::type_sidecar::DefinitionAlias {
+                    alias,
+                    protocol: type_compat_v2::probe_protocol(&e.key),
+                    type_kind: e.type_kind,
+                    side: e.role,
+                }
+            });
+        }
+    }
+    aliases.into_values().collect()
 }
 
 /// Write the capture's answers onto the manifest, and let a real shape settle
@@ -26623,7 +26637,7 @@ unfollowed_member_calls_total: 0,
             "v1's own placeholder must not read as a defined type: {dts}"
         );
         assert_eq!(
-            aliases_to_resolve(&manifest, &HashMap::new()),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
             vec!["OrderView".to_string()],
             "an alias v1 abstained on is exactly the one the capture exists to answer"
         );
@@ -26799,7 +26813,10 @@ unfollowed_member_calls_total: 0,
 
         let records = read_records_with(&sibling);
         assert_eq!(
-            aliases_to_resolve(&[consumer_entry("OrderView")], &records),
+            alias_names(&aliases_to_resolve(
+                &[consumer_entry("OrderView")],
+                &records
+            )),
             vec!["OrderView".to_string(), sibling.clone()],
             "the sibling is asked about only when the capture recorded it"
         );
@@ -26865,7 +26882,7 @@ unfollowed_member_calls_total: 0,
 
         let records = read_records_with(&case_a);
         assert_eq!(
-            aliases_to_resolve(&manifest[..1], &records),
+            alias_names(&aliases_to_resolve(&manifest[..1], &records)),
             vec!["OrderView".to_string(), case_a.clone()],
             "a case is asked about only when the capture recorded it"
         );
@@ -27015,6 +27032,94 @@ unfollowed_member_calls_total: 0,
         HashMap::from([(alias.to_string(), record)])
     }
 
+    fn alias_names(aliases: &[crate::services::type_sidecar::DefinitionAlias]) -> Vec<String> {
+        aliases.iter().map(|a| a.alias.clone()).collect()
+    }
+
+    /// carrick-cloud#3503: each alias asked about carries its entry's payload
+    /// (protocol, kind, side), and a derived alias its base entry's, so the
+    /// compiler engine can print the sending side of an http payload in the
+    /// wire form the check compares. The answer itself is the engine's rule;
+    /// these are the facts it reads.
+    #[test]
+    fn each_alias_asked_about_carries_its_entry_s_payload() {
+        use crate::engine::type_compat_v2::unwidened_alias;
+        use crate::services::type_sidecar::{DefinitionAlias, ProbeProtocol};
+        let entry = |alias: &str, key: OperationKey, role, kind| {
+            let mut e = consumer_entry(alias);
+            e.key = key;
+            e.role = role;
+            e.type_kind = kind;
+            e
+        };
+        let mut producer = entry(
+            "A_ProducerResponse",
+            OperationKey::http("GET", "/rows"),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+        );
+        producer.response_modes = Some(crate::cloud_storage::ResponseModes {
+            reads: Vec::new(),
+            cases: vec![crate::cloud_storage::ResponseModeCase {
+                value: None,
+                alias: "A_ProducerResponse_Case".to_string(),
+                expanded: None,
+            }],
+        });
+        let manifest = vec![
+            producer,
+            entry(
+                "B_ConsumerRequest",
+                OperationKey::http("POST", "/rows"),
+                ManifestRole::Consumer,
+                ManifestTypeKind::Request,
+            ),
+            entry(
+                "C_GraphqlResponse",
+                OperationKey::graphql(crate::operation::GraphqlOperationKind::Query, "rows"),
+                ManifestRole::Producer,
+                ManifestTypeKind::Response,
+            ),
+        ];
+        let mut records = read_records_with(&unwidened_alias("A_ProducerResponse"));
+        records.extend(read_records_with("A_ProducerResponse_Case"));
+        let http_producer_response = |alias: String| DefinitionAlias {
+            alias,
+            protocol: ProbeProtocol::Http,
+            type_kind: ManifestTypeKind::Response,
+            side: ManifestRole::Producer,
+        };
+        let mut expected = vec![
+            http_producer_response("A_ProducerResponse".to_string()),
+            http_producer_response(unwidened_alias("A_ProducerResponse")),
+            http_producer_response("A_ProducerResponse_Case".to_string()),
+            DefinitionAlias {
+                alias: "B_ConsumerRequest".to_string(),
+                protocol: ProbeProtocol::Http,
+                type_kind: ManifestTypeKind::Request,
+                side: ManifestRole::Consumer,
+            },
+            DefinitionAlias {
+                alias: "C_GraphqlResponse".to_string(),
+                protocol: ProbeProtocol::Graphql,
+                type_kind: ManifestTypeKind::Response,
+                side: ManifestRole::Producer,
+            },
+        ];
+        expected.sort_by(|a, b| a.alias.cmp(&b.alias));
+        assert_eq!(aliases_to_resolve(&manifest, &records), expected);
+        assert_eq!(
+            serde_json::to_value(&expected[expected.len() - 2]).unwrap(),
+            serde_json::json!({
+                "alias": "B_ConsumerRequest",
+                "protocol": "http",
+                "type_kind": "request",
+                "side": "consumer"
+            }),
+            "the request carries the names the compiler engine's validator reads"
+        );
+    }
+
     /// A capture answer that IS a top type describes nothing, so an entry v1
     /// abstained on publishes no definition at all rather than the word `any`.
     /// 210 of one indexed service's 212 rows are exactly this: the bundle said
@@ -27113,7 +27218,7 @@ unfollowed_member_calls_total: 0,
             "a shape carrying a top type does not state a contract"
         );
         assert_eq!(
-            aliases_to_resolve(&manifest, &HashMap::new()),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
             vec!["OrderView".to_string()],
             "the capture must be asked: it is the layer that resolves what v1 could not"
         );
@@ -27992,7 +28097,7 @@ unfollowed_member_calls_total: 0,
             "a bare `any` is an abstention"
         );
         assert_eq!(
-            aliases_to_resolve(&manifest, &HashMap::new()),
+            alias_names(&aliases_to_resolve(&manifest, &HashMap::new())),
             vec!["OrderView".to_string()]
         );
 

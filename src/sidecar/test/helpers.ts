@@ -3,6 +3,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import type { DefinitionAlias } from '../src/types.js';
 import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import * as zlib from 'node:zlib';
@@ -37,6 +38,20 @@ export function stubDirFor(dts: string): string {
   fs.mkdirSync(path.join(dir, 'types'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'types', 'surface.d.ts'), dts);
   return dir;
+}
+
+/**
+ * `resolve_definitions` aliases for the receiving side of an http request
+ * body: printed as declared, the way every test before carrick-cloud#3503
+ * read them. A test about the wire form names its payload itself.
+ */
+export function receivedAliases(...names: string[]): DefinitionAlias[] {
+  return names.map((alias) => ({
+    alias,
+    protocol: 'http',
+    type_kind: 'request',
+    side: 'producer',
+  }));
 }
 
 /**

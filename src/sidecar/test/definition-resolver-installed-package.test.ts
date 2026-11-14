@@ -13,6 +13,7 @@
  */
 
 import { describe, it, before, after } from 'node:test';
+import { receivedAliases } from './helpers.js';
 import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -115,14 +116,14 @@ describe('carrick#3995 T5: the resolver reads a bare package import as the self-
     // A type a package declares stays by name in the structural form, as the
     // inference path prints it; what changes is that it is the type, not any.
     it('resolves to the package type, not any', () => {
-      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, [ALIAS]);
+      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, receivedAliases(ALIAS));
       assert.ok(definition, 'no definition');
       assert.strictEqual(definition.expanded, 'Thing', JSON.stringify(definition));
       assert.match(definition.definition, /import\("pkg"\)\.Thing/, JSON.stringify(definition));
     });
 
     it('leaves no link to the installed packages in the stub', () => {
-      new DefinitionResolver().resolveFromStub(result.stub_dir, [ALIAS]);
+      new DefinitionResolver().resolveFromStub(result.stub_dir, receivedAliases(ALIAS));
       assert.strictEqual(fs.existsSync(path.join(result.stub_dir, 'node_modules')), false);
     });
   });
@@ -137,7 +138,7 @@ describe('carrick#3995 T5: the resolver reads a bare package import as the self-
     });
 
     it('still answers any: the shape comes from the installed package, nowhere else', () => {
-      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, [ALIAS]);
+      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, receivedAliases(ALIAS));
       assert.ok(definition, 'no definition');
       assert.strictEqual(definition.expanded, 'any', JSON.stringify(definition));
     });
@@ -200,7 +201,7 @@ describe('carrick#3995 T5: the resolver reads a bare package import as the self-
     });
 
     it("resolves to the sibling's package type, not any", () => {
-      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, ['Endpoint_web_Response']);
+      const [definition] = new DefinitionResolver().resolveFromStub(result.stub_dir, receivedAliases('Endpoint_web_Response'));
       assert.ok(definition, 'no definition');
       assert.strictEqual(definition.expanded, 'Span', JSON.stringify(definition));
     });
@@ -222,7 +223,7 @@ describe('carrick#3995 T5: the resolver reads a bare package import as the self-
     it('resolves a package installed inside the checkout', () => {
       const captured = capture(true);
       made.push(captured.repoDir, captured.outRoot);
-      const [definition] = new DefinitionResolver().resolveFromStub(captured.result.stub_dir, [ALIAS]);
+      const [definition] = new DefinitionResolver().resolveFromStub(captured.result.stub_dir, receivedAliases(ALIAS));
       assert.strictEqual(definition?.expanded, 'Thing', JSON.stringify(definition));
     });
 
