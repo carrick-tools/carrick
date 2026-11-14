@@ -5841,7 +5841,7 @@ impl Reader<'_> {
     /// What the function whose node is `span` returns
     /// ([`Reader::return_shapes`]).
     fn return_shape(&self, span: Span) -> Option<crate::return_flow::ReturnShape> {
-        self.return_shapes.get(&(span.lo.0, span.hi.0)).copied()
+        self.return_shapes.get(&(span.lo.0, span.hi.0)).cloned()
     }
 
     fn site(&self, span: Span) -> Site {
@@ -11256,6 +11256,8 @@ pub struct RequestSummaryIndex {
     /// What says whether a request its own line leaves open is stated by its
     /// callers alone (carrick#3961), gathered while the rows are.
     ledger: Box<CallerLedger>,
+    /// What each function hands its caller ([`ReturnChain`], carrick#4371).
+    returned: Box<ReturnChains>,
 }
 
 /// What the callers of the requests whose own line leaves the path open
@@ -11418,6 +11420,12 @@ impl RequestSummaryIndex {
     /// The rows at each call site of `file`, keyed by span start.
     pub fn rows(&self, file: &Path) -> Option<&BTreeMap<u32, Vec<SummaryRow>>> {
         self.rows.get(file)
+    }
+
+    /// What each function of the service hands its caller ([`ReturnChain`],
+    /// carrick#4371), for the site pass.
+    pub fn returned_records(&self) -> ReturnChains {
+        (*self.returned).clone()
     }
 
     /// Where the rows of each request stand (carrick#2524): the request's
@@ -11637,9 +11645,116 @@ struct Composer<'a> {
     clients: LinkedClients,
     memo: HashMap<(PathBuf, String), Summary>,
     in_progress: HashSet<(PathBuf, String)>,
+    /// Each function's [`ReturnChain`], once read.
+    returned: HashMap<(PathBuf, String), Option<ReturnChain>>,
+    returning: HashSet<(PathBuf, String)>,
+}
+
+/// The call a chain of returns ends at ([`ReturnChain::end`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnEnd {
+    /// The file as walked (a key of [`RequestSummaryInputs::files`]).
+    pub file: PathBuf,
+    pub line: u32,
+    /// SWC's span of the call.
+    pub span_start: u32,
+    pub span_end: u32,
+    /// The call is the platform's `fetch`.
+    pub fetch: bool,
+}
+
+/// What a function hands its caller, read down its returns (carrick#4371,
+/// READY-4371 R1): the returned call is followed while its callee is a
+/// function this pass reads, each parse or member read on the way is a step
+/// (in the order made, the end's value first), and the call the chain stops
+/// at is the end. [`crate::return_flow::hands_back_body`] says whether the
+/// steps hand back the end's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnChain {
+    pub steps: Vec<crate::return_flow::Step>,
+    pub end: ReturnEnd,
+}
+
+/// Every function's [`ReturnChain`], by its file as walked and its key.
+#[derive(Debug, Clone, Default)]
+pub struct ReturnChains {
+    by_function: HashMap<(PathBuf, String), Option<ReturnChain>>,
+}
+
+impl ReturnChains {
+    /// `None` for a function this pass did not read (another service's);
+    /// `Some(None)` for one whose return is no chain of returned calls: a
+    /// literal, an operator, an object, a function, nothing, or a call of a
+    /// parameter.
+    pub fn of(&self, file: &Path, key: &str) -> Option<Option<&ReturnChain>> {
+        self.by_function
+            .get(&(file.to_path_buf(), key.to_string()))
+            .map(Option::as_ref)
+    }
+
+    /// [`Self::of`] for the function `key` of the file ending in `file`.
+    #[cfg(test)]
+    pub(crate) fn find(&self, file: &str, key: &str) -> Option<Option<&ReturnChain>> {
+        self.by_function
+            .iter()
+            .find(|((path, name), _)| path.ends_with(file) && name == key)
+            .map(|(_, chain)| chain.as_ref())
+    }
 }
 
 impl Composer<'_> {
+    /// `key`'s [`ReturnChain`] in `file`, memoised. `None` on a cycle.
+    fn returned(&mut self, file: &Path, key: &str) -> Option<ReturnChain> {
+        let id = (file.to_path_buf(), key.to_string());
+        if let Some(known) = self.returned.get(&id) {
+            return known.clone();
+        }
+        let files = self.files;
+        let ir = files.get(file)?.functions.get(key)?;
+        if !self.returning.insert(id.clone()) {
+            return None;
+        }
+        let record = self.returned_of(file, ir);
+        self.returning.remove(&id);
+        self.returned.insert(id, record.clone());
+        record
+    }
+
+    fn returned_of(&mut self, file: &Path, ir: &FnIr) -> Option<ReturnChain> {
+        let shape = ir.return_shape.as_ref()?;
+        let call = ir
+            .calls
+            .iter()
+            .find(|call| call.site.lo == shape.base.lo.0 && call.site.hi == shape.base.hi.0)?;
+        if call.invokes_param.is_some() {
+            return None;
+        }
+        let files = self.files;
+        let mut record = match self.target(file, call) {
+            Some((callee_file, key))
+                if files
+                    .get(&callee_file)
+                    .is_some_and(|read| read.functions.contains_key(&key)) =>
+            {
+                self.returned(&callee_file, &key)?
+            }
+            _ => ReturnChain {
+                steps: Vec::new(),
+                end: ReturnEnd {
+                    file: file.to_path_buf(),
+                    line: call.site.line,
+                    span_start: call.site.span_start,
+                    span_end: call.site.span_end,
+                    fetch: self
+                        .request_of(file, call)
+                        .is_some_and(|request| request.kind == RequestKind::Fetch),
+                },
+            },
+        };
+        record.steps.extend(shape.step());
+        Some(record)
+    }
+
     fn summary(&mut self, file: &Path, key: &str) -> Option<Summary> {
         let id = (file.to_path_buf(), key.to_string());
         if let Some(summary) = self.memo.get(&id) {
@@ -11876,10 +11991,12 @@ impl Composer<'_> {
         summary.passes_body = summary.effects.len() == 1
             && ir
                 .return_shape
+                .as_ref()
                 .is_some_and(|shape| self.hands_back_body(file, ir, shape));
         summary.returns_request_value = summary.effects.len() == 1
             && ir
                 .return_shape
+                .as_ref()
                 .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
         for (effect, through) in lifted {
             summary.state(ir.settle_forward(effect), through);
@@ -11932,7 +12049,7 @@ impl Composer<'_> {
         &mut self,
         file: &Path,
         ir: &FnIr,
-        shape: crate::return_flow::ReturnShape,
+        shape: &crate::return_flow::ReturnShape,
     ) -> bool {
         use crate::return_flow::ShapeKind;
         let Some(call) = ir.calls.iter().find(|call| {
@@ -11958,7 +12075,7 @@ impl Composer<'_> {
         &mut self,
         file: &Path,
         ir: &FnIr,
-        shape: crate::return_flow::ReturnShape,
+        shape: &crate::return_flow::ReturnShape,
     ) -> bool {
         use crate::return_flow::ShapeKind;
         if shape.kind != ShapeKind::Value {
@@ -11995,6 +12112,8 @@ pub fn summarize(
         clients: LinkedClients::link(files, &inputs.bindings, inputs.links.as_ref()),
         memo: HashMap::new(),
         in_progress: HashSet::new(),
+        returned: HashMap::new(),
+        returning: HashSet::new(),
     };
     let mut index = RequestSummaryIndex::default();
 
@@ -12011,6 +12130,19 @@ pub fn summarize(
                 continue;
             }
             emit(&mut composer, path, ir, &mut index, true);
+        }
+    }
+    // What each function hands its caller (carrick#4371): read by the site
+    // pass, which reads a wrapper site's response where the chain says.
+    for path in &paths {
+        let mut keys: Vec<&String> = files[*path].functions.keys().collect();
+        keys.sort();
+        for key in keys {
+            let record = composer.returned(path, key);
+            index
+                .returned
+                .by_function
+                .insert((path.to_path_buf(), key.clone()), record);
         }
     }
     // The calls made where a module is loaded can send nothing too
