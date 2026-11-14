@@ -10871,6 +10871,12 @@ fn append_protocol_manifest_entries(
             op.primary_type_symbol.clone(),
             None,
         );
+        // The SDL states the response's leaves; the entry just pushed is the
+        // producer Response (carrick#4403).
+        if let (Some(entry), Some(rendered)) = (entries.last_mut(), &op.primary_type_symbol) {
+            entry.graphql_leaves =
+                crate::graphql::response_leaves(rendered, &extractions.graphql.schema_types);
+        }
         if let Some(arguments) = &op.arguments {
             add_graphql_request_entry(
                 entries,

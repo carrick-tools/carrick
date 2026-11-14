@@ -2550,14 +2550,13 @@ fn sdl_output_type(
 /// field survives.
 pub fn response_leaves(rendered: &str, types: &SdlTypeFields) -> Option<BTreeMap<String, Leaf>> {
     let named = rendered.trim_matches(|c| matches!(c, '[' | ']' | '!'));
-    let _ = (named, types);
-    None
+    let tree = leaf_tree(named, types, &mut Vec::new())?;
+    (!tree.is_empty()).then_some(tree)
 }
 
 /// The fields `name` declares as a leaf map; `None` for a non-composite.
 /// `path` holds the composite types being walked: a type already on it, or
 /// one past the depth cap, is cut.
-#[allow(dead_code)]
 fn leaf_tree<'t>(
     name: &'t str,
     types: &'t SdlTypeFields,
@@ -2592,7 +2591,6 @@ fn leaf_tree<'t>(
     tree
 }
 
-#[allow(dead_code)]
 fn leaf_of<'t>(named: &'t str, types: &'t SdlTypeFields, path: &mut Vec<&'t str>) -> Option<Leaf> {
     match types.outputs.get(named) {
         None => Some(Leaf::Scalar(named.to_string())),
