@@ -1,0 +1,6 @@
+[
+  { "id": 0, "side": "producer", "protocol": "http", "label": "GET /orders", "direction": "response", "service": "shop-api", "repo": "shop", "file": "routes.ts", "line": 10, "name": null, "site": "/orders", "locator": "registration", "groups": [{ "type": "{ orders: string[] }" }] },
+  { "id": 1, "side": "producer", "protocol": "http", "label": "GET /a", "direction": "response", "service": "shop-api", "repo": "shop", "file": "routes.ts", "line": 11, "name": null, "site": "/a", "locator": "registration", "groups": [{ "type": "{ a: number }" }] },
+  { "id": 2, "side": "producer", "protocol": "http", "label": "POST /b", "direction": "response", "service": "shop-api", "repo": "shop", "file": "routes.ts", "line": 11, "name": null, "site": "/b", "locator": "registration", "groups": [{ "type": "{ b: number }" }, { "type": "{ b: string }" }] },
+  { "id": 3, "side": "producer", "protocol": "http", "label": "GET /dup", "direction": "response", "service": "shop-api", "repo": "shop", "file": "routes.ts", "line": 99, "name": null, "site": "/dup", "locator": "registration", "groups": [{ "type": "{ n: number }" }] }
+]
