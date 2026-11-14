@@ -664,8 +664,12 @@ fn stated_whole(
         return Some(Whole::one(text));
     }
     // A name written as one choice: the summaries' pieces keep one side of
-    // a `??`, so the choice is read from the expression itself.
+    // a `??`, so the choice is read from the expression itself. Only when
+    // the name is that one value: a callee that writes text around the
+    // choice (`app.${kind}`, carrick#4365) leaves the pieces more than one,
+    // and the caller's choice is then not the whole name.
     if choices.in_place
+        && pieces.len() <= 1
         && let [expr] = exprs
         && Choices::is_choice(expr)
     {
