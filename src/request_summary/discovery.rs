@@ -2766,7 +2766,11 @@ impl<'a> Walker<'a> {
         // member not found above (carrick#4327): the call is saved with the
         // key's own reason, before any reading of the key's binding as the
         // callee's value.
-        if !construction && let Some(stop) = self.keyed_stop(file, call) {
+        // Delete-check (carrick#4327): the keyed stop is turned off.
+        if false
+            && !construction
+            && let Some(stop) = self.keyed_stop(file, call)
+        {
             return Outcome::stopped(stop);
         }
         // A callee that is a value (carrick#2432): followed through each
