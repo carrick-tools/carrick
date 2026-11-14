@@ -1,0 +1,85 @@
+{
+  "changed": [
+    {
+      "called_by": [],
+      "calls": [],
+      "change": "added",
+      "end_line": 7,
+      "exported": true,
+      "file": "cart/sum.ts",
+      "line": 1,
+      "name": "sumPrices",
+      "similar": [
+        {
+          "called_from": 0,
+          "end_line": 7,
+          "exported": true,
+          "file": "cart/total.ts",
+          "line": 1,
+          "name": "totalPrice",
+          "repo": "shop",
+          "score": 0.261
+        }
+      ]
+    },
+    {
+      "called_by": [],
+      "calls": [],
+      "change": "added",
+      "end_line": 4,
+      "exported": true,
+      "file": "ui/caption.ts",
+      "line": 1,
+      "name": "captionText",
+      "similar": [
+        {
+          "called_from": 0,
+          "end_line": 7,
+          "exported": true,
+          "file": "cart/total.ts",
+          "line": 1,
+          "name": "totalPrice",
+          "repo": "shop",
+          "score": 0.087
+        },
+        {
+          "called_from": 0,
+          "end_line": 3,
+          "exported": true,
+          "file": "ui/plural.ts",
+          "line": 1,
+          "name": "pluralize",
+          "repo": "shop",
+          "score": 0.052
+        }
+      ]
+    },
+    {
+      "called_by": [],
+      "calls": [],
+      "change": "edited",
+      "end_line": 4,
+      "exported": true,
+      "file": "ui/label.ts",
+      "line": 1,
+      "name": "formatLabel"
+    }
+  ],
+  "counts": {
+    "added": 2,
+    "edited": 1,
+    "omitted": 0,
+    "removed": 1,
+    "without_intent": 3
+  },
+  "removed": [
+    {
+      "file": "cart/legacy.ts",
+      "name": "legacyTotal"
+    }
+  ],
+  "similar_index": {
+    "functions": 2,
+    "with_tokens": 2
+  }
+}

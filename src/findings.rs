@@ -1408,6 +1408,20 @@ pub struct NamedFunctions {
     /// At most [`MAX_REMOVED_FUNCTIONS`], by file and name.
     pub removed: Vec<FunctionRef>,
     pub counts: FunctionCounts,
+    /// What the `similar` rows below were ranked against. Absent when the
+    /// run ranked nothing (no index, or no added function).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar_index: Option<SimilarIndexSize>,
+}
+
+/// The size of the index an added function's `similar` rows were ranked
+/// against: the named functions given to the ranker after the PR's own
+/// changed and removed ones were left out and copies counted once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SimilarIndexSize {
+    pub functions: usize,
+    /// Of those, how many carry body tokens.
+    pub with_tokens: usize,
 }
 
 /// Most entries `functions.changed` carries.
@@ -1451,6 +1465,14 @@ pub struct ChangedFunction {
     pub calls: Vec<FunctionRef>,
     /// The functions in this repo's services that call it.
     pub called_by: Vec<FunctionRef>,
+    /// Added functions only: the indexed functions this one looks like, as the
+    /// edit hook ranks them (`local_mode::similar`, carrick-cloud#3490), best
+    /// first. Ranked against main's copy of this repo and every peer, never
+    /// against functions this PR changed or removed, and never against the
+    /// function's own file. `[]` when no indexed function shares a word with
+    /// it; absent when the run ranked nothing or the function is edited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar: Option<Vec<crate::local_mode::contract::SimilarFunction>>,
 }
 
 /// How many functions the PR changed. `added`, `edited` and `removed` count

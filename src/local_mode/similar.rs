@@ -31,7 +31,7 @@ const SYNTHETIC_SUFFIX: &str = "_handler";
 
 /// A function the edit wrote, as one parse of the edited file states it.
 #[derive(Debug, Clone)]
-pub(super) struct Query {
+pub(crate) struct Query {
     /// As the source spells it: `name`, or `Class.member`.
     pub name: String,
     pub tokens: Vec<String>,
@@ -43,7 +43,7 @@ pub(super) struct Query {
 
 impl Query {
     /// A function with nothing to score but its name.
-    pub(super) fn named(name: &str) -> Self {
+    pub(crate) fn named(name: &str) -> Self {
         Self {
             name: name.to_string(),
             tokens: Vec::new(),
@@ -52,7 +52,7 @@ impl Query {
         }
     }
 
-    pub(super) fn of(definition: &FunctionDefinition, callees: Vec<String>) -> Self {
+    pub(crate) fn of(definition: &FunctionDefinition, callees: Vec<String>) -> Self {
         Self {
             name: definition.name.clone(),
             tokens: definition.tokens.clone(),
@@ -78,7 +78,7 @@ struct Entry<'a> {
 
 /// Every indexed function the re-check holds, read once per re-check call and
 /// ranked against every function the edit wrote.
-pub(super) struct Similar<'a> {
+pub(crate) struct Similar<'a> {
     entries: Vec<Entry<'a>>,
     index: SimilarIndex,
     /// (repo, file, member name) of a callee -> the keys of the files that call it.
@@ -97,7 +97,17 @@ fn file_key(repo: &str, file: &str) -> String {
 
 impl<'a> Similar<'a> {
     /// Read `blobs`, each labelled with the repo it belongs to.
-    pub(super) fn build(blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>) -> Self {
+    pub(crate) fn build(blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>) -> Self {
+        Self::build_except(blobs, &HashSet::new())
+    }
+
+    /// [`Self::build`], leaving out the functions in `except`, keyed on
+    /// (lower-cased repo, file as the blob spells it, name): a PR run leaves
+    /// out what the PR itself changed or removed.
+    pub(crate) fn build_except(
+        blobs: impl IntoIterator<Item = (String, &'a CloudRepoData)>,
+        except: &HashSet<(String, String, String)>,
+    ) -> Self {
         #[cfg(test)]
         BUILDS.with(|builds| builds.set(builds.get() + 1));
         let mut entries = Vec::new();
@@ -110,7 +120,8 @@ impl<'a> Similar<'a> {
                     continue;
                 }
                 let file = path_of(definition);
-                if !seen.insert((repo_key.clone(), file.clone(), definition.name.clone())) {
+                let at = (repo_key.clone(), file.clone(), definition.name.clone());
+                if except.contains(&at) || !seen.insert(at) {
                     continue;
                 }
                 let key = file_key(&repo, &file);
@@ -154,8 +165,18 @@ impl<'a> Similar<'a> {
         }
     }
 
+    /// How many functions the ranker holds, and how many of them carry tokens.
+    pub(crate) fn size(&self) -> (usize, usize) {
+        let with_tokens = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.definition.tokens.is_empty())
+            .count();
+        (self.entries.len(), with_tokens)
+    }
+
     /// The functions most like `query`, written in `file` of `repo`, best first.
-    pub(super) fn similar(&self, query: &Query, repo: &str, file: &str) -> Vec<SimilarFunction> {
+    pub(crate) fn similar(&self, query: &Query, repo: &str, file: &str) -> Vec<SimilarFunction> {
         let edited = file_key(repo, &file.replace('\\', "/"));
         let ranked = self.index.rank(&SimilarQuery {
             name: &query.name,
