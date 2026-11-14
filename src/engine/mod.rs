@@ -6012,7 +6012,7 @@ async fn analyze_current_repo_incremental(
                 });
             let (
                 analysis,
-                (settled, placements, fallbacks, caller_stops),
+                (settled, (placements, returned), fallbacks, caller_stops),
                 library_answer,
                 first_declarations,
                 entered,
@@ -6165,6 +6165,7 @@ async fn analyze_current_repo_incremental(
                 &claims,
                 SiteContext {
                     placements: Some(&placements),
+                    responses: Some((&returned, &results)),
                     caller_stops: &caller_stops,
                     library_leads: &protocol_extractions.library.leads,
                     library: library_ask.as_ref().map(|ask| &ask.sites),
@@ -7913,6 +7914,14 @@ fn held_open_at_decided_sites(
 #[derive(Debug, Default, Clone, Copy)]
 struct SiteContext<'a> {
     placements: Option<&'a crate::request_summary::decided_sites::SummaryPlacements>,
+    /// What each function hands its caller, and the store's verified result
+    /// labels: where each site's response is read (carrick#4371,
+    /// [`crate::request_summary::decided_sites::Decided::read_responses`]).
+    /// `None` reads every response at the deciding call.
+    responses: Option<(
+        &'a crate::request_summary::ReturnChains,
+        &'a crate::result_shapes::ResultIndex,
+    )>,
     /// The callers whose request the send side could not compose
     /// (carrick#3688 F), saved as unread sites.
     caller_stops: &'a [crate::request_summary::CallerStop],
@@ -8334,6 +8343,11 @@ fn site_records_of(
             &labels,
         ),
     };
+    // Where each site's response is read (carrick#4371), before any site
+    // yields, so the yielded sites' slots read it too.
+    if let Some((returned, results)) = context.responses {
+        decided.read_responses(root, returned, results);
+    }
     let yielded = context
         .placements
         .map(|placed| decided.yield_to_summaries(root, placed))
@@ -11182,6 +11196,24 @@ fn site_infer_requests(
                 // The store's label for the call's result (carrick#2910).
                 call_result.result = results.at_anchor(response, repo_path);
                 call_result.result_unanswered = results.unanswered_at_anchor(response, repo_path);
+                // Read at the labelled call below the deciding call
+                // (carrick#4371, carrick#4319): the deciding call names the
+                // types the caller binds, so a type parameter of the
+                // wrapper or maker is read as that call instantiates it
+                // (carrick#4375).
+                if *response != anchors.call {
+                    let call = at(&anchors.call, InferKind::CallResult, String::new(), None);
+                    call_result.through_call = match (call.span_start, call.span_end) {
+                        (Some(span_start), Some(span_end)) => {
+                            Some(crate::services::type_sidecar::ThroughCall {
+                                file_path: call.file_path,
+                                span_start,
+                                span_end,
+                            })
+                        }
+                        _ => None,
+                    };
+                }
                 requests.push(call_result);
             }
             (OperationKey::Http { .. }, _) => {}
@@ -13514,13 +13546,18 @@ async fn compose_summaries(
     summaries: tokio::sync::oneshot::Sender<crate::request_summary::RequestSummaryIndex>,
 ) -> (
     Option<Vec<crate::client_semantics::ClientSemanticsEntry>>,
-    crate::request_summary::decided_sites::SummaryPlacements,
+    (
+        crate::request_summary::decided_sites::SummaryPlacements,
+        crate::request_summary::ReturnChains,
+    ),
     crate::fallback_tally::ServiceFallbacks,
     Vec<crate::request_summary::CallerStop>,
 ) {
     let settled = settling.settled().await;
     let index = summarize_requests(inputs, settled.as_deref(), sidecar, service_root);
-    let placements = index.placements();
+    // Where the summaries place each request's rows, and what each function
+    // hands its caller (carrick#4371): both read by the site pass.
+    let placements = (index.placements(), index.returned_records());
     let caller_stops = index.caller_stops();
     // Stated once the analysis is done ([`analysis_fallbacks`]), with what the
     // reader's file selection fell back on.
@@ -15243,7 +15280,7 @@ async fn analyze_current_repo(
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
     let (
         analysis_result,
-        (settled, placements, fallbacks, caller_stops),
+        (settled, (placements, returned), fallbacks, caller_stops),
         library_answer,
         first_declarations,
         entered,
@@ -15387,6 +15424,7 @@ async fn analyze_current_repo(
         &claims,
         SiteContext {
             placements: Some(&placements),
+            responses: Some((&returned, &results)),
             caller_stops: &caller_stops,
             library_leads: &protocol_extractions.library.leads,
             library: library_ask.as_ref().map(|ask| &ask.sites),
@@ -31494,6 +31532,71 @@ unfollowed_member_calls_total: 0,
             bare.iter()
                 .map(|item| serde_json::to_string(item).unwrap())
                 .all(|json| !json.contains("\"result\""))
+        );
+    }
+
+    /// carrick#4371 T5: a site row whose response is read at the labelled
+    /// call below its deciding call names the deciding call beside the
+    /// result (`through_call`), so a type parameter the caller binds is read
+    /// as that call binds it (carrick#4375). One read at its own call names
+    /// none.
+    #[test]
+    fn a_response_read_below_the_deciding_call_names_the_deciding_call() {
+        use crate::request_summary::site_record::AnchorAt;
+        use crate::result_shapes::ResultIndex;
+        use crate::site_rows::RowSide;
+        let mut below = site_row(
+            "src/caller.ts",
+            OperationKey::http("POST", "/v1/orders"),
+            RowSide::Call,
+            true,
+        );
+        below.response_at = Some(AnchorAt {
+            file: "src/wrapper.ts".to_string(),
+            line: 3,
+            span_start: 40,
+            span_end: 70,
+        });
+        let own = site_row(
+            "src/own.ts",
+            OperationKey::http("GET", "/v1/own"),
+            RowSide::Call,
+            true,
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated: vec![below, own],
+            ..Default::default()
+        };
+        // No file is on disk: the spans are read as ASCII past SWC's base.
+        let requests = site_infer_requests(&fold, "/repo", &ResultIndex::default());
+        type Through = Option<(String, u32, u32)>;
+        let results: Vec<(&str, Through)> = requests
+            .iter()
+            .filter(|request| request.infer_kind == InferKind::CallResult)
+            .map(|request| {
+                (
+                    request.file_path.as_str(),
+                    request
+                        .through_call
+                        .as_ref()
+                        .map(|call| (call.file_path.clone(), call.span_start, call.span_end)),
+                )
+            })
+            .collect();
+        let base = crate::swc_scanner::SWC_SPAN_BASE;
+        assert_eq!(
+            results,
+            vec![
+                (
+                    "/repo/src/wrapper.ts",
+                    Some((
+                        "/repo/src/caller.ts".to_string(),
+                        100u32.saturating_sub(base),
+                        130u32.saturating_sub(base)
+                    ))
+                ),
+                ("/repo/src/own.ts", None),
+            ]
         );
     }
 

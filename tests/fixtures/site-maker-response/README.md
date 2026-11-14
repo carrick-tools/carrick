@@ -30,7 +30,7 @@ Two shapes put the deciding call above the labelled call:
 | `partial.ts:6` | maker; `:7` passes an unbound parameter | `{ swept: number; }` |
 | `handed.ts:6` | maker also handed on as a value at `:8` | `{ flushed: boolean; }` |
 | `pinger.ts:6`, `:7` | maker through `post`; old-path rows on the site's line | `{ up: boolean; }` each |
-| `typed-maker.ts:6` | generic maker | `unknown`, root reason `bound_by_callers` (the maker's type parameter is open at the labelled call) |
+| `typed-maker.ts:6` | generic maker | `{ count: number; }`: the maker's type parameter is open at the labelled call, and the maker call binds it (carrick#4375; read so since carrick#4371 T5, `unknown` with `bound_by_callers` before) |
 | `env-maker.ts:6` | maker given an environment base | no entry (its key is not a bare path) |
 | `generic.ts:6` | wrapper that runs the send | `{ rows: number; }` |
 | `local-run.ts:7` | wrapper that runs a local closure | `{ done: boolean; }` |
