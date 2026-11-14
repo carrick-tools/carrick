@@ -36,6 +36,11 @@ pub(in crate::request_summary) enum TextValue {
         /// carrick#3504 B10-1b): the last is the call where it settles.
         /// Empty for every other entry point.
         callers: Vec<CallAt>,
+        /// Each loop the text was read through and the element it took
+        /// (where the loop starts, the element's index; carrick#2093): two
+        /// parts join only where they took the same element of every loop
+        /// both read. Empty for a text read through no loop.
+        elements: Vec<(u32, usize)>,
     },
     /// The name is none the reader states, for `reason`, read through
     /// `callers` as a text is.
@@ -191,6 +196,16 @@ impl TextValue {
             read_from,
             from_type: false,
             callers: Vec::new(),
+            elements: Vec::new(),
+        }
+    }
+
+    /// The loop elements this value was read through ([`TextValue::Text`]'s
+    /// `elements`); none for a hole or parts.
+    fn elements(&self) -> &[(u32, usize)] {
+        match self {
+            TextValue::Text { elements, .. } => elements,
+            TextValue::Hole { .. } | TextValue::Pieced(_) => &[],
         }
     }
 
@@ -252,6 +267,7 @@ impl TextValue {
                 read_from,
                 from_type,
                 callers,
+                ..
             } => PiecedText {
                 from_type,
                 ..PiecedText::one(PartValue::Lit { text, read_from }, at, callers)
@@ -265,6 +281,23 @@ impl TextValue {
 fn chains_agree(head: &[CallAt], tail: &[CallAt]) -> bool {
     head.iter()
         .all(|a| tail.iter().filter(|b| b.fills == a.fills).all(|b| b == a))
+}
+
+/// Whether two values took the same element of every loop both were read
+/// through (carrick#2093): `${a}/${b}` over one tuple list joins each
+/// tuple's own names, never one tuple's `a` with another's `b`.
+fn elements_agree(head: &[(u32, usize)], tail: &[(u32, usize)]) -> bool {
+    head.iter().all(|(loop_at, index)| {
+        tail.iter()
+            .filter(|(other, _)| other == loop_at)
+            .all(|(_, other)| other == index)
+    })
+}
+
+/// Whether two values may be joined: their caller chains agree
+/// ([`chains_agree`]) and so do their loop elements ([`elements_agree`]).
+fn values_agree(head: &TextValue, tail: &TextValue) -> bool {
+    chains_agree(head.callers(), tail.callers()) && elements_agree(head.elements(), tail.elements())
 }
 
 /// The union of two chains that agree: `head`'s calls, then `tail`'s it
@@ -734,7 +767,124 @@ impl<'a> Resolver<'a> {
                 object,
                 args,
             } => self.text_of_built_in(file, (*lo, *hi), method, object, args),
+            ValueAt::Each {
+                list,
+                at,
+                key,
+                loop_at,
+            } => self.text_of_each(file, list, *at, key.as_deref(), *loop_at),
             _ => hole(UnreadExpression),
+        }
+    }
+
+    /// A name a `for…of` head binds (carrick#2093): one text per element of
+    /// the list, each at the tuple position or object key the pattern reads,
+    /// marked with the loop and the element so the names one loop binds join
+    /// element by element ([`Self::joined`]). Every element must state the
+    /// part as one text; otherwise the name is the hole of the first element
+    /// that does not, and a list no reader states is the hole of why not.
+    fn text_of_each(
+        &self,
+        file: &Path,
+        list: &ValueAt,
+        at: Option<usize>,
+        key: Option<&str>,
+        loop_at: u32,
+    ) -> Vec<TextValue> {
+        let hole = |reason| vec![TextValue::hole(reason)];
+        let (items, listed_in, read_from, _reading) = match self.list_elements(file, list) {
+            Ok(found) => found,
+            Err(reason) => return hole(reason),
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let part = match (at, key, item) {
+                (None, None, item) => Some(item.clone()),
+                (Some(at), None, ValueAt::Elements(tuple)) => tuple.get(at).cloned(),
+                (None, Some(key), ValueAt::Entries(_)) => handed(item, &[key.to_string()]),
+                _ => None,
+            };
+            let Some(part) = part else {
+                return hole(guards::HoleReason::UnreadExpression);
+            };
+            match self.one_text(&listed_in, &part) {
+                Ok((text, from)) => {
+                    let mut read_from = read_from.clone();
+                    note_all(&mut read_from, from);
+                    out.push(TextValue::Text {
+                        text,
+                        read_from,
+                        from_type: false,
+                        callers: Vec::new(),
+                        elements: vec![(loop_at, index)],
+                    });
+                }
+                Err(reason) => return hole(reason),
+            }
+        }
+        if out.is_empty() {
+            return hole(guards::HoleReason::UnreadExpression);
+        }
+        out
+    }
+
+    /// The elements of the list a loop reads, the file they are written in,
+    /// the declaration it was read through, and the mark that it is being
+    /// read: an array literal written in place, or a `const` the binding
+    /// table holds as one, where nothing may change it (carrick#2093). The
+    /// declaring module never changes it ([`ModuleBinding::list_kept`]), and
+    /// an exported list is written `as const`, so no importer changes it
+    /// either. Otherwise why the list is unread: a write, else an expression
+    /// no reader states, a parameter, or a name declared outside the run.
+    #[allow(clippy::type_complexity)]
+    fn list_elements(
+        &self,
+        file: &Path,
+        list: &ValueAt,
+    ) -> Result<(Vec<ValueAt>, PathBuf, Vec<String>, Option<TextReading<'_>>), guards::HoleReason>
+    {
+        use guards::HoleReason::*;
+        match list {
+            ValueAt::Elements(items) => Ok((items.clone(), file.to_path_buf(), Vec::new(), None)),
+            ValueAt::Read {
+                lo,
+                hi,
+                member: false,
+                ..
+            } => {
+                let row = self
+                    .row_at(file, *lo, *hi, Kind::Ident)
+                    .ok_or(RowsMissing)?;
+                let Some((at, binding, declared)) = self.declared_entry(row) else {
+                    return Err(if self.declared_param(row).is_some() {
+                        ParameterUnread
+                    } else if self.declared_binding(row).is_some() {
+                        UnreadExpression
+                    } else {
+                        self.unread_declaration(row)
+                    });
+                };
+                if binding.unplaceable || !binding.writes.is_empty() {
+                    return Err(Reassigned);
+                }
+                let Some(items) = binding.elements.as_deref() else {
+                    return Err(UnreadExpression);
+                };
+                if binding.kind != BindingKind::Const
+                    || !binding.list_kept
+                    || (binding.exported && !binding.list_frozen)
+                {
+                    return Err(UnreadExpression);
+                }
+                let reading = self.reading_text(&at).ok_or(Recursion)?;
+                Ok((
+                    items.to_vec(),
+                    at.0.to_path_buf(),
+                    vec![declared],
+                    Some(reading),
+                ))
+            }
+            _ => Err(UnreadExpression),
         }
     }
 
@@ -763,6 +913,7 @@ impl<'a> Resolver<'a> {
                         read_from: read_from.clone(),
                         from_type: true,
                         callers: Vec::new(),
+                        elements: Vec::new(),
                     })
                     .collect();
             }
@@ -812,7 +963,7 @@ impl<'a> Resolver<'a> {
                     .map(|head| {
                         values
                             .iter()
-                            .filter(|tail| chains_agree(head.callers(), tail.callers()))
+                            .filter(|tail| values_agree(head, tail))
                             .count()
                     })
                     .sum::<usize>();
@@ -824,7 +975,7 @@ impl<'a> Resolver<'a> {
             let mut counts: Vec<(Vec<CallAt>, usize)> = Vec::new();
             for head in &out {
                 for tail in &values {
-                    if !chains_agree(head.callers(), tail.callers()) {
+                    if !values_agree(head, tail) {
                         continue;
                     }
                     let callers = chains_joined(head.callers(), tail.callers());
@@ -840,22 +991,31 @@ impl<'a> Resolver<'a> {
                                 text,
                                 read_from,
                                 from_type,
+                                elements,
                                 ..
                             },
                             TextValue::Text {
                                 text: more,
                                 read_from: from,
                                 from_type: typed,
+                                elements: took,
                                 ..
                             },
                         ) => {
                             let mut read_from = read_from.clone();
                             note_all(&mut read_from, from.clone());
+                            let mut elements = elements.clone();
+                            for element in took {
+                                if !elements.contains(element) {
+                                    elements.push(*element);
+                                }
+                            }
                             TextValue::Text {
                                 text: format!("{text}{more}"),
                                 read_from,
                                 from_type: *from_type || *typed,
                                 callers,
+                                elements,
                             }
                         }
                         // Parts are joined by `pieces_joined`, never here:
@@ -942,8 +1102,13 @@ impl<'a> Resolver<'a> {
             .module_bindings
             .get(&(line, symbol.clone()))
             // A block-scoped or nested local is in the table, and no text
-            // read opens it yet (carrick#3794): it reads as no entry.
-            .filter(|binding| !binding.scoped_entry())?;
+            // read opens it yet (carrick#3794): it reads as no entry. A loop
+            // head is the one the text reader reads (carrick#2093): the
+            // compiler row's declaration line and name key it, so the
+            // compiler settles any shadowing.
+            .filter(|binding| {
+                !binding.scoped_entry() || binding.kind == BindingKind::LoopElement
+            })?;
         let declared = super::super::site_record::declaration_path(row.decl_file()?);
         Some(((path, line, symbol), binding, declared))
     }
@@ -997,6 +1162,9 @@ impl<'a> Resolver<'a> {
         let written = match binding.kind {
             BindingKind::Var => return hole(Reassigned),
             BindingKind::Let if binding.unplaceable => return hole(Reassigned),
+            // Two loop heads on one line with one name: no row says which a
+            // use means (carrick#2093).
+            BindingKind::LoopElement if binding.unplaceable => return hole(Reassigned),
             BindingKind::Let if !binding.writes.is_empty() => {
                 let Some(ir) = self.inputs_for(at.0).files.get(at.0) else {
                     return hole(OutsideService);
@@ -1150,7 +1318,10 @@ impl<'a> Resolver<'a> {
         // the key, where the module only ever reads the object's entries.
         let last = match binding.kind {
             BindingKind::Enum => false,
-            BindingKind::StaticField | BindingKind::Getter | BindingKind::Function => {
+            BindingKind::StaticField
+            | BindingKind::Getter
+            | BindingKind::Function
+            | BindingKind::LoopElement => {
                 return hole(UnreadExpression);
             }
             BindingKind::Var => return hole(Reassigned),
@@ -1678,7 +1849,8 @@ impl Resolver<'_> {
             | BindingKind::Enum
             | BindingKind::StaticField
             | BindingKind::Getter
-            | BindingKind::Function => false,
+            | BindingKind::Function
+            | BindingKind::LoopElement => false,
         };
         // The entries are the literal's where the module only reads them, or
         // hands the object on to the one call this entry is read for.
@@ -1849,7 +2021,6 @@ mod tests {
             "p_shadow_outer",
             "p_pair_a",
             "p_pair_b",
-            "p_loop",
             "p_catch",
         ] {
             let got = resolver.text_values(&path, &argument(callee));
@@ -1862,6 +2033,100 @@ mod tests {
                     }]
                 ),
                 "{callee}: {got:?}"
+            );
+        }
+        // A loop head is the one block-scoped name the text reader reads
+        // (carrick#2093): its list's one element.
+        let looped = resolver.text_values(&path, &argument("p_loop"));
+        assert!(
+            matches!(looped.as_slice(), [TextValue::Text { text, .. }] if text == "x"),
+            "{looped:?}"
+        );
+    }
+
+    /// The texts and holes the probe call `callee` in `src/loops.ts` reads
+    /// as (carrick#2093): the texts sorted, then each hole's reason.
+    fn loop_probe(
+        resolver: &Resolver<'_>,
+        on: &Walked,
+        callee: &str,
+    ) -> (Vec<String>, Vec<guards::HoleReason>) {
+        let path = on.path("services/web/src/loops.ts");
+        let found: Vec<ValueAt> = super::super::row_calls::every_call(&on.inputs.files)
+            .into_iter()
+            .filter(|(file, call, _)| *file == path && call.callee == callee)
+            .filter_map(|(_, call, _)| call.arg_texts.first().cloned().flatten())
+            .collect();
+        assert_eq!(found.len(), 1, "{callee}: {found:?}");
+        let mut texts = Vec::new();
+        let mut holes = Vec::new();
+        for value in resolver.text_values(&path, &found[0]) {
+            match value {
+                TextValue::Text { text, .. } => texts.push(text),
+                TextValue::Hole { reason, .. } => holes.push(reason),
+                TextValue::Pieced(pieced) => panic!("{callee}: pieced: {pieced:?}"),
+            }
+        }
+        texts.sort();
+        (texts, holes)
+    }
+
+    /// carrick#2093: a name a `for…of` head binds over a list the code
+    /// states, and that nothing changes, is each element: a name, a tuple's
+    /// positions (read together, element by element), an object's key, two
+    /// nested loops (every pairing), an exported `as const` list and a list
+    /// a function body declares. Fixture `resolve-text` (`loops.ts`).
+    #[test]
+    fn a_loop_head_over_a_stated_list_is_each_element() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let texts = |callee: &str, want: &[&str]| {
+            let want: Vec<String> = want.iter().map(|text| text.to_string()).collect();
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (want, Vec::new()),
+                "{callee}"
+            );
+        };
+        texts("p_each", &["large", "small"]);
+        texts("p_tuple", &["f1:t1", "f2:t2"]);
+        texts("p_keyed", &["n1", "n2"]);
+        texts("p_two", &["a1b1", "a1b2", "a2b1", "a2b2"]);
+        texts("p_frozen", &["apply", "create"]);
+        texts("p_local", &["one", "two"]);
+    }
+
+    /// carrick#2093: a loop head whose list the code does not state, or may
+    /// change, is one hole of why, and never `outside_service`: the head is
+    /// declared in the file. A list exported without `as const`, pushed to,
+    /// handed to a call, held in a `let` or built with a spread; a call's
+    /// result; a parameter; a `let` head; a `for…in` head; a pattern with a
+    /// default.
+    #[test]
+    fn a_loop_head_over_a_list_no_reader_states_is_a_hole_of_why() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        use guards::HoleReason::{ParameterUnread, UnreadExpression};
+        for (callee, reason) in [
+            ("p_loose", UnreadExpression),
+            ("p_pushed", UnreadExpression),
+            ("p_handed", UnreadExpression),
+            ("p_let_list", UnreadExpression),
+            ("p_spread", UnreadExpression),
+            ("p_call", UnreadExpression),
+            ("p_param", ParameterUnread),
+            ("p_let_head", UnreadExpression),
+            ("p_in", UnreadExpression),
+            ("p_default", UnreadExpression),
+        ] {
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (Vec::new(), vec![reason]),
+                "{callee}"
             );
         }
     }

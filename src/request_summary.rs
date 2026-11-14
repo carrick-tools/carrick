@@ -6993,6 +6993,14 @@ impl Reader<'_> {
                 block,
                 defaulted: false,
                 flow: None,
+                elements: declarator
+                    .init
+                    .as_deref()
+                    .and_then(|init| resolve::list_of(init, &|lo| lo)),
+                list_frozen: declarator
+                    .init
+                    .as_deref()
+                    .is_some_and(resolve::written_as_const),
             });
         }
         // `const { a, b: name } = init`: each plain key is a local of its own
@@ -7017,6 +7025,8 @@ impl Reader<'_> {
                     block,
                     defaulted: false,
                     flow: None,
+                    elements: None,
+                    list_frozen: false,
                 });
             }
         }
@@ -8619,8 +8629,9 @@ struct CallWalker<'r, 's, 'i> {
     /// for the guards (carrick#2386).
     guard: guards::WalkState,
     /// Reading a `for` loop's head: its declarators are bound again by each
-    /// iteration and state no initialiser, so they are no binding table
-    /// entry (carrick#3794).
+    /// iteration and state no initialiser, so they are no block entry
+    /// (carrick#3794). A `for…of` or `for…in` head's names are loop
+    /// entries instead ([`Self::push_loop_entries`], carrick#2093).
     in_head: bool,
     /// How many blocks deep the walk is, a `switch` case included: a
     /// function declared at depth 0 is the body's own.
@@ -9063,7 +9074,8 @@ impl Visit for CallWalker<'_, '_, '_> {
     // table entry, with its initialiser read in the body's scope as a
     // top-level local's is ([`Reader::local_entries`]). A body's own
     // top-level declarators are read by `body`, never visited here, and a
-    // module's by `module_bindings`; a `for` head's are no entry.
+    // module's by `module_bindings`; a `for` head's are no block entry (a
+    // `for…of` or `for…in` head's are loop entries, carrick#2093).
     //
     // FALLBACK (carrick#3794): also the declarator the procedures walk reads
     // while the table's entries are refused, which no binding table row
@@ -9118,6 +9130,8 @@ impl Visit for CallWalker<'_, '_, '_> {
                 block: self.depth > 0,
                 defaulted: false,
                 flow: None,
+                elements: None,
+                list_frozen: false,
             };
             self.push_entry(entry);
         }
@@ -9146,6 +9160,7 @@ impl Visit for CallWalker<'_, '_, '_> {
     }
 
     fn visit_for_in_stmt(&mut self, stmt: &ForInStmt) {
+        self.push_loop_entries(&stmt.left, None, stmt.span.lo.0);
         let in_head = std::mem::replace(&mut self.in_head, true);
         stmt.left.visit_with(self);
         self.in_head = in_head;
@@ -9154,6 +9169,12 @@ impl Visit for CallWalker<'_, '_, '_> {
     }
 
     fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
+        // Only a `const` head holds each element unchanged; an `await` loop
+        // takes what the list's iterator settles to.
+        let list = (!stmt.is_await
+            && matches!(&stmt.left, ForHead::VarDecl(var) if var.kind == VarDeclKind::Const))
+        .then_some(&*stmt.right);
+        self.push_loop_entries(&stmt.left, list, stmt.span.lo.0);
         let in_head = std::mem::replace(&mut self.in_head, true);
         stmt.left.visit_with(self);
         self.in_head = in_head;
@@ -9290,6 +9311,40 @@ impl CallWalker<'_, '_, '_> {
             true,
         );
         for entry in entries {
+            self.push_entry(entry);
+        }
+    }
+
+    /// The binding table entries of a `for…of` or `for…in` head written
+    /// here (carrick#2093): each name it binds, holding each element of
+    /// `list` (a `const` head's list; `None` reads no list) at the position
+    /// or key the pattern reads. Keyed by its declaration line, as every
+    /// entry is: two loops that reuse a name are two entries.
+    fn push_loop_entries(&mut self, head: &ForHead, list: Option<&Expr>, loop_at: u32) {
+        let kind = match head {
+            ForHead::VarDecl(var) => var.kind,
+            _ => return,
+        };
+        for (bound, text) in resolve::loop_head_names(head, list, loop_at, &|lo| lo) {
+            let entry = resolve::LocalBinding {
+                key: ident_key(&bound.id),
+                line: self
+                    .reader
+                    .source_map
+                    .lookup_char_pos(bound.id.span.lo)
+                    .line as u32,
+                init: Vec::new(),
+                kind: resolve::BindingKind::LoopElement,
+                text: Some(text),
+                // A `let` or `var` head the body may write again.
+                reassigned: kind != VarDeclKind::Const,
+                plain: false,
+                block: true,
+                defaulted: false,
+                flow: None,
+                elements: None,
+                list_frozen: false,
+            };
             self.push_entry(entry);
         }
     }
