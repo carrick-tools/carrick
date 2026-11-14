@@ -226,11 +226,13 @@ fn a_defaulted_key_states_the_version_each_caller_sends() {
         "src/use-topic.ts",
     ]);
     // The wrappers that write their object whole (`{ method: 'GET' }`, and
-    // `{ version: 'v2', method: 'GET' }`).
+    // `{ version: 'v2', method: 'GET' }`) and hand it to `http.post(url,
+    // options)`: post's second argument is the body, so the verb is POST and
+    // the `method` key is a body field. Only `http.request` reads a method key.
     let scan = scan();
     for (at, want) in [
-        ("src/use-options.ts:2", "GET /v1/a"),
-        ("src/use-options.ts:3", "GET /v2/b"),
+        ("src/use-options.ts:2", "POST /v1/a"),
+        ("src/use-options.ts:3", "POST /v2/b"),
     ] {
         assert_eq!(
             scan.rows.get(at).cloned().unwrap_or_default(),
@@ -259,10 +261,12 @@ fn a_runtime_version_stays_a_placeholder() {
     check(&["src/use-runtime.ts", "src/use-whole.ts"]);
 }
 
-/// A library that reads the verb from the `method` key sends the client's
-/// default where the caller omits it, not the library's own default; so
-/// does an options bag the call sends, read by the summaries
-/// (`use-bag-method`), not the `GET` a bag without a method reads as.
+/// A library that reads the verb from the `method` key (`http.request`) sends
+/// the client's default where the caller omits it, not the library's own
+/// default (`use-method`). A client that calls `http.post(url, { method,
+/// body })` sends POST whatever the bag's `method` says: post's second
+/// argument is the body, only `request` reads a method key. Those callers
+/// (`use-bag-method`, `bm/*`) keep their `/bm` segment and read POST.
 #[test]
 fn a_defaulted_method_key_is_the_method_a_caller_omits() {
     check(&["src/use-method.ts", "src/use-bag-method.ts"]);
