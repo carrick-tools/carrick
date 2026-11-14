@@ -6524,7 +6524,7 @@ async fn analyze_current_repo_incremental(
             let placed = crate::handler_span::attach_handler_spans(
                 &mut cloud_data,
                 |file| crate::parser::read_source(&Path::new(repo_path).join(file)),
-                crate::handler_span::declared_through(&request_inputs.bindings, repo_path),
+                |_: &str, _: &str| -> Option<(String, String)> { None },
             );
             debug!("Handler spans placed on endpoint rows: {placed}");
             crate::unfollowed_calls::attach(
@@ -15387,7 +15387,7 @@ async fn analyze_current_repo(
     let placed = crate::handler_span::attach_handler_spans(
         &mut cloud_data,
         |file| crate::parser::read_source(&Path::new(repo_path).join(file)),
-        crate::handler_span::declared_through(&request_inputs.bindings, repo_path),
+        |_: &str, _: &str| -> Option<(String, String)> { None },
     );
     debug!("Handler spans placed on endpoint rows: {placed}");
     crate::unfollowed_calls::attach(
