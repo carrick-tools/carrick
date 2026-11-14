@@ -461,3 +461,49 @@ test("a grep run from a sub-folder matches its output paths against the folder",
   const run = await grepRun(w, "grep -n readWidget *.ts", out, "sess-g4", path.join(w.root, "src"));
   assert.equal(run.stdout, "");
 });
+
+// The Bash hook writes the timing row the edit hook writes (carrick#4415).
+
+function timingRows(root: string) {
+  const file = path.join(root, ".carrick", "hook-timings.jsonl");
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+test("a shell write of a TS file writes one post-bash timing row with waited_ms and the file", async (t) => {
+  const w = repoWithWorktree(t);
+  fs.writeFileSync(path.join(w.worktree, "src", "argv.ts"), "export const flag = 1;\n");
+  const command = "cat > src/argv.ts <<'EOF'\nexport const flag = 1;\nEOF";
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, command, "sess-timing-w"),
+    cwd: w.worktree,
+    env: writeEnv(w),
+  });
+  assert.equal(run.code, 0);
+  const rows = timingRows(w.repo).filter((r) => r["hook"] === "post-bash");
+  assert.equal(rows.length, 1);
+  assert.equal(typeof rows[0]!["waited_ms"], "number");
+  assert.equal(typeof rows[0]!["duration_ms"], "number");
+  assert.ok(["printed", "silent"].includes(rows[0]!["outcome"] as string));
+  assert.equal(rows[0]!["file"], ".claude/worktrees/wt/src/argv.ts");
+  assert.equal(typeof rows[0]!["facts_ms"], "number");
+});
+
+test("a shell command that touches no file writes one silent post-bash row, as the edit hook does for nothing to do", async (t) => {
+  const w = repoWithWorktree(t);
+  const run = await runHook("post-bash.ts", {
+    payload: bashPayload(w.worktree, "ls -la", "sess-timing-none"),
+    cwd: w.worktree,
+    env: writeEnv(w),
+  });
+  assert.equal(run.code, 0);
+  const rows = timingRows(w.repo).filter((r) => r["hook"] === "post-bash");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!["outcome"], "silent");
+  assert.equal(rows[0]!["waited_ms"], 0);
+  assert.equal("file" in rows[0]!, false);
+});
