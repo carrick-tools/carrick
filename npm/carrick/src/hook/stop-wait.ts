@@ -1,6 +1,6 @@
 // What the Stop hook says about the background re-checks of this session's
-// edits (carrick#3198, B3): deliver what has finished and name what is still
-// running. It never waits (David, 2026-11-11: "we can't ever stop the agent.
+// edits (carrick#3198, B3): deliver what has finished. A re-check still running
+// is not named: the agent's next hook event delivers its answer. It never waits (David, 2026-11-11: "we can't ever stop the agent.
 // We can only deliver the results later"; hook-wording audit T2): the box
 // measured a 103-141 s hold at the end of a turn while it waited.
 //
@@ -15,8 +15,8 @@
 // or call in the edited files, or only files no service reads: nothing, and
 // the change is recorded as stated. Judged operations with no problem: one
 // line naming them, once per distinct set of operations. Problems: a header
-// and the problem lines. Any gap (a re-check still running, a stale service,
-// a deferred or failed re-check) is named in one line, with a `carrick check
+// and the problem lines. Any gap (a stale service, a deferred or failed
+// re-check) is named in one line, with a `carrick check
 // --changed` queued behind the re-checks. Every answer that lands after Stop
 // returned, that check's included, is printed once by the agent's next hook
 // event that carries late answers (`late.ts`: the next prompt, Read, edit or
@@ -45,11 +45,9 @@ import {
   ensureRunner,
   owedFor,
   isChanged,
-  markToldRunning,
   newestPerFile,
   pendingFor,
   type Answer,
-  type Pending,
 } from "./rechecks.ts";
 import { markSaid, markStated, readSession, wasSaid } from "./reuse.ts";
 import { worktreeGone } from "./worktree.ts";
@@ -138,7 +136,7 @@ export type Coverage = {
   /** The answers that cover their file, one per covered file. */
   covered: Answer[];
   /** Each file not covered, workspace-relative, and why. */
-  gaps: Array<{ file: string; reason: string }>;
+  gaps: Array<{ file: string; reason: string; running?: true }>;
 };
 
 /**
@@ -166,9 +164,9 @@ export function sessionCoverage(session: string, root: string, home?: string, no
   for (const [file, edit] of edits) {
     const relative = file.startsWith(`${root}/`) ? file.slice(root.length + 1) : file;
     const retired = edit.at <= changedAt;
-    const gap = (reason: string) => {
+    const gap = (reason: string, running?: true) => {
       if (retired) coverage.files -= 1;
-      else coverage.gaps.push({ file: relative, reason });
+      else coverage.gaps.push(running ? { file: relative, reason, running } : { file: relative, reason });
     };
     const held = newest.get(file);
     if (held === undefined) {
@@ -181,8 +179,8 @@ export function sessionCoverage(session: string, root: string, home?: string, no
       continue;
     }
     if (answer === null) {
-      const seconds = Math.max(0, Math.round((now - Date.parse(entry.enqueued_at)) / 1000));
-      gap(`its re-check is still running after ${seconds} s`);
+      // Not a reason Stop prints: the answer rides the next hook event.
+      gap("its re-check is still running", true);
       continue;
     }
     // An answer queued in place of the probe that the binary refused is not
@@ -226,10 +224,6 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
   const ensure = options.ensure ?? ((root: string) => ensureRunner(root));
   const home = options.home;
 
-  // The per-file entries still running: named, never waited for.
-  const running = (): Pending[] =>
-    pendingFor(session, home).filter((entry) => !entry.toldRunning && !isChanged(entry));
-
   // A runner that died holding the queue would leave every entry unanswered:
   // start one. A queued `check --changed` needs one too.
   for (const root of new Set(pendingFor(session, home).map((entry) => entry.root))) {
@@ -255,6 +249,15 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     if (checkedSinceLastEdit(session, root, home)) continue;
     const coverage = sessionCoverage(session, root, home, clock());
     if (coverage.files === 0) continue;
+    // A re-check still running is neither a finding nor a named clean result:
+    // Stop says nothing about it, and its answer rides the agent's next hook
+    // event (late.ts). The change is recorded as stated, as for a gap, so a
+    // later Stop does not restate what that event delivered.
+    const named = coverage.gaps.filter((gap) => gap.running !== true);
+    if (named.length === 0 && coverage.gaps.length > 0) {
+      markStated(session, root, coverage.upTo, false, home);
+      continue;
+    }
     if (coverage.gaps.length === 0) {
       // An answer queued in place of the probe prints its own lines below, as
       // the probe's would have: its problems are counted here, not listed.
@@ -293,7 +296,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     }
     // The queued check is not waited for: the gap is named now, and the
     // check's answer comes with the agent's next hook event.
-    stated.set(root, notCoveredLine(coverage.gaps));
+    stated.set(root, notCoveredLine(named));
     markStated(session, root, coverage.upTo, false, home);
   }
 
@@ -327,19 +330,5 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     if (text) lines.push(text);
   }
 
-  // Still running: said once per entry, and the agent's next hook event after
-  // the answer lands delivers it. A workspace whose gap line named it does
-  // not name it twice.
-  const told = running().filter((entry) => markToldRunning(session, entry.seq, home));
-  const unnamed = told.filter((entry) => !gapped.has(entry.root));
-  if (unnamed.length > 0) {
-    const at = clock();
-    const files = [...new Set(unnamed.map((entry) => entry.relative))];
-    const oldest = Math.max(...unnamed.map((entry) => at - Date.parse(entry.enqueued_at)));
-    const seconds = Math.max(0, Math.round(oldest / 1000));
-    lines.push(
-      `Carrick: the re-check of ${files.join(", ")} is still running after ${seconds} s.`,
-    );
-  }
   return { lines };
 }
