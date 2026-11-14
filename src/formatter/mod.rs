@@ -1,5 +1,5 @@
 use crate::analyzer::ApiAnalysisResult;
-use crate::findings::{BreakStatus, FileNotRead, Finding, PrDelta, Topology, tier};
+use crate::findings::{BreakStatus, EndpointRef, FileNotRead, Finding, PrDelta, Topology, tier};
 use std::collections::{BTreeMap, BTreeSet};
 
 // Display helpers for the wire [`Topology`]. Defined here (not in
@@ -119,7 +119,7 @@ pub fn format_analysis_results(
 
     output.push_str(&format_pr_delta(
         pr_delta,
-        &categorized.missing_keys(),
+        &removal_findings(&result.findings),
         &result.sdk_edges,
     ));
 
@@ -200,20 +200,85 @@ pub fn format_analysis_results(
     output
 }
 
+/// The rows the scanner marked as a pairing main had and this PR lost
+/// (`mark_lost_pairings`, carrick#3092): the one answer to "is this removed
+/// operation still used". The delta section reads these and pairs nothing
+/// itself (carrick#4292).
+fn removal_findings(findings: &[Finding]) -> Vec<&Finding> {
+    findings.iter().filter(|f| f.removal().is_some()).collect()
+}
+
+/// A removed operation named by marked rows, with the surviving services that
+/// still use it.
+struct StillUsed<'a> {
+    removed: &'a crate::findings::RemovedSide,
+    surviving: Vec<&'a str>,
+}
+
+/// Group the marked rows by the removed side they name, in row order.
+fn still_used_groups<'a>(removals: &[&'a Finding]) -> Vec<StillUsed<'a>> {
+    let mut groups: Vec<StillUsed<'a>> = Vec::new();
+    for finding in removals {
+        let Some(removal) = finding.removal() else {
+            continue;
+        };
+        let surviving = match finding {
+            Finding::MissingEndpoint { service, .. }
+            | Finding::OrphanedEndpoint { service, .. } => service.as_deref(),
+            _ => None,
+        };
+        let existing = groups.iter_mut().find(|g| g.removed == &removal.removed);
+        let group = match existing {
+            Some(group) => group,
+            None => {
+                groups.push(StillUsed {
+                    removed: &removal.removed,
+                    surviving: Vec::new(),
+                });
+                groups.last_mut().expect("just pushed")
+            }
+        };
+        if let Some(name) = surviving {
+            if !group.surviving.contains(&name) {
+                group.surviving.push(name);
+            }
+        }
+    }
+    groups
+}
+
+/// Whether a marked removed side is the delta row's operation: method, path
+/// and service all equal, as the scanner spells them on both.
+fn removed_side_is(removed: &crate::findings::RemovedSide, ep: &EndpointRef) -> bool {
+    removed.method == ep.method && removed.path == ep.path && removed.service == ep.service
+}
+
 /// The "In this PR" block: endpoints this change added or removed relative to
-/// the repo's last-indexed state. Empty (renders nothing) outside a PR run,
-/// when there is no prior index to diff against, or when nothing changed.
-/// A removed endpoint whose (method, path) still shows up as a missing
-/// endpoint is flagged — the PR deletes a producer something still calls.
+/// the repo's last-indexed state. Empty (renders nothing) outside a PR run
+/// or when nothing changed.
+/// A removed endpoint is flagged when a marked row names it as its removed
+/// side (same method, path and service): the PR deletes a producer something
+/// still uses. A marked row with no delta row (a removed sender, or a removal
+/// the diff did not place) gets a line of its own.
 fn format_pr_delta(
     pr_delta: Option<&PrDelta>,
-    still_missing: &[(String, String)],
+    removals: &[&Finding],
     sdk_edges: &[crate::cloud_storage::SdkEdge],
 ) -> String {
     let Some(delta) = pr_delta else {
         return String::new();
     };
-    if delta.is_empty() {
+    let groups = still_used_groups(removals);
+    let unplaced: Vec<&StillUsed> = groups
+        .iter()
+        .filter(|g| {
+            !delta
+                .removed_endpoints
+                .iter()
+                .any(|ep| removed_side_is(g.removed, ep))
+        })
+        .collect();
+    if delta.is_empty() && unplaced.is_empty() {
         return String::new();
     }
     let mut output = String::from("**In this PR**\n\n");
@@ -226,15 +291,12 @@ fn format_pr_delta(
         ));
     }
     for ep in &delta.removed_endpoints {
-        let consumed = if still_missing
-            .iter()
-            .any(|(method, path)| endpoints_overlap(&ep.method, &ep.path, method, path))
-        {
+        let consumed = if groups.iter().any(|g| removed_side_is(g.removed, ep)) {
             " — ⚠ still consumed".to_string()
         } else {
             // A consumer that reaches this route through a published client
-            // writes no URL, so it can never appear as a missing endpoint.
-            // The SDK edge is the only evidence the route still has a caller.
+            // writes no URL, so it never has a marked row. The SDK edge is
+            // the only evidence the route still has a caller.
             sdk_consumers_of(&ep.method, &ep.path, sdk_edges)
         };
         output.push_str(&format!(
@@ -243,6 +305,29 @@ fn format_pr_delta(
             code_span(&ep.path),
             service_suffix(ep.service.as_deref()),
             consumed
+        ));
+    }
+    for group in unplaced {
+        let by = if group.surviving.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " by {}",
+                join_human(
+                    &group
+                        .surviving
+                        .iter()
+                        .map(|name| format!("`{}`", code_span(name)))
+                        .collect::<Vec<_>>()
+                )
+            )
+        };
+        output.push_str(&format!(
+            "- Removed `{} {}`{} — ⚠ still used{}\n",
+            code_span(&group.removed.method),
+            code_span(&group.removed.path),
+            service_suffix(group.removed.service.as_deref()),
+            by
         ));
     }
     output.push('\n');
@@ -893,21 +978,6 @@ impl CategorizedFindings<'_> {
     fn dependencies_is_empty(&self) -> bool {
         self.major_dependencies.is_empty() && self.unparseable_dependencies.is_empty()
     }
-
-    /// (method, path) of every missing-endpoint finding — the join keys for
-    /// the delta section's "still consumed" flag on removed endpoints
-    /// (matched param-aware by `endpoints_overlap`, not literally).
-    fn missing_keys(&self) -> Vec<(String, String)> {
-        self.missing
-            .iter()
-            .filter_map(|finding| match finding {
-                Finding::MissingEndpoint { method, path, .. } => {
-                    Some((method.clone(), path.clone()))
-                }
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 fn categorize_findings(findings: &[Finding]) -> CategorizedFindings<'_> {
@@ -1503,7 +1573,7 @@ fn group_env_var_suggestions(findings: &[&Finding]) -> Vec<EnvVarSuggestionGroup
 mod tests {
     use super::*;
     use crate::findings::{
-        EndpointRef, FileNotReadReason, Finding, PackageVersionRef, Removal, RemovedSide, tier,
+        FileNotReadReason, Finding, PackageVersionRef, Removal, RemovedSide, tier,
     };
     use crate::operation::EndpointProvenance;
 
