@@ -8,7 +8,7 @@
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as path from 'node:path';
-import { SidecarClient, FIXTURES_PATH, stubDirFor } from './helpers.js';
+import { SidecarClient, FIXTURES_PATH, stubDirFor, receivedAliases } from './helpers.js';
 
 // ===========================================================================
 // Tests
@@ -1344,7 +1344,7 @@ describe('Type Sidecar Integration Tests', () => {
         action: 'resolve_definitions',
         request_id: 'resolve-1',
         stub_dir: stubDirFor(bundledDts),
-        aliases: ['User'],
+        aliases: receivedAliases('User'),
       });
 
       assert.strictEqual(response.request_id, 'resolve-1');
@@ -1379,7 +1379,7 @@ describe('Type Sidecar Integration Tests', () => {
         action: 'resolve_definitions',
         request_id: 'resolve-2',
         stub_dir: stubDirFor(bundledDts),
-        aliases: ['UserRole'],
+        aliases: receivedAliases('UserRole'),
       });
 
       assert.strictEqual(response.status, 'success');
@@ -1405,7 +1405,7 @@ describe('Type Sidecar Integration Tests', () => {
         action: 'resolve_definitions',
         request_id: 'resolve-3',
         stub_dir: stubDirFor(bundledDts),
-        aliases: ['UserProfile'],
+        aliases: receivedAliases('UserProfile'),
       });
 
       assert.strictEqual(response.status, 'success');
@@ -1453,7 +1453,7 @@ describe('Type Sidecar Integration Tests', () => {
         action: 'resolve_definitions',
         request_id: 'resolve-4',
         stub_dir: stubDirFor(bundledDts),
-        aliases: ['User', 'Order', 'OrderStatus'],
+        aliases: receivedAliases('User', 'Order', 'OrderStatus'),
       });
 
       assert.strictEqual(response.status, 'success');
@@ -1484,7 +1484,7 @@ describe('Type Sidecar Integration Tests', () => {
         action: 'resolve_definitions',
         request_id: 'resolve-5',
         stub_dir: stubDirFor(bundledDts),
-        aliases: ['User', 'NonExistentType'],
+        aliases: receivedAliases('User', 'NonExistentType'),
       });
 
       assert.strictEqual(response.status, 'success');
@@ -1529,7 +1529,7 @@ describe('Type Sidecar Integration Tests', () => {
           action: 'resolve_definitions',
           request_id: requestId,
           stub_dir: stubDirFor(corpusDts),
-          aliases: [alias],
+          aliases: receivedAliases(alias),
         });
         assert.strictEqual(response.status, 'success');
         const def = response.definitions?.find((d) => d.type_alias === alias);
@@ -1730,7 +1730,7 @@ describe('Validator Unit Tests', () => {
       action: 'resolve_definitions',
       request_id: 'test-resolve-1',
       stub_dir: stubDirFor('export type Foo = string;'),
-      aliases: ['Foo'],
+      aliases: receivedAliases('Foo'),
     });
 
     assert.strictEqual(result.success, true);
@@ -1756,7 +1756,7 @@ describe('Validator Unit Tests', () => {
       action: 'resolve_definitions',
       request_id: 'test-resolve-3',
       stub_dir: '',
-      aliases: ['Foo'],
+      aliases: receivedAliases('Foo'),
     });
 
     assert.strictEqual(result.success, false);

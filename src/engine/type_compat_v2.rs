@@ -2048,14 +2048,19 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
     pairs
 }
 
-fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltPair> {
-    let (pseudo_method, identity) = join_identity(&producer.entry.key)?;
-    let protocol = match producer.entry.key {
+/// The wire protocol an operation travels over.
+pub(crate) fn probe_protocol(key: &OperationKey) -> ProbeProtocol {
+    match key {
         OperationKey::Http { .. } => ProbeProtocol::Http,
         OperationKey::Graphql { .. } => ProbeProtocol::Graphql,
         OperationKey::Socket { .. } => ProbeProtocol::Socket,
         OperationKey::Pubsub { .. } => ProbeProtocol::Pubsub,
-    };
+    }
+}
+
+fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltPair> {
+    let (pseudo_method, identity) = join_identity(&producer.entry.key)?;
+    let protocol = probe_protocol(&producer.entry.key);
     // Socket/pubsub direction inverts regardless of manifest kind; the
     // sidecar's direction table keys on `both` for them.
     let type_kind = match (protocol, producer.entry.type_kind) {
@@ -4980,7 +4985,16 @@ mod tests {
             .unwrap()
             .prescreen_fresh_type = Some(WHY.to_string());
 
-        for literal in ["{ id: string; }", "{ id: string; }[]", "({ id: string })"] {
+        // carrick-cloud#3503: the stored text of an http producer response is
+        // its wire form, so a member class with `toJSON(): { v: number }`
+        // reads as what it returns and no longer carries `toJSON`. The
+        // prescreen now decides that pair, and its answer is still Abstain.
+        for literal in [
+            "{ id: string; }",
+            "{ id: string; }[]",
+            "({ id: string })",
+            "{ price: { v: number; }; at: string; }",
+        ] {
             let pairs = [retype_pair(ManifestTypeKind::Response, Some(literal))];
             let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
             let (items, decided) = retype_items(&pairs, &blamed, &local);
@@ -5111,7 +5125,16 @@ mod tests {
             .unwrap()
             .prescreen_undefined_free = Some(WHY.to_string());
 
-        for producer in ["{ id: string; }", "never[]", "{ a: string } | null", "{}"] {
+        // carrick-cloud#3503: the wire-form print of a member class with
+        // `toJSON()` carries no `toJSON`, so it is decided here too, and
+        // still as Abstain.
+        for producer in [
+            "{ id: string; }",
+            "never[]",
+            "{ a: string } | null",
+            "{}",
+            "{ price: { v: number; }; at: string; }",
+        ] {
             let pairs = [retype_pair(ManifestTypeKind::Response, Some(producer))];
             let blamed = HashSet::from([pairs[0].spec.pair_key.clone()]);
             let (items, decided) = retype_items(&pairs, &blamed, &local);
@@ -11619,7 +11642,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             )
             .expect("api capture");
             let expanded = sidecar
-                .resolve_definitions(dir.to_str().unwrap(), std::slice::from_ref(&producer_alias))
+                .resolve_definitions(
+                    dir.to_str().unwrap(),
+                    &[crate::services::type_sidecar::DefinitionAlias {
+                        alias: producer_alias.clone(),
+                        protocol: ProbeProtocol::Http,
+                        type_kind: ManifestTypeKind::Response,
+                        side: ManifestRole::Producer,
+                        procedure: false,
+                    }],
+                )
                 .expect("definitions")
                 .remove(0)
                 .expanded;
@@ -12109,7 +12141,16 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             )
             .expect("api capture");
             let expanded = sidecar
-                .resolve_definitions(dir.to_str().unwrap(), std::slice::from_ref(&producer_alias))
+                .resolve_definitions(
+                    dir.to_str().unwrap(),
+                    &[crate::services::type_sidecar::DefinitionAlias {
+                        alias: producer_alias.clone(),
+                        protocol: ProbeProtocol::Http,
+                        type_kind: ManifestTypeKind::Response,
+                        side: ManifestRole::Producer,
+                        procedure: false,
+                    }],
+                )
                 .expect("definitions")
                 .remove(0)
                 .expanded;
@@ -12554,7 +12595,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
         )
         .expect("api capture");
         let records = crate::engine::read_capture_records(&api_stub);
-        let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records);
+        let aliases = crate::engine::aliases_to_resolve(&api_manifest, &records, &[]);
         let resolved = api_sidecar
             .resolve_definitions(api_stub.to_str().unwrap(), &aliases)
             .expect("definitions");

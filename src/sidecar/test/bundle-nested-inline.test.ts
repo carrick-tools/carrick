@@ -27,7 +27,7 @@
 import { describe, it, before, after } from 'node:test';
 import * as assert from 'node:assert';
 import * as path from 'node:path';
-import { SidecarClient, FIXTURES_PATH, stubDirFor } from './helpers.js';
+import { SidecarClient, FIXTURES_PATH, stubDirFor, receivedAliases } from './helpers.js';
 
 const TYPES_FIXTURE = path.join(FIXTURES_PATH, 'src/types.ts');
 const noWs = (s: string) => s.replace(/\s/g, '');
@@ -134,7 +134,7 @@ describe('Explicit-symbol bundle inlines nested named members', () => {
       action: 'resolve_definitions',
       request_id: 'nested-resolve',
       stub_dir: stubDirFor(bundle.dts_content ?? ''),
-      aliases: [ALIAS],
+      aliases: receivedAliases(ALIAS),
     });
 
     assert.strictEqual(

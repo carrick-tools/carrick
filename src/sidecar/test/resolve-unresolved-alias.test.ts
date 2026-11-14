@@ -25,7 +25,7 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { SidecarClient } from './helpers.js';
+import { SidecarClient, receivedAliases } from './helpers.js';
 
 interface ResolveResponseShape {
   request_id: string;
@@ -95,7 +95,7 @@ describe('an unresolvable alias is not a definition (carrick#1444)', () => {
       action: 'resolve_definitions',
       request_id: 'unres-resolve',
       stub_dir: stubDir,
-      aliases: [UNRESOLVED, CLEAN, MEMBER],
+      aliases: receivedAliases(UNRESOLVED, CLEAN, MEMBER),
     });
     assert.strictEqual(
       resolved.status,

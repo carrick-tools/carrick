@@ -14,6 +14,18 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// A `resolve_definitions` alias for the receiving side of an http request
+/// body, which the compiler engine prints as declared (carrick-cloud#3503).
+fn received(alias: &str) -> carrick::services::type_sidecar::DefinitionAlias {
+    carrick::services::type_sidecar::DefinitionAlias {
+        alias: alias.to_string(),
+        protocol: carrick::services::type_sidecar::ProbeProtocol::Http,
+        type_kind: carrick::cloud_storage::ManifestTypeKind::Request,
+        side: carrick::cloud_storage::ManifestRole::Producer,
+        procedure: false,
+    }
+}
+
 // ============================================================================
 // Test Fixtures
 // ============================================================================
@@ -862,7 +874,7 @@ export async function getOrderCount(): Promise<number> {
     // expanded_definition) must resolve to the same array form.
     let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[received(alias)])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()
@@ -1066,7 +1078,7 @@ notificationRouter.get('/status', async () => {
 
     let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[received(alias)])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()
@@ -1250,7 +1262,7 @@ notificationRouter.get('/status', async () => {
 
     let stub = stub_dir_for(&dts);
     let definitions = sidecar
-        .resolve_definitions(&stub.to_string_lossy(), &[alias.to_string()])
+        .resolve_definitions(&stub.to_string_lossy(), &[received(alias)])
         .expect("resolve_definitions failed");
     let def = definitions
         .iter()

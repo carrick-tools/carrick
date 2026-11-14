@@ -505,8 +505,29 @@ export interface ResolveDefinitionsRequest extends BaseRequest {
   action: 'resolve_definitions';
   /** Absolute path to the capture stub dir (package.json + types/ tree). */
   stub_dir: string;
-  /** Surface type alias names to resolve */
-  aliases: string[];
+  /** Surface type aliases to resolve, each with the payload it types. */
+  aliases: DefinitionAlias[];
+}
+
+/**
+ * One surface alias to resolve, and the payload it types: which protocol,
+ * which kind of payload, and which side of the operation the entry is on.
+ * The resolver prints the alias's structural form in JSON wire form exactly
+ * where the judge compares that form (`sentInJsonWireForm`,
+ * carrick-cloud#3503): the sending side of an `http` payload. A derived alias
+ * (an unwidened reading, a response-mode case) carries its base entry's facts.
+ */
+export interface DefinitionAlias {
+  alias: string;
+  protocol: import('./capture/api.js').ProbeProtocol;
+  type_kind: 'request' | 'response';
+  side: 'producer' | 'consumer';
+  /**
+   * The entry is a procedure of an RPC router (tRPC and similar). Its wire
+   * form is its router's transformer's, which may keep a `Date` a `Date`
+   * (carrick#4275), so it prints as declared until that is a known fact.
+   */
+  procedure: boolean;
 }
 
 /**

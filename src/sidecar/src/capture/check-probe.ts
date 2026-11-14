@@ -70,6 +70,23 @@ export function directionFor(
   return { sent: 'producer', expected: 'consumer' };
 }
 
+/**
+ * Whether a payload travels in its JSON wire form: the one rule the judge and
+ * the stored type text both read (carrick-cloud#3503). An `http` payload is
+ * serialised before it travels, and `JSON.stringify` writes a value's
+ * `toJSON()` result, so the SENDING side of an `http` pair (`directionFor`'s
+ * `sent`: the producer of a response, the consumer of a request body) is
+ * what the other side receives in wire form. Every other protocol is compared
+ * and stored as declared (carrick#4275 decides theirs here, once).
+ */
+export function sentInJsonWireForm(
+  protocol: ProbeProtocol,
+  typeKind: ProbeTypeKind,
+  side: Side
+): boolean {
+  return protocol === 'http' && directionFor(protocol, typeKind).sent === side;
+}
+
 /** Deterministic FNV-1a (32-bit) over the pair's stable key. Never a path. */
 export function fnv1a(input: string): string {
   let hash = 0x811c9dc5;
@@ -480,7 +497,7 @@ export function buildProbe(
   // cost, and no way for the transform to turn an agreeing pair into a
   // disagreeing one). tsc stays the judge of both forms.
   let wireAssignmentLine: number | undefined;
-  if (spec.protocol === 'http') {
+  if (sentInJsonWireForm(spec.protocol, spec.type_kind, direction.sent)) {
     // Keep the DECLARED type whenever serialising changes nothing observable,
     // so the compiler's headline still names the real surface alias (the probe
     // prints `Sent`, which the scrub rewrites) instead of expanding a mapped

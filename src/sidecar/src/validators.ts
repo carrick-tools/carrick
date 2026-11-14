@@ -413,7 +413,17 @@ export const ImplementationsRequestSchema = BaseRequestSchema.extend({
 export const ResolveDefinitionsRequestSchema = BaseRequestSchema.extend({
   action: z.literal('resolve_definitions'),
   stub_dir: z.string().min(1, 'Stub dir cannot be empty'),
-  aliases: z.array(z.string().min(1)).min(1, 'At least one alias is required'),
+  aliases: z
+    .array(
+      z.object({
+        alias: z.string().min(1),
+        protocol: z.enum(['http', 'graphql', 'socket', 'pubsub']),
+        type_kind: z.enum(['request', 'response']),
+        side: z.enum(['producer', 'consumer']),
+        procedure: z.boolean(),
+      })
+    )
+    .min(1, 'At least one alias is required'),
 });
 
 const RetypeLocatorItemSchema = z.object({

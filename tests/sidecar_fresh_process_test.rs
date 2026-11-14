@@ -427,7 +427,16 @@ fn a_restart_that_cannot_start_a_process_says_so() {
     );
 
     let (_sidecar, result, took) = off_thread(sidecar, |sidecar| {
-        sidecar.resolve_definitions("/stub", &["A".to_string()])
+        sidecar.resolve_definitions(
+            "/stub",
+            &[carrick::services::type_sidecar::DefinitionAlias {
+                alias: "A".to_string(),
+                protocol: carrick::services::type_sidecar::ProbeProtocol::Http,
+                type_kind: carrick::cloud_storage::ManifestTypeKind::Request,
+                side: carrick::cloud_storage::ManifestRole::Producer,
+                procedure: false,
+            }],
+        )
     });
     assert!(
         matches!(result, Err(SidecarError::NotReady(_))),

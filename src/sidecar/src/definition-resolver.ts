@@ -10,7 +10,11 @@
  *    anonymous (inline object types, node-builder prints) the surface alias
  *    line itself is the as-written form.
  *  - `expanded`: the fully *structural* form, with every named member type
- *    inlined to its member structure, recursively.
+ *    inlined to its member structure, recursively. The sending side of an
+ *    `http` payload prints in JSON wire form (a `Date` as `string`), by the
+ *    rule the judge compares it under (`sentInJsonWireForm`,
+ *    carrick-cloud#3503): the stored text says what travels. `definition`
+ *    stays as written.
  *
  * An alias whose own type did not resolve produces neither: the tree is read
  * as its self-check read it, so a reference that leaves it and that the
@@ -40,12 +44,13 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { Project, Node, type SourceFile, type Type } from 'ts-morph';
-import { sidecarCompilerOptions, withStubResolution } from './capture/index.js';
+import { sentInJsonWireForm, sidecarCompilerOptions, withStubResolution } from './capture/index.js';
 import { defaultLibraryOptions } from './default-library.js';
 import {
   expandTypeStructural,
   type ExpandOrigin,
 } from './type-structural-expander.js';
+import type { DefinitionAlias } from './types.js';
 
 export interface ResolvedDefinition {
   type_alias: string;
@@ -67,7 +72,7 @@ export class DefinitionResolver {
    * both extensionless and `.js`-suffixed specifiers — the same policy the
    * check-phase workspace uses.
    */
-  resolveFromStub(stubDir: string, aliases: string[]): ResolvedDefinition[] {
+  resolveFromStub(stubDir: string, aliases: DefinitionAlias[]): ResolvedDefinition[] {
     const typesDir = path.join(stubDir, 'types');
     const surfacePath = path.join(typesDir, 'surface.d.ts');
     if (!fs.existsSync(surfacePath)) {
@@ -113,7 +118,7 @@ export class DefinitionResolver {
           if (result) {
             results.push(result);
           } else {
-            this.log(`Could not resolve alias: ${alias}`);
+            this.log(`Could not resolve alias: ${alias.alias}`);
           }
         }
         return results;
@@ -131,9 +136,10 @@ export class DefinitionResolver {
    */
   private resolveAlias(
     sourceFile: SourceFile,
-    alias: string,
+    payload: DefinitionAlias,
     origin: ExpandOrigin,
   ): ResolvedDefinition | null {
+    const alias = payload.alias;
     const decl =
       sourceFile.getTypeAlias(alias) ??
       sourceFile.getInterface(alias) ??
@@ -174,8 +180,16 @@ export class DefinitionResolver {
         }
       }
 
-      // Structural form — every named member inlined to its shape.
-      const expanded = expandTypeStructural(type, origin);
+      // Structural form — every named member inlined to its shape, in the
+      // form the payload travels in where the judge compares that form. An
+      // RPC procedure fails closed to the declared form: its router's
+      // transformer, not JSON, decides what travels (carrick#4275).
+      const wire =
+        !payload.procedure &&
+        sentInJsonWireForm(payload.protocol, payload.type_kind, payload.side)
+          ? 'json'
+          : 'declared';
+      const expanded = expandTypeStructural(type, origin, { wire });
 
       return { type_alias: alias, definition, expanded };
     } catch (err) {
