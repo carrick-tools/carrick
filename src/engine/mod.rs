@@ -3053,12 +3053,14 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                 .map(|input| &input.dependencies),
         );
     }
+    let mut removals_not_checked = 0;
     if let Some(input) = main_baseline_input {
         let unpaired = crate::pr_baseline::RunUnpaired {
             calls: std::mem::take(&mut results.unpaired_calls),
             receivers: std::mem::take(&mut results.unpaired_producers),
         };
-        mark_findings_on_main(&mut results.findings, input, &unpaired, sidecar).await;
+        removals_not_checked =
+            mark_findings_on_main(&mut results.findings, input, &unpaired, sidecar).await;
     } else if is_pr_run {
         // Nothing of this repo on main to compare with: say so on each
         // finding, rather than leave the cloud to read it as introduced
@@ -3132,6 +3134,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     &evidence.main_pairs,
                     |pair| pair_directions.for_edge(pair).resolved(),
                 ),
+                removals_not_checked,
                 dependencies: evidence.dependencies,
             }),
         functions: pr_functions,
@@ -16046,21 +16049,25 @@ fn main_side_timeout() -> std::time::Duration {
 /// are marked ([`crate::pr_baseline::mark_lost_pairings`]). The type check
 /// runs only when a finding carries a pairing to compare, so a PR that only
 /// removes runs main's matching without it.
+///
+/// Returns how many removals the PR's diff places that main's side could not
+/// check because it failed (the payload's `checked.removals_not_checked`);
+/// zero when it ran or had nothing to run.
 async fn mark_findings_on_main(
     findings: &mut Vec<crate::findings::Finding>,
     input: MainBaselineInput,
     unpaired: &crate::pr_baseline::RunUnpaired,
     sidecar: Option<&TypeSidecar>,
-) {
+) -> usize {
     let mismatches = crate::pr_baseline::has_anything_to_mark(findings);
     if !mismatches && input.removals.is_empty() {
         debug!("No mismatch to compare with main, and nothing main has removed");
-        return;
+        return 0;
     }
     if input.surface_unchanged {
         info!("This PR leaves every scanned service as main has it: its findings are main's");
         crate::pr_baseline::mark_all_on_main(findings);
-        return;
+        return 0;
     }
 
     let copy = input.copy;
@@ -16109,7 +16116,7 @@ async fn mark_findings_on_main(
                 );
             }
             logging::finish_spinner(&sp, "Compared findings with main");
-            return;
+            return 0;
         }
         Ok(Ok(Err(e))) => format!("main's analysis failed: {e}"),
         Ok(Err(panic)) => format!(
@@ -16132,6 +16139,7 @@ async fn mark_findings_on_main(
             crate::findings::OnMainUnknown::MainSideFailed,
         );
     }
+    placed_removals
 }
 
 /// Main's side of the comparison: the same analysis this run's findings came

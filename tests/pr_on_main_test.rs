@@ -3227,6 +3227,49 @@ async fn seed_http_route_removed_marking() {
     assert_no_unmarked_row_holds(&payload, "missing_endpoint", "/api/v1/orders/:encoded");
 }
 
+/// Main's side fails (an error, a panic, a hang) on a PR that only removes a
+/// route: no row can say the PR broke a caller, so the payload says how many
+/// placed removals it could not check (carrick#4292). A run that checked them
+/// writes no such field.
+#[tokio::test]
+async fn a_failed_main_side_counts_the_removals_it_could_not_check() {
+    let _serial = SERIAL.lock().await;
+    let name = "http-route-removed";
+    let repo = seed_entry(name)["repo"].as_str().unwrap().to_string();
+    let _main = main_snapshot().await;
+
+    let checked = seed_payload_with(&repo, |dir| apply_seed(dir, name), false).await;
+    assert!(
+        checked["checked"].get("removals_not_checked").is_none(),
+        "a run that checked its removals states no count: {:#}",
+        checked["checked"]
+    );
+
+    // SAFETY: the tests in this binary run one at a time (SERIAL).
+    unsafe { std::env::set_var("CARRICK_MAIN_SIDE_TIMEOUT_SECS", "1") };
+    for fault in [
+        MainSideFault::Error,
+        MainSideFault::Panic,
+        MainSideFault::Hang,
+    ] {
+        inject_mock_main_side_fault(fault);
+        let payload = seed_payload_with(&repo, |dir| apply_seed(dir, name), false).await;
+        assert_eq!(
+            payload["checked"]["removals_not_checked"],
+            serde_json::json!(1),
+            "{fault:?}: {:#}",
+            payload["checked"]
+        );
+        assert!(
+            findings_of(&payload)
+                .iter()
+                .all(|finding| finding.get("removed").is_none()),
+            "{fault:?}: no row is marked when main's side failed"
+        );
+    }
+    unsafe { std::env::remove_var("CARRICK_MAIN_SIDE_TIMEOUT_SECS") };
+}
+
 /// No row says the PR removed something another service still uses
 /// (carrick#3092): what every seed whose correct check succeeds must give.
 fn assert_no_lost_pairing(payload: &serde_json::Value) {
