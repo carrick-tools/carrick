@@ -11733,6 +11733,7 @@ impl FileOrchestrator {
         // A payload the fact layer places is read there, not at the model
         // reader's locator (empty with no rows).
         crate::site_payloads::take_over(&mut infer, payload_infer);
+        crate::site_payloads::drop_answered_symbols(&mut explicit, payload_infer);
         // A request the fact layer placed names its row's path as the
         // reader's does (carrick#1029).
         let shared = Self::mark_shared_route_lines(&mut infer, mount_graph, repo_path);
@@ -11751,15 +11752,19 @@ impl FileOrchestrator {
         // request collection (carrick#767).
         let round_trip = std::time::Instant::now();
         // A call whose result label went unanswered is not inferred: read
-        // without the label, its type is the envelope (carrick#4154).
+        // without the label, its type is the envelope (carrick#4154). A call
+        // that writes no body argument is answered here (carrick#4165).
         let asked: Vec<InferRequestItem> = infer
             .iter()
-            .filter(|request| !request.result_unanswered)
+            .filter(|request| !request.result_unanswered && !request.answered_no_body())
             .cloned()
             .collect();
         let mut result = sidecar
             .resolve_all_types(&explicit, &asked, extraction_config, server_claims)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        result
+            .inferred_types
+            .extend(infer.iter().filter_map(InferRequestItem::no_body_answer));
         // Every request as sent, for the type-reach record (carrick#3101).
         result.note_request_files(&explicit, &infer);
         // Kept only where the answer published is marked too: the type an

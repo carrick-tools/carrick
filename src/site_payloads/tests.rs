@@ -627,6 +627,112 @@ fn an_unwritten_slot_asks_the_request_config_question_with_its_key() {
     );
 }
 
+/// carrick#4165: a call no call writes a body argument for is answered by
+/// the scanner, never asked: its one request is `RequestConfig` naming no
+/// key, which the orchestrator keeps from the sidecar and answers decided
+/// `no_request_body`. The capture takes the placeholder for it, and a model
+/// symbol for the same alias, which nothing sighted, does not win over the
+/// answer. On another protocol nothing is asked or stated (carrick#4227).
+#[test]
+fn an_absent_slot_is_answered_here_and_never_asked() {
+    use crate::services::type_sidecar::{CaptureAnchor, SymbolRequest};
+    let dir = repo();
+    let root = dir.path().to_string_lossy().into_owned();
+    let absent = || PayloadSlots {
+        request: Some(PayloadAt::Absent {
+            at: at("http.post(\"/orders\", order)"),
+        }),
+        response: None,
+    };
+    let requests = SitePayloads::of(&[record("http_client", false, absent())]).requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &root,
+        &ResultIndex::default(),
+        &HashSet::new(),
+    );
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let request = &requests[0];
+    assert_eq!(request.infer_kind, InferKind::RequestConfig);
+    assert_eq!(request.member, None);
+    assert!(request.answered_no_body());
+    let answer = request.no_body_answer().expect("answered");
+    assert_eq!(answer.alias, "Req");
+    assert_eq!(answer.type_string, "unknown");
+    assert_eq!(
+        answer
+            .any_provenance
+            .iter()
+            .map(|p| (p.path.as_str(), p.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("", "no_request_body")]
+    );
+
+    // The options literal's question is still asked.
+    let unwritten = PayloadSlots {
+        request: Some(PayloadAt::Unwritten {
+            at: at("\"/orders\""),
+            key: "body".to_string(),
+        }),
+        response: None,
+    };
+    let asked = SitePayloads::of(&[record("http_client", false, unwritten)]).requests(
+        &[entry(http(), "consumer", "request", "Req", 2)],
+        &root,
+        &ResultIndex::default(),
+        &HashSet::new(),
+    );
+    assert!(!asked[0].answered_no_body());
+    assert!(asked[0].no_body_answer().is_none());
+
+    // A model symbol for the alias is never asked, so it neither resolves
+    // nor captures; another alias's stands.
+    let symbol = |alias: &str| SymbolRequest {
+        symbol_name: "Order".to_string(),
+        source_file: FILE.to_string(),
+        alias: Some(alias.to_string()),
+        array_depth: Some(1),
+        payload_borrow_witness: false,
+        consumer_response: false,
+    };
+    let mut explicit = vec![symbol("Req"), symbol("Other")];
+    drop_answered_symbols(&mut explicit, &requests);
+    assert_eq!(
+        explicit
+            .iter()
+            .filter_map(|request| request.alias.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["Other"]
+    );
+    let mut kept = vec![symbol("Req")];
+    drop_answered_symbols(&mut kept, &asked);
+    assert_eq!(kept.len(), 1);
+    // The capture: the placeholder, not the call's own value.
+    explicit.clear();
+    let anchors = crate::engine::type_compat_v2::derive_capture_anchors(
+        &explicit,
+        &requests,
+        &[],
+        &[answer],
+        &["Req".to_string()],
+        &root,
+    );
+    assert_eq!(anchors.len(), 1, "{anchors:?}");
+    assert!(
+        matches!(&anchors[0], CaptureAnchor::Literal { type_text, .. } if type_text == "unknown"),
+        "{anchors:?}"
+    );
+
+    let socket =
+        json!({ "protocol": "socket", "event": "orders", "direction": "client_to_server" });
+    let none = SitePayloads::of(&[record("socket", false, absent())]).requests(
+        &[entry(socket, "consumer", "response", "Pub", 2)],
+        &root,
+        &ResultIndex::default(),
+        &HashSet::new(),
+    );
+    assert!(none.is_empty(), "{none:?}");
+}
+
 /// An unwritten slot is an HTTP options question: on any other protocol the
 /// reader's request stands, and nothing is asked.
 #[test]

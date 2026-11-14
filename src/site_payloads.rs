@@ -39,7 +39,7 @@ use std::path::Path;
 use crate::cloud_storage::{ManifestRole, ManifestTypeKind, TypeManifestEntry};
 use crate::operation::OperationKey;
 use crate::request_summary::site_record::{AnchorAt, PayloadAt, PayloadSlots, SiteRecord};
-use crate::services::type_sidecar::{InferKind, InferRequestItem, ThroughCall};
+use crate::services::type_sidecar::{InferKind, InferRequestItem, SymbolRequest, ThroughCall};
 
 /// Which side of an operation a site is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -157,7 +157,18 @@ impl SitePayloads {
             };
             // The question is about a request's options: no other protocol's
             // payload is asked it, so the reader's request stands there.
-            if matches!(slot, PayloadAt::Unwritten { .. }) && !http {
+            // An absent payload argument is stated for HTTP alone
+            // (carrick#4165); the other protocols are carrick#4227.
+            if matches!(slot, PayloadAt::Unwritten { .. } | PayloadAt::Absent { .. }) && !http {
+                continue;
+            }
+            // A verb that sends no body states it already (carrick#4163):
+            // the fact decides the verbs that can send one.
+            if matches!(slot, PayloadAt::Absent { .. })
+                && entry.key.as_http().is_some_and(|(method, _)| {
+                    !crate::type_manifest::producer_reads_request_body(method)
+                })
+            {
                 continue;
             }
             // A call whose verb sends no body is not asked the object its
@@ -213,6 +224,10 @@ impl SitePayloads {
                 PayloadAt::Unwritten { key, .. } => {
                     (InferKind::RequestConfig, None, Some(key.clone()))
                 }
+                // No call writes the body argument: the scanner answers it
+                // and the sidecar is never asked
+                // ([`InferRequestItem::answered_no_body`], carrick#4165).
+                PayloadAt::Absent { .. } => (InferKind::RequestConfig, None, None),
             };
             // A call's result takes the store's label for the call it reads
             // (carrick#2910): the request replaces the reader's and the site
@@ -296,6 +311,27 @@ pub fn slotted_aliases(slotted: &[InferRequestItem]) -> BTreeSet<String> {
         .iter()
         .filter_map(|request| request.alias.clone())
         .collect()
+}
+
+/// `explicit` with every model symbol dropped for an alias the scanner
+/// answers as sending no body (carrick#4165,
+/// [`InferRequestItem::answered_no_body`]): no call writes a body there, so
+/// no symbol names one, and the answer is the alias's only one.
+pub fn drop_answered_symbols(explicit: &mut Vec<SymbolRequest>, slotted: &[InferRequestItem]) {
+    let answered: BTreeSet<&str> = slotted
+        .iter()
+        .filter(|request| request.answered_no_body())
+        .filter_map(|request| request.alias.as_deref())
+        .collect();
+    if answered.is_empty() {
+        return;
+    }
+    explicit.retain(|request| {
+        request
+            .alias
+            .as_deref()
+            .is_none_or(|alias| !answered.contains(alias))
+    });
 }
 
 /// `infer` with every request for an alias `slotted` types dropped, and

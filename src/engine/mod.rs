@@ -12262,6 +12262,7 @@ fn run_capture_for_service(
     explicit.extend_from_slice(extra_explicit);
     infer.extend_from_slice(extra_infer);
     crate::site_payloads::take_over(&mut infer, payload_infer);
+    crate::site_payloads::drop_answered_symbols(&mut explicit, payload_infer);
     debug!(
         carrier_asks = infer
             .iter()
