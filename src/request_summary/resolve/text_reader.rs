@@ -283,6 +283,34 @@ fn chains_agree(head: &[CallAt], tail: &[CallAt]) -> bool {
         .all(|a| tail.iter().filter(|b| b.fills == a.fills).all(|b| b == a))
 }
 
+/// Whether every value of one caller chain is a text read through a loop
+/// over a stated list (carrick#2093), each from its own element: then the
+/// texts are one name per element, never a choice between them. A text read
+/// through no loop, or two texts from one element (a choice written inside
+/// the loop), keeps the several names a choice (carrick#4245).
+///
+/// The one answer to "is this set one name per element of the loops it was
+/// read through?": the library reader (`SiteNames`) and the site path
+/// (`site_record`) both ask it here.
+pub(in crate::request_summary) fn per_element(held: &[&TextValue]) -> bool {
+    let mut seen: Vec<&[(u32, usize)]> = Vec::new();
+    for value in held {
+        let TextValue::Text {
+            elements,
+            from_type: false,
+            ..
+        } = value
+        else {
+            return false;
+        };
+        if elements.is_empty() || seen.contains(&elements.as_slice()) {
+            return false;
+        }
+        seen.push(elements);
+    }
+    true
+}
+
 /// Whether two values took the same element of every loop both were read
 /// through (carrick#2093): `${a}/${b}` over one tuple list joins each
 /// tuple's own names, never one tuple's `a` with another's `b`.

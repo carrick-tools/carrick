@@ -46,7 +46,7 @@ pub(super) use text::{
     args_text, list_of, loop_head_names, pattern_members, text_of, written_as_const,
 };
 pub(super) use text_reader::{
-    ArgTexts, Hop, PartValue, PiecedText, SpanAt, TextPart, TextValue, handed,
+    ArgTexts, Hop, PartValue, PiecedText, SpanAt, TextPart, TextValue, handed, per_element,
 };
 
 /// How many object literals deep an argument's keys are read (the decision
