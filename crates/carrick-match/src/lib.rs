@@ -70,6 +70,8 @@ pub use pairing::{
     Call, PairOutcome, Pairing, PairingPool, ProcedureKey, Producer, Routed, RouterId, Winner,
     canonical_path, pair_winners,
 };
+#[cfg(feature = "wasm")]
+pub use similar::SimilarRanker;
 pub use similar::{
     Bag, SIMILAR_ROWS, SimilarDoc, SimilarIndex, SimilarQuery, SimilarRow, bag as similar_bag,
     tokenize as similar_tokenize,

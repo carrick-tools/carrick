@@ -374,3 +374,95 @@ impl SimilarIndex {
             .collect()
     }
 }
+
+/// The ranker over wasm (carrick-cloud#3490 T5): JSON in, JSON out, in the
+/// shape of `tests/fixtures/similar_wasm.vectors.json`. The cloud builds one
+/// index from an index's function rows and ranks each `code` seed against it.
+#[cfg(feature = "wasm")]
+mod wasm {
+    use serde::Deserialize;
+    use wasm_bindgen::prelude::*;
+
+    use super::{SimilarDoc, SimilarIndex, SimilarQuery};
+
+    #[derive(Deserialize)]
+    struct Row {
+        name: String,
+        file: String,
+        #[serde(default)]
+        intent: Option<String>,
+        #[serde(default)]
+        tokens: Vec<String>,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default)]
+        exported: bool,
+        #[serde(default)]
+        line: u32,
+        #[serde(default)]
+        calls: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Query {
+        name: String,
+        file: String,
+        #[serde(default)]
+        tokens: Vec<String>,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default)]
+        callees: Vec<String>,
+    }
+
+    /// An index built once from function rows, ranked against many seeds.
+    #[wasm_bindgen]
+    pub struct SimilarRanker {
+        index: SimilarIndex,
+    }
+
+    #[wasm_bindgen]
+    impl SimilarRanker {
+        /// `rows` is a JSON array of `{name, file, intent?, tokens?,
+        /// signature?, exported?, line?, calls?}`. Throws on malformed JSON.
+        #[wasm_bindgen(constructor)]
+        pub fn from_json(rows: &str) -> Result<SimilarRanker, JsError> {
+            let rows: Vec<Row> = serde_json::from_str(rows)?;
+            let index = SimilarIndex::build(rows.iter().map(|row| SimilarDoc {
+                name: &row.name,
+                file: &row.file,
+                intent: row.intent.as_deref(),
+                tokens: &row.tokens,
+                signature: row.signature.as_deref(),
+                exported: row.exported,
+                line: row.line,
+                calls: row.calls.iter().map(String::as_str).collect(),
+            }));
+            Ok(SimilarRanker { index })
+        }
+
+        /// `query` is a JSON `{name, file, tokens?, signature?, callees?}`; the
+        /// result is a JSON `[{doc, score}]`, best first, `doc` being the
+        /// position of the row in the array given to the constructor. Throws
+        /// on malformed JSON.
+        #[wasm_bindgen(js_name = rank)]
+        pub fn rank_json(&self, query: &str) -> Result<String, JsError> {
+            let query: Query = serde_json::from_str(query)?;
+            let rows = self.index.rank(&SimilarQuery {
+                name: &query.name,
+                file: &query.file,
+                tokens: &query.tokens,
+                signature: query.signature.as_deref(),
+                callees: &query.callees,
+            });
+            let out: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| serde_json::json!({ "doc": row.doc, "score": row.score }))
+                .collect();
+            Ok(serde_json::to_string(&out)?)
+        }
+    }
+}
+
+#[cfg(feature = "wasm")]
+pub use wasm::SimilarRanker;
