@@ -2687,7 +2687,10 @@ impl<'a> Walk<'a, '_> {
         let Some(Some(param)) = function.params.get(index) else {
             return true;
         };
-        param.written_onto() || param.handed_beyond(walked)
+        {
+            let _ = walked;
+            param.written_onto()
+        }
     }
 
     /// `down` is the calls from the site (first) to the labelled call
