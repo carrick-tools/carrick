@@ -617,6 +617,7 @@ fn a_model_row_at_a_maker_sites_labelled_call_is_withdrawn() {
         ("src/poster.ts", 5),
         ("src/twice.ts", 4),
         ("src/typed-maker.ts", 4),
+        ("src/pinger.ts", 4),
     ] {
         let left = model_row_at(&on, file, line);
         assert!(
@@ -631,7 +632,6 @@ fn a_model_row_at_a_maker_sites_labelled_call_is_withdrawn() {
         ("src/generic.ts", 4),
         ("src/local-run.ts", 4),
         ("src/retried.ts", 5),
-        ("src/pinger.ts", 4),
     ] {
         let kept = model_row_at(&on, file, line);
         assert!(
@@ -648,6 +648,8 @@ fn a_model_row_at_a_maker_sites_labelled_call_is_withdrawn() {
         ("src/poster.ts", 7, "{ id: string; }"),
         ("src/twice.ts", 6, "{ up: boolean; }"),
         ("src/twice.ts", 7, "{ up: boolean; }"),
+        ("src/pinger.ts", 6, "{ up: boolean; }"),
+        ("src/pinger.ts", 7, "{ up: boolean; }"),
     ] {
         assert_eq!(response(file, line), wanted, "response at {file}:{line}");
     }

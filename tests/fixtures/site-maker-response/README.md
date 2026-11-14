@@ -59,4 +59,4 @@ rows (T1).
 | `handed.ts:4` | stays | the maker is handed on as a value at `:8` |
 | `env-maker.ts:4` | stays | the site's key has an environment base, so it has no manifest entry; the model row keeps `{ trimmed: number; }` |
 | `generic.ts:4`, `local-run.ts:4`, `retried.ts:5` | stays | a wrapper that runs the send |
-| `pinger.ts:4` | stays | no fact row was stated (old-path rows keep the site) |
+| `pinger.ts:4` | goes | maker, both calls stated (`:6` and `:7` read `{ up: boolean; }`) |
