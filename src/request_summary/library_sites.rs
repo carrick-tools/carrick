@@ -2206,9 +2206,10 @@ pub struct NamePlace {
 /// counted in the `message names:` line, and deleted when it counts zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameFallback {
-    /// The text reader has no compiler rows for the slot (a `rows_missing`
-    /// hole: no walk, or a failed one).
-    NoRows,
+    /// The text reader has no compiler row for the slot: the first hole
+    /// the position lookup gave (`rows_missing`, `walk_lost`, ...), which
+    /// the lead's word carries.
+    NoRows(super::guards::HoleReason),
 }
 
 /// One value of a name slot at one place: the text, or why none is
@@ -2359,11 +2360,12 @@ impl<'a> SiteNames<'a> {
             super::resolve::TextValue::Hole { reason, .. } => Some(*reason),
             super::resolve::TextValue::Pieced(_) => Some(HoleReason::UnreadExpression),
         };
-        if values
+        if let Some(reason) = values
             .iter()
-            .any(|value| hole(value) == Some(HoleReason::RowsMissing))
+            .filter_map(hole)
+            .find(|reason| reason.is_row_lookup())
         {
-            return Some(SlotName::Today(NameFallback::NoRows));
+            return Some(SlotName::Today(NameFallback::NoRows(reason)));
         }
         // One group per caller chain, in the order read.
         let mut chains: Vec<(&[_], Vec<&super::resolve::TextValue>)> = Vec::new();

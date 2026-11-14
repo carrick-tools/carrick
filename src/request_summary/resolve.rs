@@ -3437,6 +3437,7 @@ impl<'a> Resolver<'a> {
                     // every value written to it (carrick#3504 S1).
                     reach => self
                         .row_at(file, *lo, *hi, kind)
+                        .ok()
                         .and_then(|row| self.declared_binding(row))
                         .and_then(|(path, line, symbol)| {
                             self.binding_values(follow, path, line, &symbol, invoke)
@@ -3753,6 +3754,7 @@ impl<'a> Resolver<'a> {
             } => {
                 let Some((path, line, symbol)) = self
                     .row_at(file, *lo, *hi, Kind::Ident)
+                    .ok()
                     .and_then(|row| self.declared_binding(row))
                 else {
                     return false;
@@ -4198,14 +4200,23 @@ impl<'a> Resolver<'a> {
 
     /// The compiler row of the kind `kind` at `lo..hi` (discovery numbering)
     /// in `file`.
-    fn row_at(&self, file: &Path, lo: u32, hi: u32, kind: Kind) -> Option<&'a Row> {
+    fn row_at(
+        &self,
+        file: &Path,
+        lo: u32,
+        hi: u32,
+        kind: Kind,
+    ) -> Result<&'a Row, guards::HoleReason> {
         let inputs = self.inputs_for(file);
-        let ir = inputs.files.get(file)?;
+        let ir = inputs
+            .files
+            .get(file)
+            .ok_or(guards::HoleReason::RowsMissing)?;
         inputs
             .positions
-            .as_ref()?
+            .as_ref()
+            .ok_or(guards::HoleReason::RowsMissing)?
             .lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind)
-            .ok()
     }
 
     /// The module binding `row` names, when its declaration is one a file
