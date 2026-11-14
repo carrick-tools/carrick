@@ -202,7 +202,7 @@ agent to start something new once the task is done.
 
 | Hook | Governed code | What it does |
 |---|---|---|
-| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/edit-flow.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/lead.ts` | re-checks the edited files, prints what needs acting on, queues a background re-check for an edit that needs a re-scan, and names the indexed function a new function looks like (`recheck.new_functions[].lead`, carrick#3249) |
+| `carrick hook post-edit` | `npm/carrick/src/hook/post-edit.ts`, `npm/carrick/src/hook/edit-flow.ts`, `npm/carrick/src/hook/apply-patch.ts`, `npm/carrick/src/hook/similar.ts` | re-checks the edited files, prints what needs acting on, queues a background re-check for an edit that needs a re-scan, and lists the indexed functions a new function may already exist as (`recheck.new_functions[].similar`, carrick-cloud#3490) |
 | `carrick hook stop` (Claude Code) | `npm/carrick/src/hook/stop.ts`, `npm/carrick/src/hook/stop-wait.ts` | delivers finished background re-checks, names the files still being checked, and returns at once |
 | `carrick hook user-prompt` (Claude Code and Codex) | `npm/carrick/src/hook/user-prompt.ts`, `npm/carrick/src/hook/late.ts` | delivers the background re-checks that finished since the last hook ran, with the next prompt |
 | `carrick hook post-bash` (Claude Code) | `npm/carrick/src/hook/post-bash.ts`, `npm/carrick/src/hook/late.ts` | delivers finished background re-checks after any shell command |
@@ -212,7 +212,7 @@ event (the next edit, read, shell command or prompt) and is delivered once.
 
 The per-session store (`npm/carrick/src/hook/reuse.ts`, under
 `~/.carrick/sessions/<session_id>.json`, outside every repository) remembers
-which files' uses lines and which new functions' lead lines were shown, which
+which files' uses lines and which new functions' similar-function blocks were shown, which
 files the Read hook asked about, and the last edit per workspace.
 
 **No reuse nudge (carrick#3436).** Until carrick#3436 the Stop hook named the
@@ -222,9 +222,9 @@ that a new function "isn't in the index yet". Reuse is decided before the code
 is written (rule 1 of the AGENTS.md section, the `carrick-reuse` skill), so the
 line and the per-session list of new functions were removed from both hosts.
 `carrick check --recheck` still answers with `recheck.new_functions`. The
-post-edit hook prints one line for a new function that has a `lead`
-(carrick#3249), once per function per session, as the edit lands. Nothing about
-new functions is said at the end of the task.
+post-edit hook prints one block for a new function that has `similar` rows,
+once per function per session, as the edit lands. The hook says nothing
+about new functions at the end of the task.
 
 **The channel.** A Stop hook's `hookSpecificOutput.additionalContext` reaches
 the model and the conversation continues, so it is the one Stop channel that is
