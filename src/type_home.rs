@@ -17,7 +17,9 @@
 //!   entry from the source's stated root or from a re-aimed root, that root's
 //!   home counts too. A home for another type is never stored.
 //! - An entry with no symbol takes the published answer's home as it is; only
-//!   `defined_in` carries the name.
+//!   `defined_in` carries the name. A home marked `kind: schema` (H3) is the
+//!   `const` of the schema a request was validated by, and only ever reaches
+//!   an entry this way: the engine names no symbol for a schema contract.
 //! - The file is stored repo-relative. A file outside the repo is no home.
 
 use crate::cloud_storage::{ManifestRole, TypeHome, TypeManifestEntry};
@@ -120,6 +122,7 @@ pub fn store_type_homes(
         };
         entry.defined_in = chosen.and_then(|home| {
             Some(TypeHome {
+                kind: home.kind,
                 file_path: inside_repo(&home.file_path, repo_path)?,
                 line_number: home.line,
                 symbol: home.symbol.clone(),

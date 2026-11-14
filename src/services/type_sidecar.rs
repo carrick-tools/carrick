@@ -2114,6 +2114,10 @@ pub struct TypeHomeReport {
     pub symbol: String,
     pub file_path: String,
     pub line: u32,
+    /// `schema` where the home is the `const` of the schema value a contract
+    /// was read off, not a type declaration (carrick#2148 H3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::cloud_storage::TypeHomeKind>,
 }
 
 /// One node an answer read (carrick#4244), in the compiler's positions:
@@ -8280,6 +8284,7 @@ mod tests {
         let mut inf = inferred(alias, symbol, None);
         inf.type_string = type_string.to_string();
         inf.type_home = symbol_source.map(|file| TypeHomeReport {
+            kind: None,
             symbol: symbol.unwrap_or_default().to_string(),
             file_path: file.to_string(),
             line: 1,
@@ -8544,6 +8549,7 @@ mod tests {
             StatedBody {
                 root: Some("SearchResponse".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "SearchResponse".to_string(),
                     file_path: "/repo/src/search.ts".to_string(),
                     line: 1,
@@ -8572,6 +8578,7 @@ mod tests {
             StatedBody {
                 root: Some("Member".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "Member".to_string(),
                     file_path: "/repo/src/members.ts".to_string(),
                     line: 1,
@@ -8602,6 +8609,7 @@ mod tests {
             StatedBody {
                 root: Some("MemberPage".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "MemberPage".to_string(),
                     file_path: "/repo/src/pages.ts".to_string(),
                     line: 1,
@@ -8637,6 +8645,7 @@ mod tests {
             StatedBody {
                 root: Some("MemberPage".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "MemberPage".to_string(),
                     file_path: "/repo/src/pages.ts".to_string(),
                     line: 1,
@@ -8676,6 +8685,7 @@ mod tests {
                 StatedBody {
                     root: Some("Page".to_string()),
                     root_home: Some(TypeHomeReport {
+                        kind: None,
                         symbol: "Page".to_string(),
                         file_path: "/repo/src/pages.ts".to_string(),
                         line: 1,
@@ -8739,6 +8749,7 @@ mod tests {
             StatedBody {
                 root: Some("Response".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "Response".to_string(),
                     file_path: "/repo/node_modules/types/fetch.d.ts".to_string(),
                     line: 1,
@@ -8842,6 +8853,7 @@ mod tests {
             StatedBody {
                 root: Some("MemberPage".to_string()),
                 root_home: Some(TypeHomeReport {
+                    kind: None,
                     symbol: "MemberPage".to_string(),
                     file_path: "/repo/src/pages.ts".to_string(),
                     line: 1,
@@ -8878,6 +8890,7 @@ mod tests {
                         symbol: "MemberPage".to_string(),
                         source_file: "/repo/src/pages.ts".to_string(),
                         home: Some(TypeHomeReport {
+                            kind: None,
                             symbol: "MemberPage".to_string(),
                             file_path: "/repo/src/pages.ts".to_string(),
                             line: 1,
@@ -8891,6 +8904,7 @@ mod tests {
                         symbol: "OrderPlaced".to_string(),
                         source_file: "/repo/src/orders.ts".to_string(),
                         home: Some(TypeHomeReport {
+                            kind: None,
                             symbol: "OrderPlaced".to_string(),
                             file_path: "/repo/src/orders.ts".to_string(),
                             line: 1,
@@ -8920,6 +8934,7 @@ mod tests {
                 StatedBody {
                     root: Some("Member".to_string()),
                     root_home: Some(TypeHomeReport {
+                        kind: None,
                         symbol: "Member".to_string(),
                         file_path: "/repo/src/members.ts".to_string(),
                         line: 1,

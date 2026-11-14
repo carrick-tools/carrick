@@ -401,6 +401,10 @@ pub struct Caller {
 pub struct TypeUse {
     pub symbol: String,
     pub line: u32,
+    /// What the declaration is, where it is not a type (carrick#2148 H3): a
+    /// schema `const` is named as a schema, never as a type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::cloud_storage::TypeHomeKind>,
     pub operations: Vec<TypeOperation>,
 }
 
@@ -468,11 +472,24 @@ impl Uses {
                 } else {
                     "call(s)"
                 };
+                // A schema const is the contract's home, not a type (#2148 H3).
+                let subject = match used.kind {
+                    Some(crate::cloud_storage::TypeHomeKind::Schema) => format!(
+                        "schema {}{} validates the {}",
+                        used.symbol,
+                        at_line(used.line),
+                        first.direction
+                    ),
+                    None => format!(
+                        "type {}{} is the {} type",
+                        used.symbol,
+                        at_line(used.line),
+                        first.direction
+                    ),
+                };
                 let mut line = format!(
-                    "- type {}{} is the {} type of {} {} at {} {}: {}",
-                    used.symbol,
-                    at_line(used.line),
-                    first.direction,
+                    "- {} of {} {} at {} {}: {}",
+                    subject,
                     first.method,
                     first.path,
                     sites.len(),
@@ -1422,6 +1439,7 @@ mod tests {
             )],
             types: vec![
                 TypeUse {
+                    kind: None,
                     symbol: "OrderSummary".into(),
                     line: 4,
                     operations: vec![operation(
@@ -1433,6 +1451,7 @@ mod tests {
                     )],
                 },
                 TypeUse {
+                    kind: None,
                     symbol: "Widget".into(),
                     line: 3,
                     operations: vec![
@@ -1453,6 +1472,7 @@ mod tests {
                     ],
                 },
                 TypeUse {
+                    kind: None,
                     symbol: "Health".into(),
                     line: 8,
                     operations: vec![operation(
@@ -1489,6 +1509,7 @@ mod tests {
             Uses {
                 functions: Vec::new(),
                 types: vec![TypeUse {
+                    kind: None,
                     symbol: "T".into(),
                     line: 1,
                     operations: vec![operation("call", "s", "/p", ("x.ts", 5), counterparts)],
@@ -1506,6 +1527,36 @@ mod tests {
             line(peers),
             vec![
                 "- type T (line 1) is the response type of GET /p at 1 call(s): x.ts:5. Same contract in: c c.ts:3"
+            ]
+        );
+    }
+
+    /// carrick#2148 H3: a schema `const` a request is validated by is named as
+    /// a schema, never as a type.
+    #[test]
+    fn a_schema_home_is_named_as_the_schema_that_validates() {
+        let mut validated = operation(
+            "route",
+            "web",
+            "/tickets",
+            ("src/tickets.ts", 7),
+            Vec::new(),
+        );
+        validated.direction = "request".into();
+        validated.method = "POST".into();
+        let uses = Uses {
+            functions: Vec::new(),
+            types: vec![TypeUse {
+                kind: Some(crate::cloud_storage::TypeHomeKind::Schema),
+                symbol: "NewTicket".into(),
+                line: 4,
+                operations: vec![validated],
+            }],
+        };
+        assert_eq!(
+            uses.lines("web"),
+            vec![
+                "- schema NewTicket (line 4) validates the request of POST /tickets at 1 route(s): src/tickets.ts:7"
             ]
         );
     }

@@ -295,6 +295,9 @@ pub struct IndexedTypeUse {
     pub symbol: String,
     /// Where the type is declared.
     pub line: u32,
+    /// What the declaration is, where it is not a type (carrick#2148 H3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::cloud_storage::TypeHomeKind>,
     pub operations: Vec<IndexedTypeOperation>,
 }
 

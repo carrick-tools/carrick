@@ -79,7 +79,7 @@ import { callInto, calledFunction, narrowByArguments } from './argument-modes.js
 import { functionAtLine } from './function-line-index.js';
 import { attributedDeclaration, installedPackageOf } from './declaration-attribution.js';
 import { endLineOf, startLineOf } from './line-index.js';
-import { declaredTypeName, homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
+import { declaredTypeName, homeOfSchemaValue, homeOfTypeDeclaration, isTypeSpaceDeclaration } from './type-home.js';
 import {
   callsOf,
   descendantsOf,
@@ -443,6 +443,11 @@ interface DeclaredContract {
    * as `read_spans`.
    */
   reads?: Node[];
+  /**
+   * carrick#2148 H3: where the schema value `text` was read off is declared
+   * (`homeOfSchemaValue`), for a contract that has no `type` to home.
+   */
+  home?: TypeHome;
   /**
    * carrick#2674: the route states it takes no request body, and why. The
    * contract is then the decided `no_request_body` abstain, not `text`.
@@ -10134,22 +10139,21 @@ export class TypeInferrer {
       `Route registration at ${request.file_path}:${request.line_number} declares its ` +
         'response schema; using the declared contract'
     );
-    return this.withReads(
-      this.createInferredType(
-        request,
-        declared.text,
-        true,
-        this.getNodeLocation(registration),
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        declared.type
-      ),
-      declared.reads ?? []
+    const inferred = this.createInferredType(
+      request,
+      declared.text,
+      true,
+      this.getNodeLocation(registration),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      declared.type
     );
+    if (declared.home) inferred.type_home = declared.home;
+    return this.withReads(inferred, declared.reads ?? []);
   }
 
   /**
@@ -11042,6 +11046,7 @@ export class TypeInferrer {
       undefined,
       contract.type
     );
+    if (contract.home) inferred.type_home = contract.home;
     if (contract.provenance && contract.provenance.length > 0) {
       inferred.any_provenance = contract.provenance;
     }
@@ -11414,6 +11419,7 @@ export class TypeInferrer {
       rank: number;
       text: string;
       provenance?: TypeProvenance[];
+      home?: TypeHome;
       at: Node;
       how: string;
       typeNode?: Node;
@@ -11528,10 +11534,13 @@ export class TypeInferrer {
       return null;
     }
     const [first] = decided;
+    // carrick#2148 H3: a home only where every deciding schema is the same one.
+    const homes = new Set(decided.map(({ home }) => (home ? `${home.file_path}:${home.line}` : '')));
     return {
       text: first.text,
       type: first.typeNode?.getType(),
       provenance: first.provenance,
+      ...(first.home && homes.size === 1 ? { home: first.home } : {}),
       at: first.at,
       how: first.how,
       typeNode: first.typeNode,
@@ -11548,12 +11557,19 @@ export class TypeInferrer {
     call: CallExpression,
     index: number,
     reads: { parameters: boolean },
-    found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; at: Node; how: string }>,
+    found: Array<{ rank: number; text: string; provenance?: TypeProvenance[]; home?: TypeHome; at: Node; how: string }>,
     stateNode: (rank: number, typeNode: Node | undefined, at: Node, how: string) => void
   ): void {
     const contract = this.schemaHandedArgument(call, index);
     if (contract) {
-      found.push({ rank: 1, text: contract.text, provenance: contract.provenance, at: call, how: 'a schema it is handed to' });
+      found.push({
+        rank: 1,
+        text: contract.text,
+        provenance: contract.provenance,
+        home: contract.home,
+        at: call,
+        how: 'a schema it is handed to',
+      });
       return;
     }
 
@@ -11892,6 +11908,19 @@ export class TypeInferrer {
    *    `unknown`.
    */
   private schemaContract(
+    value: Node,
+    direction: SchemaDirection
+  ): DeclaredContract | null {
+    const contract = this.schemaContractText(value, direction);
+    if (!contract) return null;
+    const home = homeOfSchemaValue(this.unwrapExpressionNode(value));
+    return home ? { ...contract, home } : contract;
+  }
+
+  /**
+   * `schemaContract`'s text and provenance, read off the schema's types.
+   */
+  private schemaContractText(
     value: Node,
     direction: SchemaDirection
   ): DeclaredContract | null {
