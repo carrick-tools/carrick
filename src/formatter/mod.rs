@@ -323,7 +323,7 @@ fn format_pr_delta(
             )
         };
         output.push_str(&format!(
-            "- Removed `{} {}`{} — ⚠ still used{}\n",
+            "- Removed `{} {}`{} — ⚠ still consumed{}\n",
             code_span(&group.removed.method),
             code_span(&group.removed.path),
             service_suffix(group.removed.service.as_deref()),
@@ -2968,7 +2968,7 @@ mod tests {
 
         assert!(output.contains("**In this PR**"));
         assert!(output.contains(
-            "- Removed `SERVER->CLIENT order:update` (`orders`) — ⚠ still used by `gateway`\n"
+            "- Removed `SERVER->CLIENT order:update` (`orders`) — ⚠ still consumed by `gateway`\n"
         ));
     }
 
