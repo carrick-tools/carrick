@@ -39,6 +39,7 @@ import { notePrintedType } from './printed-names.js';
 import type { WireFormat } from './types.js';
 import type { GraphqlLeaf, GraphqlRoot, GraphqlTypes } from './capture/index.js';
 import {
+  graphqlDeclaresType,
   graphqlFieldLeaf,
   graphqlRootLeaf,
   graphqlScalarSent,
@@ -223,11 +224,11 @@ function memberWalk(wire: WireWalk, name: string): WireWalk {
 /**
  * A value at a GraphQL leaf, printed as the server sends it (carrick#4403),
  * mirroring the probe's `GqlLeafSent`: `null`, `undefined`, `any` and
- * `unknown` stay;
- * a union maps each member; a list maps its elements; a built-in scalar is
- * the type it sends; any other scalar, an enum, and a shape the leaf does not
- * describe print in the JSON form. `undefined` means an object type over an
- * object value: the caller walks its members.
+ * `unknown` stay; a union maps each member; a list maps its elements; a
+ * built-in scalar is the type it sends; any other scalar, an enum, a type
+ * reference the table does not hold, and a shape the leaf does not describe
+ * print in the JSON form. `undefined` means an object type over an object
+ * value: the caller walks its members.
  */
 function graphqlLeafText(
   type: Type,
@@ -261,7 +262,7 @@ function graphqlLeafText(
     return element.isUnion() || element.isIntersection() ? `(${inner})[]` : `${inner}[]`;
   }
   if ('scalar' in leaf) return graphqlScalarSent(leaf.scalar) ?? json();
-  if (!('type' in leaf)) return json();
+  if (!('type' in leaf) || !graphqlDeclaresType(wire.types, leaf.type)) return json();
   if (type.isArray() || isTuple(type)) return json();
   if (type.getCallSignatures().length > 0) return namedText(type);
   return undefined;

@@ -111,6 +111,7 @@ export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, wireFormFor } from './check-probe.js';
 export {
+  graphqlDeclaresType,
   graphqlFieldLeaf,
   graphqlRootLeaf,
   graphqlScalarSent,

@@ -97,6 +97,15 @@ function graphqlFieldsOf(
   return [...names].filter((name) => graphqlFieldLeaf(types, typeName, name) !== undefined);
 }
 
+/**
+ * Whether the table holds `typeName`. A type no schema file of the service
+ * declares (an undeclared custom scalar) is a reference with no entry: a
+ * leaf that names it is read as unknown, in the JSON form.
+ */
+export function graphqlDeclaresType(types: GraphqlTypes, typeName: string): boolean {
+  return Object.prototype.hasOwnProperty.call(types, typeName);
+}
+
 /** The leaf the root field is declared as, or `undefined` when the table has none. */
 export function graphqlRootLeaf(types: GraphqlTypes, root: GraphqlRoot): GraphqlLeaf | undefined {
   return graphqlFieldLeaf(types, root.type, root.field);
@@ -129,6 +138,7 @@ export function graphqlReachableFields(
     const name = pending.pop()!;
     if (seen.has(name)) continue;
     seen.add(name);
+    if (!graphqlDeclaresType(types, name)) continue;
     const fields: Record<string, GraphqlLeaf> = {};
     for (const field of graphqlFieldsOf(types, name).sort()) {
       const fieldLeaf = graphqlFieldLeaf(types, name, field)!;
