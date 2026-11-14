@@ -25,7 +25,7 @@ import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
-import { contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
+import { chainLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
 
 const log = createLogger("carrick-hook");
 
@@ -108,7 +108,7 @@ export async function editFlow(
             .filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())))
             .map((file) => ({ file, ...input.changes?.get(file) })),
           session,
-          { contract: contractLinesEnabled() },
+          { contract: contractLinesEnabled(), chain: chainLinesEnabled() },
         )
       : null;
   const covered = new Set(facts?.callersRead ?? []);

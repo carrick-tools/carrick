@@ -24,7 +24,7 @@ import { gapsOfLines, rangesOf, rangesOfLines, touched } from "./match.ts";
 import type { CallSpan } from "./match.ts";
 import { factsEnabled } from "./enabled.ts";
 import { FACTS_STALE_MS, openFacts } from "./store.ts";
-import type { ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
+import type { ContractGroup, ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
 import { fileMemo, isJsx, SCANNED } from "./files.ts";
 import { commitsOf, indexedCommit, localCheckouts, peersUnchanged } from "./peers.ts";
 import type { PeerContext } from "./peers.ts";
@@ -110,6 +110,12 @@ export type Candidate = {
   file?: string;
   /** Keys claimed with this line when it prints, so another kind does not say the same thing again. */
   alsoClaims?: string[];
+  /**
+   * Keys that, once said, claimed or excluded, make this line a repeat: it is
+   * skipped as a said line is, before its check (a chain line whose route's
+   * contract line another line in this action or session already said).
+   */
+  skipIf?: string[];
 };
 
 /**
@@ -245,6 +251,16 @@ function contractId(row: Pick<ContractRow, "side" | "label" | "file" | "line">):
   return `${row.side}\0${row.label}\0${row.file}\0${row.line}`;
 }
 
+/** A contract row's place with its repo: the same row whichever read of the store returned it. */
+function takenId(row: Pick<ContractRow, "repo" | "side" | "label" | "file" | "line">): string {
+  return `${row.repo}\0${contractId(row)}`;
+}
+
+/** The once-per-session key of a contract row's group `index`. */
+function contractKey(row: Pick<ContractRow, "repo" | "file" | "side" | "label">, index: number): string {
+  return `contract::${row.repo}::${row.file}::${row.side}::${row.label}::${index}`;
+}
+
 /** Contract rows in the order their lines are tried within a tier: by line, then label. */
 function byLineThenLabel(rows: ContractRow[]): ContractRow[] {
   return [...rows].sort((a, b) => (a.line ?? Infinity) - (b.line ?? Infinity) || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
@@ -319,7 +335,8 @@ export function pickLines(
       if (lines.length >= limit) break;
       if (kind === "name" && failed >= MAX_NAME_FAILURES) break;
       if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
-      if (said.has(candidate.key) || candidate.key in claims || options.exclude?.has(candidate.key)) continue;
+      const repeat = (key: string) => said.has(key) || key in claims || options.exclude?.has(key) === true;
+      if (repeat(candidate.key) || candidate.skipIf?.some(repeat)) continue;
       if (!held(kind, candidate)) {
         failed += 1;
         if (proved) proofFailures += 1;
@@ -344,13 +361,18 @@ export function pickLines(
  * operation and its type, tiered by how the edit reaches the operation
  * (tier 1: the op matcher; tier 2: a changed function the operation's code
  * calls; tier 3: the file's other operations, on its first contract line of
- * the session). A `read` edit never gets the contract kind, even with it.
+ * the session). `options.chain` (default false, the caller's switch:
+ * `chainLinesEnabled`; read only with `options.contract`) adds the chain
+ * line between tiers 2 and 3: for a changed function the cloud walked to from
+ * routes' handlers (`k: "chain"`), one line naming the first of its routes
+ * whose line holds here, in the route's lead and its contract row's first
+ * group. A `read` edit never gets the contract or chain kind, even with them.
  */
 export async function factLines(
   root: string,
   edits: readonly FactEdit[],
   session: string | undefined,
-  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean } = {},
+  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean; chain?: boolean } = {},
 ): Promise<FactOutcome> {
   const started = performance.now();
   const now = options.now ?? Date.now();
@@ -364,10 +386,15 @@ export async function factLines(
   const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, answered, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
-  // The contract kind, by tier, joined after the loop: every tier-1 line before any tier 2, then tier 3.
-  const tiers: Candidate[][] = [[], [], []];
+  // The contract kind, by tier, joined after the loop: every tier-1 line
+  // before any tier 2, then the chain lines, then tier 3.
+  const tiers: Candidate[][] = [[], [], [], []];
   const taken = new Set<ContractRow>();
+  // The same rows by repo and place, for the chain lines, which read their contract rows afresh.
+  const takenIds = new Set<string>();
   const rest: Array<{ at: NonNullable<ReturnType<typeof locate>>; rows: ContractRow[] }> = [];
+  // The changed functions of each edited file whose chain rows are looked up after the loop, when every file's tiers 1-2 are known.
+  const chained: Array<{ at: NonNullable<ReturnType<typeof locate>>; names: string[] }> = [];
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
   if (!factsEnabled(options.env)) {
     stale = false;
@@ -414,36 +441,80 @@ export async function factLines(
         return false;
       }
     };
+    // A contract group's words after its lead: the shown places, `more` and
+    // `tail`, and the places on disk the line names. A place on disk must read
+    // as at the index commit (the caller's `holds`); one off disk is said with
+    // the note, and only when the file holds its repo's full commit (else null).
+    const groupWords = (at: { repo: string; top: string }, group: ContractGroup): { words: string; onDisk: Array<{ repo: string; file: string }> } | null => {
+      if (typeof group.lead !== "string" || typeof group.more !== "string" || typeof group.tail !== "string") return null;
+      const shown = group.places.slice(0, group.shown);
+      if (shown.length === 0) return null;
+      const onDisk: Array<{ repo: string; file: string }> = [];
+      const parts: string[] = [];
+      for (const place of shown) {
+        if (checkouts.place(place.repo, at) !== null) {
+          onDisk.push(place);
+          parts.push(place.loc);
+          continue;
+        }
+        const commit = indexedCommit(commits, place.repo);
+        if (commit === null) return null;
+        parts.push(`${place.loc} (another repo, indexed at ${commit.slice(0, 8)}, not checked out here)`);
+      }
+      return { words: `${parts.join(", ")}${group.more}${group.tail}`, onDisk };
+    };
     // The contract candidates of one row: its first two groups, each a line.
-    // A place on disk must read as at the index commit (`holds`); one off disk
-    // is said with the note, and only when the file holds its repo's full commit.
     const contractCandidates = (at: { repo: string; top: string }, row: ContractRow): Candidate[] =>
       row.groups.slice(0, CONTRACT_GROUPS_PRINTED).flatMap((group, index) => {
-        if (typeof group.lead !== "string" || typeof group.more !== "string" || typeof group.tail !== "string") return [];
-        const shown = group.places.slice(0, group.shown);
-        if (shown.length === 0) return [];
-        const onDisk: Array<{ repo: string; file: string }> = [];
-        const parts: string[] = [];
-        for (const place of shown) {
-          if (checkouts.place(place.repo, at) !== null) {
-            onDisk.push(place);
-            parts.push(place.loc);
-            continue;
-          }
-          const commit = indexedCommit(commits, place.repo);
-          if (commit === null) return [];
-          parts.push(`${place.loc} (another repo, indexed at ${commit.slice(0, 8)}, not checked out here)`);
-        }
+        const composed = groupWords(at, group);
+        if (composed === null) return [];
         return [
           {
-            key: `contract::${row.repo}::${row.file}::${row.side}::${row.label}::${index}`,
-            text: `${group.lead}${parts.join(", ")}${group.more}${group.tail}`,
-            named: pathsOf(onDisk),
-            holds: peersHold(at, onDisk),
+            key: contractKey(row, index),
+            text: `${group.lead}${composed.words}`,
+            named: pathsOf(composed.onDisk),
+            holds: peersHold(at, composed.onDisk),
             alsoClaims: [rowKey(row)],
           },
         ];
       });
+    // The chain candidates of the changed functions `names` of the edited
+    // file at `at`: per chain row, one candidate per kept route, all under
+    // the row's one key, so `pickLines` prints the first that holds and the
+    // rest fall silent. A route is skipped when its contract row is gone or
+    // not printable, was taken by tier 1 or 2 in this action, or its group
+    // 0 was said (`skipIf`). The line names the route's hop files and its
+    // registration file (other than the edited file), and its group's places
+    // on disk: each must read as at the index commit.
+    const chainCandidates = (at: { repo: string; rel: string; top: string }, names: readonly string[]): Candidate[] =>
+      names.flatMap((name) =>
+        facts.chains(at.repo, at.rel, name).flatMap((chain) =>
+          chain.routes.flatMap((route) => {
+            const row = facts
+              .contracts(route.repo, route.file)
+              .find((one) => one.side === route.side && one.label === route.label && one.line === route.line && printable(one));
+            if (row === undefined || takenIds.has(takenId(row))) return [];
+            const group = row.groups[0]!;
+            const composed = groupWords(at, group);
+            if (composed === null) return [];
+            const peers = [...new Set([...route.path.map((hop) => hop.file), route.file])]
+              .filter((file) => !(route.repo === at.repo && file === at.rel))
+              .map((file) => ({ repo: route.repo, file }));
+            const others = [...peers, ...composed.onDisk];
+            const groupKey = contractKey(row, 0);
+            return [
+              {
+                key: `chain::${chain.repo}::${chain.file}::${chain.name}`,
+                text: `${route.lead}${composed.words}`,
+                named: pathsOf(others),
+                holds: peersHold(at, others),
+                skipIf: [groupKey],
+                alsoClaims: [groupKey, rowKey(row)],
+              },
+            ];
+          }),
+        ),
+      );
     for (const edit of edits) {
       const at = locate(edit.file, store.repos);
       if (at === null) continue;
@@ -499,6 +570,11 @@ export async function factLines(
       const declared = new Map<string, number>();
       for (const span of scan.spans) declared.set(span.name, (declared.get(span.name) ?? 0) + 1);
       const names = reach.names.filter((name) => declared.get(name) === 1);
+      // The chain kind's lookup, after every file's tiers 1-2 (a Read never says one).
+      if (options.contract === true && options.chain === true && !edit.read && names.length > 0) {
+        const start = new Map(scan.spans.map((span) => [span.name, span.start]));
+        chained.push({ at, names: [...names].sort((a, b) => start.get(a)! - start.get(b)!) });
+      }
       // The op rows this edit reaches: tier 1 of the contract kind.
       const reachedOps: FactRow[] = [];
       const opRan = isolated("op", () => {
@@ -527,6 +603,7 @@ export async function factLines(
           for (const row of one) taken.add(row);
           const two = contractRows.filter((row) => !taken.has(row) && bodyCalls(row, contractRows, names, scan));
           for (const row of two) taken.add(row);
+          for (const row of [...one, ...two]) takenIds.add(takenId(row));
           tiers[0]!.push(...byLineThenLabel(one).flatMap((row) => contractCandidates(at, row)));
           tiers[1]!.push(...byLineThenLabel(two).flatMap((row) => contractCandidates(at, row)));
         } catch (error) {
@@ -560,9 +637,16 @@ export async function factLines(
       }
       isolated("name", () => sameNameLines(facts, at, checkouts, text, scan, edit, isJsx(edit.file), memo));
     }
+    for (const one of chained) {
+      try {
+        tiers[2]!.push(...chainCandidates(one.at, one.names));
+      } catch (error) {
+        log("chain fact lines failed", String(error));
+      }
+    }
     for (const one of rest) {
       try {
-        tiers[2]!.push(...byLineThenLabel(one.rows.filter((row) => !taken.has(row))).flatMap((row) => contractCandidates(one.at, row)));
+        tiers[3]!.push(...byLineThenLabel(one.rows.filter((row) => !taken.has(row))).flatMap((row) => contractCandidates(one.at, row)));
       } catch (error) {
         log("contract fact lines failed", String(error));
       }

@@ -19,6 +19,17 @@ export function contractLinesEnabled(env: NodeJS.ProcessEnv = process.env): bool
 }
 
 /**
+ * The chain line's switch: opt-in, on only when `CARRICK_CHAIN_LINES` is
+ * exactly `"1"` and the contract line is on (a chain line ends in a contract
+ * row's words). Chain rows are stored either way; this decides only whether a
+ * line is printed from them (and, in `fetch.ts`, whether a file without the
+ * `chains` table is replaced).
+ */
+export function chainLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env["CARRICK_CHAIN_LINES"] === "1" && contractLinesEnabled(env);
+}
+
+/**
  * The Read's switch: opt-in, on only when `CARRICK_READ_LINES` is exactly
  * `"1"` and fact lines are on. Off, a Read (and a shell command that reads)
  * takes the binary's `check` answer and never opens the fact file

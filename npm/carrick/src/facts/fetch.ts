@@ -23,7 +23,7 @@ import { hasMarker } from "../root.ts";
 import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { splitRemote } from "../git-remote.ts";
-import { contractLinesEnabled, factsEnabled } from "./enabled.ts";
+import { chainLinesEnabled, contractLinesEnabled, factsEnabled } from "./enabled.ts";
 import { buildFacts, closeQuietly, FACTS_STALE_MS, factsPath, loadSqlite, SCHEMA, touchFetched } from "./store.ts";
 import type { LocalRepo } from "./store.ts";
 
@@ -113,7 +113,10 @@ async function knownFile(root: string, env: NodeJS.ProcessEnv): Promise<{ digest
     if (!digest || !Number.isInteger(writer)) return null;
     // With the contract line on, a file an older package built has no `contracts`
     // table to read from: no known digest, so the cloud sends the whole file.
-    if (contractLinesEnabled(env) && !open.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contracts'").get()) return null;
+    const hasTable = (name: string) => open.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined;
+    if (contractLinesEnabled(env) && !hasTable("contracts")) return null;
+    // Likewise with the chain line on and no `chains` table.
+    if (chainLinesEnabled(env) && !hasTable("chains")) return null;
     // Whether the file carries contract rows follows the file, not the switch.
     return { digest, writer, contract: meta.get("contract") === "1" };
   } catch {
