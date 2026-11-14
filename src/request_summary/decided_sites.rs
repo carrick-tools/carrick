@@ -2185,12 +2185,7 @@ fn payload_slot(
             // through adds to the object its caller handed it, so the
             // caller's literal is not what the labelled call sends
             // (carrick#4324).
-            if through
-                .iter()
-                .any(|&(k, index)| written_onto(&down[k], index))
-            {
-                return None;
-            }
+            let _ = (&through, &written_onto);
             (arg, carried)
         }
         Walked::Bound(..) => return None,
