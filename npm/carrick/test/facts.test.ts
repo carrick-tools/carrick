@@ -1570,6 +1570,11 @@ test("the commas of a type after `as` do not end the entry", () => {
   assert.deepEqual(spansOf("const read = () => load() as Record<string, unknown>\n\nrun('x')\n"), [
     "read: const read = () => load() as Record<string, unknown>",
   ]);
+  // A keyword read as a property (`Box.void`) ends an operand too.
+  assert.deepEqual(spansOf("const pick = (a: A) => a.ok ? a.value as Out<A, B> : Box.void\n\nconst wrap = <E,>(a: E) => a\n"), [
+    "pick: const pick = (a: A) => a.ok ? a.value as Out<A, B> : Box.void",
+    "wrap: const wrap = <E,>(a: E) => a",
+  ]);
 });
 
 test("a value named `async` and a `<T>value` assertion are values", () => {

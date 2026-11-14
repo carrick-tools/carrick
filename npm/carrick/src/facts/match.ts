@@ -685,7 +685,8 @@ function scanTokens(tokens: Token[], match: Map<number, number>, budget: number,
         const prev = t(k - 1)!;
         const prevEnds =
           prev.kind === "str" || prev.kind === "num" || prev.kind === "tpl" || prev.kind === "regex" ||
-          (prev.kind === "id" && !REGEX_AFTER_WORD.has(prev.value)) ||
+          // A keyword after `.` is a property name (`Effect.void`), so an operand.
+          (prev.kind === "id" && (!REGEX_AFTER_WORD.has(prev.value) || punc(k - 2, ".") || punc(k - 2, "?."))) ||
           (prev.kind === "punc" && (prev.value === ")" || prev.value === "]" || prev.value === "}")) ||
           k === typeArgsEnd;
         const startsStatement =
