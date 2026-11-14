@@ -6139,6 +6139,7 @@ async fn analyze_current_repo_incremental(
             let declarations = settled_declarations(
                 first_declarations,
                 &request_inputs,
+                &sibling_inputs,
                 &claims,
                 sidecar,
                 &semantics_root,
@@ -7578,7 +7579,7 @@ async fn fact_files_of(
     let asked = match trace {
         FirstTrace::Untraced => None,
         FirstTrace::Traced { sidecar, from_dir } => {
-            member_declarations(inputs, &answer.exports, sidecar, from_dir)
+            member_declarations(inputs, siblings, &answer.exports, sidecar, from_dir)
         }
     };
     let exports = answer.exports.clone();
@@ -8054,6 +8055,7 @@ fn discovered_edges(
 /// claims are the same ([`settled_declarations`]).
 fn member_declarations(
     inputs: &crate::request_summary::RequestSummaryInputs,
+    siblings: &[&crate::request_summary::RequestSummaryInputs],
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -8061,7 +8063,7 @@ fn member_declarations(
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
     inputs.positions.as_ref()?;
     let started = Instant::now();
-    let ask = declaration_ask(inputs, claims);
+    let ask = declaration_ask(inputs, siblings, claims);
     let mut failed = false;
     let declarations = match sidecar {
         Some(sidecar) if !ask.checks.is_empty() => {
@@ -8133,6 +8135,7 @@ enum FirstTrace<'a> {
 fn settled_declarations(
     first: Option<FirstDeclarations>,
     inputs: &crate::request_summary::RequestSummaryInputs,
+    siblings: &[&crate::request_summary::RequestSummaryInputs],
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -8142,7 +8145,8 @@ fn settled_declarations(
             exports,
             asked: Some(asked),
         }) if asked.whole && exports == claims => Some(asked.declarations),
-        _ => member_declarations(inputs, claims, sidecar, from_dir).map(|asked| asked.declarations),
+        _ => member_declarations(inputs, siblings, claims, sidecar, from_dir)
+            .map(|asked| asked.declarations),
     }
 }
 
@@ -15362,6 +15366,7 @@ async fn analyze_current_repo(
     let declarations = settled_declarations(
         first_declarations,
         &request_inputs,
+        &sibling_inputs,
         &claims,
         sidecar,
         &service_root,
@@ -29977,7 +29982,7 @@ unfollowed_member_calls_total: 0,
         super::DECLARATION_ASKS.with(|asks| asks.set(0));
         let (_, first) = receiver_trace_first(&on, &exports, trace).await;
         let settled =
-            super::settled_declarations(first, &on.inputs, &exports, Some(&sidecar), &on.repo)
+            super::settled_declarations(first, &on.inputs, &[], &exports, Some(&sidecar), &on.repo)
                 .expect("the service has rows");
         assert!(!settled.is_empty(), "the verifier names declarations");
         assert_eq!(asks(), 1, "one ask when the settled claims are the first's");
@@ -29987,6 +29992,7 @@ unfollowed_member_calls_total: 0,
         super::settled_declarations(
             first,
             &on.inputs,
+            &[],
             &exports[..more],
             Some(&sidecar),
             &on.repo,

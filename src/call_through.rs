@@ -2236,6 +2236,7 @@ fn state_leaves<'g>(
         }
         let operation = operation_of(request);
         if occupied.holds(leaf, &operation) {
+            complete_held_leaf(service.data, leaf, request);
             continue;
         }
         // A helper only its own file calls has no leaf call to make it a
@@ -2522,8 +2523,67 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
     let Some(graph) = data.mount_graph.as_mut() else {
         return false;
     };
+    let call = leaf_row(graph, leaf, reached);
+    debug!(
+        "  - {}: states {} {}, the request written at {}",
+        call.file_location, call.method, call.target_url, reached.site
+    );
+    data.calls.push(crate::cloud_storage::call_details(&call));
+    graph.data_calls.push(call);
+    true
+}
+
+/// Where a line `leaf` is written on is already held, complete the site
+/// fold's fact row there for the same operation with what [`state_leaf`]
+/// would have written: the client the call is made through and the request
+/// it reaches (carrick#4445). The fold states such a call through a sibling
+/// as a fact, but reads neither; the leaf row it stands in for carried both.
+/// Any other row holding the line is left as it is, and no row is added.
+fn complete_held_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) {
+    let Some(graph) = data.mount_graph.as_mut() else {
+        return;
+    };
+    let stated = leaf_row(graph, leaf, reached);
+    let Some(held) = graph.data_calls.iter_mut().find(|call| {
+        call.file_location == stated.file_location
+            && call.resolution_source == stated.resolution_source
+            && call.role == stated.role
+            && call.reaches_request.is_none()
+            && call.method.eq_ignore_ascii_case(&stated.method)
+            && call.canonical_path == stated.canonical_path
+            && call.dispatch == stated.dispatch
+    }) else {
+        return;
+    };
+    if held.client.is_empty() {
+        held.client = stated.client;
+    }
+    held.reaches_request = stated.reaches_request;
+    debug!(
+        "  - {}: the fact row {} {} is the call through to {}",
+        held.file_location, held.method, held.canonical_path, reached.site
+    );
+    let twin = crate::cloud_storage::call_details(held);
+    if let Some(call) = data.calls.iter_mut().find(|call| {
+        call.key == twin.key
+            && call.dispatch == twin.dispatch
+            && call.resolution_source == twin.resolution_source
+            && call.file_path == twin.file_path
+            && call.handler_name.as_deref().is_none_or(str::is_empty)
+    }) {
+        call.handler_name = twin.handler_name;
+    }
+}
+
+/// The row `leaf` states for `reached`: the one answer [`state_leaf`] writes
+/// and [`complete_held_leaf`] completes a held row from.
+fn leaf_row(
+    graph: &crate::mount_graph::MountGraph,
+    leaf: &LeafCall,
+    reached: &Reached,
+) -> DataFetchingCall {
     let own_route = serves_own_route(graph, &reached.method, &reached.canonical_path);
-    let call = DataFetchingCall {
+    DataFetchingCall {
         procedure: None,
         method: reached.method.clone(),
         target_url: reached.target_url.clone(),
@@ -2544,14 +2604,7 @@ fn state_leaf(data: &mut CloudRepoData, leaf: &LeafCall, reached: &Reached) -> b
         library_semantics: Vec::new(),
         own_route,
         static_asset: None,
-    };
-    debug!(
-        "  - {}: states {} {}, the request written at {}",
-        call.file_location, call.method, call.target_url, reached.site
-    );
-    data.calls.push(crate::cloud_storage::call_details(&call));
-    graph.data_calls.push(call);
-    true
+    }
 }
 
 /// A deterministic request row, as much of it as a corrected row takes.

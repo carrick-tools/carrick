@@ -56,6 +56,7 @@ pub(crate) fn census_declarations(
     root: &Path,
     service: &Config,
     inputs: &RequestSummaryInputs,
+    siblings: &[&RequestSummaryInputs],
     exports: &[crate::library_claims::ExportClaims],
 ) -> super::discovery::MemberDeclarations {
     let name = service.service_name.as_deref().unwrap_or("(root)");
@@ -66,7 +67,7 @@ pub(crate) fn census_declarations(
     sidecar
         .wait_ready(std::time::Duration::from_secs(900))
         .expect("the sidecar is ready");
-    let ask = super::discovery::declaration_ask(inputs, exports);
+    let ask = super::discovery::declaration_ask(inputs, siblings, exports);
     let verdicts = sidecar
         .verify_library_claims(&service_root, None, &ask.checks)
         .map(|answer| answer.verdicts)
