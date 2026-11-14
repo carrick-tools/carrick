@@ -944,8 +944,9 @@ pub struct MemberDeclarations {
     /// (it failed, or came back short): a call whose `call` row names one
     /// is a call the answer would have decided, saved `unanswered` beside
     /// its own reason ([`Discovery::declarations_unanswered`], carrick#3991).
-    /// Empty when the verifier answered, including answers that verified
-    /// nothing.
+    /// Also the pairs whose op checks the answer left unchecked with none of
+    /// theirs verified (carrick#4473). Empty when the verifier answered and
+    /// left no such pair, including answers that verified nothing.
     unanswered: HashSet<(String, String)>,
 }
 
@@ -4226,6 +4227,13 @@ mod tests {
         assert!(kept[0].also.is_empty());
     }
 
+    /// Whether a row says the trace left its call open: as its reason (a
+    /// `package_unmatched` call with its check open, carrick#4473) or beside
+    /// the walk's own reason (carrick#3991).
+    fn says_unanswered(row: &crate::unread_sites::UnreadSite) -> bool {
+        row.reason == Stop::Unanswered || row.also.contains(&Stop::Unanswered)
+    }
+
     /// The receiver-trace fixture's unread sites, with `declarations` as the
     /// trace's answer.
     fn unread_traced(
@@ -4291,18 +4299,17 @@ mod tests {
         let opened: Vec<_> = unread.iter().filter(|row| !in_read(row)).cloned().collect();
         for row in &opened {
             assert!(
-                row.also.contains(&Stop::Unanswered),
+                says_unanswered(row),
                 "{}:{} {:?} {:?}",
                 row.file,
                 row.line,
                 row.callee,
                 row.reason
             );
-            assert_ne!(row.reason, Stop::Unanswered, "the walk's reason stays");
         }
         let mut also_unread: Vec<String> = unread
             .iter()
-            .filter(|row| in_read(row) && row.also.contains(&Stop::Unanswered))
+            .filter(|row| in_read(row) && says_unanswered(row))
             .map(|row| {
                 format!(
                     "{}:{} {}",
@@ -4369,7 +4376,7 @@ mod tests {
         assert!(!answered.is_empty(), "the verifier answered the fixture");
         for row in unread_traced(&on, &exports, &answered) {
             assert!(
-                !row.also.contains(&Stop::Unanswered),
+                !says_unanswered(&row),
                 "{}:{} {:?}",
                 row.file,
                 row.line,
@@ -4399,11 +4406,101 @@ mod tests {
         for callee in ["new Local().get", "shape.get", "target.get"] {
             assert_eq!(at(&unread, callee), at(&read, callee), "{callee}");
             if let Some(row) = at(&unread, callee) {
-                assert!(!row.also.contains(&Stop::Unanswered), "{callee}");
+                assert!(!says_unanswered(&row), "{callee}");
             }
         }
         let request = at(&unread, "request.get").expect("request.get is an unread site");
-        assert!(request.also.contains(&Stop::Unanswered), "{request:?}");
+        assert!(says_unanswered(&request), "{request:?}");
+    }
+
+    /// carrick#4473: an op check the answer left unchecked (here its time
+    /// limit) decided nothing, so its call says `unanswered` as its reason:
+    /// `package_unmatched` would state a match result the scan never got. A
+    /// call the ask was not for keeps its row.
+    #[test]
+    fn a_check_the_answer_left_unchecked_saves_its_call_unanswered() {
+        let (on, exports, answered, ask) = traced_with_ask();
+        let verdicts: Vec<SemanticsResult> = ask
+            .checks
+            .iter()
+            .map(|check| SemanticsResult {
+                claim_id: check.claim_id.clone(),
+                receiver: check.receiver.clone(),
+                verdict: SemanticsVerdict::Unchecked,
+                reason: Some("budget".to_string()),
+                declarations: Vec::new(),
+            })
+            .collect();
+        let open = MemberDeclarations::of(&ask, &verdicts);
+        let read = unread_traced(&on, &exports, &answered);
+        let unread = unread_traced(&on, &exports, &open);
+        let at = |rows: &[crate::unread_sites::UnreadSite], file: &str, callee: &str| {
+            rows.iter()
+                .filter(|row| row.file.ends_with(file) && row.callee.as_deref() == Some(callee))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for (file, callee) in [
+            ("helpers.ts", "app.get"),
+            ("client.ts", "client.get"),
+            ("routes.ts", "this.app.get"),
+        ] {
+            let rows = at(&unread, file, callee);
+            assert_eq!(rows.len(), 1, "{file} {callee}: {rows:?}");
+            assert_eq!(rows[0].reason, Stop::Unanswered, "{file} {callee}");
+        }
+        for callee in ["new Local().get", "shape.get", "target.get"] {
+            assert_eq!(
+                at(&unread, "negatives.ts", callee),
+                at(&read, "negatives.ts", callee),
+                "{callee}"
+            );
+        }
+    }
+
+    /// carrick#4473 R3: a (package, member) pair one of whose checks
+    /// verified indexed its declarations, so a call outside them is another
+    /// member of that name: `request.get` stays `package_unmatched` when
+    /// only another check of the pair came back unchecked.
+    #[test]
+    fn a_pair_one_check_verified_stays_matched() {
+        let (on, exports, ask, verdicts) =
+            traced_fixture_verdicts("receiver-trace", ".", "web", &[], |_| {})
+                .expect("the receiver-trace fixture walks: a skipped test proves nothing");
+        let pair = |index: usize| {
+            ask.ops[index]
+                .as_ref()
+                .map(|op| (op.package.clone(), op.member.clone()))
+        };
+        let verified = |index: usize| verdicts[index].verdict == SemanticsVerdict::Verified;
+        // A check whose pair has another check that verified.
+        let flip = (0..verdicts.len())
+            .find(|&index| {
+                pair(index).is_some_and(|mine| {
+                    (0..verdicts.len()).any(|other| {
+                        other != index && verified(other) && pair(other) == Some(mine.clone())
+                    })
+                })
+            })
+            .expect("a pair with two op checks, one verified: stop and report, do not invent one");
+        let mut edited = verdicts.clone();
+        edited[flip].verdict = SemanticsVerdict::Unchecked;
+        edited[flip].reason = Some("budget".to_string());
+        edited[flip].declarations.clear();
+        let real = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &verdicts));
+        let mixed = unread_traced(&on, &exports, &MemberDeclarations::of(&ask, &edited));
+        let request = |rows: &[crate::unread_sites::UnreadSite]| {
+            rows.iter()
+                .find(|row| {
+                    row.file.ends_with("negatives.ts")
+                        && row.callee.as_deref() == Some("request.get")
+                })
+                .cloned()
+                .expect("request.get is an unread site")
+        };
+        assert_eq!(request(&mixed).reason, Stop::PackageUnmatched);
+        assert!(!says_unanswered(&request(&mixed)), "{:?}", request(&mixed));
+        assert_eq!(request(&mixed), request(&real));
     }
 
     /// A traced fixture through the whole site pass, with `declarations` as
@@ -4531,10 +4628,7 @@ mod tests {
                 .iter()
                 .filter(|row| (&row.file, row.span_start, row.span_end) == (&at.0, at.1, at.2))
                 .collect();
-            let marked = !here.is_empty()
-                && here.iter().all(|row| {
-                    row.also.contains(&Stop::Unanswered) && row.reason != Stop::Unanswered
-                });
+            let marked = !here.is_empty() && here.iter().all(|row| says_unanswered(row));
             let moves = rows_at(&real_rows, at) != rows_at(&dead_rows, at)
                 || real_sites.get(at) != dead_sites.get(at);
             let name = format!("{}:{}", at.0, line_of(at));
@@ -4551,7 +4645,7 @@ mod tests {
                         dead_sites.get(at)
                     ));
                 }
-            } else if here.iter().any(|row| row.also.contains(&Stop::Unanswered)) {
+            } else if here.iter().any(|row| says_unanswered(row)) {
                 marked_unmoved.push(name);
             }
         }
@@ -7469,6 +7563,27 @@ export function listen(): void {
         Vec<ExportClaims>,
         MemberDeclarations,
     )> {
+        let (on, exports, ask, verdicts) =
+            traced_fixture_verdicts(name, dir, service, files, edit)?;
+        let declarations = MemberDeclarations::of(&ask, &verdicts);
+        Some((on, exports, declarations))
+    }
+
+    /// [`traced_fixture_files`] before the verdicts are indexed: the ask and
+    /// the verifier's verdicts for it, one per check.
+    #[allow(clippy::type_complexity)]
+    fn traced_fixture_verdicts(
+        name: &str,
+        dir: &str,
+        service: &str,
+        files: &[(&str, &str)],
+        edit: impl FnOnce(&mut Vec<ExportClaims>),
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        DeclarationAsk,
+        Vec<SemanticsResult>,
+    )> {
         let on = walked(name, dir, service, files, true)?;
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7491,8 +7606,7 @@ export function listen(): void {
             .expect("the verifier answers")
             .verdicts;
         let verdicts = with_scope_declarations(name, &ask, verdicts);
-        let declarations = MemberDeclarations::of(&ask, &verdicts);
-        Some((on, exports, declarations))
+        Some((on, exports, ask, verdicts))
     }
 
     /// One verified scope verdict's declarations, as a cassette holds them.
