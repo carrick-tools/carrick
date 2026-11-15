@@ -150,8 +150,8 @@ const rows = (text: (rel: string) => string): ContractRow[] => [
   row("POST /lambda", LAMBDA, "{ ok: boolean; count: number }", [{ file: LAMBDA, span: spanOf(text(LAMBDA), "payload", 1) }]),
   // The send is in another file than the route.
   row("GET /shared", ORDERS, "{ label: string }", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
-  // A receiver declared void states no contract (K-a): its check arms (clean passes) and never speaks, so a break of the value it shares with the row above is still one line.
-  row("GET /void", ORDERS, "void", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
+  // A receiver declared void or undefined states no contract (K-a): its check arms (clean passes) and never speaks, so a break of the value it shares with the row above is still one line.
+  row("GET /void", ORDERS, "undefined", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
   // A request-direction row is never placed, whatever it carries.
   { ...row("POST /request-side", ORDERS, "{ a: number }", [{ file: ORDERS, span: spanOf(text(ORDERS), "{ created: true }") }]), direction: "request" } as ContractRow,
   // A writer-7 row (no `values`) and one whose scan read none.

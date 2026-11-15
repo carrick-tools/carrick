@@ -19,6 +19,7 @@
 // engine's site finder, behind `SiteFinder`; nothing here parses a value.
 
 import ts from "typescript";
+import { hunksOf } from "../facts/diff.ts";
 
 /** One value's position: `[start, end)` in UTF-16 code units, never counting a leading BOM. */
 export type Value = { file: string; start: number; end: number };
@@ -96,12 +97,10 @@ export function regionsFromHunks(oldText: string, newText: string, diffU0: strin
   const oldAt = lineStarts(a);
   const newAt = lineStarts(b);
   const out: Region[] = [];
-  for (const h of diffU0.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
-    const oldCount = h[2] === undefined ? 1 : Number(h[2]);
-    const newCount = h[4] === undefined ? 1 : Number(h[4]);
+  for (const { oldStart: oldAt1, oldCount, newStart: newAt1, newCount } of hunksOf(diffU0)) {
     // With nothing on a side, its start is the line BEFORE the change point.
-    const oldFirst = Number(h[1]) - 1 + (oldCount === 0 ? 1 : 0);
-    const newFirst = Number(h[3]) - 1 + (newCount === 0 ? 1 : 0);
+    const oldFirst = oldAt1 - 1 + (oldCount === 0 ? 1 : 0);
+    const newFirst = newAt1 - 1 + (newCount === 0 ? 1 : 0);
     const oldStart = oldAt(oldFirst);
     const oldEnd = oldAt(oldFirst + oldCount);
     const newStart = newAt(newFirst);
@@ -110,6 +109,22 @@ export function regionsFromHunks(oldText: string, newText: string, diffU0: strin
     out.push({ oldStart: oldStart + inner.oldStart, oldEnd: oldStart + inner.oldEnd, newStart: newStart + inner.newStart, newEnd: newStart + inner.newEnd });
   }
   return out;
+}
+
+/**
+ * The text a check appends: the engine's wire declarations and its tolerance
+ * helpers (K-a: a receiver declared void states no contract; an absent body
+ * the receiver admits is dropped), composed into the one type a check's
+ * callback receives. Nothing here restates a rule: it only names the order
+ * the judge applies them in. The literal-widened tolerance reads an export
+ * of a scan's stub, so it cannot apply here.
+ */
+export function checkWire(wire: string[], tolerances: string[]): string[] {
+  return [
+    ...wire,
+    ...tolerances,
+    "type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true ? E : __carrick_Wire<__carrick_AbsentBody<S, E>, E>;",
+  ];
 }
 
 const delta = (r: Region): number => r.newEnd - r.newStart - (r.oldEnd - r.oldStart);
@@ -143,8 +158,8 @@ type Op = { at: number; s: string; side: "pre" | "post"; seq: number; start: num
 const POST = ", (o) => o)";
 
 /**
- * The file with every placeable value wrapped. `wire` is the compiler engine's
- * wire declarations (it holds `__carrick_Wire<S, E>`). `clean` states each
+ * The file with every placeable value wrapped. `wire` is `checkWire`'s text (it holds
+ * `__carrick_Sent<S, E>`). `clean` states each
  * group's type; `twin` states it intersected with a property no value has, so
  * it must fail where the check can see the value at all.
  */
@@ -164,7 +179,7 @@ export function overlay(file: string, text: string, checks: CheckInput[], wire: 
       const k = `${input.n}_${group}`;
       const stated = mode === "twin" ? `(${g.type}) & { readonly __carrick_never: true }` : `(${g.type})`;
       decls.push(`  type O${k} = ${stated};`);
-      decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Wire<V, O${k}>) => O${k}): V;`);
+      decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Sent<V, O${k}>) => O${k}): V;`);
       ops.push({ at: start, s: `__C.send${k}(`, side: "pre", seq, start, end });
       ops.push({ at: end, s: POST, side: "post", seq, start, end });
       seq += 1;

@@ -33,6 +33,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { RunningScan, StatusRepo, StatusResult } from "../contract.ts";
 import { parseStatusResult } from "../contract.ts";
+import { alive } from "../hook/lock.ts";
 import { nativeEnv, resolveNativeBinary } from "../native.ts";
 import { elapsed, parseMarker } from "../scan.ts";
 import type { StepProgress, StepReport } from "./output.ts";
@@ -172,14 +173,7 @@ export function localIndexState(status: StatusResult | null, repos: string[]): L
  */
 function stillScanning(scan: RunningScan): boolean {
   if (scan.status !== "running" || typeof scan.pid !== "number") return false;
-  try {
-    // Signal 0 performs no action; it only reports whether the pid can be
-    // signalled. EPERM is a live process this user does not own.
-    process.kill(scan.pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+  return alive(scan.pid);
 }
 
 /** A path as the filesystem resolves it, for comparing two sides' spelling of one repo. */

@@ -15,7 +15,7 @@ const ALIAS = /'O\d+_\d+'/g;
 /** A quoted inline object type; its inner text has no quote of its own (the compiler quotes literals with double quotes). */
 const INLINE_OBJECT = /'(\{[^']*\})'/g;
 /** What must never reach an agent. */
-const MACHINERY = /__C\b|\breg\d|\bO\d+_\d+\b|__carrick_/;
+const MACHINERY = /__C\b|\bsend\d|\bO\d+_\d+\b|__carrick_/;
 
 export type RenderedHeld = {
   text: string;
