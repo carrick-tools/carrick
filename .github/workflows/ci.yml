@@ -36,13 +36,15 @@ jobs:
   # about 66 s each. Two things cut a binary across shards, both with nextest
   # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
   # library's unit tests (lib-1, lib-2) and `local_mode_test` (n3, n2, n1, n9: four slices, carrick#4565) and `call_through_rows_test` (n6, n4, n5) and
-  # `pr_on_main_test` (pr-1 to pr-4: each of its 100+ tests is a full scan with
+  # `pr_on_main_test` (pr-1, pr-2, lib-2 as `partitioned_b`: each of its 100+ tests is a full scan with
   # the type sidecar, about 94% of the old n9's time). A
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
   # first in its shard; two of its tests claim every slot (.config/nextest.toml).
   # `answers_ahead_test` (scan-2) and `parallel_services_test` (lib-2) left n3,
-  # which they made the slowest shard (carrick#4565).
+  # which they made the slowest shard (carrick#4565). carrick#4565 round 2
+  # (shed): the slowest shards gave whole binaries to the lightest ones;
+  # `previous_release_reads_blob_test` runs on scan-3 with its release fetch.
   # `scan-*` shards stay on `cargo test`. `steps` keeps one `cargo test` per
   # binary, in map order, then carrick-match last: the timing tests (readiness,
   # operation timeout, fresh process) and the signal and panic-hook tests need
@@ -75,6 +77,8 @@ jobs:
             runner: nextest
             partitioned: --lib
             partition: slice:2/2
+            partitioned_b: --test pr_on_main_test
+            partition_b: slice:3/3
             targets: >-
               --test parallel_services_test
           - shard: n1
@@ -106,7 +110,7 @@ jobs:
             partitioned: --test call_through_rows_test
             partition: slice:3/3
             targets: >-
-              --test request_summary_test --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test url_local_branches_test --test composed_strings_test --test incremental_raw_cache_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test ask_in_parts_test --test dispatch_resume_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test new_url_through_wrapper_test --test model_row_runtime_base_test --test url_to_string_choices_test --test url_text_appends_test --test wrapper_sibling_callers_test --test site_places_test --test producer_value_spans_test
+              --test spread_parameter_body_test --test object_key_url_wrapper_test --test url_local_base_test --test composed_strings_test --test incremental_raw_cache_test --test alias_shaped_type_imports_test --test const_asserted_table_types_test --test span_locator_units_test --test dispatch_resume_test --test class_client_construction_test --test wrapper_caller_stops_test --test wrapper_url_through_helper_test --test new_url_through_wrapper_test --test model_row_runtime_base_test --test url_to_string_choices_test --test url_text_appends_test --test wrapper_sibling_callers_test --test site_places_test --test producer_value_spans_test
           - shard: n6
             runner: nextest
             partitioned: --test call_through_rows_test
@@ -130,11 +134,11 @@ jobs:
           - shard: pr-1
             runner: nextest
             partitioned: --test pr_on_main_test
-            partition: slice:1/2
+            partition: slice:1/3
           - shard: pr-2
             runner: nextest
             partitioned: --test pr_on_main_test
-            partition: slice:2/2
+            partition: slice:2/3
           - shard: scan-1
             runner: cargo
             targets: >-
@@ -150,15 +154,15 @@ jobs:
           - shard: scan-3
             runner: cargo
             targets: >-
-              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test --test name_forms_test --test unread_sites_test --test unread_sites_unready_test --test version_segments_test --test trailing_slash_route_test --test decorator_route_array_test --test wrapper_request_line_test
+              --test deterministic_emission_test --test imported_request_member_test --test run_log_isolation_test --test imported_object_member_test --test call_states_its_verb_test --test props_and_hook_options_test --test interrupted_scan_test --test untrusted_tree_test --test manifest_hash_pin_test --test constant_names_test --test name_forms_test --test unread_sites_test --test unread_sites_unready_test --test version_segments_test --test trailing_slash_route_test --test decorator_route_array_test --test wrapper_request_line_test --test ask_in_parts_test --test previous_release_reads_blob_test
           - shard: scan-4
             runner: cargo
             targets: >-
-              --test integration_test --test inline_handler_response_test --test xrepo_harness_test --test sibling_declared_host_test --test env_var_whole_url_test --test exclude_patterns_test --test stated_generic_body_anchor_test --test site_payloads_test --test caller_built_body_test --test llm_cassette_hard_gate_test --test response_init_bag_test --test one_row_per_request_test --test deno_npm_specifier_test --test route_request_object_test --test type_homes_test --test summary_method_from_label_test
+              --test integration_test --test inline_handler_response_test --test xrepo_harness_test --test sibling_declared_host_test --test env_var_whole_url_test --test exclude_patterns_test --test stated_generic_body_anchor_test --test site_payloads_test --test caller_built_body_test --test llm_cassette_hard_gate_test --test response_init_bag_test --test one_row_per_request_test --test deno_npm_specifier_test --test route_request_object_test --test type_homes_test --test summary_method_from_label_test --test url_local_branches_test --test request_summary_test
           - shard: steps
             runner: steps
             targets: >-
-              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test phase_progress_test --test queue_enum_base_class_test --test pubsub_template_hole_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test --test previous_release_reads_blob_test
+              --test capability_sheet_test --test sidecar_readiness_test --test sidecar_operation_timeout_test --test sidecar_fresh_process_test --test shutdown_signal_test --test shutdown_drain_test --test panic_hook_test --test receiver_trace_test --test dispatch_routes_test --test command_object_send_test --test phase_progress_test --test queue_enum_base_class_test --test pubsub_template_hole_test --test receiver_role_split_test --test pr_empty_answer_test --test socket_inherited_listener_test
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -205,7 +209,7 @@ jobs:
       # each; the test runs each binary once per service of a three-service
       # fixture, under a second a run.
       - name: Fetch the floor and latest releases for the blob reader test
-        if: matrix.shard == 'steps'
+        if: matrix.shard == 'steps' || matrix.shard == 'scan-3'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -230,17 +234,20 @@ jobs:
       - name: Build this shard's targets
         env:
           PARTITIONED: ${{ matrix.partitioned }}
+          PARTITIONED_B: ${{ matrix.partitioned_b }}
           TARGETS: ${{ matrix.targets }}
         run: |
           # The variables hold several arguments each; word splitting is the point.
           # shellcheck disable=SC2086
-          cargo test --no-run $PARTITIONED $TARGETS
+          cargo test --no-run $PARTITIONED $PARTITIONED_B $TARGETS
 
       - name: Run this shard's tests
         env:
           RUNNER: ${{ matrix.runner }}
           PARTITIONED: ${{ matrix.partitioned }}
           PARTITION: ${{ matrix.partition }}
+          PARTITIONED_B: ${{ matrix.partitioned_b }}
+          PARTITION_B: ${{ matrix.partition_b }}
           TARGETS: ${{ matrix.targets }}
         run: |
           rc=0
@@ -250,6 +257,9 @@ jobs:
             nextest)
               if [ -n "$PARTITIONED" ]; then
                 cargo nextest run --no-fail-fast $PARTITIONED --partition "$PARTITION" || rc=$?
+              fi
+              if [ -n "$PARTITIONED_B" ]; then
+                cargo nextest run --no-fail-fast $PARTITIONED_B --partition "$PARTITION_B" || rc=$?
               fi
               if [ -n "$TARGETS" ]; then
                 cargo nextest run --no-fail-fast $TARGETS || rc=$?
