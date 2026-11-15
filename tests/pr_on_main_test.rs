@@ -3478,7 +3478,6 @@ async fn seed_trpc_adapter_prefix_moved() {
 
 /// The procedure's output loses a field the client reads.
 #[tokio::test]
-#[ignore = "carrick#937: the client call pairs, but no type verdict is stored for it, so no mismatch is raised"]
 async fn seed_trpc_output_field_removed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-output-field-removed").await;
@@ -4492,15 +4491,9 @@ async fn seed_pubsub_subscriber_field_added() {
 
 /// carrick#3082: a PR that adds a table of `{ method, path }` bookkeeping
 /// records adds no endpoint, so the delta lists none of its paths.
-// The two seeds whose assertion tests above are `#[ignore]`d for an open
-// issue still hold their scanner stage: each runs here, and fails when the run
-// stops at another stage than `known_miss` declares (carrick-cloud#2880).
-
-#[tokio::test]
-async fn stage_trpc_output_field_removed() {
-    let _serial = SERIAL.lock().await;
-    manifest_seed_payload("trpc-output-field-removed").await;
-}
+// The seed whose assertion test above is `#[ignore]`d for an open issue
+// still holds its scanner stage: it runs here, and fails when the run stops
+// at another stage than `known_miss` declares (carrick-cloud#2880).
 
 #[tokio::test]
 async fn stage_socket_field_removal() {
