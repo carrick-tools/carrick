@@ -3708,7 +3708,7 @@ impl<'a> Walker<'a> {
         // with the call's fallback word, and re-wording it is a separate
         // change (T2 of #4486).
         let sibling_hole = match known.as_slice() {
-            [Held::Stop(reason)] if !self.inputs.files.contains_key(invoke.file) => Some(*reason),
+            [Held::Stop(reason)] => Some(*reason),
             _ => None,
         };
         // Why each value reached nothing, where it says: the resolver's
