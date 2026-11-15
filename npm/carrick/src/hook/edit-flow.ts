@@ -109,7 +109,7 @@ export async function editFlow(
   // The held compiler (part 3, D10, T9): one ask per file this session changed
   // in its own checkout, filed as a queue entry (`enqueueHeld`) and handed to
   // the daemon, which files its answer where part 2's late answers land. This
-  // hook waits at most `HELD_WAIT_MS`, for an answer already computed; a slower
+  // hook waits at most the probe's budget (`probeTimeoutMs`), beside the probe and the facts; a slower
   // one is printed by the next hook (`deliverLate`). Off, nothing is asked and
   // nothing below changes.
   const heldFiles = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd()));
@@ -126,11 +126,6 @@ export async function editFlow(
           { contract: contractLinesEnabled(), chain: chainLinesEnabled() },
         )
       : null;
-  const held = heldAsked ? await heldAsked : null;
-  if (input.timing && held && held.state !== "off") {
-    input.timing.heldMs = held.ms;
-    input.timing.heldState = held.state;
-  }
   const covered = new Set(facts?.callersRead ?? []);
   const queueable = channel.channel === "hook" && Boolean(session);
   // The edit just landed, so the index describes the file as it was before
@@ -159,6 +154,13 @@ export async function editFlow(
         )
       : { results: [], failure: null, ms: 0 };
   if (input.timing) input.timing.waitedMs = answers.ms;
+  // Joined after the probe: it ran beside the facts and the probe under the
+  // probe's own budget, so it adds nothing beyond that.
+  const held = heldAsked ? await heldAsked : null;
+  if (input.timing && held && held.state !== "off") {
+    input.timing.heldMs = held.ms;
+    input.timing.heldState = held.state;
+  }
   // Each file's probe answer by its place in `edited`; null for a file queued
   // in place of the probe or one the probe gave no answer for.
   const results: Array<CheckResult | null> = relatives.map(() => null);

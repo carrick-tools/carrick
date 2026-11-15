@@ -6,18 +6,13 @@ import net from "node:net";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
 import { lockHeld, readJson, releaseLock, takeLock, type Lock } from "../hook/lock.ts";
+import { probeTimeoutMs } from "../hook/probe.ts";
 import { scriptBeside, startDetached } from "../hook/refresh.ts";
 import type { HeldAnswer, HeldRequest } from "./daemon.ts";
 import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
 
-/**
- * The longest a hook waits for the daemon (part 3, T9): only for an answer
- * that is already computed. A slower one is filed by the daemon where part 2's
- * late answers land and is printed by the next hook (`hook/late.ts`).
- */
-export const HELD_WAIT_MS = 50;
 
 export type EnsureOptions = {
   env?: NodeJS.ProcessEnv;
@@ -76,7 +71,10 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
   const started = Date.now();
   const env = options.env ?? process.env;
   if (!compilerLinesEnabled(env)) return Promise.resolve(none("off", started));
-  const waitMs = options.waitMs ?? HELD_WAIT_MS;
+  // The same budget as part 2's probe (`probeTimeoutMs`), run beside it: an
+  // answer ready within it prints in this action; a slower one is filed by the
+  // daemon where part 2's late answers land (`hook/late.ts`).
+  const waitMs = options.waitMs ?? probeTimeoutMs();
   const request: HeldRequest = {
     session: options.session,
     files,

@@ -19,7 +19,7 @@ import { factsSaid, sessionsDir } from "../src/hook/reuse.ts";
 import { deliverLate } from "../src/hook/late.ts";
 import { answerHeld, enqueue, enqueueHeld, finishedFor, heldSuperseded, pendingFor } from "../src/hook/rechecks.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
-import { HELD_WAIT_MS } from "../src/held/client.ts";
+import { probeTimeoutMs } from "../src/hook/probe.ts";
 import { heldDir, socketPath } from "../src/held/paths.ts";
 import { HeldDaemon } from "../src/held/daemon.ts";
 import type { HeldAnswer, HeldLine, HeldRequest, ServiceEngine, ServiceInit } from "../src/held/daemon.ts";
@@ -175,8 +175,20 @@ async function until(check: () => boolean, ms = 5000): Promise<void> {
 const answersOnDisk = (ws: Ws, session: string): string[] =>
   fs.readdirSync(sessionsDir(ws.home)).filter((n) => n.startsWith(`${session}.recheck.`) && n.endsWith(".answer.json"));
 
-test("the hook waits for the daemon at most 50 ms", () => {
-  assert.equal(HELD_WAIT_MS, 50);
+test("the hook waits for the daemon under the probe's budget, not a number of its own", async (t) => {
+  const ws = await workspace(t);
+  const daemon = await fakeDaemon(ws, () => [broken()], 3000);
+  t.after(() => daemon.close());
+  const out = await edit(ws, "late0");
+  assert.equal(daemon.requests[0]!["wait_ms"], probeTimeoutMs());
+  assert.ok(out.ms < 3000, `the hook took ${out.ms} ms`);
+});
+
+test("an answer ready within the budget prints in the same action", async (t) => {
+  const ws = await workspace(t);
+  const daemon = await fakeDaemon(ws, () => [broken()], 50);
+  t.after(() => daemon.close());
+  assert.ok(context((await edit(ws, "late0b")).stdout).includes(BREAK));
 });
 
 test("a slow daemon answer is not waited for and is printed by the NEXT hook call, once", async (t) => {
