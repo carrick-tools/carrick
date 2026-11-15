@@ -1,87 +1,192 @@
-// Place, arm and attribute (part 3, T4): pure functions that wrap a route
-// registration in a typed check, decide which diagnostics are the check's own,
-// and gate rows on the current text. Every name here is invented.
+// Place, arm and attribute (part 3, L1): pure functions that wrap each value a
+// producer's reply is sent from in a typed check, map a stored position across
+// an edit, decide which diagnostics are the check's own, and gate checks on the
+// current text. The moved-node lookup is the compiler engine's (a fake here).
+// Every name is invented.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import ts from "typescript";
-import { arm, attribute, findSite, overlay } from "../src/held/place.ts";
-import type { Diag, PlaceRow } from "../src/held/place.ts";
+import { arm, attribute, mapValue, overlay, regionOfEdit, regionsFromHunks, resolveValue } from "../src/held/place.ts";
+import type { Diag, SiteFinder, SiteQuery, Value } from "../src/held/place.ts";
 
 const dir = new URL("./fixtures/held/", import.meta.url);
-const TEXT = fs.readFileSync(new URL("routes.ts", dir), "utf8");
-const ROWS = JSON.parse(fs.readFileSync(new URL("rows.json", dir), "utf8")) as PlaceRow[];
-const row = (id: number): PlaceRow => structuredClone(ROWS[id]!);
-const source = (text: string): ts.SourceFile => ts.createSourceFile("routes.ts", text, ts.ScriptTarget.Latest, true);
+const TEXT = fs.readFileSync(new URL("sends.ts", dir), "utf8");
+// The wire rule is the compiler engine's (S1); this stand-in only has to type.
+const WIRE = ["type __carrick_Wire<S, E> = S;"];
 const diag = (start: number, code: number, message: string): Diag => ({ start, code, message });
 
-test("a row places on the call that starts on its line", () => {
-  const ov = overlay("routes.ts", TEXT, [row(0)], "clean");
-  assert.deepEqual(ov.unplaced, []);
-  assert.equal(ov.checks.length, 1);
-  assert.match(ov.text.slice(ov.checks[0]!.span[0]), /^__C\.reg0_0\(app\.get\("\/orders", listOrders\), \(o\) => o\)/);
-});
+/** The `[start, end)` of the first `needle` in `text`. */
+const span = (text: string, needle: string): Value => {
+  const start = text.indexOf(needle);
+  assert.ok(start >= 0, `${needle} is in the text`);
+  return { file: "sends.ts", start, end: start + needle.length };
+};
+const never: SiteFinder = async (q) => assert.fail(`the site finder must not run: ${JSON.stringify(q)}`);
+const group = (type: string): { type: string } => ({ type });
 
-test("lines moved by three still place through the site-literal fallback", () => {
+test("lines added above shift every value", () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
   const moved = "// a\n// b\n// c\n" + TEXT;
-  const found = findSite(source(moved), row(0));
-  assert.ok("node" in found);
-  const ov = overlay("routes.ts", moved, [row(0)], "clean");
-  assert.equal(ov.checks.length, 1);
+  const region = regionOfEdit(TEXT, moved);
+  assert.deepEqual(region, { oldStart: 0, oldEnd: 0, newStart: 0, newEnd: 15 });
+  const got = mapValue(value, [region]);
+  assert.deepEqual(got, { file: "sends.ts", start: value.start + 15, end: value.end + 15 });
+  assert.equal(moved.slice((got as Value).start, (got as Value).end), "{ id: order.id, total: order.total }");
+});
+
+test("an edit strictly inside the value keeps its bounds and never asks the engine", async () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const edited = TEXT.replace("total: order.total }", "amount: order.total }");
+  const region = regionOfEdit(TEXT, edited);
+  const got = await resolveValue(value, [region], TEXT, edited, never);
+  assert.deepEqual(got, { file: "sends.ts", start: value.start, end: value.end + 1 });
+  assert.equal(edited.slice((got as Value).start, (got as Value).end), "{ id: order.id, amount: order.total }");
+});
+
+test("an edit across a bound asks the engine for the moved node, with both texts", async () => {
+  // The shorthand-expanding rename: the local changes and so does the value's first characters.
+  const value = span(TEXT, "result);\n}\n\nexport function lambdaShape");
+  const old: Value = { ...value, end: value.start + "result".length };
+  const edited = TEXT.replace("const result = load();\n  return c.json(result);", "const found = load();\n  return c.json({ result: found });");
+  const region = regionOfEdit(TEXT, edited);
+  const seen: SiteQuery[] = [];
+  const finder: SiteFinder = async (q) => {
+    seen.push(q);
+    const start = edited.indexOf("{ result: found }");
+    return { start, end: start + "{ result: found }".length };
+  };
+  const got = await resolveValue(old, [region], TEXT, edited, finder);
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0], { file: "sends.ts", oldText: TEXT, newText: edited, start: old.start, end: old.end });
+  assert.equal(edited.slice((got as Value).start, (got as Value).end), "{ result: found }");
+});
+
+test("the engine's reason for a replaced parent comes back unchanged", async () => {
+  const value = span(TEXT, "{ first: 1 }");
+  const edited = TEXT.replace("return res.json({ first: 1 });", "return 1;");
+  const region = regionOfEdit(TEXT, edited);
+  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "value_edited" })), "value_edited");
+  // A shorthand value and a span that is no node are the engine's answers too.
+  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "not_wrappable" })), "not_wrappable");
+  assert.equal(await resolveValue(value, [region], TEXT, edited, async () => ({ reason: "value_not_a_node" })), "value_not_a_node");
+});
+
+test("three -U0 hunks map a value between two hunks exactly", () => {
+  const old = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
+  const lines = old.split("\n");
+  lines.splice(2, 0, "added one", "added two"); // after line 2: +2 lines
+  lines.splice(14, 1); // the old line 13 (index 12 + 2 added) goes: -1 line
+  const edited = lines.join("\n").replace("line 25", "line twenty five"); // a change in place
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "held-place-"));
+  fs.writeFileSync(path.join(tmp, "a.txt"), old);
+  fs.writeFileSync(path.join(tmp, "b.txt"), edited);
+  let diff = "";
+  try {
+    execFileSync("git", ["diff", "--no-index", "--no-ext-diff", "--no-color", "-U0", "a.txt", "b.txt"], { cwd: tmp, encoding: "utf8" });
+  } catch (error) {
+    diff = (error as { stdout: string }).stdout; // exit 1 means the files differ
+  }
+  fs.rmSync(tmp, { recursive: true });
+  assert.equal((diff.match(/^@@ /gm) ?? []).length, 3, diff);
+  const regions = regionsFromHunks(old, edited, diff);
+  assert.equal(regions.length, 3);
+  const value: Value = { file: "x.ts", start: old.indexOf("line 20"), end: old.indexOf("line 20") + "line 20".length };
+  const got = mapValue(value, regions) as Value;
+  assert.equal(edited.slice(got.start, got.end), "line 20");
+  // Each hunk's region is its own change, not the whole of its lines.
+  assert.equal(edited.slice(regions[0]!.newStart, regions[0]!.newEnd), "added one\nadded two\n");
+  assert.equal(old.slice(regions[1]!.oldStart, regions[1]!.oldEnd), "line 13\n");
+  assert.equal(edited.slice(regions[2]!.newStart, regions[2]!.newEnd), "twenty five");
+});
+
+test("a value file with a byte order mark wraps at the right offsets", () => {
+  const bom = "﻿" + TEXT;
+  const value = span(TEXT, "{ id: order.id, total: order.total }"); // positions never count the mark
+  const ov = overlay("sends.ts", bom, [{ n: 0, value, groups: [group("{ id: string; total: number }")] }], WIRE, "clean");
+  assert.ok(ov.text.startsWith("﻿"));
+  assert.match(ov.text.slice(ov.checks[0]!.span[0]), /^__C\.send0_0\(\{ id: order\.id, total: order\.total \}, \(o\) => o\)/);
+});
+
+test("two checks on one value and a check in a check nest into valid syntax", () => {
+  const route = span(TEXT, "res.json({ first: 1 })");
+  const inner = span(TEXT, "{ first: 1 }");
+  const ov = overlay(
+    "sends.ts",
+    TEXT,
+    [
+      { n: 0, value: route, groups: [group("unknown"), group("unknown")] },
+      { n: 1, value: inner, groups: [group("{ first: number }")] },
+    ],
+    WIRE,
+    "clean",
+  );
   assert.deepEqual(ov.unplaced, []);
-});
-
-test("a duplicate site gives site_not_unique", () => {
-  const ov = overlay("routes.ts", TEXT, [row(3)], "clean");
-  assert.equal(ov.checks.length, 0);
-  assert.deepEqual(ov.unplaced, [{ id: 3, reason: "site_not_unique" }]);
-});
-
-test("a site that is not in the file gives no_site_found", () => {
-  const gone = { ...row(0), site: "/nowhere", label: "GET /nowhere" };
-  assert.deepEqual(overlay("routes.ts", TEXT, [gone], "clean").unplaced, [{ id: 0, reason: "no_site_found" }]);
-});
-
-test("the chained call wraps the whole chain, and both rows nest into valid syntax", () => {
-  const ov = overlay("routes.ts", TEXT, [row(1), row(2)], "clean");
-  assert.deepEqual(ov.unplaced, []);
-  const post = ov.checks.find((c) => c.id === 2 && c.group === 0)!;
-  const postText = ov.text.slice(post.span[0], post.span[1]);
-  assert.ok(postText.includes('app.get("/a", readA), (o) => o).post("/b", writeB), (o) => o)'), postText);
-  const get = ov.checks.find((c) => c.id === 1)!;
-  assert.ok(ov.text.slice(get.span[0], get.span[1]).includes('app.get("/a", readA)'));
-  assert.ok(!ov.text.slice(get.span[0], get.span[1]).includes('post("/b"'));
-  const out = ts.transpileModule(ov.text, { reportDiagnostics: true, fileName: "routes.ts" });
+  assert.equal(ov.checks.length, 3);
+  const out = ts.transpileModule(ov.text, { reportDiagnostics: true, fileName: "sends.ts" });
   assert.deepEqual(out.diagnostics ?? [], []);
-  assert.equal(ov.checks.filter((c) => c.id === 2).length, 2, "one check per group");
+  const outer = ov.checks.find((x) => x.k === "0_1")!;
+  assert.ok(ov.text.slice(outer.span[0], outer.span[1]).includes("__C.send1_0("), "the wider value's later group is outermost");
+});
+
+test("the checks type on real TypeScript: the clean one is silent and its twin speaks", () => {
+  const cases: Array<[string, string]> = [
+    ["{ id: order.id, total: order.total }", "{ id: string; total: number }"], // express-style
+    ["result", "{ orders: string[] }"], // hono-style
+    ["JSON.stringify(payload)", "string"], // lambda-style
+  ];
+  for (const [needle, type] of cases) {
+    const value = span(TEXT, needle);
+    const clean = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group(type)] }], WIRE, "clean");
+    const twin = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group(type)] }], WIRE, "twin");
+    const c = clean.checks[0]!;
+    assert.deepEqual(typecheck(clean.text), [], `${needle}: clean`);
+    const bad = typecheck(twin.text);
+    assert.ok(bad.some((d) => d.start >= twin.checks[0]!.span[0] && d.start <= twin.checks[0]!.span[1]), `${needle}: the twin speaks inside its check`);
+    assert.equal(c.k, "0_0");
+  }
+});
+
+test("a send that lacks a member the consumer reads is a line, in the value's own check", () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.ts", TEXT, [{ n: 4, value, groups: [group("{ id: string; total: number; paid: boolean }")] }], WIRE, "clean");
+  const diags = typecheck(ov.text);
+  const own = attribute(ov, diags);
+  assert.equal(own.lines.get("4_0")?.length, 1, JSON.stringify(diags));
+  assert.deepEqual(own.outside, []);
 });
 
 test("the half-written file's syntax error inside the span is not a line", () => {
-  const ov = overlay("routes.ts", TEXT, [row(0)], "clean");
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group("{ id: string; total: number }")] }], WIRE, "clean");
   const c = ov.checks[0]!;
-  const inside = ov.text.indexOf("listOrders", c.span[0]);
-  assert.ok(inside > c.span[0] && inside < c.span[1]);
-  const got = attribute(ov, [diag(inside, 1003, "Identifier expected.")]);
+  const at = ov.text.indexOf("total", c.span[0]);
+  assert.ok(at > c.span[0] && at < c.span[1]);
+  const got = attribute(ov, [diag(at, 1003, "Identifier expected.")]);
   assert.deepEqual(got.lines.get(c.k) ?? [], []);
   assert.equal(got.outside.length, 1);
 });
 
-test("a TS2741 naming the check alias on the appended callback is the row's line", () => {
-  const r = { ...row(0), id: 3 };
-  const ov3 = overlay("routes.ts", TEXT, [r], "clean");
-  const c = ov3.checks[0]!;
+test("a TS2741 naming the check alias on the appended callback is the line, and another alias is not", () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.ts", TEXT, [{ n: 3, value, groups: [group("{ id: string }")] }], WIRE, "clean");
+  const c = ov.checks[0]!;
   assert.equal(c.k, "3_0");
-  const callback = ov3.text.lastIndexOf("(o) => o", c.span[1]);
-  assert.ok(callback > ov3.text.indexOf("listOrders", c.span[0]), "the callback is after the user's call");
-  const d = diag(callback, 2741, "Property 'orders' is missing in type '{ a: number; }' but required in type 'O3_0'.");
-  assert.deepEqual(attribute(ov3, [d]).lines.get("3_0"), [d]);
-  const other = diag(callback, 2741, "Property 'orders' is missing in type 'X' but required in type 'O13_0'.");
-  assert.deepEqual(attribute(ov3, [other]).lines.get("3_0") ?? [], [], "O13_0 is not O3_0");
+  const callback = ov.text.lastIndexOf("(o) => o", c.span[1]);
+  assert.ok(callback > ov.text.indexOf("order.total", c.span[0]), "the callback is after the user's value");
+  const d = diag(callback, 2741, "Property 'id' is missing in type '{ a: number; }' but required in type 'O3_0'.");
+  assert.deepEqual(attribute(ov, [d]).lines.get("3_0"), [d]);
+  const other = diag(callback, 2741, "Property 'id' is missing in type 'X' but required in type 'O13_0'.");
+  assert.deepEqual(attribute(ov, [other]).lines.get("3_0") ?? [], [], "O13_0 is not O3_0");
 });
 
 test("a TS2304 in the declaration span is decl_error, never a line", () => {
-  const ov = overlay("routes.ts", TEXT, [row(0)], "clean");
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group("Missing")] }], WIRE, "clean");
   const c = ov.checks[0]!;
   const d = diag(c.declSpan[0] + 4, 2304, "Cannot find name 'Missing'.");
   const got = attribute(ov, [d]);
@@ -89,21 +194,38 @@ test("a TS2304 in the declaration span is decl_error, never a line", () => {
   assert.deepEqual(got.lines.get(c.k) ?? [], []);
 });
 
-test("rows with no check form are skipped with their reason", () => {
-  assert.deepEqual(overlay("routes.js", TEXT, [row(0)], "clean").unplaced, [{ id: 0, reason: "javascript_file" }]);
-  assert.deepEqual(overlay("routes.ts", TEXT, [{ ...row(0), locator: "call" }], "clean").unplaced, [{ id: 0, reason: "not_registration" }]);
-  assert.deepEqual(overlay("routes.ts", TEXT, [{ ...row(0), label: "GET /orders {action=list}" }], "clean").unplaced, [{ id: 0, reason: "dispatch_case" }]);
+test("a JavaScript value file is skipped with its reason", () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.js", TEXT, [{ n: 7, value, groups: [group("unknown")] }], WIRE, "clean");
+  assert.deepEqual(ov.unplaced, [{ n: 7, reason: "javascript_file" }]);
+  assert.equal(ov.checks.length, 0);
+  assert.equal(ov.text, TEXT + "\n" + "declare namespace __C {\n  type __carrick_Wire<S, E> = S;\n}\n");
 });
 
-test("the gate arms a row only when the clean check is silent and its twin speaks", () => {
-  const ov = overlay("routes.ts", TEXT, [row(0)], "clean");
+test("the gate arms a check only when the clean form is silent and its twin speaks", () => {
+  const value = span(TEXT, "{ id: order.id, total: order.total }");
+  const ov = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group("{ id: string }")] }], WIRE, "clean");
   const c = ov.checks[0]!;
   const at = ov.text.lastIndexOf("(o) => o", c.span[1]);
-  const twinDiag = diag(at, 2741, "Property '__carrick_never' is missing in type '{ orders: string[] }' but required in type '{ readonly __carrick_never: true }'.");
+  const twinDiag = diag(at, 2741, "Property '__carrick_never' is missing in type '{ id: string }' but required in type '{ readonly __carrick_never: true }'.");
   assert.deepEqual(arm(ov, [], [twinDiag]), { armed: ["0_0"], unarmed: [] });
-  assert.deepEqual(arm(ov, [], []).unarmed, [{ k: "0_0", id: 0, group: 0, reason: "twin_passes" }]);
+  assert.deepEqual(arm(ov, [], []).unarmed, [{ k: "0_0", n: 0, group: 0, reason: "twin_passes" }]);
   assert.equal(arm(ov, [diag(at, 2322, "x O0_0")], [twinDiag]).unarmed[0]!.reason, "clean_check_fails:TS2322");
-  assert.equal(arm(ov, [diag(at, 2345, "__carrick_not_a_route_object")], [twinDiag]).unarmed[0]!.reason, "no_hono");
   assert.equal(arm(ov, [diag(c.declSpan[0] + 4, 2304, "Cannot find name 'Q'.")], [twinDiag]).unarmed[0]!.reason, "decl_error");
   assert.deepEqual(arm(ov, [diag(at, 1003, "Identifier expected.")], [twinDiag]).armed, ["0_0"], "a syntax error is not a check failure");
 });
+
+/** Semantic diagnostics of one in-memory file, under the real standard library. */
+function typecheck(text: string): Array<{ start: number; code: number; message: string }> {
+  const options: ts.CompilerOptions = { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, types: [] };
+  const host = ts.createCompilerHost(options);
+  const original = host.getSourceFile.bind(host);
+  host.getSourceFile = (name, ...rest) => (name === "/virtual/sends.ts" ? ts.createSourceFile(name, text, ts.ScriptTarget.ES2022, true) : original(name, ...rest));
+  const program = ts.createProgram(["/virtual/sends.ts"], options, host);
+  const sf = program.getSourceFile("/virtual/sends.ts")!;
+  return program.getSemanticDiagnostics(sf).map((d) => ({
+    start: d.start ?? 0,
+    code: d.code,
+    message: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
+  }));
+}
