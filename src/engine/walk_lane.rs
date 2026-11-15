@@ -120,10 +120,19 @@ impl Walked {
     /// every lookup in which is a hole.
     pub(super) fn index(&self) -> PositionIndex {
         match &self.rows {
-            Some(rows) => crate::position_rows::load_index(rows, &self.scan_root, &self.label),
+            Some(rows) => crate::position_rows::load_index(rows, &self.scan_root, &self.label)
+                .unwrap_or_else(|_| PositionIndex::missing(&self.scan_root)),
             None if self.lost.is_some() => PositionIndex::walk_lost(&self.scan_root),
             None => PositionIndex::missing(&self.scan_root),
         }
+    }
+}
+
+impl Walked {
+    /// Red stub (carrick#4344): reads as `index` does today.
+    #[allow(dead_code)]
+    pub(super) fn read(&mut self) -> PositionIndex {
+        self.index()
     }
 }
 
@@ -620,6 +629,82 @@ mod tests {
         );
     }
 
+    /// A gzip rows file at `path` whose header says version `v`, with no files.
+    fn rows_of_version(path: &Path, v: u32) {
+        let header =
+            format!("{{\"v\":{v},\"typescript\":\"6.0.2\",\"service\":\"client\",\"files\":0}}\n");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, header.as_bytes()).unwrap();
+        std::fs::write(path, gz.finish().unwrap()).unwrap();
+    }
+
+    fn walked_over(rows: &Path) -> Walked {
+        Walked {
+            rows: Some(Destination::kept(rows.to_path_buf())),
+            lands_at: None,
+            service: None,
+            scan_root: PathBuf::from("/repo"),
+            label: "client".to_string(),
+            peak_mb: Some(13),
+            asked: true,
+            lost: None,
+        }
+    }
+
+    /// carrick#4344: a walk that wrote a rows file the scan cannot read is
+    /// lost, as one that wrote none is: its index says `walk_lost`, it keeps
+    /// no rows, and the boundary names it. Its peak is kept, the walk ran.
+    #[test]
+    fn a_walk_whose_rows_cannot_be_read_is_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = Path::new("/repo/src/a.ts");
+        let path = dir.path().join("rows.jsonl.gz");
+
+        rows_of_version(&path, 3);
+        let mut walked = walked_over(&path);
+        let index = walked.read();
+        assert_eq!(
+            index.file_hole(file),
+            Some(crate::request_summary::HoleReason::WalkLost)
+        );
+        assert!(walked.rows.is_none());
+        assert_eq!(
+            walked.rows_lost(),
+            Some(Counted::new(1, vec!["the compiler walk failed".into()]))
+        );
+        assert_eq!(
+            walked.index().file_hole(file),
+            Some(crate::request_summary::HoleReason::WalkLost)
+        );
+        assert_eq!(walked.peak_mb(), Some(13));
+
+        // Control: a readable file with no rows for the file is a hole of
+        // its own kind, and the walk is not lost.
+        rows_of_version(&path, crate::position_rows::FORMAT_VERSION);
+        let mut walked = walked_over(&path);
+        let index = walked.read();
+        assert!(walked.rows.is_some());
+        assert_eq!(walked.rows_lost(), Some(Counted::new(0, vec![])));
+        assert_eq!(
+            index.file_hole(file),
+            Some(crate::request_summary::HoleReason::RowsMissing)
+        );
+    }
+
+    /// carrick#4344: a file that read once at the fill and no longer reads
+    /// gives `walk_lost`, not `rows_missing`.
+    #[test]
+    fn a_rows_file_that_stops_reading_after_the_fill_reads_walk_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.jsonl.gz");
+        rows_of_version(&path, 3);
+        let walked = walked_over(&path);
+        assert_eq!(
+            walked.index().file_hole(Path::new("/repo/src/a.ts")),
+            Some(crate::request_summary::HoleReason::WalkLost)
+        );
+    }
+
     fn node_missing() -> bool {
         std::process::Command::new("node")
             .arg("--version")
@@ -638,7 +723,11 @@ mod tests {
     /// request as `start <service> <heap cap or none> <ms>` in `walks`, does
     /// what `behaviour` says (it may die), then after the service's delay in
     /// `delays` writes the rows file, notes `end <service> <ms>` and answers.
-    fn stand_in(dir: &Path, delays: &str, behaviour: &str) -> PathBuf {
+    ///
+    /// The rows file is a gzip file with a current-version header and no
+    /// files. A service listed in `unreadable` (a JS array) gets a version-3
+    /// header instead, which the scan cannot read (carrick#4344).
+    fn stand_in(dir: &Path, delays: &str, unreadable: &str, behaviour: &str) -> PathBuf {
         let script = dir.join("stand-in.cjs");
         std::fs::write(
             &script,
@@ -651,6 +740,8 @@ const walks = path.join(__dirname, 'walks');
 const flag = process.execArgv.find((arg) => arg.startsWith('--max-old-space-size='));
 const heap = flag ? flag.split('=')[1] : 'none';
 const delays = {delays};
+const unreadable = {unreadable};
+const version = {version};
 const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\n');
 readline.createInterface({{ input: process.stdin, terminal: false }}).on('line', (line) => {{
   const request = JSON.parse(line);
@@ -661,7 +752,9 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
   {behaviour}
   setTimeout(() => {{
     fs.mkdirSync(path.dirname(request.out_path), {{ recursive: true }});
-    fs.writeFileSync(request.out_path, 'rows');
+    const v = unreadable.includes(request.service) ? 3 : version;
+    const header = JSON.stringify({{ v, typescript: 'stand-in', service: request.service, files: 0 }});
+    fs.writeFileSync(request.out_path, require('zlib').gzipSync(header + '\n'));
     fs.appendFileSync(walks, `end ${{request.service}} ${{Date.now()}}\n`);
     write({{
       request_id: request.request_id,
@@ -671,6 +764,8 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
   }}, delays[request.service] ?? 0);
 }});
 "#
+            ,
+                version = crate::position_rows::FORMAT_VERSION,
             ),
         )
         .unwrap();
@@ -809,7 +904,12 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let script = stand_in(dir.path(), r#"{ "orders": 300, "billing": 2000 }"#, "");
+        let script = stand_in(
+            dir.path(),
+            r#"{ "orders": 300, "billing": 2000 }"#,
+            "[]",
+            "",
+        );
         let (repo, services) = repo_of(dir.path(), &["orders", "billing"]);
         let store = tempfile::tempdir().unwrap();
         let (ends, walked) = signals(2);
@@ -858,6 +958,7 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
         let script = stand_in(
             dir.path(),
             r#"{ "orders": 0, "billing": 500 }"#,
+            "[]",
             // V8's own way out, below the run's cap only.
             "if (request.service === 'orders' && heap !== '12288') { \
              fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\\n'); \
@@ -906,6 +1007,7 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
         let script = stand_in(
             dir.path(),
             "{}",
+            "[]",
             "fs.writeSync(2, 'FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\\n'); \
              process.abort();",
         );
@@ -920,5 +1022,47 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
         .expect("the lane ended");
         assert!(slots.get(0).unwrap().rows.is_none());
         assert_eq!(walks(dir.path()).len(), 2, "{:?}", walks(dir.path()));
+    }
+
+    /// carrick#4344: a service whose stand-in rows cannot be read is a lost
+    /// walk in the lane, and the store is cleared of it rather than given
+    /// the bad file; its neighbour keeps its rows and lands them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_rows_file_is_a_lost_walk_and_clears_the_store() {
+        if node_missing() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = stand_in(dir.path(), "{}", r#"["billing"]"#, "");
+        let (repo, services) = repo_of(dir.path(), &["orders", "billing"]);
+        let store = tempfile::tempdir().unwrap();
+        let canonical = super::super::canonical_repo_path(&repo);
+        let name = super::super::get_repository_name(&canonical);
+        let place = into(store.path());
+        let stored = |service: &str| {
+            place(&name, Some(service))
+                .lands_at()
+                .map(Path::to_path_buf)
+                .unwrap()
+        };
+        let billing = stored("billing");
+        std::fs::create_dir_all(billing.parent().unwrap()).unwrap();
+        std::fs::write(&billing, "an earlier walk").unwrap();
+
+        let (ends, _walked) = signals(2);
+        let slots = walk_two_at_a_time(&script, &repo, &services, ends, store.path()).await;
+        let orders = slots.get(0).unwrap();
+        assert!(orders.rows.is_some());
+        assert_eq!(orders.rows_lost(), Some(Counted::new(0, vec![])));
+        let billing_walk = slots.get(1).unwrap();
+        assert!(billing_walk.rows.is_none());
+        assert_eq!(
+            billing_walk.rows_lost(),
+            Some(Counted::new(1, vec!["the compiler walk failed".into()]))
+        );
+
+        slots.land(|_| false);
+        assert!(stored("orders").exists(), "orders' rows landed");
+        assert!(!billing.exists(), "billing's earlier rows were cleared");
     }
 }
