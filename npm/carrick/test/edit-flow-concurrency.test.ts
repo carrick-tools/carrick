@@ -17,7 +17,7 @@ const DELAY_MS = 200;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function outcome(present: boolean): FactOutcome {
-  return { lines: [], used: [], claims: {}, stale: false, callersRead: [], present, answered: [], ms: DELAY_MS };
+  return { lines: [], used: [], claims: {}, stale: false, callersRead: [], present, answered: [], stops: {}, ms: DELAY_MS };
 }
 
 type Case = { subAgent: boolean; factFile: boolean };

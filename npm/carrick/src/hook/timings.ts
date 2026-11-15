@@ -44,6 +44,11 @@ export type TimingRecord = {
   /** Post-edit and post-read: time spent opening the fact file and matching (`facts/lines.ts`), inside `duration_ms`. */
   facts_ms?: number;
   /**
+   * Post-edit, only when non-empty: stop word -> how many fact-line candidates
+   * it dropped, so a silent line has a counted reason (`StopWord`, `facts/lines.ts`; carrick#4052).
+   */
+  facts_stops?: Record<string, number>;
+  /**
    * Post-edit only, and only when true: the probe's uses-count line was
    * printed because no fact file covered the edited file (counts the
    * fallback carrick#3966 retires).
@@ -93,6 +98,8 @@ export type Timing = {
   waitedMs: number;
   /** Time spent on fact lines, when the hook read the fact file. */
   factsMs?: number;
+  /** Stop word -> candidates dropped, from the fact lines; an empty record is not written. */
+  factsStops?: Record<string, number>;
   /** The uses-count line was printed because no fact file covered the file. */
   usesFallback?: boolean;
   /** Whether the compiler engine was ready for the re-scan the answer came from, when it says. */
@@ -243,6 +250,7 @@ export async function timed(
           outcome: failed ? "error" : gaveText(output) ? "printed" : "silent",
         };
         if (timing.factsMs !== undefined) record.facts_ms = timing.factsMs;
+        if (timing.factsStops && Object.keys(timing.factsStops).length > 0) record.facts_stops = timing.factsStops;
         if (timing.usesFallback) record.uses_fallback = true;
         if (timing.engineReady !== undefined) record.engine_ready = timing.engineReady;
         if (timing.heldState !== undefined) {

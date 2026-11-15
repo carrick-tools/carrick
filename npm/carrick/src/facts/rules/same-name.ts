@@ -11,7 +11,7 @@
 // prints. A row in a repo not checked out here is silent (R40.2).
 
 import path from "node:path";
-import type { Candidate } from "../lines.ts";
+import type { Candidate, StopWord } from "../lines.ts";
 import { MAX_FACT_FILE_BYTES } from "../files.ts";
 import type { FileMemo } from "../files.ts";
 import { scanSource } from "../match.ts";
@@ -129,8 +129,8 @@ export function sameNameLines(
       // only importing it, moved within the file, or not scanning cleanly, the
       // line would be wrong or the function may have moved into this file.
       // Checked only for a line about to print.
-      const holds = (): boolean =>
-        memo.scanned(other)?.scan.spans.some((span) => span.name === name && span.nameLine === row.line) ?? false;
+      const holds = (): StopWord | null =>
+        memo.scanned(other)?.scan.spans.some((span) => span.name === name && span.nameLine === row.line) ? null : "peer_changed";
       out.push({ key: `name::${name}`, text: row.text, named: [other], holds });
     }
   }

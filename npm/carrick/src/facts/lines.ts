@@ -27,7 +27,7 @@ import { FACTS_STALE_MS, openFacts } from "./store.ts";
 import type { ContractGroup, ContractRow, FactRow, FactStore, LocalRepo } from "./store.ts";
 import { fileMemo, isJsx, SCANNED } from "./files.ts";
 import { commitsOf, indexedCommit, localCheckouts, peersUnchanged } from "./peers.ts";
-import type { PeerContext } from "./peers.ts";
+import type { PeerContext, PeerStop } from "./peers.ts";
 import { sameNameLines } from "./rules/same-name.ts";
 import { isManifest, packageLines } from "./rules/packages.ts";
 
@@ -64,6 +64,15 @@ export type FactEdit = {
   whole?: boolean;
 };
 
+/**
+ * Why a fact-line candidate was dropped and nothing was said (carrick#4052).
+ * Protocol-blind: every kind of line counts the same words. Peer words are
+ * `PeerStop`; the rest are `no_changed_lines` (the changed lines of a
+ * file are not known), `not_read_cleanly` (the file does not scan cleanly) and
+ * `rule_failed` (a check or lookup threw).
+ */
+export type StopWord = PeerStop | "no_changed_lines" | "not_read_cleanly" | "rule_failed";
+
 export type FactOutcome = {
   lines: string[];
   /** The row keys of `lines`, in order: a second call in the same action passes them as `options.exclude`. */
@@ -94,18 +103,23 @@ export type FactOutcome = {
    * answered and nothing prints, nothing prints (T5, P7).
    */
   answered: string[];
+  /**
+   * Stop word -> how many candidates it dropped in this call, once per kind
+   * and row, never once per peer file. Written to the timing row as `facts_stops`.
+   */
+  stops: Record<string, number>;
 };
 
 /**
  * A line one rule found, before the cap: its once-per-session key and the
  * paths it points at. `holds`, when set, is a costlier check run only for a
- * line about to print within the cap; false drops the line.
+ * line about to print within the cap; null holds, a stop word drops the line.
  */
 export type Candidate = {
   key: string;
   text: string;
   named: string[];
-  holds?: () => boolean;
+  holds?: () => StopWord | null;
   /** An fn line's edited file (as given), for `callersRead`. */
   file?: string;
   /** Keys claimed with this line when it prints, so another kind does not say the same thing again. */
@@ -295,12 +309,12 @@ function bodyCalls(row: ContractRow, fileRows: readonly ContractRow[], names: re
 }
 
 /** A candidate's check, isolated like the lookups (R36.6): one that throws is a failed check, the line silent. */
-function held(kind: Kind, candidate: Candidate): boolean {
+function held(kind: Kind, candidate: Candidate): StopWord | null {
   try {
-    return candidate.holds ? candidate.holds() : true;
+    return candidate.holds ? candidate.holds() : null;
   } catch (error) {
     log(`${kind} fact check failed`, String(error));
-    return false;
+    return "rule_failed";
   }
 }
 
@@ -314,7 +328,7 @@ function held(kind: Kind, candidate: Candidate): boolean {
  * file. Op and fn share a bound of `MAX_PROOF_FAILURES` failed peer proofs
  * (R36.3): each may run git. Only a failed check counts, never a line
  * skipped as said, excluded or capped. Each printed line is added to `claims`.
- * `options.limit` is never above `MAX_FACT_LINES`; an absent or non-finite
+ * `options.stops`, when given, gets a count per stop word of the candidates dropped. `options.limit` is never above `MAX_FACT_LINES`; an absent or non-finite
  * limit (NaN, Infinity) means `MAX_FACT_LINES`, and 0 or less prints nothing.
  */
 export function pickLines(
@@ -322,12 +336,14 @@ export function pickLines(
   said: ReadonlySet<string>,
   claims: FactOutcome["claims"],
   now: number,
-  options: { limit?: number; exclude?: ReadonlySet<string> } = {},
+  options: { limit?: number; exclude?: ReadonlySet<string>; stops?: Record<string, number> } = {},
 ): { lines: string[]; used: string[] } {
   const limit = Number.isFinite(options.limit) ? Math.min(options.limit!, MAX_FACT_LINES) : MAX_FACT_LINES;
   const lines: string[] = [];
   const used: string[] = [];
   let proofFailures = 0;
+  // A dropped candidate counts once per kind and row, not once per peer file.
+  const counted = new Set<string>();
   for (const kind of KINDS) {
     let failed = 0;
     const proved = kind === "contract" || kind === "op" || kind === "fn";
@@ -337,7 +353,12 @@ export function pickLines(
       if (proved && proofFailures >= MAX_PROOF_FAILURES) break;
       const repeat = (key: string) => said.has(key) || key in claims || options.exclude?.has(key) === true;
       if (repeat(candidate.key) || candidate.skipIf?.some(repeat)) continue;
-      if (!held(kind, candidate)) {
+      const stop = held(kind, candidate);
+      if (stop !== null) {
+        if (options.stops && !counted.has(`${kind}::${candidate.key}`)) {
+          counted.add(`${kind}::${candidate.key}`);
+          options.stops[stop] = (options.stops[stop] ?? 0) + 1;
+        }
         failed += 1;
         if (proved) proofFailures += 1;
         continue;
@@ -383,7 +404,11 @@ export async function factLines(
   let stale = true;
   let present = false;
   const answered: string[] = [];
-  const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, answered, ms: Math.round((performance.now() - started) * 10) / 10 });
+  const stops: Record<string, number> = {};
+  const stopped = (word: StopWord): void => {
+    stops[word] = (stops[word] ?? 0) + 1;
+  };
+  const done = (): FactOutcome => ({ lines, used, claims, stale, callersRead, present, answered, stops, ms: Math.round((performance.now() - started) * 10) / 10 });
   let store: FactStore | null = null;
   const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // The contract kind, by tier, joined after the loop: every tier-1 line
@@ -420,7 +445,7 @@ export async function factLines(
     const git = { failed: false };
     // Where each repo is checked out here, for every kind (R40.2).
     const checkouts = localCheckouts(where);
-    const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): boolean => {
+    const peersHold = (at: { repo: string; top: string }, others: ReadonlyArray<{ repo: string; file: string }>) => (): StopWord | null => {
       const ctx: PeerContext = { at, checkouts, commits, memo, env: options.env, proofs, missing, gitFailed: git.failed };
       const answer = peersUnchanged(others, ctx);
       git.failed = ctx.gitFailed;
@@ -440,6 +465,7 @@ export async function factLines(
         return true;
       } catch (error) {
         log(`${kind} fact lines failed`, String(error));
+        stopped("rule_failed");
         return false;
       }
     };
@@ -537,6 +563,7 @@ export async function factLines(
           contractRows = facts.contracts(at.repo, at.rel).filter(printable);
         } catch (error) {
           log("contract fact lines failed", String(error));
+          stopped("rule_failed");
         }
         const prefix = `contract::${at.repo}::${at.rel}::`;
         const earlier = (key: string) => key.startsWith(prefix);
@@ -546,12 +573,16 @@ export async function factLines(
       const byLine = edit.lines || edit.removed;
       // Changed lines not known (a Write over a file, a shell write, a patch
       // hunk that cannot be placed): nothing is said.
-      if (!byLine && !edit.snippets && !edit.whole && !edit.read) continue;
+      if (!byLine && !edit.snippets && !edit.whole && !edit.read) {
+        stopped("no_changed_lines");
+        continue;
+      }
       // A file over `MAX_FACT_FILE_BYTES` is generated or bundled: never read
       // in a hook's time. One that does not scan cleanly says nothing.
       const read = memo.scanned(edit.file);
       if (read === null) {
         log(`${at.rel} was not read cleanly; no fact lines for it`);
+        stopped("not_read_cleanly");
         continue;
       }
       const { text, scan } = read;
@@ -610,6 +641,7 @@ export async function factLines(
           tiers[1]!.push(...byLineThenLabel(two).flatMap((row) => contractCandidates(at, row)));
         } catch (error) {
           log("contract fact lines failed", String(error));
+          stopped("rule_failed");
         }
       }
       // The functions' callers in other files: only the row in this file.
@@ -634,6 +666,7 @@ export async function factLines(
           if (opRan && fnRan && facts.hasCallers() && (scan.spans.length > 0 || facts.unnamed(at.repo, at.rel).length > 0)) answered.push(edit.file);
         } catch (error) {
           log("read answer check failed", String(error));
+          stopped("rule_failed");
         }
         continue;
       }
@@ -644,6 +677,7 @@ export async function factLines(
         tiers[2]!.push(...chainCandidates(one.at, one.names));
       } catch (error) {
         log("chain fact lines failed", String(error));
+        stopped("rule_failed");
       }
     }
     for (const one of rest) {
@@ -651,9 +685,10 @@ export async function factLines(
         tiers[3]!.push(...byLineThenLabel(one.rows.filter((row) => !taken.has(row))).flatMap((row) => contractCandidates(one.at, row)));
       } catch (error) {
         log("contract fact lines failed", String(error));
+        stopped("rule_failed");
       }
     }
-    const picked = pickLines({ ...found, contract: tiers.flat() }, said, claims, now, { limit: options.limit, exclude: options.exclude });
+    const picked = pickLines({ ...found, contract: tiers.flat() }, said, claims, now, { limit: options.limit, exclude: options.exclude, stops });
     lines.push(...picked.lines);
     used.push(...picked.used);
     // A file's callers are answered only where its fn line printed now or
