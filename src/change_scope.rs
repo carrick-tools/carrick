@@ -2046,7 +2046,12 @@ pub(crate) fn static_prefix(entry: &str) -> PathBuf {
 /// `None` for a path outside it. A path that is not on disk is placed by its
 /// nearest existing ancestor.
 fn top_relative(top: &Path, path: &Path) -> Option<String> {
-    let normalized = crate::workspace_resolver::normalize(path);
+    let mut normalized = crate::workspace_resolver::normalize(path);
+    if normalized.as_os_str().is_empty() {
+        // `.` (the Action's path, a root service) normalises to nothing and
+        // names the working directory, not a path outside the tree.
+        normalized = PathBuf::from(".");
+    }
     let (existing, rest): (PathBuf, PathBuf) = {
         let mut existing = normalized.clone();
         let mut rest = Vec::new();
@@ -2886,6 +2891,55 @@ mod tests {
             Some(Reason::UnresolvedImport),
             "a missing alias target that has appeared"
         );
+    }
+
+    /// carrick#4569: the repository root, spelt as a relative `.` (the run's
+    /// path on the Action) or as a path that walks back to it, is the empty
+    /// relative path, not "outside the tree"; both answerers agree.
+    #[test]
+    fn the_repository_root_is_the_empty_relative_path() {
+        let top = std::env::current_dir().unwrap().canonicalize().unwrap();
+        for root in [".", "./", "src/..", "./src/../."] {
+            assert_eq!(
+                top_relative(&top, Path::new(root)),
+                Some(String::new()),
+                "{root}"
+            );
+            assert_eq!(
+                ClosureReads::default().top_relative(&top, Path::new(root)),
+                Some(String::new()),
+                "{root} through the shared reads"
+            );
+        }
+        assert_eq!(
+            top_relative(&top, Path::new("./src")),
+            Some("src".to_string()),
+            "a named path is unchanged"
+        );
+    }
+
+    /// carrick#4569: a root service reads the whole tree, a nested service
+    /// beside it keeps its own directory out of the root's roots.
+    #[test]
+    fn a_root_service_reads_the_tree_beside_a_nested_service() {
+        let (repo, _) = committed_repo(&[
+            ("package.json", r#"{ "name": "mono", "private": true }"#),
+            ("src/main.ts", "export const main = 1;\n"),
+            ("apps/web/package.json", r#"{ "name": "web" }"#),
+            ("apps/web/src/page.ts", "export const page = 1;\n"),
+        ]);
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let top = crate::git_state::toplevel(&repo_path).unwrap();
+        let mut root: Config = serde_json::from_value(serde_json::json!({
+            "name": "root",
+            "directory": ".",
+        }))
+        .unwrap();
+        root.nested_directories = vec!["apps/web".to_string()];
+        let inputs = service_inputs(&repo_path, &top, &root, &ClosureReads::default());
+        assert_eq!(inputs.roots.len(), 1, "{:?}", inputs.roots);
+        assert_eq!(inputs.roots[0].dir, "");
+        assert_eq!(inputs.roots[0].left_out, ["apps/web"]);
     }
 
     #[test]
