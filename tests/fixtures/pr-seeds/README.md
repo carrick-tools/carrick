@@ -3,8 +3,9 @@
 Four repos and the contracts between them, used by the `seed_*` tests of
 `tests/pr_on_main_test.rs` (carrick#3095). Each seed edits one repo on a branch
 and runs a real PR scan against main's stored index. The tests replay the
-model from hand-written answers in each repo's `__llm__/`, and run with the
-five fact-layer switches the cloud runner sets.
+model from hand-written answers in each repo's `__llm__/`, which the harness
+keeps beside the scanned tree, so a model answer is never part of the PR's diff,
+as on a real PR, and run with the five fact-layer switches the cloud runner sets.
 
 `seeds.json` is the one definition of each seed: its edits, which the tests
 apply with `apply_seed`, and the check a correct Carrick posts for it
