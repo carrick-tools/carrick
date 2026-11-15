@@ -1106,7 +1106,7 @@
           ]
         }
       ],
-      "known_miss": {"stage": "found", "issues": ["carrick#527", "carrick#2448"]},
+      "known_miss": {"stage": "judged", "issues": ["carrick#527", "carrick#2448"]},
       "expect": {
         "title": "risks_introduced",
         "conclusion": "failure",
