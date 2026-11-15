@@ -45,6 +45,7 @@
     "src/q-conditional.ts"
   ],
   "unnamed": [
+    "src/c-default-none.ts",
     "src/c-destructure-written.ts",
     "src/c-coalesce.ts",
     "src/q-coalesce.ts",

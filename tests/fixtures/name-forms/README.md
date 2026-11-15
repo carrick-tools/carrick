@@ -47,6 +47,7 @@ Forms so far:
   (`send({ path = '/x' })`) is `tests/fixtures/version-segments`'s
   (carrick#3608). `c-default-given` passes the argument and
   names its own value; `c-default-spread` spreads before the position and
+  stays unknown, and `c-default-none` omits a position with no default and
   stays unknown.
 
 `rows.expected.json` is the answer key, read by `tests/name_forms_test.rs`:

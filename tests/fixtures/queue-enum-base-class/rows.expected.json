@@ -5,7 +5,7 @@
     "services/sender/src/send.ts:8 outside_service"
   ],
   "runner_possible_calls": [
-    "services/runner/src/run.ts:4 unanswered",
-    "services/runner/src/run.ts:5 unanswered"
+    "services/runner/src/run.ts:4 unread_expression",
+    "services/runner/src/run.ts:5 unread_expression"
   ]
 }
