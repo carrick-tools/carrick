@@ -833,8 +833,10 @@ pub(crate) fn claim_receivers(
 /// `siblings` are the services the walk may enter. A send in a sibling's
 /// function on a call's value is read through its declaration, and a member
 /// only the sibling's rows call is not one the own rows name (carrick#4445),
-/// the way the store ask already merges the siblings' packages (#2618). The
-/// own service's op checks come first and the siblings-only ones follow, so
+/// the way the store ask already merges the siblings' packages (#2618). Each
+/// entry of `exports` asks its maker checks once, under its own spelling
+/// (carrick#4562). The own service's op checks come first and the
+/// siblings-only ones follow, so
 /// the verifier's time limit cuts a sibling's check before an own one.
 pub fn declaration_ask(
     inputs: &RequestSummaryInputs,
@@ -867,11 +869,17 @@ pub fn declaration_ask(
         .collect();
     // The scope checks, asked once every export's op checks are in.
     let mut scope_checks: Vec<(LibraryCheck, AskedScope)> = Vec::new();
-    let mut made: HashSet<(String, String)> = HashSet::new();
+    // Each entry of the store's answer asks its makers once over both
+    // passes. An entry, not its store key: a package the service imports by
+    // two spellings is two entries with one key (a runtime module,
+    // `library_store` `claims`), and the verifier reads an instance's maker
+    // under the check's own spelling (carrick#4562).
+    let mut made: HashSet<usize> = HashSet::new();
     for called in [&own, &sibling_only] {
-        for export in exports
+        for (at, export) in exports
             .iter()
-            .filter(|export| export.role != LibraryRole::None)
+            .enumerate()
+            .filter(|(_, export)| export.role != LibraryRole::None)
         {
             let claims = export.claims_with_scopes_by_id();
             let wanted: Vec<&(String, &LibraryClaim)> = claims
@@ -898,7 +906,7 @@ pub fn declaration_ask(
                 receiver: receiver.to_string(),
                 claim: claim.without_result(),
             };
-            if made.insert((export.package.clone(), export.export.clone())) {
+            if made.insert(at) {
                 for (id, claim) in &claims {
                     if matches!(claim, LibraryClaim::Make { .. }) {
                         ask.checks.push(check(id, "export", claim));
