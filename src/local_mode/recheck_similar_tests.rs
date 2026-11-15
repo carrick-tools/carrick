@@ -15,6 +15,26 @@ const JOIN: &str = "export function joinRelative(root: string, file: string) {\n
     const trimmed = root.endsWith('/') ? root.slice(0, -1) : root;\n  \
     return file.startsWith(trimmed) ? file.slice(trimmed.length + 1) : file;\n}\n";
 
+/// Unrelated functions, so the corpus is not two functions wide: in a corpus
+/// that small every word is common and even a near copy scores little.
+const FILLER: &str = "export function parseColor(hex: string) {\n  \
+    return [hex.slice(1, 3), hex.slice(3, 5), hex.slice(5, 7)].map((part) => parseInt(part, 16));\n}\n\
+    export function debounceTimer(wait: number) {\n  \
+    return setTimeout(() => undefined, wait);\n}\n\
+    export function groupByOwner(rows: Row[]) {\n  \
+    return rows.reduce((acc, row) => ({ ...acc, [row.owner]: row }), {});\n}\n\
+    export function randomToken() {\n  \
+    return Math.random().toString(36).slice(2);\n}\n\
+    export function mergeHeaders(a: Headers, b: Headers) {\n  \
+    return new Headers([...a.entries(), ...b.entries()]);\n}\n";
+
+fn filler() -> HeldFile<'static> {
+    HeldFile {
+        file: "src/filler.ts",
+        ..here(FILLER, &[])
+    }
+}
+
 /// `(caller, callee)` pairs set on the held blob's `calls`.
 type Calls<'a> = &'a [(&'a str, &'a str)];
 
@@ -162,13 +182,13 @@ fn a_near_copy_in_another_repo_comes_back_and_names_its_repo() {
 #[test]
 fn a_near_copy_under_the_lead_floor_is_listed() {
     let held = JOIN.to_string();
-    let renamed = "export function relativePath(dir: string, name: string) {\n  \
-        const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;\n  \
-        const log = console.debug('relative', name);\n  \
+    let renamed = "export function relativePath(root: string, file: string) {\n  \
+        const base = root.endsWith('/') ? root.slice(0, -1) : root;\n  \
+        const log = console.debug('relative', file);\n  \
         const cut = base.length + 1;\n  \
-        return name.startsWith(base) ? name.slice(cut) : name;\n}\n";
-    let rows = only_rows(similar(&[here(&held, &[])], renamed));
-    assert_eq!(names(&rows), ["joinRelative"], "{rows:?}");
+        return file.startsWith(base) ? file.slice(cut) : file;\n}\n";
+    let rows = only_rows(similar(&[here(&held, &[]), filler()], renamed));
+    assert_eq!(names(&rows)[0], "joinRelative", "{rows:?}");
 }
 
 #[test]
@@ -192,12 +212,16 @@ fn a_function_that_calls_the_hit_gets_no_row() {
 /// not two copies.
 #[test]
 fn a_hit_that_calls_the_new_name_gets_no_row() {
-    let held = format!("{JOIN}function relativePath(a: string) {{ return a; }}\n");
+    let held = format!(
+        "{JOIN}function relativePath(root: string, file: string) {{\n  \
+         return file.startsWith(root) ? file.slice(root.length + 1) : file;\n}}\n"
+    );
     let calls: Calls<'_> = &[("joinRelative", "relativePath")];
     let copy = JOIN.replace("joinRelative", "relativePath");
-    let rows = only_rows(similar(&[here(&held, calls)], &copy));
+    let rows = only_rows(similar(&[here(&held, calls), filler()], &copy));
     // The held `relativePath` shares the new one's name; the hit that calls it is gone.
-    assert_eq!(names(&rows), ["relativePath"], "{rows:?}");
+    assert_eq!(names(&rows)[0], "relativePath", "{rows:?}");
+    assert!(!names(&rows).contains(&"joinRelative"), "{rows:?}");
 }
 
 /// Two other files call the hit, and so does a function in its own file, which
@@ -319,4 +343,80 @@ fn a_ranker_read_back_answers_as_built() {
     }
     assert!(some_called, "the fixture has a row another file calls");
     assert_eq!(back.size(), built.size());
+}
+
+// The list is empty when the best row matches too little of what the new
+// function says (`SIMILAR_QUIET_BELOW`). The rows below are synthetic.
+
+/// Three held functions that each share only the word `limit` with the new one.
+const UNRELATED: &str = "export function formatBanner(title: string, limit: number) {\n  \
+    return title.toUpperCase().padEnd(limit, '*');\n}\n\
+    export function openSocket(host: string, limit: number) {\n  \
+    return new WebSocket(`ws://${host}`, { limit });\n}\n\
+    export function sumPrices(items: number[], limit: number) {\n  \
+    return items.reduce((total, price) => total + price, 0) + limit;\n}\n";
+
+/// A new function with a long body that mentions `limit` once.
+const WORDY: &str = "export function reconcileLedgerBalances(ledger: Ledger, limit: number) {\n  \
+    const pending = ledger.entries.filter((entry) => entry.settled === false);\n  \
+    const settled = pending.map((entry) => entry.amount).sort();\n  \
+    return settled.slice(0, limit);\n}\n";
+
+fn best(rows: &[SimilarFunction]) -> f64 {
+    rows.iter().map(|row| row.score).fold(0.0, f64::max)
+}
+
+#[test]
+fn a_list_whose_best_row_is_under_the_floor_is_empty() {
+    let rows = only_rows(similar(&[here(UNRELATED, &[])], WORDY));
+    assert_eq!(rows, [], "{rows:?}");
+}
+
+/// The same corpus with a row that shares most of the new function's words.
+#[test]
+fn one_row_over_the_floor_brings_the_list_back() {
+    let twin = WORDY.replace("reconcileLedgerBalances", "settleLedgerEntries");
+    let held = format!("{UNRELATED}{twin}");
+    let rows = only_rows(similar(&[here(&held, &[])], WORDY));
+    assert!(names(&rows).contains(&"settleLedgerEntries"), "{rows:?}");
+    assert!(
+        best(&rows) >= carrick_match::SIMILAR_QUIET_BELOW,
+        "{rows:?}"
+    );
+}
+
+/// A same-name row sits first whatever its score: the floor reads the highest
+/// score, never row 1's.
+#[test]
+fn a_weak_same_name_row_first_does_not_silence_a_strong_row() {
+    let twin = WORDY.replace("reconcileLedgerBalances", "settleLedgerEntries");
+    let namesake = "export function reconcileLedgerBalances(limit: number) {\n  \
+        return limit;\n}\n";
+    let held = vec![
+        here(&twin, &[]),
+        HeldFile {
+            file: "src/namesake.ts",
+            ..here(namesake, &[])
+        },
+    ];
+    let rows = only_rows(similar(&held, WORDY));
+    assert_eq!(rows[0].name, "reconcileLedgerBalances", "{rows:?}");
+    assert!(
+        rows[0].score < carrick_match::SIMILAR_QUIET_BELOW,
+        "{rows:?}"
+    );
+    assert!(names(&rows).contains(&"settleLedgerEntries"), "{rows:?}");
+}
+
+/// A partial twin: its best score sits a little over the floor and is listed.
+#[test]
+fn a_row_a_little_over_the_floor_is_listed() {
+    let partial = "export function settleEntries(ledger: Ledger, limit: number) {\n  \
+        const pending = ledger.entries.filter((entry) => entry.settled === false);\n  \
+        const settled = pending.map((entry) => entry.amount);\n  \
+        return settled.slice(0, limit);\n}\n";
+    let rows = only_rows(similar(&[here(partial, &[])], WORDY));
+    assert_eq!(names(&rows), ["settleEntries"], "{rows:?}");
+    let score = best(&rows);
+    assert!((0.30..0.45).contains(&score), "{rows:?}");
 }

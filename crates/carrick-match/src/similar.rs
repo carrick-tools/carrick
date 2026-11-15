@@ -20,10 +20,13 @@
 //!
 //! BM25 takes `k1 = 1.2`, `b = 0.75` and the non-negative idf
 //! `ln(1 + (N - df + 0.5) / (df + 0.5))`. The score is divided by the idf mass
-//! of the query's words, so it reads 0 to 1 whatever the query's length.
+//! of the query's words, so it does not grow with the query's length. It is
+//! not capped at 1: a function whose words repeat the query's can score above
+//! it.
 //!
-//! The answer has no score floor: a function sharing any word with the query
-//! is a candidate, and the cut is [`SIMILAR_ROWS`]. Dropped before ranking: the
+//! `rank` has no score floor: a function sharing any word with the query is a
+//! candidate, and the cut is [`SIMILAR_ROWS`]. The caller stays quiet when the
+//! highest score is under [`SIMILAR_QUIET_BELOW`]. Dropped before ranking: the
 //! function's own file, any function the new one calls or that calls it, and
 //! rows nobody can import (callbacks the extractor named, the module-scope
 //! row). The member named like the new one moves to the front when it is
@@ -34,6 +37,15 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Rows one answer holds at most.
 pub const SIMILAR_ROWS: usize = 6;
+
+/// A list whose highest raw score is under this says nothing: the best row
+/// matches under 0.30 of the new function's word weight, so none of them is a
+/// twin worth opening. The value was read off 281 lists of our own sessions and
+/// 98 lists that held the right function (all 98 stay listed); the evidence is
+/// `reuse/quiet/rules-out.txt` in the edit-facts rig. Applied by the caller,
+/// not by [`SimilarIndex::rank`], on the highest score among the rows: `rank`
+/// puts a same-name row first whatever its score, so row 1 can be weak.
+pub const SIMILAR_QUIET_BELOW: f64 = 0.30;
 
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -72,7 +84,7 @@ pub struct SimilarQuery<'a> {
 }
 
 /// One ranked function: its position in the iterator given to
-/// [`SimilarIndex::build`], and its score from 0 to 1.
+/// [`SimilarIndex::build`], and its raw score (not capped at 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimilarRow {
     pub doc: usize,

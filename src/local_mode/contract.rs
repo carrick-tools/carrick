@@ -752,8 +752,9 @@ pub struct NewFunction {
     pub line: u32,
     /// Indexed functions this one may already exist as, best first, at most
     /// [`carrick_match::SIMILAR_ROWS`], read from its name, body tokens and
-    /// signature (`similar.rs`, carrick-cloud#3490). No score floor: it is empty
-    /// only when no indexed function shares a word with it.
+    /// signature (`similar.rs`, carrick-cloud#3490). Empty when no indexed
+    /// function shares a word with it, or when the best row scores under
+    /// [`carrick_match::SIMILAR_QUIET_BELOW`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub similar: Vec<SimilarFunction>,
 }
