@@ -801,9 +801,7 @@ export class Retyper {
 
   /** What the call yields once awaited: the type the reach test compares. */
   private resultOf(call: CallExpression): ts.Type {
-    const checker = this.project.getTypeChecker().compilerObject;
-    const returned = call.getType().compilerType;
-    return checker.getAwaitedType(returned) ?? returned;
+    return awaitedResult(this.project.getTypeChecker().compilerObject, call.compilerNode);
   }
 
   /**
