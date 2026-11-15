@@ -1,0 +1,1 @@
+{ "name": "job-runner", "version": "1.0.0", "private": true, "type": "module", "devDependencies": { "@types/node": "22.0.0" } }

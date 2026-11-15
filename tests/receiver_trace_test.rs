@@ -3703,3 +3703,42 @@ fn a_call_through_a_computed_key_on_a_library_receiver_is_saved_with_its_key_s_r
         ),
     );
 }
+
+/// carrick#4562: one service imports `child_process` and `node:child_process`.
+/// Both `.on` calls on a spawned process reach `ChildProcess.on` through the
+/// member's declaration: each is a possible call and an unread site whose
+/// slot is `kind`, never one whose callee went unread. The answer key is
+/// `tests/fixtures/runtime-module-spellings/README.md`.
+#[test]
+fn a_package_imported_by_two_spellings_reaches_its_label_at_each() {
+    let blobs = scan_fixture("runtime-module-spellings");
+    assert_eq!(blobs.len(), 1, "one service, one blob: {:?}", blobs.keys());
+    let blob: serde_json::Value =
+        serde_json::from_str(blobs.values().next().expect("the runner's blob")).unwrap();
+    for file in ["src/run.ts", "src/watch.ts"] {
+        let lead = blob["possible_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|lead| lead["file_path"] == file && lead["line_number"] == 5)
+            .unwrap_or_else(|| panic!("{file}:5 no lead: {}", blob["possible_calls"]));
+        assert_eq!(lead["kind"], "pubsub", "{lead}");
+        assert_eq!(lead["role"], "consumer", "{lead}");
+        let sites: Vec<&serde_json::Value> = blob["unread_sites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|site| site["file"] == file && site["line"] == 5)
+            .collect();
+        assert!(
+            sites.iter().any(|site| site["slot"] == "kind"
+                && site["labelled_end"]["export"] == "ChildProcess"
+                && site["labelled_end"]["member"] == "on"),
+            "{file}:5 {sites:?}"
+        );
+        assert!(
+            sites.iter().all(|site| site["slot"] != "callee"),
+            "{file}:5 {sites:?}"
+        );
+    }
+}

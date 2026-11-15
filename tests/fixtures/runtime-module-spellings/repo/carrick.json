@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "runner", "directory": ".", "tsconfig": "tsconfig.json" }]
+}
