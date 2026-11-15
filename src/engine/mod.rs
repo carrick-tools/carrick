@@ -32408,7 +32408,7 @@ unfollowed_member_calls_total: 0,
             ..Default::default()
         };
         // No file is on disk: the spans are read as ASCII past SWC's base.
-        let requests = site_infer_requests(&fold, "/repo", &ResultIndex::default());
+        let requests = site_infer_requests(&fold, &[], "/repo", &ResultIndex::default());
         type Through = Option<(String, u32, u32)>;
         let results: Vec<(&str, Through)> = requests
             .iter()

@@ -2983,6 +2983,48 @@ impl<'a> Walk<'a, '_> {
         param.written_onto() || param.handed_beyond(walked)
     }
 
+    /// Whether the deciding call of `down` only makes the function that
+    /// sends (carrick#4319): it calls a maker straight into the labelled call,
+    /// the labelled call is written in a function the maker does not run,
+    /// and every value the maker returns is that very function. Its result
+    /// is that function, so what the send answers is read at the labelled
+    /// call. Fails closed: a longer chain, a value hop, a function nested
+    /// deeper, or a maker that runs the function or hands it on rather than
+    /// only returning it (a wrapper running a local closure) reads false.
+    fn makes_end(&self, down: &[Placed<'a>]) -> bool {
+        use super::resolve::{ValueAt, written_in};
+        let [_, end] = down else {
+            return false;
+        };
+        if !self.value_hops.is_empty() || end.depth != 1 || !end.in_unrun_function() {
+            return false;
+        }
+        let Some((file, maker)) = end
+            .key
+            .and_then(|key| self.resolver.function(end.file, key))
+        else {
+            return false;
+        };
+        let at = (end.call.site.span_start, end.call.site.span_end);
+        // Every value it returns is that function: one that may also return
+        // the function's result (`return dry ? run : run()`) runs it.
+        !maker.returned_values.is_empty()
+            && maker.returned_values.iter().all(|value| {
+                let ValueAt::Function(start) = value else {
+                    return false;
+                };
+                self.resolver
+                    .written_function(file, *start)
+                    .filter(|function| written_in(maker, function))
+                    .is_some_and(|function| {
+                        function
+                            .calls
+                            .iter()
+                            .any(|call| (call.site.span_start, call.site.span_end) == at)
+                    })
+            })
+    }
+
     /// The function the deciding call of `down` runs, where the labelled call
     /// is below it (carrick#4371): the next call's owner, as the request
     /// summaries key it. `None` where the deciding call is the labelled call,
