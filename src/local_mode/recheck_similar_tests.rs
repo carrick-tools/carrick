@@ -420,6 +420,7 @@ fn a_row_a_little_over_the_floor_is_listed() {
     assert_eq!(names(&rows), ["settleEntries"], "{rows:?}");
     let score = best(&rows);
     assert!((0.30..0.45).contains(&score), "{rows:?}");
+}
 
 /// A row says where this machine has its repo: the edited repo's own root, and
 /// `None` for a repo only the hosted index holds.
