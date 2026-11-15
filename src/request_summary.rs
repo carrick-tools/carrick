@@ -11693,6 +11693,45 @@ impl RequestSummaryIndex {
             .collect()
     }
 
+    /// The one row the call at `caller` (its file and span start) states for
+    /// the request at `request_at` as a request its callee leaves open
+    /// ([`Self::stating_callers`], carrick#3961): `None` where it states
+    /// none, or two (a method declared as a set of verbs). Other rows at the
+    /// same call, for the callee's other requests, do not count
+    /// (carrick#4532). The one test the withdrawal of a request line asks of
+    /// each stating call.
+    pub fn row_for(
+        &self,
+        caller: &(PathBuf, u32),
+        request_at: &(PathBuf, u32),
+    ) -> Option<&SummaryRow> {
+        let rows = self.rows.get(&caller.0)?.get(&caller.1)?;
+        let mut stating = rows
+            .iter()
+            .filter(|row| row.request_at == *request_at && row.reaches_request.is_none());
+        let row = stating.next()?;
+        stating.next().is_none().then_some(row)
+    }
+
+    /// Whether the type anchors of a withdrawn request line can go to `row`
+    /// at `caller` (carrick#4532): no other row at that call has its verb.
+    /// A call's rows share one manifest entry per line, verb and side, so
+    /// anchors carried to a row whose verb another row there shares would
+    /// type that other request too. Where they cannot go, the line is still
+    /// withdrawn and its anchors stay unread (logged in
+    /// `carry_request_line_anchors`).
+    pub fn anchors_fit(&self, caller: &(PathBuf, u32), row: &SummaryRow) -> bool {
+        self.rows
+            .get(&caller.0)
+            .and_then(|sites| sites.get(&caller.1))
+            .is_some_and(|rows| {
+                rows.iter()
+                    .filter(|other| other.method == row.method)
+                    .count()
+                    == 1
+            })
+    }
+
     /// Call sites of `file` whose callee provably sends nothing, by span
     /// start.
     pub fn silent(&self, file: &Path) -> Option<&BTreeSet<u32>> {

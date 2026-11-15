@@ -5526,7 +5526,9 @@ fn normalize_held_request_lines(
             stating: line
                 .stating
                 .iter()
-                .map(|(file, start, response)| (normalize(file), *start, *response))
+                .map(|(file, start, response, method)| {
+                    (normalize(file), *start, *response, method.clone())
+                })
                 .collect(),
             fact_calls: line
                 .fact_calls
@@ -5577,15 +5579,17 @@ fn settle_request_lines_stated_at_module_callers(
             let Some(line) = line else {
                 continue;
             };
-            for (caller_file, caller_start, response) in &line.stating {
+            for (caller_file, caller_start, response, method) in &line.stating {
                 if key != *caller_file {
                     continue;
                 }
-                for call in result
-                    .data_calls
-                    .iter_mut()
-                    .filter(|call| call.call_expression_span_start == Some(*caller_start))
-                {
+                // The call's one result row with this verb (carrick#4532):
+                // the stating call lists none whose verb another row there
+                // shares.
+                for call in result.data_calls.iter_mut().filter(|call| {
+                    call.call_expression_span_start == Some(*caller_start)
+                        && call.method.as_deref() == Some(method.as_str())
+                }) {
                     call.request_line = Some(Box::new(RequestLineAnchors {
                         file: line.file.clone(),
                         call: line.model.clone(),
@@ -16525,6 +16529,86 @@ mod tests {
         key.len() <= 64
             && chars.next().is_some_and(|c| c.is_ascii_lowercase())
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    fn row_at(
+        span: u32,
+        source: crate::agents::file_analyzer_agent::ResolutionSource,
+    ) -> crate::agents::file_analyzer_agent::DataCallResult {
+        crate::agents::file_analyzer_agent::DataCallResult {
+            candidate_id: format!("row:{span}"),
+            line_number: 4,
+            target: "/v1/x".to_string(),
+            method: Some("POST".to_string()),
+            call_kind: None,
+            pattern_matched: String::new(),
+            call_expression_span_start: Some(span),
+            call_expression_span_end: None,
+            call_expression_text: None,
+            call_expression_line: Some(4),
+            payload_expression_text: None,
+            payload_expression_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            loopback_default_url: None,
+            base: None,
+            consumers_not_resolved: None,
+            dispatch: None,
+            resolution_source: Some(source),
+            reaches_request: None,
+            body_literals: Default::default(),
+            library_semantics: Vec::new(),
+            at_caller: false,
+            call_body: None,
+            static_asset: None,
+            request_line: None,
+            holds_transport: false,
+        }
+    }
+
+    /// The settle after the fold withdraws every row that read the settled
+    /// line itself: the model's and both base-path sources, through the one
+    /// predicate `reads_its_own_line` (carrick#4531, carrick#4532). A row at
+    /// another span, or one read some other way, stays.
+    #[test]
+    fn the_settle_after_the_fold_withdraws_a_base_path_row_at_a_settled_line() {
+        use crate::agents::file_analyzer_agent::{FileAnalysisResult, ResolutionSource};
+        let mut results = std::collections::HashMap::new();
+        results.insert(
+            "/repo/a.ts".to_string(),
+            FileAnalysisResult {
+                data_calls: vec![
+                    row_at(7, ResolutionSource::Model),
+                    row_at(7, ResolutionSource::EnvBasePath),
+                    row_at(7, ResolutionSource::LiteralBasePath),
+                    row_at(7, ResolutionSource::RequestSummary),
+                    row_at(9, ResolutionSource::EnvBasePath),
+                ],
+                ..Default::default()
+            },
+        );
+        let fold = crate::site_rows::SiteFold {
+            stated_at_fact_callers: vec![("a.ts".to_string(), 7)],
+            ..Default::default()
+        };
+        super::settle_request_lines_stated_at_module_callers(&mut results, &[], &fold, "/repo");
+        let kept: Vec<(u32, ResolutionSource)> = results["/repo/a.ts"]
+            .data_calls
+            .iter()
+            .map(|call| {
+                (
+                    call.call_expression_span_start.unwrap(),
+                    call.resolution_source.unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (7, ResolutionSource::RequestSummary),
+                (9, ResolutionSource::EnvBasePath)
+            ]
+        );
     }
 
     /// The cloud parsers skip a count key outside `^[a-z][a-z0-9_]{0,63}$`,

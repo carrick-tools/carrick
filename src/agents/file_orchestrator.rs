@@ -538,7 +538,7 @@ fn modules_named_by_candidates(file: &PartedFile<'_>) -> Option<Vec<BTreeSet<usi
 /// Per request line held at its module-level calls, by file and span start:
 /// the summary callers stating it ([`HeldRequestLine::stating`],
 /// carrick#4121).
-type HeldStating = HashMap<(String, u32), Vec<(String, u32, bool)>>;
+type HeldStating = HashMap<(String, u32), Vec<(String, u32, bool, String)>>;
 
 /// Complete result of file-centric analysis
 #[derive(Debug)]
@@ -4685,10 +4685,13 @@ impl FileOrchestrator {
         }
 
         // A request line its callers' rows state (carrick#3961) gives up its
-        // model row only where every one of those rows stands as a row, to
-        // carry the type anchors the model row held there, and is the one
-        // row at its call: a call stating two requests has one place per
-        // side and one manifest entry per line, verb and side, so the
+        // model row only where every one of those rows stands as a row, and
+        // each stating call holds one row for this request
+        // ([`RequestSummaryIndex::row_for`]); rows it holds for its callee's
+        // other requests do not count (carrick#4532). The type anchors the
+        // model row held go to a caller's row only where no other row at
+        // that call shares its verb ([`RequestSummaryIndex::anchors_fit`]):
+        // a call has one manifest entry per line, verb and side, so the
         // anchors of one request would type the other.
         let summary_sites: HashSet<(PathBuf, u32)> = analyzed
             .iter()
@@ -4716,9 +4719,12 @@ impl FileOrchestrator {
                             .iter()
                             .all(|(caller_file, caller_start)| {
                                 summary_sites.contains(&(caller_file.clone(), *caller_start))
-                                    && summaries.rows(caller_file).is_some_and(|sites| {
-                                        sites.get(caller_start).is_some_and(|rows| rows.len() == 1)
-                                    })
+                                    && summaries
+                                        .row_for(
+                                            &(caller_file.clone(), *caller_start),
+                                            &(file.clone(), *start),
+                                        )
+                                        .is_some()
                             })
                     })
                     .collect();
@@ -4739,22 +4745,19 @@ impl FileOrchestrator {
                 let mut stating = Vec::new();
                 let mut each_one_row = true;
                 for (caller_file, caller_start) in &callers {
-                    let row = summaries
-                        .rows(caller_file)
-                        .and_then(|sites| sites.get(caller_start))
-                        .and_then(|rows| match rows.as_slice() {
-                            [row] => Some(row),
-                            _ => None,
-                        });
-                    match row {
-                        Some(row)
-                            if summary_sites.contains(&(caller_file.clone(), *caller_start)) =>
-                        {
-                            stating.push((
-                                caller_file.to_string_lossy().into_owned(),
-                                *caller_start,
-                                row.returns_request_value,
-                            ));
+                    let caller = (caller_file.clone(), *caller_start);
+                    match summaries.row_for(&caller, &(file.clone(), start)) {
+                        Some(row) if summary_sites.contains(&caller) => {
+                            // Only a row whose verb is its call's alone takes
+                            // the anchors (carrick#4532).
+                            if summaries.anchors_fit(&caller, row) {
+                                stating.push((
+                                    caller_file.to_string_lossy().into_owned(),
+                                    *caller_start,
+                                    row.returns_request_value,
+                                    row.method.clone(),
+                                ));
+                            }
                         }
                         _ => each_one_row = false,
                     }
@@ -9208,8 +9211,9 @@ impl FileOrchestrator {
     /// request line's file and span start, as
     /// [`SummaryRow::request_at`](crate::request_summary::SummaryRow) is.
     ///
-    /// Only a call holding that one row takes them: the withdrawal asks every
-    /// stating call for one row.
+    /// A call's row takes them only where no other row at that call shares
+    /// its verb ([`RequestSummaryIndex::anchors_fit`], carrick#4532); the
+    /// call's own row is the one with its verb.
     fn carry_request_line_anchors(
         file_results: &mut HashMap<String, FileAnalysisResult>,
         withdrawn: &HashMap<(PathBuf, u32), DataCallResult>,
@@ -9225,17 +9229,23 @@ impl FileOrchestrator {
                 continue;
             };
             for call in &mut result.data_calls {
-                let Some(rows) = call
+                let Some((start, rows)) = call
                     .call_expression_span_start
-                    .and_then(|start| sites.get(&start))
+                    .and_then(|start| sites.get(&start).map(|rows| (start, rows)))
                 else {
                     continue;
                 };
-                // The one row at the call (the withdrawal asks for one).
-                let [row] = rows.as_slice() else {
+                // The call's own row: the one at its span with its verb.
+                let Some(row) = rows
+                    .iter()
+                    .find(|row| call.method.as_deref() == Some(row.method.as_str()))
+                else {
                     continue;
                 };
-                if row.reaches_request.is_some() || !withdrawn.contains_key(&row.request_at) {
+                if !summaries.anchors_fit(&(PathBuf::from(file), start), row)
+                    || row.reaches_request.is_some()
+                    || !withdrawn.contains_key(&row.request_at)
+                {
                     continue;
                 }
                 call.request_line = Some(Box::new(RequestLineAnchors {

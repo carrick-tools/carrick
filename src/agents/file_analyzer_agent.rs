@@ -723,10 +723,14 @@ pub struct HeldRequestLine {
     /// base-path rule's ([`ResolutionSource::reads_its_own_line`]). Its type
     /// anchors move to the stating callers.
     pub model: DataCallResult,
-    /// The calls whose summary rows state the request, by file and span
-    /// start, each with whether its function hands back the request's own
-    /// value ([`RequestLineAnchors::response`]).
-    pub stating: Vec<(String, u32, bool)>,
+    /// The calls whose summary rows state the request and take its type
+    /// anchors, by file and span start, each with whether its function hands
+    /// back the request's own value ([`RequestLineAnchors::response`]) and
+    /// the verb of its row there, which picks the call's one result row that
+    /// takes them (carrick#4532). A stating call whose verb another row at
+    /// it shares is not listed: the line is withdrawn and its anchors stay
+    /// unread there.
+    pub stating: Vec<(String, u32, bool, String)>,
     /// The calls the summaries state no row for, by file and line.
     pub fact_calls: Vec<(String, u32)>,
 }
