@@ -100,13 +100,14 @@ pub async fn fact_files_of_tree(
     let (early, first) = tokio::sync::oneshot::channel();
     let (sender, facts) = tokio::sync::oneshot::channel();
     let implementations = Default::default();
+    let no_siblings = super::siblings::Siblings::default();
     tokio::join!(
         super::settled_library_answer(Some(&ask), early),
         super::fact_files_of(
             Some(&ask),
             first,
             &inputs,
-            &[],
+            &no_siblings,
             &repo,
             &implementations,
             super::FirstTrace::Traced {

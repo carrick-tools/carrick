@@ -4198,7 +4198,6 @@ impl ServiceScan {
         }
         let (early, first_answer) = tokio::sync::oneshot::channel();
         let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
-        let sibling_inputs = siblings.inputs();
         // No type checker is held here: the lane's walk reads no implementations,
         // so a service with a call through an interface member may select other
         // files than its analysis does (carrick#2432).
@@ -4238,7 +4237,7 @@ impl ServiceScan {
                 library_ask.as_deref(),
                 first_answer,
                 &request_inputs,
-                &sibling_inputs,
+                &siblings,
                 Path::new(repo_path),
                 &implementations,
                 FirstTrace::Untraced,
@@ -6171,7 +6170,7 @@ async fn analyze_current_repo_incremental(
                     library_ask.as_deref(),
                     first_answer,
                     &request_inputs,
-                    &sibling_inputs,
+                    &siblings,
                     Path::new(repo_path),
                     &implementations,
                     FirstTrace::Traced {
@@ -6268,7 +6267,7 @@ async fn analyze_current_repo_incremental(
             let declarations = settled_declarations(
                 first_declarations,
                 &request_inputs,
-                &sibling_inputs,
+                &siblings,
                 &claims,
                 sidecar,
                 &semantics_root,
@@ -7714,7 +7713,7 @@ async fn fact_files_of(
     ask: Option<&LibraryAsk>,
     first: tokio::sync::oneshot::Receiver<crate::library_store::FirstAnswer>,
     inputs: &crate::request_summary::RequestSummaryInputs,
-    siblings: &[&crate::request_summary::RequestSummaryInputs],
+    siblings: &siblings::Siblings,
     root: &Path,
     implementations: &crate::request_summary::implementations::Implementations,
     trace: FirstTrace<'_>,
@@ -7739,7 +7738,7 @@ async fn fact_files_of(
         &ask.sites,
         answer,
         inputs,
-        siblings,
+        &siblings.inputs(),
         root,
         implementations,
         asked.as_ref().map(|asked| &asked.declarations),
@@ -8230,9 +8229,17 @@ fn discovered_edges(
 /// The first answer's discovery and the settled one both read it
 /// (carrick#4077), and the settled pass reuses the first one's when its
 /// claims are the same ([`settled_declarations`]).
+///
+/// The own ask runs from `from_dir` and names the siblings' members too
+/// (carrick#4445). A sibling's rows are asked again from the sibling's own
+/// root, by its own ask, when the answers so far leave one of them unread:
+/// the root decides package lookup, so a package installed only under the
+/// sibling, or in another version there, is verified only from there
+/// (carrick#4472). Each answer is read by declaration, and merged
+/// ([`MemberDeclarations::merge`]).
 fn member_declarations(
     inputs: &crate::request_summary::RequestSummaryInputs,
-    siblings: &[&crate::request_summary::RequestSummaryInputs],
+    siblings: &siblings::Siblings,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -8240,31 +8247,58 @@ fn member_declarations(
     use crate::request_summary::discovery::{MemberDeclarations, declaration_ask};
     inputs.positions.as_ref()?;
     let started = Instant::now();
-    let ask = declaration_ask(inputs, siblings, claims);
-    let mut failed = false;
-    let declarations = match sidecar {
-        Some(sidecar) if !ask.checks.is_empty() => {
-            #[cfg(test)]
-            DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
-            let answer = sidecar
-                .verify_library_claims(from_dir, None, &ask.checks)
-                .map(|answer| answer.verdicts);
-            failed = !answer
-                .as_ref()
-                .is_ok_and(|verdicts| verdicts.len() == ask.checks.len());
-            MemberDeclarations::answered(&ask, answer)
-        }
-        _ => MemberDeclarations::of(&ask, &[]),
+    let ask = declaration_ask(inputs, &siblings.inputs(), claims);
+    let mut whole = true;
+    let mut ask_from = |ask: &crate::request_summary::discovery::DeclarationAsk, root: &Path| {
+        let Some(sidecar) = sidecar.filter(|_| !ask.checks.is_empty()) else {
+            return MemberDeclarations::of(ask, &[]);
+        };
+        #[cfg(test)]
+        DECLARATION_ASKS.with(|asks| asks.set(asks.get() + 1));
+        let answer = sidecar
+            .verify_library_claims(root, None, &ask.checks)
+            .map(|answer| answer.verdicts);
+        let failed = !answer
+            .as_ref()
+            .is_ok_and(|verdicts| verdicts.len() == ask.checks.len());
+        let declarations = MemberDeclarations::answered(ask, answer);
+        whole &= !failed && declarations.not_reached == 0;
+        declarations
     };
+    let mut declarations = ask_from(&ask, from_dir);
+    let unread = |declarations: &MemberDeclarations| -> usize {
+        siblings
+            .iter()
+            .map(|sibling| declarations.unread_rows(&sibling.inputs, claims))
+            .sum()
+    };
+    let unread_before = unread(&declarations);
+    let mut sibling_asks = 0usize;
+    if sidecar.is_some() {
+        for sibling in siblings.iter() {
+            if !declarations.leaves_unread(&sibling.inputs, claims) {
+                continue;
+            }
+            let own = declaration_ask(&sibling.inputs, &[], claims);
+            if own.checks.is_empty() {
+                continue;
+            }
+            sibling_asks += 1;
+            declarations = declarations.merge(ask_from(&own, &sibling.root));
+        }
+    }
     debug!(
         checks = declarations.checks,
         not_reached = declarations.not_reached,
         declarations = declarations.len(),
+        sibling_asks,
+        sibling_rows_unread_before = unread_before,
+        sibling_rows_unread_after = unread(&declarations),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "receiver trace: member declarations"
     );
     Some(AskedDeclarations {
-        whole: !failed && declarations.not_reached == 0,
+        whole: whole && declarations.not_reached == 0,
         declarations,
     })
 }
@@ -8312,7 +8346,7 @@ enum FirstTrace<'a> {
 fn settled_declarations(
     first: Option<FirstDeclarations>,
     inputs: &crate::request_summary::RequestSummaryInputs,
-    siblings: &[&crate::request_summary::RequestSummaryInputs],
+    siblings: &siblings::Siblings,
     claims: &[crate::library_claims::ExportClaims],
     sidecar: Option<&TypeSidecar>,
     from_dir: &Path,
@@ -15634,7 +15668,7 @@ async fn analyze_current_repo(
             library_ask.as_deref(),
             first_answer,
             &request_inputs,
-            &sibling_inputs,
+            &siblings,
             Path::new(repo_path),
             &implementations,
             FirstTrace::Traced {
@@ -15722,7 +15756,7 @@ async fn analyze_current_repo(
     let declarations = settled_declarations(
         first_declarations,
         &request_inputs,
-        &sibling_inputs,
+        &siblings,
         &claims,
         sidecar,
         &service_root,
@@ -30652,9 +30686,15 @@ unfollowed_member_calls_total: 0,
         let asks = || super::DECLARATION_ASKS.with(|asks| asks.get());
         super::DECLARATION_ASKS.with(|asks| asks.set(0));
         let (_, first) = receiver_trace_first(&on, &exports, trace).await;
-        let settled =
-            super::settled_declarations(first, &on.inputs, &[], &exports, Some(&sidecar), &on.repo)
-                .expect("the service has rows");
+        let settled = super::settled_declarations(
+            first,
+            &on.inputs,
+            &super::siblings::Siblings::default(),
+            &exports,
+            Some(&sidecar),
+            &on.repo,
+        )
+        .expect("the service has rows");
         assert!(!settled.is_empty(), "the verifier names declarations");
         assert_eq!(asks(), 1, "one ask when the settled claims are the first's");
 
@@ -30663,7 +30703,7 @@ unfollowed_member_calls_total: 0,
         super::settled_declarations(
             first,
             &on.inputs,
-            &[],
+            &super::siblings::Siblings::default(),
             &exports[..more],
             Some(&sidecar),
             &on.repo,
@@ -30727,7 +30767,7 @@ unfollowed_member_calls_total: 0,
             Some(&ask),
             first,
             &on.inputs,
-            &[],
+            &super::siblings::Siblings::default(),
             &on.repo,
             &Default::default(),
             trace,
