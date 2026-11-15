@@ -5565,9 +5565,13 @@ fn settle_request_lines_stated_at_module_callers(
         for (key, result) in file_results.iter_mut() {
             let key = crate::site_rows::relative(Path::new(repo_path), key);
             if key == *file {
+                // The row that read the line itself goes, whichever source
+                // it is (carrick#4531).
                 result.data_calls.retain(|call| {
                     !(call.call_expression_span_start == Some(*span_start)
-                        && call.resolution_source == Some(ResolutionSource::Model))
+                        && call
+                            .resolution_source
+                            .is_some_and(ResolutionSource::reads_its_own_line))
                 });
             }
             let Some(line) = line else {

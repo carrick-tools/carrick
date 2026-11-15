@@ -772,6 +772,10 @@ pub struct ProcessingStats {
     /// Of those, the ones whose type anchors went to their callers' rows
     /// (carrick#3961). Logged only.
     pub request_lines_carried_to_callers: usize,
+    /// Base-path rows dropped at a request line whose callers' rows state
+    /// the request (carrick#4531): the model's row there is then withdrawn
+    /// as any is. Logged only.
+    pub base_path_rows_stated_at_callers: usize,
     /// Candidates in files the model was never asked about — local mode, where
     /// no model runs — that no deterministic row covers. What the paid scan
     /// would classify, counted so a free pass is distinguishable from an empty
@@ -4782,6 +4786,11 @@ impl FileOrchestrator {
                     // what the model adds to it.
                     let mut adjusted = FileAnalysisResult::default();
                     let mut withdrawn: Vec<DataCallResult> = Vec::new();
+                    Self::drop_base_path_rows_stated_at_callers(
+                        &mut pf.resolved,
+                        answered.get(&pf.path_str),
+                        &mut stats,
+                    );
                     let overrules = Self::emit_resolved_rows(
                         &mut adjusted,
                         std::mem::take(&mut pf.resolved),
@@ -4880,6 +4889,11 @@ impl FileOrchestrator {
                     }
 
                     let mut deterministic = FileAnalysisResult::default();
+                    Self::drop_base_path_rows_stated_at_callers(
+                        &mut pf.resolved,
+                        answered.get(&pf.path_str),
+                        &mut stats,
+                    );
                     Self::emit_resolved_rows(
                         &mut deterministic,
                         std::mem::take(&mut pf.resolved),
@@ -5033,6 +5047,10 @@ impl FileOrchestrator {
         debug!(
             "  - Of those, type anchors moved to their callers' rows: {}",
             stats.request_lines_carried_to_callers
+        );
+        debug!(
+            "  - Base-path rows dropped, their callers state the request: {}",
+            stats.base_path_rows_stated_at_callers
         );
 
         // PHASE 5 (carrick#656): state what the member join could not follow.
@@ -9159,6 +9177,29 @@ impl FileOrchestrator {
         }
     }
 
+    /// Drop the base-path rows ([`ResolutionSource::reads_its_own_line`]) at
+    /// the request lines of this file whose callers' rows state the request
+    /// (`answered`, carrick#3961), before they are emitted (carrick#4531).
+    /// Such a row is the line's own reading of a path its callers fill in,
+    /// the request stated once more. With it gone, the model's row at the
+    /// same span joins no twin and is withdrawn as any is
+    /// ([`Self::join_model_rows`]), its type anchors moving to the callers.
+    fn drop_base_path_rows_stated_at_callers(
+        resolved: &mut Vec<Resolved>,
+        answered: Option<&BTreeSet<u32>>,
+        stats: &mut ProcessingStats,
+    ) {
+        let Some(answered) = answered.filter(|starts| !starts.is_empty()) else {
+            return;
+        };
+        let before = resolved.len();
+        resolved.retain(|row| {
+            !(row.source.reads_its_own_line()
+                && row.span.is_some_and(|(start, _)| answered.contains(&start)))
+        });
+        stats.base_path_rows_stated_at_callers += before - resolved.len();
+    }
+
     /// Put the type anchors of each model row withdrawn at a request line
     /// its callers' rows state (carrick#3961) on every one of those rows:
     /// the model row was the only place its request and response types were
@@ -9218,9 +9259,10 @@ impl FileOrchestrator {
     }
 
     /// The request lines held at their module-level calls (carrick#4121),
-    /// each with the model's row it kept: a line with no model-only row at
-    /// the request's span has nothing the fold could withdraw, and is left
-    /// out.
+    /// each with the row it kept that reads the line itself
+    /// ([`ResolutionSource::reads_its_own_line`]: the model's, or a
+    /// base-path rule's, carrick#4531): a line with no such row at the
+    /// request's span has nothing the fold could withdraw, and is left out.
     fn held_request_lines(
         held_open: Vec<(String, u32, crate::request_summary::HeldAtFactCalls)>,
         mut stating: HeldStating,
@@ -9231,7 +9273,9 @@ impl FileOrchestrator {
             let Some(model) = file_results.get(&file).and_then(|result| {
                 result.data_calls.iter().find(|call| {
                     call.call_expression_span_start == Some(span_start)
-                        && call.resolution_source == Some(ResolutionSource::Model)
+                        && call
+                            .resolution_source
+                            .is_some_and(ResolutionSource::reads_its_own_line)
                 })
             }) else {
                 continue;
