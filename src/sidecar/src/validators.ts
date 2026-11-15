@@ -490,6 +490,7 @@ const RetypeItemSchema = RetypeLocatorItemSchema.extend({
   producer_type: z.string().min(1),
   producer_unwidened_type: z.string().min(1).optional(),
   wire: z.boolean(),
+  procedure_path: z.string().min(1).optional(),
 });
 
 export const RetypeCheckRequestSchema = BaseRequestSchema.extend({
