@@ -142,7 +142,7 @@ const rows = (text: (rel: string) => string): ContractRow[] => [
   row("GET /orders", ORDERS, '{ total: number; a: "one"; b: "two" }', [{ file: ORDERS, span: spanOf(text(ORDERS), "{ total, a, b }") }]),
   row("POST /orders", ORDERS, "{ created: boolean }", [{ file: ORDERS, span: spanOf(text(ORDERS), "{ created: true }") }]),
   row("GET /express/orders", EXPRESS, "{ orders: string[]; total: number }", [{ file: EXPRESS, span: spanOf(text(EXPRESS), "{ orders, total }") }]),
-  row("GET /express/order", EXPRESS, "{ id: string; paid: boolean; placedAt: string }", [{ file: EXPRESS, span: spanOf(text(EXPRESS), "{ id, paid, placedAt }") }]),
+  row("GET /express/order", EXPRESS, "{ id: string; settled: boolean; placedAt: string }", [{ file: EXPRESS, span: spanOf(text(EXPRESS), "{ id, settled, placedAt }") }]),
   row("GET /express/pick", EXPRESS, "{ n: number }", [
     { file: EXPRESS, span: spanOf(text(EXPRESS), "{ n: 1 }") },
     { file: EXPRESS, span: spanOf(text(EXPRESS), "{ n: 2 }") },
@@ -222,7 +222,7 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
   await r.ask(EXPRESS);
 
   // (h) a `Date` value against `string` arms (the wire form); (j) breaking each member prints a line without machinery.
-  for (const [from, to] of [["id: string", "id: number"], ["paid: boolean", "paid: string"], ["placedAt: Date", "placedAt: number"]] as const) {
+  for (const [from, to] of [["id: string", "id: number"], ["settled: boolean", "settled: string"], ["placedAt: Date", "placedAt: number"]] as const) {
     const answer = await r.edit(EXPRESS, original[EXPRESS]!.replace(from, to));
     assert.equal(answer.lines.length, 1, `${to}: ${JSON.stringify(answer.lines)}`);
     assert.equal(answer.lines[0]!.label, "GET /express/order");

@@ -7,8 +7,8 @@ export function listOrders(res: Response, list: string[], total: number): void {
   res.json({ orders, total });
 }
 
-export function getOrder(res: Response, id: string, paid: boolean, placedAt: Date): void {
-  res.json({ id, paid, placedAt });
+export function getOrder(res: Response, id: string, settled: boolean, placedAt: Date): void {
+  res.json({ id, settled, placedAt });
 }
 
 export function pickOrder(res: Response, flag: boolean): void {
