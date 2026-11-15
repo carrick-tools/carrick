@@ -1354,6 +1354,10 @@ struct Outcome<'a> {
     /// With `stop`: it is what the callee's values agree on ([`Walker::agree`]),
     /// so the walk read values even where it entered no function.
     valued: bool,
+    /// With `stop`: it is a hole handed into a sibling's function, filled
+    /// as the stop of a site that saved none (carrick#4486). A specific
+    /// stop absorbed after it takes its place; it never pushes one out.
+    filled: bool,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -1486,11 +1490,14 @@ impl<'a> Outcome<'a> {
                 None => self.ends.push(found),
             }
         }
-        if self.stop.is_none() {
+        // The first stop stays, except a filled hole, which a specific stop
+        // read beside it replaces (carrick#4486).
+        if self.stop.is_none() || (self.filled && other.stop.is_some() && !other.filled) {
             self.stop = other.stop;
             self.stop_read_in = other.stop_read_in;
             self.also = other.also;
             self.valued = other.valued;
+            self.filled = other.filled;
         }
         if self.beside.is_none() {
             self.beside = other.beside;
@@ -3839,6 +3846,7 @@ impl<'a> Walker<'a> {
         if let Some(reason) = sibling_hole {
             return Outcome {
                 valued: true,
+                filled: true,
                 ..Outcome::stopped(reason, invoke.file)
             }
             .below(&chain);

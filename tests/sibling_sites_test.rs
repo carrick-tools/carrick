@@ -1281,3 +1281,41 @@ fn a_hole_handed_into_a_sibling_is_saved_with_its_reason() {
         );
     }
 }
+
+/// A site whose walk already saved a specific reason keeps it when the value
+/// handed into the sibling is a hole: the hole's reason fills a site that
+/// saved none, and never re-words another (carrick#4486, narrowed). Here the
+/// sibling's second parameter is never bound (`value_never_bound`), read
+/// after the first, the hole. The answer key is
+/// `tests/fixtures/stop-beside-end/README.md`.
+#[test]
+fn a_hole_handed_into_a_sibling_keeps_a_specific_reason_the_walk_saved() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "stop-beside-end", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/specific-relay.ts";
+    assert_eq!(
+        unread_at(app, relay, 10).as_deref(),
+        Some("value_never_bound callee"),
+        "{}",
+        app["unread_sites"]
+    );
+    assert_eq!(
+        stop_at(app, relay, 10).as_deref(),
+        Some("packages/client/src/specific.ts:9"),
+        "{}",
+        app["unread_sites"]
+    );
+    // The twin that reaches an end: the hole is the stop the walk saved.
+    assert_eq!(
+        unread_at(app, relay, 6).as_deref(),
+        Some("unread_expression callee"),
+        "{}",
+        app["unread_sites"]
+    );
+}

@@ -63,3 +63,15 @@ and `:8` (`twoOnly`'s, two callers) reads `unread_expression`.
 are handed `ports[n]`. `:3` and `:4` have two callers and `:5` and `:6` one.
 Each reads `unread_expression` with `stop_at` `mixed.ts:5` (`:3`, `:5`) or
 `mixed.ts:10` (`:4`, `:6`).
+
+## A specific reason beside a hole (carrick#4486, narrowed)
+
+`services/app/src/specific-relay.ts` hands `ports[name]` (a hole) as the
+first argument and its own never-bound `run` parameter as the second, into
+`packages/client/src/specific.ts`. The hole's reason fills a site that saved
+no reason; it never replaces one the walk saved.
+
+| Line | Call | Unread site at the call |
+|---|---|---|
+| 6 | `sendThenRun(ports[name], run)` (reaches an end) | `unread_expression`, `stop_at` `specific.ts:3` |
+| 10 | `thenRunOnly(ports[name], run)` (twin) | `value_never_bound`, `stop_at` `specific.ts:9` (not `unread_expression`) |
