@@ -2853,7 +2853,7 @@ impl<'a> Walker<'a> {
         // key's own reason, before any reading of the key's binding as the
         // callee's value.
         if !construction && let Some(stop) = self.keyed_stop(file, call) {
-            return Outcome::stopped(stop);
+            return Outcome::stopped(stop, file);
         }
         // A callee that is a value (carrick#2432): followed through each
         // value it may hold, before the interface member that types it. A
