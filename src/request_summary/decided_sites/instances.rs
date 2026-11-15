@@ -773,7 +773,6 @@ pub(super) struct InstanceWalk<'w, 'a> {
     fielding: Vec<(PathBuf, u32, String)>,
     /// The own-factory calls being followed, outermost first: the path a
     /// root is reached through (QW-2a).
-    #[allow(dead_code)]
     via: Vec<super::super::resolve::CallAt>,
 }
 
@@ -1782,7 +1781,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                                 form: instance.form,
                                 args: instance.args.clone(),
                                 span: (instance.site.span_start, instance.site.span_end),
-                                via: Vec::new(),
+                                via: vec![self.via.iter().rev().cloned().collect()],
                             }),
                         },
                     );
@@ -1805,8 +1804,15 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     return;
                 }
                 match (target, placed) {
-                    (Some((target_file, key)), Some(_)) => {
+                    (Some((target_file, key)), Some(placed)) => {
+                        self.via.push(super::super::resolve::CallAt {
+                            file: placed.file.to_path_buf(),
+                            lo: placed.call.site.lo,
+                            hi: placed.call.site.hi,
+                            fills: (target_file.clone(), key.clone()),
+                        });
                         self.returns(&target_file, key, &at, None);
+                        self.via.pop();
                     }
                     _ => self.hole(at, InstanceHole::Unread, None),
                 }
