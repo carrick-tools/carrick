@@ -6768,7 +6768,7 @@ impl Reader<'_> {
                 && let Some(entry) =
                     self.fn_decl_entry(declared_fn, scope.body_names.as_ref(), false)
             {
-                ir.local_bindings.push(entry);
+                let _ = entry;
             }
         }
         for (index, stmt) in stmts.iter().enumerate() {
