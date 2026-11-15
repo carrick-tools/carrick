@@ -572,6 +572,18 @@ fn mark_unanswered(
     }
 }
 
+/// What the library reader did at a method decorated through a decorator
+/// factory of the service (carrick#3781 R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecoratorRead {
+    /// Nothing: the method keeps the factory's stop.
+    Unread,
+    /// A lead at the decorator's call, saved with the reader's reason.
+    Lead,
+    /// A row at the decorator's call.
+    Row,
+}
+
 /// A saved site that reached a decorator export: where it is, and what the
 /// label says of it.
 struct DecoratorEnd {
@@ -589,11 +601,20 @@ struct DecoratorEnd {
 /// method's name: slot `name`, reason [`Stop::OwnFunction`], the factory as
 /// the callee. The saved site is read, never the body again; a factory
 /// holding none gives its methods nothing.
+///
+/// What the library reader did at each method (`read`, carrick#3781 R5):
+/// a method it saved a lead at gets no such site, the lead's reason being
+/// the one save there; a method it stated a row at loses the site in the
+/// fold, as every save at a row's line does. Once every method decorated
+/// through a factory states a row, the factory body's own save of that
+/// decorator export is withdrawn from `saved` and `leads`: every use of it
+/// was read.
 pub(crate) fn of_own_decorators(
     decorators: &[crate::request_summary::own_decorators::OwnDecoratorAt],
+    read: impl Fn(&crate::request_summary::own_decorators::OwnDecoratorAt) -> DecoratorRead,
     claims: &[crate::library_claims::ExportClaims],
-    saved: &[UnreadSite],
-    leads: &[PossibleCall],
+    saved: &mut Vec<UnreadSite>,
+    leads: &mut Vec<PossibleCall>,
     root: &Path,
 ) -> Vec<UnreadSite> {
     let is_decorator = |end: &LabelledEndRef| {
@@ -609,7 +630,7 @@ pub(crate) fn of_own_decorators(
     // Each saved site that reached a decorator export: where it is, and
     // what the label says of it.
     let mut ends: Vec<DecoratorEnd> = Vec::new();
-    for site in saved {
+    for site in saved.iter() {
         if let Some(end) = site.labelled_end.as_ref().filter(|end| is_decorator(end)) {
             ends.push(DecoratorEnd {
                 file: site.file.clone(),
@@ -620,7 +641,7 @@ pub(crate) fn of_own_decorators(
             });
         }
     }
-    for lead in leads {
+    for lead in leads.iter() {
         if let Some(end) = lead.labelled_end.as_ref().filter(|end| is_decorator(end)) {
             ends.push(DecoratorEnd {
                 file: lead.file_path.clone(),
@@ -632,19 +653,45 @@ pub(crate) fn of_own_decorators(
         }
     }
     let relative = |file: &Path| crate::site_rows::relative(root, &file.to_string_lossy());
+    let in_factory =
+        |at: &crate::request_summary::own_decorators::OwnDecoratorAt, file: &str, start: u32| {
+            file == relative(&at.factory_file) && at.factory.0 <= start && start <= at.factory.1
+        };
     let mut out: Vec<UnreadSite> = Vec::new();
+    // Each factory, and whether every method decorated through it states a
+    // row.
+    let mut read_factories: Vec<(
+        &crate::request_summary::own_decorators::OwnDecoratorAt,
+        bool,
+    )> = Vec::new();
     for at in decorators {
-        let factory_file = relative(&at.factory_file);
-        let Some(found) = ends.iter().find(|found| {
-            found.file == factory_file && at.factory.0 <= found.start && found.start <= at.factory.1
-        }) else {
+        let read = read(at);
+        let row = read == DecoratorRead::Row;
+        match read_factories
+            .iter_mut()
+            .find(|(known, _)| known.factory_file == at.factory_file && known.factory == at.factory)
+        {
+            Some((_, all)) => *all &= row,
+            None => read_factories.push((at, row)),
+        }
+        // A lead keeps its own reason, the one save there. A row's method
+        // keeps the stop until the fold, which drops every save at a line a
+        // decided row stands at ([`crate::site_rows::fold`]): the one
+        // answer to whether a row stands there.
+        if read == DecoratorRead::Lead {
+            continue;
+        }
+        let Some(found) = ends
+            .iter()
+            .find(|found| in_factory(at, &found.file, found.start))
+        else {
             continue;
         };
         out.push(UnreadSite {
             file: relative(&at.file),
-            line: at.decorator.line,
-            span_start: at.decorator.call.span_start,
-            span_end: at.decorator.call.span_end,
+            line: at.decorator.line(),
+            span_start: at.decorator.site().span_start,
+            span_end: at.decorator.site().span_end,
             reason: Stop::OwnFunction,
             also: Vec::new(),
             slot: "name".to_string(),
@@ -659,6 +706,14 @@ pub(crate) fn of_own_decorators(
             beside: false,
         });
     }
+    let withdrawn = |file: &str, start: u32, end: Option<&LabelledEndRef>| {
+        end.is_some_and(|end| is_decorator(end))
+            && read_factories
+                .iter()
+                .any(|(at, all)| *all && in_factory(at, file, start))
+    };
+    saved.retain(|site| !withdrawn(&site.file, site.span_start, site.labelled_end.as_ref()));
+    leads.retain(|lead| !withdrawn(&lead.file_path, lead.span_start, lead.labelled_end.as_ref()));
     out
 }
 

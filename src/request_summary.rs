@@ -1915,6 +1915,20 @@ struct OwnGetter {
 }
 
 impl FileIr {
+    /// Every method decorator of the file that calls a name no library
+    /// export answers to, as a caller record ([`own_decorators`],
+    /// carrick#3781): the one list both caller tables read as module-level
+    /// callers. In the order of the members' definition keys, then source
+    /// order.
+    fn decorator_calls(&self) -> Vec<&CallIr> {
+        let mut keys: Vec<&String> = self.functions.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .flat_map(|key| &self.functions[key].own_decorators)
+            .map(|decorator| &decorator.call)
+            .collect()
+    }
+
     /// The instance the module-scope binding `name` holds, through each
     /// `const` that only names another binding ([`Self::module_aliases`]):
     /// `export const alias = web` holds what `web` holds (carrick#2474 R3).
@@ -5908,17 +5922,74 @@ impl Reader<'_> {
                 site.op_line = self.line(name);
                 site.decorated = decorated.map(str::to_string);
                 ir.library.push(site);
-            } else if let Expr::Ident(factory) =
-                crate::graphql_document_sites::unwrap_expression(callee)
-            {
-                // No export answers to the name: it may be a function of
-                // the service that composes one ([`own_decorators`]).
+            }
+            if let Expr::Ident(factory) = crate::graphql_document_sites::unwrap_expression(callee) {
+                // The name may be a function of the service that composes a
+                // decorator, declared here or imported (an import is a
+                // library site's receiver too, which no package export
+                // answers to): what the call reaches decides
+                // ([`own_decorators`]). The call is kept as a caller record
+                // of that function, read in the module's scope and placed at
+                // the method's name, so the caller tables read what it
+                // passes (carrick#3781).
                 ir.own_decorators.push(own_decorators::OwnDecorator {
                     callee: factory.sym.to_string(),
-                    call: self.site(call.span),
-                    line: self.line(name),
+                    call: self.decorator_call(call, factory, name, &scope),
                 });
             }
+        }
+    }
+
+    /// A method decorator's call of an own function (`@Handles("x")`) as a
+    /// caller record (carrick#3781): its site, its arguments as a library
+    /// claim's slot and the text reader read them, and the line of the
+    /// decorated member's name, where a row the call fills is stated. Never
+    /// one of a body's `calls`: no summary, call edge or lead reads it.
+    fn decorator_call(
+        &self,
+        call: &CallExpr,
+        factory: &Ident,
+        name: Span,
+        scope: &Scope<'_>,
+    ) -> CallIr {
+        let spread = call.args.iter().any(|arg| arg.spread.is_some());
+        CallIr {
+            site: self.site(call.span),
+            callee: factory.sym.to_string(),
+            args: call
+                .args
+                .iter()
+                .map(|arg| self.eval(&arg.expr, scope))
+                .collect(),
+            request: None,
+            waited: false,
+            inert: false,
+            invokes_param: None,
+            receiver: None,
+            site_args: (!spread).then(|| library_sites::site_args(&call.args, scope)),
+            spread_from: library_sites::spread_from(&call.args),
+            name_line: self.line(name),
+            jsx: false,
+            arg_subjects: Vec::new(),
+            callee_subject: None,
+            callee_text: factory.sym.to_string(),
+            callee_values: Vec::new(),
+            callee_key: None,
+            arg_values: Vec::new(),
+            arg_texts: resolve::args_text(&call.args, &|lo| lo, scope.class()),
+            rest_values: Vec::new(),
+            arg_spans: arg_spans(&call.args),
+            tested: None,
+            handed_names: Vec::new(),
+            names: Vec::new(),
+            spread_args: Vec::new(),
+            receiver_spans: Vec::new(),
+            receiver_object: None,
+            instance: InstanceIr::default(),
+            constructs: false,
+            language_call: None,
+            bound: Vec::new(),
+            path_guards: Vec::new(),
         }
     }
 

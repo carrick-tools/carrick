@@ -1650,6 +1650,22 @@ impl<'a> Calls<'a> {
                     false,
                     &mut calls,
                 );
+                // A method decorator's call of an own function is a
+                // module-level caller of it (carrick#3781): an edge the
+                // callers walks read what it passes through, and no call of
+                // a body, so no span the site path places anything at.
+                for call in file.decorator_calls() {
+                    if let Some(target) = target(source, path, call) {
+                        calls.callers.entry(target).or_default().push(Placed {
+                            file: path,
+                            key: None,
+                            depth: 0,
+                            call,
+                            host: None,
+                            written_in: None,
+                        });
+                    }
+                }
             }
         }
         calls
