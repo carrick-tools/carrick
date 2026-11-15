@@ -19,10 +19,20 @@ export function similarKey(result: CheckResult, relative: string, name: string):
   return `lead::${result.repo ?? ""}::${result.file ?? relative}::${name}`;
 }
 
-function where(row: SimilarFunction, ownRepo: string | null): string {
-  // `row.repo` is a checkout folder name or an indexed repo name, never a path.
-  const spot = `${row.file}:${row.line}`;
-  return ownRepo !== null && row.repo !== ownRepo ? `${row.repo}/${spot}` : spot;
+/**
+ * Where a row is, read from the agent's folder `cwd`. `row.repo` is a checkout
+ * folder name or an indexed repo name, never a path; `ownRoot` is the edited
+ * repo's root. A row in another repo is named, and one whose repo has no
+ * checkout here says so. Without a `cwd` the text is the older repo-relative one.
+ */
+function where(row: SimilarFunction, ownRepo: string | null, ownRoot: string | null, cwd: string | null): string {
+  const other = ownRepo !== null && row.repo !== ownRepo;
+  if (cwd === null || ownRoot === null) return other ? `${row.repo}/${row.file}:${row.line}` : `${row.file}:${row.line}`;
+  if (!other) return `${path.relative(cwd, path.join(ownRoot, row.file))}:${row.line}`;
+  if (row.checkout === undefined) {
+    return `${row.file}:${row.line} in repo ${row.repo}, which is not checked out on this machine`;
+  }
+  return `${path.relative(cwd, path.join(row.checkout, row.file))}:${row.line} in repo ${row.repo}`;
 }
 
 /**
@@ -35,10 +45,10 @@ function cut(text: string, cap: number): string {
   return chars.length <= cap ? chars.join("") : `${chars.slice(0, cap).join("")}...`;
 }
 
-function row(position: number, found: SimilarFunction, ownRepo: string | null): string {
+function row(position: number, found: SimilarFunction, place: string): string {
   const signature = found.signature ? cut(found.signature, SIGNATURE_CAP) : "";
   const first =
-    `${position}. \`${found.name}${signature}\` at ${where(found, ownRepo)} ` +
+    `${position}. \`${found.name}${signature}\` at ${place} ` +
     `(${found.exported ? "exported" : "not exported"}; called from ${found.called_from} other files)`;
   return found.intent ? `${first}\n   ${cut(found.intent, INTENT_CAP)}` : first;
 }
@@ -57,6 +67,7 @@ export function similarLines(
   const out: SimilarLines = { lines: [], keys: [] };
   if (result.error) return out;
   const ownRepo = result.repo ? path.basename(result.repo) : null;
+  const ownRoot = result.repo ?? null;
   for (const made of result.recheck?.new_functions ?? []) {
     const rows = made.similar ?? [];
     if (rows.length === 0) continue;
@@ -65,7 +76,7 @@ export function similarLines(
     out.lines.push(
       [
         `Carrick: \`${made.name}\` may already exist. Existing functions that could do this job:`,
-        ...rows.map((found, at) => row(at + 1, found, ownRepo)),
+        ...rows.map((found, at) => row(at + 1, found, where(found, ownRepo, ownRoot, cwd))),
         "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
       ].join("\n"),
     );

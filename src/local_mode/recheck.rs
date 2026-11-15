@@ -1317,9 +1317,11 @@ fn row_with_checkout(
     row: super::contract::SimilarFunction,
     roots: &[PathBuf],
 ) -> super::contract::SimilarFunction {
-    // Stub: filled by the fix.
-    let _ = roots;
-    row
+    let checkout = roots
+        .iter()
+        .find(|root| repo_label(root) == row.repo)
+        .map(|root| root.to_string_lossy().into_owned());
+    super::contract::SimilarFunction { checkout, ..row }
 }
 
 /// What an edit to `relative` adds that the index would hold.

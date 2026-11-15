@@ -1134,12 +1134,13 @@ test("on the lsp channel nothing is queued and nothing is printed; with no sessi
 // The edit-time similar-function list (carrick-cloud#3490): a function the edit
 // added gets one block naming the indexed functions it may already exist as,
 // once per function per session. The wording is frozen with the measured block.
+// The tests run from the folder above the repo, so a row prints its path from there.
 
 const SIMILAR_BLOCK = [
   "Carrick: `slugify` may already exist. Existing functions that could do this job:",
-  "1. `toSlug(title: string) => string` at src/text/slug.ts:4 (exported; called from 4 other files)",
+  "1. `toSlug(title: string) => string` at user-service/src/text/slug.ts:4 (exported; called from 4 other files)",
   "   Turns a title into a lowercase, dash-joined URL segment.",
-  "2. `urlSegment` at src/routes/segment.ts:11 (not exported; called from 0 other files)",
+  "2. `urlSegment` at user-service/src/routes/segment.ts:11 (not exported; called from 0 other files)",
   "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
 ].join("\n");
 
@@ -1192,7 +1193,7 @@ test("a queued edit with similar rows prints the block alone, and names another 
   assert.deepEqual(lines, [
     [
       "Carrick: `slugify` may already exist. Existing functions that could do this job:",
-      "1. `toSlug(title: string) => string` at shared-lib/src/text/slug.ts:4 (exported; called from 2 other files)",
+      "1. `toSlug(title: string) => string` at src/text/slug.ts:4 in repo shared-lib, which is not checked out on this machine (exported; called from 2 other files)",
       "   Turns a title into a lowercase, dash-joined URL segment.",
       "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
     ].join("\n"),
