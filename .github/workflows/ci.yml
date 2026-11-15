@@ -41,7 +41,7 @@ jobs:
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
   # first in its shard; two of its tests claim every slot (.config/nextest.toml).
-  # `answers_ahead_test` (scan-2) and `parallel_services_test` (scan-5) left n3,
+  # `answers_ahead_test` (scan-2) and `parallel_services_test` (lib-2) left n3,
   # which they made the slowest shard (carrick#4565).
   # `scan-*` shards stay on `cargo test`. `steps` keeps one `cargo test` per
   # binary, in map order, then carrick-match last: the timing tests (readiness,
@@ -75,6 +75,8 @@ jobs:
             runner: nextest
             partitioned: --lib
             partition: slice:2/2
+            targets: >-
+              --test parallel_services_test
           - shard: n1
             runner: nextest
             partitioned: --test local_mode_test
@@ -144,7 +146,7 @@ jobs:
           - shard: scan-5
             runner: cargo
             targets: >-
-              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test --test check_changed_retype_reach_test --test optional_calls_test --test declared_dispatch_handlers_test --test hook_row_over_leaf_test --test wrapper_request_line_module_test --test parallel_services_test
+              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test --test check_changed_retype_reach_test --test optional_calls_test --test declared_dispatch_handlers_test --test hook_row_over_leaf_test --test wrapper_request_line_module_test
           - shard: scan-3
             runner: cargo
             targets: >-
