@@ -114,6 +114,24 @@ export async function totals(): Promise<number[]> {
 `;
 }
 
+/**
+ * A hook read with no check on the envelope's own `undefined`: the file has
+ * a TS18048 on `result.data` whatever the procedure returns. That error is
+ * the client's, not the output's, so it must not read as a break.
+ */
+function envelopeView(from: string): string {
+  return `import { createHooks } from "fixture-procs";
+import type { AppRouter } from "../${from}";
+
+const hooks = createHooks<AppRouter>();
+
+export function firstTotal(): number {
+  const result = hooks.orders.list.useQuery();
+  return result.data[0].total;
+}
+`;
+}
+
 const VIEWS: Record<string, string> = {
   'head-view.ts': vanillaView('router-head'),
   'main-view.ts': vanillaView('router-main'),
@@ -128,6 +146,8 @@ export function firstTotal(): number | undefined {
   return first?.total;
 }
 `,
+  'envelope-main-view.ts': envelopeView('router-main'),
+  'envelope-head-view.ts': envelopeView('router-head'),
   'options-view.ts': `import { createContext } from "fixture-procs";
 import type { AppRouter } from "../router-main";
 
@@ -274,6 +294,20 @@ describe('carrick#937: the retype judges a procedure call by the consumer\'s own
 
   it('reads through a hook envelope to the read that breaks', async () => {
     const out = await judge('hook-view.ts', '{ id: string; }[]');
+    assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
+    assert.deepStrictEqual(
+      out.diagnostics.map((d) => ({ line: d.line, code: d.code })),
+      [{ line: 8, code: 2339 }]
+    );
+  });
+
+  it('does not count an error in the client\'s envelope as a break', async () => {
+    const out = await judge('envelope-main-view.ts', '{ id: string; total: number; }[]');
+    assert.strictEqual(out.outcome, 'agrees', JSON.stringify(out));
+  });
+
+  it('still finds the read of a removed field beside an error in the envelope', async () => {
+    const out = await judge('envelope-head-view.ts', '{ id: string; }[]');
     assert.strictEqual(out.outcome, 'mismatch', JSON.stringify(out));
     assert.deepStrictEqual(
       out.diagnostics.map((d) => ({ line: d.line, code: d.code })),
