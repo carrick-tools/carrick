@@ -1778,6 +1778,19 @@ export function mergeHeaders(a: Headers, b: Headers) {
         assert_eq!(caption.similar.as_ref(), Some(&expected));
     }
 
+    /// The PR wire is pinned by the cloud's copy of the fixture: a row there
+    /// never carries `checkout` (the hook-only field), so the bytes stay.
+    #[test]
+    fn a_pr_similar_row_writes_no_checkout() {
+        let block = run(true);
+        let caption = entry(&block, "captionText");
+        let rows = caption.similar.as_ref().expect("a ranked function");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.checkout.is_none()));
+        let json = serde_json::to_string(rows).unwrap();
+        assert!(!json.contains("checkout"), "{json}");
+    }
+
     #[test]
     fn an_edited_function_carries_no_similar() {
         let block = run(true);
