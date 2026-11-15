@@ -20,6 +20,7 @@ import { heldDir, socketPath } from "../src/held/paths.ts";
 import { readTimings } from "../src/hook/timings.ts";
 import { answerEarly } from "../src/hook/rechecks.ts";
 import { askHeld } from "../src/held/client.ts";
+import { heldBuildId } from "../src/held/build.ts";
 import { heldDetail } from "../src/held/early.ts";
 import type { HeldAnswer, HeldLine, HeldRequest } from "../src/held/daemon.ts";
 
@@ -131,7 +132,14 @@ async function fakeDaemon(ws: Ws, answer: HeldAnswer, delayMs = 0, root: string 
       buffer += chunk.toString("utf8");
       const end = buffer.indexOf("\n");
       if (end < 0) return;
-      const request = JSON.parse(buffer.slice(0, end)) as HeldRequest;
+      const frame = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      // The client says hello first; the fake is of the client's own build.
+      if ((JSON.parse(frame) as { hello?: boolean }).hello === true) {
+        conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root } })}\n`);
+        return;
+      }
+      const request = JSON.parse(frame) as HeldRequest;
       requests.push(request as unknown as Record<string, unknown>);
       setTimeout(() => {
         if (request.kind === "edit" && request.seq) answerEarly(request.session, request.seq, answer, Date.now(), ws.home);

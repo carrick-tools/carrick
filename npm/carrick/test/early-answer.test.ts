@@ -23,6 +23,7 @@ import { readTimings } from "../src/hook/timings.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
 import { heldDir, socketPath } from "../src/held/paths.ts";
 import { HeldDaemon } from "../src/held/daemon.ts";
+import { heldBuildId } from "../src/held/build.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit } from "../src/held/daemon.ts";
 import type { CheckItem, CheckResult } from "../src/contract.ts";
 
@@ -148,8 +149,14 @@ async function liveDaemon(t: { after: (fn: () => void | Promise<void>) => void }
       buffer += chunk.toString("utf8");
       const end = buffer.indexOf("\n");
       if (end < 0) return;
-      const request = JSON.parse(buffer.slice(0, end)) as HeldRequest;
-      buffer = "";
+      const frame = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      // The client says hello first; the fake is of the client's own build.
+      if ((JSON.parse(frame) as { hello?: boolean }).hello === true) {
+        conn.write(`${JSON.stringify({ hello: { build_id: heldBuildId(), pid: process.pid, root: ws.root } })}\n`);
+        return;
+      }
+      const request = JSON.parse(frame) as HeldRequest;
       requests.push(request);
       void daemon.handle(request).then((answer) => conn.writable && conn.end(`${JSON.stringify(answer)}\n`));
     });

@@ -9,6 +9,8 @@ import { execFile } from "node:child_process";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { binary } from "../cli.ts";
 import { createLogger } from "../log.ts";
+import { recordCrash } from "./backoff.ts";
+import { heldBuildId } from "./build.ts";
 import { serve, type DaemonDeps, type ServiceInit } from "./daemon.ts";
 import { createRuntime } from "./runtime.ts";
 
@@ -34,6 +36,15 @@ function readPrograms(root: string, env: NodeJS.ProcessEnv): Promise<ServiceInit
   });
 }
 
+let rootForCrash: string | null = null;
+let idForCrash: string | null = null;
+
+/** A daemon that dies is recorded under its build, so a build that keeps dying is not started on every edit. */
+function crashed(error: unknown): void {
+  log("daemon failed", String(error));
+  if (rootForCrash !== null && idForCrash !== null) recordCrash(rootForCrash, idForCrash);
+}
+
 async function main(): Promise<void> {
   const root = process.argv.slice(2)[0];
   if (!root) {
@@ -42,7 +53,10 @@ async function main(): Promise<void> {
   }
   const env = process.env;
   if (!compilerLinesEnabled(env)) return;
-  const deps: DaemonDeps = { root, env, programs: () => readPrograms(root, env), runtime: createRuntime({ root, env }) };
+  rootForCrash = root;
+  const buildId = heldBuildId();
+  idForCrash = buildId;
+  const deps: DaemonDeps = { root, env, buildId, programs: () => readPrograms(root, env), runtime: createRuntime({ root, env }) };
   const stop = new AbortController();
   process.once("SIGTERM", () => stop.abort());
   process.once("SIGINT", () => stop.abort());
@@ -50,9 +64,17 @@ async function main(): Promise<void> {
   await serve(deps, { signal: stop.signal, ...(Number.isFinite(spawner) ? { spawner } : {}) });
 }
 
+process.on("uncaughtException", (error) => {
+  crashed(error);
+  process.exit(0);
+});
+process.on("unhandledRejection", (error) => {
+  crashed(error);
+  process.exit(0);
+});
 try {
   await main();
 } catch (error) {
-  log("daemon failed", String(error));
+  crashed(error);
 }
 process.exit(0);

@@ -14,6 +14,7 @@ import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
+import { heldBuildId } from "./build.ts";
 import { heldDir, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
@@ -111,7 +112,16 @@ export type DaemonDeps = {
   clock?: () => number;
   programs: () => Promise<ServiceInit[]>;
   runtime: ServiceRuntime;
+  /** The id the daemon answers `hello` with; the hash of its own build files by default. */
+  buildId?: string;
 };
+
+/**
+ * First frame of a connection: who is on the other end of the socket. The
+ * client asks only a daemon of its own build; `exit` retires one of another.
+ */
+export type HeldHello = { build_id: string; pid: number; root: string };
+export type HeldFrame = { hello: true } | { exit: true };
 
 const MIN = 60_000;
 /** D2: an engine closes after this long with no request. */
@@ -414,18 +424,41 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
   if (!takeLock(lock, process.pid, now(), LOCK_CAP_MS, options.spawner)) return false;
   const daemon = new HeldDaemon(deps);
   const sock = socketPath(deps.root, deps.home);
+  const hello: HeldHello = { build_id: deps.buildId ?? heldBuildId(), pid: process.pid, root: realPath(deps.root) };
   // The lock is ours, so a socket file left here belongs to a dead daemon.
   fs.rmSync(sock, { force: true });
+  let retired = false;
+  let leave: () => void = () => undefined;
+  // A daemon of another build was told to exit: its socket and lock go at once,
+  // so the replacement can take them, and only then does it reply and wind down.
+  const retire = (): void => {
+    if (retired) return;
+    retired = true;
+    fs.rmSync(sock, { force: true });
+    releaseLock(lock, process.pid);
+  };
   const server = net.createServer((conn) => {
     let buffer = "";
+    let chain: Promise<void> = Promise.resolve();
     conn.on("error", () => undefined);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
-      const end = buffer.indexOf("\n");
-      if (end < 0) return;
-      const text = buffer.slice(0, end);
-      buffer = "";
-      void answer(daemon, text).then((reply) => conn.end(`${JSON.stringify(reply)}\n`));
+      for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+        const text = buffer.slice(0, end);
+        buffer = buffer.slice(end + 1);
+        chain = chain.then(async () => {
+          const frame = parseFrame(text);
+          if (frame !== null && "hello" in frame) {
+            conn.write(`${JSON.stringify({ hello })}\n`);
+          } else if (frame !== null) {
+            retire();
+            conn.end(`${JSON.stringify({ bye: true })}\n`);
+            leave();
+          } else {
+            conn.end(`${JSON.stringify(await answer(daemon, text))}\n`);
+          }
+        });
+      }
     });
   });
   try {
@@ -441,6 +474,7 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
   fs.chmodSync(sock, 0o600);
   await new Promise<void>((resolve) => {
     const timer = setInterval(() => {
+      if (retired) return;
       touchLock(lock, process.pid, now());
       void daemon.tick().then(() => {
         if (daemon.wantsExit()) resolve();
@@ -450,14 +484,27 @@ export async function serve(deps: DaemonDeps, options: ServeOptions = {}): Promi
       clearInterval(timer);
       resolve();
     };
+    leave = done;
     if (options.signal?.aborted) done();
     options.signal?.addEventListener("abort", done, { once: true });
   });
   server.close();
-  fs.rmSync(sock, { force: true });
+  // A retired daemon's socket and lock may be the replacement's by now.
+  if (!retired) fs.rmSync(sock, { force: true });
   await daemon.close();
-  releaseLock(lock, process.pid);
+  if (!retired) releaseLock(lock, process.pid);
   return true;
+}
+
+function parseFrame(text: string): HeldFrame | null {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (parsed["hello"] === true) return { hello: true };
+    if (parsed["exit"] === true) return { exit: true };
+  } catch {
+    // Not a frame: a request line, answered (or failed) as one.
+  }
+  return null;
 }
 
 async function answer(daemon: HeldDaemon, text: string): Promise<HeldAnswer> {
