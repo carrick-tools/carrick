@@ -248,3 +248,21 @@ Every other probe is one hole, never `outside_service`: `p_param` is
 `parameter_unread`; `p_loose` (exported, not `as const`), `p_pushed`,
 `p_handed`, `p_let_list`, `p_spread`, `p_call`, `p_let_head`, `p_in` and
 `p_default` are `unread_expression`.
+
+### A key read off a head (`r.path`, carrick#4266)
+
+| Probe | Texts |
+|---|---|
+| `p_member` (`r.path` over a module `const` list of objects) | `/a`, `/b` |
+| `p_member_pair` (`${r.verb} ${r.path}`, joined element by element) | `get /x`, `post /y` |
+| `p_member_held` (`route.path` under `{ route }`) | `/h1`, `/h2` |
+| `p_member_tuple` (`r.path` under `[, r]`) | `/t1`, `/t2` |
+| `p_member_again` (a head name other loops in the file reuse) | `/again` |
+
+Each of these is one `unread_expression` hole: `p_member_computed` (one
+element's value is a call), `p_member_computed_key` (the element writes its
+key computed), `p_member_dynamic` (`r[dyn]`), `p_member_missing` (one element
+writes no `path`), `p_member_handed` (the head is handed to a call),
+`p_member_written` (the body writes `r.path`), `p_member_reached` (the list
+is read other than by the loop, `touch(REACHED[0])`) and `p_member_exported`
+(an exported list: an importer may change an element, `as const` or not).

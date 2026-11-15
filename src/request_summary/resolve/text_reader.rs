@@ -815,14 +815,19 @@ impl<'a> Resolver<'a> {
                 at,
                 key,
                 loop_at,
-            } => self.text_of_each(file, list, *at, key.as_deref(), *loop_at),
+            } => {
+                let keys: Vec<String> = key.iter().cloned().collect();
+                self.text_of_each(file, list, *at, &keys, *loop_at)
+            }
             _ => hole(UnreadExpression),
         }
     }
 
-    /// A name a `for…of` head binds (carrick#2093): one text per element of
-    /// the list, each at the tuple position or object key the pattern reads,
-    /// marked with the loop and the element so the names one loop binds join
+    /// A name a `for…of` head binds (carrick#2093), or a key read off it
+    /// (`r.path`, carrick#4266): one text per element of the list, each at
+    /// the tuple position the pattern reads, then down `keys` (the object
+    /// key the pattern reads, then the member read off the name), marked
+    /// with the loop and the element so the names one loop binds join
     /// element by element ([`Self::joined`]). Every element must state the
     /// part as one text; otherwise the name is the hole of the first element
     /// that does not, and a list no reader states is the hole of why not.
@@ -831,17 +836,29 @@ impl<'a> Resolver<'a> {
         file: &Path,
         list: &ValueAt,
         at: Option<usize>,
-        key: Option<&str>,
+        keys: &[String],
         loop_at: u32,
     ) -> Vec<TextValue> {
         let hole = |reason| vec![TextValue::hole(reason)];
-        let (items, listed_in, read_from, _reading) = match self.list_elements(file, list) {
-            Ok(found) => found,
-            Err(reason) => return hole(reason),
-        };
+        let (items, listed_in, read_from, _reading) =
+            match self.list_elements(file, list, !keys.is_empty()) {
+                Ok(found) => found,
+                Err(reason) => return hole(reason),
+            };
         let mut out = Vec::with_capacity(items.len());
         for (index, item) in items.iter().enumerate() {
-            let Some(part) = element_part(item, at, key) else {
+            let element = match (at, item) {
+                (None, item) => Some(item.clone()),
+                (Some(at), ValueAt::Elements(tuple)) => tuple.get(at).cloned(),
+                _ => None,
+            };
+            // A key is read only off an object literal the element writes.
+            let part = match element {
+                Some(element) if keys.is_empty() => Some(element),
+                Some(element @ ValueAt::Entries(_)) => handed(&element, keys),
+                _ => None,
+            };
+            let Some(part) = part else {
                 return hole(guards::HoleReason::UnreadExpression);
             };
             match self.one_text(&listed_in, &part) {
@@ -880,7 +897,8 @@ impl<'a> Resolver<'a> {
             let ValueAt::Each { list, at, key, .. } = &test.of else {
                 continue;
             };
-            let Ok((items, listed_in, _, _reading)) = self.list_elements(file, list) else {
+            let Ok((items, listed_in, _, _reading)) = self.list_elements(file, list, key.is_some())
+            else {
                 continue;
             };
             for (index, item) in items.iter().enumerate() {
@@ -909,13 +927,19 @@ impl<'a> Resolver<'a> {
     /// table holds as one, where nothing may change it (carrick#2093). The
     /// declaring module never changes it ([`ModuleBinding::list_kept`]), and
     /// an exported list is written `as const`, so no importer changes it
-    /// either. Otherwise why the list is unread: a write, else an expression
-    /// no reader states, a parameter, or a name declared outside the run.
+    /// either. With `objects` (a key is read off each element, carrick#4266)
+    /// nothing may change an element either: the declaring module reaches
+    /// the list only through this one loop ([`ModuleBinding::elements_kept`])
+    /// and no importer reaches it at all, since `as const` does not stop a
+    /// call that is handed an element from changing it. Otherwise why the
+    /// list is unread: a write, else an expression no reader states, a
+    /// parameter, or a name declared outside the run.
     #[allow(clippy::type_complexity)]
     fn list_elements(
         &self,
         file: &Path,
         list: &ValueAt,
+        objects: bool,
     ) -> Result<(Vec<ValueAt>, PathBuf, Vec<String>, Option<TextReading<'_>>), guards::HoleReason>
     {
         use guards::HoleReason::*;
@@ -946,6 +970,7 @@ impl<'a> Resolver<'a> {
                 if binding.kind != BindingKind::Const
                     || !binding.list_kept
                     || (binding.exported && !binding.list_frozen)
+                    || (objects && (binding.exported || !binding.elements_kept))
                 {
                     return Err(UnreadExpression);
                 }
@@ -1422,6 +1447,9 @@ impl<'a> Resolver<'a> {
         let Some((at, binding, declared)) = self.declared_entry(row) else {
             return hole(self.unread_declaration(row));
         };
+        if binding.kind == BindingKind::LoopElement {
+            return self.text_of_element_member(&at, binding, declared, &key, read_from);
+        }
         let Some(ValueAt::Entries(entries)) = &binding.text else {
             return hole(UnreadExpression);
         };
@@ -1457,6 +1485,62 @@ impl<'a> Resolver<'a> {
         };
         note_all(&mut read_from, vec![declared]);
         let mut out = self.text_values(at.0, value);
+        for entry in &mut out {
+            if let TextValue::Text {
+                read_from: from, ..
+            } = entry
+            {
+                let mut all = read_from.clone();
+                note_all(&mut all, std::mem::take(from));
+                *from = all;
+            }
+        }
+        out
+    }
+
+    /// `key` read off a name a `for…of` head binds (`r.path`, carrick#4266):
+    /// each element's entry at `key`, read as the head's own name is
+    /// ([`Self::text_of_each`]), so two members of one head join element by
+    /// element. Only where the module reads the head through its entries
+    /// alone ([`ModuleBinding::entries_kept`]): a head handed to a call, or
+    /// whose entry is written, may hold an element something changed. A head
+    /// read through a tuple position or an object key reads `key` off what
+    /// that position holds.
+    fn text_of_element_member(
+        &self,
+        at: &(&'a Path, u32, String),
+        binding: &ModuleBinding,
+        declared: String,
+        key: &str,
+        mut read_from: Vec<String>,
+    ) -> Vec<TextValue> {
+        use guards::HoleReason::*;
+        let hole = |reason| vec![TextValue::hole(reason)];
+        if binding.unplaceable {
+            return hole(Reassigned);
+        }
+        let Some(ValueAt::Each {
+            list,
+            at: position,
+            key: held,
+            loop_at,
+        }) = &binding.text
+        else {
+            return hole(UnreadExpression);
+        };
+        if !binding.entries_kept {
+            return hole(UnreadExpression);
+        }
+        let Some(_reading) = self.reading_text(at) else {
+            return hole(Recursion);
+        };
+        let keys: Vec<String> = held
+            .iter()
+            .cloned()
+            .chain(std::iter::once(key.to_string()))
+            .collect();
+        note_all(&mut read_from, vec![declared]);
+        let mut out = self.text_of_each(at.0, list, *position, &keys, *loop_at);
         for entry in &mut out {
             if let TextValue::Text {
                 read_from: from, ..
@@ -2240,6 +2324,61 @@ mod tests {
         texts("p_two", &["a1b1", "a1b2", "a2b1", "a2b2"]);
         texts("p_frozen", &["apply", "create"]);
         texts("p_local", &["one", "two"]);
+    }
+
+    /// carrick#4266: a key read off a name a `for…of` head binds over a
+    /// stated list of objects is each element's entry at that key: two keys
+    /// of one head join element by element, and a key reads under a
+    /// destructured key or a tuple position. Fixture `resolve-text`
+    /// (`loops.ts`).
+    #[test]
+    fn a_key_read_off_a_loop_head_is_each_element_s_entry() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let texts = |callee: &str, want: &[&str]| {
+            let want: Vec<String> = want.iter().map(|text| text.to_string()).collect();
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (want, Vec::new()),
+                "{callee}"
+            );
+        };
+        texts("p_member", &["/a", "/b"]);
+        texts("p_member_pair", &["get /x", "post /y"]);
+        texts("p_member_held", &["/h1", "/h2"]);
+        texts("p_member_tuple", &["/t1", "/t2"]);
+        texts("p_member_again", &["/again"]);
+    }
+
+    /// carrick#4266: a key read off a loop head is one `unread_expression`
+    /// hole where an element does not state it plainly (a call's value, a
+    /// computed key, a key read by a computed name, a key one element omits)
+    /// or where an element may change (the head handed to a call or written
+    /// through, the list read other than by the loop, an exported list).
+    #[test]
+    fn a_key_read_off_a_loop_head_an_element_may_not_state_is_a_hole() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for callee in [
+            "p_member_computed",
+            "p_member_computed_key",
+            "p_member_dynamic",
+            "p_member_missing",
+            "p_member_handed",
+            "p_member_written",
+            "p_member_reached",
+            "p_member_exported",
+        ] {
+            assert_eq!(
+                loop_probe(&resolver, &on, callee),
+                (Vec::new(), vec![guards::HoleReason::UnreadExpression]),
+                "{callee}"
+            );
+        }
     }
 
     /// carrick#2093: a loop head whose list the code does not state, or may

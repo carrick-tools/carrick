@@ -72,3 +72,64 @@ for (let letHead of KINDS) p_let_head(letHead);
 for (const key in { a: 1 }) p_in(key);
 
 for (const [withDefault = 'z'] of [['a']]) p_default(withDefault);
+
+// A key read off an object element (carrick#4266). Read: each element's
+// own entry, two keys of one head together, a key under a destructured key
+// or a tuple position, and one head name reused by a second loop.
+declare function p_member(name: string): void;
+declare function p_member_pair(name: string): void;
+declare function p_member_held(name: string): void;
+declare function p_member_tuple(name: string): void;
+declare function p_member_again(name: string): void;
+declare function p_member_computed(name: string): void;
+declare function p_member_computed_key(name: string): void;
+declare function p_member_dynamic(name: string): void;
+declare function p_member_missing(name: string): void;
+declare function p_member_handed(name: string): void;
+declare function p_member_written(name: string): void;
+declare function p_member_reached(name: string): void;
+declare function p_member_exported(name: string): void;
+declare function touch(entry: { path: string }): void;
+declare const dyn: string;
+
+const ROUTES = [
+  { path: '/a', verb: 'get' },
+  { path: '/b', verb: 'post' },
+];
+for (const r of ROUTES) p_member(r.path);
+
+for (const r of [{ verb: 'get', path: '/x' }, { verb: 'post', path: '/y' }]) p_member_pair(`${r.verb} ${r.path}`);
+
+for (const { route } of [{ route: { path: '/h1' } }, { route: { path: '/h2' } }]) p_member_held(route.path);
+
+for (const [, r] of [['a', { path: '/t1' }], ['b', { path: '/t2' }]] as const) p_member_tuple(r.path);
+
+for (const r of [{ path: '/again' }]) p_member_again(r.path);
+
+// Not read: an element the code does not state whole, a key no element
+// writes plainly, a key read by a computed name, or an element something
+// may change.
+for (const r of [{ path: '/c1' }, { path: make()[0] }]) p_member_computed(r.path);
+
+for (const r of [{ [dyn]: '/k' }]) p_member_computed_key(r.path);
+
+for (const r of [{ path: '/d' }]) p_member_dynamic(r[dyn as 'path']);
+
+for (const r of [{ path: '/m1' }, { other: '/m2' }]) p_member_missing(r.path);
+
+for (const r of [{ path: '/e' }]) {
+  touch(r);
+  p_member_handed(r.path);
+}
+
+for (const r of [{ path: '/w' }]) {
+  r.path = '/z';
+  p_member_written(r.path);
+}
+
+const REACHED = [{ path: '/r' }];
+touch(REACHED[0]);
+for (const r of REACHED) p_member_reached(r.path);
+
+export const SHARED = [{ path: '/s1' }, { path: '/s2' }] as const;
+for (const r of SHARED) p_member_exported(r.path);
