@@ -5220,6 +5220,26 @@ mod tests {
         (assigned, census.entries_kept(&key, false))
     }
 
+    /// K3 body keys: a registry whose keys are listed through `Object.keys`
+    /// is still read only through its keys, so it is kept. `Object.values`
+    /// and a plain hand-on hand its entries on and stay refused.
+    #[test]
+    fn a_registry_whose_keys_are_read_through_object_keys_is_kept() {
+        let kept = |source: &str| {
+            let (census, key) = census_over(source, "r");
+            (census.object_kept(&key), census.object_held(&key))
+        };
+        assert_eq!(
+            kept("const r = { a: 1 }; if (Object.keys(r).length) {}"),
+            (true, true)
+        );
+        assert_eq!(
+            kept("const r = { a: 1 }; Object.values(r);"),
+            (false, false)
+        );
+        assert_eq!(kept("const r = { a: 1 }; f(r);"), (false, false));
+    }
+
     /// carrick#3670 (ruling R5): a module binding holds the objects placed in
     /// it when, besides member reads, it is only written in place, tested or
     /// returned. Handing it to a call, aliasing it, writing through it, or a
@@ -5729,6 +5749,25 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         assert_eq!(
             named_callee(&resolver, &on.inputs, "scoped.ts", 16),
             Some(vec![definition("sendBlock")])
+        );
+    }
+
+    /// K3 body keys: a block key read in part (one branch a definition, the
+    /// other a call nothing in the repo answers) keeps the answer the rows
+    /// gave before, stop included; the mark on locals does not make it
+    /// fail closed.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_block_key_read_in_part_keeps_its_answer() {
+        let Some(on) = walked("receiver-lazy-registry-body", ".", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "partial.ts", 10),
+            Some(vec![Got::Stop(Stop::UnreadExpression)])
         );
     }
 
