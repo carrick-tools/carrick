@@ -890,6 +890,7 @@ mod tests {
                 service: "orders-api".into(),
                 key: "SERVER->CLIENT order:shipped".into(),
                 file: "src/realtime.ts".into(),
+                site: "src/realtime.ts:5".into(),
             },
             confirmed: true,
         }
