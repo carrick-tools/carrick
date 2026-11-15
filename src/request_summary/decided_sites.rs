@@ -57,7 +57,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 
 use super::resolve::{
     CallAt as ChainCall, Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt,
-    TextPart, TextValue,
+    TextPart, TextValue, chains_agree,
 };
 use super::row_calls::Reach;
 use super::stop::Stop;
@@ -2790,6 +2790,37 @@ fn same_values(one: &[MadeWith<'_>], other: &[MadeWith<'_>]) -> bool {
 struct PiecesRead<'a> {
     all: Option<Vec<MadeWith<'a>>>,
     kept: Option<Vec<MadeWith<'a>>>,
+    /// The root's own-factory calls agree with none of the values, so
+    /// `kept` is every value (carrick#3504 QW-2b).
+    unmatched: bool,
+}
+
+/// The values a root's instance came through: those read with no caller, or
+/// at a chain that agrees with some non-empty path of own-factory calls
+/// `via` (innermost first, as the chains are). A root with no non-empty path
+/// is not filtered, and where no value agrees every value is kept: the walk
+/// then names the instance no better than the resolver, so it must not name
+/// it worse (carrick#3504 QW-2b).
+fn kept_by_via(values: &[PiecedText], via: &[Vec<ChainCall>]) -> Vec<PiecedText> {
+    let kept: Vec<PiecedText> = values
+        .iter()
+        .filter(|value| agrees_with_via(value, via))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        values.to_vec()
+    } else {
+        kept
+    }
+}
+
+/// Whether one value is one `via` filters in: no path to filter by, no
+/// caller on the value, or a chain that agrees with some non-empty path.
+fn agrees_with_via(value: &PiecedText, via: &[Vec<ChainCall>]) -> bool {
+    let mut paths = via.iter().filter(|path| !path.is_empty()).peekable();
+    paths.peek().is_none()
+        || value.callers.is_empty()
+        || paths.any(|path| chains_agree(&value.callers, path))
 }
 
 /// One walk of the join ([`Walk::joins`]): the calls of the site, and the
@@ -3580,8 +3611,9 @@ impl<'a> Walk<'a, '_> {
             // B10-2c1) replaces the walk's values only where both readings
             // agree, or where only the resolver reads the root and the cap
             // trimmed no walk; else the walk's stand, counted.
-            let through = self.made_through_callers(maker, slot);
+            let through = self.made_through_callers(maker, slot, &call.via);
             let census = &mut self.out.maker_names;
+            census.via_unmatched += usize::from(through.unmatched);
             match (read, through.all, through.kept) {
                 (true, Some(all), Some(kept)) if same_values(&all, &today) => {
                     census.same += 1;
@@ -3651,22 +3683,50 @@ impl<'a> Walk<'a, '_> {
     /// an omitted argument with no default, a reassigned or recursive value,
     /// a capped chain), a value [`falls_back`] names, a caller the site path
     /// does not list, or pieces still unknown or open on a parameter.
-    fn made_through_callers(&self, maker: Placed<'a>, slot: &ArgSlot) -> PiecesRead<'a> {
-        let all = self.read_through_callers(maker, slot);
+    fn made_through_callers(
+        &self,
+        maker: Placed<'a>,
+        slot: &ArgSlot,
+        via: &[Vec<ChainCall>],
+    ) -> PiecesRead<'a> {
+        let none = PiecesRead {
+            all: None,
+            kept: None,
+            unmatched: false,
+        };
+        let Some(term) = dry_run_term(maker.call, slot) else {
+            return none;
+        };
+        let values = self.pieces.pieces_through_callers(maker.file, &term);
+        if values.is_empty() {
+            return none;
+        }
+        // The filter runs on the raw values, before any is checked: one
+        // unread sibling caller of a factory must not send this instance
+        // back to the walk's reading.
+        let kept = kept_by_via(&values, via);
+        let unmatched = !values.iter().any(|value| agrees_with_via(value, via));
+        let all = self.read_through_callers(maker, slot, &values);
+        let kept = if kept.len() == values.len() {
+            all.clone()
+        } else {
+            self.read_through_callers(maker, slot, &kept)
+        };
         PiecesRead {
-            kept: all.clone(),
             all,
+            kept,
+            unmatched,
         }
     }
 
-    /// [`Self::made_through_callers`]' values, every one.
-    fn read_through_callers(&self, maker: Placed<'a>, slot: &ArgSlot) -> Option<Vec<MadeWith<'a>>> {
+    /// [`Self::made_through_callers`]' values for `values`, each read once.
+    fn read_through_callers(
+        &self,
+        maker: Placed<'a>,
+        slot: &ArgSlot,
+        values: &[PiecedText],
+    ) -> Option<Vec<MadeWith<'a>>> {
         use super::HoleReason;
-        let term = dry_run_term(maker.call, slot)?;
-        let values = self.pieces.pieces_through_callers(maker.file, &term);
-        if values.is_empty() {
-            return None;
-        }
         let stops = values.iter().any(|value| {
             value.parts.iter().any(|part| {
                 matches!(
@@ -3692,7 +3752,7 @@ impl<'a> Walk<'a, '_> {
                 .map(|key| (placed.file.to_path_buf(), key.to_string()))
         };
         let mut made = Vec::with_capacity(values.len());
-        for value in &values {
+        for value in values {
             let n = value.callers.len();
             let callers: Vec<Placed<'a>> = value
                 .callers
@@ -5693,6 +5753,36 @@ fn loop_key(stmt: &ForOfStmt) -> Option<(String, String)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// carrick#3504 QW-2b: the filter by an instance's own-factory calls
+    /// keeps the values read at a chain that agrees with one of them, and
+    /// every value where none does (so it never names an instance worse than
+    /// the unfiltered read).
+    #[test]
+    fn a_via_that_agrees_with_no_value_keeps_every_value() {
+        let at = |lo: u32| ChainCall {
+            file: PathBuf::from("src/a.ts"),
+            lo,
+            hi: lo + 5,
+            fills: (PathBuf::from("src/a.ts"), "make".to_string()),
+        };
+        let value = |callers: Vec<ChainCall>| PiecedText {
+            parts: Vec::new(),
+            callers,
+            from_type: false,
+        };
+        let values = vec![value(vec![at(1)]), value(vec![at(2)]), value(Vec::new())];
+        let kept = |via: Vec<Vec<ChainCall>>| kept_by_via(&values, &via);
+        assert_eq!(
+            kept(vec![vec![at(1)]]),
+            vec![values[0].clone(), values[2].clone()]
+        );
+        assert_eq!(kept(vec![vec![at(3)]]), vec![values[2].clone()]);
+        let only = vec![values[0].clone(), values[1].clone()];
+        assert_eq!(kept_by_via(&only, &[vec![at(3)]]), only);
+        assert_eq!(kept_by_via(&only, &[Vec::new()]), only);
+        assert_eq!(kept_by_via(&only, &[]), only);
+    }
 
     /// carrick#3608: a key the caller's object leaves out (or no object at
     /// all) is the callee's default; a key it writes is its own; with a

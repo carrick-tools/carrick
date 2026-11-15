@@ -281,13 +281,16 @@ impl DryRunNames {
 /// so the resolver's values are taken; `gain`: only the resolver read it, so
 /// its values are taken; `differs`: both read it and disagree, so today's
 /// stand; `fallback`: the resolver's read stops (a hole, a parameter, a cap),
-/// so today's stand.
+/// so today's stand. `via_unmatched` (carrick#3504 QW-2b): roots whose
+/// own-factory calls agree with none of the resolver's values, so every value
+/// was kept; counted beside the other words, not instead of one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MakerNames {
     pub same: usize,
     pub gain: usize,
     pub differs: usize,
     pub fallback: usize,
+    pub via_unmatched: usize,
 }
 
 /// The one debug line per service.
@@ -317,6 +320,7 @@ pub fn log(
         gain = maker.gain,
         differs = maker.differs,
         fallback = maker.fallback,
+        via_unmatched = maker.via_unmatched,
         "site-path maker names: maker roots whose name the resolver's caller read agrees with the site path's walk on, reads where the walk does not, disagrees on, or does not read"
     );
 }
