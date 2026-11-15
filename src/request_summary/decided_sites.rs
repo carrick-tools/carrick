@@ -2067,7 +2067,14 @@ fn slot_value(call: &CallIr, slot: &ArgSlot) -> Vec<Piece> {
 /// it was read at ([`super::FileIr::arg_pieces`]); else its text; else
 /// nothing they read.
 fn part_pieces(resolver: &Resolver<'_>, part: &TextPart, level: usize) -> Vec<Piece> {
-    let at = |span: &SpanAt| pieces_at(resolver, span);
+    let at = |span: &SpanAt| {
+        resolver
+            .inputs_for(&span.file)
+            .files
+            .get(&span.file)
+            .and_then(|ir| ir.arg_pieces.get(&(span.lo, span.hi)))
+            .cloned()
+    };
     if let Some(hop) = part.through.get(level) {
         let mut pieces = at(&hop.read).unwrap_or_else(|| vec![Piece::Unknown]);
         for key in &hop.keys {
@@ -2119,41 +2126,52 @@ pub(in crate::request_summary) fn dry_run_term(
     }
 }
 
-/// What the request summaries read at `span` ([`super::FileIr::arg_pieces`]).
-fn pieces_at(resolver: &Resolver<'_>, span: &SpanAt) -> Option<Vec<Piece>> {
-    resolver
-        .inputs_for(&span.file)
-        .files
-        .get(&span.file)
-        .and_then(|ir| ir.arg_pieces.get(&(span.lo, span.hi)))
-        .cloned()
+/// Whether `pieces` read a parameter of the function they are read in.
+fn reads_param(pieces: &[Piece]) -> bool {
+    pieces.iter().any(|piece| {
+        matches!(
+            piece,
+            Piece::Param(..) | Piece::ParamKey(..) | Piece::Outer(..)
+        )
+    })
 }
 
-/// Why a value the resolver read as parts sends the whole labelled call back
-/// to the site path's own walk (carrick#3504 B10-2b): a part through no
-/// parameter that still reads one (the resolver stopped at a parameter, or a
-/// builder is handed one: Q7, by its hole's word, `stated` for a text), a
-/// chain the cap ended (`capped`), or a hole the summaries read nothing at,
-/// whose reason a render would lose (`unrendered`, N5). `None`: the value
-/// renders.
-fn falls_back(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
+/// Why the resolver's pieces read of a name falls back to the site path's
+/// walk at the labelled call's own function, by word: a part through no
+/// parameter that still reads one there (the resolver stopped at a
+/// parameter, by its hole's word, or a builder is handed one, `stated`).
+/// [`falls_back`] adds the rest.
+fn param_fallback(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
     value.parts.iter().find_map(|part| {
-        if let Some(word) = unaccounted(resolver, part, 0) {
-            return Some(word);
-        }
-        match &part.value {
-            PartValue::Hole(super::HoleReason::FanOutCap) => Some("capped"),
-            PartValue::Hole(_)
-                if part
-                    .at
-                    .as_ref()
-                    .and_then(|at| pieces_at(resolver, at))
-                    .is_none() =>
-            {
-                Some("unrendered")
+        (part.through.is_empty() && reads_param(&part_pieces(resolver, part, 0))).then(|| {
+            match &part.value {
+                PartValue::Hole(reason) => Stop::from(*reason).as_str(),
+                PartValue::Lit { .. } => "stated",
             }
-            _ => None,
-        }
+        })
+    })
+}
+
+/// Why a value of the resolver's pieces read is not taken in place of the
+/// site path's own walk, by word (carrick#3504 B10-2b/B10-2c1): the dry
+/// run's [`param_fallback`]; a hole part the summaries read nothing at, so
+/// its render loses the hole's reason (`unrendered`, N5); a chain the cap
+/// ended (`capped`). `None` where the value can be taken.
+fn falls_back(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
+    if let Some(word) = param_fallback(resolver, value) {
+        return Some(word);
+    }
+    let read_at = |span: &SpanAt| {
+        resolver
+            .inputs_for(&span.file)
+            .files
+            .get(&span.file)
+            .is_some_and(|ir| ir.arg_pieces.contains_key(&(span.lo, span.hi)))
+    };
+    value.parts.iter().find_map(|part| match part.value {
+        PartValue::Hole(super::HoleReason::FanOutCap) => Some("capped"),
+        PartValue::Hole(_) if !part.at.as_ref().is_some_and(read_at) => Some("unrendered"),
+        _ => None,
     })
 }
 
@@ -2161,7 +2179,9 @@ fn falls_back(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static st
 /// labelled call, holds a parameter no hop accounts for (Q7): it went
 /// through no more than `level` parameters, and what it renders as there
 /// still waits on a caller (a parameter, or a hole of an unread call open
-/// on one: today's walk fills those, [`holds_open`]).
+/// on one: today's walk fills those, [`holds_open`]). Wider than
+/// [`param_fallback`], which the maker reading shares: on the site path a
+/// builder handed the function's own parameter also waits on a caller.
 fn unaccounted(resolver: &Resolver<'_>, part: &TextPart, level: usize) -> Option<&'static str> {
     (part.through.len() <= level && holds_open(&part_pieces(resolver, part, level))).then(|| {
         match &part.value {
@@ -2279,45 +2299,6 @@ impl NameRead {
         matches!(self, NameRead::Pieces { values, .. }
             if values.iter().any(|(_, on)| on.held.contains(&k)))
     }
-}
-
-/// Why the resolver's pieces read of a name falls back to the site path's
-/// walk at the labelled call's own function, by word: a part through no
-/// parameter that still reads one there (the resolver stopped at a
-/// parameter, by its hole's word, or a builder is handed one, `stated`).
-/// The dry run counts it ([`dry_run_name`]); [`falls_back`] adds the rest.
-fn param_fallback(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
-    value.parts.iter().find_map(|part| {
-        (part.through.is_empty() && reads_param(&part_pieces(resolver, part, 0))).then(|| {
-            match &part.value {
-                PartValue::Hole(reason) => Stop::from(*reason).as_str(),
-                PartValue::Lit { .. } => "stated",
-            }
-        })
-    })
-}
-
-/// Why a value of the resolver's pieces read is not taken in place of the
-/// site path's own walk, by word (carrick#3504 B10-2b/B10-2c1): the dry
-/// run's [`param_fallback`]; a hole part the summaries read nothing at, so
-/// its render loses the hole's reason (`unrendered`, N5); a chain the cap
-/// ended (`capped`). `None` where the value can be taken.
-fn falls_back(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
-    if let Some(word) = param_fallback(resolver, value) {
-        return Some(word);
-    }
-    let read_at = |span: &SpanAt| {
-        resolver
-            .inputs_for(&span.file)
-            .files
-            .get(&span.file)
-            .is_some_and(|ir| ir.arg_pieces.contains_key(&(span.lo, span.hi)))
-    };
-    value.parts.iter().find_map(|part| match part.value {
-        PartValue::Hole(super::HoleReason::FanOutCap) => Some("capped"),
-        PartValue::Hole(_) if !part.at.as_ref().is_some_and(read_at) => Some("unrendered"),
-        _ => None,
-    })
 }
 
 /// Where the payload `slot` names at the labelled call (the last of `down`)
@@ -9054,14 +9035,15 @@ pub(crate) mod tests {
         out
     }
 
-    /// carrick#3504 B10-2b (M4): a key of an object a caller passes by name
-    /// (an exported `const`) stays unread at that caller, for a broker topic
-    /// and for an HTTP path: the resolver reads no entry of an object an
-    /// importer or a callee may change (`entries_kept`), so its part is a
-    /// hole with nothing the summaries read, and today's walk stands
-    /// (`unrendered`, N5).
+    /// carrick#3504 B10-2b (M4): a key of an exported object a caller passes
+    /// by name stays unread at that caller, for a broker topic and for an
+    /// HTTP path: the resolver reads no entry of an object an importer or a
+    /// callee may change (`entries_kept`), so its part is a hole with nothing
+    /// the summaries read, and today's walk stands (`unrendered`, N5). A
+    /// module object of the caller's own file is named, as today's walk
+    /// names it.
     #[test]
-    fn a_key_of_an_object_a_caller_passes_by_name_stays_unread() {
+    fn a_key_of_an_exported_object_a_caller_passes_by_name_stays_unread() {
         const OPTS: &str = "export const OPTS = { topic: \"orders.made\" };\n\
              export const ROUTE = { url: \"/orders/made\" };\n";
         const SEND: &str = "import { publish } from '@fixture/pub';\n\
@@ -9069,11 +9051,17 @@ pub(crate) mod tests {
              function send(opts: { topic: string }) { return publish(opts.topic, {}); }\n\
              export function ship() { return send(OPTS); }\n\
              function get(opts: { url: string }) { return fetch(opts.url); }\n\
-             export function load() { return get(ROUTE); }\n";
+             export function load() { return get(ROUTE); }\n\
+             const LOCAL = { topic: \"local.made\" };\n\
+             export function shipLocal() { return send(LOCAL); }\n";
         let decided = decided_with_rows(&[("src/n-opts.ts", OPTS), ("src/n-send.ts", SEND)]);
         assert_eq!(
             in_file(&decided, "src/n-send.ts"),
-            vec!["site 4 None".to_string(), "site 6 None".to_string()],
+            vec![
+                "site 4 None".to_string(),
+                "site 6 None".to_string(),
+                "site 8 Some(\"local.made\")".to_string(),
+            ],
         );
         assert!(
             decided.dry_run_names.unrendered >= 2,
