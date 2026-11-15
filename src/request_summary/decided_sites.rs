@@ -8587,4 +8587,111 @@ pub(crate) mod tests {
             assert_eq!(makes(file), vec![wanted], "{file}: {every:#?}");
         }
     }
+
+    /// The `factory-closure` fixture (an HTTP client, `fetch`, and a broker
+    /// export, `publish`) with `files` written into its service, walked with
+    /// rows, discovered and decided as a scan decides it (carrick#3504
+    /// B10-2b): the resolver's pieces read needs the compiler rows.
+    fn decided_with_rows(files: &[(&str, &str)]) -> Decided {
+        let on = super::super::fixture_walk::walked(
+            "factory-closure",
+            "services/web",
+            "web",
+            files,
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        assert!(on.inputs.positions.is_some(), "the walk has rows");
+        let text = std::fs::read_to_string(
+            manifest().join("tests/fixtures/factory-closure/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let discovery = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let sites: Vec<DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        decided_sites(
+            &on.inputs,
+            &on.repo,
+            &sites,
+            &SiteLabel::from_exports(&answer.exports),
+        )
+    }
+
+    /// Every site and lead of `decided` in a file ending `file`, by line,
+    /// with its name and a lead's reason, for the assertions below.
+    fn in_file(decided: &Decided, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = decided
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with(file))
+            .map(|site| format!("site {} {:?}", site.line, site.name_text()))
+            .chain(
+                decided
+                    .leads
+                    .iter()
+                    .filter(|lead| lead.file.ends_with(file))
+                    .map(|lead| format!("lead {} {:?}", lead.line, lead.reason)),
+            )
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// carrick#3504 B10-2b (M4): a key of an object a caller passes by name
+    /// (an imported `const`) names the site at that caller, for a broker
+    /// topic and for an HTTP path. The site path's own walk fills the key
+    /// from no object it can read there.
+    #[test]
+    fn a_key_of_an_object_a_caller_passes_by_name_names_the_site() {
+        const OPTS: &str = "export const OPTS = { topic: \"orders.made\" };\n\
+             export const ROUTE = { url: \"/orders/made\" };\n";
+        const SEND: &str = "import { publish } from '@fixture/pub';\n\
+             import { OPTS, ROUTE } from './n-opts';\n\
+             function send(opts: { topic: string }) { return publish(opts.topic, {}); }\n\
+             export function ship() { return send(OPTS); }\n\
+             function get(opts: { url: string }) { return fetch(opts.url); }\n\
+             export function load() { return get(ROUTE); }\n";
+        let decided = decided_with_rows(&[("src/n-opts.ts", OPTS), ("src/n-send.ts", SEND)]);
+        assert_eq!(
+            in_file(&decided, "src/n-send.ts"),
+            vec![
+                "site 4 Some(\"orders.made\")".to_string(),
+                "site 6 Some(\"/orders/made\")".to_string(),
+            ],
+        );
+    }
+
+    /// carrick#3504 B10-2b (N3): a name a field carries, set by the
+    /// constructor from its parameter, is placed at the call made on the
+    /// construction (`new Hub("hub.events").send()`), each construction with
+    /// its own name. Today the site is the labelled call, unnamed.
+    #[test]
+    fn a_name_a_field_carries_is_placed_at_the_call_on_its_construction() {
+        const HUB: &str = "import { publish } from '@fixture/pub';\n\
+             class Hub {\n\
+             \x20 channel: string;\n\
+             \x20 constructor(channel: string) { this.channel = channel; }\n\
+             \x20 send() { return publish(this.channel, {}); }\n\
+             }\n\
+             export function go() { return new Hub(\"hub.events\").send(); }\n\
+             export function other() { return new Hub(\"hub.other\").send(); }\n";
+        let decided = decided_with_rows(&[("src/n-hub.ts", HUB)]);
+        assert_eq!(
+            in_file(&decided, "src/n-hub.ts"),
+            vec![
+                // The labelled call's own walk meets no construction: N3
+                // keeps today's site there, counted `field_unplaced`.
+                "site 5 None".to_string(),
+                "site 7 Some(\"hub.events\")".to_string(),
+                "site 8 Some(\"hub.other\")".to_string(),
+            ],
+        );
+    }
 }
