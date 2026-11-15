@@ -3615,7 +3615,7 @@ impl<'a> Walk<'a, '_> {
             // callers ([`Self::maker_stop`]): no question is asked for it. An
             // instance the walk does not reach, or a walk the cap trimmed,
             // stays unnamed as before.
-            if !unreached
+            if true
                 && !budget.trimmed
                 && let Some(stop) = self.maker_stop(&slots, None)
             {
