@@ -2130,8 +2130,8 @@ pub(crate) fn probe_protocol(key: &OperationKey) -> ProbeProtocol {
 }
 
 /// Why a procedure pair is left to the consumer's own code, as stored.
-const PROCEDURE_PAIR_REASON: &str = "a procedure call's type is its router's own, so the pair is \
-     judged only by type-checking the consumer's code";
+const PROCEDURE_PAIR_REASON: &str = "a procedure call's type is its router's own, so only \
+     type-checking the consumer's code can judge the pair";
 
 /// The pair of a procedure call and the procedure's response (carrick#937).
 /// The consumer has no manifest entry, so the pair is built from the call row
@@ -3531,11 +3531,11 @@ const RETYPE_NOTE: &str = "judged by retyping the consumer's call with the produ
 
 /// Said on every procedure pair the consumer's own code decided
 /// (carrick#937).
-const PROCEDURE_NOTE: &str = "judged by type-checking the consumer's own code against the \
+const PROCEDURE_NOTE: &str = "judged by type-checking the consumer's code against the \
      router's type, with and without the call's result";
 
 /// The abstention lead of a procedure pair the consumer's code did not decide.
-const PROCEDURE_ABSTAIN_LEAD: &str = "type-checking the consumer's own code did not decide it";
+const PROCEDURE_ABSTAIN_LEAD: &str = "type-checking the consumer's code was inconclusive";
 
 /// The words a retype answer is stored with: the note a decided pair carries
 /// and the lead of an abstention.
@@ -3559,8 +3559,8 @@ const PROCEDURE_FORM: RetypeForm = RetypeForm {
 
 const PROCEDURE_NOT_ON_DISK: &str = "the consumer's code was not on disk in this run";
 const PROCEDURE_CALL_NOT_RECORDED: &str = "the consumer's call was not recorded for the check";
-const PROCEDURE_OUTPUT_UNUSABLE: &str = "the producer's published output is empty or holds 'any' \
-     or 'unknown', so the call's result cannot be checked to carry it";
+const PROCEDURE_OUTPUT_UNUSABLE: &str = "the producer's output is empty or holds 'any' or \
+     'unknown', so the call's result cannot be checked against it";
 
 /// Said on a pair whose producer type is wider than what its handler returns
 /// (carrick#1516), before the places the published type fails.
@@ -7725,9 +7725,9 @@ mod tests {
         assert_eq!(
             outcome.unresolved_reason.as_deref(),
             Some(
-                "a procedure call's type is its router's own, so the pair is judged only by \
-                 type-checking the consumer's code; type-checking the consumer's own code did \
-                 not decide it: the consumer's code was not on disk in this run"
+                "a procedure call's type is its router's own, so only type-checking the \
+                 consumer's code can judge the pair; type-checking the consumer's code was \
+                 inconclusive: the consumer's code was not on disk in this run"
             )
         );
         assert_eq!(outcome.bucket, VerdictBucket::Unverifiable);
