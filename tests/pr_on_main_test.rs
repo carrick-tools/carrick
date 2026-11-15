@@ -3401,7 +3401,7 @@ fn assert_indirect_caller_quiet(payload: &serde_json::Value) {
     assert_quiet(payload, &["/api/v1/parcels", "/api/v1/refunds"]);
     assert_quiet(payload, &["/api/v1/returns", "/api/v1/carriers"]);
     assert!(
-        findings_of(&payload)
+        findings_of(payload)
             .iter()
             .all(|f| f["kind"] != "type_mismatch"),
         "a type_mismatch on a quiet PR: {payload:#}"
