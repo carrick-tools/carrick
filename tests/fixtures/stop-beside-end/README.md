@@ -73,5 +73,5 @@ no reason; it never replaces one the walk saved.
 
 | Line | Call | Unread site at the call |
 |---|---|---|
-| 6 | `sendThenRun(ports[name], run)` (reaches an end) | `unread_expression`, `stop_at` `specific.ts:3` |
+| 6 | `sendThenRun(ports[name], run)` (reaches an end) | `value_never_bound`, `stop_at` `specific.ts:3` |
 | 10 | `thenRunOnly(ports[name], run)` (twin) | `value_never_bound`, `stop_at` `specific.ts:9` (not `unread_expression`) |

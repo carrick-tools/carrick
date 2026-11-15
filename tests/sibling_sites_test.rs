@@ -1311,10 +1311,10 @@ fn a_hole_handed_into_a_sibling_keeps_a_specific_reason_the_walk_saved() {
         "{}",
         app["unread_sites"]
     );
-    // The twin that reaches an end: the hole is the stop the walk saved.
+    // The call that reaches an end: the reason saved beside it is the same.
     assert_eq!(
         unread_at(app, relay, 6).as_deref(),
-        Some("unread_expression callee"),
+        Some("value_never_bound callee"),
         "{}",
         app["unread_sites"]
     );

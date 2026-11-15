@@ -1358,6 +1358,8 @@ struct Outcome<'a> {
     /// as the stop of a site that saved none (carrick#4486). A specific
     /// stop absorbed after it takes its place; it never pushes one out.
     filled: bool,
+    /// With `beside`: it is a filled hole, replaced the same way.
+    beside_filled: bool,
     /// The shallowest definition still being read that the walk came back
     /// to: until it is done, this answer is not final.
     cycle_at: Option<usize>,
@@ -1431,7 +1433,7 @@ impl<'a> Outcome<'a> {
     fn drop_stop_for_ends(&mut self, own: impl Fn(&Path) -> bool) {
         if let Some(read_in) = self.stop_read_in
             && self.cycle_at.is_none()
-            && self.beside.is_none()
+            && (self.beside.is_none() || (self.beside_filled && !self.filled))
             && !own(read_in)
             && !matches!(
                 self.stop,
@@ -1439,7 +1441,9 @@ impl<'a> Outcome<'a> {
             )
         {
             self.beside = self.stop.take();
+            self.beside_filled = self.filled;
         }
+        self.filled = false;
         self.stop = None;
         self.stop_read_in = None;
     }
@@ -1499,8 +1503,11 @@ impl<'a> Outcome<'a> {
             self.valued = other.valued;
             self.filled = other.filled;
         }
-        if self.beside.is_none() {
+        if self.beside.is_none()
+            || (self.beside_filled && other.beside.is_some() && !other.beside_filled)
+        {
             self.beside = other.beside;
+            self.beside_filled = other.beside_filled;
         }
         self.missed |= other.missed;
         self.unanswered.extend(other.unanswered);
