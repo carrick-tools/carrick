@@ -216,7 +216,7 @@ fn a_method_decorated_with_a_labelled_message_decorator_is_a_listener() {
 
 /// A decorator the store does not label states nothing, whatever its
 /// argument says: no socket row names the tracing decorator's labels, and
-/// the gateway service has no socket row but its three listeners.
+/// the gateway file has no socket row but its three listeners.
 #[test]
 fn a_decorator_with_no_label_states_nothing() {
     let lobby = &scanned()["lobby"];
@@ -226,7 +226,11 @@ fn a_decorator_with_no_label_states_nothing() {
             .all(|row| !row.key.ends_with("lobby.trace") && !row.key.ends_with("lobby.idle")),
         "{lobby:#?}"
     );
-    assert_eq!(lobby.len(), 3, "{lobby:#?}");
+    let in_gateway: Vec<_> = lobby
+        .iter()
+        .filter(|row| row.file_path.starts_with(&format!("{GATEWAY}:")))
+        .collect();
+    assert_eq!(in_gateway.len(), 3, "{lobby:#?}");
 }
 
 /// A decorator whose name slot is a type parameter with no constraint and a
@@ -262,33 +266,110 @@ fn a_decorator_whose_name_is_an_unbounded_type_parameter_states_no_row_and_saves
     assert_eq!(at[0]["slot"], "name", "{}", at[0]);
 }
 
-/// A method decorated through an in-repo decorator factory (carrick#3688,
-/// the stop half of #3781): the factory's body holds the labelled
-/// decorator's call, so the method saves one unread site at its name, with
-/// the factory as the callee, and states no row. A factory over a
-/// decorator the store does not label saves nothing at its method.
-#[test]
-fn a_method_decorated_through_an_in_repo_factory_saves_a_stop_at_the_method() {
-    let scan = scan_once();
-    let lobby = &scan.services["lobby"];
-    assert!(
-        lobby.iter().all(|row| !row.key.ends_with("w:wrapped")),
-        "no row is stated for the wrapped handler: {lobby:#?}"
-    );
-    let wrapped: Vec<_> = scan.unread["lobby"]
+const WRAPPED: &str = "services/lobby/src/wrapped.ts";
+const COMPOSED: &str = "services/lobby/src/composed.ts";
+const IMPORTED: &str = "services/lobby/src/imported.ts";
+const DECORATORS: &str = "services/lobby/src/decorators.ts";
+
+/// The lobby's unread sites at `file:line`.
+fn unread_at(file: &str, line: u64) -> Vec<&'static serde_json::Value> {
+    scan_once().unread["lobby"]
         .iter()
-        .filter(|site| site["file"] == "services/lobby/src/wrapped.ts")
-        .filter(|site| site["line"] == 20 || site["line"] == 23)
-        .collect();
-    assert_eq!(
-        wrapped.len(),
-        1,
-        "{wrapped:#?} of {:#?}",
-        scan.unread["lobby"]
+        .filter(|site| site["file"] == file && site["line"] == line)
+        .collect()
+}
+
+/// The lobby states the listener of `event` at `file:line`, the player's
+/// send at `sent_at` of its client has the same key, and nothing is saved
+/// unread at the method.
+fn assert_listener_paired(event: &str, file: &str, line: u64, sent_at: u32) {
+    let services = scanned();
+    let (lobby, player) = (&services["lobby"], &services["player"]);
+    let key = format!("socket|client_to_server|{event}");
+    let listener = row("endpoints", &key, &format!("{file}:{line}"));
+    assert!(lobby.contains(&listener), "{listener:?} in {lobby:#?}");
+    let emit = row("calls", &key, &format!("{CLIENT}:{sent_at}"));
+    assert!(player.contains(&emit), "{emit:?} in {player:#?}");
+    let saved = unread_at(file, line);
+    assert!(
+        saved.is_empty(),
+        "nothing is saved at the method: {saved:#?}"
     );
-    let site = wrapped[0];
-    assert_eq!(site["line"], 20, "{site}");
-    assert_eq!(site["slot"], "name", "{site}");
-    assert_eq!(site["reason"], "own_function", "{site}");
-    assert_eq!(site["callee"], "Handles", "{site}");
+}
+
+/// A method decorated through an in-repo decorator factory whose returned
+/// value applies the labelled decorator (carrick#3781): the factory's call
+/// of the decorator is the decorator the method gets, so the method is its
+/// listener, named by what the method's decorator passes, and nothing is
+/// saved there. A factory over a decorator the store does not label states
+/// nothing and saves nothing at its method.
+#[test]
+fn a_method_decorated_through_an_in_repo_factory_is_the_decorators_listener() {
+    assert_listener_paired("w:wrapped", WRAPPED, 20, 14);
+    let lobby = &scanned()["lobby"];
+    assert!(
+        lobby.iter().all(|row| !row.key.ends_with("w:tagged")),
+        "{lobby:#?}"
+    );
+    let tagged = unread_at(WRAPPED, 23);
+    assert!(tagged.is_empty(), "{tagged:#?}");
+}
+
+/// The factory hands back a library combinator's call that holds the
+/// labelled decorator's call among its arguments.
+#[test]
+fn a_factory_over_a_library_combinator_is_the_decorators_listener() {
+    assert_listener_paired("w:combined", COMPOSED, 27, 18);
+}
+
+/// The factory is declared in another file and imported.
+#[test]
+fn a_factory_in_another_file_is_the_decorators_listener() {
+    assert_listener_paired("w:imported", IMPORTED, 5, 26);
+}
+
+/// The decorator passes a module constant: its text is the name.
+#[test]
+fn a_factory_argument_read_through_a_constant_is_the_listeners_name() {
+    assert_listener_paired("w:const", COMPOSED, 33, 22);
+}
+
+/// A factory that calls the labelled decorator but hands back another one
+/// states nothing: the method keeps the factory's stop (carrick#3688 C1).
+#[test]
+fn a_factory_that_does_not_return_the_decorator_states_nothing() {
+    let lobby = &scanned()["lobby"];
+    assert!(
+        lobby.iter().all(|row| !row.key.ends_with("w:discarded")),
+        "{lobby:#?}"
+    );
+    let saved = unread_at(COMPOSED, 30);
+    assert_eq!(saved.len(), 1, "{saved:#?}");
+    assert_eq!(saved[0]["reason"], "own_function", "{}", saved[0]);
+    assert_eq!(saved[0]["slot"], "name", "{}", saved[0]);
+    assert_eq!(saved[0]["callee"], "Logs", "{}", saved[0]);
+}
+
+/// The unread sites at `file:line` that reached the labelled decorator.
+fn saved_decorator_at(file: &str, line: u64) -> Vec<&'static serde_json::Value> {
+    unread_at(file, line)
+        .into_iter()
+        .filter(|site| site["labelled_end"]["export"] == "OnMessage")
+        .collect()
+}
+
+/// Once every method decorated through a factory is read, the factory's
+/// body saves nothing of the labelled decorator: every use of its call was
+/// read. (The unlabelled exports it also calls keep their own saves.)
+#[test]
+fn the_factory_body_saves_nothing_once_every_caller_is_read() {
+    for (file, line) in [
+        (WRAPPED, 13),
+        (COMPOSED, 4),
+        (COMPOSED, 21),
+        (DECORATORS, 12),
+    ] {
+        let saved = saved_decorator_at(file, line);
+        assert!(saved.is_empty(), "{file}:{line}: {saved:#?}");
+    }
 }
