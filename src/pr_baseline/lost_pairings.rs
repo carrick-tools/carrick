@@ -278,7 +278,6 @@ pub fn mark_lost_pairings(
                 call.service == consumer.service
                     && call.file == consumer.file
                     && call.key == consumer.key
-                    && (!call.procedure || call.sites.contains(&consumer.site))
                     && (!call.held_open || held_by_removal(call, pairing.confirmed, main))
             }) {
                 let group = producer_lost
