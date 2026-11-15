@@ -106,8 +106,8 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `trpc-resolver-body` (`rpc-api`) | a mutation's body | empty delta, no introduced risk | passes |
 | `trpc-adapter-prefix-moved` (`rpc-api`) | the adapter's endpoint `/api/trpc` to `/trpc` | every procedure new under `/trpc`, removed under `/api/trpc` | passes |
 | `trpc-output-field-removed` (`rpc-api`) | `orders.list` output loses `total`, which the client reads | `type_mismatch` at `src/web/orders-view.ts:7` | ignored, carrick#937 (no procedure client call is read) |
-| `trpc-called-procedure-removed` (`rpc-shelf`) | `shelf.get`, which `web` calls, is deleted from the router | delta removed `GET /api/rpc/shelf.get`; the correct check also carries `removed_still_called` and fails | stage test passes; `_marking` ignored, carrick#3778 |
-| `trpc-called-procedure-renamed` (`rpc-shelf`) | `get` to `fetch` in the router only | delta new `.../shelf.fetch`, removed `.../shelf.get`; correct check fails | as above |
+| `trpc-called-procedure-removed` (`rpc-shelf`) | `shelf.get`, which `web` calls, is deleted from the router | delta removed `GET /api/rpc/shelf.get`; the correct check also carries `removed_still_called` and fails | break row marked at the call site of `shelf.get`; none for `shelf.gone` |
+| `trpc-called-procedure-renamed` (`rpc-shelf`) | `get` to `fetch` in the router only | delta new `.../shelf.fetch`, removed `.../shelf.get`; correct check fails | break row marked |
 | `trpc-procedure-added-beside-calls` (`rpc-shelf`) | `shelf.put` mutation added | delta new `POST /api/rpc/shelf.put`, no risk | passes |
 | `trpc-adapter-mount-moved-with-client` (`rpc-shelf`) | adapter `/api/rpc` to `/rpc`, client `url` with it | three new under `/rpc`, three removed under `/api/rpc`, no risk | passes |
 | `trpc-adapter-mount-moved-client-stale` (`rpc-shelf`) | adapter moves, client `url` stays | the delta rows; the correct check fails (the client now misses the mount) | stage test passes; `_marking` ignored, carrick#3778 |

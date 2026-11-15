@@ -475,8 +475,7 @@
           {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
           {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get", "service": "api"}
         ]
-      },
-      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "trpc-called-procedure-renamed",
@@ -494,8 +493,7 @@
           {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
           {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get", "service": "api"}
         ]
-      },
-      "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "trpc-procedure-added-beside-calls",

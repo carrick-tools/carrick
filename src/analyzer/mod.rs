@@ -2896,6 +2896,35 @@ impl Analyzer {
                     procedure: Some(procedure.clone()),
                     ..Default::default()
                 });
+                // No row serves the procedure: never a missing endpoint, but
+                // kept for the lost-pairing marking, which writes a row only
+                // when main paired this very call site with a route the PR
+                // removed (carrick#3778). Its label is the removed route's.
+                if pairing.winners.is_empty()
+                    && let Some(service) = consumer_repo_by_call.get(&(
+                        method.to_uppercase(),
+                        target.to_string(),
+                        call.file_path.display().to_string(),
+                    ))
+                {
+                    let site = strip_ci_workspace_prefix(&call.file_path.display().to_string())
+                        .to_string();
+                    unpaired_calls.push(crate::pr_baseline::UnpairedCall {
+                        service: service.clone(),
+                        key: OperationKey::http(method, target.to_string()).canonical(),
+                        file: location_file(&site),
+                        method: method.to_string(),
+                        path: String::new(),
+                        sites: vec![site],
+                        source: consumer_source_by_call
+                            .get(&consumer_identity(&call.file_path.display().to_string()))
+                            .copied()
+                            .flatten(),
+                        held_open: false,
+                        held_by: Vec::new(),
+                        procedure: true,
+                    });
+                }
                 for winner in &pairing.winners {
                     let endpoint = &pool_endpoints[winner.producer];
                     matched_endpoints.insert(format!(
@@ -2993,6 +3022,7 @@ impl Analyzer {
                         .flatten(),
                     held_open: held_by.is_some(),
                     held_by: held_by.unwrap_or_default(),
+                    procedure: false,
                 })
             };
 
@@ -3585,6 +3615,7 @@ impl Analyzer {
                         source: call.resolution_source,
                         held_open: false,
                         held_by: Vec::new(),
+                        procedure: false,
                     });
                 }
                 missing.entry((label, name)).or_default().insert(site);
