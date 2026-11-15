@@ -118,7 +118,7 @@ jobs:
           - shard: n9
             runner: nextest
             targets: >-
-              --test sidecar_integration_test --test position_rows_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test machinery_by_origin_test --test model_symbol_not_a_type_test --test loop_route_types_test --test no_payload_registration_line_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test --test derive_reach_units_test --test stated_route_response_test
+              --test sidecar_integration_test --test position_rows_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test machinery_by_origin_test --test model_symbol_not_a_type_test --test open_type_param_state_test --test loop_route_types_test --test no_payload_registration_line_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test --test derive_reach_units_test --test stated_route_response_test
           - shard: pr-1
             runner: nextest
             partitioned: --test pr_on_main_test
