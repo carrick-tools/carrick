@@ -7947,6 +7947,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     }],
                     span: (0, 0),
+                    via: Vec::new(),
                 }),
             },
         };
