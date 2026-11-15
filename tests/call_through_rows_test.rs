@@ -939,9 +939,7 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
 /// callback, which the model's row held, states its request.
 #[test]
 fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
-    for (service, file, line) in [("cli", COMMANDS, 76)] {
-        assert_eq!(rows_in(blobs(), service, file, line), [], "{file}:{line}");
-    }
+    assert_eq!(rows_in(blobs(), "cli", COMMANDS, 76), [], "{COMMANDS}:76");
     assert_eq!(
         row_at("web", HOOKS, 24),
         Row {
@@ -954,15 +952,13 @@ fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
         }
     );
     // `hooks.ts:24` holds the leaf row, so it is not saved unread.
-    for (service, file, line) in [("cli", COMMANDS, 76)] {
-        let named = blobs()[service]["unread_sites"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|site| site["file"] == file && site["line"] == line)
-            .any(|site| reasons(site).contains(&"own_function".to_string()));
-        assert!(named, "{file}:{line} is saved unread as withdrawn");
-    }
+    let named = blobs()["cli"]["unread_sites"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|site| site["file"] == COMMANDS && site["line"] == 76)
+        .any(|site| reasons(site).contains(&"own_function".to_string()));
+    assert!(named, "{COMMANDS}:76 is saved unread as withdrawn");
 }
 
 const UNSETTLED: &str = "packages/cli/src/unsettled.ts";
