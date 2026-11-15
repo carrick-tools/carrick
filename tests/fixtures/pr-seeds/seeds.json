@@ -916,8 +916,7 @@
         "rows": [
           {"kind": "risk_introduced", "label": "PUBSUB welcome-mail", "site": "src/mail.ts:10"}
         ]
-      },
-      "known_miss": {"stage": "judged", "issues": ["carrick#3547", "carrick#3782"]}
+      }
     },
     {
       "name": "copied-helper",

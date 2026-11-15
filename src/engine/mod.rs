@@ -36691,24 +36691,21 @@ io.on("bare:in", (event) => {});
                     PubsubRole::Subscriber,
                     Some("queue"),
                 ),
+                library_row(
+                    "/repo/src/jobs.ts",
+                    14,
+                    "jobs.local",
+                    crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
+                ),
                 crate::library_claims::LibraryRow {
-                    name_scope: Some(crate::services::type_sidecar::NameScope {
-                        scope: crate::services::type_sidecar::NameScopeKind::Service,
-                        namespace: None,
-                    }),
+                    name_scope: None,
                     ..library_row(
                         "/repo/src/jobs.ts",
-                        14,
-                        "jobs.local",
+                        16,
+                        "jobs.silent",
                         crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
                     )
                 },
-                library_row(
-                    "/repo/src/jobs.ts",
-                    16,
-                    "jobs.silent",
-                    crate::library_claims::LibraryRowKind::Pubsub(PubsubRole::Publisher),
-                ),
             ],
             &HashMap::new(),
         );
