@@ -465,13 +465,22 @@ pub fn run(
     let added = added_functions(&reads, tree, relative);
     took("added-functions", began);
     let began = Instant::now();
-    let new_functions = with_similar(tree, relative, added, || match (built_similar, &source) {
-        (Some(similar), _) => Rc::new(similar),
-        (None, Source::Read(held)) => Rc::new(similar_of(held)),
-        (None, Source::Shared(held)) => probe.similar_of(held),
-        // A kept probe file read, and the ranker beside it is not current:
-        // the blobs give it, as they did before the probe kept anything.
-        (None, Source::Kept(_)) => probe.kept_similar(workspace, index_generation, inputs.as_ref()),
+    let checkout_roots: Vec<PathBuf> = before
+        .repos
+        .iter()
+        .map(|repo| PathBuf::from(&repo.path))
+        .collect();
+    let new_functions = with_similar(tree, relative, added, &checkout_roots, || {
+        match (built_similar, &source) {
+            (Some(similar), _) => Rc::new(similar),
+            (None, Source::Read(held)) => Rc::new(similar_of(held)),
+            (None, Source::Shared(held)) => probe.similar_of(held),
+            // A kept probe file read, and the ranker beside it is not current:
+            // the blobs give it, as they did before the probe kept anything.
+            (None, Source::Kept(_)) => {
+                probe.kept_similar(workspace, index_generation, inputs.as_ref())
+            }
+        }
     });
     took("similar", began);
     let began = Instant::now();
@@ -1280,6 +1289,7 @@ fn with_similar<R: std::borrow::Borrow<Similar>>(
     tree: &Tree,
     relative: &str,
     added: Vec<Added>,
+    roots: &[PathBuf],
     ranker: impl FnOnce() -> R,
 ) -> Vec<super::contract::NewFunction> {
     if added.is_empty() {
@@ -1291,10 +1301,25 @@ fn with_similar<R: std::borrow::Borrow<Similar>>(
     added
         .into_iter()
         .map(|(function, query)| super::contract::NewFunction {
-            similar: index.similar(&query, &repo, relative),
+            similar: index
+                .similar(&query, &repo, relative)
+                .into_iter()
+                .map(|row| row_with_checkout(row, roots))
+                .collect(),
             ..function
         })
         .collect()
+}
+
+/// `row`, told where this machine has its repo checked out: the root among
+/// `roots` (the workspace's repos) whose folder name is the row's repo.
+fn row_with_checkout(
+    row: super::contract::SimilarFunction,
+    roots: &[PathBuf],
+) -> super::contract::SimilarFunction {
+    // Stub: filled by the fix.
+    let _ = roots;
+    row
 }
 
 /// What an edit to `relative` adds that the index would hold.

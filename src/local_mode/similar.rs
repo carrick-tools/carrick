@@ -232,6 +232,7 @@ impl Similar {
                     exported: entry.exported,
                     called_from: entry.called_from,
                     intent: entry.intent.clone(),
+                    checkout: None,
                 }
             })
             .collect()

@@ -20,7 +20,7 @@ function rowsFor(found: Partial<SimilarFunction>): string[] {
       ],
     },
   } as unknown as CheckResult;
-  const block = similarLines(result, "a.ts", () => true).lines[0] ?? "";
+  const block = similarLines(result, "a.ts", "/w/app", () => true).lines[0] ?? "";
   return block.split("\n").slice(1, -1);
 }
 
@@ -46,4 +46,49 @@ test("a long multi-line intent is collapsed and cut at 200 plus an ellipsis", ()
   assert.equal(rows.length, 2);
   assert.ok(rows[1]!.endsWith("..."), rows[1]);
   assert.equal([...rows[1]!.trim()].length, 203);
+});
+
+// Where a row is, read from the agent's folder (the hook payload's `cwd`).
+function placeOf(found: Partial<SimilarFunction>, cwd: string | null): string {
+  const result = {
+    repo: "/w/app",
+    file: "a.ts",
+    recheck: {
+      new_functions: [
+        {
+          name: "mine",
+          similar: [
+            { name: "theirs", repo: "app", file: "src/text/slug.ts", line: 4, end_line: 9, score: 0.9, exported: true, called_from: 1, ...found },
+          ],
+        },
+      ],
+    },
+  } as unknown as CheckResult;
+  const row = similarLines(result, "a.ts", cwd, () => true).lines[0]!.split("\n")[1]!;
+  return row.slice(row.indexOf(" at ") + 4, row.indexOf(" (exported"));
+}
+
+test("a row in the edited repo, listed from its root, prints the repo-relative path", () => {
+  assert.equal(placeOf({}, "/w/app"), "src/text/slug.ts:4");
+});
+
+test("a row in the edited repo, listed from the folder above it, names the folder", () => {
+  assert.equal(placeOf({}, "/w"), "app/src/text/slug.ts:4");
+});
+
+test("a row in another repo checked out beside it names the repo and a path from the agent's folder", () => {
+  const found = { repo: "shared-lib", checkout: "/w/shared-lib" };
+  assert.equal(placeOf(found, "/w/app"), "../shared-lib/src/text/slug.ts:4 in repo shared-lib");
+});
+
+test("a row in a repo with no checkout here says so", () => {
+  assert.equal(
+    placeOf({ repo: "shared-lib" }, "/w/app"),
+    "src/text/slug.ts:4 in repo shared-lib, which is not checked out on this machine",
+  );
+});
+
+test("without a folder the text is the old one", () => {
+  assert.equal(placeOf({}, null), "src/text/slug.ts:4");
+  assert.equal(placeOf({ repo: "shared-lib", checkout: "/w/shared-lib" }, null), "shared-lib/src/text/slug.ts:4");
 });

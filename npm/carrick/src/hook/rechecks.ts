@@ -111,6 +111,8 @@ export type QueueEntry = {
    * that does not answer the edit (`late.ts` `lateContext`).
    */
   instead_of_probe?: true;
+  /** The agent's folder when it edited, so a late list prints paths from it (`similar.ts`). */
+  cwd?: string;
 };
 
 export type Answer = {
@@ -130,6 +132,8 @@ export type Answer = {
   facts_callers?: true;
   /** Carried from the entry: rendered as the edit-time probe's answer would have been. */
   instead_of_probe?: true;
+  /** Carried from the entry. */
+  cwd?: string;
   result?: CheckResult;
   /** What a `changed` entry's `check --changed` answered. */
   changed?: ChangedResult;
@@ -160,7 +164,7 @@ type ChangedOptions = Options & { named?: string[] };
  * `factsCallers`: the files whose edit-time fact lines answered their callers.
  * `insteadOfProbe`: the entries stand in for the edit-time probe.
  */
-type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean };
+type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean; cwd?: string | null };
 
 export function rechecksDir(root: string): string {
   return path.join(root, ".carrick", "rechecks");
@@ -223,6 +227,7 @@ export function enqueue(
       attempts: 0,
       ...(options.factsCallers?.has(file) ? { facts_callers: true as const } : {}),
       ...(options.insteadOfProbe ? { instead_of_probe: true as const } : {}),
+      ...(options.cwd ? { cwd: options.cwd } : {}),
     };
     const pending = sessionPart(session, seq, "pending.json", options.home);
     if (pending === null) continue;
@@ -382,6 +387,7 @@ function writeAnswer(
     ...(entry.named !== undefined ? { named: entry.named } : {}),
     ...(entry.facts_callers ? { facts_callers: true as const } : {}),
     ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
+    ...(entry.cwd ? { cwd: entry.cwd } : {}),
     ...body,
   };
   const file = sessionPart(entry.session, entry.seq, "answer.json", home);

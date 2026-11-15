@@ -50,6 +50,7 @@ function row(position: number, found: SimilarFunction, ownRepo: string | null): 
 export function similarLines(
   result: CheckResult,
   relative: string,
+  cwd: string | null,
   isNew: (key: string) => boolean,
   log: (...parts: string[]) => void = () => {},
 ): SimilarLines {

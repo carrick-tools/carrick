@@ -785,6 +785,13 @@ pub struct SimilarFunction {
     /// The index's one sentence about what it does, when it holds one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
+    /// The absolute root of this repo's checkout when this workspace has it
+    /// checked out; absent for a repo only the hosted index holds, whose files
+    /// this machine cannot open. The hook prints a path from the agent's
+    /// folder from it. Filled after the ranking (`recheck.rs` `with_similar`),
+    /// never kept in the probe file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<String>,
 }
 
 impl Recheck {

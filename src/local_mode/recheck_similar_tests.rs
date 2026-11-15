@@ -129,7 +129,7 @@ fn similar(held: &[HeldFile<'_>], edited: &str) -> Vec<(String, Vec<SimilarFunct
     let services = vec![crate::config::Config::default()];
     let none = std::collections::BTreeSet::new();
     let added = additions(&services, dir.path(), "src/b.ts", &none);
-    with_similar(&Tree::at(dir.path()), "src/b.ts", added, || {
+    with_similar(&Tree::at(dir.path()), "src/b.ts", added, &[], || {
         similar_of(&held)
     })
     .into_iter()
@@ -286,6 +286,7 @@ fn one_probe_call_builds_the_index_once() {
         &Tree::at(Path::new("/nowhere")),
         "src/b.ts",
         Vec::new(),
+        &[],
         || similar_of(&held),
     );
     assert!(nothing.is_empty());
@@ -419,4 +420,50 @@ fn a_row_a_little_over_the_floor_is_listed() {
     assert_eq!(names(&rows), ["settleEntries"], "{rows:?}");
     let score = best(&rows);
     assert!((0.30..0.45).contains(&score), "{rows:?}");
+
+/// A row says where this machine has its repo: the edited repo's own root, and
+/// `None` for a repo only the hosted index holds.
+#[test]
+fn a_row_carries_its_checkout_only_when_the_workspace_has_the_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "package.json", "{\"name\":\"svc\"}");
+    write(
+        dir.path(),
+        "src/b.ts",
+        &JOIN.replace("joinRelative", "relativePath"),
+    );
+    let mine = super::super::index::repo_label(dir.path());
+    let hosted = HeldFile {
+        repo: Some("billing"),
+        file: "lib/paths.ts",
+        source: &JOIN.replace("trimmed", "base"),
+        calls: &[],
+        intent: None,
+        callee_file: None,
+    };
+    let held = Held {
+        local: vec![blob(&mine, &here(JOIN, &[])), blob("billing", &hosted)],
+        hosted: Default::default(),
+    };
+    let services = vec![crate::config::Config::default()];
+    let none = std::collections::BTreeSet::new();
+    let added = additions(&services, dir.path(), "src/b.ts", &none);
+    let roots = [dir.path().to_path_buf()];
+    let found = with_similar(&Tree::at(dir.path()), "src/b.ts", added, &roots, || {
+        similar_of(&held)
+    });
+    let rows = &found[0].similar;
+    let own = rows
+        .iter()
+        .find(|row| row.repo == mine)
+        .expect("a row in the edited repo");
+    let theirs = rows
+        .iter()
+        .find(|row| row.repo == "billing")
+        .expect("a row in billing");
+    assert_eq!(
+        own.checkout.as_deref(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+    assert_eq!(theirs.checkout, None);
 }

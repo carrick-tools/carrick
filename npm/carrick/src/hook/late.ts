@@ -56,7 +56,7 @@ export function deliverOne(session: string, answer: Answer, home?: string): stri
   // A lead the probe already delivered is in `led`; this one is for a file
   // whose probe had no answer (carrick#3249).
   const found = answer.result
-    ? similarLines(answer.result, answer.relative, (similarKey) => !wasLed(session, similarKey, home), log)
+    ? similarLines(answer.result, answer.relative, answer.cwd ?? null, (similarKey) => !wasLed(session, similarKey, home), log)
     : null;
   if (found && found.lines.length > 0) {
     contexts.push(...found.lines);
