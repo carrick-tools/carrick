@@ -2,7 +2,7 @@
 //! commands look (`<root>/.test-credentials`, their `XDG_CONFIG_HOME`), and a
 //! hosted snapshot read under it that holds no hosted service, so nothing is
 //! read off the network. Kept copies stand in for a re-scan only under the
-//! snapshot they were read with, and never signed out (REVIEW-4634 B2).
+//! snapshot they were read with, and never signed out (PR #4634 review, B2).
 
 #![allow(dead_code)]
 

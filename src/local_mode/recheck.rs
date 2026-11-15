@@ -3655,7 +3655,7 @@ mod tests {
         .expect("a blob")
     }
 
-    /// REVIEW-4634 B4: the re-check of `web` also writes `api` (its join moved
+    /// PR #4634 review, B4: the re-check of `web` also writes `api` (its join moved
     /// `api`'s pair outcomes) without analysing it. `api`'s copy from its own
     /// earlier re-check is older than that, so it goes and nothing stands in
     /// for `api`.
@@ -3677,7 +3677,7 @@ mod tests {
         assert!(two.kept(&copies, "web").is_some(), "web's is kept");
     }
 
-    /// REVIEW-4634 N1: an edit made while the re-check's scan ran keeps no
+    /// PR #4634 review, N1: an edit made while the re-check's scan ran keeps no
     /// copy, so undoing it leaves nothing labelled with the undone digest
     /// that holds the edit. Edits that held still keep one.
     #[test]

@@ -4320,7 +4320,7 @@ fn check_changed_after_a_recheck_of_the_edit_joins_its_copy() {
 /// B8 (T5): a cold `check --changed` walks nothing of its own to decide what
 /// is current, and keeps no copy: only the per-edit re-check keeps them. A
 /// copy labelled after its scan could hold an edit made during it
-/// (REVIEW-4634 B3). So a repeat re-scans too, still without the walk.
+/// (PR #4634 review, B3). So a repeat re-scans too, still without the walk.
 #[test]
 #[serial]
 fn check_changed_cold_walks_nothing_and_keeps_no_copy() {
