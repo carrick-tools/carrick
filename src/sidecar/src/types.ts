@@ -593,6 +593,12 @@ export interface RetypeItem extends RetypeLocatorItem {
   producer_unwidened_type?: string;
   /** Judge the form JSON puts on the wire (an `http` response). */
   wire: boolean;
+  /**
+   * The key path of the procedure the call names (`orders.list`): the call's
+   * own type is the router's, so the retype judges the consumer's code
+   * against it (carrick#937).
+   */
+  procedure_path?: string;
 }
 
 /**

@@ -1549,13 +1549,20 @@ export class TypeInferrer {
    * published type came from, not a guess at the line.
    */
   locateCall(request: InferRequestItem): { sourceFile: SourceFile; call: CallExpression } | undefined {
-    const filePath = path.isAbsolute(request.file_path)
-      ? request.file_path
-      : path.join(this.repoRoot, request.file_path);
-    const sourceFile = this.getSourceFile(filePath);
+    const sourceFile = this.sourceFileOf(request.file_path);
     if (!sourceFile) return undefined;
     const call = this.resolveTargetCallExpression(sourceFile, request);
     return call ? { sourceFile, call } : undefined;
+  }
+
+  /**
+   * The source file a locator's `file_path` names (absolute, or relative to
+   * the repo root), added to the project when it is not loaded yet.
+   */
+  sourceFileOf(filePath: string): SourceFile | undefined {
+    return this.getSourceFile(
+      path.isAbsolute(filePath) ? filePath : path.join(this.repoRoot, filePath)
+    );
   }
 
   /**

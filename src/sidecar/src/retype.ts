@@ -158,6 +158,7 @@ export class Retyper {
       // comment over the rest of the call.
       return abstain(item, "the producer's response type carries a comment");
     }
+    if (item.procedure_path) return this.runProcedure(item, producer, before);
 
     const found = this.beforeRewrite(item);
     if (typeof found === 'string') return abstain(item, found);
@@ -431,14 +432,7 @@ export class Retyper {
     // Appended only when the rewrite names them: an alias nothing references
     // is a TS6196 under `noUnusedLocals`, which would read as the producer's
     // type failing to resolve.
-    const appendix = rewrite.wire
-      ? '\n' +
-        [
-          ...this.jsonWire(PREFIX),
-          `type ${WIRE}<P> = ${PREFIX}JsonWireSame<${PREFIX}JsonWire<P>, P> extends true ? P : ${PREFIX}JsonWire<P>;`,
-        ].join('\n') +
-        '\n'
-      : '';
+    const appendix = rewrite.wire ? '\n' + this.wireDeclarations().join('\n') + '\n' : '';
     const rewritten = applyEdits(original, rewrite.edits) + appendix;
     const bodyEnd = rewritten.length - appendix.length;
     const originOf = (pos: number): Origin =>
@@ -553,10 +547,222 @@ export class Retyper {
     const deciding = unknowns.length > 0 ? unknowns : diagnosed ? [] : anys;
     if (deciding.length === 0) return undefined;
 
-    const members = deciding
-      .map(({ kind, path }) => (path === '' ? `'${kind}'` : `'${kind}' at '${path}'`))
-      .join(', ');
-    return `the producer's response reads as ${members} in the consumer's program, so it was not compared`;
+    return `the producer's response reads as ${membersText(deciding)} in the consumer's program, so it was not compared`;
+  }
+
+  /**
+   * The JSON wire transform's declarations and the `${WIRE}<P>` alias that
+   * states a type in its wire form, as appended to a file that names them.
+   */
+  private wireDeclarations(): string[] {
+    return [
+      ...this.jsonWire(PREFIX),
+      `type ${WIRE}<P> = ${PREFIX}JsonWireSame<${PREFIX}JsonWire<P>, P> extends true ? P : ${PREFIX}JsonWire<P>;`,
+    ];
+  }
+
+  /**
+   * The procedure form (carrick#937): judge a procedure call by the
+   * consumer's own code against the call's own type.
+   *
+   * A procedure call's type IS the producer's router type, read by the
+   * consumer's compiler, so stating the producer's output at the call would
+   * compare one type with itself. What breaks is the consumer's use of it.
+   * The file is type-checked as it is and again with only the call's result
+   * erased (`(<call> as any)`): a diagnostic present as-is and gone when
+   * erased is a place the consumer uses what the procedure does not return.
+   *
+   * A guard runs first: the call's result (or one member of it, for a hook's
+   * envelope such as `{ data }`) must be the producer's published output, as
+   * declared or in its JSON wire form. A call whose result is something else
+   * (an options builder's `{ key }`), or a router on disk that no longer
+   * returns what the producer published, is not compared: erasing it would
+   * agree about nothing.
+   */
+  private runProcedure(
+    item: RetypeItem,
+    producer: string,
+    before: Map<SourceFile, Diag[]>
+  ): RetypeOutcome {
+    const located = this.locateProcedureCall(item, item.procedure_path!);
+    if (typeof located === 'string') return abstain(item, located);
+    const { sourceFile, call } = located;
+    if (resultIsDiscarded(call)) return abstain(item, 'the consumer never reads the response');
+    const escape = resultEscapes(call);
+    if (escape) return abstain(item, escape);
+
+    // Read now: every text replacement makes ts-morph forget the file's
+    // nodes, `call` included.
+    const start = call.getStart();
+    const end = call.getEnd();
+    const original = sourceFile.getFullText();
+    let pre = before.get(sourceFile);
+    if (!pre) {
+      pre = fileDiagnostics(sourceFile);
+      before.set(sourceFile, pre);
+    }
+
+    const top = this.procedureTopTypes(call);
+    if (typeof top === 'string') return abstain(item, top);
+
+    const carried = this.carriesProducerOutput(sourceFile, original, producer, start, end);
+    if (carried !== true) return abstain(item, carried);
+
+    const edits: Edit[] = [
+      { start, end: start, text: '(' },
+      { start: end, end, text: ' as any)' },
+    ];
+    let erased: Diag[];
+    replaceFileText(sourceFile, applyEdits(original, edits));
+    try {
+      erased = fileDiagnostics(sourceFile).flatMap((d) => {
+        const origin = mapBack(d.start, edits);
+        return origin.kind === 'inserted' ? [] : [{ ...d, start: origin.pos }];
+      });
+    } finally {
+      replaceFileText(sourceFile, original);
+    }
+
+    // Present as-is and gone once the result is erased: the reverse of
+    // `check`, which counts what a stated type adds.
+    const remaining = new Map<string, number>();
+    for (const d of erased) remaining.set(key(d), (remaining.get(key(d)) ?? 0) + 1);
+    const added: Diag[] = [];
+    for (const d of pre) {
+      if (UNUSED_DECLARATION_CODES.has(d.code)) continue;
+      const left = remaining.get(key(d)) ?? 0;
+      if (left > 0) {
+        remaining.set(key(d), left - 1);
+        continue;
+      }
+      added.push(d);
+    }
+    added.sort((a, b) => a.start - b.start || a.code - b.code);
+
+    if (added.length === 0) {
+      if (top.length > 0) {
+        return abstain(
+          item,
+          `the procedure call's result reads as ${membersText(top)} in the consumer's program, so it was not compared`
+        );
+      }
+      return { item_id: item.item_id, outcome: 'agrees', diagnostics: [] };
+    }
+    const lineOf = lineIndex(original);
+    return {
+      item_id: item.item_id,
+      outcome: 'mismatch',
+      diagnostics: added.map(
+        (d): RetypeDiagnostic => ({ line: lineOf(d.start), code: d.code, message: d.message })
+      ),
+    };
+  }
+
+  /**
+   * The one call to the procedure `procedurePath` names that starts on the
+   * item's line: a call whose callee is `R.s1.….sk.m`, with `s1..sk` the key
+   * path's segments, `m` any name (the client's operation) and `R` any
+   * expression (the client). Or why there is not exactly one.
+   */
+  private locateProcedureCall(
+    item: RetypeItem,
+    procedurePath: string
+  ): { sourceFile: SourceFile; call: CallExpression } | string {
+    const sourceFile = this.inferrer.sourceFileOf(item.file_path);
+    if (!sourceFile) return 'the procedure call could not be located on its line';
+    const segments = procedurePath.split('.');
+    const calls = sourceFile
+      .getDescendantsOfKind(SyntaxKind.CallExpression)
+      .filter((c) => c.getStartLineNumber() === item.line_number && namesProcedure(c, segments));
+    if (calls.length === 0) return 'the procedure call could not be located on its line';
+    if (calls.length > 1) {
+      return 'two calls to the procedure start on one line, so the call cannot be told apart';
+    }
+    return { sourceFile, call: calls[0] };
+  }
+
+  /**
+   * The `any` members of the call's awaited result, which can only hide a
+   * diagnostic and so decide only an empty diff, or why the result cannot be
+   * compared at all (`any`/`unknown` as a whole, `unknown` at a member). The
+   * walk's budget sentinel is dropped, as {@link unresolvedMembers} drops it.
+   */
+  private procedureTopTypes(call: CallExpression): Array<{ kind: string; path: string }> | string {
+    const program = this.project.getProgram().compilerObject;
+    const checker = program.getTypeChecker();
+    const own = awaitedResult(checker, call.compilerNode);
+    for (const [flag, kind] of [
+      [ts.TypeFlags.Any, 'any'],
+      [ts.TypeFlags.Unknown, 'unknown'],
+    ] as const) {
+      if (own.flags & flag) {
+        return `the procedure call's result reads as '${kind}' in the consumer's program, so it was not compared`;
+      }
+    }
+    const found = this.topTypes(own, program, checker, call.compilerNode);
+    const unknowns = found.filter((finding) => finding.kind === 'unknown');
+    if (unknowns.length > 0) {
+      return `the procedure call's result reads as ${membersText(unknowns)} in the consumer's program, so it was not compared`;
+    }
+    return found.filter((finding) => finding.kind === 'any');
+  }
+
+  /**
+   * Guard (carrick#937): `true` when the call's awaited result, or for an
+   * object result one of its members with `null`/`undefined` removed, is the
+   * producer's published output, declared or in its JSON wire form (each
+   * way assignable to the other), read in the consumer's own program. Else
+   * why the call is not compared.
+   */
+  private carriesProducerOutput(
+    sourceFile: SourceFile,
+    original: string,
+    producer: string,
+    start: number,
+    end: number
+  ): true | string {
+    const out = `${PREFIX}ProcOut`;
+    const wire = `${PREFIX}ProcWire`;
+    const appendix =
+      '\n' +
+      [
+        ...this.wireDeclarations(),
+        `type ${out} = (${producer});`,
+        `type ${wire} = ${WIRE}<(${producer})>;`,
+      ].join('\n') +
+      '\n';
+    replaceFileText(sourceFile, original + appendix);
+    try {
+      const unresolved = fileDiagnostics(sourceFile).find(
+        (d) => d.start >= original.length && !UNUSED_DECLARATION_CODES.has(d.code)
+      );
+      if (unresolved) {
+        return (
+          "the producer's output does not resolve in the consumer's program: " +
+          `TS${unresolved.code}: ${unresolved.message}`
+        );
+      }
+      const call = callAt(sourceFile, start, end);
+      if (!call) return 'the procedure call could not be found again after the rewrite';
+      const checker = this.project.getProgram().compilerObject.getTypeChecker();
+      const stated = [out, wire].flatMap((name) => {
+        const alias = sourceFile.getTypeAlias(name);
+        return alias ? [checker.getTypeAtLocation(alias.getNameNode().compilerNode)] : [];
+      });
+      const own = awaitedResult(checker, call.compilerNode);
+      const candidates = [own];
+      if (own.flags & ts.TypeFlags.Object && !checker.isArrayType(own) && !checker.isTupleType(own)) {
+        for (const property of checker.getPropertiesOfType(own)) {
+          candidates.push(checker.getNonNullableType(checker.getTypeOfSymbol(property)));
+        }
+      }
+      const same = (a: ts.Type, b: ts.Type) =>
+        checker.isTypeAssignableTo(a, b) && checker.isTypeAssignableTo(b, a);
+      if (candidates.some((c) => stated.some((t) => same(t, c)))) return true;
+      return "the call's result does not carry the procedure's output as the producer publishes it";
+    } finally {
+      replaceFileText(sourceFile, original);
+    }
   }
 
   /**
@@ -570,9 +776,7 @@ export class Retyper {
     sourceFile: SourceFile,
     at: { start: number; end: number }
   ): true | string {
-    const call = sourceFile
-      .getDescendantsOfKind(SyntaxKind.CallExpression)
-      .find((c) => c.getStart() === at.start && c.getEnd() === at.end);
+    const call = callAt(sourceFile, at.start, at.end);
     if (!call) return 'the retyped call could not be found again after the rewrite';
     const stated = call.getTypeArguments()[0]?.getType();
     if (!stated) return 'the retyped call carries no type argument';
@@ -615,6 +819,46 @@ export class Retyper {
       `('${checker.typeToString(this.resultOf(call))}'), so it does not state the response`
     );
   }
+}
+
+/** Top-type findings as a reason names them: `'any'`, `'unknown' at 'a.b'`. */
+function membersText(findings: Array<{ kind: string; path: string }>): string {
+  return findings
+    .map(({ kind, path }) => (path === '' ? `'${kind}'` : `'${kind}' at '${path}'`))
+    .join(', ');
+}
+
+/** What a call yields once awaited, read with `checker`. */
+function awaitedResult(checker: ts.TypeChecker, call: ts.Node): ts.Type {
+  const returned = checker.getTypeAtLocation(call);
+  return checker.getAwaitedType(returned) ?? returned;
+}
+
+/**
+ * `call`'s callee is `R.s1.….sk.m` with `[s1..sk]` equal to `segments`
+ * (`m` any name, `R` any expression).
+ */
+function namesProcedure(call: CallExpression, segments: string[]): boolean {
+  const callee = call.getExpression();
+  if (!Node.isPropertyAccessExpression(callee)) return false;
+  let at: Node = callee.getExpression();
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (!Node.isPropertyAccessExpression(at) || at.getName() !== segments[i]) return false;
+    at = at.getExpression();
+  }
+  return true;
+}
+
+/** The call expression that spans exactly `start`..`end` in `sourceFile` now. */
+function callAt(sourceFile: SourceFile, start: number, end: number): CallExpression | undefined {
+  for (
+    let at: Node | undefined = sourceFile.getDescendantAtStartWithWidth(start, end - start);
+    at && at.getStart() === start && at.getEnd() === end;
+    at = at.getParent()
+  ) {
+    if (Node.isCallExpression(at)) return at;
+  }
+  return undefined;
 }
 
 function abstain(item: RetypeItem, reason: string): RetypeOutcome {
