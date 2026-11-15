@@ -116,6 +116,7 @@ fn job(labels: &[(&str, KeyLabel)]) -> LibraryClaim {
             namespace: None,
         }),
         picker: Some("model/q1".into()),
+        of: None,
         result: None,
     }
 }

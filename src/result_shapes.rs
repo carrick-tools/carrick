@@ -87,7 +87,12 @@ pub fn result_checks(exports: &[ExportClaims], discovery: &Discovery) -> ResultA
                     },
                     claim_receivers(&claims, *on, of.as_deref()),
                 ),
-                LibraryClaim::Make { form, member, .. } => (
+                LibraryClaim::Make {
+                    form,
+                    member,
+                    of: None,
+                    ..
+                } => (
                     AskedEnd {
                         package: export.package.clone(),
                         export: export.export.clone(),

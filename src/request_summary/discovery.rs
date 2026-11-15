@@ -816,7 +816,13 @@ pub(crate) fn claim_receivers(
 ) -> Vec<String> {
     let mut all = vec!["export".to_string()];
     for (_, claim) in claims {
-        if let LibraryClaim::Make { form, member, .. } = claim {
+        if let LibraryClaim::Make {
+            form,
+            member,
+            of: None,
+            ..
+        } = claim
+        {
             all.push(make_receiver(*form, member.as_deref()));
         }
     }
@@ -859,9 +865,12 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                     member: Some(member),
                     ..
                 }
-                | LibraryClaim::Scope { member, .. } => {
-                    called.contains(&(export.package.clone(), member.clone()))
-                }
+                | LibraryClaim::Scope { member, .. }
+                | LibraryClaim::Make {
+                    member: Some(member),
+                    of: Some(_),
+                    ..
+                } => called.contains(&(export.package.clone(), member.clone())),
                 _ => false,
             })
             .collect();
@@ -877,7 +886,7 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
             claim: claim.without_result(),
         };
         for (id, claim) in &claims {
-            if matches!(claim, LibraryClaim::Make { .. }) {
+            if matches!(claim, LibraryClaim::Make { of: None, .. }) {
                 ask.checks.push(check(id, "export", claim));
                 ask.ops.push(None);
                 ask.scopes.push(None);
@@ -904,6 +913,20 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                         }));
                         ask.scopes.push(None);
                     }
+                }
+                // An `of`-make is asked on the one receiver it names, with
+                // the scopes (after every op check: the time limit), and its
+                // answer is read by `MakerLabel::from_exports`.
+                LibraryClaim::Make { of: Some(of), .. } => {
+                    scope_checks.push((
+                        check(id, of, claim),
+                        AskedScope {
+                            package: export.package.clone(),
+                            export: export.export.clone(),
+                            claim_id: id.clone(),
+                            receiver: of.clone(),
+                        },
+                    ));
                 }
                 LibraryClaim::Scope { on, of, .. } => {
                     for receiver in on_receivers(*on, of.as_deref()) {
@@ -4715,7 +4738,7 @@ mod tests {
             &on.repo,
             &discovered,
             &labels,
-            &MakerLabel::from_exports(exports),
+            &MakerLabel::from_exports(exports, &declarations.scope_answers),
             &ScopeLabel::from_exports(exports, &declarations.scope_answers),
             &ProcedureLabels::from_exports(exports, &declarations.scope_answers),
         );
@@ -8364,7 +8387,7 @@ export function listen(): void {
             &on.repo,
             &discovered,
             &SiteLabel::from_exports(exports),
-            &MakerLabel::from_exports(exports),
+            &MakerLabel::from_exports(exports, &declarations.scope_answers),
             scopes,
             &super::super::decided_sites::ProcedureLabels::from_exports(
                 exports,
@@ -9748,7 +9771,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             &on.repo,
             &discovered,
             &labels,
-            &MakerLabel::from_exports(&exports),
+            &MakerLabel::from_exports(&exports, &declarations.scope_answers),
             &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
             &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
         );
@@ -9845,7 +9868,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                     &on.repo,
                     &discovered,
                     &labels,
-                    &MakerLabel::from_exports(&exports),
+                    &MakerLabel::from_exports(&exports, &declarations.scope_answers),
                     &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
                     &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
                 );
@@ -9918,6 +9941,152 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                     "a job name is forced as a queue name: {forced:#?}"
                 );
             }
+        }
+    }
+
+    /// `tests/fixtures/stream-member-factory`'s store answer and traced
+    /// declarations, `edit`ed before the trace asks (carrick-cloud#3534 T4).
+    fn member_factory(
+        edit: impl FnOnce(&mut Vec<ExportClaims>),
+    ) -> Option<(
+        super::super::fixture_walk::Walked,
+        Vec<ExportClaims>,
+        MemberDeclarations,
+    )> {
+        traced_fixture_edited("stream-member-factory", ".", "app", edit)
+    }
+
+    /// The name each send at `src/forms.ts:<line>` is forced to, by line.
+    fn member_factory_names(
+        on: &super::super::fixture_walk::Walked,
+        exports: &[ExportClaims],
+        declarations: &MemberDeclarations,
+    ) -> BTreeMap<String, Vec<Option<String>>> {
+        use super::super::decided_sites::SiteLabel;
+        let (_, decided) = decided_traced(on, exports, declarations, &[]);
+        let labels = SiteLabel::from_exports(exports);
+        let mut forced: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
+        for record in
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels)
+        {
+            forced
+                .entry(record.state.point.at.clone())
+                .or_default()
+                .push(
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned(),
+                );
+        }
+        forced
+    }
+
+    /// carrick-cloud#3534 T4: an `of`-make is asked on the receiver it names,
+    /// after every op check, and its answer is a verified declaration.
+    #[test]
+    fn an_of_make_is_asked_on_its_receiver_after_the_ops() {
+        let Some((on, exports, declarations)) = member_factory(|_| {}) else {
+            return;
+        };
+        let ask = declaration_ask(&on.inputs, &exports);
+        let id = "fixture-hub@1:Hub:make:call:channel:of:instance:new";
+        let at = ask
+            .checks
+            .iter()
+            .position(|check| check.claim_id.ends_with(id) && check.receiver == "instance:new")
+            .unwrap_or_else(|| panic!("the of-make is asked: {:?}", ask.checks));
+        let last_op = ask.ops.iter().rposition(Option::is_some);
+        assert!(last_op.is_none_or(|op| op < at), "after every op check");
+        let asked = ask.scopes[at].as_ref().expect("asked as a scope check");
+        assert_eq!(
+            declarations
+                .scope_answers
+                .get(asked)
+                .and_then(ScopeAnswer::verified),
+            Some(&[("node_modules/fixture-hub/index.d.ts".to_string(), 3)][..]),
+            "{:?}",
+            declarations.scope_answers
+        );
+    }
+
+    /// The channels' names are read at the member call that made them: a
+    /// factory's returned call, an awaited async one, a held local, a module
+    /// constant and the in-place chain. A name from a runtime value and an
+    /// in-repo class's member of the same name force none.
+    #[test]
+    fn a_channel_made_by_a_member_call_is_named_at_that_call() {
+        let Some((on, exports, declarations)) = member_factory(|_| {}) else {
+            return;
+        };
+        let forced = member_factory_names(&on, &exports, &declarations);
+        for (line, name) in [
+            (9, "orders"),
+            (20, "audit"),
+            (27, "held"),
+            (34, "shared"),
+            (62, "chained"),
+        ] {
+            assert_eq!(
+                forced.get(&format!("src/forms.ts:{line}")).cloned(),
+                Some(vec![Some(name.to_string())]),
+                "line {line}: {forced:#?}"
+            );
+        }
+        for line in [46, 57] {
+            assert_eq!(
+                forced
+                    .get(&format!("src/forms.ts:{line}"))
+                    .and_then(|names| names.iter().flatten().next()),
+                None,
+                "line {line}: {forced:#?}"
+            );
+        }
+    }
+
+    /// An `of`-make the verifier did not verify roots nothing: no send is
+    /// named, as before.
+    #[test]
+    fn an_unverified_of_make_roots_nothing() {
+        let Some((on, exports, mut declarations)) = member_factory(|_| {}) else {
+            return;
+        };
+        for answer in declarations.scope_answers.values_mut() {
+            *answer = ScopeAnswer::Unanswered;
+        }
+        let forced = member_factory_names(&on, &exports, &declarations);
+        for line in [9, 20, 27, 34, 62] {
+            assert_eq!(
+                forced
+                    .get(&format!("src/forms.ts:{line}"))
+                    .and_then(|names| names.iter().flatten().next()),
+                None,
+                "line {line}: {forced:#?}"
+            );
+        }
+    }
+
+    /// An `of`-make verified at another declaration than the call's roots
+    /// nothing (the library half of the same-member negative).
+    #[test]
+    fn an_of_make_verified_at_another_declaration_roots_nothing() {
+        let Some((on, exports, mut declarations)) = member_factory(|_| {}) else {
+            return;
+        };
+        for answer in declarations.scope_answers.values_mut() {
+            *answer =
+                ScopeAnswer::Verified(vec![("node_modules/fixture-hub/index.d.ts".into(), 99)]);
+        }
+        let forced = member_factory_names(&on, &exports, &declarations);
+        for line in [9, 20, 27, 34, 62] {
+            assert_eq!(
+                forced
+                    .get(&format!("src/forms.ts:{line}"))
+                    .and_then(|names| names.iter().flatten().next()),
+                None,
+                "line {line}: {forced:#?}"
+            );
         }
     }
 

@@ -518,7 +518,6 @@ fn census_repo(
     )
     .exports;
     let labels = SiteLabel::from_exports(&exports);
-    let makers = MakerLabel::from_exports(&exports);
     // The scope claims count as a scan counts them: those the trace's own
     // verify request verifies, per service (carrick#2474 R2b).
     let script = super::fixture_walk::sidecar().expect("the built sidecar");
@@ -573,6 +572,7 @@ fn census_repo(
         let declarations =
             super::fixture_walk::census_declarations(&script, &root, service, &inputs, &exports);
         let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let makers = MakerLabel::from_exports(&exports, &declarations.scope_answers);
         census.scopes_verified += declarations.scope_answers.len();
         // Traced: each site also names its instance (carrick#2474 R2a),
         // which only the routes section reads.
