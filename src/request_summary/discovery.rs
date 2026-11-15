@@ -9838,6 +9838,19 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             names.sort();
             names
         };
+        let forced_at = |line: u32| -> Option<String> {
+            let point = format!("src/pooled.ts:{line}");
+            records
+                .iter()
+                .find(|record| record.state.point.at == point)
+                .and_then(|record| {
+                    record
+                        .state
+                        .forced
+                        .get(&crate::site_questions::Slot::Name)
+                        .cloned()
+                })
+        };
         // One opener, one caller: the names are read at that call.
         assert!(has_record(5), "{shown:#?}");
         assert_eq!(reason_at(5), None, "{shown:#?}");
@@ -9854,9 +9867,12 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             assert_eq!(names_at(line), names, "{line}: {shown:#?}");
             assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
         }
-        // A field of a call result at two calls: the resolver cannot read it.
+        // A field of a call result at two calls: the resolver cannot read
+        // it. The send is a lead with a record and no name (QW-2b: a record
+        // now stands there, as the filter reads past the unread sibling).
         for line in [11, 12] {
-            assert!(!has_record(line), "{line}: {shown:#?}");
+            assert!(has_record(line), "{line}: {shown:#?}");
+            assert!(names_at(line).is_empty(), "{line}: {shown:#?}");
             assert_eq!(
                 reason_at(line),
                 Some(Stop::UnreadExpression),
@@ -9865,11 +9881,17 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
         // Two literals and two different identifiers through one opener are
         // one name each.
+        for (line, name) in [(17, "lit-a"), (18, "lit-b")] {
+            assert_eq!(
+                forced_at(line),
+                Some(name.to_string()),
+                "{line}: {shown:#?}"
+            );
+            assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
+        }
         for (line, names) in [
-            (17, vec!["lit-a"]),
-            (18, vec!["lit-b"]),
-            (20, vec!["ship-cancelled", "ship-created"]),
-            (21, vec!["bill-closed", "bill-opened"]),
+            (20, ["ship-cancelled", "ship-created"]),
+            (21, ["bill-closed", "bill-opened"]),
         ] {
             assert_eq!(names_at(line), names, "{line}: {shown:#?}");
             assert_eq!(reason_at(line), None, "{line}: {shown:#?}");
