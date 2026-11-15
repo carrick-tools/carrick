@@ -310,11 +310,19 @@ pub fn mismatch_break_status(
     verdict_state: Option<VerdictState>,
     on_main: Option<bool>,
     on_main_unknown: Option<OnMainUnknown>,
+    several_producers: bool,
 ) -> BreakStatus {
     // Main already has it, whatever its proof: not this change's break
     // (carrick#3895). Read before either candidate check.
     if on_main == Some(true) {
         return BreakStatus::OnMain;
+    }
+    // Several services serve the call's route and nothing says which one its
+    // base reaches (carrick#4617): its own reason, not a model row's.
+    if several_producers {
+        return BreakStatus::Candidate {
+            reason: "several_services_serve_this_call",
+        };
     }
     if edge_source == Some(EdgeSource::Candidate) {
         return BreakStatus::Candidate {
@@ -440,6 +448,10 @@ pub enum Finding {
         /// Why `on_main` is `None` on a PR run (carrick-cloud#1408). Never set
         /// alongside `on_main`.
         on_main_unknown: Option<OnMainUnknown>,
+        /// Whether several services other than the consumer's own serve this
+        /// route (carrick#4617). Scan-local: it shows on the wire as `break`
+        /// and `break_reason`, and as `edge_source: candidate`.
+        several_producers: bool,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -609,6 +621,7 @@ impl Finding {
             pair: None,
             on_main: None,
             on_main_unknown: None,
+            several_producers: false,
         }
     }
 
@@ -713,6 +726,18 @@ impl Finding {
             Finding::TypeMismatch { edge_source, .. }
             | Finding::MethodMismatch { edge_source, .. } => *edge_source = source,
             _ => {}
+        }
+        self
+    }
+
+    /// State that several services serve the route this finding's call names
+    /// (carrick#4617). No-op for every kind but a type mismatch.
+    pub fn with_several_producers(mut self, several: bool) -> Self {
+        if let Finding::TypeMismatch {
+            several_producers, ..
+        } = &mut self
+        {
+            *several_producers = several;
         }
         self
     }
@@ -846,15 +871,28 @@ impl Finding {
                 verdict_state,
                 on_main,
                 on_main_unknown,
+                several_producers,
                 ..
-            }
-            | Finding::MethodMismatch {
+            } => mismatch_break_status(
+                *edge_source,
+                *verdict_state,
+                *on_main,
+                *on_main_unknown,
+                *several_producers,
+            ),
+            Finding::MethodMismatch {
                 edge_source,
                 verdict_state,
                 on_main,
                 on_main_unknown,
                 ..
-            } => mismatch_break_status(*edge_source, *verdict_state, *on_main, *on_main_unknown),
+            } => mismatch_break_status(
+                *edge_source,
+                *verdict_state,
+                *on_main,
+                *on_main_unknown,
+                false,
+            ),
             // A row that lost a pairing main had, of any protocol and either
             // side (`missing_endpoint`, `orphaned_endpoint`). It is proven
             // only with a fact edge, a verdict that was not withheld and a
@@ -878,6 +916,7 @@ impl Finding {
                             removal.verdict_state,
                             removal.on_main,
                             removal.on_main_unknown,
+                            false,
                         )
                     }
                 }
@@ -1040,6 +1079,8 @@ impl Serialize for Finding {
                 consumer_reads: _,
                 on_main,
                 on_main_unknown,
+                // Scan-local (carrick#4617): read through `break` above.
+                several_producers: _,
             } => {
                 map.serialize_entry("method", method)?;
                 map.serialize_entry("path", path)?;
@@ -2558,6 +2599,33 @@ mod tests {
     }
 
     /// An SDK-mediated mismatch states no source by design and is enforced.
+    #[test]
+    fn break_status_several_producers_is_candidate_with_its_own_reason() {
+        assert_eq!(
+            mismatch_break_status(
+                Some(EdgeSource::Fact),
+                Some(VerdictState::Resolved),
+                Some(false),
+                None,
+                true,
+            ),
+            BreakStatus::Candidate {
+                reason: "several_services_serve_this_call"
+            }
+        );
+        // Main already had it: not this change's break, whatever the pairing.
+        assert_eq!(
+            mismatch_break_status(
+                Some(EdgeSource::Fact),
+                Some(VerdictState::Resolved),
+                Some(true),
+                None,
+                true,
+            ),
+            BreakStatus::OnMain
+        );
+    }
+
     #[test]
     fn break_status_sdk_mediated_mismatch_with_no_source_is_certain() {
         let f = mismatch(None, None, Some(false));
