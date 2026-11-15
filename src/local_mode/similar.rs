@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use carrick_match::{SimilarDoc, SimilarIndex, SimilarQuery};
+use carrick_match::{SIMILAR_QUIET_BELOW, SimilarDoc, SimilarIndex, SimilarQuery};
 
 use crate::cloud_storage::CloudRepoData;
 use crate::visitor::{FunctionDefinition, MODULE_SCOPE_KEY};
@@ -212,6 +212,11 @@ impl Similar {
             signature: query.signature.as_deref(),
             callees: &query.callees,
         });
+        // The highest score, not row 1's: a same-name row sits first whatever it scores.
+        let best = ranked.iter().map(|row| row.score).fold(0.0, f64::max);
+        if best < SIMILAR_QUIET_BELOW {
+            return Vec::new();
+        }
         ranked
             .into_iter()
             .map(|row| {

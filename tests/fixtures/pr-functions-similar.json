@@ -18,7 +18,17 @@
           "line": 1,
           "name": "totalPrice",
           "repo": "shop",
-          "score": 0.261
+          "score": 0.404
+        },
+        {
+          "called_from": 0,
+          "end_line": 15,
+          "exported": true,
+          "file": "util/misc.ts",
+          "line": 13,
+          "name": "mergeHeaders",
+          "repo": "shop",
+          "score": 0.095
         }
       ]
     },
@@ -31,28 +41,7 @@
       "file": "ui/caption.ts",
       "line": 1,
       "name": "captionText",
-      "similar": [
-        {
-          "called_from": 0,
-          "end_line": 7,
-          "exported": true,
-          "file": "cart/total.ts",
-          "line": 1,
-          "name": "totalPrice",
-          "repo": "shop",
-          "score": 0.087
-        },
-        {
-          "called_from": 0,
-          "end_line": 3,
-          "exported": true,
-          "file": "ui/plural.ts",
-          "line": 1,
-          "name": "pluralize",
-          "repo": "shop",
-          "score": 0.052
-        }
-      ]
+      "similar": []
     },
     {
       "called_by": [],
@@ -79,7 +68,7 @@
     }
   ],
   "similar_index": {
-    "functions": 2,
-    "with_tokens": 2
+    "functions": 7,
+    "with_tokens": 7
   }
 }

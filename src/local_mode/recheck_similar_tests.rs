@@ -15,6 +15,26 @@ const JOIN: &str = "export function joinRelative(root: string, file: string) {\n
     const trimmed = root.endsWith('/') ? root.slice(0, -1) : root;\n  \
     return file.startsWith(trimmed) ? file.slice(trimmed.length + 1) : file;\n}\n";
 
+/// Unrelated functions, so the corpus is not two functions wide: in a corpus
+/// that small every word is common and even a near copy scores little.
+const FILLER: &str = "export function parseColor(hex: string) {\n  \
+    return [hex.slice(1, 3), hex.slice(3, 5), hex.slice(5, 7)].map((part) => parseInt(part, 16));\n}\n\
+    export function debounceTimer(wait: number) {\n  \
+    return setTimeout(() => undefined, wait);\n}\n\
+    export function groupByOwner(rows: Row[]) {\n  \
+    return rows.reduce((acc, row) => ({ ...acc, [row.owner]: row }), {});\n}\n\
+    export function randomToken() {\n  \
+    return Math.random().toString(36).slice(2);\n}\n\
+    export function mergeHeaders(a: Headers, b: Headers) {\n  \
+    return new Headers([...a.entries(), ...b.entries()]);\n}\n";
+
+fn filler() -> HeldFile<'static> {
+    HeldFile {
+        file: "src/filler.ts",
+        ..here(FILLER, &[])
+    }
+}
+
 /// `(caller, callee)` pairs set on the held blob's `calls`.
 type Calls<'a> = &'a [(&'a str, &'a str)];
 
@@ -162,13 +182,13 @@ fn a_near_copy_in_another_repo_comes_back_and_names_its_repo() {
 #[test]
 fn a_near_copy_under_the_lead_floor_is_listed() {
     let held = JOIN.to_string();
-    let renamed = "export function relativePath(dir: string, name: string) {\n  \
-        const base = dir.endsWith('/') ? dir.slice(0, -1) : dir;\n  \
-        const log = console.debug('relative', name);\n  \
+    let renamed = "export function relativePath(root: string, file: string) {\n  \
+        const base = root.endsWith('/') ? root.slice(0, -1) : root;\n  \
+        const log = console.debug('relative', file);\n  \
         const cut = base.length + 1;\n  \
-        return name.startsWith(base) ? name.slice(cut) : name;\n}\n";
-    let rows = only_rows(similar(&[here(&held, &[])], renamed));
-    assert_eq!(names(&rows), ["joinRelative"], "{rows:?}");
+        return file.startsWith(base) ? file.slice(cut) : file;\n}\n";
+    let rows = only_rows(similar(&[here(&held, &[]), filler()], renamed));
+    assert_eq!(names(&rows)[0], "joinRelative", "{rows:?}");
 }
 
 #[test]
@@ -192,12 +212,16 @@ fn a_function_that_calls_the_hit_gets_no_row() {
 /// not two copies.
 #[test]
 fn a_hit_that_calls_the_new_name_gets_no_row() {
-    let held = format!("{JOIN}function relativePath(a: string) {{ return a; }}\n");
+    let held = format!(
+        "{JOIN}function relativePath(root: string, file: string) {{\n  \
+         return file.startsWith(root) ? file.slice(root.length + 1) : file;\n}}\n"
+    );
     let calls: Calls<'_> = &[("joinRelative", "relativePath")];
     let copy = JOIN.replace("joinRelative", "relativePath");
-    let rows = only_rows(similar(&[here(&held, calls)], &copy));
+    let rows = only_rows(similar(&[here(&held, calls), filler()], &copy));
     // The held `relativePath` shares the new one's name; the hit that calls it is gone.
-    assert_eq!(names(&rows), ["relativePath"], "{rows:?}");
+    assert_eq!(names(&rows)[0], "relativePath", "{rows:?}");
+    assert!(!names(&rows).contains(&"joinRelative"), "{rows:?}");
 }
 
 /// Two other files call the hit, and so does a function in its own file, which

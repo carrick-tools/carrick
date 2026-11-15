@@ -1630,6 +1630,25 @@ export function pluralize(word: string, count: number): string {
 }
 ";
     const LONE: &str = "export function qzxwv(): void {}\n";
+    /// Unrelated functions, so the corpus is wide enough for a near copy to
+    /// clear the quiet floor (`SIMILAR_QUIET_BELOW`).
+    const FILLER: &str = "\
+export function parseColor(hex: string) {
+  return [hex.slice(1, 3), hex.slice(3, 5)].map((part) => parseInt(part, 16));
+}
+export function debounceTimer(wait: number) {
+  return setTimeout(() => undefined, wait);
+}
+export function groupByOwner(rows: Row[]) {
+  return rows.reduce((acc, row) => ({ ...acc, [row.owner]: row }), {});
+}
+export function randomToken() {
+  return Math.random().toString(36).slice(2);
+}
+export function mergeHeaders(a: Headers, b: Headers) {
+  return new Headers([...a.entries(), ...b.entries()]);
+}
+";
 
     const REPO: &str = "shop";
 
@@ -1653,11 +1672,12 @@ export function pluralize(word: string, count: number): string {
         .unwrap()
     }
 
-    const BASE: [(&str, &str); 4] = [
+    const BASE: [(&str, &str); 5] = [
         ("cart/total.ts", TOTAL),
         ("cart/legacy.ts", LEGACY),
         ("ui/label.ts", LABEL),
         ("ui/plural.ts", PLURAL),
+        ("util/misc.ts", FILLER),
     ];
 
     /// The PR: `sumPrices` and `captionText` added, `formatLabel` edited,
@@ -1680,6 +1700,7 @@ export function pluralize(word: string, count: number): string {
             ("ui/label.ts", LABEL_EDITED),
             ("ui/caption.ts", CAPTION),
             ("ui/plural.ts", PLURAL),
+            ("util/misc.ts", FILLER),
         ]);
         let source = with_index.then(|| SimilarSource {
             repo: REPO,
@@ -1730,9 +1751,10 @@ export function pluralize(word: string, count: number): string {
             "removed by the PR: {names:?}"
         );
         assert!(!names.contains(&"sumPrices"));
-        // The index held main's functions less the PR's own: totalPrice and pluralize.
+        // The index held main's functions less the PR's own: totalPrice, pluralize
+        // and the five filler functions.
         let size = named(&block).similar_index.expect("an index was ranked");
-        assert_eq!((size.functions, size.with_tokens), (2, 2));
+        assert_eq!((size.functions, size.with_tokens), (7, 7));
     }
 
     #[test]
@@ -1750,7 +1772,9 @@ export function pluralize(word: string, count: number): string {
         let row = head.function_definitions.values().next().unwrap();
         let query = crate::local_mode::similar::Query::of(row, Vec::new());
         let expected = index.similar(&query, REPO, "ui/caption.ts");
-        assert!(!expected.is_empty());
+        // `captionText`'s only twin is the edited function, so nothing is left to
+        // list: the list is `Some` and empty (quiet), never `None`.
+        assert!(caption.similar.is_some());
         assert_eq!(caption.similar.as_ref(), Some(&expected));
     }
 
