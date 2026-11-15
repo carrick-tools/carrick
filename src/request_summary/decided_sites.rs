@@ -9073,7 +9073,9 @@ pub(crate) mod tests {
     /// carrick#3504 B10-2b (N3): a name a field carries, set by the
     /// constructor from its parameter, is placed at the call made on the
     /// construction (`new Hub("hub.events").send()`), each construction with
-    /// its own name. Today the site is the labelled call, unnamed.
+    /// its own name. Where every construction is named so, the caller sites
+    /// state the send and the method's own asked site goes. Today the site
+    /// is the labelled call, unnamed.
     #[test]
     fn a_name_a_field_carries_is_placed_at_the_call_on_its_construction() {
         const HUB: &str = "import { publish } from '@fixture/pub';\n\
@@ -9088,11 +9090,34 @@ pub(crate) mod tests {
         assert_eq!(
             in_file(&decided, "src/n-hub.ts"),
             vec![
-                // The labelled call's own walk meets no construction: N3
-                // keeps today's site there, counted `field_unplaced`.
-                "site 5 None".to_string(),
                 "site 7 Some(\"hub.events\")".to_string(),
                 "site 8 Some(\"hub.other\")".to_string(),
+            ],
+        );
+    }
+
+    /// carrick#3504 B10-2b (N3): where one construction's name is read at
+    /// its caller and another's is not (a name no text states), the method
+    /// keeps its own asked site beside the two caller sites: one caller
+    /// does not name the send.
+    #[test]
+    fn a_method_keeps_its_asked_site_while_a_construction_is_unnamed() {
+        const HUB: &str = "import { publish } from '@fixture/pub';\n\
+             class Hub {\n\
+             \x20 channel: string;\n\
+             \x20 constructor(channel: string) { this.channel = channel; }\n\
+             \x20 send() { return publish(this.channel, {}); }\n\
+             }\n\
+             export function go() { return new Hub(\"hub.events\").send(); }\n\
+             export function other() { return new Hub(readName()).send(); }\n\
+             declare function readName(): string;\n";
+        let decided = decided_with_rows(&[("src/n-hub.ts", HUB)]);
+        assert_eq!(
+            in_file(&decided, "src/n-hub.ts"),
+            vec![
+                "site 5 None".to_string(),
+                "site 7 Some(\"hub.events\")".to_string(),
+                "site 8 None".to_string(),
             ],
         );
     }
