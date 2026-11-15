@@ -3471,10 +3471,11 @@ impl<'a> Resolver<'a> {
     }
 
     /// The in-repo definitions the call `call`, written in `file`, runs when
-    /// its callee is a module binding the resolver reads (K3: `const { default:
-    /// init } = await services[name]()`, `init(app)`): `None` unless the
-    /// compiler's row names such a binding and every value it holds is a
-    /// definition, so a callee read only in part adds no caller.
+    /// its callee is a destructured module binding the resolver reads (K3:
+    /// `const { default: init } = await services[name]()`, `init(app)`):
+    /// `None` unless the compiler's row names such a binding and every value
+    /// it holds is a definition, so a callee read only in part adds no
+    /// caller.
     pub(super) fn binding_definitions(
         &self,
         file: &'a Path,
@@ -3519,6 +3520,14 @@ impl<'a> Resolver<'a> {
             .row_at(file, call.site.lo, call.site.hi, Kind::Call)
             .ok()?;
         let (path, line, symbol) = self.declared_binding(row)?;
+        // A destructured key alone: any other binding's value may be one a
+        // `bind` shifted the arguments of, which a caller edge cannot say.
+        self.inputs_for(path)
+            .files
+            .get(path)?
+            .module_bindings
+            .get(&(line, symbol.clone()))
+            .filter(|binding| binding.destructured)?;
         let held = self.binding_values(&mut Definitions, path, line, &symbol, invoke)?;
         let mut out = Vec::new();
         for held in held {
