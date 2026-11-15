@@ -1783,8 +1783,9 @@ export function mergeHeaders(a: Headers, b: Headers) {
     #[test]
     fn a_pr_similar_row_writes_no_checkout() {
         let block = run(true);
-        let caption = entry(&block, "captionText");
-        let rows = caption.similar.as_ref().expect("a ranked function");
+        // `sumPrices` lists `totalPrice` (a near copy over the quiet floor).
+        let sum = entry(&block, "sumPrices");
+        let rows = sum.similar.as_ref().expect("a ranked function");
         assert!(!rows.is_empty());
         assert!(rows.iter().all(|row| row.checkout.is_none()));
         let json = serde_json::to_string(rows).unwrap();
