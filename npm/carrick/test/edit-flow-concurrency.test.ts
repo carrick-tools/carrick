@@ -86,11 +86,19 @@ async function runCase(t: test.TestContext, c: Case) {
   return { started, probed, total: performance.now() - t0, entries, queuedBeforeProbeAnswer };
 }
 
-test("a sub-agent edit with a fact file probes while the fact lines run", async (t) => {
+test("a sub-agent edit with a fact file probes while the fact lines run and queues its files in place of the probe", async (t) => {
   const r = await runCase(t, { subAgent: true, factFile: true });
-  assert.equal(r.probed.length, 1);
+  assert.deepEqual(r.probed, [["a.ts", "b.ts"]]);
   assert.ok(Math.abs(r.started["probe"]! - r.started["facts"]!) < 50, `probe started ${r.started["probe"]} ms, facts ${r.started["facts"]} ms`);
   assert.ok(r.total < DELAY_MS * 1.5, `waited ${r.total} ms, not the longer of the two`);
+  assert.equal(r.entries.length, 2);
+  for (const entry of r.entries) assert.equal(entry.instead_of_probe, true);
+});
+
+test("a sub-agent edit with no fact file probes while the fact lines run", async (t) => {
+  const r = await runCase(t, { subAgent: true, factFile: false });
+  assert.equal(r.probed.length, 1);
+  assert.ok(Math.abs(r.started["probe"]! - r.started["facts"]!) < 50, `probe started ${r.started["probe"]} ms, facts ${r.started["facts"]} ms`);
 });
 
 test("a main-session edit with no fact file probes while the fact lines run", async (t) => {

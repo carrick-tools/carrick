@@ -386,10 +386,7 @@ test("8: Stop counts the early break in its header and never names that route as
   assert.ok(!stop.includes("both sides agree"), stop);
 });
 
-// Needs a sub-agent's edit to take the fact-file path (carrick#4615): until it
-// lands a sub-agent's edit is probed in hand and asks the daemon nothing. Drop
-// the `todo` with the rebase onto it.
-test("9: a sub-agent's early break goes to the sub-agent; one it never heard goes once to the main session after it ends", { todo: "waits on carrick#4615" }, async (t) => {
+test("9: a sub-agent's early break goes to the sub-agent; one it never heard goes once to the main session after it ends", async (t) => {
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [broken(ws)]);
   const inHand = context((await edit(ws, "e9", part2(ws, []), "a1")).stdout);

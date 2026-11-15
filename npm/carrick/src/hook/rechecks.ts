@@ -166,7 +166,9 @@ type Options = { home?: string };
 type ChangedOptions = Options & { named?: string[] };
 /**
  * `factsCallers`: the files whose edit-time fact lines answered their callers.
- * `insteadOfProbe`: the entries stand in for the edit-time probe.
+ * `insteadOfProbe`: the entries stand in for the edit-time probe's verdict (the
+ * probe still runs and its similar-function block prints now). Main session and
+ * sub-agent alike.
  */
 type EnqueueOptions = Options & { factsCallers?: ReadonlySet<string>; insteadOfProbe?: boolean; cwd?: string | null };
 
