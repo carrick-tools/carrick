@@ -5389,10 +5389,6 @@ struct Scope<'a> {
     /// functions' included (carrick#2432). Read by discovery's value walk
     /// alone ([`resolve::ValueAt`]).
     held: HashMap<BindingKey, Vec<ValueAt>>,
-    /// The functions the body declares once and never assigns again, by where
-    /// each node starts, for what a `return` of the name hands back
-    /// (carrick#2432 slice A2).
-    declared_fns: HashMap<BindingKey, u32>,
     /// The names the body declares once, and those it assigns again, for the
     /// call walker's block declarators (carrick#3794): the same rule
     /// [`Reader::body`] reads its own top-level locals by. `None` at module
@@ -5436,7 +5432,6 @@ impl<'a> Scope<'a> {
             written_through: HashSet::new(),
             subjects: HashMap::new(),
             held: HashMap::new(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields: None,
             module,
@@ -6551,7 +6546,6 @@ impl Reader<'_> {
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields,
             module,
@@ -6658,7 +6652,6 @@ impl Reader<'_> {
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields,
             module,
@@ -6704,6 +6697,36 @@ impl Reader<'_> {
         ir
     }
 
+    /// The table entry for a function the body declares, where the body
+    /// declares its name once: the one value both the `return` reader and
+    /// the call walker's declaration read (carrick#3794, carrick#4555).
+    fn fn_decl_entry(
+        &self,
+        decl: &FnDecl,
+        names: Option<&BodyNames>,
+        block: bool,
+    ) -> Option<resolve::LocalBinding> {
+        let name = decl.ident.sym.as_ref();
+        if !names.is_none_or(|names| names.once.contains(name)) {
+            return None;
+        }
+        Some(resolve::LocalBinding {
+            key: ident_key(&decl.ident),
+            line: self.source_map.lookup_char_pos(decl.ident.span.lo).line as u32,
+            init: vec![ValueAt::Function(decl.function.span.lo.0)],
+            kind: resolve::BindingKind::Function,
+            text: None,
+            reassigned: names.is_some_and(|names| names.written.contains(name)),
+            plain: false,
+            block,
+            defaulted: false,
+            flow: None,
+            elements: None,
+            list_frozen: false,
+            element_tests: BTreeMap::new(),
+        })
+    }
+
     /// A function body, statement by statement, so a constant is readable
     /// by the statements after it. A binding assigned again anywhere in the
     /// body is opaque everywhere, and so is one the body declares twice (a
@@ -6733,20 +6756,19 @@ impl Reader<'_> {
                 .collect(),
             written: reassigned.names.clone(),
         });
-        // A function declared in the body, once and never assigned again, is
-        // the function a `return` of its name hands back, wherever the
-        // declaration sits: it is hoisted (carrick#2432 slice A2). Only a
+        // A function declared at the top of the body is in the table before
+        // the walk, wherever the declaration sits: it is hoisted, so a
+        // `return` above it reads it (carrick#2432 slice A2). One answerer:
+        // [`CallWalker::visit_return_stmt`] reads this entry, and
+        // [`CallWalker::visit_fn_decl`] finds it already pushed. Only a
         // `return` reads it: a call of it in the body is a call of code this
         // pass does not read.
         for stmt in stmts {
             if let Stmt::Decl(Decl::Fn(declared_fn)) = stmt
-                && !reassigned.names.contains(declared_fn.ident.sym.as_ref())
-                && declared.binding_count(&ident_key(&declared_fn.ident)) == 1
+                && let Some(entry) =
+                    self.fn_decl_entry(declared_fn, scope.body_names.as_ref(), false)
             {
-                scope.declared_fns.insert(
-                    ident_key(&declared_fn.ident),
-                    declared_fn.function.span.lo.0,
-                );
+                ir.local_bindings.push(entry);
             }
         }
         for (index, stmt) in stmts.iter().enumerate() {
@@ -9020,13 +9042,24 @@ impl Visit for CallWalker<'_, '_, '_> {
             .unwrap_or_default();
         if let Some(arg) = ret.arg.as_deref() {
             // `return request`: a function this body declares is that
-            // function (carrick#2432 slice A2).
+            // function (carrick#2432 slice A2), read from its table entry.
             let declared = match crate::graphql_document_sites::unwrap_expression(arg) {
-                Expr::Ident(ident) => self.scope.declared_fns.get(&ident_key(ident)).copied(),
+                Expr::Ident(ident) => {
+                    let key = ident_key(ident);
+                    self.ir
+                        .local_bindings
+                        .iter()
+                        .find(|entry| {
+                            entry.key == key
+                                && entry.kind == resolve::BindingKind::Function
+                                && !entry.reassigned
+                        })
+                        .map(|entry| entry.init.clone())
+                }
                 _ => None,
             };
             let values = match declared {
-                Some(start) => vec![ValueAt::Function(start)],
+                Some(init) => init,
                 None => self.reader.value_of(arg, self.scope, &self.guard.bound),
             };
             self.ir.returned_values.extend(values);
@@ -9139,28 +9172,10 @@ impl Visit for CallWalker<'_, '_, '_> {
     // A function declared in a body (carrick#3794): an entry holding the
     // function, which a reader reaches through where its node starts.
     fn visit_fn_decl(&mut self, decl: &FnDecl) {
-        let name = decl.ident.sym.as_ref();
-        let names = self.scope.body_names.as_ref();
-        if names.is_none_or(|names| names.once.contains(name)) {
-            let entry = resolve::LocalBinding {
-                key: ident_key(&decl.ident),
-                line: self
-                    .reader
-                    .source_map
-                    .lookup_char_pos(decl.ident.span.lo)
-                    .line as u32,
-                init: vec![ValueAt::Function(decl.function.span.lo.0)],
-                kind: resolve::BindingKind::Function,
-                text: None,
-                reassigned: names.is_some_and(|names| names.written.contains(name)),
-                plain: false,
-                block: self.depth > 0,
-                defaulted: false,
-                flow: None,
-                elements: None,
-                list_frozen: false,
-                element_tests: BTreeMap::new(),
-            };
+        if let Some(entry) =
+            self.reader
+                .fn_decl_entry(decl, self.scope.body_names.as_ref(), self.depth > 0)
+        {
             self.push_entry(entry);
         }
         decl.visit_children_with(self);
