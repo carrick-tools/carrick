@@ -1808,13 +1808,6 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     }
                     // A factory that returns a library member call's value is
                     // read as `value()` reads it.
-                    ValueAt::Returned {
-                        lo,
-                        hi,
-                        member: Some(_),
-                        made: None,
-                        ..
-                    } => self.returned(file, (lo, hi), at.to_string()),
                     _ => self.hole(at.to_string(), InstanceHole::Unread, None),
                 }
             }
