@@ -3610,7 +3610,9 @@ impl<'a> Walk<'a, '_> {
             // The resolver's caller read of the same slot (carrick#3504
             // B10-2c1) replaces the walk's values only where both readings
             // agree, or where only the resolver reads the root and the cap
-            // trimmed no walk; else the walk's stand, counted.
+            // trimmed no walk (its `kept` values, read when `all` is not:
+            // one unread sibling caller is no stop for this instance); else
+            // the walk's stand, counted.
             let through = self.made_through_callers(maker, slot, &call.via);
             let census = &mut self.out.maker_names;
             census.via_unmatched += usize::from(through.unmatched);
@@ -3619,7 +3621,7 @@ impl<'a> Walk<'a, '_> {
                     census.same += 1;
                     made.extend(kept);
                 }
-                (false, Some(_), Some(kept)) if !budget.trimmed => {
+                (false, _, Some(kept)) if !budget.trimmed => {
                     census.gain += 1;
                     made.extend(kept);
                 }
