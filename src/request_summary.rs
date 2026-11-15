@@ -11713,13 +11713,12 @@ impl RequestSummaryIndex {
         stating.next().is_none().then_some(row)
     }
 
-    /// Whether the type anchors of a withdrawn request line can go to `row`
-    /// at `caller` (carrick#4532): no other row at that call has its verb.
+    /// Whether the type anchors of a request line can go to `row` at
+    /// `caller` (carrick#4532): no other row at that call has its verb.
     /// A call's rows share one manifest entry per line, verb and side, so
     /// anchors carried to a row whose verb another row there shares would
-    /// type that other request too. Where they cannot go, the line is still
-    /// withdrawn and its anchors stay unread (logged in
-    /// `carry_request_line_anchors`).
+    /// type that other request too. Where they cannot go, the line is not
+    /// withdrawn: it keeps the model's row and anchors as before.
     pub fn anchors_fit(&self, caller: &(PathBuf, u32), row: &SummaryRow) -> bool {
         self.rows
             .get(&caller.0)

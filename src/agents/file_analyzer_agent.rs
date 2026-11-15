@@ -728,8 +728,7 @@ pub struct HeldRequestLine {
     /// back the request's own value ([`RequestLineAnchors::response`]) and
     /// the verb of its row there, which picks the call's one result row that
     /// takes them (carrick#4532). A stating call whose verb another row at
-    /// it shares is not listed: the line is withdrawn and its anchors stay
-    /// unread there.
+    /// it shares keeps the line out of the held set: it keeps its model row.
     pub stating: Vec<(String, u32, bool, String)>,
     /// The calls the summaries state no row for, by file and line.
     pub fact_calls: Vec<(String, u32)>,

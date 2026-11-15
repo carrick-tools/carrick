@@ -4688,11 +4688,11 @@ impl FileOrchestrator {
         // model row only where every one of those rows stands as a row, and
         // each stating call holds one row for this request
         // ([`RequestSummaryIndex::row_for`]); rows it holds for its callee's
-        // other requests do not count (carrick#4532). The type anchors the
-        // model row held go to a caller's row only where no other row at
-        // that call shares its verb ([`RequestSummaryIndex::anchors_fit`]):
-        // a call has one manifest entry per line, verb and side, so the
-        // anchors of one request would type the other.
+        // other requests do not count (carrick#4532). The line is withdrawn
+        // only where that row has its verb to itself
+        // ([`RequestSummaryIndex::anchors_fit`]): a call has one manifest
+        // entry per line, verb and side, so the anchors of one request would
+        // type the other, and the line keeps its model row as on main.
         let summary_sites: HashSet<(PathBuf, u32)> = analyzed
             .iter()
             .flat_map(|(pf, _)| {
@@ -4724,7 +4724,12 @@ impl FileOrchestrator {
                                             &(caller_file.clone(), *caller_start),
                                             &(file.clone(), *start),
                                         )
-                                        .is_some()
+                                        .is_some_and(|row| {
+                                            summaries.anchors_fit(
+                                                &(caller_file.clone(), *caller_start),
+                                                row,
+                                            )
+                                        })
                             })
                     })
                     .collect();
@@ -4747,17 +4752,19 @@ impl FileOrchestrator {
                 for (caller_file, caller_start) in &callers {
                     let caller = (caller_file.clone(), *caller_start);
                     match summaries.row_for(&caller, &(file.clone(), start)) {
-                        Some(row) if summary_sites.contains(&caller) => {
-                            // Only a row whose verb is its call's alone takes
-                            // the anchors (carrick#4532).
-                            if summaries.anchors_fit(&caller, row) {
-                                stating.push((
-                                    caller_file.to_string_lossy().into_owned(),
-                                    *caller_start,
-                                    row.returns_request_value,
-                                    row.method.clone(),
-                                ));
-                            }
+                        // Only a row whose verb is its call's alone takes
+                        // the anchors; where another row there shares the
+                        // verb the line keeps its model row (carrick#4532).
+                        Some(row)
+                            if summary_sites.contains(&caller)
+                                && summaries.anchors_fit(&caller, row) =>
+                        {
+                            stating.push((
+                                caller_file.to_string_lossy().into_owned(),
+                                *caller_start,
+                                row.returns_request_value,
+                                row.method.clone(),
+                            ));
                         }
                         _ => each_one_row = false,
                     }
@@ -9211,8 +9218,8 @@ impl FileOrchestrator {
     /// request line's file and span start, as
     /// [`SummaryRow::request_at`](crate::request_summary::SummaryRow) is.
     ///
-    /// A call's row takes them only where no other row at that call shares
-    /// its verb ([`RequestSummaryIndex::anchors_fit`], carrick#4532); the
+    /// A line is withdrawn only where every stating call's row has its verb
+    /// to itself ([`RequestSummaryIndex::anchors_fit`], carrick#4532); the
     /// call's own row is the one with its verb.
     fn carry_request_line_anchors(
         file_results: &mut HashMap<String, FileAnalysisResult>,
@@ -9242,10 +9249,7 @@ impl FileOrchestrator {
                 else {
                     continue;
                 };
-                if !summaries.anchors_fit(&(PathBuf::from(file), start), row)
-                    || row.reaches_request.is_some()
-                    || !withdrawn.contains_key(&row.request_at)
-                {
+                if row.reaches_request.is_some() || !withdrawn.contains_key(&row.request_at) {
                     continue;
                 }
                 call.request_line = Some(Box::new(RequestLineAnchors {

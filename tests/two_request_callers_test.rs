@@ -4,9 +4,10 @@
 //! the fixture's library-store answer and model cassette). A wrapper with two
 //! requests is called from a summary function that states both: each request
 //! line the callers state is withdrawn per request, whatever else sits at the
-//! call. Type anchors move to a caller's row only where that row's verb is its
-//! call's alone; otherwise the line is still withdrawn and its anchors stay
-//! unread. A callee line that states its own route keeps its row.
+//! call, where its type anchors go to the caller's row. That row's verb must
+//! be its call's alone; where another row at the call shares the verb the line
+//! keeps the model's row and its anchors, as before. A callee line that states
+//! its own route keeps its row.
 //!
 //! HTTP only: socket, pub/sub and RPC request lines are not read by this path
 //! (a gap).
@@ -205,14 +206,22 @@ fn log_text() -> String {
 fn a_request_line_its_two_row_callers_state_is_withdrawn() {
     for place in [
         "src/net/mixed.ts:4",
-        "src/net/paired.ts:4",
-        "src/net/paired.ts:5",
-        "src/net/shared.ts:4",
         "src/net/heldmix.ts:4",
         "src/net/single.ts:4",
     ] {
         assert_eq!(calls_at(place), Vec::<String>::new(), "{place} calls");
         assert_eq!(graph_at(place), Vec::<String>::new(), "{place} graph");
+    }
+}
+
+#[test]
+fn a_request_line_whose_verb_its_callers_call_shares_keeps_its_row() {
+    for place in ["src/net/paired.ts:4", "src/net/shared.ts:4"] {
+        assert_eq!(
+            calls_at(place),
+            ["POST /v1/:endpoint model"],
+            "{place} calls"
+        );
     }
 }
 
@@ -258,10 +267,10 @@ fn every_caller_row_stands() {
 }
 
 #[test]
-fn anchors_go_only_to_a_row_whose_verb_is_its_calls_alone() {
+fn a_line_is_withdrawn_only_where_its_anchors_go_to_a_row() {
     let log = log_text();
     assert!(
-        log.contains("Model rows withdrawn, their callers state the request: 5"),
+        log.contains("Model rows withdrawn, their callers state the request: 2"),
         "{log}"
     );
     assert!(
@@ -272,7 +281,7 @@ fn anchors_go_only_to_a_row_whose_verb_is_its_calls_alone() {
         .lines()
         .filter(|line| line.contains("was withdrawn and no caller's row took its type anchors"))
         .count();
-    assert_eq!(unread, 3, "{log}");
+    assert_eq!(unread, 0, "{log}");
     assert!(
         fold_line().contains("stated_at_fact_callers=1"),
         "{}",
