@@ -12214,6 +12214,7 @@ impl Composer<'_> {
                 .is_some_and(|shape| self.hands_back_request_value(file, ir, shape));
         summary.hands_back_transport = ir
             .return_shape
+            .as_ref()
             .is_some_and(|shape| self.hands_back_transport(file, ir, shape));
         summary.holds_transport = self.holds_transport(file, ir);
         for (effect, through) in lifted {
