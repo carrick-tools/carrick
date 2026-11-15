@@ -40,3 +40,26 @@ export function insideCallback(senders: Send[]): void {
     }
   });
 }
+
+export function outer(send: Send, other: Send): void {
+  [1].forEach(() => {
+    let s = send;
+    if (flag) s = other;
+    s("/v1/outer");
+  });
+}
+
+export function walkAll(): void {
+  function visit(n: number): void {
+    if (n > 0) visit(n - 1);
+  }
+  visit(3);
+}
+
+export function objectInBlock(): void {
+  if (flag) {
+    const held = { send: sendBlock };
+    const again = held;
+    again.send("/v1/object");
+  }
+}

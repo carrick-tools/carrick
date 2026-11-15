@@ -5352,6 +5352,18 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         file: &str,
         line: u32,
     ) -> Option<Vec<Got>> {
+        named_callee_reading(resolver, inputs, file, line, false)
+    }
+
+    /// [`named_callee`], with the binding already being read when `reading`
+    /// (a read that came back to the binding it is in the middle of).
+    fn named_callee_reading<'a>(
+        resolver: &Resolver<'a>,
+        inputs: &'a RequestSummaryInputs,
+        file: &str,
+        line: u32,
+        reading: bool,
+    ) -> Option<Vec<Got>> {
         let (path, ir) = inputs
             .files
             .iter()
@@ -5382,6 +5394,13 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             construction: false,
             bound: 0,
         };
+        if reading {
+            resolver.bindings_reading.borrow_mut().insert((
+                declared.to_path_buf(),
+                decl_line,
+                symbol.clone(),
+            ));
+        }
         resolver
             .binding_values(&mut Ends, declared, decl_line, &symbol, invoke)
             .map(got)
@@ -5430,7 +5449,8 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
 
     /// carrick#3794 T3: a local of a block inside a callback that holds the
     /// callback's own parameter reads `callback_parameter`: no caller index
-    /// keys that parameter.
+    /// keys that parameter. Read as discovery reads it, so the site's stop
+    /// is the one a consumer sees.
     ///
     /// Proof it ran: `walked` is `None` without the built compiler engine
     /// (the test then returns early); CI builds it first.
@@ -5444,12 +5464,85 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             named_callee(&resolver, &on.inputs, "scoped.ts", 39),
             Some(vec![Got::Stop(Stop::CallbackParameter)])
         );
+        let discovery = super::super::discovery::discover(
+            &on.inputs,
+            &super::super::discovery::Labels::of(&[]),
+            &on.repo,
+        );
+        let at: Vec<_> = discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("scoped.ts") && site.line == 39)
+            .collect();
+        assert!(
+            !at.is_empty(),
+            "a site at scoped.ts:39: {:?}",
+            discovery.sites
+        );
+        assert!(
+            at.iter()
+                .all(|site| site.stop == Some(Stop::CallbackParameter)),
+            "{at:?}"
+        );
+    }
+
+    /// carrick#3794 T3 review: a local of a nested function that holds a
+    /// parameter of an ENCLOSING function (depth 1 or more) is not the
+    /// callback's own: the enclosing function's callers decide it, so the
+    /// binding is not read here and no `callback_parameter` is stated.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_nested_local_holding_an_enclosing_functions_parameter_is_not_the_callbacks() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(named_callee(&resolver, &on.inputs, "scoped.ts", 48), None);
+        let discovery = super::super::discovery::discover(
+            &on.inputs,
+            &super::super::discovery::Labels::of(&[]),
+            &on.repo,
+        );
+        for site in discovery
+            .sites
+            .iter()
+            .filter(|site| site.file.ends_with("scoped.ts") && site.line == 48)
+        {
+            assert_ne!(site.stop, Some(Stop::CallbackParameter), "{site:?}");
+            assert!(!site.also.contains(&Stop::CallbackParameter), "{site:?}");
+        }
+    }
+
+    /// carrick#3794 T3 review: a binding read that comes back to the binding
+    /// it is reading says `recursion`, as a definition does, never an empty
+    /// list that reads as `value_never_bound`.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_binding_read_that_comes_back_to_itself_says_recursion() {
+        let Some(on) = walked("resolve-values", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "scoped.ts", 56),
+            Some(vec![written(53)])
+        );
+        assert_eq!(
+            named_callee_reading(&resolver, &on.inputs, "scoped.ts", 56, true),
+            Some(vec![Got::Stop(Stop::Recursion)])
+        );
     }
 
     /// carrick#3794 T3, pin: every entry of the class is outside module
     /// scope and holds no object the object reader would take
-    /// (`object_kept`), so `objects_of`, `const_call` and the receiver walk's
-    /// module binding, which filter on those, keep refusing them.
+    /// (`object_kept`). The object reader itself refuses a read of a block
+    /// local that holds an object; `const_call` and the receiver walk's
+    /// module binding (`decided_sites.rs`, `decided_sites/instances.rs`)
+    /// filter on `module_scope()`, asserted on the same entries.
     ///
     /// Proof it ran: `walked` is `None` without the built compiler engine
     /// (the test then returns early); CI builds it first.
@@ -5459,7 +5552,9 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             return;
         };
         let path = on.path("services/web/src/scoped.ts");
-        let scoped: Vec<_> = on.inputs.files[&path]
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let file = &on.inputs.files[&path];
+        let scoped: Vec<_> = file
             .module_bindings
             .values()
             .filter(|binding| binding.scoped_entry())
@@ -5469,6 +5564,20 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             assert!(!binding.declared.module_scope(), "{binding:?}");
             assert!(!binding.object_kept, "{binding:?}");
         }
+        // The object reader: `again = held`, `held` a block local holding an
+        // object, is not read through `held`.
+        let (_, again) = file
+            .module_bindings
+            .iter()
+            .find(|((_, symbol), _)| symbol == "again")
+            .expect("the binding `again`");
+        assert!(again.scoped_entry(), "{again:?}");
+        let [init] = again.init.as_slice() else {
+            panic!("one initialiser: {again:?}");
+        };
+        let mut out = Vec::new();
+        assert!(!resolver.objects_of(&path, init, None, &mut out));
+        assert!(out.is_empty());
     }
 
     /// carrick#3504 B10-1a: each parameter has an entry of its own, by line
