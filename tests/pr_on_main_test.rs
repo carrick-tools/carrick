@@ -3622,6 +3622,22 @@ fn assert_called_procedure_break(payload: &serde_json::Value, removed: (&str, &s
         .unwrap_or_else(|| panic!("no break row for {method} {path}: {findings:#?}"));
     assert_eq!(row["service"], "web", "{row:#}");
     assert_marks(row, Some(false), Some("fact"), Some("not_checked"));
+    // The row names the removed route's full path and the call site that
+    // reads it (`shelf.get`, line 8), and no other call.
+    assert_eq!(row["path"], path, "{row:#}");
+    let sites = row["call_sites"].to_string();
+    assert!(sites.contains("web/src/shelf.ts:8"), "{row:#}");
+    // `shelf.list`, `shelf.get` and `shelf.gone` share one call key. The
+    // call of `shelf.gone` (line 10) was never served on main, so no
+    // finding may name it.
+    for finding in &findings {
+        assert!(
+            !finding["call_sites"]
+                .to_string()
+                .contains("web/src/shelf.ts:10"),
+            "shelf.gone got a finding: {finding:#}"
+        );
+    }
 }
 
 /// A procedure a client calls is deleted from the router.
@@ -3634,7 +3650,6 @@ async fn seed_trpc_called_procedure_removed() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
 async fn seed_trpc_called_procedure_removed_marking() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-called-procedure-removed").await;
@@ -3651,7 +3666,6 @@ async fn seed_trpc_called_procedure_renamed() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3778: a procedure call no row serves is never listed as unpaired, so no break row is marked"]
 async fn seed_trpc_called_procedure_renamed_marking() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-called-procedure-renamed").await;
