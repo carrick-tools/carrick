@@ -4331,9 +4331,26 @@ impl<'a> Resolver<'a> {
             .module_bindings
             .get(&(line, symbol.to_string()))
             .filter(|binding| binding.values_read())?;
+        // A nested function's local that holds a parameter of an enclosing
+        // function is not read here: that function's callers decide it, as
+        // the walk's `lifted` reads it (one function nearer each hop). Only
+        // the function's own parameters (depth 0) are `callback_parameter`.
+        if binding.declared == Declared::Nested {
+            let enclosing =
+                |value: &ValueAt| matches!(value, ValueAt::Param { depth, .. } if *depth >= 1);
+            let written = binding.writes.iter().filter_map(|at| placed_write(ir, *at));
+            if binding.init.iter().any(enclosing)
+                || written
+                    .into_iter()
+                    .any(|(_, write)| write.values.iter().any(enclosing))
+            {
+                return None;
+            }
+        }
         let reading = (file.to_path_buf(), line, symbol.to_string());
         if !self.bindings_reading.borrow_mut().insert(reading.clone()) {
-            return Some(Vec::new());
+            // The read came back to the binding it is in the middle of.
+            return Some(vec![Held::Stop(Stop::Recursion)]);
         }
         let mut out = Vec::new();
         // A write no reader states: the binding may hold anything besides
@@ -5449,8 +5466,8 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
 
     /// carrick#3794 T3: a local of a block inside a callback that holds the
     /// callback's own parameter reads `callback_parameter`: no caller index
-    /// keys that parameter. Read as discovery reads it, so the site's stop
-    /// is the one a consumer sees.
+    /// keys that parameter. The discovery site at the call is pinned too: it
+    /// is what a consumer sees.
     ///
     /// Proof it ran: `walked` is `None` without the built compiler engine
     /// (the test then returns early); CI builds it first.
@@ -5479,9 +5496,12 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
             "a site at scoped.ts:39: {:?}",
             discovery.sites
         );
+        // Discovery runs the callback's own parameter as a callback, so the
+        // site states `injected_callee`: the resolver's `callback_parameter`
+        // is the word under it, which no discovery site carries today.
         assert!(
             at.iter()
-                .all(|site| site.stop == Some(Stop::CallbackParameter)),
+                .all(|site| site.stop == Some(Stop::InjectedCallee) && site.end.is_none()),
             "{at:?}"
         );
     }
