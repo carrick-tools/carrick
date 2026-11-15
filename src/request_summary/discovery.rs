@@ -865,12 +865,9 @@ pub fn declaration_ask(inputs: &RequestSummaryInputs, exports: &[ExportClaims]) 
                     member: Some(member),
                     ..
                 }
-                | LibraryClaim::Scope { member, .. }
-                | LibraryClaim::Make {
-                    member: Some(member),
-                    of: Some(_),
-                    ..
-                } => called.contains(&(export.package.clone(), member.clone())),
+                | LibraryClaim::Scope { member, .. } => {
+                    called.contains(&(export.package.clone(), member.clone()))
+                }
                 _ => false,
             })
             .collect();
