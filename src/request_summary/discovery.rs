@@ -9577,6 +9577,11 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             (5, ["bill-closed", "bill-opened"]),
             (6, ["ship-cancelled", "ship-created"]),
             (9, ["bill-closed", "bill-opened"]),
+            // One function makes the queue for two lists: each send states
+            // the names its own opener call made (QW-2b, R-QW2a; was a
+            // SeveralOperations lead, carrick#4418).
+            (14, ["ship-cancelled", "ship-created"]),
+            (15, ["bill-closed", "bill-opened"]),
         ] {
             let record = record_at(line);
             assert_eq!(record.state.asked, vec![Slot::Kind], "{line}: {shown:#?}");
@@ -9610,28 +9615,6 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
             Some(super::super::stop::Stop::UnreadExpression),
             "{shown:#?}"
         );
-        // One function makes the queue for two lists: its parameter's
-        // values are decided at two calls, so neither send states the
-        // other list's names: no record states any, and a lead says why
-        // (carrick#4418).
-        for line in [14, 15] {
-            let point = at(line);
-            assert!(
-                !records.iter().any(|record| record.state.point.at == point),
-                "{line}: {shown:#?}"
-            );
-            let reasons: Vec<_> = decided
-                .leads
-                .iter()
-                .filter(|lead| lead.file == "src/sends.ts" && lead.line == line)
-                .map(|lead| lead.reason)
-                .collect();
-            assert_eq!(
-                reasons,
-                [super::super::stop::Stop::SeveralOperations],
-                "{line}: {shown:#?}"
-            );
-        }
         // A maker in another file: its argument is read in that file, one
         // row per branch of the choice it writes.
         assert_eq!(record_at(16).names, ["flip-even", "flip-odd"], "{shown:#?}");
