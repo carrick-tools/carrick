@@ -142,8 +142,15 @@ class HeldService implements ServiceEngine {
   private readonly armed = new Set<string>();
   private readonly unarmed = new Map<string, Unarmed>();
   private readonly views = new Map<string, View>();
-  /** Files whose checks lost their place or may now be placed: gated again after the answer. */
-  private readonly regate = new Set<string>();
+  /**
+   * Positions, by file, that lost their place or may now be placed: gated again
+   * after the answer. Only these positions are gated; the file's other checks
+   * keep their state, so a file that is broken right now loses only the checks
+   * it already lost.
+   */
+  private readonly regate = new Map<string, Set<string>>();
+  /** The files of the service's program, as the compiler engine wrote them: the only files a check can sit in. */
+  private readonly program: Set<string>;
   private stampSeen: string;
   private needsGate = false;
 
@@ -167,6 +174,7 @@ class HeldService implements ServiceEngine {
     this.w = w;
     this.wire = wire;
     this.ownFiles = new Set(ownFiles);
+    this.program = new Set(ownFiles);
     for (const rel of this.ownFiles) this.sigs.set(rel, this.sigOf(rel));
     this.stampSeen = deps.stamp();
   }
@@ -221,8 +229,22 @@ class HeldService implements ServiceEngine {
     this.writePlaced();
   }
 
-  private async gateFile(rel: string, onlyNew: boolean): Promise<void> {
-    const positions = this.byFile.get(rel) ?? [];
+  /** Gate again after the answer: these positions of `rel`. */
+  private queue(rel: string, ids: Iterable<string>): void {
+    const held = this.regate.get(rel) ?? new Set<string>();
+    for (const id of ids) held.add(id);
+    this.regate.set(rel, held);
+  }
+
+  /**
+   * Place and arm the positions of `rel` (only `ids`, when given). The gate
+   * reads the disk, so it never runs on text newer than the engine's own copy
+   * (`known`): that edit is not applied yet, and gating it would arm or unarm
+   * checks on a file the answer has not seen. Those positions wait for the
+   * next answer.
+   */
+  private async gateFile(rel: string, onlyNew: boolean, ids: Set<string> | null = null): Promise<void> {
+    const positions = (this.byFile.get(rel) ?? []).filter((p) => ids === null || ids.has(p.id));
     const keysOf = (p: Pos): string[] => p.row.groups.map((_, g) => checkKey(p.row, g, p.at));
     const decided = (key: string): boolean => this.armed.has(key) || this.unarmed.has(key);
     if (onlyNew && positions.every((p) => keysOf(p).every(decided))) return;
@@ -232,16 +254,20 @@ class HeldService implements ServiceEngine {
       this.armed.delete(key);
       this.unarmed.set(key, { label: p.row.label, file: rel, reason, group: g, position: p.at });
     };
+    const noneFor = (reason: string): void => {
+      for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
+    };
+    // A check can only sit in a file of the program the compiler engine loaded.
+    if (!this.program.has(rel)) return noneFor("value_outside_service");
+    const text = readText(this.real(rel));
+    const held = this.known.get(rel);
+    if (text !== null && held !== undefined && held !== text) return this.queue(rel, positions.map((p) => p.id));
     if (!onlyNew) {
       for (const p of positions) for (const key of keysOf(p)) {
         this.armed.delete(key);
         this.unarmed.delete(key);
       }
     }
-    const noneFor = (reason: string): void => {
-      for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
-    };
-    const text = readText(this.real(rel));
     if (text === null) return noneFor("file_unreadable");
     const base = this.baseline(rel, text);
     if (typeof base === "string") return noneFor(base);
@@ -347,9 +373,11 @@ class HeldService implements ServiceEngine {
     writePlaced(placedPath(this.deps.root, this.init.service, this.deps.home), this.init.service, armed, unarmed);
   }
 
-  /** Whether any position of `rel` is unarmed for a reason an edit can change. */
-  private hasTransient(rel: string): boolean {
-    return (this.byFile.get(rel) ?? []).some((p) => p.row.groups.some((_, g) => transient(this.unarmed.get(checkKey(p.row, g, p.at))?.reason ?? "")));
+  /** The positions of `rel` that are unarmed for a reason an edit can change. */
+  private transientIds(rel: string): string[] {
+    return (this.byFile.get(rel) ?? [])
+      .filter((p) => p.row.groups.some((_, g) => transient(this.unarmed.get(checkKey(p.row, g, p.at))?.reason ?? "")))
+      .map((p) => p.id);
   }
 
   /** Move every position of `rel` with the edit from `old` to `text`; one that lost its place is dropped and the file is gated again. */
@@ -367,7 +395,7 @@ class HeldService implements ServiceEngine {
       }
       if (typeof moved === "string") {
         this.values.delete(pos.id);
-        this.regate.add(rel);
+        this.queue(rel, [pos.id]);
       } else {
         this.values.set(pos.id, moved);
       }
@@ -393,7 +421,7 @@ class HeldService implements ServiceEngine {
     this.known.set(rel, text);
     if (this.byFile.has(rel)) {
       if (old !== undefined) await this.remap(rel, old, text);
-      if (this.hasTransient(rel)) this.regate.add(rel);
+      this.queue(rel, this.transientIds(rel));
       this.setView(rel);
     } else this.engine.set(this.shadow(rel), text);
   }
@@ -478,11 +506,11 @@ class HeldService implements ServiceEngine {
       }
     }
     if (this.regate.size > 0) {
-      const files = [...this.regate];
+      const pending = [...this.regate];
       this.regate.clear();
       this.commits = await this.deps.commits();
-      for (const rel of files) {
-        await this.gateFile(rel, false);
+      for (const [rel, ids] of pending) {
+        await this.gateFile(rel, false, ids);
         this.setView(rel);
       }
       this.writePlaced();

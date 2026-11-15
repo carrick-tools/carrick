@@ -154,6 +154,8 @@ const rows = (text: (rel: string) => string): ContractRow[] => [
   row("GET /void", ORDERS, "undefined", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
   // A request-direction row is never placed, whatever it carries.
   { ...row("POST /request-side", ORDERS, "{ a: number }", [{ file: ORDERS, span: spanOf(text(ORDERS), "{ created: true }") }]), direction: "request" } as ContractRow,
+  // A send in a file outside the program the compiler engine loaded (case row 10).
+  row("GET /ghost", ORDERS, "{ a: number }", [{ file: "docs/ghost.ts", span: [0, 5] }]),
   // A writer-7 row (no `values`) and one whose scan read none.
   row("GET /legacy", ORDERS, "{ a: number }", undefined),
   row("GET /unread", ORDERS, "{ a: number }", []),
@@ -171,7 +173,7 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
     placed.armed.map((a) => `${a.label}#${a.position}`).sort(),
     ["GET /express/order#0", "GET /express/orders#0", "GET /express/pick#0", "GET /express/pick#1", "GET /orders#0", "GET /shared#0", "GET /void#0", "POST /lambda#0", "POST /orders#0"],
   );
-  assert.deepEqual(placed.unarmed.map((u) => `${u.label}:${u.reason}`).sort(), ["GET /legacy:no_values", "GET /unread:no_values"]);
+  assert.deepEqual(placed.unarmed.map((u) => `${u.label}:${u.reason}`).sort(), ["GET /ghost:value_outside_service", "GET /legacy:no_values", "GET /unread:no_values"]);
   assert.ok(![...placed.armed, ...placed.unarmed].some((p) => p.label === "POST /request-side"), "a request-side row is ignored");
   assert.deepEqual(placed.armed.find((a) => a.label === "GET /shared")!.file, SHARED);
   assert.deepEqual((await r.ask(ORDERS)).lines, [], "the unedited file says nothing");
@@ -210,16 +212,18 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
   assert.equal(movedBroken.lines.length, 1, JSON.stringify(movedBroken.lines));
   assert.equal(movedBroken.lines[0]!.line, lineAt(moved, "res.json({ orders, total })"));
   await r.edit(EXPRESS, original[EXPRESS]!);
-  await r.ask(EXPRESS); // a restore across a bound is gated again after its answer: wait for that before the next edit
 
-  // (e) the rename that crosses a value's bound: silent, and armed again once the file is gated again.
+  // (e) a rename whose two edits sit on lines apart, the second inside the value: the one-region move across the
+  // value's bound cannot place it again (`find_site` matches the value's old text, which changed), so that answer
+  // is silent for this row; the gate then reads the two hunks against the index commit and places it again. It is
+  // NOT "armed with no line, in place": a break made in this same edit would be missed (see the PR body).
   const renamed = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept, total }");
   assert.deepEqual((await r.edit(EXPRESS, renamed)).lines, []);
-  await r.ask(EXPRESS); // queued behind the after-answer gate
-  assert.ok(r.placed().armed.some((a) => a.label === "GET /express/orders"), "still armed after the rename: " + JSON.stringify(r.placed().unarmed));
-  assert.deepEqual((await r.edit(EXPRESS, renamed.replace("{ orders: kept, total }", "{ orders: kept }"))).lines.map((l) => l.label), ["GET /express/orders"]);
-  await r.edit(EXPRESS, original[EXPRESS]!);
+  // Time passes (the agent's turn): the gate after the answer runs. An edit written at once would be applied first,
+  // and the gate waits for the next answer instead of gating text the answer has not seen.
   await r.ask(EXPRESS);
+  assert.deepEqual((await r.edit(EXPRESS, renamed.replace("{ orders: kept, total }", "{ orders: kept }"))).lines.map((l) => l.label), ["GET /express/orders"], "armed again after the gate");
+  await r.edit(EXPRESS, original[EXPRESS]!);
 
   // (h) a `Date` value against `string` arms (the wire form); (j) breaking each member prints a line without machinery.
   for (const [from, to] of [["id: string", "id: number"], ["settled: boolean", "settled: string"], ["placedAt: Date", "placedAt: number"]] as const) {
