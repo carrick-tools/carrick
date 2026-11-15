@@ -54,7 +54,7 @@ export type AskOptions = {
   kind: "read" | "edit";
   editedAt?: number;
   waitMs?: number;
-  /** The session's queue entry for this ask (`enqueueHeld`): the daemon files its answer under it. */
+  /** Part 2's queue entry for this edit: the daemon files its early answer under it. */
   seq?: string;
 };
 
@@ -71,9 +71,10 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
   const started = Date.now();
   const env = options.env ?? process.env;
   if (!compilerLinesEnabled(env)) return Promise.resolve(none("off", started));
-  // The same budget as part 2's probe (`probeTimeoutMs`), run beside it: an
-  // answer ready within it prints in this action; a slower one is filed by the
-  // daemon where part 2's late answers land (`hook/late.ts`).
+  // At most the probe's budget (`probeTimeoutMs`); the edit hook passes what is
+  // left of it since the edit. An answer ready within it prints in this action;
+  // a slower one is filed by the daemon as the entry's early answer, which the
+  // next carrier prints (`hook/late.ts`).
   const waitMs = options.waitMs ?? probeTimeoutMs();
   const request: HeldRequest = {
     session: options.session,

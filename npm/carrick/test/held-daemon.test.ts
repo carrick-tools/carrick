@@ -35,6 +35,11 @@ const LINE: HeldLine = {
   file: "src/orders.ts",
   line: 8,
   message: "broken",
+  row_file: "src/orders.ts",
+  row_line: 8,
+  row_path: "/w/src/orders.ts",
+  places: [{ service: "web", file: "src/view.ts", line: 3 }],
+  expected: "{ id: string }",
 };
 
 type Fake = { init: ServiceInit; closed: boolean; rss: number; asked: string[]; events: string[]; afterGate?: Promise<void> };

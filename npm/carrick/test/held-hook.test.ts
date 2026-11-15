@@ -1,6 +1,7 @@
-// The held compiler's line in the post-edit hook (part 3, T6): what an edit
-// prints when the daemon answers, and that the hook never waits on a cold one.
-// The daemon is a fake socket server in this process. Every name is invented.
+// The held compiler's early answer in the post-edit hook (part 3, B1): what an
+// edit prints when the daemon answers, and that the hook never waits on a cold
+// one. The daemon is a fake socket server in this process that files its
+// answer as the real one does (`answerEarly`). Every name is invented.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -14,11 +15,13 @@ import { commitRepos } from "./facts-repos.ts";
 import { context, lineOf, patchEdit } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
 import { buildFacts, factsPath } from "../src/facts/store.ts";
-import { factsSaid } from "../src/hook/reuse.ts";
+import { factsSaid, sessionsDir } from "../src/hook/reuse.ts";
 import { heldDir, socketPath } from "../src/held/paths.ts";
 import { readTimings } from "../src/hook/timings.ts";
-import { renderHeldLine } from "../src/held/line.ts";
-import type { HeldAnswer, HeldLine } from "../src/held/daemon.ts";
+import { answerEarly } from "../src/hook/rechecks.ts";
+import { askHeld } from "../src/held/client.ts";
+import { heldDetail } from "../src/held/early.ts";
+import type { HeldAnswer, HeldLine, HeldRequest } from "../src/held/daemon.ts";
 
 const SLUG = "held-hook-demo";
 const NOTE = " (another repo, indexed at abcdef01, not checked out here)";
@@ -98,7 +101,7 @@ async function workspace(t: { after: (fn: () => void) => void }): Promise<Ws> {
   return { root, home, at: (rel) => path.join(root, rel) };
 }
 
-const broken = (over: Partial<HeldLine> = {}): HeldLine => ({
+const broken = (over: Partial<HeldLine> = {}, ws?: Ws): HeldLine => ({
   row_key: ROW_KEY,
   group: 0,
   label: "GET /tasks",
@@ -106,12 +109,17 @@ const broken = (over: Partial<HeldLine> = {}): HeldLine => ({
   file: "src/tasks.ts",
   line: 3,
   message: "Type '{ name: string; }' is not assignable to type 'O1_0'.",
+  row_file: "src/tasks.ts",
+  row_line: 2,
+  row_path: ws ? ws.at("api/src/tasks.ts") : "/w/api/src/tasks.ts",
+  places: [{ service: "ext", file: "src/view4.ts", line: 4 }],
+  expected: A,
   ...over,
 });
 
 type Fake = { requests: Array<Record<string, unknown>>; close(): Promise<void> };
 
-/** A daemon on the checkout's socket that answers every request with `answer` after `delayMs`. */
+/** A daemon on the checkout's socket that answers every request with `answer` after `delayMs`, filing an edit ask's answer first as the real one does. */
 async function fakeDaemon(ws: Ws, answer: HeldAnswer, delayMs = 0, root: string = ws.root): Promise<Fake> {
   fs.mkdirSync(heldDir(ws.home), { recursive: true });
   const requests: Array<Record<string, unknown>> = [];
@@ -123,8 +131,12 @@ async function fakeDaemon(ws: Ws, answer: HeldAnswer, delayMs = 0, root: string 
       buffer += chunk.toString("utf8");
       const end = buffer.indexOf("\n");
       if (end < 0) return;
-      requests.push(JSON.parse(buffer.slice(0, end)) as Record<string, unknown>);
-      setTimeout(() => conn.writable && conn.write(`${JSON.stringify(answer)}\n`), delayMs);
+      const request = JSON.parse(buffer.slice(0, end)) as HeldRequest;
+      requests.push(request as unknown as Record<string, unknown>);
+      setTimeout(() => {
+        if (request.kind === "edit" && request.seq) answerEarly(request.session, request.seq, answer, Date.now(), ws.home);
+        if (conn.writable) conn.write(`${JSON.stringify(answer)}\n`);
+      }, delayMs);
     });
     conn.on("error", () => undefined);
   });
@@ -145,29 +157,42 @@ const edit = (ws: Ws, session: string, env: Record<string, string> = ON) =>
 const ready = (lines: HeldLine[]): HeldAnswer => ({ state: "ready", lines, ms: 5 });
 const FORBIDDEN = /__C|\bsend\d|\bO\d|__carrick_/;
 
-test("row 1 (K-c): a break prints one line IN ADDITION to part 1's contract line; both are claimed", async (t) => {
+const EARLY = "Carrick's compiler engine checked api/src/tasks.ts after this edit: 1 contract problem.";
+
+test("row 1 (K-c): a break prints the early answer IN ADDITION to part 1's contract line; both are claimed", async (t) => {
   const ws = await workspace(t);
-  const daemon = await fakeDaemon(ws, ready([broken()]));
+  const daemon = await fakeDaemon(ws, ready([broken({}, ws)]));
   t.after(() => daemon.close());
   const out = await edit(ws, "h1");
   const said = context(out.stdout);
-  assert.ok(said.includes("Carrick: this edit breaks GET /tasks for web (src/tasks.ts:3): Type '{ name: string; }' is not assignable to type the type it expects."), said);
+  assert.ok(said.includes(`${EARLY}\n- api/src/tasks.ts:2:1 route GET /tasks type_mismatch: Type '{ name: string; }' is not assignable to type the type it expects. Consumers: ext src/view4.ts:4`), said);
   assert.ok(said.includes("is called from"), "part 1's line stays: " + said);
   assert.ok(!FORBIDDEN.test(said), said);
   assert.equal(daemon.requests.length, 1);
   assert.equal(daemon.requests[0]!["kind"], "edit");
-  const claimed = [...factsSaid("h1", ws.home)];
-  assert.ok(claimed.some((key) => key.startsWith("contract::")), claimed.join(" | "));
-  assert.ok(claimed.some((key) => key.startsWith("held::") && key.includes(ROW_KEY)), claimed.join(" | "));
+  assert.equal(typeof daemon.requests[0]!["seq"], "string", "the ask names part 2's entry");
+  assert.ok([...factsSaid("h1", ws.home)].some((key) => key.startsWith("contract::")));
+  assert.ok(fs.existsSync(path.join(sessionsDir(ws.home), `h1.recheck.${String(daemon.requests[0]!["seq"])}.early.said`)), "the early answer is claimed");
 });
 
-test("the same break in the same session is said once", async (t) => {
+test("the ask waits only for what is left of the probe's budget since the edit", async (t) => {
   const ws = await workspace(t);
-  const daemon = await fakeDaemon(ws, ready([broken()]));
+  const daemon = await fakeDaemon(ws, ready([]));
   t.after(() => daemon.close());
-  await edit(ws, "h1b");
-  const again = context((await edit(ws, "h1b")).stdout);
-  assert.ok(!again.includes("this edit breaks"), again);
+  await edit(ws, "h1w");
+  const wait = Number(daemon.requests[0]!["wait_ms"]);
+  assert.ok(wait >= 0 && wait < 600, String(wait));
+});
+
+test("an ask whose wait has already run out is still sent, and its answer is filed", async (t) => {
+  const ws = await workspace(t);
+  const daemon = await fakeDaemon(ws, ready([]));
+  t.after(() => daemon.close());
+  const answer = await askHeld(ws.root, [ws.at("api/src/tasks.ts")], { session: "h0", kind: "edit", waitMs: 0, seq: "0000000000001-1-0001", home: ws.home, env: ON });
+  assert.equal(answer.state, "late");
+  const end = Date.now() + 3000;
+  while (daemon.requests.length === 0 && Date.now() < end) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(daemon.requests.length, 1);
 });
 
 test("row 2: a safe edit prints part 1's line as it always did", async (t) => {
@@ -176,7 +201,7 @@ test("row 2: a safe edit prints part 1's line as it always did", async (t) => {
   t.after(() => daemon.close());
   const said = context((await edit(ws, "h2")).stdout);
   assert.ok(said.includes(PART1), said);
-  assert.ok(!said.includes("this edit breaks"), said);
+  assert.ok(!said.includes("compiler engine"), said);
   assert.equal(readTimings(ws.root).at(-1)?.held_state, "ready");
 });
 
@@ -191,14 +216,14 @@ test("rows 5 and 9: cold and none print part 1 only and name the state in the ti
   }
 });
 
-test("row 6: an answer after the wait is not printed by this hook, the hook is not held past it (50 ms), and the state is late; the daemon files it for the next hook (held-late.test.ts)", async (t) => {
+test("row 6: an answer after the wait is not printed by this hook, the hook is not held past it, and the state is late; the daemon files it for the next carrier (early-answer.test.ts)", async (t) => {
   const ws = await workspace(t);
-  const daemon = await fakeDaemon(ws, ready([broken()]), 2500);
+  const daemon = await fakeDaemon(ws, ready([broken({}, ws)]), 2500);
   t.after(() => daemon.close());
   const out = await edit(ws, "h6");
   const said = context(out.stdout);
   assert.ok(said.includes(PART1), said);
-  assert.ok(!said.includes("this edit breaks"), said);
+  assert.ok(!said.includes("compiler engine"), said);
   assert.ok(out.ms < 2300, `the hook took ${out.ms} ms`);
   const row = readTimings(ws.root).at(-1);
   assert.equal(row?.held_state, "late");
@@ -263,7 +288,7 @@ test("row 10: a file in a linked worktree is not asked about", async (t) => {
     },
     env: fakeEnv({ HOME: ws.home, CLAUDE_PROJECT_DIR: ws.root, CARRICK_FAKE_FIXTURE: fixturePath("check-silent.json"), ...ON }),
   });
-  assert.ok(!context(out.stdout).includes("this edit breaks"), out.stdout);
+  assert.ok(!context(out.stdout).includes("compiler engine"), out.stdout);
   assert.equal(daemon.requests.length, 0);
 });
 
@@ -279,7 +304,7 @@ test("a Read asks the daemon with kind read and prints nothing of part 3", async
   assert.equal(read.code, 0);
   assert.equal(daemon.requests.length, 1);
   assert.equal(daemon.requests[0]!["kind"], "read");
-  assert.ok(!read.stdout.includes("this edit breaks"), read.stdout);
+  assert.ok(!read.stdout.includes("compiler engine"), read.stdout);
 });
 
 test("the Read hook with the switch off asks nothing", async (t) => {
@@ -294,29 +319,28 @@ test("the Read hook with the switch off asks nothing", async (t) => {
   assert.equal(daemon.requests.length, 0);
 });
 
-// The wording (D13), on the renderer itself.
+// The detail (D13): the compiler's message in words an agent may read.
 
 test("the alias becomes the group's symbol, or the type it expects when there is none", () => {
   const message = "Type 'string' is not assignable to type 'O12_3'.";
-  assert.equal(renderHeldLine(broken({ message, symbol: "TaskView" }))?.text, "Carrick: this edit breaks GET /tasks for web (src/tasks.ts:3): Type 'string' is not assignable to type 'TaskView'.");
-  assert.equal(renderHeldLine(broken({ message }))?.text, "Carrick: this edit breaks GET /tasks for web (src/tasks.ts:3): Type 'string' is not assignable to type the type it expects.");
+  assert.equal(heldDetail(broken({ message, symbol: "TaskView" })), "Type 'string' is not assignable to type 'TaskView'.");
+  assert.equal(heldDetail(broken({ message })), "Type 'string' is not assignable to type the type it expects.");
 });
 
 test("a quoted inline object type over 80 characters becomes the reply; a short one stays", () => {
   const long = `'{ ${"alpha: string; ".repeat(6)}}'`;
-  const said = renderHeldLine(broken({ message: `Type ${long} is not assignable to type 'O1_0'.` }))!.text;
-  assert.ok(said.includes("Type the reply is not assignable"), said);
-  assert.ok(renderHeldLine(broken({ message: "Type '{ id: number; }' is not assignable to type 'O1_0'." }))!.text.includes("'{ id: number; }'"));
+  assert.ok(heldDetail(broken({ message: `Type ${long} is not assignable to type 'O1_0'.` }))!.includes("Type the reply is not assignable"));
+  assert.ok(heldDetail(broken({ message: "Type '{ id: number; }' is not assignable to type 'O1_0'." }))!.includes("'{ id: number; }'"));
 });
 
-test("a line is at most 300 characters on one line", () => {
-  const text = renderHeldLine(broken({ message: `Property 'x' is missing.\n  ${"because of a long reason ".repeat(40)}` }))!.text;
-  assert.ok(text.length <= 300, String(text.length));
+test("a detail is one line, cut to its cap", () => {
+  const text = heldDetail(broken({ message: `Property 'x' is missing.\n  ${"because of a long reason ".repeat(40)}` }))!;
+  assert.ok(text.length <= 240, String(text.length));
   assert.ok(!text.includes("\n"));
 });
 
-test("a message that still names the check's machinery is not printed", () => {
+test("a message that still names the check's machinery is never written", () => {
   for (const message of ["Property '__carrick_never' is missing", "Type 'x' is not assignable to type '__C.Pick2xx'", "Cannot find name 'send3'"]) {
-    assert.equal(renderHeldLine(broken({ message })), null, message);
+    assert.equal(heldDetail(broken({ message })), null, message);
   }
 });

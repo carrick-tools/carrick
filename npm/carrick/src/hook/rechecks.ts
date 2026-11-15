@@ -25,7 +25,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { binary, check, checkChanged } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
-import type { HeldLine } from "../held/daemon.ts";
 import { createLogger } from "../log.ts";
 import {
   alive,
@@ -42,6 +41,10 @@ import { scriptBeside, startDetached } from "./refresh.ts";
 import { sessionsDir, writeAtomic } from "./reuse.ts";
 import { safeId } from "./session-key.ts";
 import { appendTiming, engineReadyOf } from "./timings.ts";
+import type { HeldLine } from "../held/daemon.ts";
+import { earlyResult } from "../held/early.ts";
+import { compareEarly, hasEarlyBreak, heldRecord } from "./confirm.ts";
+import type { HeldRecord } from "./confirm.ts";
 
 const log = createLogger("carrick-recheck");
 
@@ -92,12 +95,9 @@ export type QueueEntry = {
    * `changed`: one `carrick check --changed` for the session's whole change
    * in `root` (`file` is `root`), queued by a Stop that could not state the
    * check from the per-file answers (carrick#3466). It runs after every
-   * per-file entry and Stop never waits for it. `held`: one ask to the
-   * held-compiler daemon for an edited file (part 3, T9); it is never in the
-   * runner's queue, Stop never waits for it, and only a newer `held` entry of
-   * the same file supersedes it. Absent: one edited file.
+   * per-file entry and Stop never waits for it. Absent: one edited file.
    */
-  kind?: "changed" | "held";
+  kind?: "changed";
   /**
    * The files the Stop that queued a `changed` entry named as not yet checked
    * (workspace-relative). A clean answer is delivered only for a named set
@@ -119,9 +119,6 @@ export type QueueEntry = {
   cwd?: string;
 };
 
-/** The held compiler's answer to one ask: its state and the breaks it found. */
-export type HeldFinding = { state: string; lines: HeldLine[] };
-
 export type Answer = {
   seq: string;
   session: string;
@@ -132,9 +129,7 @@ export type Answer = {
   enqueued_at: string;
   started_at: string | null;
   finished_at: string;
-  kind?: "changed" | "held";
-  /** What the daemon answered a `held` entry (part 3, T9). */
-  held?: HeldFinding;
+  kind?: "changed";
   /** The files Stop named when it queued a `changed` entry, carried from the entry. */
   named?: string[];
   /** Carried from the entry: the late answer leaves out the uses-count line. */
@@ -152,16 +147,6 @@ export type Answer = {
 /** Whether an entry or answer is the session's whole-change check. */
 export function isChanged(entry: { kind?: string }): boolean {
   return entry.kind === "changed";
-}
-
-/** Whether an entry or answer is an ask to the held-compiler daemon. */
-export function isHeld(entry: { kind?: string }): boolean {
-  return entry.kind === "held";
-}
-
-/** What supersedes what: a newer entry of the same file in the same lane (a held ask is not a re-check). */
-function laneOf(entry: { kind?: string; file: string }): string {
-  return isHeld(entry) ? `held\0${entry.file}` : entry.file;
 }
 
 /**
@@ -322,59 +307,153 @@ export function answerInHand(
   writeAtomic(pending, `${JSON.stringify(entry, null, 2)}\n`);
 }
 
-/**
- * File one ask to the held-compiler daemon for `file` (part 3, T9): the
- * session's pending entry only. It is not in the runner's queue, so no runner
- * runs it; the daemon answers it with `answerHeld`, and the carriers print
- * that answer as they print part 2's. Null when the entry could not be filed.
- */
-export function enqueueHeld(
-  root: string,
-  session: string,
-  file: string,
-  now: number,
-  options: Options & { cwd?: string | null } = {},
-): QueueEntry | null {
-  const seq = nextSeq(now);
-  const entry: QueueEntry = {
-    seq,
-    session,
-    file,
-    relative: path.relative(root, file),
-    root,
-    enqueued_at: new Date(now).toISOString(),
-    attempts: 0,
-    kind: "held",
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-  };
-  const pending = sessionPart(session, seq, "pending.json", options.home);
-  if (pending === null || !writeAtomic(pending, `${JSON.stringify(entry, null, 2)}\n`)) return null;
-  return entry;
-}
+// --- the early answer (part 3, B1) ------------------------------------------
+//
+// The held compiler answers a per-file entry with `<seq>.early.json` beside it:
+// never `answer.json` (which reads as "answered" to the coverage and the queue)
+// and never a `.delivered` name (which reads as the seq delivered). Its claim
+// is `<seq>.early.said`, holding the keys of the rows that were printed, and the
+// differ record is written once per entry under `<seq>.early.recorded`.
 
-/** Whether a newer ask for the same file has been filed since this one: its verdict is stale and never printed. */
-export function heldSuperseded(session: string, seq: string, home?: string): boolean {
+/** One early answer: the entry it is for, when it landed, and its rows as a check answer (`held/early.ts`). */
+export type EarlyAnswer = {
+  seq: string;
+  session: string;
+  file: string;
+  relative: string;
+  root: string;
+  enqueued_at: string;
+  landed_at: string;
+  /** How long the daemon took to answer. */
+  held_ms: number;
+  cwd?: string;
+  /** No items and no moved rows: the daemon answered and found no break. */
+  result: CheckResult;
+};
+
+/** Whether a newer per-file entry of the same file was filed after `seq`: its answers are the ones to give. */
+export function supersededEntry(session: string, seq: string, home?: string): boolean {
   const own = readJson<QueueEntry>(sessionPart(session, seq, "pending.json", home) ?? "");
-  if (own === null || !isHeld(own)) return false;
+  if (own === null) return false;
   for (const name of sessionNames(session, home).filter((n) => n.endsWith(".pending.json"))) {
     if (seqOf(session, name) <= seq) continue;
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
-    if (entry !== null && isHeld(entry) && entry.file === own.file) return true;
+    if (entry !== null && !isChanged(entry) && entry.file === own.file) return true;
   }
   return false;
 }
 
 /**
- * Record the daemon's answer to an ask filed by `enqueueHeld`, in the place
- * part 2's late answers land. An answer with nothing to say is filed already
- * delivered, so no carrier reads it again. False when the entry is gone.
+ * File the daemon's answer to the ask for entry `seq` as its early answer: for
+ * every `ready` answer, with no rows when it found no break. Nothing is filed
+ * for any other state, for an entry that is gone or is not a file's, or when a
+ * newer entry of the same file was filed since. When the full answer is
+ * already there, the differ record is written here. False when nothing was filed.
  */
-export function answerHeld(session: string, seq: string, held: HeldFinding, now: number, home?: string): boolean {
+export function answerEarly(
+  session: string,
+  seq: string,
+  answer: { state: string; lines: readonly HeldLine[]; ms: number },
+  now: number,
+  home?: string,
+): boolean {
+  if (answer.state !== "ready") return false;
   const entry = readJson<QueueEntry>(sessionPart(session, seq, "pending.json", home) ?? "");
-  if (entry === null || !isHeld(entry)) return false;
-  if (!writeAnswer(entry, "answered", now, now, { held }, home)) return false;
-  if (held.state !== "ready" || held.lines.length === 0) claimDelivery(session, seq, home, now);
+  if (entry === null || isChanged(entry)) return false;
+  if (supersededEntry(session, seq, home)) return false;
+  const early: EarlyAnswer = {
+    seq,
+    session,
+    file: entry.file,
+    relative: entry.relative,
+    root: entry.root,
+    enqueued_at: entry.enqueued_at,
+    landed_at: new Date(now).toISOString(),
+    held_ms: answer.ms,
+    ...(entry.cwd ? { cwd: entry.cwd } : {}),
+    result: earlyResult(entry, answer.lines),
+  };
+  const file = sessionPart(session, seq, "early.json", home);
+  if (file === null || !writeAtomic(file, `${JSON.stringify(early, null, 2)}\n`)) return false;
+  const full = readAnswer(session, seq, home);
+  if (full !== null) {
+    const record = claimRecord(session, seq, early, full.result, home);
+    if (record !== null) {
+      appendTiming(entry.root, {
+        hook: "held",
+        start: early.landed_at,
+        duration_ms: answer.ms,
+        waited_ms: 0,
+        outcome: "silent",
+        file: entry.relative,
+        held_ms: answer.ms,
+        ...record,
+      });
+    }
+  }
   return true;
+}
+
+/** The full answer filed for entry `seq`, delivered or not, or null. */
+export function readAnswer(session: string, seq: string, home?: string): Answer | null {
+  return readJson<Answer>(sessionPart(session, seq, "answer.json", home) ?? "");
+}
+
+/** The early answer filed for entry `seq`, or null. */
+export function readEarly(session: string, seq: string, home?: string): EarlyAnswer | null {
+  return readJson<EarlyAnswer>(sessionPart(session, seq, "early.json", home) ?? "");
+}
+
+/** Claim the right to print entry `seq`'s early answer, naming the rows printed: true for exactly one caller. */
+export function claimEarly(session: string, seq: string, keys: readonly string[], home?: string, now: number = Date.now()): boolean {
+  const file = sessionPart(session, seq, "early.said", home);
+  if (file === null) return false;
+  return createExclusive(file, `${JSON.stringify({ said_at: new Date(now).toISOString(), keys })}\n`);
+}
+
+/** The keys of entry `seq`'s early rows that were printed, or null when its early answer was never claimed. */
+export function earlySaid(session: string, seq: string, home?: string): Set<string> | null {
+  const said = readJson<{ keys?: string[] }>(sessionPart(session, seq, "early.said", home) ?? "");
+  return said === null ? null : new Set(said.keys ?? []);
+}
+
+/**
+ * The differ record for entry `seq`, for whichever of the two answers lands
+ * second: null when the other one wrote it first.
+ */
+function claimRecord(session: string, seq: string, early: EarlyAnswer, full: CheckResult | undefined, home?: string): HeldRecord | null {
+  const file = sessionPart(session, seq, "early.recorded", home);
+  if (file === null || !createExclusive(file, `${JSON.stringify({ at: new Date().toISOString() })}\n`)) return null;
+  return heldRecord(compareEarly(early.result, full));
+}
+
+/** An early answer with a break that `reader` has not printed, filed under the reader's own key or an ended sub-agent's. */
+export type OwedEarly = { owner: string; early: EarlyAnswer };
+
+/**
+ * Every early answer with a break that `reader` is owed: its own, then each
+ * ended sub-agent's (carrick#4074), oldest first. One a newer entry of the
+ * same file superseded is claimed here unprinted, so it is never read again.
+ */
+export function earlyOwedFor(reader: string, home?: string): OwedEarly[] {
+  const listing = sessionListing(home);
+  const out: OwedEarly[] = [];
+  for (const owner of [reader, ...endedAgents(reader, listing)]) {
+    const all = sessionNames(owner, home, listing);
+    const said = new Set(all.filter((n) => n.endsWith(".early.said")).map((n) => seqOf(owner, n)));
+    for (const name of all.filter((n) => n.endsWith(".early.json"))) {
+      const seq = seqOf(owner, name);
+      if (said.has(seq)) continue;
+      const early = readJson<EarlyAnswer>(path.join(sessionsDir(home), name));
+      if (early === null || !hasEarlyBreak(early.result)) continue;
+      if (supersededEntry(owner, seq, home)) {
+        claimEarly(owner, seq, [], home);
+        continue;
+      }
+      out.push({ owner, early });
+    }
+  }
+  return out;
 }
 
 // --- the runner's lock -----------------------------------------------------
@@ -444,7 +523,7 @@ function writeAnswer(
   state: AnswerState,
   startedAt: number | null,
   finishedAt: number,
-  body: { result?: CheckResult; changed?: ChangedResult; held?: HeldFinding; failure?: string },
+  body: { result?: CheckResult; changed?: ChangedResult; failure?: string },
   home?: string,
 ): boolean {
   const answer: Answer = {
@@ -457,7 +536,7 @@ function writeAnswer(
     enqueued_at: entry.enqueued_at,
     started_at: startedAt === null ? null : new Date(startedAt).toISOString(),
     finished_at: new Date(finishedAt).toISOString(),
-    ...(isChanged(entry) ? { kind: "changed" as const } : isHeld(entry) ? { kind: "held" as const } : {}),
+    ...(isChanged(entry) ? { kind: "changed" as const } : {}),
     ...(entry.named !== undefined ? { named: entry.named } : {}),
     ...(entry.facts_callers ? { facts_callers: true as const } : {}),
     ...(entry.instead_of_probe ? { instead_of_probe: true as const } : {}),
@@ -638,6 +717,11 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         bin,
       });
       const finishedAt = clock();
+      const body = outcome.result ? { result: outcome.result } : { failure: outcome.failure ?? "the re-check gave no answer" };
+      writeAnswer(entry, "answered", startedAt, finishedAt, body, options.home);
+      // The differ record (P12) when the early answer landed first.
+      const early = readEarly(entry.session, entry.seq, options.home);
+      const record = early === null ? null : claimRecord(entry.session, entry.seq, early, outcome.result ?? undefined, options.home);
       // One timing row per re-check, with whether the compiler engine was
       // ready for its re-scan, so the miss rate can be read later (carrick#3948).
       // Not in the hooks' p50/p90: the agent does not wait on this runner.
@@ -650,13 +734,8 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         outcome: outcome.result ? "silent" : "error",
         file: entry.relative,
         ...(engineReady === undefined ? {} : { engine_ready: engineReady }),
+        ...(record === null ? {} : { held_ms: early!.held_ms, ...record }),
       });
-      if (outcome.result) {
-        writeAnswer(entry, "answered", startedAt, finishedAt, { result: outcome.result }, options.home);
-      } else {
-        const failure = outcome.failure ?? "the re-check gave no answer";
-        writeAnswer(entry, "answered", startedAt, finishedAt, { failure }, options.home);
-      }
       remove(taken);
     }
     releaseLock(lockPath(root), pid);
@@ -734,7 +813,7 @@ export function pendingFor(session: string, home?: string): Pending[] {
     const seq = seqOf(session, name);
     if (answered.has(seq)) continue;
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
-    if (entry !== null && !isHeld(entry)) out.push(entry);
+    if (entry !== null) out.push(entry);
   }
   return out;
 }
@@ -766,9 +845,9 @@ export function finishedFor(session: string, home?: string, listing?: readonly s
     if (seqOf(session, name) < oldest) continue;
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
     if (entry === null) continue;
-    fileOf.set(entry.seq, laneOf(entry));
-    const held = newest.get(laneOf(entry));
-    if (held === undefined || held < entry.seq) newest.set(laneOf(entry), entry.seq);
+    fileOf.set(entry.seq, entry.file);
+    const held = newest.get(entry.file);
+    if (held === undefined || held < entry.seq) newest.set(entry.file, entry.seq);
   }
   const out: Answer[] = [];
   for (const seq of owed) {
@@ -779,7 +858,7 @@ export function finishedFor(session: string, home?: string, listing?: readonly s
     }
     const answer = readJson<Answer>(path.join(sessionsDir(home), `${session}.recheck.${seq}.answer.json`));
     if (answer === null) continue;
-    if (answer.state === "superseded" || (newest.get(laneOf(answer)) ?? seq) > seq) {
+    if (answer.state === "superseded" || (newest.get(answer.file) ?? seq) > seq) {
       claimDelivery(session, seq, home);
       continue;
     }
@@ -828,7 +907,7 @@ export function newestPerFile(session: string, home?: string): Map<string, { ent
   const out = new Map<string, { entry: QueueEntry; answer: Answer | null }>();
   for (const name of all.filter((n) => n.endsWith(".pending.json"))) {
     const entry = readJson<QueueEntry>(path.join(sessionsDir(home), name));
-    if (entry === null || isChanged(entry) || isHeld(entry)) continue;
+    if (entry === null || isChanged(entry)) continue;
     const held = out.get(entry.file);
     if (held !== undefined && held.entry.seq > entry.seq) continue;
     const answer = readJson<Answer>(path.join(sessionsDir(home), `${session}.recheck.${entry.seq}.answer.json`));

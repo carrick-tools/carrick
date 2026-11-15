@@ -23,6 +23,7 @@ export type TimedHook =
   | "post-edit"
   | "post-bash"
   | "recheck"
+  | "held"
   | "prompt-submit"
   | "stop"
   | "subagent-stop";
@@ -57,6 +58,16 @@ export type TimingRecord = {
   /** Post-edit, only with the held compiler on (part 3): the daemon's answer time and state (`ready`, `cold`, `late`, `none`, `capped`, `no_compiler`, `error`, `unavailable`). */
   held_ms?: number;
   held_state?: string;
+  /**
+   * Re-check rows, and `held` rows (written by the held-compiler daemon when its
+   * early answer landed after the re-check): how the early answer and the full
+   * one compared for the entry (`hook/confirm.ts`), the count per bucket, and
+   * why part 2 left a break standing on `part3_only`. `held_ms` is then the
+   * early answer's time.
+   */
+  held?: "same" | "differ" | "part2_only" | "part3_only" | "none";
+  held_rows?: { same: number; differ: number; part2_only: number; part3_only: number };
+  p2_state?: "unresolved" | "absent" | "not_judged";
 };
 
 /** The file keeps this many of its last lines. */
@@ -66,7 +77,7 @@ export const WINDOW_MS = 7 * 24 * 60 * 60_000;
 /** A hook whose p90 is above this is named at session start. */
 export const SLOW_HOOK_MS = 1000;
 
-/** The hooks whose own duration `carrick status` and the session start report; a `recheck` row runs in the background, so the agent never waits on it. */
+/** The hooks whose own duration `carrick status` and the session start report; a `recheck` or `held` row runs in the background, so the agent never waits on it. */
 const ORDER: TimedHook[] = ["session-start", "post-read", "post-edit", "post-bash", "prompt-submit", "stop", "subagent-stop"];
 
 export function timingsPath(root: string): string {

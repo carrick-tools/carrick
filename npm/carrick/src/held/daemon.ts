@@ -13,7 +13,7 @@ import path from "node:path";
 import { realPath } from "../fs-util.ts";
 import { createLogger } from "../log.ts";
 import { releaseLock, takeLock, touchLock } from "../hook/lock.ts";
-import { answerHeld, heldSuperseded } from "../hook/rechecks.ts";
+import { answerEarly, supersededEntry } from "../hook/rechecks.ts";
 import { heldDir, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
 import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
@@ -48,9 +48,9 @@ export type HeldRequest = {
   /** How long the asker waits; an answer after it is logged as late. */
   wait_ms?: number;
   /**
-   * The asker's queue entry (`enqueueHeld`, part 3 T9): the answer is filed
-   * under it where part 2's late answers land, unless a newer edit of the
-   * same file superseded this ask, which is then not run.
+   * The asker's queue entry, part 2's own (B1): the answer is filed under it as
+   * its early answer (`<seq>.early.json`), unless a newer entry of the same
+   * file superseded this ask, which is then not run.
    */
   seq?: string;
 };
@@ -64,8 +64,16 @@ export type HeldLine = {
   file: string;
   line: number;
   message: string;
-  /** The group's named type, when the row has one (the line says it in place of the check's alias). */
+  /** The group's named type, when the row has one (the detail says it in place of the check's alias). */
   symbol?: string | null;
+  /** The contract row's own file, repo-relative, and its line: where the route is, never the send. */
+  row_file: string;
+  row_line: number | null;
+  /** The row's file, absolute: what decides whether the row is in the edited file. */
+  row_path: string;
+  /** The group's places (the consumers that read the type) and the type they expect. */
+  places: Array<{ service: string; file: string; line: number | null }>;
+  expected: string;
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";
@@ -176,7 +184,7 @@ export class HeldDaemon {
     }
     const ms = Math.round(performance.now() - started);
     this.record(request, state, lines.length, ms, steps);
-    this.file(request, state, lines);
+    this.file(request, state, lines, ms);
     return { state, lines, ms };
   }
 
@@ -258,18 +266,18 @@ export class HeldDaemon {
   }
 
   private superseded(request: HeldRequest): boolean {
-    return request.seq !== undefined && heldSuperseded(request.session, request.seq, this.deps.home);
+    return request.seq !== undefined && supersededEntry(request.session, request.seq, this.deps.home);
   }
 
-  /** File the answer for an ask that named its entry, unless a newer edit superseded it. Never throws. */
-  private file(request: HeldRequest, state: HeldState, lines: HeldLine[]): void {
+  /** File the early answer for an ask that named its entry, unless a newer edit superseded it. Never throws. */
+  private file(request: HeldRequest, state: HeldState, lines: HeldLine[], ms: number): void {
     if (request.seq === undefined || request.kind !== "edit") return;
     try {
       if (this.superseded(request)) {
         log("held ask superseded by a newer edit; nothing filed");
         return;
       }
-      answerHeld(request.session, request.seq, { state, lines }, this.now(), this.deps.home);
+      answerEarly(request.session, request.seq, { state, lines, ms }, this.now(), this.deps.home);
     } catch (error) {
       log("could not file the held answer", String(error));
     }

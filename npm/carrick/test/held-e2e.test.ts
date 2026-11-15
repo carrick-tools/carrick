@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { HeldDaemon, type HeldAnswer, type ServiceInit } from "../src/held/daemon.ts";
-import { renderHeldLine } from "../src/held/line.ts";
+import { heldDetail } from "../src/held/early.ts";
 import { Ts7Lsp, type Engine } from "../src/held/engine.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { logPath, placedPath } from "../src/held/paths.ts";
@@ -216,9 +216,9 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
     assert.equal(answer.lines[0]!.label, b.label);
     assert.equal(answer.lines[0]!.file, b.label === "GET /shared" ? SHARED : b.rel);
     assert.equal(answer.lines[0]!.line, lineAt(next, b.at), b.label);
-    const said = renderHeldLine(answer.lines[0]!);
+    const said = heldDetail(answer.lines[0]!);
     assert.ok(said, `${b.label}: the line is printable: ${answer.lines[0]!.message}`);
-    assert.ok(!MACHINERY.test(said.text), said.text);
+    assert.ok(!MACHINERY.test(said), said);
     assert.deepEqual((await r.edit(b.rel, original[b.rel]!)).lines, [], `${b.label}: restored`);
   }
 
@@ -254,9 +254,9 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
     const answer = await r.edit(EXPRESS, original[EXPRESS]!.replace(from, to));
     assert.equal(answer.lines.length, 1, `${to}: ${JSON.stringify(answer.lines)}`);
     assert.equal(answer.lines[0]!.label, "GET /express/order");
-    const said = renderHeldLine(answer.lines[0]!);
+    const said = heldDetail(answer.lines[0]!);
     assert.ok(said, `${to}: ${answer.lines[0]!.message}`);
-    assert.ok(!MACHINERY.test(said.text), said.text);
+    assert.ok(!MACHINERY.test(said), said);
     await r.edit(EXPRESS, original[EXPRESS]!);
   }
 
