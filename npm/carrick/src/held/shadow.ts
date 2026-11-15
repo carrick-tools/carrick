@@ -16,8 +16,6 @@ export type ShadowAnswer = {
   tsconfig: string;
   /** The service's own files, relative to the scan root. */
   own_files: string[];
-  /** Some own file imports a package named `hono`. */
-  hono: boolean;
   /** The native TypeScript 7 executable, or null when only TypeScript 6 is installed (D12). */
   native_tsc: string | null;
 };

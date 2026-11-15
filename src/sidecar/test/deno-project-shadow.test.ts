@@ -9,7 +9,7 @@ const hasDeno = spawnSync('deno', ['--version']).status === 0;
 
 // Named `deno-project-*` so the heavy shard runs it, where Deno is installed (scripts/test-files.mjs).
 describe('write_shadow on a Deno project', { skip: !hasDeno }, () => {
-  it('(c) matches the loader\'s own-file errors, vendors the npm cache, and finds hono', () => {
+  it('(c) matches the loader\'s own-file errors, vendors the npm cache', () => {
     const repo = scratch('held-shadow-deno-repo-');
     fs.writeFileSync(
       path.join(repo, 'deno.json'),
@@ -23,7 +23,6 @@ describe('write_shadow on a Deno project', { skip: !hasDeno }, () => {
     assert.equal(installed.status, 0, installed.stderr);
     const out = scratch('held-shadow-deno-out-');
     const shadow = writeShadow(repo, out);
-    assert.equal(shadow.hono, true);
     assert.deepEqual(shadow.own_files, ['main.ts']);
     assert.ok(shadow.vendored > 0);
     const expected = loaderErrors(repo);

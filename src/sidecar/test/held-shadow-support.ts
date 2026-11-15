@@ -17,7 +17,8 @@ export interface Shadow {
   unresolved: number;
   path_conflicts: unknown[];
   bare_specifiers: string[];
-  hono: boolean;
+  wire: string[];
+  tolerances: unknown;
   native_tsc: string | null;
 }
 

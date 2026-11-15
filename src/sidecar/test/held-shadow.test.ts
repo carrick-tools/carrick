@@ -62,15 +62,6 @@ describe('write_shadow (held compiler program)', () => {
     assert.deepEqual(nativeErrors(shadow.tsconfig, path.join(out, 'w')), []);
   });
 
-  it('(e) says whether an own file imports hono', () => {
-    assert.equal(writeShadow(FIXTURE, scratch('held-shadow-e1-')).hono, true);
-    const repo = scratch('held-shadow-e-repo-');
-    fs.mkdirSync(path.join(repo, 'src'));
-    fs.writeFileSync(path.join(repo, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ['src'] }));
-    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), 'export const a: number = 1;\n');
-    assert.equal(writeShadow(repo, scratch('held-shadow-e2-')).hono, false);
-  });
-
   it('(f) answers the same files from two working directories', () => {
     // One neutral directory, and the sidecar's own, which has real `@types` above it.
     const first = writeShadow(FIXTURE, scratch('held-shadow-f1-'), os.tmpdir());

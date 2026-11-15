@@ -362,6 +362,21 @@ export interface WriteShadowRequest extends BaseRequest {
 }
 
 /**
+ * Find again, in a file's new text, the node the old text's span `[start, end)`
+ * named, with the capture's own exact-text finder (see site-find.ts). `file`
+ * only names the file (its extension picks JavaScript or TypeScript syntax);
+ * both texts are the caller's, so nothing is read from disk.
+ */
+export interface FindSiteRequest extends BaseRequest {
+  action: 'find_site';
+  file: string;
+  oldText: string;
+  newText: string;
+  start: number;
+  end: number;
+}
+
+/**
  * The import graph without statement texts. Every name and path is an index
  * into `strings`. Per file: its path, whether it is a script, its declared
  * names, the identifiers each declared name mentions that can matter (a
@@ -1061,6 +1076,7 @@ export type SidecarRequest =
   | ShutdownRequest
   | ListProgramFilesRequest
   | WriteShadowRequest
+  | FindSiteRequest
   | ReachGraphRequest
   | ReachRequest
   | AddProgramFilesRequest
@@ -1347,6 +1363,20 @@ export interface ListProgramFilesResponse extends BaseResponse {
  * Response for write_shadow action: the fields of `ShadowResult`.
  */
 export interface WriteShadowResponse extends BaseResponse, Partial<ShadowResult> {
+  errors?: string[];
+}
+
+/**
+ * Response for find_site action: the node's new bounds (offsets into
+ * `newText`, `start` excluding leading trivia), or the reason there are none.
+ * `value_not_a_node`: no node's text equals the old span's. `not_wrappable`:
+ * the node is one a call cannot wrap in place (a spread, a shorthand
+ * property's name).
+ */
+export interface FindSiteResponse extends BaseResponse {
+  start?: number;
+  end?: number;
+  reason?: 'value_not_a_node' | 'not_wrappable';
   errors?: string[];
 }
 
@@ -1745,6 +1775,7 @@ export type SidecarResponse =
   | ShutdownResponse
   | ListProgramFilesResponse
   | WriteShadowResponse
+  | FindSiteResponse
   | ReachGraphResponse
   | ReachResponse
   | AddProgramFilesResponse

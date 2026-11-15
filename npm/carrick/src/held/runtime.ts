@@ -386,8 +386,8 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       const shadow = await writeShadow(entry, init, out, env, options.home);
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service);
-      if (!shadow.hono || mine.length === 0) {
-        const reason = shadow.hono ? "no_site_found" : "no_hono";
+      if (mine.length === 0) {
+        const reason = "no_site_found";
         writePlaced(
           placedPath(options.root, init.service, options.home),
           init.service,
