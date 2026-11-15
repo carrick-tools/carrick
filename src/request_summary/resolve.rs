@@ -307,6 +307,9 @@ pub(super) struct LocalBinding {
     pub(super) list_frozen: bool,
     /// As [`ModuleBinding::element_tests`].
     pub(super) element_tests: BTreeMap<u32, Vec<ElementTest>>,
+    /// A key of a destructuring (`const { key: name } = init`): `init` is
+    /// the member read `init.key`, as on [`ModuleBinding::destructured`].
+    pub(super) destructured: bool,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -376,8 +379,8 @@ struct WriteCensus {
     next_class_name: Option<BindingKey>,
     /// How many of the references are the object of a member read, directly
     /// or through a fallback, a condition or a wrapper (`client.get`,
-    /// `(a ?? client).get`): the binding's value is only read through a
-    /// member (carrick#2448).
+    /// `(a ?? client).get`), or whose keys `Object.keys(client)` lists: the
+    /// binding's value is only read through a member (carrick#2448).
     member_bases: HashMap<BindingKey, usize>,
     /// An entry of the binding, however nested, is assigned, updated or
     /// deleted, through the binding or through a fallback of it
@@ -1046,6 +1049,21 @@ impl Visit for WriteCensus {
             // counted: the text reader reads only string entries, which no
             // callee can change.
             self.escape(callee);
+            // `Object.keys(o)` lists o's keys: a member read of o, not a
+            // hand-on of its entries (K3).
+            if let Expr::Member(member) = &**callee
+                && let Expr::Ident(object) =
+                    crate::graphql_document_sites::unwrap_expression(&member.obj)
+                && object.sym == *"Object"
+                && let MemberProp::Ident(prop) = &member.prop
+                && prop.sym == *"keys"
+                && let [arg] = call.args.as_slice()
+                && arg.spread.is_none()
+                && let Expr::Ident(read) =
+                    crate::graphql_document_sites::unwrap_expression(&arg.expr)
+            {
+                *self.member_bases.entry(ident_key(read)).or_default() += 1;
+            }
             // `Object.defineProperty(o, 'k', …)` writes a member in a form
             // no reader places (carrick#3504 S2b-7).
             if let Expr::Member(member) = &**callee
@@ -1133,6 +1151,17 @@ pub(super) type ModuleBindings = (
 /// each function's own `let` its body writes again, under the function's key
 /// (S1b), and what each states as text (S2): every plain-name local a top
 /// level definition's own body declares once, and every enum at any depth.
+/// Whether a body key's init reads a key of a module an `import()` loads
+/// directly (`const { default: init } = await import("./m")`): such a key is
+/// not marked [`LocalBinding::destructured`], so it reads as it did before
+/// K3 (a registry thunk's module is the one reading K3 opens).
+fn loads_directly(init: &[ValueAt]) -> bool {
+    init.iter().any(|value| {
+        matches!(value, ValueAt::KeyOf { object, .. }
+            if object.iter().any(|held| matches!(held, ValueAt::Loaded { .. })))
+    })
+}
+
 /// A declaration in a block, a local of a function written inside a body
 /// and a function declared in a body are in the table too ([`Declared`],
 /// carrick#3794), refused by every reader until its own step opens them
@@ -1304,7 +1333,7 @@ pub(super) fn module_bindings(
                 // The scope holds a body's own locals, not a function declared
                 // in it: the value readers read that one here (carrick#3794).
                 text_only: !local.block && !local.reassigned && local.kind != BindingKind::Function,
-                destructured: false,
+                destructured: local.destructured && !loads_directly(&local.init),
                 object_kept: false,
                 plain: local.plain,
                 reads: flow_checked(local, &census),
@@ -2994,6 +3023,7 @@ impl Reader<'_> {
                 elements: None,
                 list_frozen: false,
                 element_tests: BTreeMap::new(),
+                destructured: false,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -4649,6 +4679,7 @@ impl<'a> Resolver<'a> {
         // A destructured key is read only where it names definitions: any
         // other answer is what the rows said of it before.
         if binding.destructured
+            && !binding.values_read()
             && !(out.iter().all(|held| matches!(held, Held::Reached(_))) && !out.is_empty())
         {
             return None;
