@@ -1263,7 +1263,7 @@ test("with CARRICK_FACT_LINES=0 and a fact file on disk, an Edit, a Write that c
   assert.equal(fs.existsSync(path.join(path.dirname(queue), "runner.lock")), false, "no runner started");
 });
 
-test("with a fact file, the edit starts no probe", async (t) => {
+test("with a fact file, the edit probes once and prints only its fact line", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const file = ws.at("orders-api/src/routes/orders.ts");
@@ -1272,19 +1272,43 @@ test("with a fact file, the edit starts no probe", async (t) => {
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
-  assert.equal(probeCalls(argvLog), 0);
-  // Queued for the runner instead, and recorded for Stop.
-  assert.ok(newestPerFile("no-probe", ws.home).has(file));
+  assert.equal(probeCalls(argvLog), 1);
+  // Queued for the runner in place of the probe's verdict, and recorded for Stop.
+  assert.equal(newestPerFile("no-probe", ws.home).get(file)?.entry.instead_of_probe, true);
 });
 
-test("with a fact file and an edit that touches no row, no probe either", async (t) => {
+test("with a fact file and an edit that touches no row: one probe, nothing printed", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const file = ws.at("orders-api/src/routes/orders.ts");
   const run = await edit(ws, file, "text this file does not hold", { session: "no-row", env: { CARRICK_FAKE_ARGV_LOG: argvLog } });
   assert.equal(context(run.stdout), "");
-  assert.equal(probeCalls(argvLog), 0);
+  assert.equal(probeCalls(argvLog), 1);
   assert.ok(newestPerFile("no-row", ws.home).has(file));
+});
+
+const SIMILAR_LEAD = [
+  "Carrick: `slugify` may already exist. Existing functions that could do this job:",
+  "1. `toSlug(title: string) => string` at src/text/slug.ts:4 in repo shared-lib, which is not checked out on this machine (exported; called from 2 other files)",
+  "   Turns a title into a lowercase, dash-joined URL segment.",
+  "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
+].join("\n");
+
+test("with a fact file, the edit's own result holds the similar-function block before the fact line, and the late answer does not print it again", async (t) => {
+  const ws = await factsWorkspace(t);
+  const argvLog = path.join(ws.home, "argv.log");
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
+    session: "lead-now",
+    probe: "check-deferred-similar.json",
+    env: { CARRICK_FAKE_ARGV_LOG: argvLog },
+  });
+  assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
+  assert.equal(probeCalls(argvLog), 1);
+  assert.equal(newestPerFile("lead-now", ws.home).get(file)?.entry.instead_of_probe, true);
+  await waitForAnswer(ws, "lead-now");
+  const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead-now", probe: "check-silent.json" });
+  assert.equal(context(next.stdout), "");
 });
 
 test("with a fact file, the probe's problem line arrives on the next carrier", async (t) => {
@@ -1368,9 +1392,9 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
 });
 
 // R46.2 end to end (the review's S4): a deferred answer is named at its first
-// Stop as with the switch off, once, and its lead is not lost: Stop leaves the
-// answer for the next carrier, which prints the lead.
-test("with a fact file, a deferred answer is named at Stop as before, once, and its similar-function block prints on the next carrier", async (t) => {
+// Stop as with the switch off, once; its lead already printed in the edit's own
+// result (the probe runs in hand beside the fact lines), so no carrier says it again.
+test("with a fact file, a deferred answer is named at Stop as before, once, and its similar-function block prints in the edit's own result, once", async (t) => {
   const ws = await factsWorkspace(t);
   const file = ws.at("orders-api/src/routes/orders.ts");
   // The `check --changed` the first Stop queues answers late, whichever runner
@@ -1383,7 +1407,7 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
     probe: "check-deferred-similar.json",
     env: slowCheck,
   });
-  assert.equal(context(run.stdout), GET_ORDER_LINE);
+  assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
   await waitForAnswer(ws, "lead");
   // What this Stop said with CARRICK_FACT_LINES unset (review run 2, S4).
   assert.equal(
@@ -1400,20 +1424,14 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   // machine the queued check can answer before this Stop runs in spite of the
   // hold; Stop then states its clean line itself (carrick#4085), and that is
   // the one time it is said.
-  const lead = [
-    "Carrick: `slugify` may already exist. Existing functions that could do this job:",
-    "1. `toSlug(title: string) => string` at src/text/slug.ts:4 in repo shared-lib, which is not checked out on this machine (exported; called from 2 other files)",
-    "   Turns a title into a lowercase, dash-joined URL segment.",
-    "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
-  ].join("\n");
   const clean = "Carrick checked orders-api/src/routes/orders.ts and found no contract problem.";
   const second = context(await stop(ws, "lead"));
   assert.ok(second === "" || second === clean, `named once: ${second}`);
   // The `check --changed` Stop queued has answered (the fake binary: clean).
   await waitForSessionAnswers(ws.home, "lead", 2);
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", { session: "lead", probe: "check-silent.json" });
-  // The block always prints here; the clean line prints here unless the second Stop said it.
-  assert.equal(context(next.stdout), second === "" ? `${lead}\n\n${clean}` : lead);
+  // The block printed in the edit's own result and is not said again; the clean line prints here unless the second Stop said it.
+  assert.equal(context(next.stdout), second === "" ? clean : "");
 });
 
 // R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.

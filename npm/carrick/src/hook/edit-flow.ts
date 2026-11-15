@@ -47,8 +47,8 @@ export async function editFlow(
     session: string | undefined;
     /**
      * The payload carries an `agent_id`: a sub-agent's edit. Nothing reads a
-     * sub-agent's late answers once it ends, so its edit keeps the probe in
-     * hand, fact file or not (R46.3).
+     * sub-agent's late answers once it ends, so its edit keeps the probe's
+     * whole answer in hand, fact file or not (R46.3).
      */
     subAgent?: boolean;
     channel: Channel;
@@ -130,22 +130,6 @@ export async function editFlow(
   const run = input.run ?? { factLines, probeEdits, openFacts };
   const hook = channel.channel === "hook";
   const queueable = hook && Boolean(session);
-  // The store is opened once, here: "is there a fact file" is known from the
-  // open, so which files the probe covers is settled before the fact lines
-  // finish, and the probe can run beside them (A7). `factLines` takes the
-  // opened store and closes it.
-  const store = hook && factsEnabled() ? await run.openFacts(choice.root) : null;
-  // The edit just landed, so the index describes the file as it was before
-  // it. Without a fact file the hook asks the binary once, with a probe that
-  // never starts a re-scan: an answer that needs none (the file reads the
-  // same, a known miss) comes back at once and prints
-  // below. Every other file is queued for the background runner
-  // (carrick#3198). With a fact file the fact lines print now and every file
-  // is queued in place of the probe: its answer, problem and uses lines and
-  // leads included, arrives on the next carrier (T12-2). A sub-agent's edit
-  // keeps the probe (R46.3), and a file the queue did not take is probed in
-  // hand as before (R46.1).
-  const insteadOfProbe = queueable && store !== null && !input.subAgent;
   const probeOf = (indexes: number[]) =>
     indexes.length > 0
       ? run.probeEdits(
@@ -153,19 +137,35 @@ export async function editFlow(
           choice.root,
         )
       : Promise.resolve({ results: [], failure: null, ms: 0 });
-  // The fact lines and the probe run side by side: the wait is the longer of
-  // the two, not their sum. Files queued in place of the probe are not probed.
-  const [facts, early] = await Promise.all([
-    hook
-      ? run.factLines(
-          choice.root,
-          factFiles.map((file) => ({ file, ...input.changes?.get(file) })),
-          session,
-          { contract: contractLinesEnabled(), chain: chainLinesEnabled(), store },
-        )
-      : null,
-    insteadOfProbe ? null : probeOf([...relatives.keys()]),
-  ]);
+  // The probe starts first and covers every edited file, queued or not (one
+  // call per edit). It is awaited only after the fact lines and the enqueue, so
+  // the entry and the held ask never wait for it. Its handler is attached here:
+  // the promise sits unawaited while the fact lines run, and an empty answer is
+  // the existing "a probe with no answer queues every file" case.
+  const probing = probeOf([...relatives.keys()]).catch((error: unknown) => ({ results: [], failure: String(error), ms: 0 }));
+  // The store is opened once: "is there a fact file" is known from the open.
+  // `factLines` takes the opened store and closes it.
+  const store = hook && factsEnabled() ? await run.openFacts(choice.root) : null;
+  // The edit just landed, so the index describes the file as it was before
+  // it. The hook asks the binary once, with a probe that never starts a
+  // re-scan: an answer that needs none (the file reads the same, a known miss)
+  // comes back at once and prints below. Every other file is queued for the
+  // background runner (carrick#3198). With a fact file the fact lines print now
+  // and every file is queued in place of the probe's verdict: its answer,
+  // problem and uses lines and leads included, arrives on the next carrier
+  // (T12-2). The probe still runs beside the fact lines and its similar-function
+  // block prints now. A sub-agent's edit keeps the probe's whole answer (R46.3),
+  // and a file the queue did not take is rendered from it in hand as before
+  // (R46.1).
+  const insteadOfProbe = queueable && store !== null && !input.subAgent;
+  const facts = hook
+    ? await run.factLines(
+        choice.root,
+        factFiles.map((file) => ({ file, ...input.changes?.get(file) })),
+        session,
+        { contract: contractLinesEnabled(), chain: chainLinesEnabled(), store },
+      )
+    : null;
   const covered = new Set(facts?.callersRead ?? []);
   const queued = new Set<string>();
   if (insteadOfProbe && edited.length > 0) {
@@ -174,18 +174,24 @@ export async function editFlow(
     for (const entry of entries) queued.add(entry.file);
     askFor(entries);
   }
-  const probed = [...relatives.keys()].filter((index) => !queued.has(edited[index]!));
-  const answers = early ?? (await probeOf(probed));
+  const answers = await probing;
   if (input.timing) input.timing.waitedMs = answers.ms;
   // Each file's probe answer by its place in `edited`; null for a file queued
-  // in place of the probe or one the probe gave no answer for.
-  const results: Array<CheckResult | null> = relatives.map(() => null);
-  for (const [at, index] of probed.entries()) results[index] = answers.results[at] ?? null;
+  // in place of the probe (its answer is read for the similar-function block
+  // only) or one the probe gave no answer for.
+  const results: Array<CheckResult | null> = relatives.map((_, index) => (queued.has(edited[index]!) ? null : (answers.results[index] ?? null)));
   const toQueue: number[] = [];
   const rendered = new Map<number, string>();
   const leads = new Map<number, SimilarLines>();
   for (const [index, relative] of relatives.entries()) {
     if (queued.has(edited[index]!)) {
+      // Only the similar-function block is read from the probe; the queued
+      // re-check states the edit's answer.
+      const answer = answers.results[index] ?? null;
+      if (answer) {
+        const found = similarLines(answer, relative, cwd, (key) => !session || !wasLed(session, key), log);
+        if (found.lines.length > 0) leads.set(index, found);
+      }
       log("queued in place of the probe:", relative);
       continue;
     }
