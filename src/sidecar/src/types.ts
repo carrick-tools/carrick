@@ -1369,7 +1369,7 @@ export interface WriteShadowResponse extends BaseResponse, Partial<ShadowResult>
 /**
  * Response for find_site action: the node's new bounds (offsets into
  * `newText`, `start` excluding leading trivia), or the reason there are none.
- * `value_not_a_node`: no node's text equals the old span's. `not_wrappable`:
+ * `value_not_a_node`: no node of the new text fills the slot the old span sat in. `not_wrappable`:
  * the node is one a call cannot wrap in place (a spread, a shorthand
  * property's name).
  */

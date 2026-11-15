@@ -109,7 +109,7 @@ export {
 export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, jsonWireRule, judgeTolerances, wireFormFor, type JudgeTolerances } from './check-probe.js';
-export { nodeByExpressionText } from './anchors.js';
+export { nodeByExpressionText, isPreferredTarget } from './anchors.js';
 export { findDisqualifyingTopTypes } from './deep-walk.js';
 
 const SURFACE_ENTRY_BASENAME = '__carrick_surface__';

@@ -141,7 +141,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
 | `write_shadow` | yes | Writes the program as a shadow tree for a held-open TypeScript 7 compiler (`out_dir`, outside the checkout) |
-| `find_site` | no | The node an old text's span named, found again in a new text by the capture's own exact-text finder; reads no program and no disk |
+| `find_site` | no | The node an old text's span named, found again in a new text by the slot it sat in (a call's n-th child, a `return`'s expression, an arrow body), nearest the old position; reads no program and no disk |
 | `add_program_files` | yes | Add files to the program in a given order |
 | `reach_graph` | yes | The import graph of every built program (builds the default one first), without statement texts, paths relative to the scan root |
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
@@ -930,7 +930,7 @@ Response fields: `tsconfig`, `own_files` (relative to the scan root), `vendored`
 
 #### `find_site` - The capture's site finder, asked by a caller
 
-`find_site` takes `file` (its extension picks the syntax), `oldText`, `newText` and `start`, `end` (the span's offsets in `oldText`). It takes the span's text as the locator and runs the exact-text match the capture binds a locator with over `newText`, from the line the span started on (a match that ends above it is skipped; whitespace collapsed, string quotes canonical). It answers `{ start, end }` (offsets into `newText`, `start` excluding leading trivia), or `{ reason }`: `value_not_a_node` (no expression has that text) or `not_wrappable` (a spread, or the name of a shorthand property). It reads no program and no disk, so it needs no `init`.
+`find_site` takes `file` (its extension picks the syntax), `oldText`, `newText` and `start`, `end` (the span's offsets in `oldText`). It finds the node of the old span, takes the slot it sits in under its parent (the child index, and for a call the callee's text unless the edit reaches the call) and answers the node in that slot of `newText` nearest the old position carried through the edit, among the nodes the capture reads a value type at. The span's text is never the locator, so an edit to the value's own text or the same text elsewhere does not move it. It answers `{ start, end }` (offsets into `newText`, `start` excluding leading trivia), or `{ reason }`: `value_not_a_node` (no node of `newText` fills the slot) or `not_wrappable` (a spread, or the name of a shorthand property). It reads no program and no disk, so it needs no `init`.
 
 ```json
 { "request_id": "14", "action": "find_site", "file": "src/orders.ts", "oldText": "...", "newText": "...", "start": 120, "end": 138 }

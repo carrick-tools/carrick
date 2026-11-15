@@ -213,16 +213,14 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
   assert.equal(movedBroken.lines[0]!.line, lineAt(moved, "res.json({ orders, total })"));
   await r.edit(EXPRESS, original[EXPRESS]!);
 
-  // (e) a rename whose two edits sit on lines apart, the second inside the value: the one-region move across the
-  // value's bound cannot place it again (`find_site` matches the value's old text, which changed), so that answer
-  // is silent for this row; the gate then reads the two hunks against the index commit and places it again. It is
-  // NOT "armed with no line, in place": a break made in this same edit would be missed (see the PR body).
+  // (e) a rename whose second edit sits inside the value, across its start bound: the engine places the value by its
+  // parent slot (the send's argument), so the check stays armed, and a break made in this same edit gives its line.
   const renamed = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept, total }");
   assert.deepEqual((await r.edit(EXPRESS, renamed)).lines, []);
-  // Time passes (the agent's turn): the gate after the answer runs. An edit written at once would be applied first,
-  // and the gate waits for the next answer instead of gating text the answer has not seen.
-  await r.ask(EXPRESS);
-  assert.deepEqual((await r.edit(EXPRESS, renamed.replace("{ orders: kept, total }", "{ orders: kept }"))).lines.map((l) => l.label), ["GET /express/orders"], "armed again after the gate");
+  const renamedBroken = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept }");
+  const brokenAnswer = await r.edit(EXPRESS, renamedBroken);
+  assert.deepEqual(brokenAnswer.lines.map((l) => l.label), ["GET /express/orders"], "a break in the same edit as the rename is one line");
+  assert.equal(brokenAnswer.lines[0]!.line, lineAt(renamedBroken, "res.json({ orders: kept })"));
   await r.edit(EXPRESS, original[EXPRESS]!);
 
   // (h) a `Date` value against `string` arms (the wire form); (j) breaking each member prints a line without machinery.
