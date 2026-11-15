@@ -26,8 +26,9 @@
 //! is a candidate, and the cut is [`SIMILAR_ROWS`]. Dropped before ranking: the
 //! function's own file, any function the new one calls or that calls it, and
 //! rows nobody can import (callbacks the extractor named, the module-scope
-//! row). The member named like the new one comes first. Reference:
-//! `docs/local-mode-output.md`.
+//! row). The member named like the new one moves to the front when it is
+//! already in the top [`SIMILAR_ROWS`] by score; below that it is not listed.
+//! Reference: `docs/local-mode-output.md`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -354,14 +355,12 @@ impl SimilarIndex {
             })
             .collect();
         // A total order that reads nothing about the order the index was fed:
-        // the same-member row, score, exported, file path, line, then the name.
-        // Only a function written twice at one line of one file falls to the
-        // input position.
-        rows.sort_by(|(same_a, a), (same_b, b)| {
+        // score, exported, file path, line, then the name. Only a function
+        // written twice at one line of one file falls to the input position.
+        rows.sort_by(|(_, a), (_, b)| {
             let (meta_a, meta_b) = (self.meta(a.doc), self.meta(b.doc));
-            same_b
-                .cmp(same_a)
-                .then_with(|| b.score.total_cmp(&a.score))
+            b.score
+                .total_cmp(&a.score)
                 .then_with(|| meta_b.exported.cmp(&meta_a.exported))
                 .then_with(|| {
                     self.file_keys[meta_a.file as usize].cmp(&self.file_keys[meta_b.file as usize])
@@ -370,10 +369,12 @@ impl SimilarIndex {
                 .then_with(|| self.names[a.doc].cmp(&self.names[b.doc]))
                 .then_with(|| a.doc.cmp(&b.doc))
         });
-        rows.into_iter()
-            .take(SIMILAR_ROWS)
-            .map(|(_, row)| row)
-            .collect()
+        // The cut reads the score alone; a same-member row already inside it
+        // moves to the front, in order. One below it is not listed.
+        rows.truncate(SIMILAR_ROWS);
+        let (mut front, back): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(same, _)| *same);
+        front.extend(back);
+        front.into_iter().map(|(_, row)| row).collect()
     }
 }
 
