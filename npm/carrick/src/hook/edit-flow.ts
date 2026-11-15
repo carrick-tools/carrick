@@ -18,7 +18,7 @@ import type { SimilarLines } from "./similar.ts";
 import { deliverLate, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
-import { answerInHand, enqueue, ensureRunner } from "./rechecks.ts";
+import { answerInHand, enqueue, enqueueHeld, ensureRunner } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
@@ -27,13 +27,12 @@ import type { FactEdit, FactOutcome } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
 import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
 import { askHeld } from "../held/client.ts";
-import { parseHeldClaim, renderHeldLine } from "../held/line.ts";
+import { parseHeldClaim, unsaidHeld } from "../held/line.ts";
 import type { HeldRoute, RenderedHeld } from "../held/line.ts";
 import type { HeldLine } from "../held/daemon.ts";
 
 const log = createLogger("carrick-hook");
 /** D13: at most this many compiler lines in one action. */
-const MAX_HELD_LINES = 2;
 
 /**
  * Check `edited` (absolute paths, at least one) as the post-edit hook does and
@@ -107,13 +106,16 @@ export async function editFlow(
   // rendered: a file the fact file covers gets its callers from there, not
   // the uses-count line.
   const factFiles = [...edited, ...(input.factOnly ?? [])].filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())));
-  // The held compiler (part 3, D10): asked in parallel with the fact lines, for
-  // the files this session changed in its own checkout, and waited for at most
-  // `HELD_WAIT_MS`. Off, nothing is asked and nothing below changes.
+  // The held compiler (part 3, D10, T9): one ask per file this session changed
+  // in its own checkout, filed as a queue entry (`enqueueHeld`) and handed to
+  // the daemon, which files its answer where part 2's late answers land. This
+  // hook waits at most `HELD_WAIT_MS`, for an answer already computed; a slower
+  // one is printed by the next hook (`deliverLate`). Off, nothing is asked and
+  // nothing below changes.
   const heldFiles = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd()));
   const heldAsked =
     channel.channel === "hook" && session && heldFiles.length > 0 && compilerLinesEnabled()
-      ? askHeld(choice.root, heldFiles, { session, kind: "edit", editedAt })
+      ? askHeldFiles(choice.root, heldFiles, session, editedAt, cwd)
       : null;
   const facts =
     channel.channel === "hook"
@@ -275,6 +277,25 @@ export async function editFlow(
   emitPostToolUse(contexts);
 }
 
+/** One ask per file, each under its own queue entry; the answers in hand are merged. */
+async function askHeldFiles(
+  root: string,
+  files: string[],
+  session: string,
+  editedAt: number,
+  cwd: string | null | undefined,
+): Promise<Awaited<ReturnType<typeof askHeld>>> {
+  const answers = await Promise.all(
+    files.map((file) => {
+      const entry = enqueueHeld(root, session, file, editedAt, { cwd });
+      return askHeld(root, [file], { session, kind: "edit", editedAt, ...(entry ? { seq: entry.seq } : {}) });
+    }),
+  );
+  const ready = answers.filter((a) => a.state === "ready");
+  const first = ready[0] ?? answers[0]!;
+  return { ...first, lines: ready.flatMap((a) => a.lines), ms: Math.max(...answers.map((a) => a.ms)) };
+}
+
 /**
  * The compiler's lines for this action (D13): each said once per session, at
  * most two. A line is ADDED to part 1's: part 3 never replaces or drops a
@@ -294,15 +315,5 @@ function heldContexts(facts: FactOutcome, held: Awaited<ReturnType<typeof askHel
 /** The held lines this action says: ready, not said before in the session, at most two. */
 function heldToSay(held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): { line: HeldLine; rendered: RenderedHeld }[] {
   if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
-  const said = factsSaid(session);
-  const out: { line: HeldLine; rendered: RenderedHeld }[] = [];
-  const seen = new Set<string>();
-  for (const line of held.lines) {
-    const rendered = renderHeldLine(line);
-    if (!rendered) continue;
-    if (said.has(rendered.claim) || seen.has(rendered.claim) || out.length >= MAX_HELD_LINES) continue;
-    seen.add(rendered.claim);
-    out.push({ line, rendered });
-  }
-  return out;
+  return unsaidHeld(held.lines, factsSaid(session));
 }

@@ -37,6 +37,27 @@ export function renderHeldLine(line: HeldLine): RenderedHeld | null {
   return { text, claim: `held::${line.row_key}::${hash}` };
 }
 
+/** At most this many held lines in one message. */
+export const MAX_HELD_LINES = 2;
+
+/**
+ * The lines a message says: rendered, not claimed in the session already, no
+ * claim twice, at most `MAX_HELD_LINES`. The one rule for the hook that got
+ * the answer in hand and for the carrier that prints it late.
+ */
+export function unsaidHeld(lines: readonly HeldLine[], said: ReadonlySet<string>): { line: HeldLine; rendered: RenderedHeld }[] {
+  const out: { line: HeldLine; rendered: RenderedHeld }[] = [];
+  const seen = new Set<string>();
+  for (const line of lines) {
+    const rendered = renderHeldLine(line);
+    if (!rendered) continue;
+    if (said.has(rendered.claim) || seen.has(rendered.claim) || out.length >= MAX_HELD_LINES) continue;
+    seen.add(rendered.claim);
+    out.push({ line, rendered });
+  }
+  return out;
+}
+
 /** The route a held claim is about: the row's repo, file and label, read from its row key (`contractKey`). */
 export type HeldRoute = { repo: string; file: string; label: string };
 

@@ -12,8 +12,12 @@ import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
 
-/** D10: the longest a hook waits for the daemon. */
-export const HELD_WAIT_MS = 1000;
+/**
+ * The longest a hook waits for the daemon (part 3, T9): only for an answer
+ * that is already computed. A slower one is filed by the daemon where part 2's
+ * late answers land and is printed by the next hook (`hook/late.ts`).
+ */
+export const HELD_WAIT_MS = 50;
 
 export type EnsureOptions = {
   env?: NodeJS.ProcessEnv;
@@ -55,6 +59,8 @@ export type AskOptions = {
   kind: "read" | "edit";
   editedAt?: number;
   waitMs?: number;
+  /** The session's queue entry for this ask (`enqueueHeld`): the daemon files its answer under it. */
+  seq?: string;
 };
 
 /**
@@ -77,6 +83,7 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     kind: options.kind,
     wait_ms: waitMs,
     ...(options.editedAt === undefined ? {} : { edited_at: options.editedAt }),
+    ...(options.seq === undefined ? {} : { seq: options.seq }),
   };
   return new Promise((resolve) => {
     let buffer = "";
@@ -85,12 +92,15 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      conn.destroy();
+      // An ask the daemon files an answer for is let go gracefully: the
+      // request is already written, and the daemon works on without us.
+      if (options.seq === undefined) conn.destroy();
+      else conn.end();
       resolve(answer);
     };
     const conn = net.createConnection(socketPath(root, options.home));
     const timer = setTimeout(() => finish(none("late", started)), waitMs);
-    conn.on("connect", () => conn.write(`${JSON.stringify(request)}\n`));
+    conn.write(`${JSON.stringify(request)}\n`);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       const end = buffer.indexOf("\n");

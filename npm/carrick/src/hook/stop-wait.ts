@@ -37,7 +37,7 @@ import {
   staleClause,
 } from "../render.ts";
 import { checkedSinceLastEdit } from "./checked.ts";
-import { adoptedLine, changedLine, deliverOne, hasFindings } from "./late.ts";
+import { adoptedLine, changedLine, deliverHeld, deliverOne, hasFindings } from "./late.ts";
 import {
   changedAnsweredAt,
   claimDelivery,
@@ -45,6 +45,7 @@ import {
   ensureRunner,
   owedFor,
   isChanged,
+  isHeld,
   newestPerFile,
   pendingFor,
   type Answer,
@@ -117,15 +118,22 @@ export type StopResult = {
  * all (R46.2): Stop claims it only with a finding it prints, and otherwise
  * leaves it for the next carrier, which prints all of it.
  */
-function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[] } {
+function collect(session: string, home: string | undefined, now: number): { own: Answer[]; adopted: Answer[]; held: string[] } {
   const own: Answer[] = [];
   const adopted: Answer[] = [];
+  // The held compiler's finished verdicts (part 3, T9) are findings, not a
+  // re-check: said as the carriers say them, outside the session's check.
+  const held: string[] = [];
   for (const { owner, answer } of owedFor(session, home)) {
+    if (isHeld(answer)) {
+      if (claimDelivery(owner, answer.seq, home, now)) held.push(...deliverHeld(session, answer, home, now).contexts);
+      continue;
+    }
     if (answer.instead_of_probe && !hasFindings(answer)) continue;
     if (!claimDelivery(owner, answer.seq, home, now)) continue;
     (owner === session ? own : adopted).push(answer);
   }
-  return { own, adopted };
+  return { own, adopted, held };
 }
 
 export type Coverage = {
@@ -233,7 +241,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
       log("could not restart the re-check runner", String(error));
     }
   }
-  const { own: delivered, adopted } = collect(session, home, clock());
+  const { own: delivered, adopted, held } = collect(session, home, clock());
 
   // The session's check, per workspace with an edit Stop has not yet spoken
   // about. A clean `check --changed` the agent ran since that edit already
@@ -300,7 +308,7 @@ export function stopAnswers(session: string, options: StopOptions = {}): StopRes
     markStated(session, root, coverage.upTo, false, home);
   }
 
-  const lines: string[] = [...stated.values()];
+  const lines: string[] = [...stated.values(), ...held];
   // A whole-change check speaks through the one reader the carriers use: a
   // problem, or the clean line for a set Stop named, once per set.
   for (const answer of delivered) {
