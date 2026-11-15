@@ -36,3 +36,18 @@ export function renderHeldLine(line: HeldLine): RenderedHeld | null {
   const hash = createHash("sha256").update(line.message).digest("hex").slice(0, 8);
   return { text, claim: `held::${line.row_key}::${hash}` };
 }
+
+/** The route a held claim is about: the row's repo, file and label, read from its row key (`contractKey`). */
+export type HeldRoute = { repo: string; file: string; label: string };
+
+/**
+ * The route behind a claim `renderHeldLine` made, or null for any other key.
+ * The file is the ROW's (the route's), never the value's file a line names.
+ */
+export function parseHeldClaim(claim: string): HeldRoute | null {
+  if (!claim.startsWith("held::")) return null;
+  const parts = claim.slice("held::".length).split("::");
+  // contract :: repo :: file :: side :: label... :: group :: hash
+  if (parts.length < 7 || parts[0] !== "contract") return null;
+  return { repo: parts[1]!, file: parts[2]!, label: parts.slice(4, -2).join("::") };
+}

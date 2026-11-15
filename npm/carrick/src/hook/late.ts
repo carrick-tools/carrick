@@ -9,11 +9,14 @@
 
 import { resolveChannel } from "../channel.ts";
 import { problemItems } from "../contract.ts";
+import type { CheckItem } from "../contract.ts";
+import { parseHeldClaim } from "../held/line.ts";
+import type { HeldRoute } from "../held/line.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, movedLines, renderPostToolUse } from "../render.ts";
 import { claimDelivery, isChanged, owedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
-import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
+import { heldClaimsSince, markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 
@@ -46,7 +49,8 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
  * keys marked as told. Shared by `deliverLate` and by the Stop hook for an
  * answer queued in place of the probe (R46.2), so both print it the same way.
  */
-export function deliverOne(session: string, answer: Answer, home?: string): string[] {
+export function deliverOne(session: string, answer: Answer, home?: string, heldNow: readonly HeldRoute[] = []): string[] {
+  answer = withoutHeldProblems(session, answer, home, heldNow);
   const contexts: string[] = [];
   const key = answer.result ? toldKey(answer.result, answer.relative) : null;
   // As the edit-time answer would have: no uses-count line where the fact
@@ -66,6 +70,42 @@ export function deliverOne(session: string, answer: Answer, home?: string): stri
   contexts.push(context);
   if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
   return contexts;
+}
+
+/** The label a problem item has as a contract row: `METHOD path{ dispatch}`. */
+function itemLabel(item: CheckItem): string | null {
+  return item.method && item.path ? `${item.method} ${item.path}${item.dispatch_label ?? ""}` : null;
+}
+
+/**
+ * The answer without the route problems the held compiler's line already named
+ * (part 3 D11b): same file (the claim's ROW file, never the value's), same
+ * label, claimed at or after the entry's edit. `heldNow` are the lines of the
+ * action being printed, claimed only when it ends. Part 2's problem for a route
+ * part 3 stayed silent on still prints.
+ */
+function withoutHeldProblems(session: string, answer: Answer, home: string | undefined, heldNow: readonly HeldRoute[]): Answer {
+  const result = answer.result;
+  if (isChanged(answer) || !result?.items?.length) return answer;
+  const since = Date.parse(answer.enqueued_at);
+  const claimed = [
+    ...heldClaimsSince(session, Number.isNaN(since) ? 0 : since, home).map(parseHeldClaim),
+    ...heldNow,
+  ].filter((route): route is HeldRoute => route !== null);
+  if (claimed.length === 0) return answer;
+  const said = (item: CheckItem): boolean => {
+    const label = itemLabel(item);
+    return (
+      item.kind === "route" &&
+      label !== null &&
+      claimed.some((route) => route.label === label && (answer.file === route.file || answer.file.endsWith(`/${route.file}`)))
+    );
+  };
+  const problems = new Set(problemItems(result));
+  const items = result.items.filter((item) => !(problems.has(item) && said(item)));
+  if (items.length === result.items.length) return answer;
+  log("late problem dropped: the held compiler's line named it", answer.relative);
+  return { ...answer, result: { ...result, items } };
 }
 
 /**
@@ -114,7 +154,7 @@ export function changedLine(session: string, answer: Answer, home?: string): str
  * Claim and render every finished answer this session has not been given.
  * Returns the contexts to print, oldest first. Nothing here throws.
  */
-export function deliverLate(session: string | undefined, now: number = Date.now()): string[] {
+export function deliverLate(session: string | undefined, now: number = Date.now(), heldNow: readonly HeldRoute[] = []): string[] {
   if (!session) return [];
   const contexts: string[] = [];
   try {
@@ -129,7 +169,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       }
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
-      contexts.push(...deliverOne(session, answer));
+      contexts.push(...deliverOne(session, answer, undefined, heldNow));
     }
   } catch (error) {
     log("late delivery failed", String(error));
