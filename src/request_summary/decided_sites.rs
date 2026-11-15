@@ -3615,17 +3615,6 @@ impl<'a> Walk<'a, '_> {
             // callers ([`Self::maker_stop`]): no question is asked for it. An
             // instance the walk does not reach, or a walk the cap trimmed,
             // stays unnamed as before.
-            if !unreached
-                && !budget.trimmed
-                && let Some(stop) = self.maker_stop(&slots, None)
-            {
-                if self.calls.is_own(last.file) {
-                    self.lead(&last, end, stop);
-                } else {
-                    self.lead(&chain[0], end, stop);
-                }
-                return false;
-            }
             return self.unnamed_trimmed(chain, end, budget.trimmed);
         }
         if made.iter().all(|value| !value.passed.is_empty()) {
