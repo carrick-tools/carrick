@@ -1826,7 +1826,19 @@ fn rejoin_held(
         // commit and every file's hash ([`crate::position_rows::kept_rows`]),
         // so the next check reads them instead of walking again. Never an
         // analysed service's rows.
-        super::index::keep_carried_walks(&scan_dir, &kept, &carried);
+        // The scan also writes a carried service whose pairs the join moved, so
+        // it is in `fresh`, not `carried`, though it was walked as a carried
+        // one: with a plan, every written service the plan did not re-read is
+        // one of those.
+        let written_carried: Vec<crate::cloud_storage::CloudRepoData> =
+            carried
+                .iter()
+                .chain(fresh.iter().filter(|blob| {
+                    plan.is_some_and(|plan| !plan.services.contains(&service_id(blob)))
+                }))
+                .cloned()
+                .collect();
+        super::index::keep_carried_walks(&scan_dir, &kept, &written_carried);
         took("after-scan/carried-and-kept-walks", began);
         let began = Instant::now();
         for (offset, blob) in fresh.iter().chain(&carried).enumerate() {

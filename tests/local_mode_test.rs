@@ -6897,6 +6897,64 @@ fn check_changed_keeps_a_carried_walk_for_the_next_check() {
     }
 }
 
+/// A per-edit re-check keeps the walk of a carried service it
+/// walked for a sibling, also when the scan writes that service's blob. The
+/// app serves a route and calls `mid`, which states the request and sends
+/// through `base`. Re-checking the route walks `mid` for the app and `base` for
+/// `mid`, and the join moves `mid`'s pair, so the scan writes `mid` too. Both
+/// walks are kept after the first re-check and reused by the second; the app's
+/// rows, an analysed service's, are not kept.
+#[test]
+#[serial]
+fn a_re_check_keeps_the_walks_of_carried_services_the_scan_also_writes() {
+    if !repo_root().join("src/sidecar/dist/src/index.js").exists() {
+        assert!(
+            std::env::var("CI").is_err(),
+            "the built sidecar is missing in CI"
+        );
+        eprintln!("Skipping: the built sidecar is missing");
+        return;
+    }
+    let workspace = workspace("kept-walk-chain", &["repo"]);
+    let root = workspace.path();
+    let mut env = walking_env(&root.join("repo"));
+    env.push(("CARRICK_RECHECK_BUDGET_MS".into(), "600000".into()));
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    run_with_env(root, &["refresh", "--workspace", "."], &env_refs);
+    let positions = root.join(".carrick/positions");
+    // A hosted index has no kept rows.
+    std::fs::remove_dir_all(&positions).expect("remove the kept rows");
+
+    let route = "repo/services/app/app/routes/api.v1.widgets.$widgetId.ts";
+    edit(
+        &root.join(route),
+        "activeCount: number",
+        "activeCount: string",
+    );
+    edit(&root.join(route), "activeCount: 3", "activeCount: \"3\"");
+    let rows_of = |service: &str| {
+        std::fs::read_dir(&positions)
+            .ok()?
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.to_string_lossy()
+                    .ends_with(&format!("__{service}.jsonl.gz"))
+            })
+    };
+
+    recheck_json(root, route, &env_refs);
+    let mid = rows_of("mid").expect("the first re-check kept the walk of mid, which it wrote");
+    let base = rows_of("base").expect("and the walk of base, reached by mid's rows");
+    assert!(
+        rows_of("app").is_none(),
+        "an analysed service's rows are not kept"
+    );
+    let (mid_kept, base_kept) = (identity(&mid), identity(&base));
+    recheck_json(root, route, &env_refs);
+    assert_eq!(identity(&mid), mid_kept, "the next re-check reused mid");
+    assert_eq!(identity(&base), base_kept, "and base");
+}
+
 fn git_head(repo: &Path) -> String {
     let output = Command::new("git")
         .arg("-C")
