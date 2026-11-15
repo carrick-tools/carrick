@@ -246,7 +246,9 @@ pub fn parity(root: &Path, library: &[LibraryRow], site: &[SiteRow]) -> Tally<Pa
 /// values that do not run through the chain as one), a render at the
 /// labelled call that differs from today's (`differs_kept`), a hole the
 /// summaries read nothing at (`unrendered`, N5), or a construction hop no
-/// chain call is made on (`field_unplaced`, N3). One count per call.
+/// chain call is made on (`field_unplaced`, N3); or no site at all, where
+/// every value is a field's name the caller sites made on its constructions
+/// state as text (`field_placed`, N3). One count per call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DryRunNames {
     pub resolver: usize,
@@ -256,6 +258,7 @@ pub struct DryRunNames {
     pub differs_gain: usize,
     pub unrendered: usize,
     pub field_unplaced: usize,
+    pub field_placed: usize,
 }
 
 /// One labelled call's count in [`DryRunNames`].
@@ -268,6 +271,7 @@ pub enum SitePathRead {
     DiffersGain,
     Unrendered,
     FieldUnplaced,
+    FieldPlaced,
 }
 
 impl DryRunNames {
@@ -280,6 +284,7 @@ impl DryRunNames {
             SitePathRead::DiffersGain => self.differs_gain += 1,
             SitePathRead::Unrendered => self.unrendered += 1,
             SitePathRead::FieldUnplaced => self.field_unplaced += 1,
+            SitePathRead::FieldPlaced => self.field_placed += 1,
         }
     }
 
@@ -330,6 +335,7 @@ pub fn log(
         differs_gain = read.differs_gain,
         unrendered = read.unrendered,
         field_unplaced = read.field_unplaced,
+        field_placed = read.field_placed,
         "site-path names: labelled calls whose name slot the site path read through the resolver's pieces, or on its own walk, by why"
     );
     let maker = &site.maker_names;

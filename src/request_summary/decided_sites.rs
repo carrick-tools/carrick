@@ -2281,6 +2281,10 @@ enum NameRead {
         values: Vec<(PiecedText, OnChain)>,
         gain: bool,
     },
+    /// Every value is a name a field carries, and each is stated as text at
+    /// a chain call some discovered site makes on its construction (N3):
+    /// those caller sites state the send, so the labelled call states none.
+    NamedAtCallers,
 }
 
 impl NameRead {
@@ -2289,6 +2293,7 @@ impl NameRead {
         use crate::name_census::SitePathRead;
         match self {
             NameRead::Today(word) => *word,
+            NameRead::NamedAtCallers => SitePathRead::FieldPlaced,
             NameRead::Pieces { gain: true, .. } => SitePathRead::DiffersGain,
             NameRead::Pieces { gain: false, .. } => SitePathRead::Resolver,
         }
@@ -2829,6 +2834,10 @@ struct Walk<'a, 'i> {
     /// The calls a verified runner label names, by file and span start, with
     /// the slot each is handed its function at (carrick#3481).
     runners: &'i HashMap<(PathBuf, u32), ArgSlot>,
+    /// The constructions some discovered chain makes a call on, written in
+    /// place (`new Hub(..).send()`, [`Calls::receiver_construction`]): where
+    /// a name a field carries is placed (carrick#3504 B10-2b, N3).
+    constructed: Vec<ChainCall>,
 }
 
 /// One value a maker call's name slot takes ([`Walk::made_with`]): the call
@@ -3647,9 +3656,12 @@ impl<'a> Walk<'a, '_> {
             }
         };
         let mut kept: Vec<(PiecedText, OnChain)> = Vec::new();
-        for value in values {
-            match self.on_chain(&value, chain) {
-                Ok(on) => kept.push((value, on)),
+        for value in &values {
+            match self.on_chain(value, chain) {
+                Ok(on) => kept.push((value.clone(), on)),
+                Err(OffChain::Unplaced) if self.named_at_callers(&values) => {
+                    return NameRead::NamedAtCallers;
+                }
                 Err(OffChain::Unplaced) => return NameRead::Today(FieldUnplaced),
                 Err(OffChain::Other) => {}
             }
@@ -3676,6 +3688,20 @@ impl<'a> Walk<'a, '_> {
             }
         }
         NameRead::Pieces { values: kept, gain }
+    }
+
+    /// Whether every value is a name a field carries that a caller site
+    /// states as text (N3): read through a construction first, one some
+    /// discovered chain makes a call on ([`Walk::constructed`]), where the
+    /// construction's own function reads it as one text. One value that is
+    /// not (no such construction, a name no text states there) keeps the
+    /// labelled call's own site.
+    fn named_at_callers(&self, values: &[PiecedText]) -> bool {
+        values.iter().all(|value| {
+            value.callers.first().is_some_and(|at| {
+                self.calls.is_constructor(&at.fills.0, &at.fills.1) && self.constructed.contains(at)
+            }) && literal_name(&rendered(&self.pieces, value, 1)).is_some()
+        })
     }
 
     /// Where `value`'s levels sit on `chain` ([`OnChain`]): each parameter
@@ -4671,6 +4697,22 @@ fn decide(
             Some(((root.join(&end.file), end.span_start), slot.clone()))
         })
         .collect();
+    let mut constructed: Vec<ChainCall> = Vec::new();
+    for site in discovered.iter().filter(|site| site.stop.is_none()) {
+        let Some(end) = &site.end else {
+            continue;
+        };
+        let Some(last) = calls.at_span(&root.join(&end.file), end.span_start, end.span_end) else {
+            continue;
+        };
+        for placed in place_chain(&calls, root, site, &last).unwrap_or_default() {
+            if let Some(made) = calls.receiver_construction(&placed)
+                && !constructed.contains(&made)
+            {
+                constructed.push(made);
+            }
+        }
+    }
     let mut walk = Walk {
         calls: &calls,
         inputs,
@@ -4693,6 +4735,7 @@ fn decide(
         fold: super::site_record::NameFold::new(inputs, siblings, root),
         entered: &entered,
         runners: &runners,
+        constructed,
     };
     for (at, site) in discovered.iter().enumerate() {
         let shifted = shifted[at].as_slice();
@@ -4840,10 +4883,15 @@ fn decide(
                 .as_deref()
                 .unwrap_or(std::slice::from_ref(&last)),
         );
+        // The caller sites made on each construction state the send (N3).
+        if matches!(read, NameRead::NamedAtCallers) {
+            walk.out.dry_run_names.note(read.word());
+            continue;
+        }
         let n_last = placed_chain.as_ref().map_or(0, |chain| chain.len() - 1);
         let named = match &read {
             NameRead::Pieces { values, .. } => rendered(&walk.pieces, &values[0].0, 0),
-            NameRead::Today(_) => at_end.clone(),
+            NameRead::Today(_) | NameRead::NamedAtCallers => at_end.clone(),
         };
         if last_is_own && !read.held(n_last) && walk.settles(&last, &named, end) {
             walk.out.dry_run_names.note(read.word());
@@ -4926,7 +4974,9 @@ fn decide(
                     let values: Vec<&PiecedText> = values.iter().map(|(value, _)| value).collect();
                     walk.up_pieces(&[last], 0, &values, end, &mut Vec::new());
                 }
-                NameRead::Today(_) => walk.up(&[last], &at_end, end, &mut Vec::new()),
+                NameRead::Today(_) | NameRead::NamedAtCallers => {
+                    walk.up(&[last], &at_end, end, &mut Vec::new())
+                }
             }
             continue;
         };
@@ -4953,7 +5003,7 @@ fn decide(
                         .unwrap_or_default();
                 }
             }
-            NameRead::Today(_) => {
+            NameRead::Today(_) | NameRead::NamedAtCallers => {
                 values[n - 1] = Some(at_end);
                 for k in (0..n - 1).rev() {
                     let below = &chain[k + 1];
@@ -5017,7 +5067,9 @@ fn decide(
                     let values: Vec<&PiecedText> = values.iter().map(|(value, _)| value).collect();
                     walk.up_pieces(&chain, level, &values, end, &mut Vec::new());
                 }
-                NameRead::Today(_) => walk.up(&chain, &top, end, &mut Vec::new()),
+                NameRead::Today(_) | NameRead::NamedAtCallers => {
+                    walk.up(&chain, &top, end, &mut Vec::new())
+                }
             }
             walk.template = None;
         }
