@@ -162,10 +162,7 @@ impl UrlNormalizer {
         // Handle process.env patterns (e.g., process.env.API_URL + "/users")
         // An env read after a `/` is one segment of the path, not the base
         // (carrick#4514).
-        if url
-            .find("process.env.")
-            .is_some_and(|at| !url[..at].contains('/'))
-        {
+        if url.contains("process.env.") {
             return self.normalize_process_env_pattern(url, original);
         }
 
