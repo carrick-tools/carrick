@@ -56,8 +56,8 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use super::resolve::{
-    CallAt, Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt, TextPart,
-    TextValue,
+    CallAt as ChainCall, Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt,
+    TextPart, TextValue,
 };
 use super::row_calls::Reach;
 use super::stop::Stop;
@@ -1716,10 +1716,10 @@ impl<'a> Calls<'a> {
     }
 
     /// The caller [`Self::callers_of`] lists for the call the resolver read
-    /// a parameter at ([`CallAt`]): the one lookup from a resolver chain to
+    /// a parameter at ([`ChainCall`]): the one lookup from a resolver chain to
     /// the site path's calls (carrick#3504 B10-2c1). `None` where the site
     /// path lists no such caller of the function the call fills.
-    pub(super) fn caller_at(&self, at: &CallAt) -> Option<Placed<'a>> {
+    pub(super) fn caller_at(&self, at: &ChainCall) -> Option<Placed<'a>> {
         self.callers_of(&at.fills.0, &at.fills.1)
             .iter()
             .find(|placed| {
@@ -2760,7 +2760,7 @@ struct MadeWith<'a> {
     /// The calls the resolver read the value through, innermost first, for
     /// a value of its caller read ([`Walk::made_through_callers`]); `None`
     /// for one [`Walk::made_with`] read.
-    chain: Option<Vec<CallAt>>,
+    chain: Option<Vec<ChainCall>>,
 }
 
 impl MadeWith<'_> {
