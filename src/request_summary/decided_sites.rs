@@ -2807,11 +2807,7 @@ fn kept_by_via(values: &[PiecedText], via: &[Vec<ChainCall>]) -> Vec<PiecedText>
         .filter(|value| agrees_with_via(value, via))
         .cloned()
         .collect();
-    if kept.is_empty() {
-        values.to_vec()
-    } else {
-        kept
-    }
+    kept
 }
 
 /// Whether one value is one `via` filters in: no path to filter by, no
