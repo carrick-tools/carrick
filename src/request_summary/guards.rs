@@ -140,8 +140,8 @@ pub enum HoleReason {
     /// kind there (carrick#2413).
     RowsMissing,
     /// The service holding the position was walked and its walk wrote no
-    /// rows (carrick#4247), so every position in it is this hole
-    /// (carrick#4256).
+    /// rows, or none the scan could read (carrick#4247, #4344), so every
+    /// position in it is this hole (carrick#4256).
     WalkLost,
     /// The file's bytes hash otherwise than the ones its rows were read
     /// from.

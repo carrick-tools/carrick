@@ -538,10 +538,15 @@ fn each_operation_through_a_client_wrapper_keeps_one_fact_row() {
 /// service named in `delays` (milliseconds), which it holds that long
 /// first: that service's walk ends late, whatever the machine. A service
 /// named in `fails` (a JS array) never has its `position_rows` walk
-/// forwarded: it is answered with an error, as a failed walk is.
-fn late_walks(dir: &Path, delays: &str, fails: &str) -> PathBuf {
+/// forwarded: it is answered with an error, as a failed walk is. A service
+/// named in `unreadable` (a JS array) has its walk answered as a success
+/// whose rows file is a version-3 one the scan cannot read: the real walk
+/// runs, into a file under `dir`, so the answer's counts are real
+/// (carrick#4344).
+fn late_walks(dir: &Path, delays: &str, fails: &str, unreadable: &str) -> PathBuf {
     let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sidecar/dist/src/index.js");
     let entry = dir.join("dist/src/index.js");
+    let real_rows = dir.join("real-rows");
     fs::create_dir_all(entry.parent().unwrap()).unwrap();
     fs::write(
         &entry,
@@ -551,6 +556,7 @@ const {{ spawn }} = require('child_process');
 const readline = require('readline');
 const delays = {delays};
 const fails = {fails};
+const unreadable = {unreadable};
 const child = spawn(process.execPath, [...process.execArgv, {real:?}], {{
   stdio: ['pipe', 'inherit', 'inherit'],
 }});
@@ -562,6 +568,14 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
     if (request.action === 'position_rows' && fails.includes(request.service)) {{
       require('fs').writeSync(1, JSON.stringify({{ request_id: request.request_id, status: 'error', errors: ['the walk failed'] }}) + '\n');
       return;
+    }}
+    if (request.action === 'position_rows' && unreadable.includes(request.service)) {{
+      const fs = require('fs');
+      const header = JSON.stringify({{ v: 3, typescript: 'stand-in', service: request.service, files: 0 }});
+      fs.mkdirSync(require('path').dirname(request.out_path), {{ recursive: true }});
+      fs.writeFileSync(request.out_path, require('zlib').gzipSync(header + '\\n'));
+      request.out_path = {real_rows:?} + '.' + request.service + '.real';
+      line = JSON.stringify(request);
     }}
     if (request.action === 'position_rows') delay = delays[request.service] ?? 0;
   }} catch {{}}
@@ -619,7 +633,12 @@ fn an_analysis_whose_rows_hold_an_unresolved_import_waits_for_every_walk() {
 
     let repo = unresolved_copy(&tmp.path().join("late"));
     let store = tempfile::tempdir().unwrap();
-    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ client: 15000 }"#, "[]");
+    let sidecar = late_walks(
+        &tmp.path().join("sidecar"),
+        r#"{ client: 15000 }"#,
+        "[]",
+        "[]",
+    );
     let sidecar = sidecar.to_string_lossy();
     let (late, printed) = scan_with(
         &repo,
@@ -681,7 +700,12 @@ fn a_carried_service_reached_through_an_unresolved_import_reads_its_kept_rows() 
     run_git(&repo, &["add", "-A"]);
     run_git(&repo, &["commit", "-q", "-m", "app and worker"]);
 
-    let sidecar = late_walks(&tmp.path().join("sidecar"), r#"{ worker: 15000 }"#, "[]");
+    let sidecar = late_walks(
+        &tmp.path().join("sidecar"),
+        r#"{ worker: 15000 }"#,
+        "[]",
+        "[]",
+    );
     let sidecar = sidecar.to_string_lossy();
     let (scoped, printed) = scan_with(
         &repo,
@@ -803,7 +827,7 @@ fn a_carried_sibling_whose_walk_fails_is_named_at_the_sites_that_needed_it() {
     let before = blob_of(&full, "client")["commit_hash"].clone();
     fs::remove_file(kept_client_rows(store.path())).unwrap();
     change_the_app(&repo);
-    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#, "[]");
     let sidecar = sidecar.to_string_lossy();
     let (scoped, printed) = scan_with(
         &repo,
@@ -835,7 +859,7 @@ fn an_analysed_sibling_whose_walk_fails_is_named_at_every_site_that_needed_it() 
     let tmp = tempfile::tempdir().unwrap();
     let repo = committed_copy(tmp.path());
     let store = tempfile::tempdir().unwrap();
-    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", r#"["client"]"#, "[]");
     let sidecar = sidecar.to_string_lossy();
     let (blobs, printed) = scan_with(
         &repo,
@@ -858,6 +882,95 @@ fn an_analysed_sibling_whose_walk_fails_is_named_at_every_site_that_needed_it() 
         client["boundary"]["walk_rows_lost"],
         serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
     );
+}
+
+/// The head of the run-log line for a walk whose rows were written but
+/// cannot be read, up to the error (carrick#4344).
+const UNREADABLE_ROWS_LINE: &str = "Position rows for service client could not be read:";
+
+/// The client's kept rows in `store`, when there are any.
+fn client_rows_in(store: &Path) -> Option<PathBuf> {
+    fs::read_dir(store.join("positions"))
+        .ok()?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.to_string_lossy().ends_with("__client.jsonl.gz"))
+}
+
+/// carrick#4344: the client is carried and its walk writes a rows file the
+/// scan cannot read, on demand for the app. It reads as a failed walk does:
+/// the app's sites into the client say `walk_lost`, and the unreadable file
+/// does not land in the store.
+#[test]
+fn a_carried_sibling_whose_rows_cannot_be_read_is_named_at_the_sites_that_needed_it() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let (full, _) = scan_with(&repo, store.path(), &[], false, &[]);
+    assert_app_rows(&full);
+    let before = blob_of(&full, "client")["commit_hash"].clone();
+    fs::remove_file(kept_client_rows(store.path())).unwrap();
+    change_the_app(&repo);
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", "[]", r#"["client"]"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (scoped, printed) = scan_with(
+        &repo,
+        store.path(),
+        &["--changed-only"],
+        false,
+        &[("CARRICK_SIDECAR_DIR", &sidecar)],
+    );
+    assert_eq!(blob_of(&scoped, "client")["commit_hash"], before, "carried");
+    assert_eq!(
+        call_rows(blob_of(&scoped, "app")),
+        [
+            "services/app/src/main.ts:14 DELETE /v1/api/items/:id",
+            "services/app/src/main.ts:5 GET /v1/api/items/:id",
+        ],
+        "{printed}"
+    );
+    assert_the_app_names_the_lost_walk(blob_of(&scoped, "app"));
+    assert!(printed.contains(UNREADABLE_ROWS_LINE), "{printed}");
+    assert_eq!(client_rows_in(store.path()), None, "the bad file landed");
+}
+
+/// carrick#4344: the client is analysed and its walk writes a rows file the
+/// scan cannot read. The app's sites into it, and the client's own, say
+/// `walk_lost`, and the boundary names the lost walk, as for a failed walk.
+#[test]
+fn an_analysed_sibling_whose_rows_cannot_be_read_is_named_at_every_site_that_needed_it() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy(tmp.path());
+    let store = tempfile::tempdir().unwrap();
+    let sidecar = late_walks(&tmp.path().join("sidecar"), "{}", "[]", r#"["client"]"#);
+    let sidecar = sidecar.to_string_lossy();
+    let (blobs, printed) = scan_with(
+        &repo,
+        store.path(),
+        &[],
+        true,
+        &[("CARRICK_SIDECAR_DIR", &sidecar)],
+    );
+    assert_the_app_names_the_lost_walk(blob_of(&blobs, "app"));
+    let client = blob_of(&blobs, "client");
+    assert_eq!(
+        client["unread_sites_by_reason"],
+        serde_json::json!({"walk_lost": 5}),
+        "{}",
+        client["unread_sites"]
+    );
+    assert_eq!(call_rows(client).len(), 3, "{:?}", call_rows(client));
+    assert_eq!(
+        client["boundary"]["walk_rows_lost"],
+        serde_json::json!({"total": 1, "reasons": ["the compiler walk failed"]})
+    );
+    assert!(printed.contains(UNREADABLE_ROWS_LINE), "{printed}");
+    assert_eq!(client_rows_in(store.path()), None, "the bad file landed");
 }
 
 /// An unread site of `blob` at `file:line` as `reason slot`, when it has one.

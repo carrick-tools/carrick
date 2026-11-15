@@ -943,24 +943,22 @@ fn rows_span(text: Option<&Utf16Offsets>, lo: u32, hi: u32) -> (u32, u32) {
 }
 
 /// Read the rows `destination` holds into an index for the repo rooted at
-/// `scan_root`, or an empty one, with the reason logged, when there are none
-/// to read. The file is read once: a temporary one is removed when
-/// `destination` is dropped.
-pub fn load_index(destination: &Destination, scan_root: &Path, service: &str) -> PositionIndex {
-    match read_rows_file(destination.path()) {
-        Ok(rows) => {
-            let index = PositionIndex::of(scan_root, rows);
-            debug!(
-                "Position rows for service {service} read: {} file(s)",
-                index.file_count()
-            );
-            index
-        }
-        Err(error) => {
-            debug!("Position rows for service {service} were not read: {error}");
-            PositionIndex::missing(scan_root)
-        }
-    }
+/// `scan_root`, or the error that says why the file cannot be read. The
+/// caller decides what an unreadable file means: a walk that wrote one is
+/// lost (carrick#4344). The file is read once: a temporary one is removed
+/// when `destination` is dropped.
+pub fn load_index(
+    destination: &Destination,
+    scan_root: &Path,
+    service: &str,
+) -> Result<PositionIndex, String> {
+    let rows = read_rows_file(destination.path())?;
+    let index = PositionIndex::of(scan_root, rows);
+    debug!(
+        "Position rows for service {service} read: {} file(s)",
+        index.file_count()
+    );
+    Ok(index)
 }
 
 /// The temporary name the sidecar writes a rows file under before it renames
@@ -1368,8 +1366,8 @@ mod tests {
     /// carrick#2448, #2561: the reader reads the current version only (a version-6
     /// file, written before the flags widened, is one of the others); a file of any
     /// other version is an error, so `load_index` over a version-3 file (with
-    /// its `impl` rows) left by an earlier build gives every lookup
-    /// [`HoleReason::RowsMissing`] and the scan goes on.
+    /// its `impl` rows) left by an earlier build gives an error, and the walk
+    /// that wrote it is lost (carrick#4344).
     #[test]
     fn a_rows_file_of_another_version_is_not_read() {
         for v in [3, 4, 6] {
@@ -1390,16 +1388,9 @@ mod tests {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut gz, text.as_bytes()).unwrap();
         std::fs::write(destination.path(), gz.finish().unwrap()).unwrap();
-        let root = Path::new("/repo");
-        let mut index = load_index(&destination, root, "api");
-        index.bind(&root.join("a.ts"), "a");
-        let base = crate::swc_scanner::SWC_SPAN_BASE;
-        assert_eq!(
-            index
-                .lookup(&root.join("a.ts"), base, base + 1, Kind::Ident)
-                .err(),
-            Some(HoleReason::RowsMissing)
-        );
+        let error = load_index(&destination, Path::new("/repo"), "api")
+            .expect_err("a version-3 file is not read");
+        assert!(error.contains("version"), "{error}");
     }
 
     /// A version-7 row carries the sixteen-bit flags: the declared-type bit
