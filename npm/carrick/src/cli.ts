@@ -50,6 +50,13 @@ export type RunOptions = {
    * SIGTERM is not left running behind the edit.
    */
   killSignal?: NodeJS.Signals;
+  /**
+   * The folder whose `.carrick/` answers, passed to `check` and `check --each`
+   * as `--workspace`. The caller's root is the one answerer of which folder is
+   * read: left out, the binary walks up from the file and a nested
+   * `.carrick/` can win over the root's own (carrick#1534).
+   */
+  workspace?: string | null;
 };
 
 /**
@@ -119,6 +126,7 @@ export async function check(
     args.push("--recheck");
     if (options.noRescan) args.push("--no-rescan");
   }
+  if (options.workspace) args.push("--workspace", options.workspace);
   return await run(args, options, parseCheckResult);
 }
 
@@ -134,6 +142,7 @@ export async function checkEach(
 ): Promise<RunOutcome<Array<CheckResult | null>>> {
   const args = ["check", "--each", ...files, "--json", "--recheck"];
   if (options.noRescan) args.push("--no-rescan");
+  if (options.workspace) args.push("--workspace", options.workspace);
   return await run(args, options, parseCheckResults);
 }
 

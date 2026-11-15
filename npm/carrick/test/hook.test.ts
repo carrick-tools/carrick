@@ -485,7 +485,8 @@ test("a Codex patch is re-checked in one call, and the deleted file is not asked
     .filter((line) => line.trim().length > 0)
     .map((line) => (JSON.parse(line) as { argv: string[] }).argv);
   assert.equal(calls.length, 1, JSON.stringify(calls));
-  assert.deepEqual(calls[0], [
+  // The hook's root is passed as `--workspace` (carrick#1534).
+  assert.deepEqual(calls[0]!.slice(0, -1), [
     "check",
     "--each",
     "user-service/src/routes/users.ts",
@@ -493,6 +494,7 @@ test("a Codex patch is re-checked in one call, and the deleted file is not asked
     "--json",
     "--recheck",
     "--no-rescan",
+    "--workspace",
   ]);
   const asked = calls[0]!;
   // The deleted file is gone from disk, so asking about it would be asking
@@ -1096,7 +1098,9 @@ test("a GraphQL schema edit runs the probe", async (t) => {
     env: fakeEnv({ CARRICK_FAKE_ARGV_LOG: argvLog }),
   });
   const call = firstCall(argvLog);
-  assert.deepEqual(call?.argv, ["check", "user-service/schema.graphql", "--json", "--recheck", "--no-rescan"]);
+  // The hook's root is passed as `--workspace` (carrick#1534).
+  assert.deepEqual(call?.argv.slice(0, -1), ["check", "user-service/schema.graphql", "--json", "--recheck", "--no-rescan", "--workspace"]);
+  assert.equal(fs.realpathSync(call!.argv.at(-1)!), fs.realpathSync(workspace.root));
 });
 
 test("a probe that fails still queues the edit", async (t) => {

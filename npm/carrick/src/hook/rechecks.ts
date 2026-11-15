@@ -631,6 +631,7 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       }
       const outcome = await check(entry.relative, {
         cwd: root,
+        workspace: root,
         recheck: true,
         limitMs: cap + CALL_SLACK_MS,
         env: callEnv,
