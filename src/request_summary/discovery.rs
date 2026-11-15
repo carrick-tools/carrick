@@ -9671,6 +9671,82 @@ export const flip = new Queue(Date.now() % 2 === 0 ? EVEN : ODD);\n";
         );
     }
 
+    /// carrick#3504 QW-2a: the instance walk keeps, on each root, the
+    /// own-factory calls it came through, innermost first, as the resolver
+    /// writes the same calls into a value's caller chain; a maker made where
+    /// it is used came through none. Nothing reads them yet.
+    #[test]
+    fn the_instance_walk_keeps_the_own_factory_calls_it_came_through() {
+        let openers = "import { Queue } from 'bullmq';\n\
+function makeQueue(name: string) { return new Queue(name); }\n\
+function gammaQueue() { return makeQueue('gamma-q'); }\n\
+export async function pushGamma() { await gammaQueue().add('task', { n: 1 }); }\n\
+export async function pushDirect() { await new Queue('direct-q').add('task', { n: 1 }); }\n";
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/own_factory.ts", openers)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ArgSlot, InstanceAt, ScopeLabel, dry_run_term};
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let made_at = |line: u32| {
+            let made: Vec<_> = decided
+                .sites
+                .iter()
+                .filter(|site| site.file == "src/own_factory.ts" && site.line == line)
+                .flat_map(|site| site.instances.iter())
+                .filter_map(|end| match &end.end {
+                    InstanceAt::Root {
+                        made: Some(made), ..
+                    } => Some(made.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(made.len(), 1, "one root at line {line}: {decided:#?}");
+            made.into_iter().next().unwrap()
+        };
+        let direct = made_at(5);
+        assert!(
+            direct.via.iter().all(Vec::is_empty),
+            "a maker made where it is used came through no call: {:?}",
+            direct.via
+        );
+        let gamma = made_at(4);
+        assert_eq!(gamma.via.len(), 1, "one path: {:?}", gamma.via);
+        let path = &gamma.via[0];
+        assert_eq!(path.len(), 2, "two own-factory calls: {path:?}");
+        assert_eq!(path[0].fills.1, "makeQueue", "innermost first: {path:?}");
+        assert_eq!(path[1].fills.1, "gammaQueue", "outermost last: {path:?}");
+        // The first entry is the call the resolver writes for the same
+        // maker's name slot.
+        let (file, ir) = on
+            .inputs
+            .files
+            .iter()
+            .find(|(file, _)| file.ends_with("src/own_factory.ts"))
+            .expect("the fixture file");
+        let maker_call = ir
+            .functions
+            .values()
+            .flat_map(|function| function.calls.iter())
+            .find(|call| (call.site.span_start, call.site.span_end) == gamma.span)
+            .expect("the maker call");
+        let term = dry_run_term(maker_call, &ArgSlot { arg: 0, key: None })
+            .expect("the name slot is written");
+        let values = Resolver::new(&on.inputs, &[]).pieces_through_callers(file, &term);
+        assert_eq!(values.len(), 1, "one value: {values:?}");
+        assert_eq!(
+            values[0].callers.first(),
+            Some(&path[0]),
+            "the walk's call is the resolver's: {values:?} vs {path:?}"
+        );
+    }
+
     /// carrick#4418: values that agree on a name's pieces but were decided
     /// at two or more calls (one opener called from two loops) are not one
     /// name, and no one call states them. The send is a lead whose reason

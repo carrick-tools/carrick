@@ -479,13 +479,35 @@ pub enum InstanceAt {
 
 /// A labelled maker call a walk ended at: its form and its arguments, as a
 /// library claim's slot reads them (carrick#3488).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct MakerCall {
     pub form: MakerForm,
     pub args: Vec<super::super::SiteArg>,
     /// The maker call's span, in the file the root names: where a name
     /// bound to the maker is read (carrick#3527).
     pub span: (u32, u32),
+    /// Each path of own-factory calls the instance walk came through to
+    /// this maker, innermost first, as the resolver's caller chains are
+    /// ordered (carrick#3504 QW-2a). An instance made where it is used has
+    /// the one empty path. Nothing reads it yet.
+    pub(in crate::request_summary) via: Vec<Vec<super::super::resolve::CallAt>>,
+}
+
+/// `via` is where the walk came from, not what the end is.
+impl PartialEq for MakerCall {
+    fn eq(&self, other: &Self) -> bool {
+        self.form == other.form && self.args == other.args && self.span == other.span
+    }
+}
+
+impl Eq for MakerCall {}
+
+impl std::hash::Hash for MakerCall {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.form.hash(state);
+        self.args.hash(state);
+        self.span.hash(state);
+    }
 }
 
 /// One instance end of a decided site: the call that hands the instance
@@ -749,6 +771,10 @@ pub(super) struct InstanceWalk<'w, 'a> {
     /// field: one reached again inside its own walk ends it (a field passed
     /// back into its own class).
     fielding: Vec<(PathBuf, u32, String)>,
+    /// The own-factory calls being followed, outermost first: the path a
+    /// root is reached through (QW-2a).
+    #[allow(dead_code)]
+    via: Vec<super::super::resolve::CallAt>,
 }
 
 impl<'w, 'a> InstanceWalk<'w, 'a> {
@@ -773,6 +799,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
             passing: Vec::new(),
             factories: HashSet::new(),
             fielding: Vec::new(),
+            via: Vec::new(),
         }
     }
 
@@ -786,8 +813,27 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
 
     fn push(&mut self, at: String, end: InstanceAt) {
         let end = InstanceEnd { at, end };
-        if !self.ends.contains(&end) {
-            self.ends.push(end);
+        match self.ends.iter_mut().find(|kept| **kept == end) {
+            // The same end reached through another path of own-factory
+            // calls keeps those paths too (QW-2a).
+            Some(kept) => {
+                if let (
+                    InstanceAt::Root {
+                        made: Some(kept), ..
+                    },
+                    InstanceAt::Root {
+                        made: Some(new), ..
+                    },
+                ) = (&mut kept.end, &end.end)
+                {
+                    for path in &new.via {
+                        if !kept.via.contains(path) {
+                            kept.via.push(path.clone());
+                        }
+                    }
+                }
+            }
+            None => self.ends.push(end),
         }
     }
 
@@ -1736,6 +1782,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                                 form: instance.form,
                                 args: instance.args.clone(),
                                 span: (instance.site.span_start, instance.site.span_end),
+                                via: Vec::new(),
                             }),
                         },
                     );
@@ -1757,9 +1804,11 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     self.returned_at(placed, at);
                     return;
                 }
-                match target {
-                    Some((target_file, key)) => self.returns(&target_file, key, &at, None),
-                    None => self.hole(at, InstanceHole::Unread, None),
+                match (target, placed) {
+                    (Some((target_file, key)), Some(_)) => {
+                        self.returns(&target_file, key, &at, None);
+                    }
+                    _ => self.hole(at, InstanceHole::Unread, None),
                 }
             }
         }
