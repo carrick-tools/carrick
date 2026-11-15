@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { HeldDaemon, type HeldAnswer, type ServiceInit } from "../src/held/daemon.ts";
 import { renderHeldLine } from "../src/held/line.ts";
+import { Ts7Lsp, type Engine } from "../src/held/engine.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { logPath, placedPath } from "../src/held/paths.ts";
 import type { ContractRow } from "../src/facts/store.ts";
@@ -77,6 +78,8 @@ async function rig(
   t: { after: (fn: () => void | Promise<void>) => void },
   rowsOf: (text: (rel: string) => string) => ContractRow[],
   before: (root: string) => void = () => undefined,
+  /** Sees every call to the held compiler (a test's spy). */
+  wrap: (engine: Engine) => Engine = (engine) => engine,
 ): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-e2e-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -103,6 +106,7 @@ async function rig(
     rows: async () => rows,
     commits: async () => ({ shop: commit }),
     stamp: () => "fixed",
+    makeEngine: (command, cwd) => wrap(new Ts7Lsp(command, cwd)),
   });
   const daemon = new HeldDaemon({ root, home, env, programs: async () => [init], runtime });
   t.after(() => daemon.close());
@@ -195,7 +199,7 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
     for (const name of ["programs", "queue_wait", "engine", "refresh", "sweep"]) assert.equal(typeof steps[name], "number", `${name} in ${JSON.stringify(row)}`);
   }
   assert.ok(answered.some((row) => typeof (row["steps"] as Record<string, number>)["pull"] === "number"), "an edit's row names the pull");
-  assert.ok(logged.some((row) => row["kind"] === "after" && typeof (row["steps"] as Record<string, number>)["twin"] === "number"), "the twin pass has a row");
+  assert.ok(logged.some((row) => row["kind"] === "after"), "the after-answer work has a row");
 
   // (b) removing a required member from each shape: exactly one line, at the send's line.
   const breaks: Array<{ rel: string; from: string; to: string; label: string; at: string }> = [
@@ -217,6 +221,9 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
     assert.ok(!MACHINERY.test(said.text), said.text);
     assert.deepEqual((await r.edit(b.rel, original[b.rel]!)).lines, [], `${b.label}: restored`);
   }
+
+  // An edit changed text, so its after-answer row has the twin pass.
+  assert.ok(r.log().some((row) => row["kind"] === "after" && typeof (row["steps"] as Record<string, number>)["twin"] === "number"), "the twin pass has a row");
 
   // (c) half-written inside a send: a syntax error is never a line.
   const half = await r.edit(EXPRESS, original[EXPRESS]!.replace("{ orders, total }", "{ orders, total: orders. }"));
@@ -301,4 +308,36 @@ test("an uncommitted change made before the engine starts still places (the hunk
   // (g) the writer-7 row.
   assert.ok(r.placed().unarmed.some((u) => u.label === "GET /legacy" && u.reason === "no_values"));
   assert.deepEqual((await r.edit(EXPRESS, r.text(EXPRESS).replace("res.json({ orders })", "res.json({ orders, total })"))).lines, []);
+});
+
+test("the twin pass runs after a request that changed text, never after one that changed none", { timeout: 300_000 }, async (t) => {
+  let pulls: string[][] = [];
+  const r = await rig(t, rows, undefined, (engine) => ({
+    set: (file, text) => engine.set(file, text),
+    pull: (files) => {
+      pulls.push(files);
+      return engine.pull(files);
+    },
+    rss: () => engine.rss(),
+    close: () => engine.close(),
+  }));
+  // A request waits for the one before it to finish, after-answer work included: this ask flushes the queue.
+  const settle = (): Promise<HeldAnswer> => r.ask(ORDERS, "read");
+  await settle();
+  pulls = [];
+  for (let i = 0; i < 3; i += 1) await r.ask(EXPRESS, "read");
+  // A file of the program no check sits in, read for the first time, is as the shadow has it.
+  await r.ask("src/helper.ts", "read");
+  await settle();
+  assert.deepEqual(pulls, [], "reads of unchanged files pull nothing, in the answer or after it");
+  const next = r.text(EXPRESS).replace("res.json({ orders, total })", "res.json({ orders })");
+  const answer = await r.edit(EXPRESS, next);
+  assert.equal(answer.lines.length, 1);
+  await settle();
+  assert.ok(pulls.length >= 2, `the edit pulls for its answer and for the twin pass: ${JSON.stringify(pulls)}`);
+  pulls = [];
+  await r.ask(EXPRESS, "read");
+  await settle();
+  assert.deepEqual(pulls, [], "a read after the edit changes nothing, so no twin pass");
+  await r.edit(EXPRESS, r.text(EXPRESS).replace("res.json({ orders })", "res.json({ orders, total })"));
 });

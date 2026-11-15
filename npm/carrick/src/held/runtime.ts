@@ -154,6 +154,8 @@ class HeldService implements ServiceEngine {
   private readonly program: Set<string>;
   private stampSeen: string;
   private needsGate = false;
+  /** Set when a request changed a file's text in the engine: the twin pass has something new to test. */
+  private textMoved = false;
   /** Where the answer in flight spends its time; the after-answer work has its own (the queue runs them one at a time). */
   private timer = new StepTimer();
   private afterTimer = new StepTimer();
@@ -414,15 +416,19 @@ class HeldService implements ServiceEngine {
       this.ownFiles.delete(rel);
       this.sigs.delete(rel);
       fs.rmSync(this.shadow(rel), { force: true });
+      this.textMoved = true;
       return;
     }
     this.ownFiles.add(rel);
     this.sigs.set(rel, this.sigOf(rel));
     const old = this.known.get(rel);
     if (old === text) return;
+    // A file the engine has not been told about yet, still as the shadow copied it, moves no text.
+    const unmoved = old === undefined && readText(this.shadow(rel)) === text;
     fs.mkdirSync(path.dirname(this.shadow(rel)), { recursive: true });
     fs.writeFileSync(this.shadow(rel), text);
     this.known.set(rel, text);
+    if (!unmoved) this.textMoved = true;
     if (this.byFile.has(rel)) {
       if (old !== undefined) await this.timer.run("remap", () => this.remap(rel, old, text));
       this.queue(rel, this.transientIds(rel));
@@ -499,7 +505,12 @@ class HeldService implements ServiceEngine {
   /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */
   private async afterAnswer(): Promise<Steps> {
     this.afterTimer = new StepTimer();
-    await this.afterTimer.run("twin", () => this.twinPass());
+    // The twin pass tests texts; a request that changed none (a read of an unchanged file) has nothing new for it, and
+    // the next request would wait behind it for a second and more on a large service.
+    if (this.textMoved) {
+      this.textMoved = false;
+      await this.afterTimer.run("twin", () => this.twinPass());
+    }
     if (this.regate.size > 0) await this.afterTimer.run("regate", () => this.regatePending());
     if (this.needsGate) {
       this.needsGate = false;
