@@ -4771,6 +4771,51 @@ mod tests {
         );
     }
 
+    /// K3 (koa-style mounts): a callee bound by destructuring the awaited
+    /// result of a registry thunk (`const { default: init } = await
+    /// services[name]()`, each thunk `() => import("./m")`) is the default
+    /// export of each module the registry can return, one value per thunk.
+    #[test]
+    fn a_default_export_reached_through_a_lazy_registry_is_the_callee() {
+        let Some(on) = walked("receiver-lazy-registry", ".", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, ir) = on
+            .inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with("main.ts"))
+            .expect("main.ts is read");
+        // `init(app)`, the call a module-scope binding is the callee of.
+        let call = ir
+            .module_level
+            .read_calls()
+            .map(|(call, _)| call)
+            .find(|call| call.site.line == 11)
+            .expect("the call of init");
+        let invoke = Invoke {
+            file: path,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let row = resolver
+            .row_at(path, call.site.lo, call.site.hi, Kind::Call)
+            .expect("a row for the call");
+        let (file, line, symbol) = resolver
+            .declared_binding(row)
+            .expect("init is a module binding");
+        let held = resolver
+            .binding_values(&mut Ends, file, line, &symbol, invoke)
+            .expect("the binding is read");
+        assert_eq!(
+            got(held),
+            [definition("init"), definition("init")],
+            "one value per thunk's module"
+        );
+    }
+
     /// A factory that returns a module `const` object returns the object the
     /// binding holds (shape c, ruling R5).
     #[test]
