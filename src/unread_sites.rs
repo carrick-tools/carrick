@@ -707,7 +707,7 @@ pub(crate) fn of_own_decorators(
         });
     }
     let withdrawn = |file: &str, start: u32, end: Option<&LabelledEndRef>| {
-        end.is_some_and(|end| is_decorator(end))
+        end.is_some_and(&is_decorator)
             && read_factories
                 .iter()
                 .any(|(at, all)| *all && in_factory(at, file, start))
