@@ -292,7 +292,10 @@ export async function editFlow(
     log(`the ${channel.channel} channel owns delivery in this install; printing nothing`);
     return;
   }
-  if (input.timing) input.timing.factsMs = facts.ms;
+  if (input.timing) {
+    input.timing.factsMs = facts.ms;
+    input.timing.factsStops = facts.stops;
+  }
   // The first part-2 line of the session says which index it read while it
   // differs from the fact file's (once per session).
   const generation = contexts.length > generationAt ? await firstLineGeneration(choice.root, session, stamps) : null;

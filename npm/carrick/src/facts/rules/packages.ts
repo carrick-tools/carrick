@@ -18,7 +18,7 @@ import path from "node:path";
 import { tokenize } from "../match.ts";
 import type { FactStore } from "../store.ts";
 import type { FileMemo } from "../files.ts";
-import type { Candidate } from "../lines.ts";
+import type { Candidate, StopWord } from "../lines.ts";
 import { inRepo } from "../peers.ts";
 import type { LocalCheckouts } from "../peers.ts";
 import { textBefore } from "./same-name.ts";
@@ -141,14 +141,16 @@ export function packageLines(
     // Each other service must still hold the stated spec on disk (R33.1,
     // R33.4): the package named in at least one of the four sections, and
     // every section naming it at exactly that spec (R36.6).
-    const holds = (): boolean =>
+    const holds = (): StopWord | null =>
       others.every((service, index) => {
         const manifest = memo.text(named[index]!);
         const parsed = manifest === null ? null : parse(manifest);
         if (parsed === null) return false;
         const specs = [...SECTIONS].map((section) => specIn(parsed, section, name)).filter((spec) => spec !== undefined);
         return specs.length > 0 && specs.every((spec) => spec === service.spec);
-      });
+      })
+        ? null
+        : "peer_changed";
     out.push({ key: `pkg::${name}`, text, named, holds });
   }
   return out;

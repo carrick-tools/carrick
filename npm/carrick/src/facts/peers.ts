@@ -51,6 +51,15 @@ export function indexedCommit(commits: Readonly<Record<string, string>> | null, 
   return typeof commit === "string" && OBJECT_ID.test(commit) ? commit : null;
 }
 
+/**
+ * Why a peer proof drops a line (carrick#4052, counted as `facts_stops`):
+ * a peer file differs from, or cannot be proven against, the index commit
+ * (`peer_changed`); its repo has no checkout here (`peer_not_checked_out`);
+ * the fact file holds no full commit for its repo (`peer_no_index_commit`);
+ * git ran out of time or the clone lacks the commit (`peer_git_failed`).
+ */
+export type PeerStop = "peer_changed" | "peer_not_checked_out" | "peer_no_index_commit" | "peer_git_failed";
+
 /** What one `factLines` call proves against. */
 export type PeerContext = {
   /** The edited file's repo and the checkout it sits in. */
@@ -61,7 +70,7 @@ export type PeerContext = {
   memo: FileMemo;
   env?: NodeJS.ProcessEnv;
   /** Answers already given in this call, by repo top, commit and files. */
-  proofs: Map<string, boolean>;
+  proofs: Map<string, PeerStop | null>;
   /** Commits a clone answered it lacks in this call, by repo top and commit: not asked again (R36.3). */
   missing: Set<string>;
   /** A git call ran out of time in this call: no further git call, every proof false. */
@@ -84,23 +93,23 @@ export function inRepo(file: string): string | null {
   return parts.join("/");
 }
 
-/** Whether every file in `files` under `top` is its blob at `commit`. */
-function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: readonly string[]): boolean {
+/** Null when every file in `files` under `top` is its blob at `commit`, else why not. */
+function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: readonly string[]): PeerStop | null {
   const key = `${top}\0${commit}\0${files.join("\0")}`;
   const known = ctx.proofs.get(key);
   if (known !== undefined) return known;
-  const answer = ((): boolean => {
+  const answer = ((): PeerStop | null => {
     const wanted = new Map<string, string>();
     for (const file of files) {
       const bytes = ctx.memo.bytes(path.join(top, file));
-      if (bytes === null) return false;
+      if (bytes === null) return "peer_changed";
       wanted.set(file, blobId(bytes, commit.length === 64));
     }
     const clone = `${top}\0${commit}`;
-    if (ctx.gitFailed || ctx.missing.has(clone)) return false;
+    if (ctx.gitFailed || ctx.missing.has(clone)) return "peer_git_failed";
     // A repo folder that is not itself a checkout's top would be answered by
     // the checkout around it: no proof.
-    if (checkoutOf(top)?.top !== fs.realpathSync(top)) return false;
+    if (checkoutOf(top)?.top !== fs.realpathSync(top)) return "peer_not_checked_out";
     // In a partial clone `gitFacts` runs nothing and answers null (R40.4).
     const started = performance.now();
     const out = gitFacts(top, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", commit, "--", ...files], ctx.env);
@@ -110,43 +119,45 @@ function sameAsCommit(ctx: PeerContext, top: string, commit: string, files: read
       // and is not asked again in this action.
       if (performance.now() - started >= factsGitBudgetMs(ctx.env)) ctx.gitFailed = true;
       else ctx.missing.add(clone);
-      return false;
+      return "peer_git_failed";
     }
     const found = new Map<string, string>();
     for (const entry of out.split("\0")) {
       const match = /^\d+ blob ([0-9a-f]+)\t(.+)$/s.exec(entry);
       if (match) found.set(match[2]!, match[1]!);
     }
-    return [...wanted].every(([file, id]) => found.get(file) === id);
+    return [...wanted].every(([file, id]) => found.get(file) === id) ? null : "peer_changed";
   })();
   ctx.proofs.set(key, answer);
   return answer;
 }
 
 /**
- * Whether the line naming `others` may print: every peer file in a repo
- * checked out here reads as it did at the index commit.
+ * Null when the line naming `others` may print: every peer file in a repo
+ * checked out here reads as it did at the index commit. Else the stop word
+ * of the first proof that fails; a proof that throws is `rule_failed`.
  */
-export function peersUnchanged(others: ReadonlyArray<{ repo: string; file: string }>, ctx: PeerContext): boolean {
+export function peersUnchanged(others: ReadonlyArray<{ repo: string; file: string }>, ctx: PeerContext): PeerStop | "rule_failed" | null {
   try {
     const byRepo = new Map<string, Set<string>>();
     for (const other of others) {
       const files = byRepo.get(other.repo) ?? new Set<string>();
       byRepo.set(other.repo, files);
       const file = inRepo(other.file);
-      if (file === null) return false;
+      if (file === null) return "peer_changed";
       files.add(file);
     }
     for (const [repo, files] of byRepo) {
       const place = ctx.checkouts.place(repo, ctx.at);
-      if (place === null) return false;
+      if (place === null) return "peer_not_checked_out";
       const commit = indexedCommit(ctx.commits, repo);
-      if (commit === null) return false;
-      if (!sameAsCommit(ctx, place.top, commit, [...files].sort())) return false;
+      if (commit === null) return "peer_no_index_commit";
+      const stop = sameAsCommit(ctx, place.top, commit, [...files].sort());
+      if (stop !== null) return stop;
     }
-    return true;
+    return null;
   } catch {
-    return false;
+    return "rule_failed";
   }
 }
 
