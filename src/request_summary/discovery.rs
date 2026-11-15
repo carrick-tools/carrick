@@ -3701,6 +3701,16 @@ impl<'a> Walker<'a> {
         if known.iter().all(|value| matches!(value, Held::Callback)) {
             return Outcome::stopped(Stop::InjectedCallee, invoke.file).below(&chain);
         }
+        // One value that is a hole with a reason, read at a call in a
+        // sibling's file (carrick#4486): the reason is kept as a stop, so a
+        // call that also reaches an end saves it beside the end (#4474).
+        // Own files are left as they were: their one-caller case is saved
+        // with the call's fallback word, and re-wording it is a separate
+        // change (T2 of #4486).
+        let sibling_hole = match known.as_slice() {
+            [Held::Stop(reason)] if !self.inputs.files.contains_key(invoke.file) => Some(*reason),
+            _ => None,
+        };
         // Why each value reached nothing, where it says: the resolver's
         // reason, a callback's, or the stop the walk met inside it. A value
         // that reached nothing and says no reason is `None`.
@@ -3725,6 +3735,13 @@ impl<'a> Walker<'a> {
                 Held::Param(..) => Outcome::default(),
             })
             .collect();
+        if let Some(reason) = sibling_hole {
+            return Outcome {
+                valued: true,
+                ..Outcome::stopped(reason, invoke.file)
+            }
+            .below(&chain);
+        }
         if outcomes.len() == 1 {
             return outcomes.remove(0).below(&chain);
         }
