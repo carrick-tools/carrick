@@ -816,6 +816,39 @@ fn folded_values(
     (values, hole.get())
 }
 
+/// Why a lead's name is unread where nothing at this call reads it
+/// (carrick#4500): the last fallback of the lead's word, run only where
+/// no other reading noted one. A name position the call writes no argument
+/// at (at or after a spread, or past its last argument) is
+/// `caller_arg_missing`, as the resolver's caller rule says
+/// (`text_reader` `param_texts`); the position arm needs the discovery fill's
+/// own verdict that nothing was passed, a `Piece::Unknown`. Else the hole
+/// discovery met reading a piece no expression here writes.
+fn unread_below(
+    pieces: &[super::Piece],
+    parts: &CallParts,
+    name_args: &BTreeSet<usize>,
+    folded: &FoldedValues,
+) -> Option<Stop> {
+    if pieces
+        .iter()
+        .any(|piece| matches!(piece, super::Piece::Unknown))
+    {
+        let written = parts.spread_from.unwrap_or(parts.arg_exprs.len());
+        if name_args.iter().any(|index| *index >= written) {
+            return Some(Stop::CallerArgMissing);
+        }
+    }
+    pieces.iter().find_map(|piece| match piece {
+        super::Piece::Opaque {
+            text,
+            end: super::Root::Hole(reason),
+            ..
+        } if !folded.contains_key(text) => Some(Stop::from(*reason)),
+        _ => None,
+    })
+}
+
 /// The literals for the value written as `text`: the compiler's literal
 /// type for a name among `names`, else the one text it folds to
 /// ([`folded_values`]).
@@ -1239,6 +1272,8 @@ struct CallParts {
     enclosing: Option<(String, u32)>,
     /// The arguments as written.
     arg_exprs: Vec<Expr>,
+    /// The position of the first spread argument (carrick#4500).
+    spread_from: Option<usize>,
     /// The call's span.
     span: Span,
 }
@@ -1514,6 +1549,7 @@ impl CallFinder<'_> {
         }
         self.found = Some(CallParts {
             arg_exprs: args.iter().map(|arg| (*arg.expr).clone()).collect(),
+            spread_from: super::library_sites::spread_from(args),
             span,
             text: self.parsed.text_of(span),
             callee: callee
@@ -2476,6 +2512,9 @@ fn record(
     }
     asked.sort();
     asked.dedup();
+    if let Some(stop) = unread_below(&site.name, name_parts, name_args, &folded) {
+        note_hole(&name_hole, stop);
+    }
 
     let bucket = if name_unstated {
         Bucket::Lead
