@@ -275,6 +275,21 @@ impl DryRunNames {
     }
 }
 
+/// How each maker root's name was read (carrick#3504 B10-2c1): the
+/// resolver's caller-chain read of the maker's name slot, beside the site
+/// path's own caller walk (`made_with`). `same`: both read the root and agree,
+/// so the resolver's values are taken; `gain`: only the resolver read it, so
+/// its values are taken; `differs`: both read it and disagree, so today's
+/// stand; `fallback`: the resolver's read stops (a hole, a parameter, a cap),
+/// so today's stand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MakerNames {
+    pub same: usize,
+    pub gain: usize,
+    pub differs: usize,
+    pub fallback: usize,
+}
+
 /// The one debug line per service.
 pub fn log(
     root: &Path,
@@ -295,5 +310,13 @@ pub fn log(
         fallback_by_word = %dry_run.fallback_line(),
         capped = dry_run.capped,
         "site-path names (dry run): labelled calls whose name slot the resolver's pieces read spells as the site path does, or not; of them, those that would fall back to the site path's walk, by word, and those a cap ended"
+    );
+    let maker = &site.maker_names;
+    tracing::debug!(
+        same = maker.same,
+        gain = maker.gain,
+        differs = maker.differs,
+        fallback = maker.fallback,
+        "site-path maker names: maker roots whose name the resolver's caller read agrees with the site path's walk on, reads where the walk does not, disagrees on, or does not read"
     );
 }

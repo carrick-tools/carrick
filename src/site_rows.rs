@@ -249,6 +249,9 @@ pub struct SiteRows {
     /// The resolver's pieces read of each labelled call's name slot beside
     /// the site path's own (carrick#3504 B10-2a2). Log-only: no row reads it.
     pub dry_run_names: crate::name_census::DryRunNames,
+    /// How each maker root's name was read (carrick#3504 B10-2c1).
+    /// Log-only: no row reads it.
+    pub maker_names: crate::name_census::MakerNames,
     /// The request lines whose every deciding call the summaries or the site
     /// pass named: the lines whose callers the summaries read, save direct
     /// calls made where a module is loaded, each of which holds one site the
@@ -1168,6 +1171,7 @@ pub fn of(
         boundaries: Default::default(),
         names: site_names(decided, records),
         dry_run_names: decided.dry_run_names.clone(),
+        maker_names: decided.maker_names.clone(),
         held_open: Vec::new(),
         scopes_unanswered: decided.scopes_unanswered.clone(),
     };

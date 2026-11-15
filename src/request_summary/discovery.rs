@@ -9873,6 +9873,121 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         }
     }
 
+    /// A maker-bound name a parameter's default states, at a caller that
+    /// omits the argument (carrick#3504 B10-2c1): the resolver's caller
+    /// read takes the default, positional or a destructured key's, so the
+    /// send's name is forced there and not asked.
+    #[test]
+    fn a_maker_name_a_default_fills_is_read_at_the_caller_that_omits_it() {
+        use crate::site_questions::Slot;
+        let defaults = "import { Queue } from 'bullmq';\n\
+function openDefault(name: string = 'default-q') { return new Queue(name); }\n\
+export async function pushDefault() { await openDefault().add('task', {}); }\n\
+function openKeyed({ name = 'keyed-q' }: { name?: string } = {}) { return new Queue(name); }\n\
+export async function pushKeyed() { await openKeyed({}).add('task', {}); }\n";
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/defaults.ts", defaults)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::{ScopeLabel, SiteLabel};
+        let labels = SiteLabel::from_exports(&exports);
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let records =
+            super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
+        let shown: Vec<String> = records
+            .iter()
+            .filter(|record| record.state.point.at.starts_with("src/defaults.ts:"))
+            .map(|record| {
+                format!(
+                    "{} {:?} asked={:?} forced={:?} unread={:?}",
+                    record.state.point.at,
+                    record.bucket,
+                    record.state.asked,
+                    record.state.forced.get(&Slot::Name),
+                    record.unread
+                )
+            })
+            .collect();
+        for (line, name) in [(3, "default-q"), (5, "keyed-q")] {
+            let point = format!("src/defaults.ts:{line}");
+            let record = records
+                .iter()
+                .find(|record| record.state.point.at == point)
+                .unwrap_or_else(|| panic!("a record at {point}: {shown:#?}"));
+            assert_eq!(
+                record.state.forced.get(&Slot::Name).map(String::as_str),
+                Some(name),
+                "{line}: {shown:#?}"
+            );
+            assert!(
+                !record.state.asked.contains(&Slot::Name),
+                "{line}: {shown:#?}"
+            );
+        }
+    }
+
+    /// The maker-name census (carrick#3504 B10-2c1): each maker root's name
+    /// is counted once by how the resolver's caller read compares with the
+    /// site path's walk. The two defaults only the resolver reads are gains;
+    /// the pooled openers of `maker_values_pooled_at_two_calls_...`, which
+    /// both read alike, include a `same`.
+    #[test]
+    fn the_maker_census_counts_each_reading() {
+        let defaults = "import { Queue } from 'bullmq';\n\
+function openDefault(name: string = 'default-q') { return new Queue(name); }\n\
+export async function pushDefault() { await openDefault().add('task', {}); }\n\
+function openKeyed({ name = 'keyed-q' }: { name?: string } = {}) { return new Queue(name); }\n\
+export async function pushKeyed() { await openKeyed({}).add('task', {}); }\n";
+        let pooled = "import { Queue } from 'bullmq';\n\
+const SHIPPING = ['ship-created', 'ship-cancelled'] as const;\n\
+const BILLING = ['bill-opened', 'bill-closed'];\n\
+function open(name: string) { return new Queue(name); }\n\
+export async function pushOpened() { for (const q of BILLING) await open(q).add('task', { n: 1 }); }\n\
+function openTwice(name: string) { return new Queue(name); }\n\
+export async function pushTwiceShipping() { for (const q of SHIPPING) await openTwice(q).add('task', { n: 1 }); }\n\
+export async function pushTwiceBilling() { for (const q of BILLING) await openTwice(q).add('task', { n: 1 }); }\n\
+declare function loadConfig(): { name: string };\n\
+function openCfg(name: string) { return new Queue(name); }\n\
+export async function pushCfgA() { const cfg = loadConfig(); await openCfg(cfg.name).add('task', { n: 1 }); }\n\
+export async function pushCfgB() { const cfg = loadConfig(); await openCfg(cfg.name).add('task', { n: 1 }); }\n\
+function openSame(name: string) { return new Queue(name); }\n\
+export async function pushSameA() { for (const q of SHIPPING) await openSame(q).add('task', { n: 1 }); }\n\
+export async function pushSameB() { for (const q of SHIPPING) await openSame(q).add('task', { n: 1 }); }\n\
+function openLit(name: string) { return new Queue(name); }\n\
+export async function pushLitA() { await openLit('lit-a').add('task', { n: 1 }); }\n\
+export async function pushLitB() { await openLit('lit-b').add('task', { n: 1 }); }\n\
+function openDiff(name: string) { return new Queue(name); }\n\
+export async function pushDiffA() { for (const a of SHIPPING) await openDiff(a).add('task', { n: 1 }); }\n\
+export async function pushDiffB() { for (const b of BILLING) await openDiff(b).add('task', { n: 1 }); }\n\
+declare const process: { env: Record<string, string> };\n\
+function openEnv(name: string) { return new Queue(name); }\n\
+export async function pushEnvA() { await openEnv(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n\
+export async function pushEnvB() { await openEnv(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n\
+function openEnvOne(name: string) { return new Queue(name); }\n\
+export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add('task', { n: 1 }); }\n";
+        let Some((on, exports, declarations)) = traced_fixture_files(
+            "queue-enum-base-class-one",
+            ".",
+            "jobs",
+            &[("src/defaults.ts", defaults), ("src/pooled.ts", pooled)],
+            |_| {},
+        ) else {
+            panic!("the sidecar is not built: cd src/sidecar && npm ci && npm run build");
+        };
+        use super::super::decided_sites::ScopeLabel;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let census = &decided.maker_names;
+        assert_eq!(census.gain, 2, "{census:?}");
+        assert!(census.same >= 1, "{census:?}");
+    }
+
     /// The `queue-enum-base-class` sender's decided sites and records, with
     /// the shared package `queue-kit` as a sibling, and the enum package
     /// `topics` too where `with_topics`. The engine reaches siblings through

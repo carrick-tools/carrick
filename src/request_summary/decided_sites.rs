@@ -56,7 +56,8 @@ use swc_ecma_ast::*;
 use swc_ecma_visit::{Visit, VisitWith};
 
 use super::resolve::{
-    Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt, TextPart, TextValue,
+    CallAt as ChainCall, Follow, Held, Hop, Invoke, Maker, PartValue, PiecedText, Resolver, SpanAt,
+    TextPart, TextValue,
 };
 use super::row_calls::Reach;
 use super::stop::Stop;
@@ -1095,6 +1096,9 @@ pub struct Decided {
     /// compares with the site path's own (carrick#3504 B10-2a2): log-only,
     /// nothing reads it.
     pub dry_run_names: crate::name_census::DryRunNames,
+    /// How each maker root's name was read: the resolver's caller read
+    /// beside the site path's own walk (carrick#3504 B10-2c1). Log-only.
+    pub maker_names: crate::name_census::MakerNames,
     /// HTTP sites kept beside the summaries' rows for their request
     /// ([`Self::yield_to_summaries`], C11 T1): no row placed for the request
     /// is composed through the site's line, by `file:line`. Counted in the
@@ -1711,6 +1715,21 @@ impl<'a> Calls<'a> {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The caller [`Self::callers_of`] lists for the call the resolver read
+    /// a parameter at ([`ChainCall`]): the one lookup from a resolver chain to
+    /// the site path's calls (carrick#3504 B10-2c1). `None` where the site
+    /// path lists no such caller of the function the call fills.
+    pub(super) fn caller_at(&self, at: &ChainCall) -> Option<Placed<'a>> {
+        self.callers_of(&at.fills.0, &at.fills.1)
+            .iter()
+            .find(|placed| {
+                placed.file == at.file
+                    && placed.call.site.lo == at.lo
+                    && placed.call.site.hi == at.hi
+            })
+            .copied()
+    }
+
     /// Whether the definition `key` of `file` is handed on as a value to a
     /// function of the service ([`HandedOn::inward`]): what runs it may be
     /// a call [`Self::callers_of`] does not list.
@@ -2136,16 +2155,9 @@ fn dry_run_name(
         renders.push(vec![Piece::Unknown]);
     }
     let same = renders.iter().all(|render| render.as_slice() == today);
-    let fallback = values.iter().find_map(|value| {
-        value.parts.iter().find_map(|part| {
-            (part.through.is_empty() && reads_param(&part_pieces(resolver, part, 0))).then(|| {
-                match &part.value {
-                    PartValue::Hole(reason) => Stop::from(*reason).as_str(),
-                    PartValue::Lit { .. } => "stated",
-                }
-            })
-        })
-    });
+    let fallback = values
+        .iter()
+        .find_map(|value| param_fallback(resolver, value));
     let capped = values.iter().any(|value| {
         value
             .parts
@@ -2164,6 +2176,45 @@ fn dry_run_name(
         );
     }
     out.note(same, fallback, capped);
+}
+
+/// Why the resolver's pieces read of a name falls back to the site path's
+/// walk at the labelled call's own function, by word: a part through no
+/// parameter that still reads one there (the resolver stopped at a
+/// parameter, by its hole's word, or a builder is handed one, `stated`).
+/// The dry run counts it ([`dry_run_name`]); [`falls_back`] adds the rest.
+fn param_fallback(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
+    value.parts.iter().find_map(|part| {
+        (part.through.is_empty() && reads_param(&part_pieces(resolver, part, 0))).then(|| {
+            match &part.value {
+                PartValue::Hole(reason) => Stop::from(*reason).as_str(),
+                PartValue::Lit { .. } => "stated",
+            }
+        })
+    })
+}
+
+/// Why a value of the resolver's pieces read is not taken in place of the
+/// site path's own walk, by word (carrick#3504 B10-2b/B10-2c1): the dry
+/// run's [`param_fallback`]; a hole part the summaries read nothing at, so
+/// its render loses the hole's reason (`unrendered`, N5); a chain the cap
+/// ended (`capped`). `None` where the value can be taken.
+fn falls_back(resolver: &Resolver<'_>, value: &PiecedText) -> Option<&'static str> {
+    if let Some(word) = param_fallback(resolver, value) {
+        return Some(word);
+    }
+    let read_at = |span: &SpanAt| {
+        resolver
+            .inputs_for(&span.file)
+            .files
+            .get(&span.file)
+            .is_some_and(|ir| ir.arg_pieces.contains_key(&(span.lo, span.hi)))
+    };
+    value.parts.iter().find_map(|part| match part.value {
+        PartValue::Hole(super::HoleReason::FanOutCap) => Some("capped"),
+        PartValue::Hole(_) if !part.at.as_ref().is_some_and(read_at) => Some("unrendered"),
+        _ => None,
+    })
 }
 
 /// Where the payload `slot` names at the labelled call (the last of `down`)
@@ -2645,6 +2696,10 @@ struct Walk<'a, 'i> {
     inputs: &'i RequestSummaryInputs,
     /// Reads the defaults an omitted argument takes (carrick#3504 S2b-2).
     resolver: Resolver<'i>,
+    /// Reads names as parts through callers (carrick#3504 B10-2a2, N7): the
+    /// dry run's and the maker names' own, so its queries leave
+    /// [`Self::resolver`] as it was.
+    pieces: Resolver<'i>,
     root: &'i Path,
     /// With the receiver trace on, the makers the store labels: each site's
     /// instance is walked to them ([`instances`]).
@@ -2696,11 +2751,45 @@ struct Walk<'a, 'i> {
 /// that decides it, its pieces as that call's body reads them, the argument
 /// positions they are read from, and the constructor bodies the walk from
 /// the maker passed, by file and key (carrick#3527).
+#[derive(Clone)]
 struct MadeWith<'a> {
     at: Placed<'a>,
     pieces: Vec<Piece>,
     args: BTreeSet<usize>,
     passed: BTreeSet<(PathBuf, String)>,
+    /// The calls the resolver read the value through, innermost first, for
+    /// a value of its caller read ([`Walk::made_through_callers`]); `None`
+    /// for one [`Walk::made_with`] read.
+    chain: Option<Vec<ChainCall>>,
+}
+
+impl MadeWith<'_> {
+    /// What two readings of a value must agree on to be one value: where it
+    /// is decided, its pieces, the argument positions and the constructor
+    /// bodies passed (not `chain`, which only one reading writes).
+    fn same_value(&self, other: &Self) -> bool {
+        self.at.file == other.at.file
+            && (self.at.call.site.lo, self.at.call.site.hi)
+                == (other.at.call.site.lo, other.at.call.site.hi)
+            && self.pieces == other.pieces
+            && self.args == other.args
+            && self.passed == other.passed
+    }
+}
+
+/// Whether two lists of values hold the same values, each read once.
+fn same_values(one: &[MadeWith<'_>], other: &[MadeWith<'_>]) -> bool {
+    one.iter().all(|a| other.iter().any(|b| a.same_value(b)))
+        && other.iter().all(|b| one.iter().any(|a| a.same_value(b)))
+}
+
+/// The resolver's caller read of a maker call's name slot
+/// ([`Walk::made_through_callers`]): every value, one per caller chain
+/// (`all`, compared with [`Walk::made_with`]'s), and those a root takes
+/// (`kept`). `None` where the read falls back to the site path's walk.
+struct PiecesRead<'a> {
+    all: Option<Vec<MadeWith<'a>>>,
+    kept: Option<Vec<MadeWith<'a>>>,
 }
 
 /// One walk of the join ([`Walk::joins`]): the calls of the site, and the
@@ -3477,15 +3566,41 @@ impl<'a> Walk<'a, '_> {
             };
             let pieces = slot_value(maker.call, slot);
             let args = BTreeSet::from([slot.arg]);
-            unread |= !self.made_with(
+            let mut today: Vec<MadeWith<'a>> = Vec::new();
+            let read = self.made_with(
                 maker,
                 pieces,
                 args,
                 BTreeSet::new(),
-                &mut made,
+                &mut today,
                 &mut Vec::new(),
                 &mut budget,
             );
+            // The resolver's caller read of the same slot (carrick#3504
+            // B10-2c1) replaces the walk's values only where both readings
+            // agree, or where only the resolver reads the root and the cap
+            // trimmed no walk; else the walk's stand, counted.
+            let through = self.made_through_callers(maker, slot);
+            let census = &mut self.out.maker_names;
+            match (read, through.all, through.kept) {
+                (true, Some(all), Some(kept)) if same_values(&all, &today) => {
+                    census.same += 1;
+                    made.extend(kept);
+                }
+                (false, Some(_), Some(kept)) if !budget.trimmed => {
+                    census.gain += 1;
+                    made.extend(kept);
+                }
+                (_, all, kept) => {
+                    if all.is_some() && kept.is_some() {
+                        census.differs += 1;
+                    } else {
+                        census.fallback += 1;
+                    }
+                    unread |= !read;
+                    made.extend(today);
+                }
+            }
         }
         if unread || made.is_empty() {
             return self.unnamed_trimmed(chain, end, budget.trimmed);
@@ -3525,6 +3640,92 @@ impl<'a> Walk<'a, '_> {
         }
     }
 
+    /// Every value the name slot `slot` of the maker call `maker` takes, as
+    /// the resolver reads it through callers (carrick#3504 B10-2c1): one per
+    /// caller chain, each decided at the outermost call of its chain (the
+    /// maker itself for none), spelled as that call's function reads it,
+    /// with the argument positions the function it calls reads and the
+    /// constructor bodies the chain passes. `None` in both halves where any
+    /// value is not read as [`Self::made_with`] reads one: a hole the walk
+    /// does not read past (a parameter nothing hands in, a callback's own,
+    /// an omitted argument with no default, a reassigned or recursive value,
+    /// a capped chain), a value [`falls_back`] names, a caller the site path
+    /// does not list, or pieces still unknown or open on a parameter.
+    fn made_through_callers(&self, maker: Placed<'a>, slot: &ArgSlot) -> PiecesRead<'a> {
+        let all = self.read_through_callers(maker, slot);
+        PiecesRead {
+            kept: all.clone(),
+            all,
+        }
+    }
+
+    /// [`Self::made_through_callers`]' values, every one.
+    fn read_through_callers(&self, maker: Placed<'a>, slot: &ArgSlot) -> Option<Vec<MadeWith<'a>>> {
+        use super::HoleReason;
+        let term = dry_run_term(maker.call, slot)?;
+        let values = self.pieces.pieces_through_callers(maker.file, &term);
+        if values.is_empty() {
+            return None;
+        }
+        let stops = values.iter().any(|value| {
+            value.parts.iter().any(|part| {
+                matches!(
+                    part.value,
+                    PartValue::Hole(
+                        HoleReason::NameNeverBound
+                            | HoleReason::CallbackParameter
+                            | HoleReason::CallerArgMissing
+                            | HoleReason::Reassigned
+                            | HoleReason::Recursion
+                            | HoleReason::FanOutCap
+                    )
+                )
+            }) || falls_back(&self.pieces, value).is_some()
+        });
+        if stops {
+            return None;
+        }
+        let constructor = |placed: &Placed<'a>| {
+            placed
+                .key
+                .filter(|key| self.calls.is_constructor(placed.file, key))
+                .map(|key| (placed.file.to_path_buf(), key.to_string()))
+        };
+        let mut made = Vec::with_capacity(values.len());
+        for value in &values {
+            let n = value.callers.len();
+            let callers: Vec<Placed<'a>> = value
+                .callers
+                .iter()
+                .map(|at| self.calls.caller_at(at))
+                .collect::<Option<_>>()?;
+            let at = callers.last().copied().unwrap_or(maker);
+            let pieces = rendered(&self.pieces, value, n);
+            if pieces.is_empty()
+                || pieces.iter().any(|piece| matches!(piece, Piece::Unknown))
+                || holds_parameter(&pieces)
+            {
+                return None;
+            }
+            let args = match n {
+                0 => BTreeSet::from([slot.arg]),
+                _ => parameter_positions(&rendered(&self.pieces, value, n - 1)),
+            };
+            let passed = std::iter::once(&maker)
+                .chain(&callers)
+                .filter_map(constructor)
+                .collect();
+            made.push(MadeWith {
+                at,
+                pieces,
+                args,
+                passed,
+                chain: Some(value.callers.clone()),
+            });
+        }
+        Some(made)
+    }
+
     /// Every value the name slot of a maker call takes (carrick#3527): the
     /// slot's `pieces` at `placed` (read from its arguments `args`) where they
     /// hold no parameter, else what each caller of the function `placed` is
@@ -3562,6 +3763,7 @@ impl<'a> Walk<'a, '_> {
                 pieces,
                 args,
                 passed,
+                chain: None,
             });
             return true;
         }
@@ -4125,9 +4327,6 @@ fn decide(
         .iter()
         .map(|site| bound_calls(&calls, root, site))
         .collect();
-    // The dry run's own resolver (carrick#3504 B10-2a2): its queries leave
-    // the walk's resolver as it was.
-    let dry_run = Resolver::new(inputs, &calls.siblings);
     let runners: HashMap<(PathBuf, u32), ArgSlot> = discovered
         .iter()
         .filter_map(|site| {
@@ -4140,6 +4339,7 @@ fn decide(
         calls: &calls,
         inputs,
         resolver: Resolver::new(inputs, &calls.siblings),
+        pieces: Resolver::new(inputs, &calls.siblings),
         root,
         makers,
         scopes,
@@ -4284,7 +4484,7 @@ fn decide(
         }
         let at_end = slot_value(last.call, slot);
         dry_run_name(
-            &dry_run,
+            &walk.pieces,
             last.file,
             last.call,
             slot,
