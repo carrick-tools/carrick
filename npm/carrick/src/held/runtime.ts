@@ -496,6 +496,11 @@ class HeldService implements ServiceEngine {
           line: at.line(first.start),
           message: first.message,
           symbol: row.groups[g]!.symbol,
+          row_file: row.file,
+          row_line: row.line,
+          row_path: path.join(this.init.repo_path, row.file),
+          places: row.groups[g]!.places.map((p) => ({ service: p.service, file: p.file, line: p.line })),
+          expected: row.groups[g]!.type,
         });
       }
     }

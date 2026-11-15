@@ -12,25 +12,24 @@ import { renderPostToolUse } from "../render.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
-import { factsSaid, markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
+import { markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
-import { deliverLateFirst, emitPostToolUse } from "./late.ts";
-import { needsBackground, probeEdits } from "./probe.ts";
+import { deliverEarly, deliverLateFirst, emitPostToolUse } from "./late.ts";
+import { needsBackground, probeEdits, probeTimeoutMs } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
-import { answerInHand, enqueue, enqueueHeld, ensureRunner } from "./rechecks.ts";
+import { answerInHand, enqueue, ensureRunner, readEarly } from "./rechecks.ts";
+import type { QueueEntry } from "./rechecks.ts";
 import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
 import { openFacts } from "../facts/store.ts";
-import type { FactEdit, FactOutcome } from "../facts/lines.ts";
+import type { FactEdit } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
 import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
 import { askHeld } from "../held/client.ts";
-import { parseHeldClaim, unsaidHeld } from "../held/line.ts";
-import type { HeldRoute, RenderedHeld } from "../held/line.ts";
-import type { HeldLine } from "../held/daemon.ts";
+import type { AskAnswer } from "../held/client.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
 import type { LocalStamp } from "../hosted-snapshot.ts";
 
@@ -111,17 +110,23 @@ export async function editFlow(
   // rendered: a file the fact file covers gets its callers from there, not
   // the uses-count line.
   const factFiles = [...edited, ...(input.factOnly ?? [])].filter((file) => !(input.shell && inOtherWorktree(file, cwd ?? process.cwd())));
-  // The held compiler (part 3, D10, T9): one ask per file this session changed
-  // in its own checkout, filed as a queue entry (`enqueueHeld`) and handed to
-  // the daemon, which files its answer where part 2's late answers land. This
-  // hook waits at most the probe's budget (`probeTimeoutMs`), beside the probe and the facts; a slower
-  // one is printed by the next hook (`deliverLate`). Off, nothing is asked and
-  // nothing below changes.
-  const heldFiles = edited.filter((file) => !inOtherWorktree(file, cwd ?? process.cwd()));
-  const heldAsked =
-    channel.channel === "hook" && session && heldFiles.length > 0 && compilerLinesEnabled()
-      ? askHeldFiles(choice.root, heldFiles, session, editedAt, cwd)
-      : null;
+  // The held compiler (part 3, B1): one ask per queued entry of a file in this
+  // session's own checkout, made once part 2's entry exists and named by its
+  // seq, so the daemon files its early answer beside that entry. The hook waits
+  // for the asks until the probe's budget since the edit has run out
+  // (`probeTimeoutMs`); a slower answer is printed by the next carrier
+  // (`deliverLate`). Off, nothing is asked and nothing below changes.
+  const asks: Array<Promise<{ entry: QueueEntry; answer: AskAnswer }>> = [];
+  const askFor = (entries: readonly QueueEntry[]): void => {
+    if (!compilerLinesEnabled()) return;
+    for (const entry of entries) {
+      if (inOtherWorktree(entry.file, cwd ?? process.cwd())) continue;
+      const waitMs = Math.max(0, editedAt + probeTimeoutMs() - Date.now());
+      asks.push(
+        askHeld(choice.root, [entry.file], { session: entry.session, kind: "edit", editedAt, waitMs, seq: entry.seq }).then((answer) => ({ entry, answer })),
+      );
+    }
+  };
   const run = input.run ?? { factLines, probeEdits, openFacts };
   const hook = channel.channel === "hook";
   const queueable = hook && Boolean(session);
@@ -167,17 +172,11 @@ export async function editFlow(
     const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe, cwd });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
+    askFor(entries);
   }
   const probed = [...relatives.keys()].filter((index) => !queued.has(edited[index]!));
   const answers = early ?? (await probeOf(probed));
   if (input.timing) input.timing.waitedMs = answers.ms;
-  // Joined after the probe: it ran beside the facts and the probe under the
-  // probe's own budget, so it adds nothing beyond that.
-  const held = heldAsked ? await heldAsked : null;
-  if (input.timing && held && held.state !== "off") {
-    input.timing.heldMs = held.ms;
-    input.timing.heldState = held.state;
-  }
   // Each file's probe answer by its place in `edited`; null for a file queued
   // in place of the probe or one the probe gave no answer for.
   const results: Array<CheckResult | null> = relatives.map(() => null);
@@ -228,6 +227,7 @@ export async function editFlow(
     const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered, cwd });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
+    askFor(entries);
     // A queued file says nothing now: its answer is delivered with the next
     // Carrick line only when it holds a finding, and a refused queue entry is a
     // gap the Stop hook names (hook-wording audit T4).
@@ -250,12 +250,26 @@ export async function editFlow(
     }
     if (recorded.length > 0) recordEdit(session, choice.root, editedAt, undefined, recorded);
   }
+  // The early answers in hand: each ask ends by the edit's deadline, and one
+  // that answered `ready` has filed its early answer before replying. Each is
+  // claimed before the late answers below are read, so no carrier says it again.
+  const answered = await Promise.all(asks);
+  const held = mergedAsk(answered.map((a) => a.answer));
+  if (input.timing && held && held.state !== "off") {
+    input.timing.heldMs = held.ms;
+    input.timing.heldState = held.state;
+  }
+  const seen = new Set<string>();
+  const earlyNow: string[] = [];
+  for (const { entry, answer } of answered) {
+    if (answer.state !== "ready") continue;
+    const early = readEarly(entry.session, entry.seq);
+    if (early) earlyNow.push(...deliverEarly(entry.session, early, seen, { late: false }));
+  }
   // Delivered after this edit is queued, so an older answer for a file this
   // edit queues again is skipped (the newer entry carries it).
-  // A late problem for a route this action's held line names is not said twice.
-  const heldNow = heldToSay(held, session).map(({ rendered }) => parseHeldClaim(rendered.claim)).filter((r): r is HeldRoute => r !== null);
   const stamps: LocalStamp[] = [];
-  const late = channel.channel === "hook" ? await deliverLateFirst(session, Date.now(), heldNow) : [];
+  const late = channel.channel === "hook" ? await deliverLateFirst(session, Date.now(), seen) : [];
   const generationAt = contexts.length;
   contexts.push(...late);
   for (const index of relatives.keys()) {
@@ -283,7 +297,8 @@ export async function editFlow(
   // differs from the fact file's (once per session).
   const generation = contexts.length > generationAt ? await firstLineGeneration(choice.root, session, stamps) : null;
   if (generation) contexts.splice(generationAt, 0, generation);
-  contexts.push(...heldContexts(facts, held, session));
+  // An early line is ADDED to part 1's: it never replaces a contract line.
+  contexts.push(...earlyNow);
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.
   if (facts.stale) (await import("../facts/fetch.ts")).startFactsRefresh(choice.root);
@@ -304,43 +319,9 @@ export async function editFlow(
   emitPostToolUse(contexts);
 }
 
-/** One ask per file, each under its own queue entry; the answers in hand are merged. */
-async function askHeldFiles(
-  root: string,
-  files: string[],
-  session: string,
-  editedAt: number,
-  cwd: string | null | undefined,
-): Promise<Awaited<ReturnType<typeof askHeld>>> {
-  const answers = await Promise.all(
-    files.map((file) => {
-      const entry = enqueueHeld(root, session, file, editedAt, { cwd });
-      return askHeld(root, [file], { session, kind: "edit", editedAt, ...(entry ? { seq: entry.seq } : {}) });
-    }),
-  );
-  const ready = answers.filter((a) => a.state === "ready");
-  const first = ready[0] ?? answers[0]!;
-  return { ...first, lines: ready.flatMap((a) => a.lines), ms: Math.max(...answers.map((a) => a.ms)) };
-}
-
-/**
- * The compiler's lines for this action (D13): each said once per session, at
- * most two. A line is ADDED to part 1's: part 3 never replaces or drops a
- * part-1 contract line (K-c). Its claim is its own, so a break is said once.
- */
-function heldContexts(facts: FactOutcome, held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): string[] {
-  const claims: Record<string, { at: number; named: string[] }> = {};
-  const out: string[] = [];
-  for (const { line, rendered } of heldToSay(held, session)) {
-    out.push(rendered.text);
-    claims[rendered.claim] = { at: Date.now(), named: [line.file] };
-  }
-  Object.assign(facts.claims, claims);
-  return out;
-}
-
-/** The held lines this action says: ready, not said before in the session, at most two. */
-function heldToSay(held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): { line: HeldLine; rendered: RenderedHeld }[] {
-  if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
-  return unsaidHeld(held.lines, factsSaid(session));
+/** One state and time for the action's asks: the first that answered `ready`, else the first; the longest wait. */
+function mergedAsk(answers: readonly AskAnswer[]): AskAnswer | null {
+  if (answers.length === 0) return null;
+  const first = answers.find((a) => a.state === "ready") ?? answers[0]!;
+  return { ...first, ms: Math.max(...answers.map((a) => a.ms)) };
 }

@@ -537,8 +537,9 @@ function notJudgedReason(result: CheckResult): string {
  * re-check answered for are all silent (hook-wording audit T4, 568 firings and
  * no finding). A header exists only to introduce a problem or a moved row.
  */
-function headline(result: CheckResult, where: string, problems: number, late: boolean): string | null {
+function headline(result: CheckResult, where: string, problems: number, late: boolean, early: boolean): string | null {
   const moved = movedLines(result).length > 0;
+  if (early) return earlyHeadline(where, problems, moved, late);
   if (problems === 0) return moved ? `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}; rows elsewhere moved:` : null;
   const count = `${problems} contract ${problems === 1 ? "problem" : "problems"}`;
   if (recheckDidNotRun(result)) return `Carrick: ${where}: ${count}.`;
@@ -548,6 +549,25 @@ function headline(result: CheckResult, where: string, problems: number, late: bo
   // `check --changed` for it (carrick#3466).
   if (stale.length > 0) return `Carrick re-checked ${where}: ${count} in what it re-read; ${staleClause(stale, "this edit")}.`;
   return `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}: ${count}.`;
+}
+
+/**
+ * The headline of an early answer (part 3, B1): the held compiler engine's
+ * check of an HTTP route's response, which the full re-check later confirms or
+ * corrects (`hook/confirm.ts`). Null when it states no break.
+ */
+function earlyHeadline(where: string, problems: number, moved: boolean, late: boolean): string | null {
+  const after = late ? "your earlier edit to it" : "this edit";
+  if (problems > 0) return `Carrick's compiler engine checked ${where} after ${after}: ${problems} contract ${problems === 1 ? "problem" : "problems"}.`;
+  return moved ? `Carrick's compiler engine checked ${where} after ${after}; routes in other files broke:` : null;
+}
+
+/**
+ * The line for an early break the full re-check found compatible (part 3, B1):
+ * the earlier line no longer holds.
+ */
+export function correctionLine(where: string, label: string): string {
+  return `Carrick: the full re-check of ${where} found ${label} compatible, so the compiler engine's earlier problem for it no longer applies.`;
 }
 
 /**
@@ -562,6 +582,8 @@ function headline(result: CheckResult, where: string, problems: number, late: bo
  *   the edit. The Stop hook names a gap once.
  * - A file answered from the working tree: its problems (a result other than
  *   `compatible`), at most three, and nothing about the rows that are fine.
+ * - `options.early`: the answer is the held compiler engine's early one
+ *   (part 3, B1); only the headline differs.
  * - Then, unless `options.uses` is `false`, one line counting who uses this
  *   file from elsewhere (carrick#2067); the hook shows it once per file per
  *   session, and the uses themselves are the Read hook's to list.
@@ -572,7 +594,7 @@ function headline(result: CheckResult, where: string, problems: number, late: bo
 export function renderPostToolUse(
   result: CheckResult,
   displayFile?: string,
-  options: { uses?: boolean; late?: boolean } = {},
+  options: { uses?: boolean; late?: boolean; early?: boolean } = {},
 ): string | null {
   if (result.error) return null;
   // `result.file` is relative to the repo that owns it, so the caller's own
@@ -585,7 +607,7 @@ export function renderPostToolUse(
       const gone = deletedLine(result, where);
       if (gone !== null) lines.push(gone);
     } else {
-      const head = headline(result, where, problems.length, options.late === true);
+      const head = headline(result, where, problems.length, options.late === true, options.early === true);
       if (head !== null) lines.push(head);
     }
     for (const item of problems.slice(0, MAX_EDIT_PROBLEMS)) lines.push(cutLine(itemLine(item, where)));

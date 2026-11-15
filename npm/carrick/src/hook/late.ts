@@ -9,14 +9,12 @@
 
 import { resolveChannel } from "../channel.ts";
 import { problemItems } from "../contract.ts";
-import type { CheckItem } from "../contract.ts";
-import { parseHeldClaim, unsaidHeld } from "../held/line.ts";
-import type { HeldRoute } from "../held/line.ts";
 import { createLogger } from "../log.ts";
-import { answersTheEdit, changedCleanLine, changedLines, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, isChanged, isHeld, owedFor } from "./rechecks.ts";
-import type { Answer } from "./rechecks.ts";
-import { factsSaid, heldClaimsSince, markFacts, markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
+import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
+import type { Answer, EarlyAnswer } from "./rechecks.ts";
+import { confirmedResult, earlyRows, keepRows, standingEarly } from "./confirm.ts";
+import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 import { firstLineGeneration, stampOf } from "./generation.ts";
@@ -46,13 +44,32 @@ export function lateContext(answer: Answer, uses: boolean): string | null {
 }
 
 /**
- * What a carrier prints for one finished answer it has claimed, oldest first:
- * its similar-function blocks, then its words (`lateContext`), with the uses-count and lead
- * keys marked as told. Shared by `deliverLate` and by the Stop hook for an
- * answer queued in place of the probe (R46.2), so both print it the same way.
+ * The full answer as a carrier prints it once its entry's early answer has
+ * spoken (part 3, B1, P10): without the breaks the early rows already stated
+ * and their mirror call rows, and one correction line for each early break the
+ * full re-check found compatible. An entry with no early answer, or whose early
+ * answer was never printed, is printed as it stands: an early break part 2 did
+ * not judge is then printed by its own carrier (`deliverEarly`).
  */
-export function deliverOne(session: string, answer: Answer, home?: string, heldNow: readonly HeldRoute[] = []): string[] {
-  answer = withoutHeldProblems(session, answer, home, heldNow);
+export function confirmAnswer(answer: Answer, home?: string): { answer: Answer; corrections: string[] } {
+  if (isChanged(answer) || !answer.result || answer.result.error) return { answer, corrections: [] };
+  const early = readEarly(answer.session, answer.seq, home);
+  const said = early === null ? null : earlySaid(answer.session, answer.seq, home);
+  if (early === null || said === null || said.size === 0) return { answer, corrections: [] };
+  const { result, corrected } = confirmedResult(answer.result, early.result, said);
+  if (result !== answer.result) log("late rows dropped: the early answer stated them", answer.relative);
+  return { answer: { ...answer, result }, corrections: corrected.map((label) => correctionLine(answer.relative, label)) };
+}
+
+/**
+ * What a carrier prints for one finished answer it has claimed, oldest first:
+ * its similar-function blocks, then its words (`lateContext`), then any
+ * correction of its early answer, with the uses-count and lead keys marked as
+ * told. Shared by `deliverLate` and by the Stop hook for an answer queued in
+ * place of the probe (R46.2), so both print it the same way.
+ */
+export function deliverOne(session: string, raw: Answer, home?: string): string[] {
+  const { answer, corrections } = confirmAnswer(raw, home);
   const contexts: string[] = [];
   const key = answer.result ? toldKey(answer.result, answer.relative) : null;
   // As the edit-time answer would have: no uses-count line where the fact
@@ -68,64 +85,36 @@ export function deliverOne(session: string, answer: Answer, home?: string, heldN
     contexts.push(...found.lines);
     markLed(session, found.keys, home);
   }
-  if (!context) return contexts;
-  contexts.push(context);
-  if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
+  if (context) {
+    contexts.push(context);
+    if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
+  }
+  contexts.push(...corrections);
   return contexts;
 }
 
 /**
- * What a carrier prints for a finished held-compiler answer (part 3, T9): its
- * breaks not said in this session, with each claim taken as T6's in-hand line
- * takes it, so a break is said once whichever carrier prints it. `routes` are
- * the routes named, for part 2's dedup of the answers printed with it
- * (`withoutHeldProblems`).
+ * What a carrier prints for one early answer (part 3, B1) it owes: the breaks
+ * not yet printed in this message (`seen`, the rows' keys), through the one
+ * renderer, claimed once under `<seq>.early.said` with the keys of every row the
+ * message states. When the full answer has already landed, only the rows it did
+ * not judge stand and print (R5a); the rest are its to say.
  */
-export function deliverHeld(session: string, answer: Answer, home?: string, now: number = Date.now()): { contexts: string[]; routes: HeldRoute[] } {
-  const found = answer.held;
-  if (!found || found.state !== "ready") return { contexts: [], routes: [] };
-  const said = unsaidHeld(found.lines, factsSaid(session, home));
-  const claims: Record<string, { at: number; named: string[] }> = {};
-  for (const { line, rendered } of said) claims[rendered.claim] = { at: now, named: [line.file] };
-  markFacts(session, claims, home);
-  const routes = said.map(({ rendered }) => parseHeldClaim(rendered.claim)).filter((r): r is HeldRoute => r !== null);
-  return { contexts: said.map(({ rendered }) => rendered.text), routes };
+export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string>, options: { home?: string; now?: number; late?: boolean } = {}): string[] {
+  const full = readAnswer(owner, early.seq, options.home);
+  const view = full?.state === "answered" && full.result && !full.result.error ? standingEarly(early.result, full.result) : early.result;
+  const rows = earlyRows(view);
+  if (!claimEarly(owner, early.seq, rows.map((row) => row.key), options.home, options.now)) return [];
+  const fresh = keepRows(view, (row) => !seen.has(row.key));
+  for (const row of rows) seen.add(row.key);
+  const text = renderPostToolUse(fresh, early.relative, { early: true, uses: false, late: options.late !== false });
+  if (text) log(`early answer ${early.relative} delivered ${Math.round(((options.now ?? Date.now()) - Date.parse(early.enqueued_at)) / 1000)} s after the edit`);
+  return text ? [text] : [];
 }
 
-/** The label a problem item has as a contract row: `METHOD path{ dispatch}`. */
-function itemLabel(item: CheckItem): string | null {
-  return item.method && item.path ? `${item.method} ${item.path}${item.dispatch_label ?? ""}` : null;
-}
-
-/**
- * The answer without the route problems the held compiler's line already named
- * (part 3 D11b): same file (the claim's ROW file, never the value's), same
- * label, claimed at or after the entry's edit. `heldNow` are the lines of the
- * action being printed, claimed only when it ends. Part 2's problem for a route
- * part 3 stayed silent on still prints.
- */
-function withoutHeldProblems(session: string, answer: Answer, home: string | undefined, heldNow: readonly HeldRoute[]): Answer {
-  const result = answer.result;
-  if (isChanged(answer) || !result?.items?.length) return answer;
-  const since = Date.parse(answer.enqueued_at);
-  const claimed = [
-    ...heldClaimsSince(session, Number.isNaN(since) ? 0 : since, home).map(parseHeldClaim),
-    ...heldNow,
-  ].filter((route): route is HeldRoute => route !== null);
-  if (claimed.length === 0) return answer;
-  const said = (item: CheckItem): boolean => {
-    const label = itemLabel(item);
-    return (
-      item.kind === "route" &&
-      label !== null &&
-      claimed.some((route) => route.label === label && (answer.file === route.file || answer.file.endsWith(`/${route.file}`)))
-    );
-  };
-  const problems = new Set(problemItems(result));
-  const items = result.items.filter((item) => !(problems.has(item) && said(item)));
-  if (items.length === result.items.length) return answer;
-  log("late problem dropped: the held compiler's line named it", answer.relative);
-  return { ...answer, result: { ...result, items } };
+/** Every early answer `session` is owed, printed oldest first (`deliverEarly`). */
+export function deliverEarlies(session: string, seen: Set<string>, home?: string, now: number = Date.now(), listing?: readonly string[]): string[] {
+  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now }));
 }
 
 /**
@@ -156,9 +145,12 @@ export function hasFindings(answer: Answer): boolean {
  * the findings alone. No uses-count line and no leads, which a parent with
  * many sub-agents would get once per file it never edited.
  */
-export function adoptedLine(answer: Answer): string | null {
-  if (isChanged(answer)) return lateContext(answer, false);
-  return hasFindings(answer) ? lateContext(answer, false) : null;
+export function adoptedLine(raw: Answer, home?: string): string | null {
+  if (isChanged(raw)) return lateContext(raw, false);
+  const { answer, corrections } = confirmAnswer(raw, home);
+  const said = hasFindings(answer) ? lateContext(answer, false) : null;
+  const lines = [...(said ? [said] : []), ...corrections];
+  return lines.length > 0 ? lines.join("\n\n") : null;
 }
 
 /**
@@ -181,11 +173,11 @@ export type LateStamp = { root: string; stamp: LocalStamp; at: number };
 export async function deliverLateFirst(
   session: string | undefined,
   now: number = Date.now(),
-  heldNow: readonly HeldRoute[] = [],
+  seen: Set<string> = new Set(),
   home?: string,
 ): Promise<string[]> {
   const stamps: LateStamp[] = [];
-  const contexts = deliverLate(session, now, heldNow, home, stamps);
+  const contexts = deliverLate(session, now, seen, home, stamps);
   const first = stamps[0];
   if (!first) return contexts;
   const line = await firstLineGeneration(first.root, session, stamps.filter((s) => s.root === first.root).map((s) => s.stamp), now, home);
@@ -195,41 +187,36 @@ export async function deliverLateFirst(
 
 /**
  * Claim and render every finished answer this session has not been given.
- * Returns the contexts to print, oldest first. Nothing here throws.
+ * Returns the contexts to print, oldest first. Nothing here throws. `seen` are
+ * the early rows this message already states (the edit hook's in hand).
  */
 export function deliverLate(
   session: string | undefined,
   now: number = Date.now(),
-  heldNow: readonly HeldRoute[] = [],
+  seen: Set<string> = new Set(),
   home?: string,
   stamps?: LateStamp[],
 ): string[] {
   if (!session) return [];
   const contexts: string[] = [];
   try {
-    // The held compiler's verdicts first, so part 2's problem for a route one
-    // of them named is not said again beside it.
-    const owed = owedFor(session, home);
-    const routes = [...heldNow];
-    for (const { owner, answer } of owed.filter((o) => isHeld(o.answer))) {
-      if (!claimDelivery(owner, answer.seq, home, now)) continue;
-      const delivered = deliverHeld(session, answer, home, now);
-      log(`held verdict ${answer.relative} delivered ${Math.round((now - Date.parse(answer.enqueued_at)) / 1000)} s after the edit`);
-      contexts.push(...delivered.contexts);
-      routes.push(...delivered.routes);
-    }
-    for (const { owner, answer } of owed.filter((o) => !isHeld(o.answer))) {
+    // Early answers first, so a full answer delivered beside its entry's
+    // early one is compared with it (`confirmAnswer`), never said twice.
+    // One listing of the sessions folder serves both readers.
+    const listing = sessionListing(home);
+    contexts.push(...deliverEarlies(session, seen, home, now, listing));
+    for (const { owner, answer } of owedFor(session, home, listing)) {
       if (!claimDelivery(owner, answer.seq, home, now)) continue;
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       if (owner !== session) {
-        const adopted = adoptedLine(answer);
+        const adopted = adoptedLine(answer, home);
         log(`late answer ${answer.relative} of an ended sub-agent delivered`);
         if (adopted) contexts.push(adopted);
         continue;
       }
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
-      const said = deliverOne(session, answer, home, routes);
+      const said = deliverOne(session, answer, home);
       contexts.push(...said);
       // The index the words came from, for the first-line generation sentence.
       const stamp = said.length > 0 && answer.result ? stampOf(answer.result) : null;
