@@ -4086,7 +4086,23 @@ async fn seed_copied_helper() {
 #[tokio::test]
 async fn seed_queue_job_renamed() {
     let _serial = SERIAL.lock().await;
-    manifest_seed_payload("queue-job-renamed").await;
+    let payload = manifest_seed_payload("queue-job-renamed").await;
+    // The model's answers live beside the scanned tree, so the PR's diff holds
+    // the source edit only and the removed send is placed (R2).
+    let row = lost_pairing_row(&payload, "orphaned_endpoint", "PUBSUB", "welcome-mail");
+    assert_eq!(row["service"], "jobs-worker", "{row:#}");
+    assert_eq!(
+        row["sites"],
+        serde_json::json!(["src/mail-worker.ts:9"]),
+        "{row:#}"
+    );
+    assert_eq!(
+        row["removed"],
+        serde_json::json!({"method": "PUBSUB", "path": "welcome-mail", "service": null, "place": "src/mail.ts:10"}),
+        "{row:#}"
+    );
+    assert!(row.get("on_main_unknown").is_none(), "{row:#}");
+    assert_marks(&row, Some(false), Some("candidate"), Some("not_checked"));
 }
 
 #[tokio::test]
