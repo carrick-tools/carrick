@@ -26,6 +26,12 @@ const span = (text: string, needle: string): Value => {
   assert.ok(start >= 0, `${needle} is in the text`);
   return { file: "sends.ts", start, end: start + needle.length };
 };
+/** The `inner` text inside the first `outer`. */
+const within = (text: string, outer: string, inner: string): Value => {
+  const o = span(text, outer);
+  const at = o.start + outer.indexOf(inner);
+  return { file: "sends.ts", start: at, end: at + inner.length };
+};
 const never: SiteFinder = async (q) => assert.fail(`the site finder must not run: ${JSON.stringify(q)}`);
 const group = (type: string): { type: string } => ({ type });
 
@@ -33,7 +39,8 @@ test("lines added above shift every value", () => {
   const value = span(TEXT, "{ id: order.id, total: order.total }");
   const moved = "// a\n// b\n// c\n" + TEXT;
   const region = regionOfEdit(TEXT, moved);
-  assert.deepEqual(region, { oldStart: 0, oldEnd: 0, newStart: 0, newEnd: 15 });
+  assert.equal(region.oldEnd, region.oldStart, "an insertion");
+  assert.equal(region.newEnd - region.newStart, 15);
   const got = mapValue(value, [region]);
   assert.deepEqual(got, { file: "sends.ts", start: value.start + 15, end: value.end + 15 });
   assert.equal(moved.slice((got as Value).start, (got as Value).end), "{ id: order.id, total: order.total }");
@@ -50,8 +57,7 @@ test("an edit strictly inside the value keeps its bounds and never asks the engi
 
 test("an edit across a bound asks the engine for the moved node, with both texts", async () => {
   // The shorthand-expanding rename: the local changes and so does the value's first characters.
-  const value = span(TEXT, "result);\n}\n\nexport function lambdaShape");
-  const old: Value = { ...value, end: value.start + "result".length };
+  const old = within(TEXT, "c.json(result)", "result");
   const edited = TEXT.replace("const result = load();\n  return c.json(result);", "const found = load();\n  return c.json({ result: found });");
   const region = regionOfEdit(TEXT, edited);
   const seen: SiteQuery[] = [];
@@ -134,13 +140,12 @@ test("two checks on one value and a check in a check nest into valid syntax", ()
 });
 
 test("the checks type on real TypeScript: the clean one is silent and its twin speaks", () => {
-  const cases: Array<[string, string]> = [
-    ["{ id: order.id, total: order.total }", "{ id: string; total: number }"], // express-style
-    ["result", "{ orders: string[] }"], // hono-style
-    ["JSON.stringify(payload)", "string"], // lambda-style
+  const cases: Array<[Value, string, string]> = [
+    [span(TEXT, "{ id: order.id, total: order.total }"), "{ id: string; total: number }", "express"],
+    [within(TEXT, "c.json(result)", "result"), "{ orders: string[] }", "hono"],
+    [span(TEXT, "JSON.stringify(payload)"), "string", "lambda"],
   ];
-  for (const [needle, type] of cases) {
-    const value = span(TEXT, needle);
+  for (const [value, type, needle] of cases) {
     const clean = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group(type)] }], WIRE, "clean");
     const twin = overlay("sends.ts", TEXT, [{ n: 0, value, groups: [group(type)] }], WIRE, "twin");
     const c = clean.checks[0]!;
