@@ -47,7 +47,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// One scan of the fixture: its `unread_sites` rows, written
 /// `file:line reason slot export.member` (`-` where the labelled end is
-/// null), and its `calls` rows, written `file:line METHOD path`, both sorted.
+/// null), and its `calls` rows (their `file_path` carries the line), written `file:line METHOD path`, both sorted.
 fn scan(fixture: &str) -> (Vec<String>, Vec<String>) {
     let tmp = tempfile::tempdir().expect("temp dir");
     let repo = tmp.path().join("workspace");
@@ -137,9 +137,8 @@ fn scan(fixture: &str) -> (Vec<String>, Vec<String>) {
                 continue;
             }
             calls.push(format!(
-                "{}:{} {} {}",
+                "{} {} {}",
                 row["file_path"].as_str().unwrap(),
-                row["line_number"],
                 key["method"].as_str().unwrap(),
                 key["path"].as_str().unwrap()
             ));
