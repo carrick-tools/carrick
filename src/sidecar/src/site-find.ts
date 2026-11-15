@@ -1,43 +1,36 @@
 /**
- * `find_site`: the capture's own site finder, asked by a caller that holds
- * a value's expression text and needs its node again (a held check whose
- * bounds an edit crossed). It runs `nodeByExpressionText`, the exact-text
- * match the capture binds a locator with, over the file's syntax: no program
- * is loaded, and the file's text is either the caller's own (an unsaved
- * edit) or the disk's.
+ * `find_site`: the capture's own site finder, asked by a caller that held a
+ * value's span in one text and needs its node in another (a held check whose
+ * bounds an edit crossed). The old span's text is the locator; it runs
+ * `nodeByExpressionText`, the exact-text match the capture binds a locator
+ * with, over the new text's syntax, from the line the old span started on.
+ * No program is loaded and nothing is read from disk: both texts are the
+ * caller's.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import { nodeByExpressionText } from './capture/anchors.js';
-import type { FindSiteResponse } from './types.js';
 
-/** The file a request names, resolved under the repo root; null when it lies outside it. */
-function underRepo(repoRoot: string, file: string): string | null {
-  const resolved = path.resolve(repoRoot, file);
-  const relative = path.relative(repoRoot, resolved);
-  return relative.startsWith('..') || path.isAbsolute(relative) ? null : resolved;
-}
+export type SiteAnswer =
+  | { start: number; end: number }
+  | { reason: 'value_not_a_node' | 'not_wrappable' };
 
-export function findSite(
-  repoRoot: string,
-  request: { file: string; text: string; from_line?: number; file_text?: string }
-): Omit<FindSiteResponse, 'request_id' | 'status'> {
-  const resolved = underRepo(repoRoot, request.file);
-  if (!resolved) throw new Error(`find_site: ${request.file} is outside the repo`);
-  const source = request.file_text ?? fs.readFileSync(resolved, 'utf8');
-  const sourceFile = ts.createSourceFile(resolved, source, ts.ScriptTarget.Latest, true);
-  const node = nodeByExpressionText(sourceFile, request.text, request.from_line);
-  if (!node) return { found: false };
-  const at = (pos: number): number => sourceFile.getLineAndCharacterOfPosition(pos).line + 1;
-  const start = node.getStart(sourceFile);
-  return {
-    found: true,
-    start,
-    end: node.getEnd(),
-    start_line: at(start),
-    end_line: at(node.getEnd()),
-    kind: ts.SyntaxKind[node.kind],
-  };
+export function findSite(request: {
+  file: string;
+  oldText: string;
+  newText: string;
+  start: number;
+  end: number;
+}): SiteAnswer {
+  const wanted = request.oldText.slice(request.start, request.end);
+  const sourceFile = ts.createSourceFile(request.file, request.newText, ts.ScriptTarget.Latest, true);
+  const oldFile = ts.createSourceFile(request.file, request.oldText, ts.ScriptTarget.Latest, true);
+  const fromLine = oldFile.getLineAndCharacterOfPosition(request.start).line + 1;
+  const node = nodeByExpressionText(sourceFile, wanted, fromLine);
+  if (!node || !ts.isExpression(node)) return { reason: 'value_not_a_node' };
+  // A call cannot wrap a spread, or the name a shorthand property is also the value of.
+  if (ts.isSpreadElement(node) || (ts.isIdentifier(node) && node.parent && ts.isShorthandPropertyAssignment(node.parent))) {
+    return { reason: 'not_wrappable' };
+  }
+  return { start: node.getStart(sourceFile), end: node.getEnd() };
 }

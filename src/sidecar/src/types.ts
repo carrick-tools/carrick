@@ -362,17 +362,18 @@ export interface WriteShadowRequest extends BaseRequest {
 }
 
 /**
- * Find again the node a value's expression text names in one file, with the
- * capture's own exact-text finder (see site-find.ts). `file` is relative to
- * the repo root. `file_text` is the file's text when the caller holds one
- * that is not on disk yet; `from_line` skips a match that ends above it.
+ * Find again, in a file's new text, the node the old text's span `[start, end)`
+ * named, with the capture's own exact-text finder (see site-find.ts). `file`
+ * only names the file (its extension picks JavaScript or TypeScript syntax);
+ * both texts are the caller's, so nothing is read from disk.
  */
 export interface FindSiteRequest extends BaseRequest {
   action: 'find_site';
   file: string;
-  text: string;
-  from_line?: number;
-  file_text?: string;
+  oldText: string;
+  newText: string;
+  start: number;
+  end: number;
 }
 
 /**
@@ -1366,16 +1367,16 @@ export interface WriteShadowResponse extends BaseResponse, Partial<ShadowResult>
 }
 
 /**
- * Response for find_site action. `start` and `end` are offsets into the text
- * the finder read (the node's start, trivia excluded); lines are 1-based.
+ * Response for find_site action: the node's new bounds (offsets into
+ * `newText`, `start` excluding leading trivia), or the reason there are none.
+ * `value_not_a_node`: no node's text equals the old span's. `not_wrappable`:
+ * the node is one a call cannot wrap in place (a spread, a shorthand
+ * property's name).
  */
 export interface FindSiteResponse extends BaseResponse {
-  found?: boolean;
   start?: number;
   end?: number;
-  start_line?: number;
-  end_line?: number;
-  kind?: string;
+  reason?: 'value_not_a_node' | 'not_wrappable';
   errors?: string[];
 }
 

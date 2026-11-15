@@ -79,24 +79,29 @@ describe('the wire rule from one writer', () => {
 
   it('(d) the judge\'s three tolerances travel with the wire rule, read from its own code', () => {
     const shadow = writeShadow(FIXTURE, scratch('held-wire-d-'));
-    assert.deepEqual(shadow.tolerances, judgeTolerances());
-    assert.equal(judgeTolerances().unwidened_alias_suffix, unwidenedAliasOf(''));
-    assert.equal(judgeTolerances().void_receiver, voidReceiverDeclaration());
-    assert.equal(judgeTolerances().absent_body.declared, absentBodyRule('S', 'E', false));
-    assert.equal(judgeTolerances().absent_body.by_handler, absentBodyRule('S', 'E', true));
+    assert.deepEqual(shadow.tolerances, judgeTolerances('__carrick_'));
+    const t = judgeTolerances('__carrick_');
+    assert.equal(t.unwidened_alias_suffix, unwidenedAliasOf(''));
+    assert.deepEqual(t.declarations, [
+      voidReceiverDeclaration('__carrick_'),
+      `type __carrick_AbsentBody<S, E> = ${absentBodyRule('S', 'E', false)};`,
+      `type __carrick_AbsentBodyByHandler<S, E> = ${absentBodyRule('S', 'E', true)};`,
+    ]);
   });
 
   it('(d2) absent body: dropped when the receiver admits absence, or its handler tolerates it', () => {
-    const body = (expected: string, tolerant: boolean): string =>
-      `type S = { a: number } | undefined;\ntype E = ${expected};\ntype Out = ${absentBodyRule('S', 'E', tolerant)};\nconst out: E = null as unknown as Out;\n`;
-    assert.deepEqual(tscErrors(body('{ a?: number } | undefined', false)), []);
-    assert.ok(tscErrors(body('{ a?: number }', false)).length > 0, 'a receiver that does not admit absence keeps it');
-    assert.deepEqual(tscErrors(body('{ a?: number }', true)), []);
-    assert.ok(tscErrors(body('{ a: number }', true)).length > 0, 'a required member is no tolerance');
+    const decls = judgeTolerances('__carrick_').declarations.join('\n');
+    const body = (expected: string, alias: string): string =>
+      `${decls}\ntype S = { a: number } | undefined;\ntype E = ${expected};\nconst out: E = null as unknown as ${alias}<S, E>;\n`;
+    assert.deepEqual(tscErrors(body('{ a?: number } | undefined', '__carrick_AbsentBody')), []);
+    assert.ok(tscErrors(body('{ a?: number }', '__carrick_AbsentBody')).length > 0, 'a receiver that does not admit absence keeps it');
+    assert.deepEqual(tscErrors(body('{ a?: number }', '__carrick_AbsentBodyByHandler')), []);
+    assert.ok(tscErrors(body('{ a: number }', '__carrick_AbsentBodyByHandler')).length > 0, 'a required member is no tolerance');
   });
 
   it('(d3) void receiver: void is read, any and a shape are not', () => {
-    const src = (t: string): string => `${voidReceiverDeclaration()}\nconst x: IsVoid<${t}> = true;\n`;
+    const decls = judgeTolerances('__carrick_').declarations.join('\n');
+    const src = (t: string): string => `${decls}\nconst x: __carrick_IsVoid<${t}> = true;\n`;
     assert.deepEqual(tscErrors(src('void')), []);
     assert.ok(tscErrors(src('any')).length > 0);
     assert.ok(tscErrors(src('{ a: 1 }')).length > 0);
@@ -107,35 +112,35 @@ describe('find_site (the scan\'s own site finder, through the engine)', () => {
   const repo = scratch('held-wire-site-');
   fs.mkdirSync(path.join(repo, 'src'));
   fs.writeFileSync(path.join(repo, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ['src'] }));
-  const text = 'export const a = 1;\nexport function f() {\n  return { ok:   true,\n    n: 2 };\n}\n';
-  fs.writeFileSync(path.join(repo, 'src', 'a.ts'), text);
+  const ask = (q: Record<string, unknown>): Record<string, unknown> =>
+    actions(repo, [{ action: 'find_site', request_id: 'f', file: 'src/a.ts', ...q }]).find((x) => x.request_id === 'f') as Record<string, unknown>;
+  const oldText = 'export const a = 1;\nexport function f() {\n  return { ok:   true,\n    n: 2 };\n}\n';
+  const span = (text: string, of: string): { start: number; end: number } => ({ start: text.indexOf(of), end: text.indexOf(of) + of.length });
 
-  it('(e) finds the exact-text node: offsets, lines, kind', () => {
-    const answers = actions(repo, [{ action: 'find_site', request_id: 'f', file: 'src/a.ts', text: '{ ok: true, n: 2 }' }]);
-    const a = answers.find((x) => x.request_id === 'f') as Record<string, unknown>;
+  it('(e) finds the node the old span named, in the new text', () => {
+    const newText = '// a line\n' + oldText.replace('ok:   true', 'ok: true');
+    const a = ask({ oldText, newText, ...span(oldText, '{ ok:   true,\n    n: 2 }') });
     assert.equal(a.status, 'success', JSON.stringify(a));
-    const start = text.indexOf('{ ok');
-    assert.deepEqual([a.found, a.start, a.end, a.start_line, a.end_line, a.kind], [true, start, text.indexOf('};', start) + 1, 3, 4, 'ObjectLiteralExpression']);
+    const start = newText.indexOf('{ ok');
+    assert.deepEqual([a.start, a.end, a.reason], [start, newText.indexOf('};', start) + 1, undefined]);
   });
 
-  it('(f) reads the text the caller sends instead of the disk, and says not found for no exact match', () => {
-    const edited = text.replace('a = 1', 'a = 11');
-    const hit = actions(repo, [{ action: 'find_site', request_id: 'f', file: 'src/a.ts', text: '11', file_text: edited }]).find((x) => x.request_id === 'f') as Record<string, unknown>;
-    assert.equal(hit.found, true);
-    assert.equal(hit.start, edited.indexOf('11'));
-    const miss = actions(repo, [{ action: 'find_site', request_id: 'f', file: 'src/a.ts', text: 'no such expression' }]).find((x) => x.request_id === 'f') as Record<string, unknown>;
-    assert.equal(miss.status, 'success');
-    assert.equal(miss.found, false);
+  it('(f) says value_not_a_node when no node has the old span\'s text, or only a property does', () => {
+    assert.equal(ask({ oldText, newText: 'export const q = 2;\n', ...span(oldText, '{ ok:   true,\n    n: 2 }') }).reason, 'value_not_a_node');
+    const prop = 'const o = { k: 1 };\n';
+    assert.equal(ask({ oldText: prop, newText: prop, ...span(prop, 'k: 1') }).reason, 'value_not_a_node');
   });
 
-  it('(g) from_line skips a match that ends above it', () => {
-    const two = 'const k = foo(1);\nconst m = foo(1);\n';
-    const a = actions(repo, [{ action: 'find_site', request_id: 'f', file: 'src/b.ts', text: 'foo(1)', from_line: 2, file_text: two }]).find((x) => x.request_id === 'f') as Record<string, unknown>;
-    assert.equal(a.start_line, 2);
+  it('(g) the match at or below the old span\'s line wins over one above it', () => {
+    const t = 'const k = foo(1);\nconst m = foo(1);\n';
+    const a = ask({ oldText: t, newText: t, ...span(t.slice(18), 'foo(1)'), start: 18 + t.slice(18).indexOf('foo(1)'), end: 18 + t.slice(18).indexOf('foo(1)') + 6 });
+    assert.equal(a.start, t.lastIndexOf('foo(1)'));
   });
 
-  it('(h) refuses a file outside the scanned repo', () => {
-    const a = actions(repo, [{ action: 'find_site', request_id: 'f', file: '../outside.ts', text: 'x', file_text: 'x' }]).find((x) => x.request_id === 'f') as Record<string, unknown>;
-    assert.equal(a.status, 'error');
+  it('(h) says not_wrappable for a spread and a shorthand property\'s name', () => {
+    const sp = 'const a = [...xs];\n';
+    assert.equal(ask({ oldText: sp, newText: sp, ...span(sp, '...xs') }).reason, 'not_wrappable');
+    const sh = 'const o = { xs };\n';
+    assert.equal(ask({ oldText: sh, newText: sh, ...span(sh, 'xs') }).reason, 'not_wrappable');
   });
 });

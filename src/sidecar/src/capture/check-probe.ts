@@ -245,10 +245,10 @@ export function jsonWireRule(sent: string, expected: string, prefix: string): st
  * The receiver-declared-void gate's helper: `void` or `undefined` is what a
  * call site that reads no body types its response as, and states no contract
  * (carrick#1162). `any` is excluded first, so an `any` side keeps its own
- * top-type reason.
+ * top-type reason. `prefix` namespaces the name, as for `jsonWireDeclarations`.
  */
-export function voidReceiverDeclaration(): string {
-  return `type IsVoid<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [void] ? true : false;`;
+export function voidReceiverDeclaration(prefix: string): string {
+  return `type ${prefix}IsVoid<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [void] ? true : false;`;
 }
 
 /**
@@ -267,26 +267,28 @@ export function absentBodyRule(sent: string, expected: string, toleratesAbsence:
 
 /**
  * The judge's three tolerances, as the texts the probe is built from: the
- * literal-widened reading (the export suffix a stub ships its unwidened
- * response under, `unwidenedAliasOf`), the absent body (`absentBodyRule`,
- * with and without the handler's mark) and the void receiver. A caller that
- * checks a value against a declared type reads them from here, never from a
- * copy.
+ * literal-widened reading (`unwidened_alias_suffix`, the export suffix a stub
+ * ships its unwidened response under, `unwidenedAliasOf`), and the other two
+ * as declarations to append beside `jsonWireDeclarations` (same `prefix`):
+ * `<p>IsVoid<T>` (a receiver declared void), `<p>AbsentBody<S, E>` (the absent
+ * body dropped when the receiver admits absence) and `<p>AbsentBodyByHandler<S,
+ * E>` (the same when the receiver's handler is marked to tolerate it). A
+ * caller that checks a value against a declared type reads them from here,
+ * never from a copy.
  */
 export interface JudgeTolerances {
   unwidened_alias_suffix: string;
-  void_receiver: string;
-  absent_body: { declared: string; by_handler: string };
+  declarations: string[];
 }
 
-export function judgeTolerances(): JudgeTolerances {
+export function judgeTolerances(prefix: string): JudgeTolerances {
   return {
     unwidened_alias_suffix: unwidenedAliasOf(''),
-    void_receiver: voidReceiverDeclaration(),
-    absent_body: {
-      declared: absentBodyRule('S', 'E', false),
-      by_handler: absentBodyRule('S', 'E', true),
-    },
+    declarations: [
+      voidReceiverDeclaration(prefix),
+      `type ${prefix}AbsentBody<S, E> = ${absentBodyRule('S', 'E', false)};`,
+      `type ${prefix}AbsentBodyByHandler<S, E> = ${absentBodyRule('S', 'E', true)};`,
+    ],
   };
 }
 
@@ -359,7 +361,7 @@ export function buildProbe(
   // contract, so no counterparty shape can be judged against it.
   // `any` is excluded first: `[any] extends [void]` holds, and an `any` side
   // must keep its own top-type reason, never read as "reads no body".
-  push(voidReceiverDeclaration());
+  push(voidReceiverDeclaration(''));
   gateLines.set(push(`type _G_sent_void = Assert<Not<IsVoid<Sent>>>;`), 'sent:void');
   gateLines.set(push(`type _G_expected_void = Assert<Not<IsVoid<Expected>>>;`), 'expected:void');
   // carrick#1162: a form-encoded request body (the platform `FormData` or

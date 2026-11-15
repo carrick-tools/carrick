@@ -54,7 +54,7 @@ export interface ShadowResult {
    * scan's judge answer "what travels" the same way.
    */
   wire: string[];
-  /** The judge's three tolerances, read from its own code (`judgeTolerances`). */
+  /** The judge's three tolerances, read from its own code (`judgeTolerances('__carrick_')`): declarations to append beside `wire`. */
   tolerances: JudgeTolerances;
   /** The native TypeScript 7 executable, or null when only TypeScript 6's tsc is installed. */
   native_tsc: string | null;
@@ -259,7 +259,7 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     path_conflicts: pathConflicts,
     bare_specifiers: Object.keys(paths).sort(),
     wire: heldWire(),
-    tolerances: judgeTolerances(),
+    tolerances: judgeTolerances('__carrick_'),
     native_tsc: nativeTscPath(),
   };
 }

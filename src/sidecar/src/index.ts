@@ -956,13 +956,12 @@ function handleWriteShadow(request: SidecarRequest & { action: 'write_shadow' })
 }
 
 /**
- * Handle the 'find_site' action: the capture's own site finder over one file's
- * syntax (site-find.ts). Reads no program.
+ * Handle the 'find_site' action: the capture's own site finder over the
+ * caller's two texts (site-find.ts). Reads no program and no disk.
  */
 function handleFindSite(request: SidecarRequest & { action: 'find_site' }): FindSiteResponse {
   try {
-    const answer = findSite(initializedLoader().getRepoRoot(), request);
-    return { request_id: request.request_id, status: 'success', ...answer };
+    return { request_id: request.request_id, status: 'success', ...findSite(request) };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     logError(`Finding the site failed: ${error}`);
