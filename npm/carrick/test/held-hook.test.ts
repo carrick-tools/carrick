@@ -191,7 +191,7 @@ test("rows 5 and 9: cold and none print part 1 only and name the state in the ti
   }
 });
 
-test("row 6: an answer after the wait is dropped, the hook is not held past it, and the state is late", async (t) => {
+test("row 6: an answer after the wait is not printed by this hook, the hook is not held past it (50 ms), and the state is late; the daemon files it for the next hook (held-late.test.ts)", async (t) => {
   const ws = await workspace(t);
   const daemon = await fakeDaemon(ws, ready([broken()]), 2500);
   t.after(() => daemon.close());
@@ -202,7 +202,7 @@ test("row 6: an answer after the wait is dropped, the hook is not held past it, 
   assert.ok(out.ms < 2300, `the hook took ${out.ms} ms`);
   const row = readTimings(ws.root).at(-1);
   assert.equal(row?.held_state, "late");
-  assert.ok((row?.held_ms ?? 0) >= 900, String(row?.held_ms));
+  assert.ok((row?.held_ms ?? 0) >= 40 && (row?.held_ms ?? 0) < 900, String(row?.held_ms));
 });
 
 test("no daemon at all: part 1 prints and the state is unavailable", async (t) => {

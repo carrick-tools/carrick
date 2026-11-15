@@ -10,13 +10,13 @@
 import { resolveChannel } from "../channel.ts";
 import { problemItems } from "../contract.ts";
 import type { CheckItem } from "../contract.ts";
-import { parseHeldClaim } from "../held/line.ts";
+import { parseHeldClaim, unsaidHeld } from "../held/line.ts";
 import type { HeldRoute } from "../held/line.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, isChanged, owedFor } from "./rechecks.ts";
+import { claimDelivery, isChanged, isHeld, owedFor } from "./rechecks.ts";
 import type { Answer } from "./rechecks.ts";
-import { heldClaimsSince, markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
+import { factsSaid, heldClaimsSince, markFacts, markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
 
@@ -70,6 +70,24 @@ export function deliverOne(session: string, answer: Answer, home?: string, heldN
   contexts.push(context);
   if (key !== null && uses && answer.result?.uses_lines?.length) markTold(session, [key], home);
   return contexts;
+}
+
+/**
+ * What a carrier prints for a finished held-compiler answer (part 3, T9): its
+ * breaks not said in this session, with each claim taken as T6's in-hand line
+ * takes it, so a break is said once whichever carrier prints it. `routes` are
+ * the routes named, for part 2's dedup of the answers printed with it
+ * (`withoutHeldProblems`).
+ */
+export function deliverHeld(session: string, answer: Answer, home?: string, now: number = Date.now()): { contexts: string[]; routes: HeldRoute[] } {
+  const found = answer.held;
+  if (!found || found.state !== "ready") return { contexts: [], routes: [] };
+  const said = unsaidHeld(found.lines, factsSaid(session, home));
+  const claims: Record<string, { at: number; named: string[] }> = {};
+  for (const { line, rendered } of said) claims[rendered.claim] = { at: now, named: [line.file] };
+  markFacts(session, claims, home);
+  const routes = said.map(({ rendered }) => parseHeldClaim(rendered.claim)).filter((r): r is HeldRoute => r !== null);
+  return { contexts: said.map(({ rendered }) => rendered.text), routes };
 }
 
 /** The label a problem item has as a contract row: `METHOD path{ dispatch}`. */
@@ -154,12 +172,28 @@ export function changedLine(session: string, answer: Answer, home?: string): str
  * Claim and render every finished answer this session has not been given.
  * Returns the contexts to print, oldest first. Nothing here throws.
  */
-export function deliverLate(session: string | undefined, now: number = Date.now(), heldNow: readonly HeldRoute[] = []): string[] {
+export function deliverLate(
+  session: string | undefined,
+  now: number = Date.now(),
+  heldNow: readonly HeldRoute[] = [],
+  home?: string,
+): string[] {
   if (!session) return [];
   const contexts: string[] = [];
   try {
-    for (const { owner, answer } of owedFor(session)) {
-      if (!claimDelivery(owner, answer.seq, undefined, now)) continue;
+    // The held compiler's verdicts first, so part 2's problem for a route one
+    // of them named is not said again beside it.
+    const owed = owedFor(session, home);
+    const routes = [...heldNow];
+    for (const { owner, answer } of owed.filter((o) => isHeld(o.answer))) {
+      if (!claimDelivery(owner, answer.seq, home, now)) continue;
+      const delivered = deliverHeld(session, answer, home, now);
+      log(`held verdict ${answer.relative} delivered ${Math.round((now - Date.parse(answer.enqueued_at)) / 1000)} s after the edit`);
+      contexts.push(...delivered.contexts);
+      routes.push(...delivered.routes);
+    }
+    for (const { owner, answer } of owed.filter((o) => !isHeld(o.answer))) {
+      if (!claimDelivery(owner, answer.seq, home, now)) continue;
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       if (owner !== session) {
         const adopted = adoptedLine(answer);
@@ -169,7 +203,7 @@ export function deliverLate(session: string | undefined, now: number = Date.now(
       }
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
-      contexts.push(...deliverOne(session, answer, undefined, heldNow));
+      contexts.push(...deliverOne(session, answer, home, routes));
     }
   } catch (error) {
     log("late delivery failed", String(error));

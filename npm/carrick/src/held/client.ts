@@ -6,14 +6,13 @@ import net from "node:net";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
 import { lockHeld, readJson, releaseLock, takeLock, type Lock } from "../hook/lock.ts";
+import { probeTimeoutMs } from "../hook/probe.ts";
 import { scriptBeside, startDetached } from "../hook/refresh.ts";
 import type { HeldAnswer, HeldRequest } from "./daemon.ts";
 import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
 
-/** D10: the longest a hook waits for the daemon. */
-export const HELD_WAIT_MS = 1000;
 
 export type EnsureOptions = {
   env?: NodeJS.ProcessEnv;
@@ -55,6 +54,8 @@ export type AskOptions = {
   kind: "read" | "edit";
   editedAt?: number;
   waitMs?: number;
+  /** The session's queue entry for this ask (`enqueueHeld`): the daemon files its answer under it. */
+  seq?: string;
 };
 
 /**
@@ -70,13 +71,17 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
   const started = Date.now();
   const env = options.env ?? process.env;
   if (!compilerLinesEnabled(env)) return Promise.resolve(none("off", started));
-  const waitMs = options.waitMs ?? HELD_WAIT_MS;
+  // The same budget as part 2's probe (`probeTimeoutMs`), run beside it: an
+  // answer ready within it prints in this action; a slower one is filed by the
+  // daemon where part 2's late answers land (`hook/late.ts`).
+  const waitMs = options.waitMs ?? probeTimeoutMs();
   const request: HeldRequest = {
     session: options.session,
     files,
     kind: options.kind,
     wait_ms: waitMs,
     ...(options.editedAt === undefined ? {} : { edited_at: options.editedAt }),
+    ...(options.seq === undefined ? {} : { seq: options.seq }),
   };
   return new Promise((resolve) => {
     let buffer = "";
@@ -85,12 +90,15 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      conn.destroy();
+      // An ask the daemon files an answer for is let go gracefully: the
+      // request is already written, and the daemon works on without us.
+      if (options.seq === undefined) conn.destroy();
+      else conn.end();
       resolve(answer);
     };
     const conn = net.createConnection(socketPath(root, options.home));
     const timer = setTimeout(() => finish(none("late", started)), waitMs);
-    conn.on("connect", () => conn.write(`${JSON.stringify(request)}\n`));
+    conn.write(`${JSON.stringify(request)}\n`);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       const end = buffer.indexOf("\n");
