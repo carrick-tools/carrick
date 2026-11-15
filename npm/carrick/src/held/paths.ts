@@ -47,3 +47,8 @@ export function placedPath(root: string, service: string, home?: string): string
 export function logPath(root: string, home?: string): string {
   return path.join(heldDir(home), `${rootKey(root)}.log`);
 }
+
+/** One `<unix seconds> <build id>` line per daemon crash (the back-off reads it). */
+export function crashesPath(root: string, home?: string): string {
+  return path.join(heldDir(home), `${rootKey(root)}.crashes`);
+}
