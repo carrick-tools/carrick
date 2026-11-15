@@ -155,6 +155,10 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
         ("s-closure-param.ts:7", "/p/s-closure-param"),
         ("s-closure-param-key.ts:7", "/p/s-closure-param-key"),
         ("s-two-level.ts:17", "/p/s-two-level"),
+        // A function the factory declares below its `return` is hoisted, and
+        // a cast on the returned name does not hide it (carrick#4555).
+        ("s-closure-hoisted.ts:7", "/p/s-closure-hoisted"),
+        ("s-closure-cast.ts:7", "/p/s-closure-cast"),
     ] {
         let found = rows
             .iter()
@@ -177,6 +181,23 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
         .any(|lead| lead.ends_with("src/t-real.ts:26 injected_callee"))
     {
         wrong.push("t-real.ts:26 is still an injected callee".to_string());
+    }
+    // A parameter of a nested callback shadows the factory's function by
+    // name, so the body declares the name twice and nothing here says which
+    // one `return request` means: the send at line 4 is a possible call with
+    // its reason, and the caller at line 8 states no row
+    // (carrick#4609; one answerer for a body function's value).
+    if rows
+        .iter()
+        .any(|row| row.contains("src/s-closure-shadowed.ts:8 POST"))
+    {
+        wrong.push("s-closure-shadowed.ts:8 states a row".to_string());
+    }
+    if !leads
+        .iter()
+        .any(|lead| lead.ends_with("src/s-closure-shadowed.ts:4 callback_parameter"))
+    {
+        wrong.push("no callback_parameter possible call at s-closure-shadowed.ts:4".to_string());
     }
     // The maker call fills `send` with a function that sends nothing.
     if rows
