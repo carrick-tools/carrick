@@ -9236,9 +9236,9 @@ impl FileOrchestrator {
                 continue;
             };
             for call in &mut result.data_calls {
-                let Some((start, rows)) = call
+                let Some(rows) = call
                     .call_expression_span_start
-                    .and_then(|start| sites.get(&start).map(|rows| (start, rows)))
+                    .and_then(|start| sites.get(&start))
                 else {
                     continue;
                 };
