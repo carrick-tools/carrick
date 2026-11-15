@@ -2067,6 +2067,7 @@ fn a_module_callers_fact_withdraws_the_reader_row_at_the_request_line() {
         "{:?}",
         data.calls
     );
+    assert!(fold.held_kept.is_empty());
     let key = OperationKey::http("POST", "/v1/:endpoint");
     assert!(
         fold.withdrawn
@@ -2112,6 +2113,24 @@ fn a_module_caller_whose_fact_is_kept_out_keeps_the_request_line() {
     );
     assert_eq!(at_site(&calls, HELD_LINE).len(), 1);
     assert!(fold.stated_at_fact_callers.is_empty());
+    assert_eq!(
+        fold.held_kept,
+        BTreeMap::from([("call_without_fact".to_string(), 1)])
+    );
+}
+
+/// The module-level call's fact stands but no reader row sits at the
+/// request line (the blob dropped it): nothing to withdraw, and the fold
+/// says that is why the line was kept.
+#[test]
+fn a_request_line_with_no_reader_row_is_counted() {
+    let mut data = blob_with_graph(Vec::new(), Vec::new());
+    let fold = fold_into(&mut data, &module_held());
+    assert!(fold.stated_at_fact_callers.is_empty());
+    assert_eq!(
+        fold.held_kept,
+        BTreeMap::from([("no_reader".to_string(), 1)])
+    );
 }
 
 /// Two reader rows at the request line: no one of them is the request's,
@@ -2137,6 +2156,10 @@ fn two_reader_rows_at_the_request_line_keep_it() {
     );
     assert_eq!(at_site(&calls, HELD_LINE).len(), 2);
     assert!(fold.stated_at_fact_callers.is_empty());
+    assert_eq!(
+        fold.held_kept,
+        BTreeMap::from([("several_readers".to_string(), 1)])
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1425,6 +1425,12 @@ pub struct SiteFold {
     /// engine drops the model's row there from the file results and moves
     /// its request type to the callers.
     pub stated_at_fact_callers: Vec<(String, u32)>,
+    /// The request lines ([`SiteRows::held_open`]) the held-open step kept,
+    /// by why: `call_without_fact` (a call holds no single fact row this
+    /// fold stated: a lead, a row kept out, a second row), `no_reader` (no
+    /// reader row at the line: the blob dropped it or another step
+    /// withdrew it), `several_readers`. Log-only (carrick#4374).
+    pub held_kept: std::collections::BTreeMap<String, usize>,
     /// Fact site rows kept out of their site by a row already there, by the
     /// resolution source of the row that kept it (`socket_call`,
     /// `event_bus`, `library_claim`, ...). The measure of how much a frozen
