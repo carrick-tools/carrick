@@ -1110,6 +1110,40 @@ fn a_route_path_over_a_nested_template_constant_keeps_its_row() {
             .any(|count| count.ends_with(" routes_guessed_withdrawn=1")),
         "{counts:#?}"
     );
+    // The constant is built on a runtime call, so the lead at its line says
+    // so: its declaring package is a service of the run, read as a sibling
+    // (carrick#4444), no longer a file outside every service.
+    let unread = unread_reasons(&on);
+    assert_eq!(
+        unread
+            .get("packages/server/src/main.ts:11")
+            .map(String::as_str),
+        Some("unread_expression"),
+        "{unread:#?}"
+    );
+    let slots: Vec<String> = on
+        .values()
+        .flat_map(|text| {
+            let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+            blob["possible_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter(|call| {
+            call["file_path"] == "packages/server/src/main.ts" && call["line_number"] == 11
+        })
+        .map(|call| {
+            call["unread"]["slot"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !slots.is_empty() && slots.iter().all(|slot| slot == "path"),
+        "{slots:?}"
+    );
 }
 
 /// carrick#3207: the same tree as the types-only package's, with the host

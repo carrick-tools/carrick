@@ -710,6 +710,18 @@ impl PositionIndex {
             .filter(|row| row.kind() == Kind::Call)
     }
 
+    /// Every `ident` row of every file, in no fixed order: the declarations
+    /// the code reads as a value (an enum, a constant, an object). A read of
+    /// one may enter the files that declare it, so the sibling set takes the
+    /// services holding them (carrick#4444). `member` rows are left out: they
+    /// also name interface members, which would reach a package of types.
+    pub fn value_reads(&self) -> impl Iterator<Item = &Row> {
+        self.files
+            .values()
+            .flat_map(|file| file.rows.values())
+            .filter(|row| row.kind() == Kind::Ident)
+    }
+
     /// Every `member` row of every file, in no fixed order: the members the
     /// code reads, called or held as a value (carrick#3504 S4a).
     pub fn member_rows(&self) -> impl Iterator<Item = &Row> {

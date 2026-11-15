@@ -7,8 +7,9 @@
 //! Services are analysed side by side on threads of their own, so a sibling's
 //! facts are read once per run, from its own walk, and shared:
 //!
-//! - **Reached siblings only.** The services whose files some call of this one
-//!   is declared in, and transitively those they reach in turn. A service that
+//! - **Reached siblings only.** The services whose files some call of this one,
+//!   or some value it reads (an enum, a constant), is declared in, and
+//!   transitively those they reach in turn. A service that
 //!   calls into no other is read alone, as before.
 //! - **Built on first need,** by the first service that reaches it, with the
 //!   same discovery a service's own analysis runs, quietly ([`Read::Sibling`]):
@@ -167,12 +168,15 @@ impl SiblingRegistry {
         reads
     }
 
-    /// The declared services whose files the calls the rows `positions` hold
-    /// are declared in.
+    /// The declared services whose files the calls and the value reads the
+    /// rows `positions` hold are declared in (carrick#4444). The reach
+    /// ([`RequestSummaryInputs::outside_declarations`]) takes the same value
+    /// reads, so this set holds every service a read may enter.
     fn declared_in(&self, positions: &crate::position_rows::PositionIndex) -> BTreeSet<usize> {
         let owners = self.owners();
         positions
             .call_rows()
+            .chain(positions.value_reads())
             .filter_map(|row| row.decl_file())
             .filter(|file| !file.starts_with("lib:") && !file.starts_with("pkg:"))
             .collect::<BTreeSet<&str>>()
@@ -337,5 +341,72 @@ mod tests {
         shared::<Sibling>();
         shared::<SiblingRegistry>();
         shared::<Siblings>();
+    }
+
+    /// carrick#4444: a service that reads a value (an enum member, a
+    /// constant) another declared service holds, and calls nothing in it,
+    /// still reads that service's walk, so the analysis waits for it. The
+    /// binary fixture passes on timing with the gate left to calls alone,
+    /// so this is the test that holds the gate.
+    #[test]
+    fn a_value_read_in_another_service_is_a_walk_the_read_waits_for() {
+        use crate::position_rows::{
+            FORMAT_VERSION, FileRows, Header, Kind, PositionIndex, Row, RowsFile, content_hash,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let text = "export const topic = Topic.Alpha;\n";
+        for (service, file) in [("a", "x.ts"), ("b", "y.ts")] {
+            std::fs::create_dir_all(root.join(service)).unwrap();
+            std::fs::write(root.join(service).join(file), text).unwrap();
+        }
+        let services: Vec<Config> = ["a", "b"]
+            .iter()
+            .map(|name| Config {
+                service_name: Some((*name).to_string()),
+                directory: Some((*name).to_string()),
+                ..Config::default()
+            })
+            .collect();
+        // One `ident` row in `a/x.ts` declared in `b/y.ts`, and no call row.
+        let ident = Row(
+            Kind::Ident,
+            23,
+            33,
+            Some("Alpha".to_string()),
+            Some("b/y.ts".to_string()),
+            Some(1),
+            None,
+            Some("Topic".to_string()),
+            0,
+        );
+        let index = PositionIndex::of(
+            &root,
+            RowsFile {
+                header: Header {
+                    v: FORMAT_VERSION,
+                    typescript: "6.0.2".to_string(),
+                    service: "a".to_string(),
+                    files: 1,
+                },
+                files: vec![FileRows {
+                    f: "a/x.ts".to_string(),
+                    h: Some(content_hash(text.as_bytes())),
+                    skip: None,
+                    r: vec![ident],
+                }],
+            },
+        );
+        let registry = SiblingRegistry::new(
+            root.to_str().unwrap(),
+            &services,
+            vec![Some(0), Some(1)],
+            None,
+        );
+        assert_eq!(
+            registry.walks_read_by(0, &index),
+            BTreeSet::from([1]),
+            "the service that declares the value is a walk the read waits for"
+        );
     }
 }
