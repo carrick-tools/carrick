@@ -76,7 +76,7 @@ use crate::operation::{OperationKey, SocketDirection};
 use crate::possible_calls::PossibleCall;
 use crate::request_summary::Stop;
 use crate::request_summary::decided_sites::{
-    Decided, DecidedSite, SiteLabel, Through, origin_side,
+    Decided, DecidedSite, LabelledEnd, SiteLabel, Through, origin_side,
 };
 use crate::request_summary::site_record::{AnchorAt, Basis, Bucket, SiteRecord, TypeAnchors};
 use crate::site_questions::{Answered, SiteAnswers, SiteQuestion, Slot, SlotAnswer, SlotValue};
@@ -249,27 +249,32 @@ pub struct SiteRows {
     /// The resolver's pieces read of each labelled call's name slot beside
     /// the site path's own (carrick#3504 B10-2a2). Log-only: no row reads it.
     pub dry_run_names: crate::name_census::DryRunNames,
-    /// The request lines whose callers the summaries read, save direct calls
-    /// made where a module is loaded, each of which the site pass decided to
-    /// that request (carrick#4121). The fold withdraws the request line's
-    /// reader row where a fact row stands at every one of those calls.
+    /// The request lines whose every deciding call the summaries or the site
+    /// pass named: the lines whose callers the summaries read, save direct
+    /// calls made where a module is loaded, each of which the site pass
+    /// decided to that request (carrick#4121); and the labelled calls whose
+    /// every deciding call only makes the function that sends
+    /// ([`held_at_maker_sites`], carrick#4319). The fold withdraws the
+    /// request line's reader row where a fact row stands at every one of
+    /// those calls.
     pub held_open: Vec<HeldOpen>,
     /// The sites a scope check the trace's ask got no answer for could
     /// have decided ([`Decided::scopes_unanswered`], carrick#4155).
     pub scopes_unanswered: std::collections::BTreeSet<(String, u32, u32)>,
 }
 
-/// A request line held open by functions called directly where a module is
-/// loaded (carrick#4121, [`SiteRows::held_open`]).
+/// A request line whose every deciding call the summaries or the site pass
+/// named ([`SiteRows::held_open`]): functions called directly where a module
+/// is loaded (carrick#4121), or makers of the function that sends
+/// (carrick#4319).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldOpen {
     /// Repo-relative, `/`-separated.
     pub file: String,
     pub line: u32,
     pub span_start: u32,
-    /// The calls the summaries state no row for, by repo-relative file and
-    /// line: each holds exactly one decided HTTP site, which ends at this
-    /// request.
+    /// The deciding calls, by repo-relative file and line: each holds
+    /// exactly one decided HTTP site, which ends at this request.
     pub fact_calls: Vec<(String, u32)>,
 }
 
@@ -1045,6 +1050,94 @@ pub fn key_requests_canonically(
         }
     }
     rows.rows = kept;
+}
+
+/// The labelled HTTP requests whose every deciding call only makes the
+/// function that sends (carrick#4319 T2): each such call states the request
+/// as a fact row and reads its response at the labelled call
+/// ([`DecidedSite::makes_end`], T1), so the model's row at the labelled call
+/// is the same request stated again. The fold's held-open block
+/// ([`SiteRows::held_open`]) withdraws it where each call's fact row stands.
+///
+/// Fails closed, per request, on any of:
+/// - (a) a deciding call that runs the send rather than only making it;
+/// - (b) a lead or a stop at the request: a caller this pass left open;
+/// - (c) a function on a chain also handed on as a value, which may send
+///   the request with no labelled end read ([`DecidedSite::chain_handed_on`]);
+/// - (d) a request the summaries state rows for (`summarized`, by file and
+///   span start): they own its rows;
+/// - (e) a deciding call whose own name is not a bare path: its row gets no
+///   manifest pair, so the model's row holds the only type;
+/// - a deciding call that does not hold exactly one decided HTTP site on its
+///   line, as [`SiteRows::held_open`]'s other producer requires: the fold
+///   reads each call's fact row by its line.
+pub fn held_at_maker_sites(
+    decided: &Decided,
+    summarized: impl Fn(&str, u32) -> bool,
+) -> Vec<HeldOpen> {
+    let mut ends: BTreeMap<(String, u32), (u32, Vec<&DecidedSite>)> = BTreeMap::new();
+    for site in &decided.sites {
+        if site.end.role == "http_client" {
+            ends.entry((site.end.file.clone(), site.end.span_start))
+                .or_insert_with(|| (site.end.line, Vec::new()))
+                .1
+                .push(site);
+        }
+    }
+    let names = |file: &str, span_start: u32, end: &LabelledEnd| {
+        end.file == file && end.span_start == span_start
+    };
+    // The own paths a site's row is keyed by: its name, or the way each
+    // composed path joins (as `of` reads them).
+    let bare = |site: &DecidedSite| {
+        let name = site.name_text();
+        name.as_deref().is_some_and(|name| name.starts_with('/'))
+            && site.composed.iter().all(|composed| {
+                composed
+                    .own
+                    .as_deref()
+                    .or(name.as_deref())
+                    .is_some_and(|own| own.starts_with('/'))
+            })
+    };
+    // The fold finds a call's fact row by its line: a second HTTP site there
+    // (another request, a lead-bucket record) could stand in for this one.
+    let alone_on_its_line = |site: &DecidedSite| {
+        decided
+            .sites
+            .iter()
+            .filter(|other| {
+                other.end.role == "http_client"
+                    && other.file == site.file
+                    && other.line == site.line
+            })
+            .count()
+            == 1
+    };
+    ends.into_iter()
+        .filter(|((file, span_start), (_, sites))| {
+            sites.iter().all(|site| {
+                site.makes_end && !site.chain_handed_on && bare(site) && alone_on_its_line(site)
+            }) && !decided
+                .leads
+                .iter()
+                .any(|lead| names(file, *span_start, &lead.end))
+                && !decided
+                    .stops
+                    .iter()
+                    .any(|stop| names(file, *span_start, &stop.end))
+                && !summarized(file, *span_start)
+        })
+        .map(|((file, span_start), (line, sites))| HeldOpen {
+            file,
+            line,
+            span_start,
+            fact_calls: sites
+                .iter()
+                .map(|site| (site.file.clone(), site.line))
+                .collect(),
+        })
+        .collect()
 }
 
 /// The rows and possible calls a service's records come to, read with the
