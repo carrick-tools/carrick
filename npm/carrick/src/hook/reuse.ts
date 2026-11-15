@@ -352,6 +352,13 @@ export function factsSaid(sessionId: string, home?: string): Set<string> {
   return new Set(Object.keys(readSession(sessionId, home).facts));
 }
 
+/** The held compiler's claims this session made at or after `since` (epoch ms). */
+export function heldClaimsSince(sessionId: string, since: number, home?: string): string[] {
+  return Object.entries(readSession(sessionId, home).facts)
+    .filter(([key, claim]) => key.startsWith("held::") && claim.at >= since)
+    .map(([key]) => key);
+}
+
 /** Remember that this session has been given the fact lines under `claims`. */
 export function markFacts(sessionId: string, claims: Record<string, { at: number; named: string[] }>, home?: string): void {
   if (Object.keys(claims).length === 0) return;

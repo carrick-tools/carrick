@@ -27,7 +27,9 @@ import type { FactEdit, FactOutcome } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
 import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
 import { askHeld } from "../held/client.ts";
-import { renderHeldLine } from "../held/line.ts";
+import { parseHeldClaim, renderHeldLine } from "../held/line.ts";
+import type { HeldRoute, RenderedHeld } from "../held/line.ts";
+import type { HeldLine } from "../held/daemon.ts";
 
 const log = createLogger("carrick-hook");
 /** D13: at most this many compiler lines in one action. */
@@ -229,7 +231,9 @@ export async function editFlow(
   }
   // Delivered after this edit is queued, so an older answer for a file this
   // edit queues again is skipped (the newer entry carries it).
-  const late = channel.channel === "hook" ? deliverLate(session) : [];
+  // A late problem for a route this action's held line names is not said twice.
+  const heldNow = heldToSay(held, session).map(({ rendered }) => parseHeldClaim(rendered.claim)).filter((r): r is HeldRoute => r !== null);
+  const late = channel.channel === "hook" ? deliverLate(session, Date.now(), heldNow) : [];
   contexts.push(...late);
   for (const index of relatives.keys()) {
     const context = rendered.get(index);
@@ -277,17 +281,28 @@ export async function editFlow(
  * part-1 contract line (K-c). Its claim is its own, so a break is said once.
  */
 function heldContexts(facts: FactOutcome, held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): string[] {
-  if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
-  const said = factsSaid(session);
-  const out: string[] = [];
   const claims: Record<string, { at: number; named: string[] }> = {};
-  for (const line of held.lines) {
-    const rendered = renderHeldLine(line);
-    if (!rendered) continue;
-    if (said.has(rendered.claim) || rendered.claim in claims || out.length >= MAX_HELD_LINES) continue;
+  const out: string[] = [];
+  for (const { line, rendered } of heldToSay(held, session)) {
     out.push(rendered.text);
     claims[rendered.claim] = { at: Date.now(), named: [line.file] };
   }
   Object.assign(facts.claims, claims);
+  return out;
+}
+
+/** The held lines this action says: ready, not said before in the session, at most two. */
+function heldToSay(held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): { line: HeldLine; rendered: RenderedHeld }[] {
+  if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
+  const said = factsSaid(session);
+  const out: { line: HeldLine; rendered: RenderedHeld }[] = [];
+  const seen = new Set<string>();
+  for (const line of held.lines) {
+    const rendered = renderHeldLine(line);
+    if (!rendered) continue;
+    if (said.has(rendered.claim) || seen.has(rendered.claim) || out.length >= MAX_HELD_LINES) continue;
+    seen.add(rendered.claim);
+    out.push({ line, rendered });
+  }
   return out;
 }
