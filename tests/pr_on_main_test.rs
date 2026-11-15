@@ -242,7 +242,9 @@ fn sidecar_for(repo: &Path) -> Option<TypeSidecar> {
     // as `main` does (`spawn_sidecar`): a service below the root finds the
     // modules and the tsconfig above it through that root. Without it the
     // `rpc-shelf` services read fewer rows than the shipped binary does.
-    if repo.join("__llm__").is_dir() && repo.join("carrick.json").is_file() {
+    if (repo.join("__llm__").is_dir() || seed_cassettes(repo).is_dir())
+        && repo.join("carrick.json").is_file()
+    {
         sidecar.set_scan_root(repo);
     }
     sidecar.start_init(repo, None);
@@ -2205,13 +2207,28 @@ fn seed_env() {
     }
 }
 
-/// A fresh git repo holding a copy of `tests/fixtures/pr-seeds/<name>`.
+/// Where a seed repo keeps the model's answers: beside the scanned tree, never
+/// in it or its git history, so a seed's edit of an answer is not part of the
+/// PR's diff, as on a real PR. A repo `<root>/<name>` keeps them at
+/// `<root>/__llm__/<name>`.
+fn seed_cassettes(repo: &Path) -> PathBuf {
+    repo.parent()
+        .unwrap()
+        .join("__llm__")
+        .join(repo.file_name().unwrap())
+}
+
+/// A fresh git repo holding a copy of `tests/fixtures/pr-seeds/<name>`, its
+/// `__llm__/` moved beside the tree (`seed_cassettes`) before the first commit.
 fn seed_repo(root: &Path, name: &str) -> PathBuf {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/pr-seeds")
         .join(name);
     let repo = unlinked(root).join(name);
     copy_dir(&src, &repo);
+    let cassettes = seed_cassettes(&repo);
+    std::fs::create_dir_all(cassettes.parent().unwrap()).unwrap();
+    std::fs::rename(repo.join("__llm__"), &cassettes).unwrap();
     git(&repo, &["init", "-q"]);
     commit(&repo, "init");
     repo
@@ -2220,8 +2237,12 @@ fn seed_repo(root: &Path, name: &str) -> PathBuf {
 /// Replace each `from` in `file` of `repo` with its `to`. A `from` the file
 /// lacks panics, so a seed that stops applying fails loudly.
 fn edit(repo: &Path, file: &str, replacements: &[(&str, &str)]) {
-    let path = repo.join(file);
-    let mut source = std::fs::read_to_string(&path).unwrap();
+    edit_at(&repo.join(file), file, replacements);
+}
+
+/// `edit` of the file at `path`, named `file` in a failure.
+fn edit_at(path: &Path, file: &str, replacements: &[(&str, &str)]) {
+    let mut source = std::fs::read_to_string(path).unwrap();
     for (from, to) in replacements {
         assert!(
             source.contains(from),
@@ -2229,7 +2250,7 @@ fn edit(repo: &Path, file: &str, replacements: &[(&str, &str)]) {
         );
         source = source.replace(from, to);
     }
-    std::fs::write(&path, source).unwrap();
+    std::fs::write(path, source).unwrap();
 }
 
 /// The seeds' manifest (`tests/fixtures/pr-seeds/seeds.json`): each seed's
@@ -2260,6 +2281,18 @@ fn apply_seed(repo: &Path, name: &str) {
                 .as_str()
                 .unwrap_or_else(|| panic!("{name}: {key} in {op}"))
         };
+        let model_answer = ["file", "from", "to"].iter().any(|key| {
+            op[key]
+                .as_str()
+                .is_some_and(|path| path.starts_with("__llm__/"))
+        });
+        if model_answer {
+            assert_eq!(
+                field("op"),
+                "replace",
+                "{name}: a seed edits model answers by replace only"
+            );
+        }
         match field("op") {
             "replace" => {
                 let pairs: Vec<(String, String)> = op["pairs"]
@@ -2277,7 +2310,12 @@ fn apply_seed(repo: &Path, name: &str) {
                     .iter()
                     .map(|(from, to)| (from.as_str(), to.as_str()))
                     .collect();
-                edit(repo, field("file"), &pairs);
+                match field("file").strip_prefix("__llm__/") {
+                    Some(answer) => {
+                        edit_at(&seed_cassettes(repo).join(answer), field("file"), &pairs)
+                    }
+                    None => edit(repo, field("file"), &pairs),
+                }
             }
             "move" => git(repo, &["mv", field("from"), field("to")]),
             "copy" => {
@@ -2534,7 +2572,7 @@ impl MainSnapshot {
 
 /// Scan `repo` typed, with the model answering from its own `__llm__`.
 async fn scan_seed_repo(store: &Store, repo: &Path) {
-    let _cassettes = Cassettes::from(&repo.join("__llm__"));
+    let _cassettes = Cassettes::from(&seed_cassettes(repo));
     scan(store, repo).await;
 }
 
@@ -2852,6 +2890,10 @@ async fn seed_payload_from(
     let tmp = tempfile::tempdir().unwrap();
     let repo = unlinked(tmp.path()).join(repo_name);
     copy_dir(&main.trees.join(repo_name), &repo);
+    copy_dir(
+        &seed_cassettes(&main.trees.join(repo_name)),
+        &seed_cassettes(&repo),
+    );
     let base = head(&repo);
     git(&repo, &["checkout", "-q", "-b", "pr"]);
     change(&repo);
@@ -2869,7 +2911,7 @@ async fn seed_payload_from(
         pr_results: Arc::default(),
         type_reach: Arc::new(Mutex::new(reach.clone())),
     };
-    let _cassettes = Cassettes::from(&repo.join("__llm__"));
+    let _cassettes = Cassettes::from(&seed_cassettes(&repo));
     pr_payload(&store, &repo).await
 }
 
@@ -4086,7 +4128,23 @@ async fn seed_copied_helper() {
 #[tokio::test]
 async fn seed_queue_job_renamed() {
     let _serial = SERIAL.lock().await;
-    manifest_seed_payload("queue-job-renamed").await;
+    let payload = manifest_seed_payload("queue-job-renamed").await;
+    // The model's answers live beside the scanned tree, so the PR's diff holds
+    // the source edit only and the removed send is placed (R2).
+    let row = lost_pairing_row(&payload, "orphaned_endpoint", "PUBSUB", "welcome-mail");
+    assert_eq!(row["service"], "jobs-worker", "{row:#}");
+    assert_eq!(
+        row["sites"],
+        serde_json::json!(["src/mail-worker.ts:9"]),
+        "{row:#}"
+    );
+    assert_eq!(
+        row["removed"],
+        serde_json::json!({"method": "PUBSUB", "path": "welcome-mail", "service": null, "place": "src/mail.ts:10"}),
+        "{row:#}"
+    );
+    assert!(row.get("on_main_unknown").is_none(), "{row:#}");
+    assert_marks(&row, Some(false), Some("candidate"), Some("not_checked"));
 }
 
 #[tokio::test]
