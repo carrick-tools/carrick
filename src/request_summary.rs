@@ -1540,6 +1540,12 @@ struct FnIr {
     /// back, for a callee an own factory returns (carrick#2432). Read by
     /// discovery alone.
     returned_values: Vec<ValueAt>,
+    /// The same returns as the text they state, for the text reader to read
+    /// a call of an own builder by (carrick#3815), lowered as
+    /// [`Self::param_default_texts`] is; a bare `return;` is
+    /// [`ValueAt::Unread`]. Empty for an `async` function or a generator,
+    /// whose call returns no text.
+    returned_texts: Vec<ValueAt>,
     /// Each request this body builds and returns for a caller to send
     /// (carrick#3470, [`descriptors`]). Read by that pass alone.
     built_requests: Vec<descriptors::BuiltRequest>,
@@ -6592,6 +6598,9 @@ impl Reader<'_> {
             None => ir.bodyless = true,
         }
         ir.key_defaults = self.key_defaults(&scope);
+        if function.is_async || function.is_generator {
+            ir.returned_texts.clear();
+        }
         ir.settle_returned(function.is_async, function.is_generator);
         self.keep_returns(function.span.lo.0, &ir);
         ir
@@ -6694,11 +6703,15 @@ impl Reader<'_> {
                 ir.returns.push((expr.span().lo.0, returned));
                 ir.returned_values
                     .extend(self.value_of(expr, &scope, &guards::Bound::default()));
+                ir.returned_texts.push(resolve::text_of(expr, &|lo| lo));
                 ir.returns_tests.push(guards::is_test(expr));
                 self.walk_returned(expr, &scope, &mut ir);
             }
         }
         ir.key_defaults = self.key_defaults(&scope);
+        if arrow.is_async || arrow.is_generator {
+            ir.returned_texts.clear();
+        }
         ir.settle_returned(arrow.is_async, arrow.is_generator);
         self.keep_returns(arrow.span.lo.0, &ir);
         ir
@@ -9031,6 +9044,12 @@ impl Visit for CallWalker<'_, '_, '_> {
             };
             self.ir.returned_values.extend(values);
         }
+        // The text the return states, for the text reader (carrick#3815).
+        self.ir.returned_texts.push(
+            ret.arg
+                .as_deref()
+                .map_or(ValueAt::Unread, |arg| resolve::text_of(arg, &|lo| lo)),
+        );
         self.ir.returns.push((ret.span.lo.0, returned));
         // A predicate's guard is read where it is returned (carrick#2386).
         self.ir
