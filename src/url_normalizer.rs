@@ -160,7 +160,12 @@ impl UrlNormalizer {
         }
 
         // Handle process.env patterns (e.g., process.env.API_URL + "/users")
-        if url.contains("process.env.") {
+        // An env read after a `/` is one segment of the path, not the base
+        // (carrick#4514).
+        if url
+            .find("process.env.")
+            .is_some_and(|at| !url[..at].contains('/'))
+        {
             return self.normalize_process_env_pattern(url, original);
         }
 
@@ -383,7 +388,25 @@ impl UrlNormalizer {
     /// Reduce an interpolation expression to a single clean param identifier.
     /// `row.pr_number` -> `pr_number`, `userId` -> `userId`; an expression with no
     /// usable leading-alpha identifier (empty, numeric, operators) -> `param`.
+    ///
+    /// Text inside a string literal is a value, never a name, so it is dropped
+    /// first; an expression that holds a choice (`?` that is neither `??` nor
+    /// `?.`) names none of its values: `param` (carrick#4514).
     fn clean_param_name(expr: &str) -> String {
+        let mut code = String::new();
+        let mut quote: Option<char> = None;
+        for c in expr.chars() {
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None if matches!(c, '"' | '\'' | '`') => quote = Some(c),
+                None => code.push(c),
+            }
+        }
+        if code.replace("??", "").replace("?.", "").contains('?') {
+            return "param".to_string();
+        }
+        let expr = code.as_str();
         // Take the final run of identifier characters: for a member/bracket/call
         // expression that is the accessed key, which is the meaningful name.
         let mut last = String::new();
@@ -1518,6 +1541,32 @@ mod tests {
                 .normalize("https://api.stripe.com/v1/charges")
                 .is_internal
         );
+    }
+
+    #[test]
+    fn env_read_after_a_slash_is_a_segment_not_the_base() {
+        let config = create_test_config();
+        let n = UrlNormalizer::new(&config);
+        assert_eq!(n.normalize("/a/${process.env.V}/b").path, "/a/:V/b");
+        assert_eq!(n.normalize("${base}/a/${process.env.V}").path, "/a/:V");
+        assert_eq!(
+            n.normalize("(process.env.A || 'http://x') + '/users'").path,
+            "/users"
+        );
+        assert_eq!(
+            n.normalize("`${process.env.ORDER_SERVICE_URL}/api/orders/101`")
+                .path,
+            "/api/orders/101"
+        );
+    }
+
+    #[test]
+    fn a_choice_segment_is_param_and_no_name_comes_from_a_literal() {
+        let config = create_test_config();
+        let n = UrlNormalizer::new(&config);
+        assert_eq!(n.normalize("/k/${a ? \"x\" : \"y\"}").path, "/k/:param");
+        assert_eq!(n.normalize("/k/${name ?? ''}").path, "/k/:name");
+        assert_eq!(n.normalize("/k/${row.pr_number}").path, "/k/:pr_number");
     }
 
     #[test]
