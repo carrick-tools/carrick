@@ -1750,9 +1750,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // waits for.
         let reaches_of: walk_lane::ReachesOf = {
             let scan = std::sync::Arc::clone(&scan);
-            std::sync::Arc::new(move |service: usize, walked: &walk_lane::Walked| {
-                scan.siblings.walks_read_by(service, &walked.index())
-            })
+            std::sync::Arc::new(
+                move |service: usize, positions: &crate::position_rows::PositionIndex| {
+                    scan.siblings.walks_read_by(service, positions)
+                },
+            )
         };
         let lane = walk_lane::Lane::new(
             recipe,

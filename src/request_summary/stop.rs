@@ -109,7 +109,8 @@ pub enum Stop {
     Recursion,
     /// No compiler row answers the position.
     RowsMissing,
-    /// The compiler walk of the service holding this position wrote no rows.
+    /// The compiler walk of the service holding this position wrote no rows,
+    /// or none the scan could read (carrick#4344).
     WalkLost,
     /// The file's bytes differ from the ones its rows were read from.
     RowsStale,

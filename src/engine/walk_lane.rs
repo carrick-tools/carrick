@@ -53,9 +53,9 @@ pub(super) type WalkEnded = oneshot::Receiver<()>;
 pub(super) type Place = Arc<dyn Fn(&str, Option<&str>) -> Destination + Send + Sync>;
 
 /// The services the walk of a declared service reaches, by declared
-/// position ([`super::siblings::SiblingRegistry::walks_read_by`]); none when
-/// no sibling is ever read.
-pub(super) type ReachesOf = Arc<dyn Fn(usize, &Walked) -> BTreeSet<usize> + Send + Sync>;
+/// position ([`super::siblings::SiblingRegistry::walks_read_by`]), read from
+/// the index [`Walked::read`] made; none when no sibling is ever read.
+pub(super) type ReachesOf = Arc<dyn Fn(usize, &PositionIndex) -> BTreeSet<usize> + Send + Sync>;
 
 /// One service's walk, as the run keeps it until it ends.
 #[derive(Debug)]
@@ -73,7 +73,8 @@ pub(super) struct Walked {
     label: String,
     /// The walk's sidecar at its peak, in MB (carrick#3083). `None` when
     /// nothing was walked, the walk failed, kept rows were reused, or the
-    /// platform could not say.
+    /// platform could not say. A walk whose rows could not be read keeps its
+    /// peak: it ran (carrick#4344).
     peak_mb: Option<u64>,
     /// Whether a walk was asked for: false only when the run has no compiler
     /// engine to ask (carrick#4247).
@@ -115,24 +116,39 @@ impl Walked {
         self.peak_mb
     }
 
+    /// The service's rows for its first pass, read once before the walk's
+    /// slot is filled; a rows file the scan cannot read makes the walk lost
+    /// (carrick#4344). The walk then keeps no rows, so the store is cleared
+    /// of the file and the boundary names the lost walk, and every read from
+    /// then on gives `walk_lost`.
+    pub(super) fn read(&mut self) -> PositionIndex {
+        let Some(rows) = &self.rows else {
+            return self.index();
+        };
+        match crate::position_rows::load_index(rows, &self.scan_root, &self.label) {
+            Ok(index) => index,
+            Err(error) => {
+                warn!("{}", unreadable_rows(&self.label, &error));
+                self.rows = None;
+                self.lost = Some(WalkLoss::Failed);
+                PositionIndex::walk_lost(&self.scan_root)
+            }
+        }
+    }
+
     /// The service's rows for one pass of its analysis, read from the file
     /// its walk wrote. A walk that wrote none gives an index with no rows,
     /// every lookup in which is a hole.
     pub(super) fn index(&self) -> PositionIndex {
         match &self.rows {
             Some(rows) => crate::position_rows::load_index(rows, &self.scan_root, &self.label)
-                .unwrap_or_else(|_| PositionIndex::missing(&self.scan_root)),
+                .unwrap_or_else(|error| {
+                    warn!("{}", unreadable_rows(&self.label, &error));
+                    PositionIndex::walk_lost(&self.scan_root)
+                }),
             None if self.lost.is_some() => PositionIndex::walk_lost(&self.scan_root),
             None => PositionIndex::missing(&self.scan_root),
         }
-    }
-}
-
-impl Walked {
-    /// Red stub (carrick#4344): reads as `index` does today.
-    #[allow(dead_code)]
-    pub(super) fn read(&mut self) -> PositionIndex {
-        self.index()
     }
 }
 
@@ -194,6 +210,13 @@ impl Slots {
 /// each walk ends.
 pub(super) fn signals(count: usize) -> (Vec<oneshot::Sender<()>>, Vec<WalkEnded>) {
     (0..count).map(|_| oneshot::channel()).unzip()
+}
+
+/// The run-log line for a rows file the walk wrote and the scan cannot read.
+/// The error keeps its path for the run log only: the blob carries a fixed
+/// sentence (carrick#4344).
+fn unreadable_rows(label: &str, error: &str) -> String {
+    format!("Position rows for service {label} were written but could not be read: {error}")
 }
 
 /// A heap cap as the run log states it.
@@ -321,12 +344,13 @@ impl Lane {
                 let started = Instant::now();
                 let deaths = MemoryDeathNote::default();
                 let recipe = recipe.map(|recipe| recipe.noting_memory_deaths(&deaths));
-                let walked = walk(recipe.as_ref(), &repo_path, &config, at.as_deref(), &place);
+                let mut walked = walk(recipe.as_ref(), &repo_path, &config, at.as_deref(), &place);
                 let died = deaths.take().is_some();
                 let reaches = if died || walked.rows.is_none() {
                     BTreeSet::new()
                 } else {
-                    reaches_of(service, &walked)
+                    let index = walked.read();
+                    reaches_of(service, &index)
                 };
                 WalkDone {
                     walked,
@@ -403,9 +427,10 @@ impl Lane {
         let label = self.label(service).to_string();
         if let Some(commit) = &self.at[service] {
             match reuse(&self.repo_path, &self.services[service], commit) {
-                Ok(walked) => {
+                Ok(mut walked) => {
                     debug!("Position rows for service {label} reused from the last pass");
-                    let reaches = (self.reaches_of)(service, &walked);
+                    let index = walked.read();
+                    let reaches = (self.reaches_of)(service, &index);
                     self.slots.fill(service, walked);
                     return Reached::Filled { reaches };
                 }
@@ -563,15 +588,13 @@ mod tests {
     use crate::services::type_sidecar::TypeSidecar;
 
     /// Rows written into `store`, as a scan with a local store writes them.
+    /// The run's temporary rows are under `store` too: tests that share the
+    /// OS temp dir share its per-process folder, and one test's rows file
+    /// vanishes under another's read (carrick#4344).
     fn into(store: &Path) -> Place {
         let store = store.to_path_buf();
         Arc::new(move |repo, service| {
-            crate::position_rows::destination_from(
-                Some(&store),
-                &std::env::temp_dir(),
-                repo,
-                service,
-            )
+            crate::position_rows::destination_from(Some(&store), &store, repo, service)
         })
     }
 
@@ -1033,8 +1056,8 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let script = stand_in(dir.path(), "{}", r#"["billing"]"#, "");
-        let (repo, services) = repo_of(dir.path(), &["orders", "billing"]);
+        let script = stand_in(dir.path(), "{}", r#"["refunds"]"#, "");
+        let (repo, services) = repo_of(dir.path(), &["payments", "refunds"]);
         let store = tempfile::tempdir().unwrap();
         let canonical = super::super::canonical_repo_path(&repo);
         let name = super::super::get_repository_name(&canonical);
@@ -1045,24 +1068,24 @@ readline.createInterface({{ input: process.stdin, terminal: false }}).on('line',
                 .map(Path::to_path_buf)
                 .unwrap()
         };
-        let billing = stored("billing");
-        std::fs::create_dir_all(billing.parent().unwrap()).unwrap();
-        std::fs::write(&billing, "an earlier walk").unwrap();
+        let refunds = stored("refunds");
+        std::fs::create_dir_all(refunds.parent().unwrap()).unwrap();
+        std::fs::write(&refunds, "an earlier walk").unwrap();
 
         let (ends, _walked) = signals(2);
         let slots = walk_two_at_a_time(&script, &repo, &services, ends, store.path()).await;
-        let orders = slots.get(0).unwrap();
-        assert!(orders.rows.is_some());
-        assert_eq!(orders.rows_lost(), Some(Counted::new(0, vec![])));
-        let billing_walk = slots.get(1).unwrap();
-        assert!(billing_walk.rows.is_none());
+        let payments = slots.get(0).unwrap();
+        assert!(payments.rows.is_some());
+        assert_eq!(payments.rows_lost(), Some(Counted::new(0, vec![])));
+        let refunds_walk = slots.get(1).unwrap();
+        assert!(refunds_walk.rows.is_none());
         assert_eq!(
-            billing_walk.rows_lost(),
+            refunds_walk.rows_lost(),
             Some(Counted::new(1, vec!["the compiler walk failed".into()]))
         );
 
         slots.land(|_| false);
-        assert!(stored("orders").exists(), "orders' rows landed");
-        assert!(!billing.exists(), "billing's earlier rows were cleared");
+        assert!(stored("payments").exists(), "payments' rows landed");
+        assert!(!refunds.exists(), "refunds' earlier rows were cleared");
     }
 }
