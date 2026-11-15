@@ -273,29 +273,20 @@ export async function editFlow(
 
 /**
  * The compiler's lines for this action (D13): each said once per session, at
- * most two. Each one replaces part 1's contract line for the same row and
- * group (D11a): that line leaves `facts.lines` and its claim is not taken, so
- * the facts mutated here are what `markFacts` and the print read afterwards.
+ * most two. A line is ADDED to part 1's: part 3 never replaces or drops a
+ * part-1 contract line (K-c). Its claim is its own, so a break is said once.
  */
 function heldContexts(facts: FactOutcome, held: Awaited<ReturnType<typeof askHeld>> | null, session: string | undefined): string[] {
   if (!held || held.state !== "ready" || held.lines.length === 0 || !session) return [];
   const said = factsSaid(session);
   const out: string[] = [];
   const claims: Record<string, { at: number; named: string[] }> = {};
-  const replaced = new Set<string>();
   for (const line of held.lines) {
     const rendered = renderHeldLine(line);
     if (!rendered) continue;
-    replaced.add(line.row_key);
     if (said.has(rendered.claim) || rendered.claim in claims || out.length >= MAX_HELD_LINES) continue;
     out.push(rendered.text);
     claims[rendered.claim] = { at: Date.now(), named: [line.file] };
-  }
-  if (replaced.size > 0 && facts.used.length === facts.lines.length) {
-    const keep = facts.used.map((key) => !replaced.has(key));
-    facts.lines = facts.lines.filter((_, at) => keep[at]);
-    facts.used = facts.used.filter((_, at) => keep[at]);
-    for (const key of replaced) delete facts.claims[key];
   }
   Object.assign(facts.claims, claims);
   return out;

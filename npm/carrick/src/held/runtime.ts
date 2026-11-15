@@ -1,28 +1,53 @@
-// The real `ServiceRuntime` of the held-compiler daemon (part 3, T5b).
+// The real `ServiceRuntime` of the held-compiler daemon (part 3, T5b, L2).
 //
 // start:  write the service's shadow tree through the compiler engine, open a
 //         TypeScript 7 language server over it, place every producer response
-//         row's check on the current text and arm the ones that pass the gate.
-// answer: sync files that changed on disk, put the edited file's text into the
-//         engine, pull diagnostics of every check file and keep only a check's
-//         own (R3). After the answer, the twin pass tests that each armed check
-//         can still fail, and rows the fact file added or changed are gated.
+//         row's checks at the positions the index stored for its sends
+//         (`values`), map those positions onto the current text and arm the
+//         ones that pass the gate.
+// answer: sync files that changed on disk, move each check with the edit, put
+//         the edited file's text into the engine, pull diagnostics of every
+//         check file and keep only a check's own (R3). After the answer, the
+//         twin pass tests that each armed check can still fail, files whose
+//         checks lost their place are gated again, and rows the fact file added
+//         or changed are gated.
 //
-// What an armed row IS is keyed by the row's identity plus its group's type
-// text: a `ContractRow` has no id and a fact refresh may reorder rows.
+// Checks are keyed by the VALUE's file: a send can sit in another file than its
+// route's. What an armed check IS is keyed by the row's identity, its group's
+// type text and the position's index in the row's `values`.
 
 import fs from "node:fs";
 import path from "node:path";
+import ts from "typescript";
+import { diffAgainst, textAtCommit } from "../facts/diff.ts";
 import { contractKey } from "../facts/lines.ts";
+import { commitsOf, indexedCommit } from "../facts/peers.ts";
 import { factsPath, openFacts, type ContractRow } from "../facts/store.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
 import { placedPath, shadowDir } from "./paths.ts";
-import { arm, attribute, overlay, type Diag, type Overlay, type PlaceRow } from "./place.ts";
-import { engineEntry, writeShadow } from "./shadow.ts";
+import {
+  arm,
+  attribute,
+  checkWire,
+  overlay,
+  regionOfEdit,
+  regionsFromHunks,
+  resolveValue,
+  type CheckInput,
+  type Diag,
+  type Overlay,
+  type Region,
+  type SiteFinder,
+  type Value,
+} from "./place.ts";
+import { engineEntry, engineSiteFinder, writeShadow } from "./shadow.ts";
 
 const log = createLogger("carrick-held-runtime");
+
+/** The longest each git call of the gate may take (a slower one is `index_text_unavailable`). */
+const GIT_BUDGET_MS = 2000;
 
 export type RuntimeDeps = {
   root: string;
@@ -32,31 +57,46 @@ export type RuntimeDeps = {
   entry?: string | null;
   /** The producer response rows now. Default: the fact file's. */
   rows?: () => Promise<ContractRow[]>;
+  /** Each repo's index commit, as the fact file's header names it. Default: the fact file's. */
+  commits?: () => Promise<Record<string, string> | null>;
   /** Changes when the rows may have: the fact file's size and mtime by default. */
   stamp?: () => string;
   /** The held compiler over a shadow's `w` directory. */
   makeEngine?: (command: string, cwd: string) => Engine;
+  /** The compiler engine's site finder; the engine's `find_site` action by default. */
+  site?: SiteFinder;
 };
 
-type Unarmed = { label: string; file: string; reason: string };
+type Unarmed = { label: string; file: string; reason: string; group: number; position: number | null };
 
 const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}`;
 const groupKey = (row: ContractRow, group: number): string => `${identity(row)}\0${row.groups[group]!.type}`;
+/** One group at one position of its row's `values`. */
+const checkKey = (row: ContractRow, group: number, at: number): string => `${groupKey(row, group)}\0${at}`;
+const posId = (row: ContractRow, at: number): string => `${identity(row)}\0${at}`;
+
+/** Lines and offsets of one text, TypeScript's own (the compiler states positions as line and character). */
+function lineMap(text: string): { offset: (line: number, character: number) => number; line: (offset: number) => number } {
+  const sf = ts.createSourceFile("held.ts", text, ts.ScriptTarget.Latest, false);
+  return {
+    offset: (line, character) => {
+      try {
+        return sf.getPositionOfLineAndCharacter(line, character);
+      } catch {
+        return text.length;
+      }
+    },
+    line: (offset) => sf.getLineAndCharacterOfPosition(Math.min(Math.max(offset, 0), text.length)).line + 1,
+  };
+}
 
 /** A compiler's line/character diagnostics as offsets into the exact text that was set. */
 function offsetDiags(text: string, diags: LspDiag[] | undefined): Diag[] {
-  const starts = [0];
-  for (let i = 0; i < text.length; i++) if (text[i] === "\n") starts.push(i + 1);
+  const at = lineMap(text);
   return (diags ?? [])
     .filter((d) => d.severity === undefined || d.severity === 1)
-    .map((d) => ({
-      start: (starts[d.range.start.line] ?? text.length) + d.range.start.character,
-      code: Number(d.code),
-      message: d.message,
-    }));
+    .map((d) => ({ start: at.offset(d.range.start.line, d.range.start.character), code: Number(d.code), message: d.message }));
 }
-
-const lineOf = (text: string, offset: number): number => text.slice(0, offset).split("\n").length;
 
 function readText(file: string): string | null {
   try {
@@ -66,7 +106,7 @@ function readText(file: string): string | null {
   }
 }
 
-function writePlaced(file: string, service: string, armed: Array<{ label: string; file: string; group: number }>, unarmed: Unarmed[]): void {
+function writePlaced(file: string, service: string, armed: Array<{ label: string; file: string; group: number; position: number }>, unarmed: Unarmed[]): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), service, armed, unarmed }, null, 2));
@@ -75,27 +115,18 @@ function writePlaced(file: string, service: string, armed: Array<{ label: string
   }
 }
 
-/** The rows' check text for one file: only the groups in `only`, or every group. */
-function placeRows(rows: ContractRow[], only: Set<string> | null): { rows: PlaceRow[]; origin: Array<{ row: ContractRow; groups: number[] }> } {
-  const placed: PlaceRow[] = [];
-  const origin: Array<{ row: ContractRow; groups: number[] }> = [];
-  for (const row of rows) {
-    const groups = row.groups.map((_, g) => g).filter((g) => only === null || only.has(groupKey(row, g)));
-    if (groups.length === 0) continue;
-    placed.push({
-      id: origin.length,
-      label: row.label,
-      locator: row.locator,
-      site: row.site,
-      line: row.line,
-      groups: groups.map((g) => ({ type: row.groups[g]!.type })),
-    });
-    origin.push({ row, groups });
-  }
-  return { rows: placed, origin };
-}
+/** Rows that state where their replies are sent from; the others are never placed. */
+const hasValues = (row: ContractRow): boolean => (row.values?.length ?? 0) > 0;
 
-type View = { ov: Overlay; rows: PlaceRow[]; origin: Array<{ row: ContractRow; groups: number[] }>; text: string };
+/** One send position of a row. */
+type Pos = { id: string; row: ContractRow; at: number };
+/** A placed position: its bounds on the current text, and the groups it checks. */
+type Entry = { pos: Pos; value: Value; groups: number[] };
+
+type View = { ov: Overlay; inputs: CheckInput[]; entries: Entry[]; text: string };
+
+/** Whether an unarmed reason may pass when the file is edited again. */
+const transient = (reason: string): boolean => reason === "value_edited" || reason === "value_not_a_node" || reason === "not_wrappable" || reason.startsWith("clean_check_fails");
 
 /** One service's held compiler: its shadow, its checks and what is armed. */
 class HeldService implements ServiceEngine {
@@ -103,30 +134,47 @@ class HeldService implements ServiceEngine {
   private readonly sigs = new Map<string, string>();
   /** Plain text of every file the engine holds open. */
   private readonly known = new Map<string, string>();
-  private readonly byFile = new Map<string, ContractRow[]>();
+  /** The service's rows, and their positions by value file. */
+  private rows: ContractRow[] = [];
+  private readonly byFile = new Map<string, Pos[]>();
+  /** Where each position is on `known`'s text. */
+  private readonly values = new Map<string, Value>();
   private readonly armed = new Set<string>();
   private readonly unarmed = new Map<string, Unarmed>();
   private readonly views = new Map<string, View>();
+  /**
+   * Positions, by file, that lost their place or may now be placed: gated again
+   * after the answer. Only these positions are gated; the file's other checks
+   * keep their state, so a file that is broken right now loses only the checks
+   * it already lost.
+   */
+  private readonly regate = new Map<string, Set<string>>();
+  /** The files of the service's program, as the compiler engine wrote them: the only files a check can sit in. */
+  private readonly program: Set<string>;
   private stampSeen: string;
   private needsGate = false;
 
   private readonly init: ServiceInit;
-  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp">> & { root: string; home?: string };
+  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
   private readonly engine: Engine;
   private readonly w: string;
+  private readonly wire: string[];
 
   constructor(
     init: ServiceInit,
-    deps: Required<Pick<RuntimeDeps, "rows" | "stamp">> & { root: string; home?: string },
+    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
     engine: Engine,
     w: string,
     ownFiles: string[],
+    wire: string[],
   ) {
     this.init = init;
     this.deps = deps;
     this.engine = engine;
     this.w = w;
+    this.wire = wire;
     this.ownFiles = new Set(ownFiles);
+    this.program = new Set(ownFiles);
     for (const rel of this.ownFiles) this.sigs.set(rel, this.sigOf(rel));
     this.stampSeen = deps.stamp();
   }
@@ -145,99 +193,217 @@ class HeldService implements ServiceEngine {
 
   loadRows(rows: ContractRow[]): void {
     this.byFile.clear();
-    for (const row of rows) {
-      if (row.repo !== this.init.repo || row.service !== this.init.service) continue;
-      this.byFile.set(row.file, [...(this.byFile.get(row.file) ?? []), row]);
+    this.rows = rows.filter((row) => row.repo === this.init.repo && row.service === this.init.service && row.direction === "response");
+    const live = new Set<string>();
+    for (const row of this.rows) {
+      (row.values ?? []).forEach((v, at) => {
+        const pos: Pos = { id: posId(row, at), row, at };
+        live.add(pos.id);
+        this.byFile.set(v.file, [...(this.byFile.get(v.file) ?? []), pos]);
+      });
     }
+    for (const id of [...this.values.keys()]) if (!live.has(id)) this.values.delete(id);
   }
 
-  /** D6: place every row of every file on the current text and arm what passes. `onlyNew`: leave decided groups alone. */
+  /** The text of `rel` at the index commit and the regions the disk text changed it by; or why neither is known. */
+  private baseline(rel: string, text: string): { old: string; regions: Region[] } | "index_text_unavailable" {
+    const commit = indexedCommit(this.commits, this.init.repo);
+    if (commit === null) return "index_text_unavailable";
+    const real = this.real(rel);
+    const old = textAtCommit(real, commit, this.deps.env, GIT_BUDGET_MS);
+    if (old === null) return "index_text_unavailable";
+    if (old === text) return { old, regions: [] };
+    const diff = diffAgainst(real, commit, this.deps.env, GIT_BUDGET_MS);
+    if (diff === null || diff === "") return "index_text_unavailable";
+    return { old, regions: regionsFromHunks(old, text, diff) };
+  }
+
+  private commits: Record<string, string> | null = null;
+
+  /** D6: place every position of every file on the current text and arm what passes. `onlyNew`: leave decided checks alone. */
   async gate(onlyNew: boolean): Promise<void> {
-    const decided = (key: string): boolean => this.armed.has(key) || this.unarmed.has(key);
-    for (const [rel, rows] of this.byFile) {
-      const keys = rows.flatMap((row) => row.groups.map((_, g) => groupKey(row, g)));
-      if (onlyNew && keys.every(decided)) continue;
-      const no = (row: ContractRow, g: number, reason: string): void => {
-        const key = groupKey(row, g);
-        if (onlyNew && decided(key)) return;
-        this.unarmed.set(key, { label: row.label, file: row.file, reason });
-      };
-      const text = readText(this.real(rel));
-      if (text === null) {
-        for (const row of rows) row.groups.forEach((_, g) => no(row, g, "file_unreadable"));
-        continue;
-      }
-      const shadow = this.shadow(rel);
-      const all = placeRows(rows, null);
-      const clean = overlay(shadow, text, all.rows, "clean");
-      for (const u of clean.unplaced) {
-        const row = all.origin[u.id]!.row;
-        row.groups.forEach((_, g) => no(row, g, u.reason));
-      }
-      if (clean.checks.length > 0) {
-        try {
-          this.engine.set(shadow, clean.text);
-          const cleanDiags = offsetDiags(clean.text, (await this.engine.pull([shadow])).get(shadow));
-          const twin = overlay(shadow, text, all.rows, "twin");
-          this.engine.set(shadow, twin.text);
-          const twinDiags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
-          const verdict = arm(clean, cleanDiags, twinDiags);
-          for (const k of verdict.armed) {
-            const c = clean.checks.find((x) => x.k === k)!;
-            const { row, groups } = all.origin[c.id]!;
-            const g = groups[c.group]!;
-            if (onlyNew && decided(groupKey(row, g))) continue;
-            this.armed.add(groupKey(row, g));
-            this.unarmed.delete(groupKey(row, g));
-          }
-          for (const u of verdict.unarmed) {
-            const { row, groups } = all.origin[u.id]!;
-            no(row, groups[u.group]!, u.reason);
-          }
-        } finally {
-          this.engine.set(shadow, text);
-        }
-      }
-      this.known.set(rel, text);
-    }
+    this.commits = await this.deps.commits();
+    for (const rel of this.byFile.keys()) await this.gateFile(rel, onlyNew);
     for (const rel of this.byFile.keys()) this.setView(rel);
     for (const rel of [...this.views.keys()]) if (!this.byFile.has(rel)) this.views.delete(rel);
     this.writePlaced();
+  }
+
+  /** Gate again after the answer: these positions of `rel`. */
+  private queue(rel: string, ids: Iterable<string>): void {
+    const held = this.regate.get(rel) ?? new Set<string>();
+    for (const id of ids) held.add(id);
+    this.regate.set(rel, held);
+  }
+
+  /**
+   * Place and arm the positions of `rel` (only `ids`, when given). The gate
+   * reads the disk, so it never runs on text newer than the engine's own copy
+   * (`known`): that edit is not applied yet, and gating it would arm or unarm
+   * checks on a file the answer has not seen. Those positions wait for the
+   * next answer.
+   */
+  private async gateFile(rel: string, onlyNew: boolean, ids: Set<string> | null = null): Promise<void> {
+    const positions = (this.byFile.get(rel) ?? []).filter((p) => ids === null || ids.has(p.id));
+    const keysOf = (p: Pos): string[] => p.row.groups.map((_, g) => checkKey(p.row, g, p.at));
+    const decided = (key: string): boolean => this.armed.has(key) || this.unarmed.has(key);
+    if (onlyNew && positions.every((p) => keysOf(p).every(decided))) return;
+    const no = (p: Pos, g: number, reason: string): void => {
+      const key = checkKey(p.row, g, p.at);
+      if (onlyNew && decided(key)) return;
+      this.armed.delete(key);
+      this.unarmed.set(key, { label: p.row.label, file: rel, reason, group: g, position: p.at });
+    };
+    const noneFor = (reason: string): void => {
+      for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
+    };
+    // A check can only sit in a file of the program the compiler engine loaded.
+    if (!this.program.has(rel)) return noneFor("value_outside_service");
+    const text = readText(this.real(rel));
+    const held = this.known.get(rel);
+    if (text !== null && held !== undefined && held !== text) return this.queue(rel, positions.map((p) => p.id));
+    if (!onlyNew) {
+      for (const p of positions) for (const key of keysOf(p)) {
+        this.armed.delete(key);
+        this.unarmed.delete(key);
+      }
+    }
+    if (text === null) return noneFor("file_unreadable");
+    const base = this.baseline(rel, text);
+    if (typeof base === "string") return noneFor(base);
+    const entries: Entry[] = [];
+    for (const p of positions) {
+      const span = p.row.values![p.at]!.span;
+      let placed: Value | string;
+      try {
+        placed = await resolveValue({ file: rel, start: span[0], end: span[1] }, base.regions, base.old, text, this.deps.site);
+      } catch (error) {
+        log("find_site failed", String(error));
+        placed = "value_not_a_node";
+      }
+      if (typeof placed === "string") {
+        p.row.groups.forEach((_, g) => no(p, g, placed as string));
+        continue;
+      }
+      this.values.set(p.id, placed);
+      entries.push({ pos: p, value: placed, groups: p.row.groups.map((_, g) => g) });
+    }
+    const shadow = this.shadow(rel);
+    const inputs = this.inputsOf(entries);
+    const clean = overlay(shadow, text, inputs, this.wire, "clean");
+    for (const u of clean.unplaced) {
+      const e = entries[u.n]!;
+      e.groups.forEach((g) => no(e.pos, g, u.reason));
+    }
+    if (clean.checks.length > 0) {
+      try {
+        this.engine.set(shadow, clean.text);
+        const cleanDiags = offsetDiags(clean.text, (await this.engine.pull([shadow])).get(shadow));
+        const twin = overlay(shadow, text, inputs, this.wire, "twin");
+        this.engine.set(shadow, twin.text);
+        const twinDiags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
+        const verdict = arm(clean, cleanDiags, twinDiags);
+        for (const k of verdict.armed) {
+          const c = clean.checks.find((x) => x.k === k)!;
+          const e = entries[c.n]!;
+          const key = checkKey(e.pos.row, e.groups[c.group]!, e.pos.at);
+          if (onlyNew && decided(key)) continue;
+          this.armed.add(key);
+          this.unarmed.delete(key);
+        }
+        for (const u of verdict.unarmed) {
+          const e = entries[u.n]!;
+          no(e.pos, e.groups[u.group]!, u.reason);
+        }
+      } finally {
+        this.engine.set(shadow, text);
+      }
+    }
+    this.known.set(rel, text);
+  }
+
+  /** The checks' inputs: one per entry, numbered by its place in `entries`. */
+  private inputsOf(entries: Entry[]): CheckInput[] {
+    return entries.map((e, n) => ({ n, value: e.value, groups: e.groups.map((g) => ({ type: e.pos.row.groups[g]!.type })) }));
+  }
+
+  /** The armed groups of each position of `rel`, placed where they are now. */
+  private armedEntries(rel: string): Entry[] {
+    const out: Entry[] = [];
+    for (const pos of this.byFile.get(rel) ?? []) {
+      const value = this.values.get(pos.id);
+      const groups = pos.row.groups.map((_, g) => g).filter((g) => this.armed.has(checkKey(pos.row, g, pos.at)));
+      if (value !== undefined && groups.length > 0) out.push({ pos, value, groups });
+    }
+    return out;
   }
 
   /** Put `rel`'s text into the engine, with its armed checks wrapped when it has any. */
   private setView(rel: string): void {
     const text = this.known.get(rel);
     if (text === undefined) return;
-    const rows = this.byFile.get(rel) ?? [];
-    const view = placeRows(rows, this.armed);
-    if (view.rows.length === 0) {
+    const entries = this.armedEntries(rel);
+    if (entries.length === 0) {
       this.views.delete(rel);
       this.engine.set(this.shadow(rel), text);
       return;
     }
-    const ov = overlay(this.shadow(rel), text, view.rows, "clean");
+    const inputs = this.inputsOf(entries);
+    const ov = overlay(this.shadow(rel), text, inputs, this.wire, "clean");
     this.engine.set(this.shadow(rel), ov.text);
-    this.views.set(rel, { ov, rows: view.rows, origin: view.origin, text });
+    this.views.set(rel, { ov, inputs, entries, text });
   }
 
   private writePlaced(): void {
-    const armed: Array<{ label: string; file: string; group: number }> = [];
+    const armed: Array<{ label: string; file: string; group: number; position: number }> = [];
     const unarmed: Unarmed[] = [];
-    for (const rows of this.byFile.values()) {
-      for (const row of rows) {
+    for (const row of this.rows) {
+      if (!hasValues(row)) {
+        row.groups.forEach((_, g) => unarmed.push({ label: row.label, file: row.file, reason: "no_values", group: g, position: null }));
+        continue;
+      }
+      row.values!.forEach((v, at) => {
         row.groups.forEach((_, g) => {
-          const key = groupKey(row, g);
-          if (this.armed.has(key)) armed.push({ label: row.label, file: row.file, group: g });
+          const key = checkKey(row, g, at);
+          if (this.armed.has(key)) armed.push({ label: row.label, file: v.file, group: g, position: at });
           else if (this.unarmed.has(key)) unarmed.push(this.unarmed.get(key)!);
         });
-      }
+      });
     }
     writePlaced(placedPath(this.deps.root, this.init.service, this.deps.home), this.init.service, armed, unarmed);
   }
 
+  /** The positions of `rel` that are unarmed for a reason an edit can change. */
+  private transientIds(rel: string): string[] {
+    return (this.byFile.get(rel) ?? [])
+      .filter((p) => p.row.groups.some((_, g) => transient(this.unarmed.get(checkKey(p.row, g, p.at))?.reason ?? "")))
+      .map((p) => p.id);
+  }
+
+  /** Move every position of `rel` with the edit from `old` to `text`; one that lost its place is dropped and the file is gated again. */
+  private async remap(rel: string, old: string, text: string): Promise<void> {
+    const regions = [regionOfEdit(old, text)];
+    for (const pos of this.byFile.get(rel) ?? []) {
+      const value = this.values.get(pos.id);
+      if (value === undefined) continue;
+      let moved: Value | string;
+      try {
+        moved = await resolveValue(value, regions, old, text, this.deps.site);
+      } catch (error) {
+        log("find_site failed", String(error));
+        moved = "value_edited";
+      }
+      if (typeof moved === "string") {
+        this.values.delete(pos.id);
+        this.queue(rel, [pos.id]);
+      } else {
+        this.values.set(pos.id, moved);
+      }
+    }
+  }
+
   /** Make the shadow and the engine agree with the disk for `rel`. */
-  private apply(rel: string): void {
+  private async apply(rel: string): Promise<void> {
     const real = this.real(rel);
     const text = readText(real);
     if (text === null) {
@@ -248,12 +414,16 @@ class HeldService implements ServiceEngine {
     }
     this.ownFiles.add(rel);
     this.sigs.set(rel, this.sigOf(rel));
-    if (this.known.get(rel) === text) return;
+    const old = this.known.get(rel);
+    if (old === text) return;
     fs.mkdirSync(path.dirname(this.shadow(rel)), { recursive: true });
     fs.writeFileSync(this.shadow(rel), text);
     this.known.set(rel, text);
-    if (this.byFile.has(rel)) this.setView(rel);
-    else this.engine.set(this.shadow(rel), text);
+    if (this.byFile.has(rel)) {
+      if (old !== undefined) await this.remap(rel, old, text);
+      this.queue(rel, this.transientIds(rel));
+      this.setView(rel);
+    } else this.engine.set(this.shadow(rel), text);
   }
 
   /**
@@ -262,11 +432,11 @@ class HeldService implements ServiceEngine {
    * server's own disk watch: that watch lagged a fraction of a second behind in
    * measurement, which would answer with the file as it was.
    */
-  private sync(requested: string[]): void {
+  private async sync(requested: string[]): Promise<void> {
     for (const rel of [...this.ownFiles]) {
-      if (!requested.includes(rel) && this.sigOf(rel) !== this.sigs.get(rel)) this.apply(rel);
+      if (!requested.includes(rel) && this.sigOf(rel) !== this.sigs.get(rel)) await this.apply(rel);
     }
-    for (const rel of requested) this.apply(rel);
+    for (const rel of requested) await this.apply(rel);
   }
 
   private async refreshRows(): Promise<void> {
@@ -282,7 +452,7 @@ class HeldService implements ServiceEngine {
     const requested = files
       .map((file) => path.relative(this.init.scan_root, file))
       .filter((rel) => rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel));
-    this.sync(requested);
+    await this.sync(requested);
     const lines = request.kind === "edit" ? await this.lines() : [];
     return { lines, after: () => this.afterAnswer() };
   }
@@ -292,21 +462,28 @@ class HeldService implements ServiceEngine {
     if (rels.length === 0) return [];
     const pulled = await this.engine.pull(rels.map((rel) => this.shadow(rel)));
     const out: HeldLine[] = [];
+    const said = new Set<string>();
     for (const rel of rels) {
       const view = this.views.get(rel)!;
+      const at = lineMap(view.ov.text);
       const own = attribute(view.ov, offsetDiags(view.ov.text, pulled.get(this.shadow(rel))));
-      for (const [k, diags] of own.lines) {
-        const check = view.ov.checks.find((c) => c.k === k)!;
-        const { row, groups } = view.origin[check.id]!;
-        const g = groups[check.group]!;
+      // One line per (row, group), at the first position that broke.
+      const broken = [...own.lines].map(([k, diags]) => ({ check: view.ov.checks.find((c) => c.k === k)!, diags })).sort((a, b) => a.diags[0]!.start - b.diags[0]!.start);
+      for (const { check, diags } of broken) {
+        const entry = view.entries[check.n]!;
+        const g = entry.groups[check.group]!;
+        const row = entry.pos.row;
+        const key = `${contractKey(row, g)}\0${g}`;
+        if (said.has(key)) continue;
+        said.add(key);
         const first = diags[0]!;
         out.push({
           row_key: contractKey(row, g),
           group: g,
           label: row.label,
           consumer: [...new Set(row.groups[g]!.places.map((p) => p.service))].join(", "),
-          file: row.file,
-          line: lineOf(view.ov.text, first.start),
+          file: rel,
+          line: at.line(first.start),
           message: first.message,
           symbol: row.groups[g]!.symbol,
         });
@@ -315,11 +492,11 @@ class HeldService implements ServiceEngine {
     return out;
   }
 
-  /** The twin pass, restored in a `finally`; then rows the fact file added or changed. */
+  /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */
   private async afterAnswer(): Promise<void> {
     for (const [rel, view] of this.views) {
       const shadow = this.shadow(rel);
-      const twin = overlay(shadow, view.text, view.rows, "twin");
+      const twin = overlay(shadow, view.text, view.inputs, this.wire, "twin");
       try {
         this.engine.set(shadow, twin.text);
         const diags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
@@ -327,6 +504,16 @@ class HeldService implements ServiceEngine {
       } finally {
         this.engine.set(shadow, view.ov.text);
       }
+    }
+    if (this.regate.size > 0) {
+      const pending = [...this.regate];
+      this.regate.clear();
+      this.commits = await this.deps.commits();
+      for (const [rel, ids] of pending) {
+        await this.gateFile(rel, false, ids);
+        this.setView(rel);
+      }
+      this.writePlaced();
     }
     if (this.needsGate) {
       this.needsGate = false;
@@ -359,6 +546,16 @@ function factStamp(root: string): string {
   }
 }
 
+async function factCommits(root: string): Promise<Record<string, string> | null> {
+  const store = await openFacts(root);
+  if (store === null) return null;
+  try {
+    return commitsOf(store.meta);
+  } finally {
+    store.close();
+  }
+}
+
 async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
@@ -376,6 +573,8 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
     ...(options.home === undefined ? {} : { home: options.home }),
     rows: options.rows ?? (() => factRows(options.root)),
     stamp: options.stamp ?? (() => factStamp(options.root)),
+    commits: options.commits ?? (() => factCommits(options.root)),
+    env,
   };
   return {
     async start(init: ServiceInit): Promise<StartResult> {
@@ -385,20 +584,20 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       fs.rmSync(out, { recursive: true, force: true });
       const shadow = await writeShadow(entry, init, out, env, options.home);
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
-      const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service);
-      if (mine.length === 0) {
-        const reason = "no_site_found";
+      const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service && row.direction === "response");
+      if (!mine.some((row) => (row.values?.length ?? 0) > 0)) {
         writePlaced(
           placedPath(options.root, init.service, options.home),
           init.service,
           [],
-          mine.map((row) => ({ label: row.label, file: row.file, reason })),
+          mine.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, file: row.file, reason: "no_values", group: g, position: null }))),
         );
         return { engine: new IdleService() };
       }
       const w = path.dirname(shadow.tsconfig);
       const engine = (options.makeEngine ?? ((command, cwd) => new Ts7Lsp(command, cwd)))(shadow.native_tsc, w);
-      const service = new HeldService(init, deps, engine, w, shadow.own_files);
+      const site = options.site ?? engineSiteFinder(entry, env, options.home);
+      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, checkWire(shadow.wire, shadow.tolerances.declarations));
       try {
         service.loadRows(mine);
         await service.gate(false);

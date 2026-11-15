@@ -95,6 +95,12 @@ export type ContractRow = {
   name: string | null;
   site: string | null;
   locator: "registration" | "call";
+  /**
+   * Producer rows (writer 8): where each reply's value is, in the file's text
+   * at the index commit (UTF-16 `[start, end)`, repo-relative). Absent on an
+   * older file; `[]` when the scan read none.
+   */
+  values?: Array<{ file: string; span: [number, number] }>;
   groups: ContractGroup[];
   untyped: Array<{ service: string; repo: string; file: string; line: number | null; reason: string }>;
   total: number;
@@ -399,6 +405,23 @@ const allOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean
 const someOf = (value: unknown, each: (entry: Record<string, unknown>) => boolean): boolean =>
   Array.isArray(value) && value.length > 0 && allOf(value, each);
 
+/** A contract row's `values`: each a file and a `[start, end)` span with `0 <= start < end`. Malformed, the row is skipped. */
+const isValues = (value: unknown): boolean =>
+  Array.isArray(value) &&
+  value.every((entry) => {
+    if (entry === null || typeof entry !== "object") return false;
+    const { file, span } = entry as Record<string, unknown>;
+    return (
+      isText(file) &&
+      Array.isArray(span) &&
+      span.length === 2 &&
+      Number.isInteger(span[0]) &&
+      Number.isInteger(span[1]) &&
+      Number(span[0]) >= 0 &&
+      Number(span[0]) < Number(span[1])
+    );
+  });
+
 /**
  * Whether a wire row carries every field its kind requires, each of the
  * wire's type (carrick-cloud `docs/internal/reference/edit-facts-wire.md`):
@@ -462,6 +485,7 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         isNameOrNull(raw["name"]) &&
         (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
         (raw["locator"] === "registration" || raw["locator"] === "call") &&
+        (raw["values"] === undefined || isValues(raw["values"])) &&
         Number.isInteger(raw["total"]) &&
         allOf(raw["untyped"], (entry) => isText(entry["repo"]) && isText(entry["file"]) && isLine(entry["line"])) &&
         Array.isArray(raw["groups"]) &&

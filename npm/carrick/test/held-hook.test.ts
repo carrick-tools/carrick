@@ -143,21 +143,21 @@ const edit = (ws: Ws, session: string, env: Record<string, string> = ON) =>
   patchEdit(ws, ws.at("api/src/tasks.ts"), [{ newStart: lineOf(ws.at("api/src/tasks.ts"), IN_LIST), lines: [`+  ${IN_LIST}`] }], { session, env });
 
 const ready = (lines: HeldLine[]): HeldAnswer => ({ state: "ready", lines, ms: 5 });
-const FORBIDDEN = /__C|\breg\d|\bO\d|__carrick_/;
+const FORBIDDEN = /__C|\bsend\d|\bO\d|__carrick_/;
 
-test("row 1: a break prints one line that replaces part 1's contract line, and the replaced line is not claimed", async (t) => {
+test("row 1 (K-c): a break prints one line IN ADDITION to part 1's contract line; both are claimed", async (t) => {
   const ws = await workspace(t);
   const daemon = await fakeDaemon(ws, ready([broken()]));
   t.after(() => daemon.close());
   const out = await edit(ws, "h1");
   const said = context(out.stdout);
   assert.ok(said.includes("Carrick: this edit breaks GET /tasks for web (src/tasks.ts:3): Type '{ name: string; }' is not assignable to type the type it expects."), said);
-  assert.ok(!said.includes("is called from"), said);
+  assert.ok(said.includes("is called from"), "part 1's line stays: " + said);
   assert.ok(!FORBIDDEN.test(said), said);
   assert.equal(daemon.requests.length, 1);
   assert.equal(daemon.requests[0]!["kind"], "edit");
   const claimed = [...factsSaid("h1", ws.home)];
-  assert.ok(!claimed.some((key) => key.startsWith("contract::")), claimed.join(" | "));
+  assert.ok(claimed.some((key) => key.startsWith("contract::")), claimed.join(" | "));
   assert.ok(claimed.some((key) => key.startsWith("held::") && key.includes(ROW_KEY)), claimed.join(" | "));
 });
 
@@ -316,7 +316,7 @@ test("a line is at most 300 characters on one line", () => {
 });
 
 test("a message that still names the check's machinery is not printed", () => {
-  for (const message of ["Property '__carrick_never' is missing", "Type 'x' is not assignable to type '__C.Pick2xx'", "Cannot find name 'reg3'"]) {
+  for (const message of ["Property '__carrick_never' is missing", "Type 'x' is not assignable to type '__C.Pick2xx'", "Cannot find name 'send3'"]) {
     assert.equal(renderHeldLine(broken({ message })), null, message);
   }
 });

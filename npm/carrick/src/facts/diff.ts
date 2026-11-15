@@ -40,7 +40,7 @@ export type DiffChange = { lines?: number[]; removed?: number[]; whole?: boolean
  * peer proof (`peers.ts`). In a partial clone, or a folder in no checkout, it
  * runs nothing and answers null.
  */
-export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env): string | null {
+export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env, budgetMs: number = factsGitBudgetMs(env)): string | null {
   const checkout = checkoutOf(dir);
   if (checkout === null || isPartialClone(checkout.top)) return null;
   // Four fixed variables, set after both spreads so neither the process env
@@ -49,7 +49,7 @@ export function gitFacts(dir: string, args: string[], env: NodeJS.ProcessEnv = p
   // and no credential prompt. A hook never uses the network. An explicit
   // `core.useReplaceRefs=true` (repo, global or env config) outranks
   // GIT_NO_REPLACE_OBJECTS, so the command line, read last, turns it off (R42.2).
-  return git(dir, ["-c", "core.useReplaceRefs=false", ...args], factsGitBudgetMs(env), {
+  return git(dir, ["-c", "core.useReplaceRefs=false", ...args], budgetMs, {
     ...process.env,
     ...env,
     GIT_NO_REPLACE_OBJECTS: "1",
@@ -100,6 +100,29 @@ export function factsGitBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
   return cooldownMs(env, "CARRICK_FACTS_DIFF_BUDGET_MS", DIFF_BUDGET_MS);
 }
 
+/** One `@@ -a,b +c,d @@` header: the line counts default to 1 when git omits them. */
+export type Hunk = { oldStart: number; oldCount: number; newStart: number; newCount: number };
+
+/** The hunk headers of a `git diff -U0` output, in order. The one reader of that header (here and the held check's offset map). */
+export function hunksOf(diff: string): Hunk[] {
+  return [...diff.matchAll(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)].map((h) => ({
+    oldStart: Number(h[1]),
+    oldCount: h[2] === undefined ? 1 : Number(h[2]),
+    newStart: Number(h[3]),
+    newCount: h[4] === undefined ? 1 : Number(h[4]),
+  }));
+}
+
+/** `file`'s text as `commit` held it, or null when git cannot say (no such commit or file, partial clone, over the budget). */
+export function textAtCommit(file: string, commit: string, env: NodeJS.ProcessEnv = process.env, budgetMs?: number): string | null {
+  return gitFacts(path.dirname(file), ["show", "--no-textconv", `${commit}:./${path.basename(file)}`], env, budgetMs);
+}
+
+/** `git diff -U0` of `file` on disk against `commit`: "" when it reads the same, null when git cannot say. */
+export function diffAgainst(file: string, commit: string, env: NodeJS.ProcessEnv = process.env, budgetMs?: number): string | null {
+  return gitFacts(path.dirname(file), ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", commit, "--", path.basename(file)], env, budgetMs);
+}
+
 /**
  * Where `file` differs from `HEAD`, or null when that is not known (or there
  * is no difference). An untracked file counts whole only when `created`: the
@@ -107,8 +130,7 @@ export function factsGitBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
  */
 export function changesAgainstHead(file: string, created: boolean, env: NodeJS.ProcessEnv = process.env): DiffChange | null {
   try {
-    const dir = path.dirname(file);
-    const out = gitFacts(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", "HEAD", "--", path.basename(file)], env);
+    const out = diffAgainst(file, "HEAD", env);
     if (out === null) return null;
     if (out === "") {
       // No difference from HEAD: a tracked file that reads the same, or one git does not track.
@@ -117,10 +139,7 @@ export function changesAgainstHead(file: string, created: boolean, env: NodeJS.P
     const lines: number[] = [];
     const removed: number[] = [];
     let changed = 0;
-    for (const header of out.matchAll(/^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm)) {
-      const was = header[1] === undefined ? 1 : Number(header[1]);
-      const start = Number(header[2]);
-      const now = header[3] === undefined ? 1 : Number(header[3]);
+    for (const { oldCount: was, newStart: start, newCount: now } of hunksOf(out)) {
       changed += was + now;
       if (changed > MAX_DIFF_LINES) return null;
       for (let at = 0; at < now; at += 1) lines.push(start + at);

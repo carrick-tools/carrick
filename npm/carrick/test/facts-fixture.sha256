@@ -1,2 +1,2 @@
-b5c6ded3d7693751ce3970585e22740d3d9c5d51d8036e7978d89cc8bb651339  edit-facts.s1.ndjson
-# carrick-cloud chain-c2b-rows at 3d2fc3886, lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 5 (with contract and chain rows)
+90879b70d3f938e05c23225bc7e8c853b80c33ef57520e9187b09a574ef5e2ad  edit-facts.s1.ndjson
+# carrick-cloud at bde372231 (#3545), lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 8 (producer contract rows carry values)

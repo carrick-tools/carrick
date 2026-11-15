@@ -1,49 +1,56 @@
-// Part 3, T4: place, arm and attribute. Pure functions, no engine and no disk.
+// Part 3, L1: place, map, arm and attribute. Pure functions, no engine and no disk.
 //
-// A producer response row says "this route's 2xx reply has type T". To ask the
-// compiler whether an edit breaks that, the registration call is wrapped in a
-// check, `__C.reg<k>(<call>, (o) => o)`, where `o` is the route framework's own
-// record of the handler's reply and the callback must return `O<k>`, the row's
-// stated type. The check text is appended to the file's end (`declare
-// namespace __C`), so no line moves.
+// A producer response row stores where each reply is sent from (the value
+// positions of its entry). To ask the compiler whether an edit breaks that, the
+// value is wrapped in place, `__C.send<n>_<g>(<value>, (o) => o)`: the call
+// returns the value, so the code around it types as before, and `o` is the
+// value on the wire (the judge's own wire rule, pasted from the compiler
+// engine) which the callback must return as `O<n>_<g>`, the stated type. `o`
+// is no fresh literal, so there is no excess-property check. The check text is
+// appended to the file's end (`declare namespace __C`), so no line moves.
 //
-// Three decisions live here:
-//   place     (D7)  which call is the row's site, on the CURRENT text
+// Four decisions live here:
+//   map       (V5)  where a stored value is on the CURRENT text
+//   place           the file with every value wrapped
 //   arm       (D6)  which checks may speak: clean passes, its twin fails
 //   attribute (R3)  which diagnostics are a check's own, and so may be a line
+//
+// Finding a node again after an edit that crosses its bounds is the compiler
+// engine's site finder, behind `SiteFinder`; nothing here parses a value.
 
 import ts from "typescript";
-import type { ContractGroup, ContractRow } from "../facts/store.ts";
+import { hunksOf } from "../facts/diff.ts";
 
-/** What the placer reads of a contract row (a subset of the fact store's row). */
-export type PlaceRow = Pick<ContractRow, "label" | "locator"> & {
-  id: number;
-  site: string | null;
-  line: number | null;
-  groups: Array<Pick<ContractGroup, "type">>;
-};
+/** One value's position: `[start, end)` in UTF-16 code units, never counting a leading BOM. */
+export type Value = { file: string; start: number; end: number };
+
+/** Why a value has no check. */
+export type ValueReason = "value_not_a_node" | "not_wrappable" | "value_edited";
+export type UnplacedReason = ValueReason | "javascript_file";
+
+/** One changed stretch of text: the old and the new bounds (BOM not counted). */
+export type Region = { oldStart: number; oldEnd: number; newStart: number; newEnd: number };
+
+/** What the compiler engine is asked: the node the old span named, in the new text. */
+export type SiteQuery = { file: string; oldText: string; newText: string; start: number; end: number };
+export type SiteAnswer = { start: number; end: number } | { reason: ValueReason };
+/** The compiler engine's site finder (the engine action beside `site-node.ts`); a fake in tests. */
+export type SiteFinder = (query: SiteQuery) => Promise<SiteAnswer>;
 
 /** A compiler diagnostic: its start offset in the checked text, its code, its message. */
 export type Diag = { start: number; code: number; message: string };
 
-export type UnplacedReason =
-  | "not_registration"
-  | "dispatch_case"
-  | "javascript_file"
-  | "no_site_found"
-  | "site_not_unique";
+export type UnarmedReason = "twin_passes" | "decl_error" | `clean_check_fails:TS${number}`;
 
-export type UnarmedReason = "twin_passes" | "decl_error" | "no_hono" | `clean_check_fails:TS${number}`;
-
-/** `no_hono` is a row's own reason too (the clean check names a non-route object). */
-export type RowReason = UnplacedReason | UnarmedReason;
+/** One (row, position) pair, numbered across the overlay, with one stated type per group. */
+export type CheckInput = { n: number; value: Value; groups: Array<{ type: string }> };
 
 export type Check = {
-  id: number;
+  n: number;
   group: number;
-  /** `<id>_<group>`; the check's alias is `O<k>`. */
+  /** `<n>_<group>`; the check's alias is `O<k>`. */
   k: string;
-  /** The whole check expression: `__C.reg<k>(` through `, (o) => o)`. */
+  /** The whole check expression: `__C.send<k>(` through `, (o) => o)`. */
   span: [number, number];
   /** The check's two declaration lines in the appended namespace. */
   declSpan: [number, number];
@@ -52,94 +59,134 @@ export type Check = {
 export type Overlay = {
   text: string;
   checks: Check[];
-  unplaced: Array<{ id: number; reason: UnplacedReason }>;
+  unplaced: Array<{ n: number; reason: UnplacedReason }>;
   /** Offset where the appended namespace starts. */
   bodyEnd: number;
 };
 
-const POST = ", (o) => o)";
-const OK = "200 | 201 | 202 | 203 | 204 | 205 | 206 | 207 | 208 | 226";
-const PREAMBLE = [
-  `  type Ok = ${OK};`,
-  "  type Pick2xx<E> = E extends { status: infer St; output: infer O } ? ([Extract<St, Ok>] extends [never] ? never : O) : never;",
-  '  type Out<R, P extends string, M extends string> = R extends import("hono").Hono<any, infer S extends import("hono").Schema, any>',
-  "    ? (P extends keyof S ? (`$${M}` extends keyof S[P] ? Pick2xx<S[P][`$${M}`]> : { readonly __carrick_no_method_in_route_schema: M })",
-  "      : { readonly __carrick_no_site_in_route_schema: P }) : { readonly __carrick_not_a_route_object: R };",
-];
+const BOM = 0xfeff;
+const stripBom = (text: string): string => (text.charCodeAt(0) === BOM ? text.slice(1) : text);
 
-const methodOf = (label: string): string => label.split(" ")[0]!.toLowerCase();
+/** One region, from the common prefix and suffix of the two texts. */
+export function regionOfEdit(oldText: string, newText: string): Region {
+  const a = stripBom(oldText);
+  const b = stripBom(newText);
+  const limit = Math.min(a.length, b.length);
+  let prefix = 0;
+  while (prefix < limit && a.charCodeAt(prefix) === b.charCodeAt(prefix)) prefix += 1;
+  let suffix = 0;
+  while (suffix < limit - prefix && a.charCodeAt(a.length - 1 - suffix) === b.charCodeAt(b.length - 1 - suffix)) suffix += 1;
+  return { oldStart: prefix, oldEnd: a.length - suffix, newStart: prefix, newEnd: b.length - suffix };
+}
 
-const scriptKind = (file: string): ts.ScriptKind => (file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+/** Where line `index` (0-based) starts; one past the last line is the text's end. TypeScript's own line map. */
+function lineStarts(text: string): (index: number) => number {
+  const sf = ts.createSourceFile("lines.ts", text, ts.ScriptTarget.Latest, false);
+  const last = sf.getLineAndCharacterOfPosition(text.length).line;
+  return (index) => (index > last ? text.length : sf.getPositionOfLineAndCharacter(index, 0));
+}
 
-/** One member call: the call node, its method name, and its first argument when that is a plain string. */
-type Call = { node: ts.CallExpression; name: string; literal: string | undefined };
-
-function memberCalls(sf: ts.SourceFile): Array<Call & { line: number }> {
-  const out: Array<Call & { line: number }> = [];
-  const visit = (n: ts.Node): void => {
-    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) {
-      const a0 = n.arguments[0];
-      const literal = a0 && (ts.isStringLiteral(a0) || ts.isNoSubstitutionTemplateLiteral(a0)) ? a0.text : undefined;
-      out.push({ node: n, name: n.expression.name.text, literal, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1 });
-    }
-    ts.forEachChild(n, visit);
-  };
-  visit(sf);
+/**
+ * `git diff -U0` line hunks turned into character regions, each narrowed by
+ * common prefix and suffix inside its hunk (a hunk replaces whole lines; the
+ * change is usually a few characters of them).
+ */
+export function regionsFromHunks(oldText: string, newText: string, diffU0: string): Region[] {
+  const a = stripBom(oldText);
+  const b = stripBom(newText);
+  const oldAt = lineStarts(a);
+  const newAt = lineStarts(b);
+  const out: Region[] = [];
+  for (const { oldStart: oldAt1, oldCount, newStart: newAt1, newCount } of hunksOf(diffU0)) {
+    // With nothing on a side, its start is the line BEFORE the change point.
+    const oldFirst = oldAt1 - 1 + (oldCount === 0 ? 1 : 0);
+    const newFirst = newAt1 - 1 + (newCount === 0 ? 1 : 0);
+    const oldStart = oldAt(oldFirst);
+    const oldEnd = oldAt(oldFirst + oldCount);
+    const newStart = newAt(newFirst);
+    const newEnd = newAt(newFirst + newCount);
+    const inner = regionOfEdit(a.slice(oldStart, oldEnd), b.slice(newStart, newEnd));
+    out.push({ oldStart: oldStart + inner.oldStart, oldEnd: oldStart + inner.oldEnd, newStart: newStart + inner.newStart, newEnd: newStart + inner.newEnd });
+  }
   return out;
 }
 
 /**
- * D7. The call that starts on the row's line, whose callee is the label's
- * method and whose first argument is the row's site literal. With none on that
- * line, the unique such call in the file. Two or more is never a guess.
+ * The text a check appends: the engine's wire declarations and its tolerance
+ * helpers (K-a: a receiver declared void states no contract; an absent body
+ * the receiver admits is dropped), composed into the one type a check's
+ * callback receives. Nothing here restates a rule: it only names the order
+ * the judge applies them in. The literal-widened tolerance reads an export
+ * of a scan's stub, so it cannot apply here.
  */
-export function findSite(sf: ts.SourceFile, row: Pick<PlaceRow, "label" | "site" | "line">): { node: ts.CallExpression } | { reason: UnplacedReason } {
-  if (row.site === null) return { reason: "no_site_found" };
-  const method = methodOf(row.label);
-  const same = memberCalls(sf).filter((c) => c.name === method && c.literal === row.site);
-  const onLine = same.filter((c) => c.line === row.line);
-  if (onLine.length === 1) return { node: onLine[0]!.node };
-  if (onLine.length > 1) return { reason: "site_not_unique" };
-  if (same.length === 1) return { node: same[0]!.node };
-  return { reason: same.length === 0 ? "no_site_found" : "site_not_unique" };
+export function checkWire(wire: string[], tolerances: string[]): string[] {
+  return [
+    ...wire,
+    ...tolerances,
+    "type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true ? E : __carrick_Wire<__carrick_AbsentBody<S, E>, E>;",
+  ];
+}
+
+const delta = (r: Region): number => r.newEnd - r.newStart - (r.oldEnd - r.oldStart);
+
+/**
+ * V5, the two arithmetic cases. A region meets the value when it touches
+ * `[start, end]`. None does: the value shifts by the regions before it. Every
+ * one that does lies strictly inside: the value keeps its bounds and grows or
+ * shrinks with them. Any other edit (one across a bound) is the engine's to
+ * place again: `"needs_site"`.
+ */
+export function mapValue(value: Value, regions: Region[]): Value | "needs_site" {
+  const meeting = regions.filter((r) => r.oldStart <= value.end && r.oldEnd >= value.start);
+  const before = regions.filter((r) => r.oldEnd < value.start).reduce((sum, r) => sum + delta(r), 0);
+  if (meeting.length === 0) return { file: value.file, start: value.start + before, end: value.end + before };
+  if (meeting.some((r) => r.oldStart <= value.start || r.oldEnd >= value.end)) return "needs_site";
+  const within = meeting.reduce((sum, r) => sum + delta(r), 0);
+  return { file: value.file, start: value.start + before, end: value.end + before + within };
+}
+
+/** `mapValue`, and for an edit across a bound the compiler engine's site finder on both texts. */
+export async function resolveValue(value: Value, regions: Region[], oldText: string, newText: string, find: SiteFinder): Promise<Value | ValueReason> {
+  const mapped = mapValue(value, regions);
+  if (mapped !== "needs_site") return mapped;
+  const answer = await find({ file: value.file, oldText, newText, start: value.start, end: value.end });
+  return "reason" in answer ? answer.reason : { file: value.file, start: answer.start, end: answer.end };
 }
 
 type Op = { at: number; s: string; side: "pre" | "post"; seq: number; start: number; end: number };
 
+const POST = ", (o) => o)";
+
 /**
- * The file with every placeable row's registration wrapped. `clean` states the
- * row's type; `twin` states it intersected with a property no reply has, so it
- * must fail where the check can see the reply at all.
+ * The file with every placeable value wrapped. `wire` is `checkWire`'s text (it holds
+ * `__carrick_Sent<S, E>`). `clean` states each
+ * group's type; `twin` states it intersected with a property no value has, so
+ * it must fail where the check can see the value at all.
  */
-export function overlay(file: string, text: string, rows: PlaceRow[], mode: "clean" | "twin"): Overlay {
+export function overlay(file: string, text: string, checks: CheckInput[], wire: string[], mode: "clean" | "twin"): Overlay {
   const unplaced: Overlay["unplaced"] = [];
   const js = /\.(?:[mc]?js|jsx)$/.test(file);
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, scriptKind(file));
+  const bom = text.charCodeAt(0) === BOM ? 1 : 0;
   const ops: Op[] = [];
-  const checks: Array<Check & { span: [number, number] }> = [];
+  const made: Check[] = [];
   const decls: string[] = [];
   let seq = 0;
-  for (const row of rows) {
-    if (row.locator !== "registration") { unplaced.push({ id: row.id, reason: "not_registration" }); continue; }
-    if (row.label.includes("{")) { unplaced.push({ id: row.id, reason: "dispatch_case" }); continue; }
-    if (js) { unplaced.push({ id: row.id, reason: "javascript_file" }); continue; }
-    const found = findSite(sf, row);
-    if (!("node" in found)) { unplaced.push({ id: row.id, reason: found.reason }); continue; }
-    const start = found.node.getStart(sf);
-    const end = found.node.end;
-    const method = methodOf(row.label);
-    row.groups.forEach((g, group) => {
-      const k = `${row.id}_${group}`;
+  for (const input of checks) {
+    if (js) { unplaced.push({ n: input.n, reason: "javascript_file" }); continue; }
+    const start = input.value.start + bom;
+    const end = input.value.end + bom;
+    input.groups.forEach((g, group) => {
+      const k = `${input.n}_${group}`;
       const stated = mode === "twin" ? `(${g.type}) & { readonly __carrick_never: true }` : `(${g.type})`;
       decls.push(`  type O${k} = ${stated};`);
-      decls.push(`  function reg${k}<R>(r: R, c: (o: Out<R, ${JSON.stringify(row.site)}, ${JSON.stringify(method)}>) => O${k}): R;`);
-      ops.push({ at: start, s: `__C.reg${k}(`, side: "pre", seq, start, end });
+      decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Sent<V, O${k}>) => O${k}): V;`);
+      ops.push({ at: start, s: `__C.send${k}(`, side: "pre", seq, start, end });
       ops.push({ at: end, s: POST, side: "post", seq, start, end });
       seq += 1;
-      checks.push({ id: row.id, group, k, span: [0, 0], declSpan: [0, 0] });
+      made.push({ n: input.n, group, k, span: [0, 0], declSpan: [0, 0] });
     });
   }
-  // Wraps at one offset must nest. Opening: the wider call first, later group outside.
+  // Wraps at one offset must nest. Opening: the wider value first, later group outside.
   // Closing: the mirror image. A close at an offset comes before an open there.
   ops.sort((a, b) => {
     if (a.at !== b.at) return a.at - b.at;
@@ -158,13 +205,13 @@ export function overlay(file: string, text: string, rows: PlaceRow[], mode: "cle
   }
   out += text.slice(last);
   const bodyEnd = out.length;
-  out += "\n" + ["declare namespace __C {", ...PREAMBLE, ...decls, "}"].join("\n") + "\n";
-  checks.forEach((c, i) => {
+  out += "\n" + ["declare namespace __C {", ...wire.map((l) => `  ${l}`), ...decls, "}"].join("\n") + "\n";
+  made.forEach((c, i) => {
     c.span = [pos.get(`${i}:pre`)!, pos.get(`${i}:post`)! + POST.length];
     const declAt = out.indexOf(`  type O${c.k} = `, bodyEnd);
-    c.declSpan = [declAt, out.indexOf("\n", out.indexOf(`function reg${c.k}<`, declAt))];
+    c.declSpan = [declAt, out.indexOf("\n", out.indexOf(`function send${c.k}<`, declAt))];
   });
-  return { text: out, checks, unplaced, bodyEnd };
+  return { text: out, checks: made, unplaced, bodyEnd };
 }
 
 const inside = (p: number, s: [number, number]): boolean => p >= s[0] && p <= s[1];
@@ -173,7 +220,7 @@ const names = (message: string, k: string): boolean => new RegExp(`\\bO${k}\\b`)
 /**
  * R3. A diagnostic is a check's own line only when its start lies in the
  * check's whole expression AND its message names the check's alias. Several
- * checks can share an expression (two groups of one row, a chain): the
+ * checks can share an expression (two groups of one value, a nest): the
  * narrowest that the message names wins. A diagnostic in a check's declaration
  * lines is that check's `decl_error`. Everything else is `outside`, and never
  * a line.
@@ -211,14 +258,14 @@ export function arm(
   ov: Overlay,
   clean: Diag[],
   twin: Diag[],
-): { armed: string[]; unarmed: Array<{ k: string; id: number; group: number; reason: UnarmedReason }> } {
+): { armed: string[]; unarmed: Array<{ k: string; n: number; group: number; reason: UnarmedReason }> } {
   const armed: string[] = [];
-  const unarmed: Array<{ k: string; id: number; group: number; reason: UnarmedReason }> = [];
+  const unarmed: Array<{ k: string; n: number; group: number; reason: UnarmedReason }> = [];
   for (const c of ov.checks) {
-    const no = (reason: UnarmedReason): void => { unarmed.push({ k: c.k, id: c.id, group: c.group, reason }); };
+    const no = (reason: UnarmedReason): void => { unarmed.push({ k: c.k, n: c.n, group: c.group, reason }); };
     if (clean.some((d) => inside(d.start, c.declSpan))) { no("decl_error"); continue; }
     const bad = speaks(c, clean);
-    if (bad) { no(bad.message.includes("__carrick_not_a_route_object") ? "no_hono" : `clean_check_fails:TS${bad.code}`); continue; }
+    if (bad) { no(`clean_check_fails:TS${bad.code}`); continue; }
     if (!speaks(c, twin)) { no("twin_passes"); continue; }
     armed.push(c.k);
   }

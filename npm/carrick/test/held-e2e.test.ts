@@ -1,15 +1,18 @@
-// The held compiler end to end (part 3, T5b): the real compiler engine action
-// writes the shadow, a real TypeScript 7 language server holds it, the real
-// placer arms two producer rows of a synthetic route service, and the daemon
-// answers edits. Fails, never skips, when the native compiler or the built
-// engine is missing. Every name here is invented.
+// The held compiler end to end (part 3, L2): the real compiler engine action
+// writes the shadow, a real TypeScript 7 language server holds it, and the
+// real placer arms checks at the send positions a producer row stores
+// (`values`), in three framework shapes (Hono-, Express- and Lambda-style).
+// Fails, never skips, when the native compiler or the built engine is missing.
+// Every name here is invented.
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { HeldDaemon, type HeldAnswer, type ServiceInit } from "../src/held/daemon.ts";
+import { renderHeldLine } from "../src/held/line.ts";
 import { createRuntime } from "../src/held/runtime.ts";
 import { placedPath } from "../src/held/paths.ts";
 import type { ContractRow } from "../src/facts/store.ts";
@@ -18,134 +21,267 @@ import { testDir } from "./helpers.ts";
 const SIDECAR = path.resolve(testDir, "..", "..", "..", "src", "sidecar");
 const FIXTURE = path.join(SIDECAR, "test", "fixtures", "held-node");
 
-const row = (id: number, label: string, site: string, line: number, type: string): ContractRow =>
-  ({
+type Value = { file: string; span: [number, number] };
+
+/** The `[start, end)` of `snippet`'s `nth` occurrence in `text`. */
+function spanOf(text: string, snippet: string, nth = 0): [number, number] {
+  let at = -1;
+  for (let i = 0; i <= nth; i++) at = text.indexOf(snippet, at + 1);
+  assert.ok(at >= 0, `no ${snippet} in the text`);
+  return [at, at + snippet.length];
+}
+
+const lineAt = (text: string, snippet: string): number => text.slice(0, text.indexOf(snippet)).split("\n").length;
+
+function row(label: string, file: string, type: string, values: Value[] | undefined): ContractRow {
+  return {
     side: "producer",
     protocol: "http",
     label,
     direction: "response",
     service: "orders-api",
     repo: "shop",
-    file: "src/orders.ts",
-    line,
+    file,
+    line: 1,
     name: null,
-    site,
-    locator: "registration",
-    groups: [{ type, places: [{ service: "web", repo: "shop", file: "web/a.ts", line: 3, loc: "web/a.ts:3" }] }],
+    site: null,
+    locator: "call",
+    ...(values === undefined ? {} : { values }),
+    groups: [{ type, symbol: null, places: [{ service: "web", repo: "shop", file: "web/a.ts", line: 3, loc: "web/a.ts:3" }] }],
     untyped: [],
     total: 1,
-  }) as unknown as ContractRow;
+  } as unknown as ContractRow;
+}
 
-const ROWS = [
-  row(0, "GET /orders", "/orders", 13, '{ total: number; a: "one"; b: "two" }'),
-  row(1, "POST /orders", "/orders", 14, "{ created: boolean }"),
-];
+type Placed = { armed: Array<{ label: string; file: string; position: number }>; unarmed: Array<{ label: string; reason: string }> };
 
-test("two rows arm on real TypeScript 7; a break is one line, a half-written edit none, moved lines stay armed", { timeout: 240_000 }, async (t) => {
+type Rig = {
+  root: string;
+  file: (rel: string) => string;
+  text: (rel: string) => string;
+  placed: () => Placed;
+  edit: (rel: string, text: string) => Promise<HeldAnswer>;
+  ask: (rel: string, kind?: "read" | "edit") => Promise<HeldAnswer>;
+};
+
+const git = (cwd: string, ...args: string[]): string =>
+  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim();
+
+/**
+ * A copy of the fixture, committed (the index commit), then `before` changes
+ * the files on disk, then the daemon starts over `rowsOf(texts at the commit)`.
+ */
+async function rig(
+  t: { after: (fn: () => void | Promise<void>) => void },
+  rowsOf: (text: (rel: string) => string) => ContractRow[],
+  before: (root: string) => void = () => undefined,
+): Promise<Rig> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-e2e-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
   const home = path.join(dir, "home");
   fs.cpSync(FIXTURE, root, { recursive: true, dereference: true });
-  const orders = path.join(root, "src", "orders.ts");
   // `total` takes its type from the helper, so a change to the helper alone reaches the route.
+  const orders = path.join(root, "src", "orders.ts");
   fs.writeFileSync(orders, fs.readFileSync(orders, "utf8").replace("const total: number =", "const total ="));
-  const helper = path.join(root, "src", "helper.ts");
-  const helperOriginal = fs.readFileSync(helper, "utf8");
-  const original = fs.readFileSync(orders, "utf8");
+  git(root, "init", "-q");
+  git(root, "add", "-A");
+  git(root, "commit", "-q", "-m", "index");
+  const commit = git(root, "rev-parse", "HEAD");
+  const committed = (rel: string): string => fs.readFileSync(path.join(root, rel), "utf8");
+  const rows = rowsOf(committed);
+  before(root);
   const init: ServiceInit = { repo: "shop", service: "orders-api", repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
   const env = { ...process.env, CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
-  let current = ROWS;
-  let stampValue = "fixed";
   const runtime = createRuntime({
     root,
     home,
     env,
     entry: path.join(SIDECAR, "dist", "src", "index.js"),
-    rows: async () => current,
-    stamp: () => stampValue,
+    rows: async () => rows,
+    commits: async () => ({ shop: commit }),
+    stamp: () => "fixed",
   });
   const daemon = new HeldDaemon({ root, home, env, programs: async () => [init], runtime });
   t.after(() => daemon.close());
-
   let session = 0;
-  const ask = (kind: "read" | "edit"): Promise<HeldAnswer> =>
-    daemon.handle({ session: `s${session++}`, files: [orders], kind, edited_at: Date.now() });
-  const edit = async (text: string): Promise<HeldAnswer> => {
-    fs.writeFileSync(orders, text);
+  const file = (rel: string): string => path.join(root, rel);
+  const ask = (rel: string, kind: "read" | "edit" = "edit"): Promise<HeldAnswer> => daemon.handle({ session: `s${session++}`, files: [file(rel)], kind, edited_at: Date.now() });
+  const edit = async (rel: string, text: string): Promise<HeldAnswer> => {
+    fs.writeFileSync(file(rel), text);
     // Bump the mtime past the filesystem's resolution.
     const later = new Date(Date.now() + 5000 * (session + 1));
-    fs.utimesSync(orders, later, later);
-    return ask("edit");
+    fs.utimesSync(file(rel), later, later);
+    return ask(rel);
   };
-
   // The first request starts the engine and answers cold; wait for it to be ready.
-  assert.equal((await ask("read")).state, "cold");
+  assert.equal((await ask("src/orders.ts", "read")).state, "cold");
   let ready: HeldAnswer | null = null;
   for (let i = 0; i < 200 && ready === null; i++) {
     await new Promise((resolve) => setTimeout(resolve, 500));
-    const answer = await ask("edit");
+    const answer = await ask("src/orders.ts");
     if (answer.state === "ready") ready = answer;
   }
   assert.ok(ready, "the engine never became ready");
-  assert.deepEqual(ready.lines, [], "the unedited file says nothing");
+  return {
+    root,
+    file,
+    text: (rel) => fs.readFileSync(file(rel), "utf8"),
+    placed: () => JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8")) as Placed,
+    edit,
+    ask,
+  };
+}
 
-  // Both rows armed: the gate's record names them.
-  const placed = JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8")) as { armed: Array<{ label: string }>; unarmed: unknown[] };
-  assert.deepEqual(placed.armed.map((a) => a.label).sort(), ["GET /orders", "POST /orders"]);
-  assert.deepEqual(placed.unarmed, []);
+const ORDERS = "src/orders.ts";
+const EXPRESS = "src/express-orders.ts";
+const LAMBDA = "src/lambda.ts";
+const SHARED = "src/shared-send.ts";
 
-  // A member the row's type requires is gone: exactly one line, naming the route.
-  const broken = await edit(original.replace("c.json({ total, a, b })", "c.json({ a, b })"));
-  assert.equal(broken.state, "ready");
-  assert.equal(broken.lines.length, 1, JSON.stringify(broken.lines));
-  assert.equal(broken.lines[0]!.label, "GET /orders");
-  assert.equal(broken.lines[0]!.file, "src/orders.ts");
+const rows = (text: (rel: string) => string): ContractRow[] => [
+  row("GET /orders", ORDERS, '{ total: number; a: "one"; b: "two" }', [{ file: ORDERS, span: spanOf(text(ORDERS), "{ total, a, b }") }]),
+  row("POST /orders", ORDERS, "{ created: boolean }", [{ file: ORDERS, span: spanOf(text(ORDERS), "{ created: true }") }]),
+  row("GET /express/orders", EXPRESS, "{ orders: string[]; total: number }", [{ file: EXPRESS, span: spanOf(text(EXPRESS), "{ orders, total }") }]),
+  row("GET /express/order", EXPRESS, "{ id: string; settled: boolean; placedAt: string }", [{ file: EXPRESS, span: spanOf(text(EXPRESS), "{ id, settled, placedAt }") }]),
+  row("GET /express/pick", EXPRESS, "{ n: number }", [
+    { file: EXPRESS, span: spanOf(text(EXPRESS), "{ n: 1 }") },
+    { file: EXPRESS, span: spanOf(text(EXPRESS), "{ n: 2 }") },
+  ]),
+  row("POST /lambda", LAMBDA, "{ ok: boolean; count: number }", [{ file: LAMBDA, span: spanOf(text(LAMBDA), "payload", 1) }]),
+  // The send is in another file than the route.
+  row("GET /shared", ORDERS, "{ label: string }", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
+  // A receiver declared void or undefined states no contract (K-a): its check arms (clean passes) and never speaks, so a break of the value it shares with the row above is still one line.
+  row("GET /void", ORDERS, "undefined", [{ file: SHARED, span: spanOf(text(SHARED), "{ label }") }]),
+  // A request-direction row is never placed, whatever it carries.
+  { ...row("POST /request-side", ORDERS, "{ a: number }", [{ file: ORDERS, span: spanOf(text(ORDERS), "{ created: true }") }]), direction: "request" } as ContractRow,
+  // A send in a file outside the program the compiler engine loaded (case row 10).
+  row("GET /ghost", ORDERS, "{ a: number }", [{ file: "docs/ghost.ts", span: [0, 5] }]),
+  // A writer-7 row (no `values`) and one whose scan read none.
+  row("GET /legacy", ORDERS, "{ a: number }", undefined),
+  row("GET /unread", ORDERS, "{ a: number }", []),
+];
 
-  // Restored: silent again (the twin pass of the last answer left clean text).
-  assert.deepEqual((await edit(original)).lines, []);
+const MACHINERY = /__C|\bsend\d|\bO\d+_\d+|__carrick_/;
 
-  // Half-written inside the handler: a syntax error is never a line.
-  const half = await edit(original.replace("c.json({ total, a, b })", "c.json({ total: orders., a, b })"));
+test("three framework shapes arm on real TypeScript 7; a break is one line at the send, a half-written edit none, moved lines stay armed", { timeout: 300_000 }, async (t) => {
+  const r = await rig(t, rows);
+  const original = Object.fromEntries([ORDERS, EXPRESS, LAMBDA, SHARED].map((rel) => [rel, r.text(rel)]));
+
+  // (a) every row with values arms; the two without say why and stay silent.
+  const placed = r.placed();
+  assert.deepEqual(
+    placed.armed.map((a) => `${a.label}#${a.position}`).sort(),
+    ["GET /express/order#0", "GET /express/orders#0", "GET /express/pick#0", "GET /express/pick#1", "GET /orders#0", "GET /shared#0", "GET /void#0", "POST /lambda#0", "POST /orders#0"],
+  );
+  assert.deepEqual(placed.unarmed.map((u) => `${u.label}:${u.reason}`).sort(), ["GET /ghost:value_outside_service", "GET /legacy:no_values", "GET /unread:no_values"]);
+  assert.ok(![...placed.armed, ...placed.unarmed].some((p) => p.label === "POST /request-side"), "a request-side row is ignored");
+  assert.deepEqual(placed.armed.find((a) => a.label === "GET /shared")!.file, SHARED);
+  assert.deepEqual((await r.ask(ORDERS)).lines, [], "the unedited file says nothing");
+
+  // (b) removing a required member from each shape: exactly one line, at the send's line.
+  const breaks: Array<{ rel: string; from: string; to: string; label: string; at: string }> = [
+    { rel: ORDERS, from: "c.json({ total, a, b })", to: "c.json({ a, b })", label: "GET /orders", at: "c.json({ a, b })" },
+    { rel: EXPRESS, from: "res.json({ orders, total })", to: "res.json({ orders })", label: "GET /express/orders", at: "res.json({ orders })" },
+    { rel: LAMBDA, from: "payload: { ok: boolean; count: number }", to: "payload: { ok: boolean }", label: "POST /lambda", at: "JSON.stringify(payload)" },
+    { rel: SHARED, from: "res.json({ label })", to: "res.json({ label: 1 })", label: "GET /shared", at: "res.json({ label: 1 })" },
+  ];
+  for (const b of breaks) {
+    const next = original[b.rel]!.replace(b.from, b.to);
+    const answer = await r.edit(b.rel, next);
+    assert.equal(answer.state, "ready");
+    assert.equal(answer.lines.length, 1, `${b.label}: ${JSON.stringify(answer.lines)}`);
+    assert.equal(answer.lines[0]!.label, b.label);
+    assert.equal(answer.lines[0]!.file, b.label === "GET /shared" ? SHARED : b.rel);
+    assert.equal(answer.lines[0]!.line, lineAt(next, b.at), b.label);
+    const said = renderHeldLine(answer.lines[0]!);
+    assert.ok(said, `${b.label}: the line is printable: ${answer.lines[0]!.message}`);
+    assert.ok(!MACHINERY.test(said.text), said.text);
+    assert.deepEqual((await r.edit(b.rel, original[b.rel]!)).lines, [], `${b.label}: restored`);
+  }
+
+  // (c) half-written inside a send: a syntax error is never a line.
+  const half = await r.edit(EXPRESS, original[EXPRESS]!.replace("{ orders, total }", "{ orders, total: orders. }"));
   assert.equal(half.state, "ready");
   assert.deepEqual(half.lines, []);
+  assert.deepEqual((await r.edit(EXPRESS, original[EXPRESS]!)).lines, []);
 
-  // A comment line above both routes moves them: both stay armed (site-literal fallback).
-  const moved = "// moved\n" + original;
-  assert.deepEqual((await edit(moved)).lines, []);
-  const movedBroken = await edit(moved.replace("c.json({ total, a, b })", "c.json({ a, b })"));
+  // (d) a comment line above shifts every send; they stay armed and a break is still one line.
+  const moved = "// moved\n" + original[EXPRESS]!;
+  assert.deepEqual((await r.edit(EXPRESS, moved)).lines, []);
+  const movedBroken = await r.edit(EXPRESS, moved.replace("res.json({ orders, total })", "res.json({ orders })"));
   assert.equal(movedBroken.lines.length, 1, JSON.stringify(movedBroken.lines));
-  assert.equal(movedBroken.lines[0]!.label, "GET /orders");
+  assert.equal(movedBroken.lines[0]!.line, lineAt(moved, "res.json({ orders, total })"));
+  await r.edit(EXPRESS, original[EXPRESS]!);
+
+  // (e) a rename whose two edits sit on lines apart, the second inside the value: the one-region move across the
+  // value's bound cannot place it again (`find_site` matches the value's old text, which changed), so that answer
+  // is silent for this row; the gate then reads the two hunks against the index commit and places it again. It is
+  // NOT "armed with no line, in place": a break made in this same edit would be missed (see the PR body).
+  const renamed = original[EXPRESS]!.replace("const orders = list", "const kept = list").replace("{ orders, total }", "{ orders: kept, total }");
+  assert.deepEqual((await r.edit(EXPRESS, renamed)).lines, []);
+  // Time passes (the agent's turn): the gate after the answer runs. An edit written at once would be applied first,
+  // and the gate waits for the next answer instead of gating text the answer has not seen.
+  await r.ask(EXPRESS);
+  assert.deepEqual((await r.edit(EXPRESS, renamed.replace("{ orders: kept, total }", "{ orders: kept }"))).lines.map((l) => l.label), ["GET /express/orders"], "armed again after the gate");
+  await r.edit(EXPRESS, original[EXPRESS]!);
+
+  // (h) a `Date` value against `string` arms (the wire form); (j) breaking each member prints a line without machinery.
+  for (const [from, to] of [["id: string", "id: number"], ["settled: boolean", "settled: string"], ["placedAt: Date", "placedAt: number"]] as const) {
+    const answer = await r.edit(EXPRESS, original[EXPRESS]!.replace(from, to));
+    assert.equal(answer.lines.length, 1, `${to}: ${JSON.stringify(answer.lines)}`);
+    assert.equal(answer.lines[0]!.label, "GET /express/order");
+    const said = renderHeldLine(answer.lines[0]!);
+    assert.ok(said, `${to}: ${answer.lines[0]!.message}`);
+    assert.ok(!MACHINERY.test(said.text), said.text);
+    await r.edit(EXPRESS, original[EXPRESS]!);
+  }
+
+  // (i) a route with two sends: breaking either gives a line, at that send; both give one line.
+  for (const [snippet, other] of [["{ n: 1 }", "{ n: 2 }"], ["{ n: 2 }", "{ n: 1 }"]] as const) {
+    const next = original[EXPRESS]!.replace(snippet, '{ n: "x" }');
+    const answer = await r.edit(EXPRESS, next);
+    assert.equal(answer.lines.length, 1, JSON.stringify(answer.lines));
+    assert.equal(answer.lines[0]!.line, lineAt(next, '{ n: "x" }'), other);
+    await r.edit(EXPRESS, original[EXPRESS]!);
+  }
+  // Breaking the second send too, in a second edit, still says one line: the first broken send's.
+  const first = original[EXPRESS]!.replace("{ n: 1 }", '{ n: "x" }');
+  assert.equal((await r.edit(EXPRESS, first)).lines.length, 1);
+  const both = await r.edit(EXPRESS, first.replace("{ n: 2 }", '{ n: "y" }'));
+  assert.equal(both.lines.length, 1, JSON.stringify(both.lines));
+  assert.equal(both.lines[0]!.line, lineAt(first, '{ n: "x" }'), "the first broken send is named");
+  await r.edit(EXPRESS, original[EXPRESS]!);
 
   // A file the hook never named changes on disk behind the daemon (a checkout, a
   // formatter): it is synced before the answer, and the route it reaches speaks.
-  fs.writeFileSync(orders, original);
+  const helper = path.join(r.root, "src", "helper.ts");
+  const helperOriginal = fs.readFileSync(helper, "utf8");
   fs.writeFileSync(helper, helperOriginal.replace('Number(process.env.LIMIT ?? "10")', '"ten"'));
-  const later = new Date(Date.now() + 60_000);
+  const later = new Date(Date.now() + 90_000);
   fs.utimesSync(helper, later, later);
-  const drift = await ask("edit");
+  const drift = await r.ask(ORDERS);
   assert.equal(drift.lines.length, 1, JSON.stringify(drift.lines));
   assert.equal(drift.lines[0]!.label, "GET /orders");
   fs.writeFileSync(helper, helperOriginal);
-  const back = new Date(Date.now() + 120_000);
+  const back = new Date(Date.now() + 180_000);
   fs.utimesSync(helper, back, back);
-  assert.deepEqual((await ask("edit")).lines, []);
+  assert.deepEqual((await r.edit(EXPRESS, r.text(EXPRESS).replace("res.json({ orders })", "res.json({ orders, total })"))).lines, []);
+});
 
-  // The fact file moves and a row's stated type changes to one the route does
-  // not have: the row is gated again (in the background) and is unarmed, with
-  // its reason saved, while the other row stays armed.
-  fs.writeFileSync(orders, original);
-  current = [ROWS[0]!, row(1, "POST /orders", "/orders", 14, "{ created: string }")];
-  stampValue = "moved";
-  type Placed = { armed: Array<{ label: string }>; unarmed: Array<{ label: string; reason: string }> };
-  let regated: Placed | null = null;
-  for (let i = 0; i < 60 && regated === null; i++) {
-    await ask("edit");
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const now: Placed = JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8"));
-    if (now.unarmed.length > 0) regated = now;
-  }
-  assert.ok(regated, "the changed row was never gated again");
-  assert.deepEqual(regated.armed.map((a) => a.label), ["GET /orders"]);
-  assert.match(regated.unarmed[0]!.reason, /^clean_check_fails:TS\d+$/);
+test("an uncommitted change made before the engine starts still places (the hunk map); a row without values is silent", { timeout: 300_000 }, async (t) => {
+  const r = await rig(t, rows, (root) => {
+    // Lines added above both sends and a rename, none committed: the stored spans are the committed text's.
+    const file = path.join(root, EXPRESS);
+    fs.writeFileSync(file, "// one\n// two\n" + fs.readFileSync(file, "utf8").replace("const orders = list", "const orders = [...list]"));
+  });
+  const armed = r.placed().armed.map((a) => a.label);
+  assert.ok(armed.includes("GET /express/orders"), armed.join(", "));
+  assert.ok(armed.includes("GET /express/pick"), armed.join(", "));
+  const next = r.text(EXPRESS).replace("res.json({ orders, total })", "res.json({ orders })");
+  const answer = await r.edit(EXPRESS, next);
+  assert.equal(answer.lines.length, 1, JSON.stringify(answer.lines));
+  assert.equal(answer.lines[0]!.line, lineAt(next, "res.json({ orders })"));
+  // (g) the writer-7 row.
+  assert.ok(r.placed().unarmed.some((u) => u.label === "GET /legacy" && u.reason === "no_values"));
+  assert.deepEqual((await r.edit(EXPRESS, r.text(EXPRESS).replace("res.json({ orders })", "res.json({ orders, total })"))).lines, []);
 });
