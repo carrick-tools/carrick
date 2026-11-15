@@ -224,7 +224,7 @@ async function resultFor(absFile: string): Promise<CheckResult | null> {
   const key = path.resolve(absFile);
   const cached = lastCheck.get(key);
   if (cached) return cached;
-  const outcome = await check(relative(absFile), { cwd: root });
+  const outcome = await check(relative(absFile), { cwd: root, workspace: root });
   if (!outcome.result) {
     log("no answer for", relative(absFile), outcome.failure ?? "");
     return null;

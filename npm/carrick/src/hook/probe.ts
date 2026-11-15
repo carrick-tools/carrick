@@ -56,6 +56,7 @@ export async function probeEdits(
   const probeEnv = { ...env, CARRICK_RECHECK_BUDGET_MS: String(backgroundCapMs(env)) };
   const options = {
     cwd,
+    workspace: cwd,
     env: probeEnv,
     recheck: true as const,
     noRescan: true,

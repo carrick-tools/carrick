@@ -42,7 +42,7 @@ async function checkRead(file: string, root: string, session: string | undefined
   const { renderPostRead } = await import("../render.ts");
   const relative = path.relative(root, file);
   const env = { ...process.env, CARRICK_TIMEOUT_MS: process.env["CARRICK_TIMEOUT_MS"] ?? CHECK_TIMEOUT_MS };
-  const outcome = await check(relative, { cwd: root, env });
+  const outcome = await check(relative, { cwd: root, workspace: root, env });
   if (session) markRead(session, file);
   if (!outcome.result) {
     log("no answer for", relative, outcome.failure ?? "");
