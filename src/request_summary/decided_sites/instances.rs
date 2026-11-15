@@ -1240,9 +1240,6 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
         if self.library_call(host.file, host.call) && self.passes(&host) {
             return;
         }
-        if self.library_call(host.file, host.call) && self.made_by_member(&host, &at) {
-            return;
-        }
         let labels: Vec<&'w ScopeLabel> = self
             .scopes
             .iter()
