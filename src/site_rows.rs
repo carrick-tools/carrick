@@ -406,6 +406,14 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
                     *out.untraced
                         .entry("procedure_unserved".to_string())
                         .or_default() += 1;
+                } else if let Ok(method) = forced_method(record) {
+                    // The scan saved this site as unread: a removed row it
+                    // may serve is a guess, as for an unread HTTP route.
+                    out.guessed.push(GuessedRoute {
+                        file: site.file.clone(),
+                        line: site.line,
+                        method: method.to_uppercase(),
+                    });
                 }
                 continue;
             }

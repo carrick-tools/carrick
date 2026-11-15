@@ -112,7 +112,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `trpc-adapter-mount-moved-with-client` (`rpc-shelf`) | adapter `/api/rpc` to `/rpc`, client `url` with it | three new under `/rpc`, three removed under `/api/rpc`, no risk | passes |
 | `trpc-adapter-mount-moved-client-stale` (`rpc-shelf`) | adapter moves, client `url` stays | the delta rows; the correct check fails (the client now misses the mount) | stage test passes; `_marking` ignored, carrick#3778 |
 | `trpc-router-binding-renamed` (`rpc-shelf`) | `appRouter` to `shopRouter`, alias and client import with it | empty delta, no risk | passes |
-| `trpc-router-rewritten-unread` (`rpc-shelf`) | the `shelf` keys written as computed keys the reader cannot read | the correct check sees no change; main posts three removed rows | stage test passes; `_marking` ignored, carrick#3778 |
+| `trpc-router-rewritten-unread` (`rpc-shelf`) | the `shelf` keys written as computed keys the reader cannot read | the correct check sees no change; the three removed rows are candidates, not posted | passes |
 | `graphql-field-added` | `OrderView` gains nullable `note` (schema, resolver type, the answer's resolver line) | no introduced risk, no call left without a producer, empty delta | passes (carrick#3172) |
 | `graphql-root-added` | a root query `orders` no client calls | as above; delta new `QUERY orders` | passes (carrick#3172) |
 | `graphql-resolver-body` | the `order` resolver's body | as above, empty delta | passes (carrick#3172) |
