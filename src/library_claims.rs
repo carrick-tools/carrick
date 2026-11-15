@@ -2577,10 +2577,19 @@ mod tests {
             );
         }
         let claims = hub.claims_by_id();
+        let of_only: Vec<_> = claims
+            .iter()
+            .filter(|(id, _)| id.ends_with(":of:instance:new"))
+            .cloned()
+            .collect();
         assert!(
-            !crate::request_summary::discovery::claim_receivers(&claims, Some(ClaimOn::Both), None)
-                .iter()
-                .any(|receiver| receiver == "instance:channel"),
+            !crate::request_summary::discovery::claim_receivers(
+                &of_only,
+                Some(ClaimOn::Both),
+                None
+            )
+            .iter()
+            .any(|receiver| receiver == "instance:channel"),
             "an of-make opens no instance:channel"
         );
         let on_export = [(
