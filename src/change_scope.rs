@@ -690,13 +690,43 @@ pub fn decide(
     dependencies: impl FnOnce(&ServiceInputs) -> DependencyReach,
     inputs: impl FnOnce() -> ServiceInputs,
 ) -> Scope {
+    let stored = match stored_gate(stored, this_run, config_json) {
+        Ok(stored) => stored,
+        Err(analysed) => return analysed,
+    };
+    decide_change(
+        &stored.commit_hash,
+        changed,
+        version_only,
+        gitignore_moves,
+        keeps_imports,
+        dependencies,
+        inputs,
+    )
+}
+
+/// The part of [`decide`] that reads the stored blob alone: `Err` with why
+/// the service is analysed whatever changed (no blob, another scanner or
+/// cache, read from uncommitted changes, owed work, another config), else
+/// the blob [`decide_change`] judges from. A check that stands kept copies
+/// in for a `--changed-only` scan asks it of every service the change does
+/// not reach (`local_mode::recheck`), so both answer "what does this scan
+/// read again" with one rule.
+pub fn stored_gate<'a>(
+    stored: Option<&'a CloudRepoData>,
+    this_run: ThisRun<'_>,
+    config_json: Option<&str>,
+) -> Result<&'a CloudRepoData, Scope> {
     let Some(stored) = stored else {
-        return Scope::analysed(Reason::NoStored, "no stored index for this service");
+        return Err(Scope::analysed(
+            Reason::NoStored,
+            "no stored index for this service",
+        ));
     };
     let other_release =
         this_run.asks_model && stored.scanner_version.as_deref() != Some(this_run.scanner_version);
     if other_release || stored.cache_version != Some(this_run.cache_version) {
-        return Scope::analysed(
+        return Err(Scope::analysed(
             Reason::OtherScanner,
             format!(
                 "stored by Carrick {} with cache {}, this run is Carrick {} with cache {}",
@@ -710,32 +740,24 @@ pub fn decide(
                 this_run.scanner_version,
                 this_run.cache_version
             ),
-        );
+        ));
     }
     if stored.dirty == Some(true) {
-        return Scope::analysed(
+        return Err(Scope::analysed(
             Reason::StoredDirty,
             "the stored index was read from uncommitted changes",
-        );
+        ));
     }
     if let Some(owed) = owed_work(stored, this_run) {
-        return Scope::analysed(Reason::StoredIncomplete, owed);
+        return Err(Scope::analysed(Reason::StoredIncomplete, owed));
     }
     if stored.config_json.as_deref() != config_json {
-        return Scope::analysed(
+        return Err(Scope::analysed(
             Reason::ConfigChanged,
             "its carrick.json entry differs from the stored one",
-        );
+        ));
     }
-    decide_change(
-        &stored.commit_hash,
-        changed,
-        version_only,
-        gitignore_moves,
-        keeps_imports,
-        dependencies,
-        inputs,
-    )
+    Ok(stored)
 }
 
 /// The part of [`decide`] that reads the change since `commit`: carried at

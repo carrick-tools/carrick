@@ -27,6 +27,9 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/signed_in.rs"]
+mod signed_in;
+
 fn carrick() -> &'static str {
     env!("CARGO_BIN_EXE_carrick")
 }
@@ -254,12 +257,6 @@ fn observe(
         .as_object_mut()
         .expect("an object")
         .remove("elapsed_ms");
-    // How the answer was reached: the JSON run follows the text run on the
-    // same tree, so it may join the copies the text run kept (`current`) or
-    // re-scan when the join cannot stand for it (`ran`).
-    for repo in payload["repos"].as_array_mut().into_iter().flatten() {
-        repo.as_object_mut().expect("a repo").remove("rescan");
-    }
 
     let mut log = String::new();
     for path in files_under(&root.join("home/.carrick/logs"), "log") {
@@ -835,6 +832,7 @@ fn indexed_and_edited() -> tempfile::TempDir {
     let route = root.join("mono/apps/api/app/routes/api.v1.widgets.$widgetId.ts");
     edit(&route, "activeCount: number", "active: number");
     edit(&route, "activeCount: 3", "active: 3");
+    signed_in::sign_in(root, "one");
     workspace
 }
 
