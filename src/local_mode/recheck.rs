@@ -1134,7 +1134,22 @@ fn current_copy(
     if reads_outside {
         return None;
     }
-    read_working(workspace, generation, service, digest?).filter(|copy| copy.whole)
+    read_working(workspace, generation, service, digest?).filter(|copy| {
+        copy.whole
+            && !std::iter::once(&copy.blob)
+                .chain(&copy.carried)
+                .any(read_short)
+    })
+}
+
+/// Whether the scan that wrote `blob` was short of an answer a re-scan now
+/// may get: the library store or the model's replayed answers. Such a copy
+/// never stands in for a re-scan; the re-scan says what is missing, or
+/// reads it.
+fn read_short(blob: &crate::cloud_storage::CloudRepoData) -> bool {
+    blob.boundary.as_ref().is_some_and(|boundary| {
+        boundary.library_ask_failed.is_some() || boundary.model_answers_unavailable.is_some()
+    })
 }
 
 /// Write one service's copy where [`read_working`] finds it.
@@ -1991,6 +2006,9 @@ pub(super) fn rejoin(
             if let Some(set) = repo_copies.current(workspace, &repo_copies.reached()) {
                 sets.insert(name.clone(), set);
             }
+            // What `--changed` keeps is never whole, walked or not: only the
+            // per-edit re-check's copies stand in for a re-scan.
+            repo_copies.walked = false;
         }
         copies.insert(name, repo_copies);
     }
