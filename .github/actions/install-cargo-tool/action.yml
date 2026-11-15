@@ -2,9 +2,14 @@ name: Install a cargo tool (CI)
 description: >
   Puts a pinned cargo tool on PATH from the Actions cache. On a miss it
   compiles the tool from crates.io and saves it to the cache, so later runs
-  are a restore. It never reads GitHub release downloads: on 2026-11-08 those
-  returned 504 for hours, and taiki-e/install-action (which reads them) hung
-  test shards for 20+ minutes at "Install cargo-nextest".
+  are a restore. A caller may also pass a pinned prebuilt tarball and its
+  sha256: the action then tries that download first (short timeouts, one
+  retry, checksum verified) and falls back to the cache and compile path when
+  it fails. A merge_group ref cannot read the cache a PR saved, so the compile
+  path cost 3-4 minutes there (carrick#4565). Release downloads are only ever
+  the fast path: on 2026-11-08 they returned 504 for hours, and
+  taiki-e/install-action (which depends on them) hung test shards for 20+
+  minutes at "Install cargo-nextest".
 inputs:
   crate:
     description: crates.io package name, e.g. cargo-nextest.
@@ -12,18 +17,50 @@ inputs:
   version:
     description: Exact version to install.
     required: true
+  prebuilt-url:
+    description: Optional pinned release tarball (x86_64 Linux) holding the tool binary at its top level.
+    required: false
+    default: ""
+  prebuilt-sha256:
+    description: sha256 of that tarball, from the publisher's checksum file. Required with prebuilt-url.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
+    - name: Download prebuilt ${{ inputs.crate }} ${{ inputs.version }}
+      id: prebuilt
+      if: inputs.prebuilt-url != ''
+      shell: bash
+      env:
+        CRATE: ${{ inputs.crate }}
+        VERSION: ${{ inputs.version }}
+        URL: ${{ inputs.prebuilt-url }}
+        SHA256: ${{ inputs.prebuilt-sha256 }}
+      run: |
+        set -uo pipefail
+        root="$HOME/.cache/ci-tools/$CRATE-$VERSION"
+        tmp="$(mktemp -d)"
+        if curl -fsSL --connect-timeout 5 --max-time 30 --retry 1 -o "$tmp/tool.tgz" "$URL" \
+          && echo "$SHA256  $tmp/tool.tgz" | sha256sum -c - \
+          && mkdir -p "$root" && tar -xzf "$tmp/tool.tgz" -C "$root" "$CRATE"; then
+          echo "installed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::prebuilt $CRATE $VERSION unavailable or failed its checksum; building from crates.io"
+          rm -rf "$root"
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Restore ${{ inputs.crate }} ${{ inputs.version }}
       id: cache
+      if: steps.prebuilt.outputs.installed != 'true'
       uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ~/.cache/ci-tools/${{ inputs.crate }}-${{ inputs.version }}
         key: ci-tool-${{ runner.os }}-${{ runner.arch }}-${{ inputs.crate }}-${{ inputs.version }}
 
     - name: Compile ${{ inputs.crate }} ${{ inputs.version }} from crates.io (cache miss)
-      if: steps.cache.outputs.cache-hit != 'true'
+      if: steps.prebuilt.outputs.installed != 'true' && steps.cache.outputs.cache-hit != 'true'
       shell: bash
       env:
         CRATE: ${{ inputs.crate }}
@@ -36,7 +73,7 @@ runs:
         cp "$root.build/bin/"* "$root/"
 
     - name: Save ${{ inputs.crate }} ${{ inputs.version }}
-      if: steps.cache.outputs.cache-hit != 'true'
+      if: steps.prebuilt.outputs.installed != 'true' && steps.cache.outputs.cache-hit != 'true'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: ~/.cache/ci-tools/${{ inputs.crate }}-${{ inputs.version }}

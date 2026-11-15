@@ -35,12 +35,14 @@ jobs:
   # test-seconds each (about 70 s at four tests at once); scan shards hold
   # about 66 s each. Two things cut a binary across shards, both with nextest
   # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
-  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n2, n3) and `call_through_rows_test` (n6, n4, n5) and
+  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n3, n2, n1, n9: four slices, carrick#4565) and `call_through_rows_test` (n6, n4, n5) and
   # `pr_on_main_test` (pr-1 to pr-4: each of its 100+ tests is a full scan with
   # the type sidecar, about 94% of the old n9's time). A
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
   # first in its shard; two of its tests claim every slot (.config/nextest.toml).
+  # `answers_ahead_test` (scan-2) and `parallel_services_test` (scan-5) left n3,
+  # which they made the slowest shard (carrick#4565).
   # `scan-*` shards stay on `cargo test`. `steps` keeps one `cargo test` per
   # binary, in map order, then carrick-match last: the timing tests (readiness,
   # operation timeout, fresh process) and the signal and panic-hook tests need
@@ -75,20 +77,22 @@ jobs:
             partition: slice:2/2
           - shard: n1
             runner: nextest
+            partitioned: --test local_mode_test
+            partition: slice:3/4
             targets: >-
               --test client_semantics_test --test url_bases_through_bindings_test --test nonhttp_source_labels_test --test literal_base_url_test --test object_export_surface_test --test file_centric_analysis_test --test output_contract_test --test feature_probes_test
           - shard: n2
             runner: nextest
             partitioned: --test local_mode_test
-            partition: slice:2/2
+            partition: slice:2/4
             targets: >-
               --test new_url_target_test --test unanswered_on_row_line_test --test scan_durability_test --test node_module_extensions_test --test analysis_failure_keeps_deterministic_rows_test --test scan_timing_lines_test --test final_loss_scan_test --test engine_stamp_test
           - shard: n3
             runner: nextest
             partitioned: --test local_mode_test
-            partition: slice:1/2
+            partition: slice:1/4
             targets: >-
-              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test call_key_base_test --test url_alias_matching_test --test parallel_services_test --test answers_ahead_test
+              --test sidecar_parent_gone_test --test library_claims_sidecar_test --test log_value_guard_test --test file_based_routing_test --test call_key_base_test --test url_alias_matching_test
           - shard: n4
             runner: nextest
             partitioned: --test call_through_rows_test
@@ -117,6 +121,8 @@ jobs:
               --test retype_consumer_test --test unwidened_budget_test --test socket_bus_yield_test --test socket_claims_parity_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test graphql_held_documents_test --test alias_import_callers_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test graphql_object_documents_test --test graphql_document_arguments_test --test graphql_document_files_test --test graphql_nested_walk_test --test workspace_package_client_test --test graphql_undeclared_selection_test --test governing_config_callers_test --test nestjs_uri_versioning_test
           - shard: n9
             runner: nextest
+            partitioned: --test local_mode_test
+            partition: slice:4/4
             targets: >-
               --test sidecar_integration_test --test position_rows_test --test action_install_test --test graphql_code_first_response_types_test --test route_request_anchor_test --test machinery_by_origin_test --test model_symbol_not_a_type_test --test open_type_param_state_test --test loop_route_types_test --test no_payload_registration_line_test --test env_var_template_call_segment_test --test commonjs_require_callers_test --test eval_xrepo --test bundle_row_id_golden_test --test derive_matches_scan_test --test derive_reach_units_test --test stated_route_response_test
           - shard: pr-1
@@ -134,11 +140,11 @@ jobs:
           - shard: scan-2
             runner: cargo
             targets: >-
-              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test descriptor_route_data_test --test undeclared_external_host_test --test open_member_any_test --test request_descriptor_test
+              --test keep_awake_test --test pubsub_wrapper_type_capture_test --test descriptor_route_anchor_test --test descriptor_route_data_test --test undeclared_external_host_test --test open_member_any_test --test request_descriptor_test --test answers_ahead_test
           - shard: scan-5
             runner: cargo
             targets: >-
-              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test --test check_changed_retype_reach_test --test optional_calls_test --test declared_dispatch_handlers_test --test hook_row_over_leaf_test --test wrapper_request_line_module_test
+              --test method_per_site_test --test payload_without_method_test --test unprepared_refusal_test --test runner_flags_test --test changed_only_test --test check_changed_retype_reach_test --test optional_calls_test --test declared_dispatch_handlers_test --test hook_row_over_leaf_test --test wrapper_request_line_module_test --test parallel_services_test
           - shard: scan-3
             runner: cargo
             targets: >-
@@ -166,6 +172,9 @@ jobs:
         with:
           crate: cargo-nextest
           version: "0.9.148"
+          # sha256 from the release's own cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.sha256 asset.
+          prebuilt-url: https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz
+          prebuilt-sha256: 223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
 
       # carrick#4349: the Yarn releases tests/action_install_test.rs pins,
       # fetched once per version list and then read with the network off, so a
