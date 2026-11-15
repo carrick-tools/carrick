@@ -1,0 +1,23 @@
+{
+  "library_claims": [
+    {
+      "package": "node:child_process",
+      "version": "22.0.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "node:child_process",
+          "export": "ChildProcess",
+          "role": "in_process_bus",
+          "makes": [{ "form": "new", "member": null, "picker": "fixture-picker" }],
+          "scopes": [],
+          "ops": [{ "op": "receive", "member": "on", "of": "instance:new", "name": { "arg": 0 }, "picker": "fixture-picker" }],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        },
+        { "specifier": "node:child_process", "export": "spawn", "role": "none", "makes": [], "scopes": [], "ops": [], "reserved": [], "calls": [], "patterns": [] }
+      ]
+    }
+  ]
+}

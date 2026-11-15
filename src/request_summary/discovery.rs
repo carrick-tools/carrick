@@ -10360,6 +10360,71 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         );
     }
 
+    /// carrick#4562: a service imports `child_process` and `node:child_process`,
+    /// so the store states `ChildProcess` once per spelling, under one store key.
+    /// Each spelling's entry asks its own maker check, and the op on the instance
+    /// that maker builds verifies under the spelling the declaration is read by.
+    #[test]
+    fn each_spelling_of_a_package_asks_its_own_maker() {
+        let Some((_, _, ask, verdicts)) =
+            traced_fixture_verdicts("runtime-module-spellings", ".", "runner", &[], |exports| {
+                // As the store states a runtime module per spelling
+                // (`library_store` `claims`): the bare spelling first.
+                let mut bare = exports
+                    .iter()
+                    .find(|export| export.export == "ChildProcess")
+                    .expect("the fixture labels ChildProcess")
+                    .clone();
+                bare.specifier = "child_process".to_string();
+                exports.insert(0, bare);
+            })
+        else {
+            return;
+        };
+        let makers: Vec<&str> = ask
+            .checks
+            .iter()
+            .filter(|check| {
+                check.receiver == "export" && matches!(check.claim, LibraryClaim::Make { .. })
+            })
+            .map(|check| check.package.as_str())
+            .collect();
+        assert_eq!(
+            makers,
+            vec!["child_process", "node:child_process"],
+            "{:#?}",
+            ask.checks
+        );
+        // Every op on an instance has its maker under the same spelling.
+        for check in ask
+            .checks
+            .iter()
+            .filter(|check| check.receiver.starts_with("instance:"))
+        {
+            assert!(
+                ask.checks.iter().any(|maker| maker.package == check.package
+                    && maker.export == check.export
+                    && maker.receiver == "export"
+                    && matches!(maker.claim, LibraryClaim::Make { .. })),
+                "no maker for {} {} {}",
+                check.package,
+                check.export,
+                check.receiver
+            );
+        }
+        let on = ask
+            .checks
+            .iter()
+            .zip(&verdicts)
+            .find(|(check, _)| {
+                check.package == "node:child_process" && check.receiver == "instance:new"
+            })
+            .map(|(_, verdict)| verdict)
+            .expect("the node: spelling asks `on` on its instance");
+        assert_eq!(on.verdict, SemanticsVerdict::Verified, "{on:?}");
+        assert!(!MemberDeclarations::of(&ask, &verdicts).is_empty());
+    }
+
     /// carrick#3527: the walk up a maker-bound name's callers is capped
     /// (`MAX_COMPOSED` calls visited). Past the cap, here 128 paths through
     /// seven levels of parameter-passing helpers, the send stays one site
