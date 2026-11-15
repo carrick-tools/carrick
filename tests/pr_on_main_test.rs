@@ -3706,7 +3706,8 @@ async fn seed_trpc_router_binding_renamed() {
 }
 
 /// The router's keys are written so the reader cannot read them: no contract
-/// change, but main's rows read as removed.
+/// change, and the scan saves the three sites as unread, so main's rows are
+/// candidates and none is posted as a fact.
 #[tokio::test]
 async fn seed_trpc_router_rewritten_unread() {
     let _serial = SERIAL.lock().await;
@@ -3716,13 +3717,15 @@ async fn seed_trpc_router_rewritten_unread() {
             .iter()
             .any(|f| f["removed"].is_object())
     );
-}
-
-#[tokio::test]
-async fn seed_trpc_router_rewritten_unread_marking() {
-    let _serial = SERIAL.lock().await;
-    let payload = manifest_seed_payload("trpc-router-rewritten-unread").await;
-    assert_manifest_delta(&payload, "trpc-router-rewritten-unread");
+    for side in ["new_endpoints", "removed_endpoints"] {
+        for row in payload["delta"][side]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            assert_ne!(row["edge_source"], "fact", "{side}: {payload:#}");
+        }
+    }
 }
 
 // ---- GraphQL -----------------------------------------------------------
