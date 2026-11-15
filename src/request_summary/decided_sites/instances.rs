@@ -1333,6 +1333,7 @@ impl<'w, 'a> InstanceWalk<'w, 'a> {
                     form: MakerForm::Call,
                     args: Vec::new(),
                     span: (host.call.site.span_start, host.call.site.span_end),
+                    via: vec![self.via.iter().rev().cloned().collect()],
                 }),
             },
         );

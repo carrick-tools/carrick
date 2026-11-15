@@ -10043,7 +10043,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
                 &on.repo,
                 &discovered,
                 &labels,
-                &MakerLabel::from_exports(&exports),
+                &MakerLabel::from_exports(&exports, &declarations.scope_answers),
                 &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
                 &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
             );
@@ -10254,7 +10254,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
         let Some((on, exports, declarations)) = member_factory(|_| {}) else {
             return;
         };
-        let ask = declaration_ask(&on.inputs, &exports);
+        let ask = declaration_ask(&on.inputs, &[], &exports);
         let id = "fixture-hub@1:Hub:make:call:channel:of:instance:new";
         let at = ask
             .checks
@@ -10576,7 +10576,7 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
             &on.repo,
             &discovered,
             &labels,
-            &MakerLabel::from_exports(&exports),
+            &MakerLabel::from_exports(&exports, &declarations.scope_answers),
             &ScopeLabel::from_exports(&exports, &declarations.scope_answers),
             &ProcedureLabels::from_exports(&exports, &declarations.scope_answers),
         );
