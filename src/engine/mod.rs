@@ -7923,11 +7923,6 @@ async fn site_rows_of(
     .await;
     let mut rows = crate::site_rows::of(&decided, &records, &site_labels, &answers);
     rows.held_open = held_open_at_decided_sites(context.held_at_module, &decided);
-    debug!(
-        held = context.held_at_module.len(),
-        decided_at_each_call = rows.held_open.len(),
-        "site questions: request lines held at module-level calls (carrick#4121)"
-    );
     // The labelled calls whose every deciding call only makes the function
     // that sends (carrick#4319 T2). With no placements to read, whether the
     // summaries own a request is unknown, and none is named. A line both
@@ -7951,6 +7946,11 @@ async fn site_rows_of(
             "site questions: labelled calls held at maker sites (carrick#4319)"
         );
     }
+    debug!(
+        held = context.held_at_module.len(),
+        sited_at_each_call = rows.held_open.len(),
+        "site questions: request lines held at module-level calls (carrick#4121)"
+    );
     // The requests the service builds and returns for a caller to send
     // (carrick#3470): candidate rows, folded as every site row is.
     rows.rows
@@ -8049,8 +8049,10 @@ async fn site_rows_of(
 /// The request lines held at their module-level calls (carrick#4121) whose
 /// every such call holds exactly one decided HTTP site, ending at that
 /// request: the join `yield_to_summaries` reads a site's request by. A call
-/// that fails it (no site, a lead, two sites on its line, a site ending
-/// elsewhere) leaves its request line out, and the line keeps its row.
+/// that fails it (no site, two sites on its line, a site ending elsewhere)
+/// leaves its request line out, and the line keeps its row. A lead passes: it
+/// holds a decided site, and the fold keeps its line
+/// ([`crate::site_rows::SiteFold::held_kept`]).
 fn held_open_at_decided_sites(
     held: &[crate::agents::file_analyzer_agent::HeldRequestLine],
     decided: &crate::request_summary::decided_sites::Decided,
@@ -9982,6 +9984,7 @@ fn append_deterministic_protocol_operations(
             through = extractions.site.through.len(),
             through_folded = site.through_folded.len(),
             stated_at_fact_callers = site.stated_at_fact_callers.len(),
+            held_kept = ?site.held_kept,
             kept_out = ?site.kept_out,
             socket_disagrees = site.socket_disagrees,
             "site questions: fold"
