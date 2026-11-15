@@ -56,6 +56,10 @@ pub struct MainConsumer {
     /// The canonical call key, as this run's unpaired call spells it.
     pub key: String,
     pub file: String,
+    /// The call's `file:line` on main. A procedure call is told apart from
+    /// the others of its file by this site (carrick#3778): every procedure
+    /// call of a file shares one key.
+    pub site: String,
 }
 
 /// A producer row main has and this run lacks, keyed `(service, key)`.
@@ -108,6 +112,10 @@ pub struct UnpairedCall {
     pub held_open: bool,
     /// When `held_open`: the delta identities of the routes that hold it.
     pub held_by: Vec<String>,
+    /// The call names a procedure of an RPC router, which no row serves in
+    /// this run. Its `method` and `path` are the removed route's, and it
+    /// pairs with main's pairing only at the same call site.
+    pub procedure: bool,
 }
 
 /// An endpoint registration this run holds that no sender reaches.
@@ -270,6 +278,7 @@ pub fn mark_lost_pairings(
                 call.service == consumer.service
                     && call.file == consumer.file
                     && call.key == consumer.key
+                    && (!call.procedure || call.sites.contains(&consumer.site))
                     && (!call.held_open || held_by_removal(call, pairing.confirmed, main))
             }) {
                 let group = producer_lost
@@ -277,7 +286,11 @@ pub fn mark_lost_pairings(
                         producer.service.clone(),
                         producer.key.clone(),
                         call.service.clone(),
-                        format!("{} {}", call.method, call.path),
+                        if call.procedure {
+                            format!("{} {}", first.method, first.path)
+                        } else {
+                            format!("{} {}", call.method, call.path)
+                        },
                     ))
                     .or_insert_with(|| Group {
                         removals: operations.iter().map(|op| (op.placed, op.source)).collect(),
@@ -289,8 +302,18 @@ pub fn mark_lost_pairings(
                         },
                         removed_service: producer.service.clone(),
                         service: call.service.clone(),
-                        method: call.method.clone(),
-                        path: call.path.clone(),
+                        // A procedure call states no path: the row names the
+                        // route its procedure was served at (carrick#3778).
+                        method: if call.procedure {
+                            first.method.clone()
+                        } else {
+                            call.method.clone()
+                        },
+                        path: if call.procedure {
+                            first.path.clone()
+                        } else {
+                            call.path.clone()
+                        },
                         sites: BTreeSet::new(),
                         surviving_sources: Vec::new(),
                     });
@@ -464,6 +487,7 @@ mod tests {
                 service: "storefront".into(),
                 key: "GET /orders/:param".into(),
                 file: "src/checkout.ts".into(),
+                site: "src/checkout.ts:4".into(),
             },
             confirmed: true,
         }
@@ -493,6 +517,7 @@ mod tests {
             source: Some(ResolutionSource::RequestSpec),
             held_open: false,
             held_by: vec![],
+            procedure: false,
         }
     }
 
@@ -1108,5 +1133,44 @@ mod tests {
             serde_json::to_string(&orphan_row()).unwrap(),
             r#"{"kind":"orphaned_endpoint","severity":"gap","break":"none","method":"SERVER->CLIENT","path":"order:shipped","service":"storefront","provenance":"route"}"#
         );
+    }
+
+    /// Every procedure call of a file shares one key (carrick#3778): main's
+    /// pairing is of the call at one site, so only that site's call is marked,
+    /// and the row names the removed route.
+    #[test]
+    fn a_procedure_call_is_marked_at_its_own_site_only() {
+        let mut pairing = http_pairing();
+        pairing.consumer.key = "http|GET|".into();
+        pairing.consumer.site = "src/checkout.ts:8".into();
+        pairing.producer.key = "GET /api/rpc/shelf.get".into();
+        let mut removed = removed_route(true);
+        removed.key = "GET /api/rpc/shelf.get".into();
+        removed.path = "/api/rpc/shelf.get".into();
+        let call = |site: &str| UnpairedCall {
+            key: "http|GET|".into(),
+            method: "GET".into(),
+            path: String::new(),
+            sites: vec![site.into()],
+            procedure: true,
+            ..surviving_call()
+        };
+        let main = MainRemovals {
+            pairings: vec![pairing],
+            operations: vec![removed],
+            ..Default::default()
+        };
+        let run = RunUnpaired {
+            calls: vec![call("src/checkout.ts:8"), call("src/checkout.ts:10")],
+            receivers: vec![],
+        };
+        let mut rows = Vec::new();
+        assert_eq!(
+            mark_lost_pairings(&mut rows, &main, &run, MainCopy::Current, None),
+            1
+        );
+        let row = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(row["path"], "/api/rpc/shelf.get");
+        assert_eq!(row["call_sites"], json!(["src/checkout.ts:8"]));
     }
 }

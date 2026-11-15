@@ -416,6 +416,7 @@ pub(super) fn main_pairings(matches: &[CrossRepoMatch]) -> Vec<MainPairing> {
                     service: edge.consumer_repo.clone(),
                     key: edge.consumer_key.clone(),
                     file: location_file(edge.consumer_location.as_deref()?),
+                    site: edge.consumer_location.clone()?,
                 },
                 confirmed: match (&producer, OperationKey::from_canonical(&edge.consumer_key)) {
                     (
