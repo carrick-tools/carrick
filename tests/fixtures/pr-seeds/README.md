@@ -28,8 +28,11 @@ miss moves the declaration in the same PR. A seed is removed only by
   on line 2 so no other line moves. `src/augment.ts` augments
   an interface of the contracts module, and `src/legacy.js` is a CommonJS helper outside the
   tsconfig's program. Each has an empty answer.
-- `storefront` is the other side of each. Seeds never edit it, so every break
-  is a consumer the PR did not update.
+- `storefront` is the other side of each. Seeds edit it only for the quiet
+  indirect-caller seeds (a wrapper, a generated client declaration,
+  `fetchQuery` with generated options, a query hook), where the PR edits the
+  caller's file and changes no contract. Every break seed leaves it alone, so
+  every break is a consumer the PR did not update.
 - `admin-api` registers routes in code through a router stub, for two
   negatives. It scans against a store of its own: its stub pins a package no
   registry has, which would make every cross-repo type check in a shared store
