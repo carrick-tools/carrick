@@ -298,6 +298,7 @@ const CheckPairSpecSchema = z
     producer: CheckPairEndpointSchema,
     consumer: CheckPairEndpointSchema,
     topic: z.string().min(1).optional(),
+    procedure: z.literal(true).optional(),
   })
   .superRefine((spec, ctx) => {
     // carrick#1979: the topic is the pub/sub operation's own key. It is

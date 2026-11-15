@@ -573,10 +573,13 @@ export type ProbeTypeKind = 'request' | 'response' | 'both';
  * `JSON.stringify` calls a value's `toJSON()` and serialises its RESULT, so a
  * `Date` travels as the string its `toJSON` returns, and so does any other
  * type that declares one. The mapping is read from the compiler's own
- * signature, never from a list of type names. Which payloads travel in which
- * form is `wireFormFor` (check-probe.ts), the one rule.
+ * signature, never from a list of type names. `'unknown'` is a payload whose
+ * form is not a known fact (an RPC procedure, carrick#4402): it prints as
+ * declared, and the judge abstains where the declared and JSON readings
+ * disagree. Which payloads travel in which form is `wireFormFor`
+ * (check-probe.ts), the one rule.
  */
-export type WireFormat = 'declared' | 'json';
+export type WireFormat = 'declared' | 'json' | 'unknown';
 
 /** One capture stub package to assemble into the check workspace. */
 export interface CheckStubInput {
@@ -611,6 +614,12 @@ export interface CheckPairSpec {
    * is the whole message from a side that is its payload.
    */
   topic?: string;
+  /**
+   * The producer is a procedure of an RPC router (tRPC and similar), and only
+   * then (carrick#4402). Its router's transformer, not JSON, decides the form
+   * the payload travels in, so the judge reads neither form alone.
+   */
+  procedure?: true;
 }
 
 /**

@@ -17,6 +17,8 @@
  *                                            else unverifiable (no body read)
  *   IsFormBody gate fired (TS2344)        -> unverifiable (form-encoded body)
  *   IsByteBody gate fired (TS2344)        -> unverifiable (bytes, even agreeing)
+ *   procedure wire-form gate (TS2344)     -> unverifiable (declared and JSON
+ *                                            readings disagree, carrick#4402)
  *   raw-text read marked on a side        -> unverifiable (text, even agreeing)
  *   assignment error, sent union taken in part by a weak expected type
  *                                         -> unverifiable (carrick#1995)
@@ -340,6 +342,22 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
+  // 4c'. A procedure payload whose form travels by its router's transformer
+  //      (carrick#4402): the declared reading fails and the JSON reading
+  //      passes, so which one travels decides the verdict, and that is not a
+  //      known fact. Not a fact either way, and no side to retype: a retype
+  //      would read the same two forms.
+  if (firedGates.has('sent:wire_form')) {
+    const { side } = sideForGate('sent:wire_form', plan);
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${side}:wire_form`,
+      diagnostic: `${wireFormUnknownReason(side)}.`,
+      ...notAFact(wireFormUnknownReason(side)),
+    };
+  }
+
   // 4d. A body read as raw text (carrick#1842): a `.text()` read, or a request
   //     library's text format, takes the body unparsed, so `string` there
   //     states no structural contract. Like bytes, the pair is not compared,
@@ -507,6 +525,14 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
 
   // 6. No diagnostics -> compatible.
   return { ...base, bucket: 'compatible', ...factness(input) };
+}
+
+/**
+ * Why a procedure pair whose two wire readings disagree is not compared
+ * (carrick#4402). Customer-facing: it prints after "Types not verified".
+ */
+export function wireFormUnknownReason(side: Side): string {
+  return `the ${side} sends this payload through an RPC router whose transformer decides how a Date travels; the types match in one form and not the other, so Carrick cannot verify them without knowing the transformer`;
 }
 
 /**
