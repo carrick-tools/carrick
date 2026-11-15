@@ -606,16 +606,32 @@ export class Retyper {
     if (typeof top === 'string') return abstain(item, top);
 
     const carried = this.carriesProducerOutput(sourceFile, original, producer, start, end);
-    if (carried !== true) return abstain(item, carried);
+    if (typeof carried === 'string') return abstain(item, carried);
 
-    const edits: Edit[] = [
-      { start, end: start, text: '(' },
-      { start: end, end, text: ' as any)' },
-    ];
+    // Erase only what carries the output. A result that IS the output is
+    // erased to `any`. A result that carries it in one member (a hook's
+    // `{ data: O | undefined }`) keeps its envelope, and that member keeps its
+    // `null`/`undefined`: an error the client's own envelope raises
+    // (`result.data` possibly undefined) is the same with any output, so it
+    // must stay when the output is erased, not read as a break.
+    const edits: Edit[] =
+      carried.member === undefined
+        ? [
+            { start, end: start, text: '(' },
+            { start: end, end, text: ' as any)' },
+          ]
+        : [
+            { start, end: start, text: `${ERASE_MEMBER}(` },
+            { start: end, end, text: `, ${JSON.stringify(carried.member)})` },
+          ];
+    const appendix =
+      carried.member === undefined ? '' : '\n' + eraseMemberDeclarations().join('\n') + '\n';
+    const body = applyEdits(original, edits);
     let erased: Diag[];
-    replaceFileText(sourceFile, applyEdits(original, edits));
+    replaceFileText(sourceFile, body + appendix);
     try {
       erased = fileDiagnostics(sourceFile).flatMap((d) => {
+        if (d.start >= body.length) return [];
         const origin = mapBack(d.start, edits);
         return origin.kind === 'inserted' ? [] : [{ ...d, start: origin.pos }];
       });
@@ -708,11 +724,12 @@ export class Retyper {
   }
 
   /**
-   * Guard (carrick#937): `true` when the call's awaited result, or for an
-   * object result one of its members with `null`/`undefined` removed, is the
-   * producer's published output, declared or in its JSON wire form (each
-   * way assignable to the other), read in the consumer's own program. Else
-   * why the call is not compared.
+   * Guard (carrick#937): what carries the producer's published output,
+   * declared or in its JSON wire form (each way assignable to the other),
+   * read in the consumer's own program: the call's awaited result as a whole
+   * (`member` unset), or for an object result the string-named member that
+   * does once `null`/`undefined` are removed. Else why the call is not
+   * compared.
    */
   private carriesProducerOutput(
     sourceFile: SourceFile,
@@ -720,7 +737,7 @@ export class Retyper {
     producer: string,
     start: number,
     end: number
-  ): true | string {
+  ): { member?: string } | string {
     const out = `${PREFIX}ProcOut`;
     const wire = `${PREFIX}ProcWire`;
     const appendix =
@@ -750,15 +767,21 @@ export class Retyper {
         return alias ? [checker.getTypeAtLocation(alias.getNameNode().compilerNode)] : [];
       });
       const own = awaitedResult(checker, call.compilerNode);
-      const candidates = [own];
+      const candidates: Array<{ type: ts.Type; member?: string }> = [{ type: own }];
       if (own.flags & ts.TypeFlags.Object && !checker.isArrayType(own) && !checker.isTupleType(own)) {
         for (const property of checker.getPropertiesOfType(own)) {
-          candidates.push(checker.getNonNullableType(checker.getTypeOfSymbol(property)));
+          // A symbol-keyed member has no name the erase can write.
+          if (property.escapedName.toString().startsWith('__@')) continue;
+          candidates.push({
+            type: checker.getNonNullableType(checker.getTypeOfSymbol(property)),
+            member: property.getName(),
+          });
         }
       }
       const same = (a: ts.Type, b: ts.Type) =>
         checker.isTypeAssignableTo(a, b) && checker.isTypeAssignableTo(b, a);
-      if (candidates.some((c) => stated.some((t) => same(t, c)))) return true;
+      const carrier = candidates.find((c) => stated.some((t) => same(t, c.type)));
+      if (carrier) return { member: carrier.member };
       return "the call's result does not carry the procedure's output as the producer publishes it";
     } finally {
       replaceFileText(sourceFile, original);
@@ -817,6 +840,25 @@ export class Retyper {
       `('${checker.typeToString(this.resultOf(call))}'), so it does not state the response`
     );
   }
+}
+
+const ERASE_MEMBER = `${PREFIX}eraseMember`;
+
+/**
+ * `${ERASE_MEMBER}(value, key)` types as `value` (awaited or not) with member
+ * `key` erased: any read of it passes, but the `null`/`undefined` it held
+ * stays, so a read the envelope itself rejects is still rejected. The
+ * erased part is an object that answers every property and index read with
+ * `any`, since `any | undefined` would collapse to `any`.
+ */
+function eraseMemberDeclarations(): string[] {
+  const loose = `${PREFIX}Loose`;
+  const erasedIn = `${PREFIX}EraseIn`;
+  return [
+    `type ${loose} = { [key: string]: any; [index: number]: any };`,
+    `type ${erasedIn}<T, K extends PropertyKey> = Omit<T, K> & { [P in K & keyof T]: ${loose} | Exclude<T[P], NonNullable<T[P]>> };`,
+    `declare function ${ERASE_MEMBER}<T, K extends PropertyKey>(value: T, key: K): T extends PromiseLike<infer U> ? Promise<${erasedIn}<U, K>> : ${erasedIn}<T, K>;`,
+  ];
 }
 
 /** Top-type findings as a reason names them: `'any'`, `'unknown' at 'a.b'`. */
