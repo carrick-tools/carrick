@@ -37,13 +37,14 @@ for m in entry.finditer(text):
         sys.exit(1)
     for _, name in pairs:
         plain[name].append(shard)
-    part = re.search(r"^ +partitioned: (.+)$", body, re.M)
-    if part:
-        spec = re.search(r"^ +partition: slice:(\d+)/(\d+)$", body, re.M)
-        if not spec:
-            print(f"::error::shard {shard} partitions {part.group(1)} without 'partition: slice:k/m'")
-            sys.exit(1)
-        sliced[part.group(1).strip()].append((shard, int(spec.group(1)), int(spec.group(2))))
+    for suffix in ("", "_b"):
+        part = re.search(rf"^ +partitioned{suffix}: (.+)$", body, re.M)
+        if part:
+            spec = re.search(rf"^ +partition{suffix}: slice:(\d+)/(\d+)$", body, re.M)
+            if not spec:
+                print(f"::error::shard {shard} partitions {part.group(1)} without 'partition{suffix}: slice:k/m'")
+                sys.exit(1)
+            sliced[part.group(1).strip()].append((shard, int(spec.group(1)), int(spec.group(2))))
 
 errors = []
 

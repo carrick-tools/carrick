@@ -35,8 +35,8 @@ jobs:
   # test-seconds each (about 70 s at four tests at once); scan shards hold
   # about 66 s each. Two things cut a binary across shards, both with nextest
   # `--partition slice:k/m` (even; `count:` is deprecated upstream): the
-  # library's unit tests (n8, lib-2) and `local_mode_test` (n3, n2, n1, n9: four slices, carrick#4565) and `call_through_rows_test` (n6, n4, n5) and
-  # `pr_on_main_test` (pr-1, pr-2, lib-1: each of its 100+ tests is a full scan with
+  # library's unit tests (lib-1, lib-2) and `local_mode_test` (n3, n2, n1, n9: four slices, carrick#4565) and `call_through_rows_test` (n6, n4, n5) and
+  # `pr_on_main_test` (pr-1, pr-2, lib-2 as `partitioned_b`: each of its 100+ tests is a full scan with
   # the type sidecar, about 94% of the old n9's time). A
   # `partitioned:` target runs in its own nextest call, because `--partition`
   # slices every test of a call, not one binary of it. `local_mode_test` runs
@@ -71,12 +71,14 @@ jobs:
         include:
           - shard: lib-1
             runner: nextest
-            partitioned: --test pr_on_main_test
-            partition: slice:3/3
+            partitioned: --lib
+            partition: slice:1/2
           - shard: lib-2
             runner: nextest
             partitioned: --lib
             partition: slice:2/2
+            partitioned_b: --test pr_on_main_test
+            partition_b: slice:3/3
             targets: >-
               --test parallel_services_test
           - shard: n1
@@ -121,8 +123,6 @@ jobs:
               --test paired_method_url_test --test prompt_determinism_test --test own_route_calls_test --test catch_all_type_pair_test --test handler_file_route_row_test --test dispatch_file_route_test --test unanchored_route_rows_test --test graphql_schema_identity_test --test sidecar_program_files_test --test sidecar_reach_test --test inline_registration_scope_test --test fact_seam_test --test socket_generic_test --test socket_origin_test --test socket_per_connection_test --test store_ask_beside_test --test dependency_analysis_test --test socket_decorated_handlers_test --test graphql_decorated_resolvers_test
           - shard: n8
             runner: nextest
-            partitioned: --lib
-            partition: slice:1/2
             targets: >-
               --test retype_consumer_test --test unwidened_budget_test --test socket_bus_yield_test --test socket_claims_parity_test --test union_method_param_test --test graphql_schemas_setting_test --test graphql_walked_schema_evidence_test --test graphql_held_documents_test --test alias_import_callers_test --test intent_incremental_test --test framework_coverage_test --test graphql_document_call_sites_test --test graphql_object_documents_test --test graphql_document_arguments_test --test graphql_document_files_test --test graphql_nested_walk_test --test workspace_package_client_test --test graphql_undeclared_selection_test --test governing_config_callers_test --test nestjs_uri_versioning_test
           - shard: n9
@@ -234,17 +234,20 @@ jobs:
       - name: Build this shard's targets
         env:
           PARTITIONED: ${{ matrix.partitioned }}
+          PARTITIONED_B: ${{ matrix.partitioned_b }}
           TARGETS: ${{ matrix.targets }}
         run: |
           # The variables hold several arguments each; word splitting is the point.
           # shellcheck disable=SC2086
-          cargo test --no-run $PARTITIONED $TARGETS
+          cargo test --no-run $PARTITIONED $PARTITIONED_B $TARGETS
 
       - name: Run this shard's tests
         env:
           RUNNER: ${{ matrix.runner }}
           PARTITIONED: ${{ matrix.partitioned }}
           PARTITION: ${{ matrix.partition }}
+          PARTITIONED_B: ${{ matrix.partitioned_b }}
+          PARTITION_B: ${{ matrix.partition_b }}
           TARGETS: ${{ matrix.targets }}
         run: |
           rc=0
@@ -254,6 +257,9 @@ jobs:
             nextest)
               if [ -n "$PARTITIONED" ]; then
                 cargo nextest run --no-fail-fast $PARTITIONED --partition "$PARTITION" || rc=$?
+              fi
+              if [ -n "$PARTITIONED_B" ]; then
+                cargo nextest run --no-fail-fast $PARTITIONED_B --partition "$PARTITION_B" || rc=$?
               fi
               if [ -n "$TARGETS" ]; then
                 cargo nextest run --no-fail-fast $TARGETS || rc=$?
