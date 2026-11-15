@@ -2046,7 +2046,12 @@ pub(crate) fn static_prefix(entry: &str) -> PathBuf {
 /// `None` for a path outside it. A path that is not on disk is placed by its
 /// nearest existing ancestor.
 fn top_relative(top: &Path, path: &Path) -> Option<String> {
-    let normalized = crate::workspace_resolver::normalize(path);
+    let mut normalized = crate::workspace_resolver::normalize(path);
+    if normalized.as_os_str().is_empty() {
+        // `.` (the Action's path, a root service) normalises to nothing and
+        // names the working directory, not a path outside the tree.
+        normalized = PathBuf::from(".");
+    }
     let (existing, rest): (PathBuf, PathBuf) = {
         let mut existing = normalized.clone();
         let mut rest = Vec::new();
