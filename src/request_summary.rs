@@ -5389,10 +5389,6 @@ struct Scope<'a> {
     /// functions' included (carrick#2432). Read by discovery's value walk
     /// alone ([`resolve::ValueAt`]).
     held: HashMap<BindingKey, Vec<ValueAt>>,
-    /// The functions the body declares once and never assigns again, by where
-    /// each node starts, for what a `return` of the name hands back
-    /// (carrick#2432 slice A2).
-    declared_fns: HashMap<BindingKey, u32>,
     /// The names the body declares once, and those it assigns again, for the
     /// call walker's block declarators (carrick#3794): the same rule
     /// [`Reader::body`] reads its own top-level locals by. `None` at module
@@ -5436,7 +5432,6 @@ impl<'a> Scope<'a> {
             written_through: HashSet::new(),
             subjects: HashMap::new(),
             held: HashMap::new(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields: None,
             module,
@@ -6551,7 +6546,6 @@ impl Reader<'_> {
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields,
             module,
@@ -6658,7 +6652,6 @@ impl Reader<'_> {
             written_through: HashSet::new(),
             subjects: captured.subjects.clone(),
             held: captured.held.clone(),
-            declared_fns: HashMap::new(),
             body_names: None,
             fields,
             module,
@@ -6733,22 +6726,6 @@ impl Reader<'_> {
                 .collect(),
             written: reassigned.names.clone(),
         });
-        // A function declared in the body, once and never assigned again, is
-        // the function a `return` of its name hands back, wherever the
-        // declaration sits: it is hoisted (carrick#2432 slice A2). Only a
-        // `return` reads it: a call of it in the body is a call of code this
-        // pass does not read.
-        for stmt in stmts {
-            if let Stmt::Decl(Decl::Fn(declared_fn)) = stmt
-                && !reassigned.names.contains(declared_fn.ident.sym.as_ref())
-                && declared.binding_count(&ident_key(&declared_fn.ident)) == 1
-            {
-                scope.declared_fns.insert(
-                    ident_key(&declared_fn.ident),
-                    declared_fn.function.span.lo.0,
-                );
-            }
-        }
         for (index, stmt) in stmts.iter().enumerate() {
             if let Stmt::Decl(Decl::Var(var)) = stmt {
                 for declarator in &var.decls {
@@ -9019,16 +8996,7 @@ impl Visit for CallWalker<'_, '_, '_> {
             .map(|arg| self.reader.returned_instances(arg, self.scope))
             .unwrap_or_default();
         if let Some(arg) = ret.arg.as_deref() {
-            // `return request`: a function this body declares is that
-            // function (carrick#2432 slice A2).
-            let declared = match crate::graphql_document_sites::unwrap_expression(arg) {
-                Expr::Ident(ident) => self.scope.declared_fns.get(&ident_key(ident)).copied(),
-                _ => None,
-            };
-            let values = match declared {
-                Some(start) => vec![ValueAt::Function(start)],
-                None => self.reader.value_of(arg, self.scope, &self.guard.bound),
-            };
+            let values = self.reader.value_of(arg, self.scope, &self.guard.bound);
             self.ir.returned_values.extend(values);
         }
         self.ir.returns.push((ret.span.lo.0, returned));
