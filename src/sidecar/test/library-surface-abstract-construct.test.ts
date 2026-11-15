@@ -12,6 +12,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SidecarClient } from './helpers.js';
+import { fullSurfaceSha256 } from '../src/library-claims.js';
+import type { LibrarySurface } from '../src/types.js';
 
 const TSCONFIG = JSON.stringify({
   compilerOptions: {
@@ -57,6 +59,7 @@ describe('list_library_surface: abstract construct signatures', () => {
   let client: SidecarClient;
   let root: string;
   let listed: Surface;
+  let all: { surfaces: LibrarySurface[]; surface_sha256: string };
 
   const constructs = (exported: string): Signature[] => {
     const entry = listed.exports.find(e => e.export === exported);
@@ -82,12 +85,13 @@ describe('list_library_surface: abstract construct signatures', () => {
     await client.start();
     const init = await client.send<{ status: string }>({ request_id: 'init', action: 'init', repo_root: root });
     assert.strictEqual(init.status, 'ready');
-    const response = await client.send<{ status: string; surfaces: Surface[]; errors?: string[] }>(
+    const response = await client.send<{ status: string; surfaces: Surface[]; surface_sha256: string; errors?: string[] }>(
       { request_id: 's', action: 'list_library_surface', from_dir: root, packages: [P] },
       60_000
     );
     assert.strictEqual(response.status, 'success', JSON.stringify(response.errors));
     listed = response.surfaces[0];
+    all = response as unknown as { surfaces: LibrarySurface[]; surface_sha256: string };
   });
 
   after(async () => {
@@ -117,5 +121,10 @@ describe('list_library_surface: abstract construct signatures', () => {
     const signatures = constructs('Made');
     assert.strictEqual(signatures.length, 1);
     assert.ok(!('abstract' in signatures[0]), JSON.stringify(signatures[0]));
+  });
+
+  it('keeps the hash: the listing hashes as it does without the field, so no package key moves (David 2026-11-15: a lister move never pays to rebuild every package)', () => {
+    const without = JSON.parse(JSON.stringify(all.surfaces, (key, value) => (key === 'abstract' ? undefined : value)));
+    assert.strictEqual(all.surface_sha256, fullSurfaceSha256(without));
   });
 });

@@ -1500,14 +1500,16 @@ export function fullSurfaceSha256(surfaces: readonly LibrarySurface[]): string {
   // A member's `handlers` (carrick#2674), a signature's `result_candidates`
   // (carrick#2817) and a member's `scope_receiver` (carrick#2774) are out of
   // the hash at every depth, and so is a member's `runtime_events`
-  // (carrick#3032), and a receiver's `properties` (carrick#3696), so a
-  // package's key does not change when the lister learns to list them.
+  // (carrick#3032), a receiver's `properties` (carrick#3696) and a construct
+  // signature's `abstract` (L2, R5), so a package's key does not change when
+  // the lister learns to list them.
   const text = JSON.stringify(listed, (key, value) =>
     key === 'handlers' ||
     key === 'result_candidates' ||
     key === 'scope_receiver' ||
     key === 'runtime_events' ||
-    key === 'properties'
+    key === 'properties' ||
+    key === 'abstract'
       ? undefined
       : value
   );
