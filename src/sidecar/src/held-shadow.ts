@@ -29,6 +29,7 @@ import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
 import { WriteGuard, judgeTscPath } from './capture/index.js';
+import { jsonWireDeclarations, jsonWireRule, judgeTolerances, type JudgeTolerances } from './capture/check-probe.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {
@@ -46,8 +47,15 @@ export interface ShadowResult {
   path_conflicts: Array<{ spec: string; a: string; b: string; from: string }>;
   /** The bare specifiers the own files use, as written to `paths`. */
   bare_specifiers: string[];
-  /** Some own file imports a package named `hono` that resolved into the program. */
-  hono: boolean;
+  /**
+   * The judge's JSON wire form as declarations a caller appends to a file:
+   * `jsonWireDeclarations('__carrick_')` and `type __carrick_Wire<S, E>`, the
+   * judge's own rule (`jsonWireRule`). One writer, so a held check and the
+   * scan's judge answer "what travels" the same way.
+   */
+  wire: string[];
+  /** The judge's three tolerances, read from its own code (`judgeTolerances`). */
+  tolerances: JudgeTolerances;
   /** The native TypeScript 7 executable, or null when only TypeScript 6's tsc is installed. */
   native_tsc: string | null;
 }
@@ -132,12 +140,11 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
   let vendored = 0;
   let rewritten = 0;
   let unresolved = 0;
-  let hono = false;
 
   for (const sf of program.getSourceFiles()) {
     const file = sf.fileName;
     if (isLibraryFile(program, file)) continue;
-    const literals: Array<{ node: ts.StringLiteralLike; text: string; to?: string; pkg?: string; augmentation: boolean; synthesized: boolean }> = [];
+    const literals: Array<{ node: ts.StringLiteralLike; text: string; to?: string; augmentation: boolean; synthesized: boolean }> = [];
     const { imports = [], moduleAugmentations = [] } = sf as unknown as InternalSourceFile;
     for (const node of [...imports, ...moduleAugmentations]) {
       if (!ts.isStringLiteralLike(node)) continue;
@@ -149,7 +156,6 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
         node,
         text: node.text,
         to: resolved?.resolvedFileName,
-        pkg: resolved?.packageId?.name,
         augmentation,
         synthesized: node.pos < 0 || node.end < 0 || !node.parent,
       });
@@ -162,7 +168,6 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
       for (const lit of literals) {
         if (lit.text.startsWith('.') || path.isAbsolute(lit.text)) continue;
         if (!lit.to || !inProgram.has(lit.to)) continue; // unresolved stays unresolved: no `paths` entry
-        if (isHonoFile(loader, lit.to, lit.pkg)) hono = true;
         const target = shadowPath(lit.to);
         const known = paths[lit.text];
         if (known && known[0] !== target) pathConflicts.push({ spec: lit.text, a: known[0], b: target, from: ownRelative(file) });
@@ -253,14 +258,18 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     unresolved,
     path_conflicts: pathConflicts,
     bare_specifiers: Object.keys(paths).sort(),
-    hono,
+    wire: heldWire(),
+    tolerances: judgeTolerances(),
     native_tsc: nativeTscPath(),
   };
 }
 
-/** The resolved file belongs to a package named `hono`: by the resolver's package id, the Deno graph, or the install path. */
-function isHonoFile(loader: ProjectLoader, file: string, packageId: string | undefined): boolean {
-  return packageId === 'hono' || loader.packageDirectoryOf(file)?.name === 'hono' || /[\\/]node_modules[\\/]hono[\\/]/.test(file);
+/** The wire declarations and the one rule type a held check appends (prefix `__carrick_`). */
+export function heldWire(): string[] {
+  return [
+    ...jsonWireDeclarations('__carrick_'),
+    `type __carrick_Wire<S, E> = ${jsonWireRule('S', 'E', '__carrick_')};`,
+  ];
 }
 
 function safeRealpath(p: string): string {

@@ -362,6 +362,20 @@ export interface WriteShadowRequest extends BaseRequest {
 }
 
 /**
+ * Find again the node a value's expression text names in one file, with the
+ * capture's own exact-text finder (see site-find.ts). `file` is relative to
+ * the repo root. `file_text` is the file's text when the caller holds one
+ * that is not on disk yet; `from_line` skips a match that ends above it.
+ */
+export interface FindSiteRequest extends BaseRequest {
+  action: 'find_site';
+  file: string;
+  text: string;
+  from_line?: number;
+  file_text?: string;
+}
+
+/**
  * The import graph without statement texts. Every name and path is an index
  * into `strings`. Per file: its path, whether it is a script, its declared
  * names, the identifiers each declared name mentions that can matter (a
@@ -1061,6 +1075,7 @@ export type SidecarRequest =
   | ShutdownRequest
   | ListProgramFilesRequest
   | WriteShadowRequest
+  | FindSiteRequest
   | ReachGraphRequest
   | ReachRequest
   | AddProgramFilesRequest
@@ -1347,6 +1362,20 @@ export interface ListProgramFilesResponse extends BaseResponse {
  * Response for write_shadow action: the fields of `ShadowResult`.
  */
 export interface WriteShadowResponse extends BaseResponse, Partial<ShadowResult> {
+  errors?: string[];
+}
+
+/**
+ * Response for find_site action. `start` and `end` are offsets into the text
+ * the finder read (the node's start, trivia excluded); lines are 1-based.
+ */
+export interface FindSiteResponse extends BaseResponse {
+  found?: boolean;
+  start?: number;
+  end?: number;
+  start_line?: number;
+  end_line?: number;
+  kind?: string;
   errors?: string[];
 }
 
@@ -1745,6 +1774,7 @@ export type SidecarResponse =
   | ShutdownResponse
   | ListProgramFilesResponse
   | WriteShadowResponse
+  | FindSiteResponse
   | ReachGraphResponse
   | ReachResponse
   | AddProgramFilesResponse

@@ -141,6 +141,7 @@ Frames are written by the work itself, between units, except for `check_v2`, who
 | `list_library_surface` | yes | List a package's declared surface the way the verifier reads it, with its full-surface hash |
 | `list_program_files` | yes | The files the program was built from, in order |
 | `write_shadow` | yes | Writes the program as a shadow tree for a held-open TypeScript 7 compiler (`out_dir`, outside the checkout) |
+| `find_site` | init only | The node a value's expression text names in one file, found by the capture's own exact-text finder; reads no program |
 | `add_program_files` | yes | Add files to the program in a given order |
 | `reach_graph` | yes | The import graph of every built program (builds the default one first), without statement texts, paths relative to the scan root |
 | `reach` | no | The files a set of edits can reach in a `reach_graph` graph: `{ reached, augmented, exports_moved }` |
@@ -925,7 +926,15 @@ A batch that names fewer requests than it timed left out none slower than the la
 { "request_id": "13", "action": "write_shadow", "out_dir": "/home/me/.carrick/held/ab12cd/api" }
 ```
 
-Response fields: `tsconfig`, `own_files` (relative to the scan root), `vendored`, `rewritten`, `unresolved`, `path_conflicts` (a bare specifier two own files resolve to different files; reported, not solved), `bare_specifiers`, `hono` (an own file imports a package named `hono` that resolved into the program) and `native_tsc` (the platform's TypeScript 7 executable, or `null` when only TypeScript 6's `tsc` is installed).
+Response fields: `tsconfig`, `own_files` (relative to the scan root), `vendored`, `rewritten`, `unresolved`, `path_conflicts` (a bare specifier two own files resolve to different files; reported, not solved), `bare_specifiers`, `wire` (the judge's JSON wire form as declarations to append to a file: `jsonWireDeclarations('__carrick_')` and `type __carrick_Wire<S, E>`, the judge's own rule, so a held check and the scan's judge agree on what travels), `tolerances` (the judge's three tolerances as texts, read from its own code: `unwidened_alias_suffix`, the export suffix a stub ships its literal-unwidened response under; `void_receiver`, the `IsVoid` declaration; and `absent_body`, the rule over `S` and `E` as `declared` and `by_handler`) and `native_tsc` (the platform's TypeScript 7 executable, or `null` when only TypeScript 6's `tsc` is installed).
+
+#### `find_site` - The capture's site finder, asked by a caller
+
+`find_site` takes `file` (relative to the repo root), `text` (the expression's text), optionally `from_line` (a match that ends above it is skipped) and `file_text` (the file's text when it is not on disk yet; otherwise the disk's is read). It runs the exact-text match the capture binds a locator with, over the file's syntax, and answers `{ found: false }` when no node's text equals `text` (whitespace collapsed, string quotes canonical). Otherwise it answers `found`, `start` and `end` (offsets into the text it read; `start` excludes leading trivia), `start_line`, `end_line` (1-based) and `kind` (the node's syntax kind). A file outside the repo is an error. It needs `init` for the repo root and loads no program.
+
+```json
+{ "request_id": "14", "action": "find_site", "file": "src/orders.ts", "text": "{ ok: true }", "from_line": 12 }
+```
 
 #### `list_program_files` and `add_program_files` - One program, one file order
 

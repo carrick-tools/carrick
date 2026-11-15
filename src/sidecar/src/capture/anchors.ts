@@ -1645,7 +1645,7 @@ function tightestCoveringNode(
  * among the nodes a value type can be read at (`firstExactLocatorMatch`,
  * carrick#3500).
  */
-function nodeByExpressionText(
+export function nodeByExpressionText(
   sourceFile: ts.SourceFile,
   text: string,
   fromLine?: number

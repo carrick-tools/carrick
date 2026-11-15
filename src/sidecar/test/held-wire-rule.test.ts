@@ -24,7 +24,8 @@ function tscErrors(source: string): string[] {
   const dir = scratch('held-wire-rule-');
   const file = path.join(dir, 'a.ts');
   fs.writeFileSync(file, source);
-  const run = spawnSync(nativeTsc(), ['--noEmit', '--strict', '--target', 'es2022', '--lib', 'es2022', '--types', '', '--pretty', 'false', file], {
+  const run = spawnSync(nativeTsc(), ['--noEmit', '--strict', '--target', 'es2022', '--lib', 'es2022', '--ignoreConfig', '--pretty', 'false', file], {
+    cwd: dir,
     encoding: 'utf8',
   });
   return run.stdout.split('\n').filter((l) => /error TS\d+/.test(l));

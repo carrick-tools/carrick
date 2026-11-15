@@ -229,6 +229,67 @@ export function jsonWireDeclarations(prefix: string): string[] {
   ];
 }
 
+/**
+ * The judge's decisive wire rule as a type expression: keep the declared
+ * `sent` type whenever it already assigns to `expected` or serialising
+ * changes nothing observable, else the wire form. `buildProbe` writes it at
+ * every wire line, and the held check appends it, so the line and the PR
+ * check answer "what travels" from this one text. `prefix` is the one
+ * `jsonWireDeclarations` was given.
+ */
+export function jsonWireRule(sent: string, expected: string, prefix: string): string {
+  return `[${sent}] extends [${expected}] ? ${sent} : (${prefix}JsonWireSame<${prefix}JsonWire<${sent}>, ${sent}> extends true ? ${sent} : ${prefix}JsonWire<${sent}>)`;
+}
+
+/**
+ * The receiver-declared-void gate's helper: `void` or `undefined` is what a
+ * call site that reads no body types its response as, and states no contract
+ * (carrick#1162). `any` is excluded first, so an `any` side keeps its own
+ * top-type reason.
+ */
+export function voidReceiverDeclaration(): string {
+  return `type IsVoid<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [void] ? true : false;`;
+}
+
+/**
+ * The absent-body tolerance as a type expression over `sent` (carrick#2814):
+ * a body the sender may omit (`T | undefined`, `T | void`) is compatible with
+ * a receiver that requires none, which is one with no required member
+ * (`{} extends expected`) that either admits absence itself or whose handler
+ * works with nothing sent (`toleratesAbsence`, the capture record's
+ * `absent_body_tolerated`).
+ */
+export function absentBodyRule(sent: string, expected: string, toleratesAbsence: boolean): string {
+  const dropped = `Exclude<${sent}, undefined | void>`;
+  const byHandler = toleratesAbsence ? dropped : sent;
+  return `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [${expected}] ? ([Extract<${expected}, undefined | void>] extends [never] ? ${byHandler} : ${dropped}) : ${sent}`;
+}
+
+/**
+ * The judge's three tolerances, as the texts the probe is built from: the
+ * literal-widened reading (the export suffix a stub ships its unwidened
+ * response under, `unwidenedAliasOf`), the absent body (`absentBodyRule`,
+ * with and without the handler's mark) and the void receiver. A caller that
+ * checks a value against a declared type reads them from here, never from a
+ * copy.
+ */
+export interface JudgeTolerances {
+  unwidened_alias_suffix: string;
+  void_receiver: string;
+  absent_body: { declared: string; by_handler: string };
+}
+
+export function judgeTolerances(): JudgeTolerances {
+  return {
+    unwidened_alias_suffix: unwidenedAliasOf(''),
+    void_receiver: voidReceiverDeclaration(),
+    absent_body: {
+      declared: absentBodyRule('S', 'E', false),
+      by_handler: absentBodyRule('S', 'E', true),
+    },
+  };
+}
+
 export function decisiveAssignmentLine(plan: ProbePlan): number {
   return plan.wireAssignmentLine ?? plan.assignmentLine;
 }
@@ -298,9 +359,7 @@ export function buildProbe(
   // contract, so no counterparty shape can be judged against it.
   // `any` is excluded first: `[any] extends [void]` holds, and an `any` side
   // must keep its own top-type reason, never read as "reads no body".
-  push(
-    `type IsVoid<T> = 0 extends 1 & T ? false : [T] extends [never] ? false : [T] extends [void] ? true : false;`
-  );
+  push(voidReceiverDeclaration());
   gateLines.set(push(`type _G_sent_void = Assert<Not<IsVoid<Sent>>>;`), 'sent:void');
   gateLines.set(push(`type _G_expected_void = Assert<Not<IsVoid<Expected>>>;`), 'expected:void');
   // carrick#1162: a form-encoded request body (the platform `FormData` or
@@ -384,11 +443,7 @@ export function buildProbe(
     spec.protocol === 'socket' ||
     spec.protocol === 'pubsub';
   const toleratesAbsence = expectedToleratesAbsence?.(expectedEndpoint) === true;
-  const sentBodyType = (sent: string): string => {
-    const dropped = `Exclude<${sent}, undefined | void>`;
-    const byHandler = toleratesAbsence ? dropped : sent;
-    return `[Extract<${sent}, undefined | void>] extends [never] ? ${sent} : [{}] extends [Expected] ? ([Extract<Expected, undefined | void>] extends [never] ? ${byHandler} : ${dropped}) : ${sent}`;
-  };
+  const sentBodyType = (sent: string): string => absentBodyRule(sent, 'Expected', toleratesAbsence);
   if (absentBodyAllowed) push(`type SentBody = ${sentBodyType('Sent')};`);
   const sentBody = absentBodyAllowed ? 'SentBody' : 'Sent';
   push(`declare const sent: ${sentBody};`);
@@ -497,9 +552,7 @@ export function buildProbe(
     // field report reads (`comparedTypes`).
     if (wire === 'json') {
       for (const line of jsonWireDeclarations('')) push(line);
-      push(
-        `type GqlWire = [GqlComparand] extends [GqlExpected] ? GqlComparand : (JsonWireSame<JsonWire<GqlComparand>, GqlComparand> extends true ? GqlComparand : JsonWire<GqlComparand>);`
-      );
+      push(`type GqlWire = ${jsonWireRule('GqlComparand', 'GqlExpected', '')};`);
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
     }
@@ -528,9 +581,7 @@ export function buildProbe(
     // type structurally. Only a pair whose payload really is transformed loses
     // that name — and there the declared name no longer describes what travels.
     for (const line of jsonWireDeclarations('')) push(line);
-    push(
-      `type WireSent = [${sentBody}] extends [Expected] ? ${sentBody} : (JsonWireSame<JsonWire<${sentBody}>, ${sentBody}> extends true ? ${sentBody} : JsonWire<${sentBody}>);`
-    );
+    push(`type WireSent = ${jsonWireRule(sentBody, 'Expected', '')};`);
     push(`declare const sentWire: WireSent;`);
     wireAssignmentLine = push(`const expectedWire: Expected = sentWire;`);
   }
@@ -568,9 +619,7 @@ export function buildProbe(
       push(`type SentUnwidenedBody = ${sentBodyType(local)};`);
       unwidenedBody = 'SentUnwidenedBody';
     }
-    push(
-      `type WireSentUnwidened = [${unwidenedBody}] extends [Expected] ? ${unwidenedBody} : (JsonWireSame<JsonWire<${unwidenedBody}>, ${unwidenedBody}> extends true ? ${unwidenedBody} : JsonWire<${unwidenedBody}>);`
-    );
+    push(`type WireSentUnwidened = ${jsonWireRule(unwidenedBody, 'Expected', '')};`);
     push(`declare const sentWireUnwidened: WireSentUnwidened;`);
     push(`const expectedWireUnwidened: Expected = sentWireUnwidened;`);
   }

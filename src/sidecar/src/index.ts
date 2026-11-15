@@ -38,6 +38,7 @@ import { PROGRESS_INTERVAL_MS, atMostEvery } from './progress.js';
 import { mergeInferTimings } from './infer-timing.js';
 import { addProgramFiles, listProgramFiles } from './program-files.js';
 import { writeShadow } from './held-shadow.js';
+import { findSite } from './site-find.js';
 import {
   type AnswerKey,
   type KeptAnswer,
@@ -74,6 +75,7 @@ import type {
   ShutdownResponse,
   ListProgramFilesResponse,
   WriteShadowResponse,
+  FindSiteResponse,
   ReachGraphResponse,
   ReachResponse,
   AddProgramFilesResponse,
@@ -954,6 +956,21 @@ function handleWriteShadow(request: SidecarRequest & { action: 'write_shadow' })
 }
 
 /**
+ * Handle the 'find_site' action: the capture's own site finder over one file's
+ * syntax (site-find.ts). Reads no program.
+ */
+function handleFindSite(request: SidecarRequest & { action: 'find_site' }): FindSiteResponse {
+  try {
+    const answer = findSite(initializedLoader().getRepoRoot(), request);
+    return { request_id: request.request_id, status: 'success', ...answer };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logError(`Finding the site failed: ${error}`);
+    return { request_id: request.request_id, status: 'error', errors: [error] };
+  }
+}
+
+/**
  * Handle the 'reach_graph' action - the import graph of every program the
  * process has built, the default one and each owning project's (carrick#3100).
  * A process that has built none builds the default one, so a replay can ask
@@ -1162,6 +1179,8 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
       return handleListProgramFiles(request);
     case 'write_shadow':
       return handleWriteShadow(request);
+    case 'find_site':
+      return handleFindSite(request);
     case 'reach_graph':
       return handleReachGraph(request);
     case 'reach':

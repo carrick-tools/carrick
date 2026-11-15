@@ -354,6 +354,14 @@ export const WriteShadowRequestSchema = BaseRequestSchema.extend({
   out_dir: z.string().min(1),
 });
 
+export const FindSiteRequestSchema = BaseRequestSchema.extend({
+  action: z.literal('find_site'),
+  file: z.string().min(1),
+  text: z.string().min(1),
+  from_line: z.number().int().positive().optional(),
+  file_text: z.string().optional(),
+});
+
 export const ReachGraphRequestSchema = BaseRequestSchema.extend({
   action: z.literal('reach_graph'),
 });
@@ -828,6 +836,7 @@ export const SidecarRequestSchema = z.discriminatedUnion('action', [
   ShutdownRequestSchema,
   ListProgramFilesRequestSchema,
   WriteShadowRequestSchema,
+  FindSiteRequestSchema,
   ReachGraphRequestSchema,
   ReachRequestSchema,
   AddProgramFilesRequestSchema,
