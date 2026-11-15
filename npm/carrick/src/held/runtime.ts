@@ -43,6 +43,7 @@ import {
   type Value,
 } from "./place.ts";
 import { engineEntry, engineSiteFinder, writeShadow } from "./shadow.ts";
+import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
 
@@ -153,6 +154,9 @@ class HeldService implements ServiceEngine {
   private readonly program: Set<string>;
   private stampSeen: string;
   private needsGate = false;
+  /** Where the answer in flight spends its time; the after-answer work has its own (the queue runs them one at a time). */
+  private timer = new StepTimer();
+  private afterTimer = new StepTimer();
 
   private readonly init: ServiceInit;
   private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
@@ -420,9 +424,9 @@ class HeldService implements ServiceEngine {
     fs.writeFileSync(this.shadow(rel), text);
     this.known.set(rel, text);
     if (this.byFile.has(rel)) {
-      if (old !== undefined) await this.remap(rel, old, text);
+      if (old !== undefined) await this.timer.run("remap", () => this.remap(rel, old, text));
       this.queue(rel, this.transientIds(rel));
-      this.setView(rel);
+      await this.timer.run("view", () => this.setView(rel));
     } else this.engine.set(this.shadow(rel), text);
   }
 
@@ -433,9 +437,8 @@ class HeldService implements ServiceEngine {
    * measurement, which would answer with the file as it was.
    */
   private async sync(requested: string[]): Promise<void> {
-    for (const rel of [...this.ownFiles]) {
-      if (!requested.includes(rel) && this.sigOf(rel) !== this.sigs.get(rel)) await this.apply(rel);
-    }
+    const moved = await this.timer.run("sweep", () => [...this.ownFiles].filter((rel) => !requested.includes(rel) && this.sigOf(rel) !== this.sigs.get(rel)));
+    for (const rel of moved) await this.apply(rel);
     for (const rel of requested) await this.apply(rel);
   }
 
@@ -447,20 +450,21 @@ class HeldService implements ServiceEngine {
     this.needsGate = true;
   }
 
-  async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; after?: () => Promise<void> }> {
-    await this.refreshRows();
+  async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; after: () => Promise<Steps> }> {
+    this.timer = new StepTimer();
+    await this.timer.run("refresh", () => this.refreshRows());
     const requested = files
       .map((file) => path.relative(this.init.scan_root, file))
       .filter((rel) => rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel));
     await this.sync(requested);
     const lines = request.kind === "edit" ? await this.lines() : [];
-    return { lines, after: () => this.afterAnswer() };
+    return { lines, steps: this.timer.steps(), after: () => this.afterAnswer() };
   }
 
   private async lines(): Promise<HeldLine[]> {
     const rels = [...this.views.keys()];
     if (rels.length === 0) return [];
-    const pulled = await this.engine.pull(rels.map((rel) => this.shadow(rel)));
+    const pulled = await this.timer.run("pull", () => this.engine.pull(rels.map((rel) => this.shadow(rel))));
     const out: HeldLine[] = [];
     const said = new Set<string>();
     for (const rel of rels) {
@@ -493,7 +497,18 @@ class HeldService implements ServiceEngine {
   }
 
   /** The twin pass, restored in a `finally`; then files that lost a check's place, then rows the fact file added or changed. */
-  private async afterAnswer(): Promise<void> {
+  private async afterAnswer(): Promise<Steps> {
+    this.afterTimer = new StepTimer();
+    await this.afterTimer.run("twin", () => this.twinPass());
+    if (this.regate.size > 0) await this.afterTimer.run("regate", () => this.regatePending());
+    if (this.needsGate) {
+      this.needsGate = false;
+      await this.afterTimer.run("gate", () => this.gate(true));
+    }
+    return this.afterTimer.steps();
+  }
+
+  private async twinPass(): Promise<void> {
     for (const [rel, view] of this.views) {
       const shadow = this.shadow(rel);
       const twin = overlay(shadow, view.text, view.inputs, this.wire, "twin");
@@ -505,20 +520,17 @@ class HeldService implements ServiceEngine {
         this.engine.set(shadow, view.ov.text);
       }
     }
-    if (this.regate.size > 0) {
-      const pending = [...this.regate];
-      this.regate.clear();
-      this.commits = await this.deps.commits();
-      for (const [rel, ids] of pending) {
-        await this.gateFile(rel, false, ids);
-        this.setView(rel);
-      }
-      this.writePlaced();
+  }
+
+  private async regatePending(): Promise<void> {
+    const pending = [...this.regate];
+    this.regate.clear();
+    this.commits = await this.deps.commits();
+    for (const [rel, ids] of pending) {
+      await this.gateFile(rel, false, ids);
+      this.setView(rel);
     }
-    if (this.needsGate) {
-      this.needsGate = false;
-      await this.gate(true);
-    }
+    this.writePlaced();
   }
 
   rss(): number | null {

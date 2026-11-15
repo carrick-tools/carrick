@@ -14,7 +14,7 @@ import path from "node:path";
 import { HeldDaemon, type HeldAnswer, type ServiceInit } from "../src/held/daemon.ts";
 import { renderHeldLine } from "../src/held/line.ts";
 import { createRuntime } from "../src/held/runtime.ts";
-import { placedPath } from "../src/held/paths.ts";
+import { logPath, placedPath } from "../src/held/paths.ts";
 import type { ContractRow } from "../src/facts/store.ts";
 import { testDir } from "./helpers.ts";
 
@@ -60,6 +60,8 @@ type Rig = {
   file: (rel: string) => string;
   text: (rel: string) => string;
   placed: () => Placed;
+  /** The daemon's request log, one parsed row per line. */
+  log: () => Array<Record<string, unknown>>;
   edit: (rel: string, text: string) => Promise<HeldAnswer>;
   ask: (rel: string, kind?: "read" | "edit") => Promise<HeldAnswer>;
 };
@@ -128,6 +130,12 @@ async function rig(
     file,
     text: (rel) => fs.readFileSync(file(rel), "utf8"),
     placed: () => JSON.parse(fs.readFileSync(placedPath(root, "orders-api", home), "utf8")) as Placed,
+    log: () =>
+      fs
+        .readFileSync(logPath(root, home), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>),
     edit,
     ask,
   };
@@ -177,6 +185,17 @@ test("three framework shapes arm on real TypeScript 7; a break is one line at th
   assert.ok(![...placed.armed, ...placed.unarmed].some((p) => p.label === "POST /request-side"), "a request-side row is ignored");
   assert.deepEqual(placed.armed.find((a) => a.label === "GET /shared")!.file, SHARED);
   assert.deepEqual((await r.ask(ORDERS)).lines, [], "the unedited file says nothing");
+
+  // The log says where each answer's time went: the sweep, the edit's apply, the pull; and the twin pass after.
+  const logged = r.log();
+  const answered = logged.filter((row) => row["kind"] === "edit" && row["state"] === "ready");
+  assert.ok(answered.length > 0, "an answered edit is logged");
+  for (const row of answered) {
+    const steps = row["steps"] as Record<string, number>;
+    for (const name of ["programs", "queue_wait", "engine", "refresh", "sweep"]) assert.equal(typeof steps[name], "number", `${name} in ${JSON.stringify(row)}`);
+  }
+  assert.ok(answered.some((row) => typeof (row["steps"] as Record<string, number>)["pull"] === "number"), "an edit's row names the pull");
+  assert.ok(logged.some((row) => row["kind"] === "after" && typeof (row["steps"] as Record<string, number>)["twin"] === "number"), "the twin pass has a row");
 
   // (b) removing a required member from each shape: exactly one line, at the send's line.
   const breaks: Array<{ rel: string; from: string; to: string; label: string; at: string }> = [

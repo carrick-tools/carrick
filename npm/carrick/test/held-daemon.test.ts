@@ -326,6 +326,60 @@ test("each request is one JSON line in the log, with the state and the time it t
   }
 });
 
+test("an answer's log row names where its time went, and the after-answer work gets its own row", async () => {
+  const w = world(["api"]);
+  try {
+    w.release();
+    await w.daemon.handle(w.req(w.file("api")));
+    await settle();
+    // The world's fake engine states no steps of its own: the daemon's are the queue wait and the engine call.
+    await w.daemon.handle(w.req(w.file("api")));
+    await settle();
+    const rows = fs.readFileSync(logPath(w.root, w.home), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const ready = rows.filter((r) => r["state"] === "ready");
+    assert.equal(ready.length, 1);
+    const steps = ready[0]!["steps"] as Record<string, number>;
+    for (const name of ["programs", "queue_wait", "engine"]) assert.equal(typeof steps[name], "number", `${name} is logged`);
+    // An engine that reports steps has them in the same row, beside the daemon's.
+    assert.ok(!("sweep" in steps));
+  } finally {
+    w.done();
+  }
+});
+
+test("steps an engine reports reach the request's row, and the after-answer steps a row of their own", async () => {
+  const w = world(["api"]);
+  try {
+    const runtime: ServiceRuntime = {
+      start: async () => ({
+        engine: {
+          answer: async () => ({ lines: [], steps: { sweep: 12.5, pull: 3 }, after: async () => ({ twin: 7.25 }) }),
+          rss: () => 100,
+          close: async () => undefined,
+        },
+      }),
+    };
+    const daemon = new HeldDaemon({ root: w.root, home: w.home, env: { ...ON }, programs: async () => w.inits, runtime });
+    await daemon.handle(w.req(w.file("api")));
+    await settle();
+    await daemon.handle(w.req(w.file("api"), { session: "s2" }));
+    await settle();
+    const rows = fs.readFileSync(logPath(w.root, w.home), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    const answered = rows.find((r) => r["session"] === "s2" && r["kind"] === "edit")!;
+    assert.deepEqual(
+      Object.keys(answered["steps"] as object).sort(),
+      ["engine", "programs", "pull", "queue_wait", "sweep"],
+    );
+    assert.equal((answered["steps"] as Record<string, number>)["sweep"], 12.5);
+    const after = rows.find((r) => r["session"] === "s2" && r["kind"] === "after")!;
+    assert.equal(after["service"], "api");
+    assert.deepEqual(after["steps"], { twin: 7.25 });
+    assert.equal(typeof after["ms"], "number");
+  } finally {
+    w.done();
+  }
+});
+
 test("a second ensureHeld starts nothing; with the switch off, none starts", () => {
   const w = world(["api"]);
   try {
