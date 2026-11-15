@@ -591,8 +591,7 @@
         "conclusion": "success",
         "quiet": true,
         "rows": []
-      },
-      "known_miss": {"stage": "finding", "issues": ["carrick#3778"]}
+      }
     },
     {
       "name": "graphql-field-rename",
