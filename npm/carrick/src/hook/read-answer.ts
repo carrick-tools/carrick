@@ -16,6 +16,8 @@ import { createLogger } from "../log.ts";
 import { resolveRoot, rootNote } from "../root.ts";
 import { readLinesEnabled } from "../facts/enabled.ts";
 import { markRead, markTold, toldKey } from "./reuse.ts";
+import { stampOf } from "./generation.ts";
+import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
 /** The limit on the one check, unless the caller set its own. */
@@ -30,6 +32,10 @@ export type ReadAnswers = {
   used: string[];
   /** Time the fact lookups took, for the timing record. */
   factsMs: number | undefined;
+  /** The index each printed `check` answer came from, for the first-line generation sentence. */
+  stamps: LocalStamp[];
+  /** Where in `contexts` the `check` answers start. */
+  checksAt: number;
 };
 
 /**
@@ -37,7 +43,7 @@ export type ReadAnswers = {
  * there is nothing to say. The file is marked as asked about whatever the
  * answer was, so an error or a timeout is not asked again.
  */
-async function checkRead(file: string, root: string, session: string | undefined): Promise<string | null> {
+async function checkRead(file: string, root: string, session: string | undefined): Promise<{ context: string; stamp: LocalStamp | null } | null> {
   const { check } = await import("../cli.ts");
   const { renderPostRead } = await import("../render.ts");
   const relative = path.relative(root, file);
@@ -56,7 +62,7 @@ async function checkRead(file: string, root: string, session: string | undefined
   if (session && outcome.result.uses_lines?.length) {
     markTold(session, [toldKey(outcome.result, relative)]);
   }
-  return context;
+  return context ? { context, stamp: stampOf(outcome.result) } : null;
 }
 
 /**
@@ -117,6 +123,9 @@ export async function answerReads(
     }
   }
   const checked = await Promise.all(unanswered.map((entry) => checkRead(entry.file, entry.root, session)));
-  contexts.push(...checked.filter((line): line is string => line !== null));
-  return { contexts, claims, used, factsMs };
+  const checksAt = contexts.length;
+  const printed = checked.filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  contexts.push(...printed.map((entry) => entry.context));
+  const stamps = printed.flatMap((entry) => (entry.stamp ? [entry.stamp] : []));
+  return { contexts, claims, used, factsMs, stamps, checksAt };
 }

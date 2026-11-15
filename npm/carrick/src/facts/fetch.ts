@@ -20,7 +20,10 @@ import zlib from "node:zlib";
 import { API_BASE, readCredential } from "../auth/credentials.ts";
 import { createLogger } from "../log.ts";
 import { hasMarker } from "../root.ts";
-import { claimRefresh, cooldownMs, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
+import { claimRefresh, cooldownMs, forwardInBackground, markerPath, scriptBeside, startDetached } from "../hook/refresh.ts";
+import type { RefreshOptions } from "../hook/refresh.ts";
+import { status as readStatus } from "../cli.ts";
+import type { StatusResult } from "../contract.ts";
 import { snapshotProjectSlug } from "../hook/reuse.ts";
 import { splitRemote } from "../git-remote.ts";
 import { chainLinesEnabled, contractLinesEnabled, factsEnabled } from "./enabled.ts";
@@ -40,6 +43,8 @@ export type FactsRefreshOptions = {
   env?: NodeJS.ProcessEnv;
   request?: typeof fetch;
   now?: number;
+  /** Injected in tests: the workspace status and the detached start of the hosted move that a new fact file begins. */
+  forward?: { status?: () => Promise<StatusResult | null>; start?: RefreshOptions["start"] };
 };
 
 /** Each repo of the local index and where it is checked out (`.carrick/index.json`). */
@@ -235,8 +240,26 @@ export function startFactsRefresh(
 export async function runFactsRefresh(root: string, options: FactsRefreshOptions = {}): Promise<RefreshOutcome> {
   const outcome = await refreshFacts(root, options);
   log(`fact refresh: ${outcome}`);
+  // A new fact file is the hosted index moving: start the move of this
+  // machine's copy under its own claim and cooldown (`forwardInBackground`).
+  // `status` runs here, in the detached runner, never in a hook's path.
+  if (outcome === "written") await startHostedMove(root, options);
   if (outcome === "retry") allowEarlyRetry(root, options.env ?? process.env, options.now ?? Date.now());
   return outcome;
+}
+
+/** The move that follows a written fact file. Never throws. */
+async function startHostedMove(root: string, options: FactsRefreshOptions): Promise<void> {
+  try {
+    const result = options.forward?.status
+      ? await options.forward.status()
+      : (await readStatus({ cwd: root, workspace: root, env: options.env })).result ?? null;
+    if (!result || result.error) return;
+    const started = forwardInBackground(root, result, { env: options.env, now: options.now, start: options.forward?.start });
+    log(`hosted move after a new fact file: ${started ? "started" : "not started"}`);
+  } catch (error) {
+    log("hosted move not started", String(error));
+  }
 }
 
 /**

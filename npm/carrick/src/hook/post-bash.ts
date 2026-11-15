@@ -53,7 +53,7 @@ type Payload = {
 /** The late answers alone, through the shared printer (`late.ts`). */
 async function lateOnly(session: string | undefined): Promise<void> {
   const { printLateOnly } = await import("./late.ts");
-  printLateOnly(session);
+  await printLateOnly(session);
 }
 
 async function main(timing: Timing): Promise<void> {
@@ -150,8 +150,8 @@ async function main(timing: Timing): Promise<void> {
     );
     return;
   }
-  const { deliverLate, emitPostToolUse } = await import("./late.ts");
-  emitPostToolUse([...deliverLate(session), ...answers]);
+  const { deliverLateFirst, emitPostToolUse } = await import("./late.ts");
+  emitPostToolUse([...(await deliverLateFirst(session)), ...answers]);
   // Claimed only now that the lines are printed.
   if (session) reuse.markFacts(session, read.claims);
 }

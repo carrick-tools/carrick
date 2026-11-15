@@ -27,7 +27,7 @@ import { patchedFiles, patchEdits, placeHunks } from "./apply-patch.ts";
 import { MAX_FACT_FILE_BYTES } from "../facts/files.ts";
 import type { FactEdit } from "../facts/lines.ts";
 import { markInvoker } from "./invoker.ts";
-import { deliverLate, emitPostToolUse } from "./late.ts";
+import { deliverLateFirst, emitPostToolUse } from "./late.ts";
 import { editFlow } from "./edit-flow.ts";
 import { sessionKey } from "./session-key.ts";
 import { isManifest } from "../facts/rules/packages.ts";
@@ -125,7 +125,7 @@ async function main(timing: Timing): Promise<void> {
     // Nothing of ours to check in this edit, but a finished background answer
     // is still owed to the model (B3: every carrier delivers).
     if (channel.channel === "hook") {
-      const late = deliverLate(session);
+      const late = await deliverLateFirst(session);
       emitPostToolUse(late);
     }
     return;
