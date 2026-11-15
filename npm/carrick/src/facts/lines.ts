@@ -372,7 +372,7 @@ export async function factLines(
   root: string,
   edits: readonly FactEdit[],
   session: string | undefined,
-  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean; chain?: boolean } = {},
+  options: { home?: string; now?: number; env?: NodeJS.ProcessEnv; limit?: number; exclude?: ReadonlySet<string>; contract?: boolean; chain?: boolean; store?: FactStore | null } = {},
 ): Promise<FactOutcome> {
   const started = performance.now();
   const now = options.now ?? Date.now();
@@ -398,10 +398,12 @@ export async function factLines(
   // Off by default (`enabled.ts`): the store is not opened and nothing refreshes.
   if (!factsEnabled(options.env)) {
     stale = false;
+    options.store?.close();
     return done();
   }
   try {
-    store = await openFacts(root);
+    // A caller that already opened the store hands it in; this call closes it.
+    store = options.store !== undefined ? options.store : await openFacts(root);
     if (store === null) return done();
     present = true;
     const facts: FactStore = store;

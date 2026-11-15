@@ -23,6 +23,7 @@ import { engineReadyOf } from "./timings.ts";
 import type { Timing } from "./timings.ts";
 import type { CheckResult } from "../contract.ts";
 import { factLines } from "../facts/lines.ts";
+import { openFacts } from "../facts/store.ts";
 import type { FactEdit, FactOutcome } from "../facts/lines.ts";
 import { isManifest } from "../facts/rules/packages.ts";
 import { chainLinesEnabled, compilerLinesEnabled, contractLinesEnabled, factsEnabled } from "../facts/enabled.ts";
@@ -71,6 +72,8 @@ export async function editFlow(
      * are never probed, queued or recorded as an edit, so `edited` may be empty.
      */
     factOnly?: string[];
+    /** The three calls whose timing the edit-flow tests fake; the hook passes none. */
+    run?: { factLines: typeof factLines; probeEdits: typeof probeEdits; openFacts: typeof openFacts };
   },
   edited: string[],
   extra: string[] = [],
@@ -117,17 +120,14 @@ export async function editFlow(
     channel.channel === "hook" && session && heldFiles.length > 0 && compilerLinesEnabled()
       ? askHeldFiles(choice.root, heldFiles, session, editedAt, cwd)
       : null;
-  const facts =
-    channel.channel === "hook"
-      ? await factLines(
-          choice.root,
-          factFiles.map((file) => ({ file, ...input.changes?.get(file) })),
-          session,
-          { contract: contractLinesEnabled(), chain: chainLinesEnabled() },
-        )
-      : null;
-  const covered = new Set(facts?.callersRead ?? []);
-  const queueable = channel.channel === "hook" && Boolean(session);
+  const run = input.run ?? { factLines, probeEdits, openFacts };
+  const hook = channel.channel === "hook";
+  const queueable = hook && Boolean(session);
+  // The store is opened once, here: "is there a fact file" is known from the
+  // open, so which files the probe covers is settled before the fact lines
+  // finish, and the probe can run beside them (A7). `factLines` takes the
+  // opened store and closes it.
+  const store = hook && factsEnabled() ? await run.openFacts(choice.root) : null;
   // The edit just landed, so the index describes the file as it was before
   // it. Without a fact file the hook asks the binary once, with a probe that
   // never starts a re-scan: an answer that needs none (the file reads the
@@ -138,7 +138,28 @@ export async function editFlow(
   // leads included, arrives on the next carrier (T12-2). A sub-agent's edit
   // keeps the probe (R46.3), and a file the queue did not take is probed in
   // hand as before (R46.1).
-  const insteadOfProbe = queueable && facts?.present === true && !input.subAgent;
+  const insteadOfProbe = queueable && store !== null && !input.subAgent;
+  const probeOf = (indexes: number[]) =>
+    indexes.length > 0
+      ? run.probeEdits(
+          indexes.map((index) => relatives[index]!),
+          choice.root,
+        )
+      : Promise.resolve({ results: [], failure: null, ms: 0 });
+  // The fact lines and the probe run side by side: the wait is the longer of
+  // the two, not their sum. Files queued in place of the probe are not probed.
+  const [facts, early] = await Promise.all([
+    hook
+      ? run.factLines(
+          choice.root,
+          factFiles.map((file) => ({ file, ...input.changes?.get(file) })),
+          session,
+          { contract: contractLinesEnabled(), chain: chainLinesEnabled(), store },
+        )
+      : null,
+    insteadOfProbe ? null : probeOf([...relatives.keys()]),
+  ]);
+  const covered = new Set(facts?.callersRead ?? []);
   const queued = new Set<string>();
   if (insteadOfProbe && edited.length > 0) {
     const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe, cwd });
@@ -146,13 +167,7 @@ export async function editFlow(
     for (const entry of entries) queued.add(entry.file);
   }
   const probed = [...relatives.keys()].filter((index) => !queued.has(edited[index]!));
-  const answers =
-    probed.length > 0
-      ? await probeEdits(
-          probed.map((index) => relatives[index]!),
-          choice.root,
-        )
-      : { results: [], failure: null, ms: 0 };
+  const answers = early ?? (await probeOf(probed));
   if (input.timing) input.timing.waitedMs = answers.ms;
   // Joined after the probe: it ran beside the facts and the probe under the
   // probe's own budget, so it adds nothing beyond that.
