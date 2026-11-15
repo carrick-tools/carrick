@@ -111,6 +111,11 @@ pub(super) struct ModuleBinding {
     /// every other reader (`scope.held`), so [`Resolver::binding_values`]
     /// does not answer for it.
     pub(super) text_only: bool,
+    /// A key of a destructuring (`const { key: name } = init`) at module
+    /// scope: [`Self::init`] is the member read `init.key`. Only
+    /// [`Resolver::binding_values`] reads it, and only where every value it
+    /// holds is an in-repo definition (K3).
+    pub(super) destructured: bool,
     /// The module reads the object the binding holds only through a member,
     /// and otherwise only writes it in place, tests it or returns it
     /// ([`WriteCensus::object_held`], carrick#3670), whether or not it
@@ -302,6 +307,9 @@ pub(super) struct LocalBinding {
     pub(super) list_frozen: bool,
     /// As [`ModuleBinding::element_tests`].
     pub(super) element_tests: BTreeMap<u32, Vec<ElementTest>>,
+    /// A key of a destructuring (`const { key: name } = init`): `init` is
+    /// the member read `init.key`, as on [`ModuleBinding::destructured`].
+    pub(super) destructured: bool,
 }
 
 /// A placed assignment `name = value`, `name ??= value` or `name ||= value`
@@ -371,8 +379,8 @@ struct WriteCensus {
     next_class_name: Option<BindingKey>,
     /// How many of the references are the object of a member read, directly
     /// or through a fallback, a condition or a wrapper (`client.get`,
-    /// `(a ?? client).get`): the binding's value is only read through a
-    /// member (carrick#2448).
+    /// `(a ?? client).get`), or whose keys `Object.keys(client)` lists: the
+    /// binding's value is only read through a member (carrick#2448).
     member_bases: HashMap<BindingKey, usize>,
     /// An entry of the binding, however nested, is assigned, updated or
     /// deleted, through the binding or through a fallback of it
@@ -389,6 +397,10 @@ struct WriteCensus {
     /// How many of the references are the list a `for…of` loops over
     /// (`for (const x of LIST)`, carrick#2093).
     loop_lists: HashMap<BindingKey, usize>,
+    /// Each binding the module exports by name as its default
+    /// (`export default services`): one of its references, which publishes
+    /// the binding as `export const` does.
+    exported_default: HashSet<BindingKey>,
     /// A member of the binding that changes an array in place is read
     /// (`LIST.push`, `LIST?.sort`, `LIST['splice']`): the list may change.
     list_mutated: HashSet<BindingKey>,
@@ -679,7 +691,12 @@ impl WriteCensus {
         let tested = self.tested_or_returned.get(key).map_or(0, HashSet::len);
         !self.is_unplaceable(key)
             && !self.written_through.contains(key)
-            && count(&self.references) == count(&self.member_bases) + writes + tested + 1
+            && count(&self.references)
+                == count(&self.member_bases)
+                    + writes
+                    + tested
+                    + usize::from(self.exported_default.contains(key))
+                    + 1
     }
 
     /// Whether the module never changes the list `key` holds (carrick#2093):
@@ -975,6 +992,13 @@ impl Visit for WriteCensus {
         member.visit_children_with(self);
     }
 
+    fn visit_export_default_expr(&mut self, export: &ExportDefaultExpr) {
+        if let Expr::Ident(name) = crate::request_summary::unwrap_value(&export.expr) {
+            self.exported_default.insert(ident_key(name));
+        }
+        export.visit_children_with(self);
+    }
+
     fn visit_for_of_stmt(&mut self, stmt: &ForOfStmt) {
         if let Expr::Ident(list) = crate::request_summary::unwrap_value(&stmt.right) {
             *self.loop_lists.entry(ident_key(list)).or_default() += 1;
@@ -1025,6 +1049,21 @@ impl Visit for WriteCensus {
             // counted: the text reader reads only string entries, which no
             // callee can change.
             self.escape(callee);
+            // `Object.keys(o)` lists o's keys: a member read of o, not a
+            // hand-on of its entries (K3).
+            if let Expr::Member(member) = &**callee
+                && let Expr::Ident(object) =
+                    crate::graphql_document_sites::unwrap_expression(&member.obj)
+                && object.sym == *"Object"
+                && let MemberProp::Ident(prop) = &member.prop
+                && prop.sym == *"keys"
+                && let [arg] = call.args.as_slice()
+                && arg.spread.is_none()
+                && let Expr::Ident(read) =
+                    crate::graphql_document_sites::unwrap_expression(&arg.expr)
+            {
+                *self.member_bases.entry(ident_key(read)).or_default() += 1;
+            }
             // `Object.defineProperty(o, 'k', …)` writes a member in a form
             // no reader places (carrick#3504 S2b-7).
             if let Expr::Member(member) = &**callee
@@ -1107,6 +1146,17 @@ pub(super) type ModuleBindings = (
     PlacedWrites,
 );
 
+/// Whether a body key's init reads a key of a module an `import()` loads
+/// directly (`const { default: init } = await import("./m")`): such a key is
+/// not marked [`LocalBinding::destructured`], so it reads as it did before
+/// K3 (a registry thunk's module is the one reading K3 opens).
+fn loads_directly(init: &[ValueAt]) -> bool {
+    init.iter().any(|value| {
+        matches!(value, ValueAt::KeyOf { object, .. }
+            if object.iter().any(|held| matches!(held, ValueAt::Loaded { .. })))
+    })
+}
+
 /// Each module-scope binding a plain name declares, with its initialiser
 /// read in module scope and every write the census finds (carrick#3504 S1),
 /// each function's own `let` its body writes again, under the function's key
@@ -1183,6 +1233,7 @@ pub(super) fn module_bindings(
                         handed: Vec::new(),
                         exported: false,
                         text_only: true,
+                        destructured: true,
                         object_kept: false,
                         plain: false,
                         // Module-level writes may run in any function, in
@@ -1204,6 +1255,7 @@ pub(super) fn module_bindings(
             let key = ident_key(&ident.id);
             let line = source_map.lookup_char_pos(ident.id.span.lo).line as u32;
             let init = declarator.init.as_deref();
+            let exported = exported || census.exported_default.contains(&key);
             let binding = ModuleBinding {
                 declared: Declared::Module,
                 init: init
@@ -1218,6 +1270,7 @@ pub(super) fn module_bindings(
                 handed: census.handed.get(&key).cloned().unwrap_or_default(),
                 exported,
                 text_only: false,
+                destructured: false,
                 object_kept: census.object_held(&key),
                 plain: true,
                 reads: BTreeMap::new(),
@@ -1280,6 +1333,7 @@ pub(super) fn module_bindings(
                 // The scope holds a body's own locals, not a function declared
                 // in it: the value readers read that one here (carrick#3794).
                 text_only: !local.block && !local.reassigned && local.kind != BindingKind::Function,
+                destructured: local.destructured && !loads_directly(&local.init),
                 object_kept: false,
                 plain: local.plain,
                 reads: flow_checked(local, &census),
@@ -1772,6 +1826,11 @@ pub(super) enum ValueAt {
         /// `const`'s name), read by the text reader.
         key: Box<ValueAt>,
     },
+    /// `import("<specifier>")` spanning `lo..hi`, its specifier a string
+    /// literal: the namespace of the module it loads, which a key of it
+    /// reads an export of ([`Resolver::key_values`]). Every other reader
+    /// treats it as [`Self::Unread`].
+    Loaded { lo: u32, hi: u32, specifier: String },
     /// A function written here, by where its node starts.
     Function(u32),
     /// An object literal: each key's values, and whether a spread or a
@@ -2510,6 +2569,26 @@ impl Reader<'_> {
             },
             Expr::Arrow(arrow) => vec![ValueAt::Function(arrow.span.lo.0)],
             Expr::Fn(function) => vec![ValueAt::Function(function.function.span.lo.0)],
+            // `import("./m")`: the module's namespace.
+            Expr::Call(call) if matches!(call.callee, Callee::Import(_)) => {
+                match call
+                    .args
+                    .first()
+                    .filter(|arg| arg.spread.is_none())
+                    .and_then(|arg| match &*arg.expr {
+                        Expr::Lit(Lit::Str(text)) => {
+                            Some(text.value.to_string_lossy().into_owned())
+                        }
+                        _ => None,
+                    }) {
+                    Some(specifier) => vec![ValueAt::Loaded {
+                        lo: call.span.lo.0,
+                        hi: call.span.hi.0,
+                        specifier,
+                    }],
+                    None => vec![ValueAt::Unread],
+                }
+            }
             Expr::Call(call) if matches!(call.callee, Callee::Expr(_)) => {
                 let member = match &call.callee {
                     Callee::Expr(callee) => {
@@ -2944,6 +3023,7 @@ impl Reader<'_> {
                 elements: None,
                 list_frozen: false,
                 element_tests: BTreeMap::new(),
+                destructured: false,
             })
         };
         let named = |binding: &Ident, index: usize, keys: Vec<String>| ParamName {
@@ -3420,6 +3500,78 @@ impl<'a> Resolver<'a> {
             .find_map(|body| find(body, start))
     }
 
+    /// The in-repo definitions the call `call`, written in `file`, runs when
+    /// its callee is a destructured module binding the resolver reads (K3:
+    /// `const { default: init } = await services[name]()`, `init(app)`):
+    /// `None` unless the compiler's row names such a binding and every value
+    /// it holds is a definition, so a callee read only in part adds no
+    /// caller.
+    pub(super) fn binding_definitions(
+        &self,
+        file: &'a Path,
+        call: &'a CallIr,
+    ) -> Option<Vec<(PathBuf, String)>> {
+        struct Definitions;
+        impl<'a> Follow<'a> for Definitions {
+            type Reached = Option<(PathBuf, String)>;
+
+            fn export(
+                &mut self,
+                _: &'a Path,
+                _: u32,
+                _: u32,
+                _: Kind,
+                _: Invoke<'a>,
+            ) -> Option<Self::Reached> {
+                None
+            }
+
+            fn definition(&mut self, target: PathBuf, key: String, _: Invoke<'a>) -> Self::Reached {
+                Some((target, key))
+            }
+
+            fn written(
+                &mut self,
+                _: &'a Path,
+                _: &'a FnIr,
+                _: Invoke<'a>,
+                _: Option<Maker<'a>>,
+            ) -> Self::Reached {
+                None
+            }
+        }
+        let invoke = Invoke {
+            file,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let row = self
+            .row_at(file, call.site.lo, call.site.hi, Kind::Call)
+            .ok()?;
+        let (path, line, symbol) = self.declared_binding(row)?;
+        // A destructured key alone: any other binding's value may be one a
+        // `bind` shifted the arguments of, which a caller edge cannot say.
+        self.inputs_for(path)
+            .files
+            .get(path)?
+            .module_bindings
+            .get(&(line, symbol.clone()))
+            .filter(|binding| binding.destructured)?;
+        let held = self.binding_values(&mut Definitions, path, line, &symbol, invoke)?;
+        let mut out = Vec::new();
+        for held in held {
+            match held {
+                Held::Reached(Some(definition)) if !out.contains(&definition) => {
+                    out.push(definition);
+                }
+                Held::Reached(Some(_)) => {}
+                _ => return None,
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// What `value`, read in a body of `file`, holds when `invoke` runs it
     /// (carrick#2432): a parameter of that body is left for its callers; a
     /// name or member is what `follow` says its row is, else the in-repo
@@ -3635,6 +3787,7 @@ impl<'a> Resolver<'a> {
             // guards' (carrick#3504 S7b-2).
             | ValueAt::New { .. }
             | ValueAt::Constructed { .. }
+            | ValueAt::Loaded { .. }
             | ValueAt::Unstated { .. }
             | ValueAt::Unread => stop(Stop::UnreadExpression),
         }
@@ -3711,7 +3864,14 @@ impl<'a> Resolver<'a> {
         let _query = self.enter();
         let mut out: Vec<Held<F::Reached>> = Vec::new();
         let mut objects: Vec<ObjectAt<'a, 'v>> = Vec::new();
+        let mut modules: Vec<(PathBuf, String)> = Vec::new();
         for held in object {
+            // The namespace of a module an `import()` loads, or of each
+            // module a registry's thunks load: the export under the key.
+            if let Some(loaded) = self.loaded_modules(file, held) {
+                modules.extend(loaded);
+                continue;
+            }
             match held {
                 // `options.client.get`: what the callers write at the key.
                 ValueAt::Param { depth, index, keys } => {
@@ -3726,8 +3886,11 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
-        if objects.is_empty() {
+        if objects.is_empty() && modules.is_empty() {
             return None;
+        }
+        for (importer, specifier) in &modules {
+            out.extend(self.module_export(follow, importer, specifier, key, invoke));
         }
         // One module binding read twice (`if (c) return c; …; return c`) is
         // one object (carrick#3670): no factory call made it.
@@ -3763,6 +3926,93 @@ impl<'a> Resolver<'a> {
             }
         }
         Some(self.settle(out))
+    }
+
+    /// The modules `value`, read in `file`, may hold the namespace of, each
+    /// as the file that loads it and its specifier: an `import()` with a
+    /// literal specifier, or the call of a thunk a registry object holds
+    /// (`services[name]()`, each entry `() => import("./m")`), the entry its
+    /// key names when that is one text, else every entry. `None` when some
+    /// value it may hold is none of these (a registry something may change,
+    /// a thunk that returns anything else): nothing is guessed.
+    fn loaded_modules(&self, file: &'a Path, value: &ValueAt) -> Option<Vec<(PathBuf, String)>> {
+        match value {
+            ValueAt::Loaded { specifier, .. } => {
+                Some(vec![(file.to_path_buf(), specifier.clone())])
+            }
+            ValueAt::Returned {
+                lo,
+                member: None,
+                local,
+                ..
+            } if local.is_empty() => {
+                let call = self.written_call(file, *lo)?;
+                let ValueAt::KeyOf { object, key, .. } = call.callee_key.as_ref()? else {
+                    return None;
+                };
+                let named = self.one_text(file, key).ok().map(|(text, _)| text);
+                let mut registries: Vec<ObjectAt<'a, '_>> = Vec::new();
+                for held in object {
+                    if !self.objects_of(file, held, None, &mut registries) {
+                        return None;
+                    }
+                }
+                let mut out = Vec::new();
+                for registry in &registries {
+                    let entries: Vec<&Vec<ValueAt>> = match &named {
+                        Some(name) => vec![registry.fields.get(name)?],
+                        None => registry.fields.values().collect(),
+                    };
+                    for values in entries {
+                        for entry in values {
+                            let ValueAt::Function(start) = entry else {
+                                return None;
+                            };
+                            let thunk = self.written_function(registry.file, *start)?;
+                            if thunk.returned_values.is_empty() {
+                                return None;
+                            }
+                            for returned in &thunk.returned_values {
+                                let ValueAt::Loaded { specifier, .. } = returned else {
+                                    return None;
+                                };
+                                out.push((registry.file.to_path_buf(), specifier.clone()));
+                            }
+                        }
+                    }
+                }
+                (!out.is_empty() && out.len() <= MAX_VALUES).then_some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// What the export `key` of the module `importer` loads by `specifier`
+    /// is: the definition a published binding of that name is, else why not.
+    fn module_export<F: Follow<'a>>(
+        &self,
+        follow: &mut F,
+        importer: &Path,
+        specifier: &str,
+        key: &str,
+        invoke: Invoke<'a>,
+    ) -> Vec<Held<F::Reached>> {
+        let Some(ImportedBinding::Module(published)) =
+            self.inputs_for(importer).bindings.load(importer, specifier)
+        else {
+            return vec![Held::Stop(Stop::UnreadExpression)];
+        };
+        let Some(binding) = published.iter().find(|binding| binding.published == key) else {
+            return vec![Held::Stop(Stop::ValueNeverBound)];
+        };
+        match self.function(&binding.file, &binding.name) {
+            Some(_) => vec![Held::Reached(follow.definition(
+                binding.file.clone(),
+                binding.name.clone(),
+                invoke,
+            ))],
+            None => vec![Held::Stop(Stop::UnreadExpression)],
+        }
     }
 
     /// Each object literal `value`, read in `file`, may hold, pushed to
@@ -4349,7 +4599,7 @@ impl<'a> Resolver<'a> {
         let binding = ir
             .module_bindings
             .get(&(line, symbol.to_string()))
-            .filter(|binding| binding.values_read())?;
+            .filter(|binding| binding.values_read() || binding.destructured)?;
         // A nested function's local that holds a parameter of an enclosing
         // function is not read here: that function's callers decide it, as
         // the walk's `lifted` reads it (one function nearer each hop). Only
@@ -4425,7 +4675,16 @@ impl<'a> Resolver<'a> {
             }
         }
         self.bindings_reading.borrow_mut().remove(&reading);
-        Some(self.settle(out))
+        let out = self.settle(out);
+        // A destructured key is read only where it names definitions: any
+        // other answer is what the rows said of it before.
+        if binding.destructured
+            && !binding.values_read()
+            && !(out.iter().all(|held| matches!(held, Held::Reached(_))) && !out.is_empty())
+        {
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -4771,6 +5030,51 @@ mod tests {
         );
     }
 
+    /// K3 (koa-style mounts): a callee bound by destructuring the awaited
+    /// result of a registry thunk (`const { default: init } = await
+    /// services[name]()`, each thunk `() => import("./m")`) is the default
+    /// export of each module the registry can return, one value per thunk.
+    #[test]
+    fn a_default_export_reached_through_a_lazy_registry_is_the_callee() {
+        let Some(on) = walked("receiver-lazy-registry", ".", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        let (path, ir) = on
+            .inputs
+            .files
+            .iter()
+            .find(|(path, _)| path.ends_with("main.ts"))
+            .expect("main.ts is read");
+        // `init(app)`, the call a module-scope binding is the callee of.
+        let call = ir
+            .module_level
+            .read_calls()
+            .map(|(call, _)| call)
+            .find(|call| call.site.line == 11)
+            .expect("the call of init");
+        let invoke = Invoke {
+            file: path,
+            call,
+            construction: false,
+            bound: 0,
+        };
+        let row = resolver
+            .row_at(path, call.site.lo, call.site.hi, Kind::Call)
+            .expect("a row for the call");
+        let (file, line, symbol) = resolver
+            .declared_binding(row)
+            .expect("init is a module binding");
+        let held = resolver
+            .binding_values(&mut Ends, file, line, &symbol, invoke)
+            .expect("the binding is read");
+        assert_eq!(
+            got(held),
+            [definition("init"), definition("init")],
+            "one value per thunk's module"
+        );
+    }
+
     /// A factory that returns a module `const` object returns the object the
     /// binding holds (shape c, ruling R5).
     #[test]
@@ -4945,6 +5249,26 @@ mod tests {
         let (census, key) = census_over(source, name);
         let assigned = census.writes.contains_key(&key) || census.is_unplaceable(&key);
         (assigned, census.entries_kept(&key, false))
+    }
+
+    /// K3 body keys: a registry whose keys are listed through `Object.keys`
+    /// is still read only through its keys, so it is kept. `Object.values`
+    /// and a plain hand-on hand its entries on and stay refused.
+    #[test]
+    fn a_registry_whose_keys_are_read_through_object_keys_is_kept() {
+        let kept = |source: &str| {
+            let (census, key) = census_over(source, "r");
+            (census.object_kept(&key), census.object_held(&key))
+        };
+        assert_eq!(
+            kept("const r = { a: 1 }; if (Object.keys(r).length) {}"),
+            (true, true)
+        );
+        assert_eq!(
+            kept("const r = { a: 1 }; Object.values(r);"),
+            (false, false)
+        );
+        assert_eq!(kept("const r = { a: 1 }; f(r);"), (false, false));
     }
 
     /// carrick#3670 (ruling R5): a module binding holds the objects placed in
@@ -5456,6 +5780,25 @@ function twice(x: boolean) { let w: any = 1; if (x) { w = 2; } w.get('/t'); }
         assert_eq!(
             named_callee(&resolver, &on.inputs, "scoped.ts", 16),
             Some(vec![definition("sendBlock")])
+        );
+    }
+
+    /// K3 body keys: a block key read in part (one branch a definition, the
+    /// other a call nothing in the repo answers) keeps the answer the rows
+    /// gave before, stop included; the mark on locals does not make it
+    /// fail closed.
+    ///
+    /// Proof it ran: `walked` is `None` without the built compiler engine
+    /// (the test then returns early); CI builds it first.
+    #[test]
+    fn a_block_key_read_in_part_keeps_its_answer() {
+        let Some(on) = walked("receiver-lazy-registry-body", ".", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        assert_eq!(
+            named_callee(&resolver, &on.inputs, "partial.ts", 10),
+            Some(vec![Got::Stop(Stop::UnreadExpression)])
         );
     }
 

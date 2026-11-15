@@ -7027,6 +7027,7 @@ impl Reader<'_> {
                     .as_deref()
                     .is_some_and(resolve::written_as_const),
                 element_tests: BTreeMap::new(),
+                destructured: false,
             });
         }
         // `const { a, b: name } = init`: each plain key is a local of its own
@@ -7054,6 +7055,7 @@ impl Reader<'_> {
                     elements: None,
                     list_frozen: false,
                     element_tests: BTreeMap::new(),
+                    destructured: true,
                 });
             }
         }
@@ -9160,6 +9162,7 @@ impl Visit for CallWalker<'_, '_, '_> {
                 elements: None,
                 list_frozen: false,
                 element_tests: BTreeMap::new(),
+                destructured: false,
             };
             self.push_entry(entry);
         }
@@ -9397,6 +9400,7 @@ impl CallWalker<'_, '_, '_> {
                 elements: None,
                 list_frozen: false,
                 element_tests,
+                destructured: false,
             };
             self.push_entry(entry);
         }

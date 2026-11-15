@@ -8504,6 +8504,53 @@ export function listen(): void {
         assert_eq!(got, want, "{got:#?}");
     }
 
+    /// K3 (koa-style mounts): an app handed to a function the module that
+    /// calls it loads lazily. `init` is the default export of whichever
+    /// module a registry's thunk imports (`const { default: init } = await
+    /// services[name]()`), so the call is a caller of each module's default
+    /// export, and the app it hands in is the top of both modules' routes
+    /// rather than a function nothing calls (`entry_point`).
+    #[test]
+    fn routes_on_an_app_handed_through_a_lazy_registry_are_served_at_the_top() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-lazy-registry")
+        else {
+            return;
+        };
+        use super::super::decided_sites::ScopeLabel;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        let want = texts(&["src/admin.ts:8 <- /reg/stats", "src/web.ts:8 <- /reg/ping"]);
+        assert_eq!(got, want, "{got:#?}");
+    }
+
+    /// K3 body keys: a callee destructured in a function or loop body from a
+    /// registry thunk's awaited module (`const { default: init } = await
+    /// services[name]()`) has that caller, as at module scope: the app a body
+    /// hands in is served at the top. A module loaded directly in a body
+    /// (`await import("./m")`) stays unread.
+    #[test]
+    fn routes_on_an_app_handed_through_a_lazy_registry_in_a_body_are_served_at_the_top() {
+        let Some((on, exports, declarations)) = traced_fixture_named("receiver-lazy-registry-body")
+        else {
+            return;
+        };
+        use super::super::decided_sites::ScopeLabel;
+        let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
+        let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
+        let got = composed_lines(&decided, false);
+        let want = texts(&[
+            "src/real/services/web.ts:8 <- /e/ping",
+            "src/svc/a.ts:8 <- /a/ping",
+            "src/svc/b.ts:8 <- /b/ping",
+            "src/svc/c.ts:8 <- /c/ping",
+            "src/svc/d.ts:8 <- /d/ping",
+            "src/svc/f.ts:8 <- /f/ping (entry_point)",
+            "src/svc/g.ts:8 <- /g/ping",
+        ]);
+        assert_eq!(got, want, "{got:#?}");
+    }
+
     /// carrick#3488: a client the library-site reader does not hold (a
     /// parameter, a constructor parameter property) is walked to the maker
     /// call each caller hands in. That root is where its base is read: a
