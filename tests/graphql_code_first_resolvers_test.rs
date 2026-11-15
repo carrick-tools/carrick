@@ -58,8 +58,8 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// `(kind|field, file:line)` for every GraphQL endpoint row of `parcels-api`.
-fn scan_graphql_endpoints(cassettes: &Path) -> BTreeSet<(String, String)> {
+/// The index blob of `parcels-api`, scanned offline against `cassettes`.
+fn scan_blob(cassettes: &Path) -> serde_json::Value {
     let storage = tempfile::tempdir().expect("temp storage dir");
     let cache = tempfile::tempdir().expect("temp cache dir");
     let mut cmd = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_carrick")));
@@ -106,7 +106,12 @@ fn scan_graphql_endpoints(cassettes: &Path) -> BTreeSet<(String, String)> {
         serde_json::from_slice(&std::fs::read(entry.path()).expect("read blob"))
             .expect("parse blob");
     assert_eq!(blob["service_name"], "parcels-api");
-    blob["endpoints"]
+    blob
+}
+
+/// `(kind|field, file:line)` for every GraphQL endpoint row of `parcels-api`.
+fn scan_graphql_endpoints(cassettes: &Path) -> BTreeSet<(String, String)> {
+    scan_blob(cassettes)["endpoints"]
         .as_array()
         .expect("endpoints")
         .iter()
@@ -250,4 +255,47 @@ fn a_field_the_model_leaves_out_is_located_from_the_schema() {
         });
     });
     assert_eq!(scan_graphql_endpoints(cassettes.path()), answer_key());
+}
+
+/// A root field no reader places is saved as an unread site on the line its
+/// row sits on, with the reason (carrick#3989). The two fields the answer
+/// key serves at the printed schema are the ones no resolver was found for;
+/// every other field is served at its resolver and saves nothing. The rows
+/// themselves do not move.
+#[test]
+fn a_field_no_reader_places_is_saved_with_a_reason() {
+    let blob = scan_blob(&fixture_dir().join("__llm__"));
+    let sites = blob["unread_sites"]
+        .as_array()
+        .expect("the blob has the unread_sites key");
+    let handler: BTreeSet<(String, u64, String, String)> = sites
+        .iter()
+        .filter(|site| site["slot"] == "handler")
+        .map(|site| {
+            (
+                site["file"].as_str().unwrap_or_default().to_string(),
+                site["line"].as_u64().unwrap_or_default(),
+                site["reason"].as_str().unwrap_or_default().to_string(),
+                site["role"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let at = |line: u64| {
+        (
+            "apps/api/dist/schema.graphql".to_string(),
+            line,
+            "handler_not_located".to_string(),
+            "producer".to_string(),
+        )
+    };
+    assert_eq!(handler, BTreeSet::from([at(3), at(4)]));
+    assert_eq!(
+        blob["unread_sites_by_reason"]["handler_not_located"], 2,
+        "the count per reason names both"
+    );
+    assert_eq!(
+        scan_graphql_endpoints(&fixture_dir().join("__llm__")),
+        answer_key(),
+        "saving the sites moves no row"
+    );
 }

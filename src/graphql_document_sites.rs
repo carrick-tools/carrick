@@ -471,6 +471,7 @@ fn site_consumer(
         file_path: file.to_path_buf(),
         line,
         document_line: line,
+        name_offset: 0,
         primary_type_symbol: None,
         payload_type_symbol: None,
         payload_type_source: None,
