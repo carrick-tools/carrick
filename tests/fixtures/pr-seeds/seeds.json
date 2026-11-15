@@ -458,7 +458,7 @@
           {"kind": "risk_introduced", "label": "GET /api/trpc/orders.list", "site": "src/web/orders-view.ts:7"}
         ]
       },
-      "known_miss": {"stage": "found", "issues": ["carrick#937"]}
+      "known_miss": {"stage": "judged", "issues": ["carrick#937"]}
     },
     {
       "name": "trpc-called-procedure-removed",
@@ -472,8 +472,8 @@
         "title": "not_clean",
         "conclusion": "failure",
         "rows": [
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
-          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get", "service": "api"}
         ]
       },
       "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
@@ -490,9 +490,9 @@
         "title": "not_clean",
         "conclusion": "failure",
         "rows": [
-          {"kind": "delta_new", "label": "GET /api/rpc/shelf.fetch"},
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
-          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+          {"kind": "delta_new", "label": "GET /api/rpc/shelf.fetch", "service": "api"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get", "service": "api"}
         ]
       },
       "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}
@@ -510,7 +510,7 @@
         "conclusion": "success",
         "quiet": true,
         "rows": [
-          {"kind": "delta_new", "label": "POST /api/rpc/shelf.put"}
+          {"kind": "delta_new", "label": "POST /api/rpc/shelf.put", "service": "api"}
         ]
       }
     },
@@ -528,12 +528,12 @@
         "conclusion": "success",
         "quiet": true,
         "rows": [
-          {"kind": "delta_new", "label": "GET /rpc/shelf.list"},
-          {"kind": "delta_new", "label": "GET /rpc/shelf.get"},
-          {"kind": "delta_new", "label": "POST /rpc/shelf.add"},
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list"},
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
-          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add"}
+          {"kind": "delta_new", "label": "GET /rpc/shelf.list", "service": "api"},
+          {"kind": "delta_new", "label": "GET /rpc/shelf.get", "service": "api"},
+          {"kind": "delta_new", "label": "POST /rpc/shelf.add", "service": "api"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list", "service": "api"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
+          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add", "service": "api"}
         ]
       }
     },
@@ -549,14 +549,14 @@
         "title": "not_clean",
         "conclusion": "failure",
         "rows": [
-          {"kind": "delta_new", "label": "GET /rpc/shelf.list"},
-          {"kind": "delta_new", "label": "GET /rpc/shelf.get"},
-          {"kind": "delta_new", "label": "POST /rpc/shelf.add"},
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list"},
-          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get"},
-          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add"},
-          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.list"},
-          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get"}
+          {"kind": "delta_new", "label": "GET /rpc/shelf.list", "service": "api"},
+          {"kind": "delta_new", "label": "GET /rpc/shelf.get", "service": "api"},
+          {"kind": "delta_new", "label": "POST /rpc/shelf.add", "service": "api"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.list", "service": "api"},
+          {"kind": "delta_removed", "label": "GET /api/rpc/shelf.get", "service": "api"},
+          {"kind": "delta_removed", "label": "POST /api/rpc/shelf.add", "service": "api"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.list", "service": "api"},
+          {"kind": "removed_still_called", "label": "GET /api/rpc/shelf.get", "service": "api"}
         ]
       },
       "known_miss": {"stage": "paired", "issues": ["carrick#3778"]}

@@ -3436,7 +3436,7 @@ async fn seed_trpc_adapter_prefix_moved() {
 
 /// The procedure's output loses a field the client reads.
 #[tokio::test]
-#[ignore = "carrick#937: no procedure client call is read, so no pair exists to break"]
+#[ignore = "carrick#937: the client call pairs, but no type verdict is stored for it, so no mismatch is raised"]
 async fn seed_trpc_output_field_removed() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-output-field-removed").await;
