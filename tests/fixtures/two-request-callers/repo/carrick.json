@@ -1,0 +1,3 @@
+{
+  "services": [{ "name": "two-request-callers", "directory": ".", "tsconfig": "tsconfig.json" }]
+}
