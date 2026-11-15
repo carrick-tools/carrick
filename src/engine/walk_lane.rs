@@ -129,9 +129,7 @@ impl Walked {
             Ok(index) => index,
             Err(error) => {
                 warn!("{}", unreadable_rows(&self.label, &error));
-                self.rows = None;
-                self.lost = Some(WalkLoss::Failed);
-                PositionIndex::walk_lost(&self.scan_root)
+                PositionIndex::missing(&self.scan_root)
             }
         }
     }
