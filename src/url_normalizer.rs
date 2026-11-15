@@ -403,10 +403,7 @@ impl UrlNormalizer {
                 None => code.push(c),
             }
         }
-        if code.replace("??", "").replace("?.", "").contains('?') {
-            return "param".to_string();
-        }
-        let expr = code.as_str();
+        let expr = expr;
         // Take the final run of identifier characters: for a member/bracket/call
         // expression that is the accessed key, which is the meaningful name.
         let mut last = String::new();
