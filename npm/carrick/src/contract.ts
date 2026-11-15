@@ -338,6 +338,12 @@ export type SimilarFunction = {
   called_from: number;
   /** The index's one sentence about what it does, when it holds one. */
   intent?: string;
+  /**
+   * The absolute root of this repo's checkout when the workspace has it
+   * checked out; absent for a repo only the hosted index holds, whose files
+   * this machine cannot open.
+   */
+  checkout?: string;
 };
 
 export const SCHEMA = "carrick.check/0";

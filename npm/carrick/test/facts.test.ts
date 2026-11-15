@@ -1402,7 +1402,7 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   // the one time it is said.
   const lead = [
     "Carrick: `slugify` may already exist. Existing functions that could do this job:",
-    "1. `toSlug(title: string) => string` at shared-lib/src/text/slug.ts:4 (exported; called from 2 other files)",
+    "1. `toSlug(title: string) => string` at src/text/slug.ts:4 in repo shared-lib, which is not checked out on this machine (exported; called from 2 other files)",
     "   Turns a title into a lowercase, dash-joined URL segment.",
     "If one does the job, call it (export or move it if needed) and delete yours. If none does, keep yours.",
   ].join("\n");

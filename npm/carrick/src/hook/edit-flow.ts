@@ -144,7 +144,7 @@ export async function editFlow(
   const insteadOfProbe = queueable && facts?.present === true && !input.subAgent;
   const queued = new Set<string>();
   if (insteadOfProbe && edited.length > 0) {
-    const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe });
+    const entries = enqueue(choice.root, session!, edited, editedAt, { factsCallers: covered, insteadOfProbe, cwd });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
   }
@@ -180,7 +180,7 @@ export async function editFlow(
       continue;
     }
     // The block rides on the probe answer, so a queued file gets it too.
-    const found = similarLines(result, relative, (key) => !session || !wasLed(session, key), log);
+    const found = similarLines(result, relative, cwd, (key) => !session || !wasLed(session, key), log);
     if (found.lines.length > 0) leads.set(index, found);
     if (queueable && needsBackground(result)) {
       toQueue.push(index);
@@ -204,7 +204,7 @@ export async function editFlow(
   if (toQueue.length > 0 && session) {
     // A file whose callers the fact lines answered keeps its late answer free
     // of the uses-count line too, as this answer would have been.
-    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered });
+    const entries = enqueue(choice.root, session, toQueue.map((index) => edited[index]!), editedAt, { factsCallers: covered, cwd });
     if (entries.length > 0) ensureRunner(choice.root);
     for (const entry of entries) queued.add(entry.file);
     // A queued file says nothing now: its answer is delivered with the next
