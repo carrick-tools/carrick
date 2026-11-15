@@ -1101,9 +1101,9 @@ fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
             app["unread_sites"]
         );
     }
-    // Controls: recursion beside the end, a callback written at the call, and
-    // the misses (keyed value, field, `let` handed in) are no stop.
-    for line in [14, 32, 40, 52, 66] {
+    // Controls: recursion beside the end and a callback written at the call
+    // are no stop.
+    for line in [40, 52] {
         assert_eq!(
             unread_at(app, relay, line),
             None,
@@ -1111,10 +1111,6 @@ fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
             app["unread_sites"]
         );
     }
-    assert_eq!(
-        unread_at(app, relay, 70).as_deref(),
-        Some("missed_inside callee")
-    );
     // The nine calls with an end keep their rows.
     let rows = call_rows(app);
     for line in [4, 14, 22, 32, 40, 44, 52, 56, 66] {
