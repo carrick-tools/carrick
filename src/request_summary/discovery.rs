@@ -686,7 +686,9 @@ pub(crate) fn receiver_object(callee: &Expr) -> Option<(u32, u32, ObjectForm)> {
     Some((span.lo.0, span.hi.0, form))
 }
 
-/// What one receiver read gives (see `Walker::receiver_end`).
+/// What one receiver read gives (see `Walker::receiver_end`). Built and
+/// matched once per read, never stored, so the size gap is no cost.
+#[allow(clippy::large_enum_variant)]
 enum ReceiverEnd {
     /// The compiler has no row at the receiver: stop reading receivers.
     Unread,
