@@ -297,9 +297,12 @@ impl ExportClaims {
         maker: &SiteMaker,
     ) -> Option<(&'c str, &'c LibraryClaim)> {
         claims.iter().find_map(|(id, claim)| match claim {
-            LibraryClaim::Make { form, member, .. }
-                if same_form(*form, maker.form) && *member == maker.member =>
-            {
+            LibraryClaim::Make {
+                form,
+                member,
+                of: None,
+                ..
+            } if same_form(*form, maker.form) && *member == maker.member => {
                 Some((id.as_str(), *claim))
             }
             _ => None,
@@ -341,8 +344,13 @@ impl ExportClaims {
                 LibraryClaim::Make {
                     form: MakeForm::New,
                     member,
+                    of,
                     ..
-                } => receiver == "export" && used.path.is_empty() && *member == used.member,
+                } => {
+                    make_applies(of.as_deref(), receiver)
+                        && used.path.is_empty()
+                        && *member == used.member
+                }
                 LibraryClaim::Op {
                     member,
                     path,
@@ -370,8 +378,13 @@ impl ExportClaims {
                 LibraryClaim::Make {
                     form: MakeForm::Call,
                     member,
+                    of,
                     ..
-                } => receiver == "export" && used.path.is_empty() && *member == used.member,
+                } => {
+                    make_applies(of.as_deref(), receiver)
+                        && used.path.is_empty()
+                        && *member == used.member
+                }
                 LibraryClaim::Op {
                     member,
                     path,
@@ -508,13 +521,16 @@ fn claim_id(prefix: &str, claim: &LibraryClaim) -> Option<String> {
         (None, None) => String::new(),
     };
     match claim {
-        LibraryClaim::Make { form, member, .. } => Some(format!(
-            "{prefix}:make:{}:{}",
+        LibraryClaim::Make {
+            form, member, of, ..
+        } => Some(format!(
+            "{prefix}:make:{}:{}{}",
             match form {
                 MakeForm::Call => "call",
                 MakeForm::New => "new",
             },
-            member.as_deref().unwrap_or("()")
+            member.as_deref().unwrap_or("()"),
+            selector(&None, of)
         )),
         LibraryClaim::Op {
             op,
@@ -692,6 +708,12 @@ pub(crate) fn applies(on: Option<ClaimOn>, of: Option<&str>, receiver: &str) -> 
     }
 }
 
+/// Whether a maker claim built on `of` (amendment 12; `None` is the export
+/// itself) is the one a member use on `receiver` is.
+fn make_applies(of: Option<&str>, receiver: &str) -> bool {
+    receiver == of.unwrap_or("export")
+}
+
 /// The base receiver and the scope member of a receiver id that names what a
 /// scope member returns (`instance:()>scope:at` is `instance:()` and `at`);
 /// `None` for any other id (carrick#1678).
@@ -744,7 +766,14 @@ pub fn checks(sites: &LibrarySites, exports: &[ExportClaims]) -> Vec<LibraryChec
                 continue;
             }
             let on: Vec<&str> = match claim {
-                LibraryClaim::Make { .. } => vec!["export"],
+                LibraryClaim::Make { of: None, .. } => vec!["export"],
+                // An `of`-make applies to the one receiver it names, never
+                // to the export (amendment 12).
+                LibraryClaim::Make { of: Some(of), .. } => receivers
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|receiver| receiver == of)
+                    .collect(),
                 LibraryClaim::Op { on, of, .. } | LibraryClaim::Reserved { on, of, .. } => {
                     receivers
                         .iter()
@@ -784,7 +813,7 @@ pub fn server_checks(exports: &[ExportClaims]) -> Vec<LibraryCheck> {
     {
         for (id, claim) in export.claims_with_scopes_by_id() {
             let receiver = match claim {
-                LibraryClaim::Make { .. } => Some("export".to_string()),
+                LibraryClaim::Make { of: None, .. } => Some("export".to_string()),
                 LibraryClaim::Scope { on, of, .. }
                 | LibraryClaim::Op {
                     op: LibraryOp::Send,
@@ -2502,6 +2531,71 @@ mod tests {
         assert_eq!(
             runtime_packages_of("fixture-middleware-types", &exports),
             ["fixture-middleware"]
+        );
+    }
+
+    /// Amendment 12 (carrick-cloud#3534 T4): a maker member called on one
+    /// instance receiver (`of`) is a claim of its own. Its id carries the
+    /// receiver, a make without `of` keeps today's id and bytes, no check
+    /// asks it on the export, and it opens no receiver of its own.
+    #[test]
+    fn an_of_make_has_its_own_id_is_never_asked_on_the_export_and_opens_no_receiver() {
+        let plain = json!({ "kind": "make", "form": "call", "member": "channel" });
+        let of_make = json!({ "kind": "make", "form": "call", "member": "channel",
+                              "of": "instance:new", "name": { "arg": 0 } });
+        let hub = export(json!({
+            "package": "fixture-hub", "version": "1.0.0", "specifier": "fixture-hub",
+            "export": "Hub", "role": "broker",
+            "claims": [
+                { "kind": "make", "form": "new", "member": null },
+                plain.clone(),
+                of_make.clone()
+            ]
+        }));
+        let ids: Vec<String> = hub.claims_by_id().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fixture-hub@1:Hub:make:new:()",
+                "fixture-hub@1:Hub:make:call:channel",
+                "fixture-hub@1:Hub:make:call:channel:of:instance:new",
+            ]
+        );
+        let claim: LibraryClaim = serde_json::from_value(plain.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&claim).unwrap(), plain);
+        let claim: LibraryClaim = serde_json::from_value(of_make.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&claim).unwrap(), of_make);
+
+        let sites = sites_of(&[(
+            "src/hub.ts",
+            "import { Hub } from \"fixture-hub\";\nexport function open() { return new Hub().channel(\"a\"); }\n",
+        )]);
+        for check in checks(&sites, std::slice::from_ref(&hub)) {
+            assert!(
+                !(check.claim_id.ends_with(":of:instance:new") && check.receiver == "export"),
+                "{check:?}"
+            );
+        }
+        let claims = hub.claims_by_id();
+        assert!(
+            !crate::request_summary::discovery::claim_receivers(&claims, Some(ClaimOn::Both), None)
+                .iter()
+                .any(|receiver| receiver == "instance:channel"),
+            "an of-make opens no instance:channel"
+        );
+        let on_export = [(
+            "x".to_string(),
+            &serde_json::from_value::<LibraryClaim>(plain).unwrap(),
+        )];
+        assert!(
+            crate::request_summary::discovery::claim_receivers(
+                &on_export,
+                Some(ClaimOn::Both),
+                None
+            )
+            .iter()
+            .any(|receiver| receiver == "instance:channel"),
+            "a make on the export does"
         );
     }
 

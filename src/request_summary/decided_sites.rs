@@ -3451,6 +3451,7 @@ impl<'a> Walk<'a, '_> {
                 package,
                 export,
                 member,
+                receiver,
                 made: Some(call),
                 ..
             } = &root.end
@@ -3466,6 +3467,7 @@ impl<'a> Walk<'a, '_> {
                         && maker.export == *export
                         && maker.member == *member
                         && maker.new == new
+                        && maker.root_receiver() == *receiver
                 })
                 .and_then(|maker| maker.name.as_ref());
             let maker = self

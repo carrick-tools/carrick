@@ -8497,7 +8497,10 @@ fn site_records_of(
             root,
             &discovered,
             &labels,
-            &crate::request_summary::decided_sites::MakerLabel::from_exports(claims),
+            &crate::request_summary::decided_sites::MakerLabel::from_exports(
+                claims,
+                &declarations.scope_answers,
+            ),
             &crate::request_summary::decided_sites::ScopeLabel::from_exports(
                 claims,
                 &declarations.scope_answers,
