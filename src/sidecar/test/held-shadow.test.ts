@@ -13,7 +13,7 @@ describe('write_shadow (held compiler program)', () => {
   it('(a) vendors a node_modules file and never counts it as own', () => {
     const out = scratch('held-shadow-a-');
     const shadow = writeShadow(FIXTURE, out);
-    assert.deepEqual(shadow.own_files, ['src/helper.ts', 'src/libuse.ts', 'src/orders.ts']);
+    assert.deepEqual(shadow.own_files, ['src/express-orders.ts', 'src/helper.ts', 'src/lambda.ts', 'src/libuse.ts', 'src/orders.ts', 'src/shared-send.ts']);
     assert.ok(shadow.vendored > 0);
     assert.ok(fs.existsSync(path.join(out, 'w', 'src', 'orders.ts')));
     assert.ok(!fs.existsSync(path.join(out, 'w', 'node_modules')));

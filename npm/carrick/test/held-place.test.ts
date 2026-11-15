@@ -11,13 +11,14 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import ts from "typescript";
-import { arm, attribute, mapValue, overlay, regionOfEdit, regionsFromHunks, resolveValue } from "../src/held/place.ts";
+import { hunksOf } from "../src/facts/diff.ts";
+import { arm, attribute, checkWire, mapValue, overlay, regionOfEdit, regionsFromHunks, resolveValue } from "../src/held/place.ts";
 import type { Diag, SiteFinder, SiteQuery, Value } from "../src/held/place.ts";
 
 const dir = new URL("./fixtures/held/", import.meta.url);
 const TEXT = fs.readFileSync(new URL("sends.ts", dir), "utf8");
 // The wire rule is the compiler engine's (S1); this stand-in only has to type.
-const WIRE = ["type __carrick_Wire<S, E> = S;"];
+const WIRE = ["type __carrick_Sent<S, E> = S;"];
 const diag = (start: number, code: number, message: string): Diag => ({ start, code, message });
 
 /** The `[start, end)` of the first `needle` in `text`. */
@@ -204,7 +205,7 @@ test("a JavaScript value file is skipped with its reason", () => {
   const ov = overlay("sends.js", TEXT, [{ n: 7, value, groups: [group("unknown")] }], WIRE, "clean");
   assert.deepEqual(ov.unplaced, [{ n: 7, reason: "javascript_file" }]);
   assert.equal(ov.checks.length, 0);
-  assert.equal(ov.text, TEXT + "\n" + "declare namespace __C {\n  type __carrick_Wire<S, E> = S;\n}\n");
+  assert.equal(ov.text, TEXT + "\n" + "declare namespace __C {\n  type __carrick_Sent<S, E> = S;\n}\n");
 });
 
 test("the gate arms a check only when the clean form is silent and its twin speaks", () => {
@@ -234,3 +235,19 @@ function typecheck(text: string): Array<{ start: number; code: number; message: 
     message: ts.flattenDiagnosticMessageText(d.messageText, "\n"),
   }));
 }
+
+test("hunksOf reads every `-U0` header, with the counts git omits as 1; the offset map and part 1's diff read the same headers", () => {
+  const diff = "diff --git a/f b/f\n@@ -3 +3,2 @@\n-a\n+b\n+c\n@@ -10,0 +12,4 @@\n+x\n@@ -20,2 +22 @@\n";
+  assert.deepEqual(hunksOf(diff), [
+    { oldStart: 3, oldCount: 1, newStart: 3, newCount: 2 },
+    { oldStart: 10, oldCount: 0, newStart: 12, newCount: 4 },
+    { oldStart: 20, oldCount: 2, newStart: 22, newCount: 1 },
+  ]);
+  assert.deepEqual(hunksOf("no headers"), []);
+});
+
+test("checkWire composes the engine's declarations and tolerance helpers into the one type a check receives", () => {
+  const text = checkWire(["W1"], ["T1", "T2"]);
+  assert.deepEqual(text.slice(0, 3), ["W1", "T1", "T2"]);
+  assert.match(text[3]!, /^type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true \? E : __carrick_Wire<__carrick_AbsentBody<S, E>, E>;$/);
+});
