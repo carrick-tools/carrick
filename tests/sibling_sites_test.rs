@@ -886,8 +886,7 @@ fn an_analysed_sibling_whose_walk_fails_is_named_at_every_site_that_needed_it() 
 
 /// The head of the run-log line for a walk whose rows were written but
 /// cannot be read, up to the error (carrick#4344).
-const UNREADABLE_ROWS_LINE: &str =
-    "Position rows for service client were written but could not be read:";
+const UNREADABLE_ROWS_LINE: &str = "Position rows for service client could not be read:";
 
 /// The client's kept rows in `store`, when there are any.
 fn client_rows_in(store: &Path) -> Option<PathBuf> {

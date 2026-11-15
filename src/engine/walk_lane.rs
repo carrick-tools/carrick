@@ -212,11 +212,12 @@ pub(super) fn signals(count: usize) -> (Vec<oneshot::Sender<()>>, Vec<WalkEnded>
     (0..count).map(|_| oneshot::channel()).unzip()
 }
 
-/// The run-log line for a rows file the walk wrote and the scan cannot read.
+/// The run-log line for a rows file the walk wrote and the scan cannot read;
+/// the wording went through the copy pass.
 /// The error keeps its path for the run log only: the blob carries a fixed
 /// sentence (carrick#4344).
 fn unreadable_rows(label: &str, error: &str) -> String {
-    format!("Position rows for service {label} were written but could not be read: {error}")
+    format!("Position rows for service {label} could not be read: {error}")
 }
 
 /// A heap cap as the run log states it.
