@@ -2035,9 +2035,6 @@ pub fn fold_rows(
                 }))
             });
         if !facts_stand {
-            *out.held_kept
-                .entry("call_without_fact".to_string())
-                .or_default() += 1;
             continue;
         }
         let readers: Vec<usize> = calls
@@ -2048,12 +2045,7 @@ pub fn fold_rows(
             .collect();
         match readers.as_slice() {
             [index] => stated_at_module.push((*index, held)),
-            [] => *out.held_kept.entry("no_reader".to_string()).or_default() += 1,
-            _ => {
-                *out.held_kept
-                    .entry("several_readers".to_string())
-                    .or_default() += 1
-            }
+            _ => {}
         }
     }
     stated_at_module.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
