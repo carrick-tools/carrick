@@ -1600,7 +1600,8 @@ function declarationNamedBy(node: ts.Node): ts.Declaration | undefined {
   return named && parent.name === node ? parent : undefined;
 }
 
-function isPreferredTarget(node: ts.Node): boolean {
+/** The nodes a value type can be read at: the capture's own target rule. */
+export function isPreferredTarget(node: ts.Node): boolean {
   return (
     ts.isExpression(node) ||
     ts.isVariableDeclaration(node) ||
