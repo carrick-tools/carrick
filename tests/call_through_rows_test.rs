@@ -692,8 +692,8 @@ fn a_token_handed_to_the_returned_request_is_not_the_request_reached() {
 /// makes a `fetch` only the model reads. The token is not the one operation
 /// the call reaches, so the row stays as the model stated it, and is counted.
 /// The function is in the call's own file, so the row is not withdrawn
-/// (carrick#4206 withdraws `commands.ts:94`, the other such row, whose function
-/// is in another file).
+/// (carrick#4206 withdraws the model's row at a call into another file's
+/// function that settles no one request).
 #[test]
 fn a_call_that_also_reaches_a_request_no_fact_states_stays_as_the_model_stated_it() {
     assert_eq!(
@@ -931,14 +931,15 @@ fn a_row_whose_call_proves_no_one_operation_stays_as_the_model_stated_it() {
 /// carrick#4206: the rows above that called a function of another file of the
 /// repository, whose walk settled no one request, lose the model's key and
 /// are saved unread. `commands.ts:76` (`send(base, path)` writes its URL from
-/// its parameters) and `:94` (`ping()` makes a `fetch` only the model reads,
-/// and the model's `/api/v1/pings` is not its `/api/v1/ping`) hold no row.
+/// its parameters) holds no row. `:94` (`ping()`) is not one of them: its
+/// `fetch` is a request a fact states, so the call states that request and
+/// the model's row there is replaced (carrick#4078), as asserted above.
 /// `hooks.ts:24` hands two callbacks to `retry` (`spinner.ts`): the model's
 /// `POST /vendor/send` goes, and the call into the client inside the other
 /// callback, which the model's row held, states its request.
 #[test]
 fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
-    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+    for (service, file, line) in [("cli", COMMANDS, 76)] {
         assert_eq!(rows_in(blobs(), service, file, line), [], "{file}:{line}");
     }
     assert_eq!(
@@ -953,7 +954,7 @@ fn a_row_whose_call_into_another_files_function_settles_nothing_is_withdrawn() {
         }
     );
     // `hooks.ts:24` holds the leaf row, so it is not saved unread.
-    for (service, file, line) in [("cli", COMMANDS, 76), ("cli", COMMANDS, 94)] {
+    for (service, file, line) in [("cli", COMMANDS, 76)] {
         let named = blobs()[service]["unread_sites"]
             .as_array()
             .into_iter()
@@ -988,11 +989,10 @@ fn a_call_into_a_function_in_another_file_that_settles_no_request_is_saved_unrea
             blobs()["cli"]["unread_sites"]
         )
     });
-    // The walk below the call already saved it (nothing binds the client's
-    // `send`), so the site keeps that reason and names the withdrawal beside
-    // it; a site no walk saved takes `own_function` as its reason (unit test
-    // in `src/unread_sites.rs`).
-    assert_eq!(text(&site["callee"]).as_deref(), Some("client.close"));
+    // The walk below the call already saved it (the `fetch` inside the
+    // client is a library end), so the site keeps that reason and names the
+    // withdrawal beside it; a site no walk saved takes `own_function` as its
+    // reason (unit test in `src/unread_sites.rs`).
     assert!(
         reasons(site).contains(&"own_function".to_string()),
         "{site:#}"
@@ -1085,14 +1085,14 @@ fn a_call_whose_argument_call_hands_on_the_rows_path_keeps_the_models_row() {
 }
 
 /// carrick#4218 T3: the aliases of the type entries anchored at withdrawn
-/// rows leave the bundled types, which serve definitions by alias: 14
-/// aliases of the rows `cli` withdraws in `commands.ts` (76, 94) and
+/// rows leave the bundled types, which serve definitions by alias: 10
+/// aliases of the rows `cli` withdraws in `commands.ts` (76) and
 /// `unsettled.ts` (6, 31, 43) and of `web`'s at `hooks.ts:24`. No manifest
 /// entry names them any more, and no bundle declares them.
 #[test]
 fn a_withdrawn_rows_aliases_leave_the_bundled_types() {
     let taken_out = aliases_taken_out();
-    assert_eq!(taken_out.len(), 14, "{taken_out:#?}");
+    assert_eq!(taken_out.len(), 10, "{taken_out:#?}");
     for blob in blobs().values() {
         let bundle = blob["bundled_types"].as_str().unwrap_or_default();
         let named: Vec<&str> = blob["type_manifest"]
@@ -1231,16 +1231,16 @@ fn the_calls_projection_agrees_with_the_mount_graph() {
 #[test]
 fn the_boundary_counts_the_settled_rows() {
     let boundary = &blobs()["cli"]["boundary"];
-    // Nine rows in `commands.ts` the model alone states, the one at
-    // `nested.ts:7` and the five at `unsettled.ts` lines 13, 20, 30, 32 and
-    // 38 (carrick#4218 keeps the last three). `commands.ts` lines 76 and 94
-    // and `unsettled.ts` lines 6, 31 and 43 are withdrawn (carrick#4206).
+    // The model alone states 20 rows of `cli` before the withdrawals;
+    // `commands.ts` line 76 and `unsettled.ts` lines 6, 31 and 43 go
+    // (carrick#4206), and `unsettled.ts` lines 13, 20, 30, 32 and 38 stay
+    // (carrick#4218 keeps the last three).
     // The three in `inline-commands.ts` (lines 9, 13, 22) are
     // corrected, not the model's alone: every scan now walks with the
     // compiler's rows (`position_rows::destination` has no switch), which
     // follow them (carrick#2822), as `a_method_called_on_a_factorys_value_…`
     // and `a_wrapper_over_a_factorys_value_…` assert.
-    assert_eq!(boundary["model_only_rows"], 15, "{boundary}");
+    assert_eq!(boundary["model_only_rows"], 16, "{boundary}");
     let untyped: Vec<String> = boundary["calls_without_expected_type"]["reasons"]
         .as_array()
         .unwrap()
@@ -1795,12 +1795,12 @@ fn scanned_then_cli_edited(tmp: &Path) -> (PathBuf, PathBuf) {
     (repo, storage)
 }
 
-/// The two calls of `cli` into a function of `client` whose walk settles no
-/// request: a full scan withdraws their model rows (carrick#4206); a scan
-/// that carries `client` keeps them, because what `client`'s functions write
+/// The call of `cli` into a function of `client` whose walk settles no
+/// request: a full scan withdraws its model row (carrick#4206); a scan
+/// that carries `client` keeps it, because what `client`'s functions write
 /// and hand on is read only in the run that analyses it (carrick#4218 T0,
 /// fail closed).
-const INTO_CARRIED: [(u32, &str); 2] = [(76, "/reply"), (94, "/api/v1/pings")];
+const INTO_CARRIED: [(u32, &str); 1] = [(76, "/reply")];
 
 /// Whether `entry` (a type entry or an unread site, by its `file` key and
 /// `line` key) is at one of [`INTO_CARRIED`].
@@ -1811,7 +1811,7 @@ fn is_into_carried(entry: &serde_json::Value, file: &str, line: &str) -> bool {
 /// `blob` with everything the rows at [`INTO_CARRIED`] state taken out: the
 /// rows and their projection, their type entries, their boundary reasons and
 /// counts, the withdrawal named on their unread sites, and the declarations
-/// of `aliases` in the bundle.
+/// of `aliases` in the bundle and in the compiler engine's input.
 fn without_into_carried(mut blob: serde_json::Value, aliases: &[String]) -> serde_json::Value {
     let at = |value: &serde_json::Value| {
         INTO_CARRIED
@@ -1860,6 +1860,29 @@ fn without_into_carried(mut blob: serde_json::Value, aliases: &[String]) -> serd
             .collect();
         blob["bundled_types"] = serde_json::Value::String(kept);
     }
+    // The compiler engine's input is written from the entries above: its
+    // manifest and surface name the aliases, and the digest of it follows.
+    let named = |alias: &str| aliases.iter().any(|taken| taken == alias);
+    if let Some(manifest) = blob["capture_stub"]["files"]["carrick-manifest.json"].as_str() {
+        let mut manifest: serde_json::Value = serde_json::from_str(manifest).unwrap();
+        if let Some(entries) = manifest["aliases"].as_array_mut() {
+            entries.retain(|entry| !entry["alias"].as_str().is_some_and(named));
+        }
+        blob["capture_stub"]["files"]["carrick-manifest.json"] =
+            serde_json::Value::String(serde_json::to_string_pretty(&manifest).unwrap());
+    }
+    if let Some(surface) = blob["capture_stub"]["files"]["types/surface.d.ts"].as_str() {
+        let kept: String = surface
+            .split_inclusive('\n')
+            .filter(|line| {
+                !aliases
+                    .iter()
+                    .any(|alias| line.contains(&format!("type {alias} ")))
+            })
+            .collect();
+        blob["capture_stub"]["files"]["types/surface.d.ts"] = serde_json::Value::String(kept);
+    }
+    blob["type_reach"] = serde_json::Value::Null;
     blob
 }
 
@@ -1896,9 +1919,9 @@ fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     let scoped_cli = read_blobs(&storage)["cli"].1.clone();
     let full_cli = read_blobs(&full_storage)["cli"].1.clone();
 
-    // The known gap, exactly: the scoped scan keeps the two rows into the
-    // carried `client`, with their type entries, aliases and boundary
-    // counts; the full scan withdraws them and saves each site unread as
+    // The known gap, exactly: the scoped scan keeps the row into the
+    // carried `client`, with its type entries, aliases and boundary
+    // counts; the full scan withdraws it and saves the site unread as
     // withdrawn.
     let rows_at = |blob: &serde_json::Value, line: u32| -> Vec<(String, String)> {
         let site = format!("{COMMANDS}:{line}");
@@ -1940,7 +1963,7 @@ fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
         .filter(|entry| is_into_carried(entry, "file_path", "line_number"))
         .filter_map(|entry| text(&entry["type_alias"]))
         .collect();
-    assert_eq!(aliases.len(), 4, "a request and a response entry each");
+    assert_eq!(aliases.len(), 2, "a request and a response entry");
     let scoped_bundle = scoped_cli["bundled_types"].as_str().unwrap_or_default();
     let full_bundle = full_cli["bundled_types"].as_str().unwrap_or_default();
     for alias in &aliases {
@@ -1956,7 +1979,7 @@ fn a_changed_only_scan_settles_the_rows_a_full_scan_settles() {
     };
     for key in ["model_only_rows", "calls_without_expected_type"] {
         assert_eq!(
-            count(&scoped_cli, key).map(|scoped| scoped - 2),
+            count(&scoped_cli, key).map(|scoped| scoped - 1),
             count(&full_cli, key),
             "{key}"
         );
