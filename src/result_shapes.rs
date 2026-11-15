@@ -523,12 +523,14 @@ mod tests {
                 export
             })
             .collect();
-        let sent = crate::request_summary::discovery::declaration_ask(&on.inputs, &exports).checks;
+        let sent =
+            crate::request_summary::discovery::declaration_ask(&on.inputs, &[], &exports).checks;
         assert!(!sent.is_empty());
         assert_eq!(
             serde_json::to_string(&sent).unwrap(),
             serde_json::to_string(
-                &crate::request_summary::discovery::declaration_ask(&on.inputs, &unlabelled).checks
+                &crate::request_summary::discovery::declaration_ask(&on.inputs, &[], &unlabelled)
+                    .checks
             )
             .unwrap()
         );

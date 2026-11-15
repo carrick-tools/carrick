@@ -570,8 +570,14 @@ fn census_repo(
             .filter(|site| files.contains(&site.file))
             .cloned()
             .collect();
-        let declarations =
-            super::fixture_walk::census_declarations(&script, &root, service, &inputs, &exports);
+        let declarations = super::fixture_walk::census_declarations(
+            &script,
+            &root,
+            service,
+            &inputs,
+            &[],
+            &exports,
+        );
         let scopes = ScopeLabel::from_exports(&exports, &declarations.scope_answers);
         census.scopes_verified += declarations.scope_answers.len();
         // Traced: each site also names its instance (carrick#2474 R2a),
