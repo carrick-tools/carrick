@@ -975,9 +975,9 @@ fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
             app["unread_sites"]
         );
     }
-    // Controls: recursion beside the end, a callback written at the call, and
-    // the misses (keyed value, field, `let` handed in) are no stop.
-    for line in [14, 32, 40, 52, 66] {
+    // Controls: recursion beside the end and a callback written at the call
+    // are no stop.
+    for line in [40, 52] {
         assert_eq!(
             unread_at(app, relay, line),
             None,
@@ -985,10 +985,6 @@ fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
             app["unread_sites"]
         );
     }
-    assert_eq!(
-        unread_at(app, relay, 70).as_deref(),
-        Some("missed_inside callee")
-    );
     // The nine calls with an end keep their rows.
     let rows = call_rows(app);
     for line in [4, 14, 22, 32, 40, 44, 52, 56, 66] {
@@ -1006,6 +1002,98 @@ fn a_stop_in_a_sibling_beside_an_end_is_saved_at_the_call() {
             Some("value_never_bound callee"),
             "client {line}: {}",
             client["unread_sites"]
+        );
+    }
+}
+
+/// A value the app hands into a sibling's function, read as one hole with a
+/// reason, is saved at the app's call with that reason when the sibling's
+/// function also reaches an end, and at its twin that reaches none
+/// (carrick#4486). The sibling-file gate keeps own files as they were: a
+/// helper in the app's own files handed the same hole reads as before. The
+/// answer key is `tests/fixtures/stop-beside-end/README.md`.
+#[test]
+fn a_hole_handed_into_a_sibling_is_saved_with_its_reason() {
+    if !sidecar_built() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = committed_copy_of(tmp.path(), "stop-beside-end", |_| {});
+    let store = tempfile::tempdir().unwrap();
+    let scanned = scan(&repo, store.path(), &[], true);
+    let app = blob_of(&scanned, "app");
+    let relay = "services/app/src/relay.ts";
+    let mixed = "packages/client/src/mixed.ts";
+    // The call that hands the hole in, the sibling function line it runs.
+    for (line, at) in [(14, 5), (18, 10), (32, 5), (35, 10), (66, 5), (70, 10)] {
+        assert_eq!(
+            unread_at(app, relay, line).as_deref(),
+            Some("unread_expression callee"),
+            "{line}: {}",
+            app["unread_sites"]
+        );
+        assert_eq!(
+            stop_at(app, relay, line),
+            Some(format!("{mixed}:{at}")),
+            "{line}: {}",
+            app["unread_sites"]
+        );
+    }
+    // The calls with an end keep their rows.
+    let rows = call_rows(app);
+    for line in [14, 32, 66] {
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("relay.ts:{line} "))),
+            "row at {line}: {rows:?}"
+        );
+    }
+    // A receiver the sibling writes itself is saved as before.
+    let inside = "services/app/src/inside-relay.ts";
+    for (line, word) in [
+        (4, "interface_member callee"),
+        (5, "interface_member callee"),
+        (6, "value_never_bound callee"),
+        (7, "value_never_bound callee"),
+        // The gate's controls: stop-only helpers in the app's own files.
+        (11, "missed_inside callee"),
+        (12, "missed_inside callee"),
+        (13, "missed_inside callee"),
+    ] {
+        assert_eq!(
+            unread_at(app, inside, line).as_deref(),
+            Some(word),
+            "inside {line}: {}",
+            app["unread_sites"]
+        );
+    }
+    let local = "services/app/src/local.ts";
+    assert_eq!(
+        unread_at(app, local, 4).as_deref(),
+        Some("value_callee callee"),
+        "{}",
+        app["unread_sites"]
+    );
+    assert_eq!(
+        unread_at(app, local, 8).as_deref(),
+        Some("unread_expression callee"),
+        "{}",
+        app["unread_sites"]
+    );
+    // Pass-throughs of the app's own that call into the sibling.
+    let pass = "services/app/src/pass.ts";
+    for (line, at) in [(3, 5), (4, 10), (5, 5), (6, 10)] {
+        assert_eq!(
+            unread_at(app, pass, line).as_deref(),
+            Some("unread_expression callee"),
+            "pass {line}: {}",
+            app["unread_sites"]
+        );
+        assert_eq!(
+            stop_at(app, pass, line),
+            Some(format!("{mixed}:{at}")),
+            "pass {line}: {}",
+            app["unread_sites"]
         );
     }
 }
