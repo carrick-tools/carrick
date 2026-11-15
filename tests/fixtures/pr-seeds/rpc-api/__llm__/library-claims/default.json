@@ -100,6 +100,51 @@
           "reserved": [],
           "calls": [],
           "patterns": []
+        },
+        {
+          "specifier": "fixture-procs",
+          "export": "createClient",
+          "role": "http_client",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": null
+            }
+          ],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "query",
+              "of": "type:fixture-procs#ClientOf",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "GET"
+            },
+            {
+              "op": "request",
+              "member": "mutate",
+              "of": "type:fixture-procs#ClientOf",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "POST"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [],
+          "receiver_types": {
+            "instance:()": [
+              "type:fixture-procs#ClientOf"
+            ]
+          }
         }
       ]
     },
