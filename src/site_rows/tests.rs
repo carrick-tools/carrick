@@ -3190,6 +3190,52 @@ fn every_route_the_trace_does_not_serve_is_counted_by_why() {
     );
 }
 
+/// A procedure site the scan could not read (an adapter and key path reached
+/// it and named no path) is a guess at its method, as an unread HTTP route
+/// is, so a removed row it may serve is a candidate. A procedure nothing
+/// serves, and one whose label forces no method, is no guess.
+#[test]
+fn an_unread_procedure_site_is_a_guessed_route_of_the_method_its_label_forces() {
+    use crate::request_summary::decided_sites::Procedure;
+    let procedure_site = |file: &str, unread: usize| {
+        let mut site = traced_site(file, 100, &[("top", None)]);
+        site.procedure = Some(Procedure {
+            unread: if unread == 0 {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([("unread_key".to_string(), unread)])
+            },
+            ..Procedure::default()
+        });
+        site
+    };
+    let unread = procedure_site("src/unread.ts", 1);
+    let unserved = procedure_site("src/unserved.ts", 0);
+    let unstated = procedure_site("src/unstated.ts", 1);
+    let sites = [&unread, &unserved, &unstated];
+    let records: Vec<SiteRecord> = sites
+        .iter()
+        .map(|site| {
+            let method = (site.file != "src/unstated.ts").then_some("get");
+            route_record(site, method)
+        })
+        .collect();
+    let decided = Decided {
+        sites: sites.iter().map(|site| (*site).clone()).collect(),
+        ..Decided::default()
+    };
+    let routes = traced(&decided, &records);
+    assert!(routes.routes.is_empty());
+    assert_eq!(
+        routes.guessed,
+        vec![GuessedRoute {
+            file: "src/unread.ts".to_string(),
+            line: LINE,
+            method: "GET".to_string(),
+        }]
+    );
+}
+
 /// A socket lead flips its side as a pub/sub lead does: a producer lead on a
 /// call row's line is that row's site (carrick#3498).
 #[test]

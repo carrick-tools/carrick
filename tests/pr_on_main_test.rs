@@ -3719,7 +3719,6 @@ async fn seed_trpc_router_rewritten_unread() {
 }
 
 #[tokio::test]
-#[ignore = "carrick#3778: a removal under a router the PR rewrote so its keys are unread is posted as a fact"]
 async fn seed_trpc_router_rewritten_unread_marking() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("trpc-router-rewritten-unread").await;
