@@ -816,13 +816,7 @@ pub(crate) fn claim_receivers(
 ) -> Vec<String> {
     let mut all = vec!["export".to_string()];
     for (_, claim) in claims {
-        if let LibraryClaim::Make {
-            form,
-            member,
-            of: None,
-            ..
-        } = claim
-        {
+        if let LibraryClaim::Make { form, member, .. } = claim {
             all.push(make_receiver(*form, member.as_deref()));
         }
     }
