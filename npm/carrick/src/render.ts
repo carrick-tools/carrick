@@ -18,7 +18,7 @@ import {
   type StatusResult,
   type StatusService,
 } from "./contract.ts";
-import type { SyncRecord, SyncedRepo } from "./hosted-snapshot.ts";
+import type { GenerationGap, SyncRecord, SyncedRepo } from "./hosted-snapshot.ts";
 
 /** How many item lines one hook message carries before it says how many are left. */
 export const MAX_ITEM_LINES = 12;
@@ -728,6 +728,32 @@ function named(parts: string[]): string {
 const STALE_RECORD_MS = 60 * 60_000;
 
 /**
+ * Which index each part reads (carrick#3434): the MCP tools and the fact lines
+ * read the hosted index, the re-check, Read, uses and search lines read this
+ * machine's copy. The one wording, for the session start and for the first
+ * part-2 line of an edit or a Read.
+ */
+function generationStatement(hosted: string, copy: string): string {
+  return `Carrick's MCP tools and fact lines read the hosted index: ${hosted}. The re-check, Read, uses and search lines read this machine's copy: ${copy}.`;
+}
+
+/**
+ * The statement for a fact file and a local copy at different commits: each
+ * repo's fact-file commit (dated by when the fact file was built) beside its
+ * local one (dated by that copy's own scan). Null when no repo differs.
+ */
+export function generationSentence(gaps: readonly GenerationGap[], factBuiltAt: string | null, now: number): string | null {
+  if (gaps.length === 0) return null;
+  const at = (repo: string, commit: string, when: string | null, word: string): string => {
+    const age = when ? ago(when, now) : null;
+    return `${repo.split("/").pop() ?? repo} at ${commit.slice(0, 7)}${age ? ` (${word} ${age})` : ""}`;
+  };
+  const facts = gaps.map((gap) => at(gap.repo, gap.fact, factBuiltAt, "built"));
+  const copies = gaps.map((gap) => at(gap.repo, gap.local, gap.localIndexedAt, "scanned"));
+  return generationStatement(named(facts), named(copies));
+}
+
+/**
  * The first session-start line where the hosted copy has a record
  * (carrick#3432): which hosted index the MCP tools answer from and how old it
  * is, and, where this machine's copy is older, that copy apart. The status
@@ -739,9 +765,8 @@ export function hostedLine(sync: SyncRecord, now: number): string | null {
   // A copy at the hosted commit is a fresh index: nothing to say.
   if (!older.length) return null;
   const hosted = sync.repos.map((repo) => indexAt(repo, repo.hosted_commit, repo.hosted_scanned_at, now));
-  let line = `Carrick's MCP tools answer from the hosted index: ${named(hosted)}.`;
   const copies = older.map((repo) => indexAt(repo, repo.copy_commit, repo.copy_scanned_at, now));
-  line += ` The hooks and \`carrick check\` compare against this machine's older copy: ${named(copies)}.`;
+  let line = generationStatement(named(hosted), named(copies));
   const checked = Date.parse(sync.at);
   if (Number.isFinite(checked) && now - checked > STALE_RECORD_MS) {
     line += ` Last checked ${ago(sync.at, now)}.`;

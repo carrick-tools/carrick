@@ -53,8 +53,8 @@ test("a copy at the hosted commit is fresh and has no hosted line", () => {
 test("an older copy on this machine is stated apart, with its own age", () => {
   assert.equal(
     hostedLine(record([behind]), NOW),
-    "Carrick's MCP tools answer from the hosted index: api at bbbbbbb (scanned 2 h ago). " +
-      "The hooks and `carrick check` compare against this machine's older copy: api at aaaaaaa (scanned 8 days ago).",
+    "Carrick's MCP tools and fact lines read the hosted index: api at bbbbbbb (scanned 2 h ago). " +
+      "The re-check, Read, uses and search lines read this machine's copy: api at aaaaaaa (scanned 8 days ago).",
   );
 });
 
@@ -126,8 +126,8 @@ test("the session start opens with the hosted index, then says once a day that t
   const lines = first.stdout.split("\n");
   assert.equal(
     lines[0],
-    "Carrick's MCP tools answer from the hosted index: api at bbbbbbb (scanned 2 h ago). " +
-      "The hooks and `carrick check` compare against this machine's older copy: api at aaaaaaa (scanned 8 days ago).",
+    "Carrick's MCP tools and fact lines read the hosted index: api at bbbbbbb (scanned 2 h ago). " +
+      "The re-check, Read, uses and search lines read this machine's copy: api at aaaaaaa (scanned 8 days ago).",
   );
   assert.match(lines[1] ?? "", /^This checkout is 93 commits behind the hosted index of api \(bbbbbbb\)/);
   // The machine's own scan keeps its date, said to be this machine's.
@@ -135,7 +135,7 @@ test("the session start opens with the hosted index, then says once a day that t
   assert.equal(lines.length, 3, first.stdout);
 
   const second = await runHook("session-start.ts", { cwd: workspace.root, env });
-  assert.match(second.stdout, /^Carrick's MCP tools answer from the hosted index/);
+  assert.match(second.stdout, /^Carrick's MCP tools and fact lines read the hosted index/);
   assert.doesNotMatch(second.stdout, /commits behind/, "the held line came twice in a day");
 
   const daily = await runHook("session-start.ts", {

@@ -1,5 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import { realPath } from "./fs-util.ts";
+import { createLogger } from "./log.ts";
+import type { Logger } from "./log.ts";
+
+const defaultLog = createLogger("carrick-generation");
 
 /**
  * `resolution.repos` of the workspace's cached hosted snapshot
@@ -77,4 +82,43 @@ export function lastSync(root: string): SyncRecord | null {
   } catch {
     return null;
   }
+}
+
+/** One repo of this machine's copy: its folder, the single commit it was indexed at (null when it has none), and when. */
+export type LocalStamp = { repo: string; commit: string | null; indexedAt?: string };
+
+/** A repo whose fact file and local copy name different commits. */
+export type GenerationGap = { repo: string; fact: string; local: string; localIndexedAt: string | null };
+
+/**
+ * The one answer to "do the fact lines and the re-check read the same
+ * generation": the repos whose fact-file commit (`factCommits`, by repo name,
+ * as `commitsOf` reads it; `factRepos` maps each name to its folder here)
+ * differs from the commit of this machine's copy of the same folder. Two
+ * stamps are compared for equality and nothing is re-derived from HEAD. A
+ * repo either side names no single commit for is left out, with a logged
+ * stop word, never guessed at.
+ */
+export function generationGap(
+  factCommits: Readonly<Record<string, string>> | null,
+  factRepos: ReadonlyArray<{ repo: string; path: string }>,
+  local: readonly LocalStamp[],
+  log: Logger = defaultLog,
+): GenerationGap[] {
+  const gaps: GenerationGap[] = [];
+  for (const stamp of local) {
+    const fact = factRepos.find((entry) => realPath(entry.path) === realPath(stamp.repo));
+    if (!fact) continue;
+    if (stamp.commit === null) {
+      log("generation: left out, no single local commit:", stamp.repo);
+      continue;
+    }
+    const commit = factCommits?.[fact.repo];
+    if (typeof commit !== "string") {
+      log("generation: left out, no single fact commit:", fact.repo);
+      continue;
+    }
+    if (commit !== stamp.commit) gaps.push({ repo: fact.repo, fact: commit, local: stamp.commit, localIndexedAt: stamp.indexedAt ?? null });
+  }
+  return gaps;
 }

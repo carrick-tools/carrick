@@ -20,8 +20,9 @@ import { createLogger } from "../log.ts";
 import { markFacts, wasRead } from "./reuse.ts";
 import { sessionKey } from "./session-key.ts";
 import { markInvoker } from "./invoker.ts";
-import { deliverLate, emitPostToolUse as emit } from "./late.ts";
+import { deliverLateFirst, emitPostToolUse as emit } from "./late.ts";
 import { answerReads } from "./read-answer.ts";
+import { firstLineGeneration } from "./generation.ts";
 import { timed, type Timing } from "./timings.ts";
 
 import { resolveRoot } from "../root.ts";
@@ -61,7 +62,7 @@ async function main(timing: Timing): Promise<void> {
   // A finished background re-check is owed to the model whatever this Read
   // is: delivered before the early returns below, in the same one object.
   const session = sessionKey(payload);
-  const late = deliverLate(session);
+  const late = await deliverLateFirst(session);
   const named = payload.tool_input?.file_path;
   if (!named || !CHECKED.test(named)) return emit(late);
   const file = path.isAbsolute(named) ? named : path.resolve(payload.cwd ?? process.cwd(), named);
@@ -79,7 +80,13 @@ async function main(timing: Timing): Promise<void> {
   await heldAsked;
   timing.waitedMs = Date.now() - waitStarted;
   if (answers.factsMs !== undefined) timing.factsMs = answers.factsMs;
-  emit([...late, ...answers.contexts]);
+  // The first part-2 line of the session says which index it read while it
+  // differs from the fact file's; a late answer carries its own (`deliverLateFirst`).
+  const stamps = answers.stamps;
+  const contexts = [...answers.contexts];
+  const generation = stamps.length > 0 ? await firstLineGeneration(resolveRoot({ clientRoot: payload.cwd ?? null, projectDir: process.env["CLAUDE_PROJECT_DIR"] ?? null, filePath: file }).root, session, stamps) : null;
+  if (generation) contexts.splice(answers.checksAt, 0, generation);
+  emit([...late, ...contexts]);
   // Claimed only now that the lines are printed.
   if (session) markFacts(session, answers.claims);
 }

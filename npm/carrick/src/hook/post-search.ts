@@ -19,7 +19,7 @@ async function main(): Promise<void> {
     return;
   }
   const { printLateOnly } = await import("./late.ts");
-  printLateOnly(session);
+  await printLateOnly(session);
 }
 
 await main();

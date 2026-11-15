@@ -19,6 +19,8 @@ import type { Answer } from "./rechecks.ts";
 import { factsSaid, heldClaimsSince, markFacts, markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import { needsBackground } from "./probe.ts";
+import { firstLineGeneration, stampOf } from "./generation.ts";
+import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-late");
 
@@ -168,6 +170,29 @@ export function changedLine(session: string, answer: Answer, home?: string): str
   return lateContext(answer, false) ?? cleanNamedLine(session, answer, home);
 }
 
+/** The index a delivered answer was read from, and where in the returned contexts its words start. */
+export type LateStamp = { root: string; stamp: LocalStamp; at: number };
+
+/**
+ * `deliverLate`, with the sentence saying which index the first part-2 line of
+ * the session read when it differs from the fact file's (once per session,
+ * `generation.ts`), placed before that line.
+ */
+export async function deliverLateFirst(
+  session: string | undefined,
+  now: number = Date.now(),
+  heldNow: readonly HeldRoute[] = [],
+  home?: string,
+): Promise<string[]> {
+  const stamps: LateStamp[] = [];
+  const contexts = deliverLate(session, now, heldNow, home, stamps);
+  const first = stamps[0];
+  if (!first) return contexts;
+  const line = await firstLineGeneration(first.root, session, stamps.filter((s) => s.root === first.root).map((s) => s.stamp), now, home);
+  if (line) contexts.splice(first.at, 0, line);
+  return contexts;
+}
+
 /**
  * Claim and render every finished answer this session has not been given.
  * Returns the contexts to print, oldest first. Nothing here throws.
@@ -177,6 +202,7 @@ export function deliverLate(
   now: number = Date.now(),
   heldNow: readonly HeldRoute[] = [],
   home?: string,
+  stamps?: LateStamp[],
 ): string[] {
   if (!session) return [];
   const contexts: string[] = [];
@@ -203,7 +229,11 @@ export function deliverLate(
       }
       const seconds = Math.round((now - Date.parse(answer.enqueued_at)) / 1000);
       log(`late answer ${answer.relative} delivered ${seconds} s after the edit`);
-      contexts.push(...deliverOne(session, answer, home, routes));
+      const said = deliverOne(session, answer, home, routes);
+      contexts.push(...said);
+      // The index the words came from, for the first-line generation sentence.
+      const stamp = said.length > 0 && answer.result ? stampOf(answer.result) : null;
+      if (stamp) stamps?.push({ root: answer.root, stamp, at: contexts.length - said.length });
     }
   } catch (error) {
     log("late delivery failed", String(error));
@@ -226,8 +256,8 @@ export function emitPostToolUse(contexts: readonly string[]): void {
  * command that names no source file, a search tool): on the hook channel only,
  * and nothing when none has landed.
  */
-export function printLateOnly(session: string | undefined): void {
+export async function printLateOnly(session: string | undefined): Promise<void> {
   if (!session) return;
   if (resolveChannel({ hooksInstalled: true }).channel !== "hook") return;
-  emitPostToolUse(deliverLate(session));
+  emitPostToolUse(await deliverLateFirst(session));
 }

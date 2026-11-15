@@ -15,7 +15,7 @@ import { currentVersion } from "../update.ts";
 import { factsSaid, markFacts, markLed, markTold, recordEdit, toldKey, wasLed, wasTold } from "./reuse.ts";
 import { similarLines } from "./similar.ts";
 import type { SimilarLines } from "./similar.ts";
-import { deliverLate, emitPostToolUse } from "./late.ts";
+import { deliverLateFirst, emitPostToolUse } from "./late.ts";
 import { needsBackground, probeEdits } from "./probe.ts";
 import { inOtherWorktree } from "./worktree.ts";
 import { answerInHand, enqueue, enqueueHeld, ensureRunner } from "./rechecks.ts";
@@ -31,6 +31,8 @@ import { askHeld } from "../held/client.ts";
 import { parseHeldClaim, unsaidHeld } from "../held/line.ts";
 import type { HeldRoute, RenderedHeld } from "../held/line.ts";
 import type { HeldLine } from "../held/daemon.ts";
+import { firstLineGeneration, stampOf } from "./generation.ts";
+import type { LocalStamp } from "../hosted-snapshot.ts";
 
 const log = createLogger("carrick-hook");
 /** D13: at most this many compiler lines in one action. */
@@ -252,11 +254,15 @@ export async function editFlow(
   // edit queues again is skipped (the newer entry carries it).
   // A late problem for a route this action's held line names is not said twice.
   const heldNow = heldToSay(held, session).map(({ rendered }) => parseHeldClaim(rendered.claim)).filter((r): r is HeldRoute => r !== null);
-  const late = channel.channel === "hook" ? deliverLate(session, Date.now(), heldNow) : [];
+  const stamps: LocalStamp[] = [];
+  const late = channel.channel === "hook" ? await deliverLateFirst(session, Date.now(), heldNow) : [];
+  const generationAt = contexts.length;
   contexts.push(...late);
   for (const index of relatives.keys()) {
     const context = rendered.get(index);
     if (context) contexts.push(context);
+    const stamp = context && results[index] ? stampOf(results[index]!) : null;
+    if (stamp) stamps.push(stamp);
     const found = leads.get(index);
     if (found) {
       // A late answer delivered just above may have claimed the same function.
@@ -273,6 +279,10 @@ export async function editFlow(
     return;
   }
   if (input.timing) input.timing.factsMs = facts.ms;
+  // The first part-2 line of the session says which index it read while it
+  // differs from the fact file's (once per session).
+  const generation = contexts.length > generationAt ? await firstLineGeneration(choice.root, session, stamps) : null;
+  if (generation) contexts.splice(generationAt, 0, generation);
   contexts.push(...heldContexts(facts, held, session));
   contexts.push(...facts.lines);
   // A missing or stale fact file is refreshed in the background, detached.

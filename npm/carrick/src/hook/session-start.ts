@@ -39,6 +39,7 @@ import { markInvoker } from "./invoker.ts";
 import { slowHookLines, timed } from "./timings.ts";
 import { startFactsRefresh } from "../facts/fetch.ts";
 import { ensureHeld } from "../held/client.ts";
+import { sessionGenerationSentence } from "./generation.ts";
 
 const log = createLogger("carrick-session");
 
@@ -145,7 +146,8 @@ async function main(): Promise<void> {
   // of this machine's own scan: that scan's date alone was read as the age of
   // every answer (carrick#3432). From the last background move's record; the
   // move itself runs after this read, so the line is at most one run behind.
-  const hosted = outcome.result.error ? null : hostedSync(choice.root, Date.now());
+  const generation = outcome.result.error ? null : await sessionGenerationSentence(choice.root, outcome.result.services, Date.now());
+  const hosted = outcome.result.error ? null : hostedSync(choice.root, Date.now(), process.env, generation);
   if (hosted) lines.push(...hosted);
   // Empty for a healthy, fresh index.
   const rendered = renderSessionStart(outcome.result);
@@ -194,12 +196,20 @@ export const HELD_NOTICE_COOLDOWN_MS = 24 * 60 * 60_000;
  * which keeps the session start as it was. The claim is taken only when there
  * is a held line to print, so a day of current copies does not use it up.
  */
-export function hostedSync(root: string, now: number, env: NodeJS.ProcessEnv = process.env): string[] | null {
+export function hostedSync(
+  root: string,
+  now: number,
+  env: NodeJS.ProcessEnv = process.env,
+  generation: string | null = null,
+): string[] | null {
   const sync = lastSync(root);
-  const hosted = sync ? hostedLine(sync, now) : null;
-  if (!sync || !hosted) return null;
+  // A fact file and a local copy at different commits are stated first, from
+  // the fact file's own commits (`generation.ts`); that sentence says what the
+  // record's line would.
+  const hosted = generation ?? (sync ? hostedLine(sync, now) : null);
+  if (!hosted) return null;
   const lines = [hosted];
-  const held = heldLine(sync);
+  const held = sync ? heldLine(sync) : null;
   const cooldown = cooldownMs(env, "CARRICK_HELD_NOTICE_COOLDOWN_MS", HELD_NOTICE_COOLDOWN_MS);
   if (held && claimRefresh(markerPath(root, "last-held-notice"), now, cooldown)) lines.push(held);
   return lines;

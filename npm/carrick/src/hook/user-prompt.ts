@@ -26,7 +26,7 @@ import { readStdin } from "./stdin.ts";
 import { sessionKey } from "./session-key.ts";
 import { createLogger } from "../log.ts";
 import { resolveChannel } from "../channel.ts";
-import { deliverLate } from "./late.ts";
+import { deliverLateFirst } from "./late.ts";
 import { initialisedRoot, throttledVersionMismatch } from "../init/outdated.ts";
 import { currentVersion } from "../update.ts";
 import { timed } from "./timings.ts";
@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   }
 
   // Finished background re-checks no hook has delivered yet.
-  const parts: string[] = [...deliverLate(session)];
+  const parts: string[] = [...(await deliverLateFirst(session))];
   const root = initialisedRoot(process.env["CLAUDE_PROJECT_DIR"] ?? process.cwd());
 
   // The same backstop the other hooks carry: this `carrick` is not the one
