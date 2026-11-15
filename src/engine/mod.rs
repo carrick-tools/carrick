@@ -15668,7 +15668,7 @@ async fn analyze_current_repo(
             library_ask.as_deref(),
             first_answer,
             &request_inputs,
-            &siblings,
+            siblings,
             Path::new(repo_path),
             &implementations,
             FirstTrace::Traced {
@@ -15756,7 +15756,7 @@ async fn analyze_current_repo(
     let declarations = settled_declarations(
         first_declarations,
         &request_inputs,
-        &siblings,
+        siblings,
         &claims,
         sidecar,
         &service_root,
