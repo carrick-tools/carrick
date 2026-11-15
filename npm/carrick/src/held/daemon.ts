@@ -15,6 +15,7 @@ import { createLogger } from "../log.ts";
 import { releaseLock, takeLock, touchLock } from "../hook/lock.ts";
 import { answerHeld, heldSuperseded } from "../hook/rechecks.ts";
 import { heldDir, lockPath, LOCK_CAP_MS, logPath, socketPath } from "./paths.ts";
+import { addSteps, tenth, type Steps } from "./steps.ts";
 import {
   admits,
   ADMISSION_MB,
@@ -71,14 +72,18 @@ export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "
 
 export type HeldAnswer = { state: HeldState; lines: HeldLine[]; ms: number };
 
+/** What serving a request found, and where its time went. */
+type Served = { state: HeldState; lines: HeldLine[]; steps: Steps };
+
 /** A started engine for one service. */
 export interface ServiceEngine {
   /**
    * The lines for `files` as they are now. `after` runs once the answer has
    * been sent, still inside the engine's queue: no request reaches the engine
-   * until it ends (the twin pass edits the engine's texts).
+   * until it ends (the twin pass edits the engine's texts). `steps` is where
+   * the answer's time went, in ms by step; `after` answers the same for its own.
    */
-  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; after?: () => Promise<void> }>;
+  answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps?: Steps; after?: () => Promise<Steps | void> }>;
   /** Resident memory in MB, or null. */
   rss(): number | null;
   close(): Promise<void>;
@@ -162,41 +167,41 @@ export class HeldDaemon {
     this.lastRequest = this.now();
     let state: HeldState = "none";
     let lines: HeldLine[] = [];
+    let steps: Steps = {};
     try {
-      ({ state, lines } = await this.route(request));
+      ({ state, lines, steps } = await this.route(request));
     } catch (error) {
       log("request failed", String(error));
       state = "error";
     }
     const ms = Math.round(performance.now() - started);
-    this.record(request, state, lines.length, ms);
+    this.record(request, state, lines.length, ms, steps);
     this.file(request, state, lines);
     return { state, lines, ms };
   }
 
-  private async route(request: HeldRequest): Promise<{ state: HeldState; lines: HeldLine[] }> {
+  private async route(request: HeldRequest): Promise<Served> {
+    const started = performance.now();
     const programs = await this.loadPrograms();
     const files = request.files.map(realPath);
     const lines: HeldLine[] = [];
     const states: HeldState[] = [];
+    const steps: Steps = { programs: tenth(performance.now() - started) };
     for (const { init, dir } of programs) {
       const mine = files.filter((f) => within(f, dir));
       if (mine.length === 0) continue;
       const answer = await this.serveService(init, mine, request);
       states.push(answer.state);
       lines.push(...answer.lines);
+      addSteps(steps, answer.steps);
     }
     // One state for the whole request: the most useful one any service gave.
     const order: HeldState[] = ["ready", "cold", "capped", "no_compiler", "error"];
     const state = order.find((s) => states.includes(s)) ?? "none";
-    return { state, lines };
+    return { state, lines, steps };
   }
 
-  private async serveService(
-    init: ServiceInit,
-    files: string[],
-    request: HeldRequest,
-  ): Promise<{ state: HeldState; lines: HeldLine[] }> {
+  private async serveService(init: ServiceInit, files: string[], request: HeldRequest): Promise<Served> {
     const now = this.now();
     let slot = this.slots.get(key(init));
     if (slot?.status === "failed" && now - slot.failedAt >= RETRY_MS) {
@@ -204,39 +209,47 @@ export class HeldDaemon {
       slot = undefined;
     }
     if (slot === undefined) {
-      if (!(await this.makeRoom())) return { state: "capped", lines: [] };
+      if (!(await this.makeRoom())) return { state: "capped", lines: [], steps: {} };
       this.begin(init, now);
-      return { state: "cold", lines: [] };
+      return { state: "cold", lines: [], steps: {} };
     }
     slot.lastUsed = now;
-    if (slot.status === "starting") return { state: "cold", lines: [] };
-    if (slot.status === "no_compiler") return { state: "no_compiler", lines: [] };
-    if (slot.status === "failed" || slot.engine === null) return { state: "error", lines: [] };
-    const lines = await this.ask(slot, slot.engine, files, request);
-    return lines === null ? { state: "error", lines: [] } : { state: "ready", lines };
+    if (slot.status === "starting") return { state: "cold", lines: [], steps: {} };
+    if (slot.status === "no_compiler") return { state: "no_compiler", lines: [], steps: {} };
+    if (slot.status === "failed" || slot.engine === null) return { state: "error", lines: [], steps: {} };
+    const asked = await this.ask(slot, slot.engine, files, request);
+    return asked === null ? { state: "error", lines: [], steps: {} } : { state: "ready", ...asked };
   }
 
   /** Asked through the slot's queue; `null` when the engine could not answer. */
-  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<HeldLine[] | null> {
+  private ask(slot: Slot, engine: ServiceEngine, files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps } | null> {
+    const queued = performance.now();
     return new Promise((resolve) => {
       slot.queue = slot.queue.then(async () => {
+        const begun = performance.now();
         // A newer edit of the file asked again while this waited: its answer is
         // the one to give, and this one would only be stale.
         if (this.superseded(request)) {
-          resolve([]);
+          resolve({ lines: [], steps: { queue_wait: tenth(begun - queued) } });
           return;
         }
-        let after: (() => Promise<void>) | undefined;
+        let after: (() => Promise<Steps | void>) | undefined;
         try {
           const answered = await engine.answer(files, request);
           after = answered.after;
-          resolve(answered.lines);
+          const engineMs = performance.now() - begun;
+          resolve({
+            lines: answered.lines,
+            steps: { queue_wait: tenth(begun - queued), engine: tenth(engineMs), ...answered.steps },
+          });
         } catch (error) {
           log("engine could not answer", String(error));
           resolve(null);
         }
+        const afterBegun = performance.now();
         try {
-          await after?.();
+          const afterSteps = await after?.();
+          if (afterSteps !== undefined) this.recordAfter(request, slot.init.service, Math.round(performance.now() - afterBegun), afterSteps);
         } catch (error) {
           log("after-answer step failed", String(error));
         }
@@ -347,8 +360,8 @@ export class HeldDaemon {
     for (const slot of [...this.slots.values()]) await this.closeSlot(slot);
   }
 
-  private record(request: HeldRequest, state: HeldState, lines: number, ms: number): void {
-    const row = {
+  private record(request: HeldRequest, state: HeldState, lines: number, ms: number, steps: Steps): void {
+    this.write({
       at: new Date(this.now()).toISOString(),
       session: request.session,
       kind: request.kind,
@@ -357,7 +370,16 @@ export class HeldDaemon {
       lines,
       ms,
       late: request.wait_ms !== undefined && ms > request.wait_ms ? true : undefined,
-    };
+      steps: Object.keys(steps).length > 0 ? steps : undefined,
+    });
+  }
+
+  /** The after-answer work of a request, once it ends: its own row, `kind: "after"`. */
+  private recordAfter(request: HeldRequest, service: string, ms: number, steps: Steps): void {
+    this.write({ at: new Date(this.now()).toISOString(), session: request.session, kind: "after", service, ms, steps });
+  }
+
+  private write(row: Record<string, unknown>): void {
     try {
       fs.mkdirSync(heldDir(this.deps.home), { recursive: true, mode: 0o700 });
       fs.appendFileSync(logPath(this.root, this.deps.home), `${JSON.stringify(row)}\n`);
