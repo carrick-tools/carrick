@@ -3520,9 +3520,11 @@ impl<'a> Walk<'a, '_> {
     /// receiver is a construction, named by the values whose walk passed
     /// that class's constructor ([`Self::joined`]). Else the values are
     /// pooled at the labelled call. One name is the site's; several are a
-    /// `SeveralOperations` lead; an instance or a name no walk reads leaves
-    /// the site unnamed, as before ([`Self::unnamed`]). True where the site
-    /// is the labelled call.
+    /// `SeveralOperations` lead; a value no walk reads is a lead with the
+    /// reason the resolver meets reading it through callers
+    /// ([`Self::maker_stop`], carrick#4520); an instance the walk does not
+    /// reach leaves the site unnamed, as before ([`Self::unnamed`]). True
+    /// where the site is the labelled call.
     fn maker_named(&mut self, chain: &[Placed<'a>], end: &LabelledEnd) -> bool {
         let last = chain[chain.len() - 1];
         let Some(makers) = self.makers else {
@@ -3531,6 +3533,8 @@ impl<'a> Walk<'a, '_> {
         let roots = self.instances(&[last]);
         let mut made: Vec<MadeWith<'a>> = Vec::new();
         let mut unread = roots.is_empty();
+        let mut unreached = roots.is_empty();
+        let mut slots: Vec<(Placed<'a>, ArgSlot)> = Vec::new();
         // Each caller multiplies the paths up: the walks share one cap, and
         // a walk the cap stops reads no name.
         let mut budget = composed::Budget::full();
@@ -3545,6 +3549,7 @@ impl<'a> Walk<'a, '_> {
             } = &root.end
             else {
                 unread = true;
+                unreached = true;
                 continue;
             };
             let new = call.form == super::MakerForm::New;
@@ -3562,8 +3567,10 @@ impl<'a> Walk<'a, '_> {
                 .at_span(&self.root.join(file), call.span.0, call.span.1);
             let (Some(slot), Some(maker)) = (slot, maker) else {
                 unread = true;
+                unreached = true;
                 continue;
             };
+            slots.push((maker, slot.clone()));
             let pieces = slot_value(maker.call, slot);
             let args = BTreeSet::from([slot.arg]);
             let mut today: Vec<MadeWith<'a>> = Vec::new();
@@ -3603,6 +3610,22 @@ impl<'a> Walk<'a, '_> {
             }
         }
         if unread || made.is_empty() {
+            // A name a caller fills with a value no walk reads (carrick#4520)
+            // is a lead with the reason the resolver meets reading it through
+            // callers ([`Self::maker_stop`]): no question is asked for it. An
+            // instance the walk does not reach, or a walk the cap trimmed,
+            // stays unnamed as before.
+            if !unreached
+                && !budget.trimmed
+                && let Some(stop) = self.maker_stop(&slots, None)
+            {
+                if self.calls.is_own(last.file) {
+                    self.lead(&last, end, stop);
+                } else {
+                    self.lead(&chain[0], end, stop);
+                }
+                return false;
+            }
             return self.unnamed_trimmed(chain, end, budget.trimmed);
         }
         if made.iter().all(|value| !value.passed.is_empty()) {
@@ -3625,7 +3648,7 @@ impl<'a> Walk<'a, '_> {
                     Some(fitting) => {
                         let fitting: Vec<&MadeWith<'a>> =
                             fitting.iter().map(|&at| &made[at]).collect();
-                        self.named_by(&join.down, &fitting, end);
+                        self.named_by(&join.down, &fitting, &slots, end);
                     }
                 }
             }
@@ -3633,9 +3656,9 @@ impl<'a> Walk<'a, '_> {
         }
         let made: Vec<&MadeWith<'a>> = made.iter().collect();
         if self.calls.is_own(last.file) {
-            self.named_by(&[last], &made, end)
+            self.named_by(&[last], &made, &slots, end)
         } else {
-            self.named_by(chain, &made, end);
+            self.named_by(chain, &made, &slots, end);
             false
         }
     }
@@ -3916,7 +3939,13 @@ impl<'a> Walk<'a, '_> {
     /// name the values `made` agree on, each read where it was decided
     /// ([`Self::name_at`]); a `SeveralOperations` lead there where they name
     /// several. True where the site is written at the labelled call.
-    fn named_by(&mut self, down: &[Placed<'a>], made: &[&MadeWith<'a>], end: &LabelledEnd) -> bool {
+    fn named_by(
+        &mut self,
+        down: &[Placed<'a>],
+        made: &[&MadeWith<'a>],
+        slots: &[(Placed<'a>, ArgSlot)],
+        end: &LabelledEnd,
+    ) -> bool {
         let mut names: Vec<Vec<Piece>> = Vec::new();
         for value in made {
             let name = self.name_at(value);
@@ -3932,7 +3961,9 @@ impl<'a> Walk<'a, '_> {
             && !super::site_record::reads_env(name)
             && decided_at_several_calls(made)
         {
-            let stop = self.pooled_stop(made);
+            let stop = self
+                .maker_stop(slots, Some(made))
+                .unwrap_or(Stop::SeveralOperations);
             self.lead(&down[0], end, stop);
             return false;
         }
@@ -3941,33 +3972,43 @@ impl<'a> Walk<'a, '_> {
         down.len() == 1
     }
 
-    /// Why the values `made`, decided at several calls, state no name: the
-    /// one answer to that question (carrick#4418). Each value is read at its
-    /// own call by the resolver's set reader, and the first hole it meets is
-    /// the reason; where every value reads, the values differ by call, so
-    /// several operations.
-    fn pooled_stop(&mut self, made: &[&MadeWith<'a>]) -> Stop {
-        for value in made {
-            let [arg] = value.args.iter().copied().collect::<Vec<_>>()[..] else {
+    /// Why a maker-bound name states nothing: the one answer to that question
+    /// (carrick#4418, carrick#4520). Each maker call's name slot is read
+    /// through its callers by the resolver ([`Resolver::texts_through_callers`],
+    /// the reader library sites name slots with), and the first hole it meets
+    /// is the reason. With `decided`, only holes in chains decided at one of
+    /// those values' calls count, so a join reads only its own values. `None`
+    /// where every value reads.
+    fn maker_stop(
+        &self,
+        slots: &[(Placed<'a>, ArgSlot)],
+        decided: Option<&[&MadeWith<'a>]>,
+    ) -> Option<Stop> {
+        for (maker, slot) in slots {
+            let Some(term) = dry_run_term(maker.call, slot) else {
                 continue;
             };
-            let file = relative(self.root, value.at.file);
-            let span = (value.at.call.site.span_start, value.at.call.site.span_end);
-            match self.fold.arg_texts(&file, span, arg, None) {
-                Some(super::resolve::ArgTexts::Unread(stop)) => return stop,
-                Some(super::resolve::ArgTexts::Values(values)) => {
-                    let hole = values.iter().find_map(|value| match value {
-                        super::resolve::TextValue::Hole { reason, .. } => Some(*reason),
-                        _ => None,
-                    });
-                    if let Some(reason) = hole {
-                        return Stop::from(reason);
+            for value in self.pieces.texts_through_callers(maker.file, &term) {
+                let TextValue::Hole { reason, callers } = &value else {
+                    continue;
+                };
+                if let Some(decided) = decided {
+                    let (file, lo, hi) = match callers.last() {
+                        Some(at) => (at.file.as_path(), at.lo, at.hi),
+                        None => (maker.file, maker.call.site.lo, maker.call.site.hi),
+                    };
+                    if !decided.iter().any(|value| {
+                        value.at.file == file
+                            && value.at.call.site.lo == lo
+                            && value.at.call.site.hi == hi
+                    }) {
+                        continue;
                     }
                 }
-                None => {}
+                return Some(Stop::from(*reason));
             }
         }
-        Stop::SeveralOperations
+        None
     }
 
     /// A maker-bound name as the call that decided it reads it
