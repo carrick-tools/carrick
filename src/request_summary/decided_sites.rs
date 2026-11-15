@@ -3652,7 +3652,7 @@ impl<'a> Walk<'a, '_> {
     /// a capped chain), a value [`falls_back`] names, a caller the site path
     /// does not list, or pieces still unknown or open on a parameter.
     fn made_through_callers(&self, maker: Placed<'a>, slot: &ArgSlot) -> PiecesRead<'a> {
-        let all = self.read_through_callers(maker, slot);
+        let all = self.read_through_callers(maker, slot).filter(|_| false);
         PiecesRead {
             kept: all.clone(),
             all,
