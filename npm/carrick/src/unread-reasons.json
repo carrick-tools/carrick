@@ -22,6 +22,7 @@
   "no_method": "a route looks registered here, but no request method is stated (often a sub-app mounted under a prefix)",
   "owner_unknown": "a route looks registered here, but Carrick can't tell which router it hangs from, so its full path is unknown",
   "uncorroborated": "only the library's label points at this target; the code doesn't state it and no other reading agrees",
+  "label_unchecked": "matched only by Carrick's label for a library export, which could not be checked against the installed package's type declarations",
   "mount_unverified": "the router is handed to a call that Carrick could not verify mounts it, so the full path is unknown",
   "entry_point": "the function holding it is called by nothing in this code and handed to no library",
   "runs_by_library": "a library runs the function holding it, and no known scope applies",
