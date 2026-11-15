@@ -1146,11 +1146,6 @@ pub(super) type ModuleBindings = (
     PlacedWrites,
 );
 
-/// Each module-scope binding a plain name declares, with its initialiser
-/// read in module scope and every write the census finds (carrick#3504 S1),
-/// each function's own `let` its body writes again, under the function's key
-/// (S1b), and what each states as text (S2): every plain-name local a top
-/// level definition's own body declares once, and every enum at any depth.
 /// Whether a body key's init reads a key of a module an `import()` loads
 /// directly (`const { default: init } = await import("./m")`): such a key is
 /// not marked [`LocalBinding::destructured`], so it reads as it did before
@@ -1162,6 +1157,11 @@ fn loads_directly(init: &[ValueAt]) -> bool {
     })
 }
 
+/// Each module-scope binding a plain name declares, with its initialiser
+/// read in module scope and every write the census finds (carrick#3504 S1),
+/// each function's own `let` its body writes again, under the function's key
+/// (S1b), and what each states as text (S2): every plain-name local a top
+/// level definition's own body declares once, and every enum at any depth.
 /// A declaration in a block, a local of a function written inside a body
 /// and a function declared in a body are in the table too ([`Declared`],
 /// carrick#3794), refused by every reader until its own step opens them
