@@ -5294,6 +5294,81 @@ mod tests {
         );
     }
 
+    /// Every row today's reading states through an own builder's call, the
+    /// text reader states too (carrick#3815): a builder held in a local, an
+    /// awaited `async` builder, a method read through `this`, a static
+    /// method, an omitted argument with a default, a re-exported builder, a
+    /// builder two objects deep, and one method with two implementations.
+    #[test]
+    fn every_builder_today_reads_the_text_reader_reads() {
+        let Some((_, today, rowed)) = read_twice(
+            &[
+                (
+                    "src/topics.ts",
+                    "export async function later(n: string) { return `later.${n}`; }\n\
+                     export class T { static of(k: string) { return `st.${k}`; } }\n\
+                     export function withDefault(k: string = \"def\") { return `d.${k}`; }\n\
+                     export const topicFor = (kind: string) => `svc.${kind}`;\n\
+                     export const TOPICS = { orders: { byId: (id: string) => `ord.${id}` } };\n\
+                     export interface Namer { name(k: string): string; }\n\
+                     export class A implements Namer { name(k: string) { return `a.${k}`; } }\n\
+                     export class B implements Namer { name(k: string) { return `b.${k}`; } }\n",
+                ),
+                ("src/index.ts", "export { topicFor } from \"./topics\";\n"),
+                (
+                    "src/use.ts",
+                    "import { bus } from \"@fixture/bus\";\n\
+                     import { later, T, withDefault, TOPICS, Namer, A, B } from \"./topics\";\n\
+                     import { topicFor } from \"./index\";\n\
+                     export function local() { const t = (k: string) => `loc.${k}`; bus.publish(t(\"l\"), {}); }\n\
+                     export async function awaited() { bus.publish(await later(\"w\"), {}); }\n\
+                     export class Hub {\n\
+                     \x20 topic(k: string) { return `hub.${k}`; }\n\
+                     \x20 go() { bus.publish(this.topic(\"m\"), {}); }\n\
+                     }\n\
+                     export function stat() { bus.publish(T.of(\"s\"), {}); }\n\
+                     export function omitted() { bus.publish(withDefault(), {}); }\n\
+                     export function reexported() { bus.publish(topicFor(\"r\"), {}); }\n\
+                     export function deep() { bus.publish(TOPICS.orders.byId(\"7\"), {}); }\n\
+                     export function either(n: Namer) { bus.publish(n.name(\"i\"), {}); }\n\
+                     export function go() { either(new A()); either(new B()); }\n",
+                ),
+            ],
+            &[bus()],
+            None,
+        ) else {
+            return;
+        };
+        today_stands(&today, &rowed);
+        assert_eq!(
+            placed(&rowed),
+            vec![
+                ("use.ts".to_string(), 12, "svc.r".to_string()),
+                ("use.ts".to_string(), 13, "ord.7".to_string()),
+            ],
+            "{rowed:#?}"
+        );
+        // A builder in a local, an awaited `async` one and a method with two
+        // implementations read no text, here or today: leads. The method
+        // through `this`, the static method and the default read a name
+        // today's reading does not, on a label that does not say topic:
+        // the kind question decides (Q-B3e).
+        assert_eq!(
+            leads_of(&rowed),
+            vec![
+                ("use.ts".to_string(), 4, Stop::UnreadExpression),
+                ("use.ts".to_string(), 5, Stop::UnreadExpression),
+                ("use.ts".to_string(), 14, Stop::UnreadExpression),
+            ]
+        );
+        assert_eq!(
+            rowed.names.count(NameOutcome::KindAsked),
+            3,
+            "{:?}",
+            rowed.names
+        );
+    }
+
     /// Past the resolver's step cap, each further caller of a wrapper keeps
     /// today's name, counted `capped`, and saves no lead (review finding
     /// 4): the cap counts across every caller of one slot.
