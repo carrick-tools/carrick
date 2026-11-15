@@ -38,6 +38,7 @@ import { bringUpToDate } from "../init/self-update.ts";
 import { markInvoker } from "./invoker.ts";
 import { slowHookLines, timed } from "./timings.ts";
 import { startFactsRefresh } from "../facts/fetch.ts";
+import { ensureHeld } from "../held/client.ts";
 
 const log = createLogger("carrick-session");
 
@@ -174,6 +175,13 @@ async function main(): Promise<void> {
   // at most once per cooldown; it asks the cloud and costs one read when the
   // project has not changed.
   startFactsRefresh(choice.root);
+  // Part 3: one small daemon per checkout, cheap to start; no compiler runs
+  // until a file is read or edited. Nothing happens with the switch off.
+  try {
+    ensureHeld(choice.root);
+  } catch (error) {
+    log("held-compiler daemon not ensured", String(error));
+  }
   flush(lines, codex);
 }
 

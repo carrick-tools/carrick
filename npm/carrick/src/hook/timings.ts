@@ -54,6 +54,9 @@ export type TimingRecord = {
    * rate of re-checks that missed it can be read later (carrick#3948).
    */
   engine_ready?: boolean;
+  /** Post-edit, only with the held compiler on (part 3): the daemon's answer time and state (`ready`, `cold`, `late`, `none`, `capped`, `no_compiler`, `error`, `unavailable`). */
+  held_ms?: number;
+  held_state?: string;
 };
 
 /** The file keeps this many of its last lines. */
@@ -83,6 +86,9 @@ export type Timing = {
   usesFallback?: boolean;
   /** Whether the compiler engine was ready for the re-scan the answer came from, when it says. */
   engineReady?: boolean;
+  /** Post-edit with the held compiler on: how long the daemon took to answer, and its state. */
+  heldMs?: number;
+  heldState?: string;
 };
 
 /** `recheck.engine_ready` of an answer, or undefined where no re-scan ran. */
@@ -228,6 +234,10 @@ export async function timed(
         if (timing.factsMs !== undefined) record.facts_ms = timing.factsMs;
         if (timing.usesFallback) record.uses_fallback = true;
         if (timing.engineReady !== undefined) record.engine_ready = timing.engineReady;
+        if (timing.heldState !== undefined) {
+          record.held_ms = timing.heldMs ?? 0;
+          record.held_state = timing.heldState;
+        }
         if (timing.file) record.file = path.isAbsolute(timing.file) ? path.relative(root, timing.file) : timing.file;
         appendTiming(root, record);
       }
