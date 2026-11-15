@@ -312,6 +312,7 @@ test("an uncommitted change made before the engine starts still places (the hunk
 
 test("the twin pass runs after a request that changed text, never after one that changed none", { timeout: 300_000 }, async (t) => {
   let pulls: string[][] = [];
+  const calls = (): string[][] => pulls;
   const r = await rig(t, rows, undefined, (engine) => ({
     set: (file, text) => engine.set(file, text),
     pull: (files) => {
@@ -334,7 +335,11 @@ test("the twin pass runs after a request that changed text, never after one that
   const answer = await r.edit(EXPRESS, next);
   assert.equal(answer.lines.length, 1);
   await settle();
-  assert.ok(pulls.length >= 2, `the edit pulls for its answer and for the twin pass: ${JSON.stringify(pulls)}`);
+  // One pull for the answer and one for the twin pass, which asks for every armed file side by side.
+  const [answered, twinned] = calls();
+  assert.equal(calls().length, 2, JSON.stringify(calls()));
+  assert.ok(twinned!.length > 1, `the twin pass pulls all armed files at once: ${JSON.stringify(twinned)}`);
+  assert.deepEqual([...twinned!].sort(), [...answered!].sort(), "the same files as the answer");
   pulls = [];
   await r.ask(EXPRESS, "read");
   await settle();

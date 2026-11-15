@@ -519,17 +519,27 @@ class HeldService implements ServiceEngine {
     return this.afterTimer.steps();
   }
 
+  /**
+   * Every view's twin text goes in, one pull answers for all of them (the compiler
+   * checks the files side by side), and every clean text goes back in a `finally`.
+   * A twin only adds a property to what a check states, so no file's twin changes
+   * what another file's diagnostics say.
+   */
   private async twinPass(): Promise<void> {
-    for (const [rel, view] of this.views) {
+    const twins = [...this.views].map(([rel, view]) => {
       const shadow = this.shadow(rel);
-      const twin = overlay(shadow, view.text, view.inputs, this.wire, "twin");
-      try {
-        this.engine.set(shadow, twin.text);
-        const diags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
-        for (const lost of arm(view.ov, [], diags).unarmed) log(`twin_lost ${this.init.service} ${rel} ${lost.k}`);
-      } finally {
-        this.engine.set(shadow, view.ov.text);
+      return { rel, view, shadow, twin: overlay(shadow, view.text, view.inputs, this.wire, "twin") };
+    });
+    if (twins.length === 0) return;
+    try {
+      for (const t of twins) this.engine.set(t.shadow, t.twin.text);
+      const pulled = await this.engine.pull(twins.map((t) => t.shadow));
+      for (const t of twins) {
+        const diags = offsetDiags(t.twin.text, pulled.get(t.shadow));
+        for (const lost of arm(t.view.ov, [], diags).unarmed) log(`twin_lost ${this.init.service} ${t.rel} ${lost.k}`);
       }
+    } finally {
+      for (const t of twins) this.engine.set(t.shadow, t.view.ov.text);
     }
   }
 
