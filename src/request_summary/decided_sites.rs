@@ -3587,7 +3587,7 @@ impl<'a> Walk<'a, '_> {
                     census.same += 1;
                     made.extend(kept);
                 }
-                (false, Some(_), Some(kept)) if !budget.trimmed => {
+                (false, Some(_), Some(kept)) => {
                     census.gain += 1;
                     made.extend(kept);
                 }
