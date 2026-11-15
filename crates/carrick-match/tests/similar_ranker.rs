@@ -276,8 +276,11 @@ fn at_most_six_rows_and_a_same_member_row_in_the_score_top_six_goes_first() {
 #[test]
 fn a_same_member_row_outside_the_score_top_six_is_not_listed() {
     let mut corpus = eight_strong_week_rows();
-    // Weaker on words than the rest, but it carries the member name.
-    corpus.push(function("Calendar.weekNine", "w/9.ts", &["date"]));
+    // Weaker on words than the rest (one shared word in a long body of
+    // others), but it carries the member name.
+    let mut weak = vec!["date"];
+    weak.extend(["pad"; 40]);
+    corpus.push(function("Calendar.weekNine", "w/9.ts", &weak));
     let tokens = texts(&["week", "number", "utc", "date"]);
     let rows = index(&corpus).rank(&query("weekNine", "q/q.ts", &tokens, &[]));
     assert_eq!(rows.len(), 6);
