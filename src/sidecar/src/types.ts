@@ -1562,6 +1562,12 @@ export interface SurfaceSignature {
    * signature returns nothing.
    */
   result_candidates?: SurfaceResultCandidates;
+  /**
+   * On a `construct` entry only, and only when true: the class it constructs
+   * is abstract, so `new` on it is a type error. Absent otherwise. Part of
+   * the surface hash, so a package that declares one gets a new key.
+   */
+  abstract?: true;
 }
 
 /** What a signature's return offers as its result, by rule R (`result-candidates.ts`). */

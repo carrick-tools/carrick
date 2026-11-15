@@ -5924,6 +5924,24 @@ class DeclarationReader {
     return listed;
   }
 
+  /**
+   * A construct signature of an abstract class: `new` on it is a type error.
+   * Read from the class declaration, which the written constructor sits in or
+   * the instance type names when the class writes none. A call signature, or
+   * a construct signature written in an interface, is never abstract.
+   */
+  private isAbstractConstruct(signature: ts.Signature): boolean {
+    const declaration = signature.getDeclaration();
+    const abstractClass = (node: ts.Node | undefined): boolean =>
+      node !== undefined &&
+      ts.isClassLike(node) &&
+      (ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Abstract) !== 0;
+    if (declaration !== undefined && ts.isConstructorDeclaration(declaration)) return abstractClass(declaration.parent);
+    if (declaration !== undefined && ts.isClassLike(declaration)) return abstractClass(declaration);
+    if (declaration !== undefined) return false;
+    return (this.checker.getReturnTypeOfSignature(signature).symbol?.declarations ?? []).some(abstractClass);
+  }
+
   private listSignatures(signatures: readonly ts.Signature[], holder: ts.Type, take: () => boolean): SurfaceSignature[] {
     const listed: SurfaceSignature[] = [];
     for (const signature of signatures) {
@@ -5959,6 +5977,7 @@ class DeclarationReader {
       const entry: SurfaceSignature = { params, returns: this.printed(this.checker.getReturnTypeOfSignature(signature)) };
       const candidates = this.listResultCandidates ? resultCandidatesOf(this.checker, signature) : undefined;
       if (candidates !== undefined) entry.result_candidates = candidates;
+      if (this.isAbstractConstruct(signature)) entry.abstract = true;
       listed.push(entry);
     }
     return listed;
