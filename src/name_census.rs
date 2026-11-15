@@ -236,38 +236,56 @@ pub fn parity(root: &Path, library: &[LibraryRow], site: &[SiteRow]) -> Tally<Pa
     out
 }
 
-/// The resolver's pieces read of each labelled call's name slot, beside the
-/// site path's own (carrick#3504 B10-2a2, the dry run that sizes B10-2b):
-/// one count per call of `same` or `differs` (the pieces read spells the
-/// name at the labelled call's own function as the site path does, or not),
-/// and among them how many would fall back to the site path's walk, by the
-/// word of the part that would, and how many hold a chain the cap ended.
+/// How the site path read each labelled call's name slot (carrick#3504
+/// B10-2b): through the resolver's pieces (`resolver`, and `differs_gain`
+/// where a render states as text what today's pieces leave unknown, N1), or
+/// on today's walk, by why: a value-hop chain (`r1_value_hop`, Q7a), a value
+/// that falls back (`r1_fallback`, by the word of the part that does: a
+/// parameter stop's, `stated` for a builder handed a parameter, `capped`,
+/// `absent` for no term or value read, `off_chain` and `several_values` for
+/// values that do not run through the chain as one), a render at the
+/// labelled call that differs from today's (`differs_kept`), a hole the
+/// summaries read nothing at (`unrendered`, N5), or a construction hop no
+/// chain call is made on (`field_unplaced`, N3). One count per call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DryRunNames {
-    pub same: usize,
-    pub differs: usize,
-    pub fallback: BTreeMap<&'static str, usize>,
-    pub capped: usize,
+    pub resolver: usize,
+    pub r1_value_hop: usize,
+    pub r1_fallback: BTreeMap<&'static str, usize>,
+    pub differs_kept: usize,
+    pub differs_gain: usize,
+    pub unrendered: usize,
+    pub field_unplaced: usize,
+}
+
+/// One labelled call's count in [`DryRunNames`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SitePathRead {
+    Resolver,
+    ValueHop,
+    Fallback(&'static str),
+    DiffersKept,
+    DiffersGain,
+    Unrendered,
+    FieldUnplaced,
 }
 
 impl DryRunNames {
-    pub fn note(&mut self, same: bool, fallback: Option<&'static str>, capped: bool) {
-        if same {
-            self.same += 1;
-        } else {
-            self.differs += 1;
-        }
-        if let Some(word) = fallback {
-            *self.fallback.entry(word).or_default() += 1;
-        }
-        if capped {
-            self.capped += 1;
+    pub fn note(&mut self, read: SitePathRead) {
+        match read {
+            SitePathRead::Resolver => self.resolver += 1,
+            SitePathRead::ValueHop => self.r1_value_hop += 1,
+            SitePathRead::Fallback(word) => *self.r1_fallback.entry(word).or_default() += 1,
+            SitePathRead::DiffersKept => self.differs_kept += 1,
+            SitePathRead::DiffersGain => self.differs_gain += 1,
+            SitePathRead::Unrendered => self.unrendered += 1,
+            SitePathRead::FieldUnplaced => self.field_unplaced += 1,
         }
     }
 
     /// The fallbacks by word, as the log prints them.
     pub fn fallback_line(&self) -> String {
-        self.fallback
+        self.r1_fallback
             .iter()
             .map(|(word, count)| format!("{word}={count}"))
             .collect::<Vec<_>>()
@@ -302,14 +320,17 @@ pub fn log(
         parity = %parity(root, &library.rows, &site.rows).line(),
         "message names: library-reader sites by name outcome, site-path message sites by name source, library-reader rows by what the site path states at the same place"
     );
-    let dry_run = &site.dry_run_names;
+    let read = &site.dry_run_names;
     tracing::debug!(
-        same = dry_run.same,
-        differs = dry_run.differs,
-        fallback = dry_run.fallback.values().sum::<usize>(),
-        fallback_by_word = %dry_run.fallback_line(),
-        capped = dry_run.capped,
-        "site-path names (dry run): labelled calls whose name slot the resolver's pieces read spells as the site path does, or not; of them, those that would fall back to the site path's walk, by word, and those a cap ended"
+        resolver = read.resolver,
+        r1_value_hop = read.r1_value_hop,
+        r1_fallback = read.r1_fallback.values().sum::<usize>(),
+        r1_fallback_by_word = %read.fallback_line(),
+        differs_kept = read.differs_kept,
+        differs_gain = read.differs_gain,
+        unrendered = read.unrendered,
+        field_unplaced = read.field_unplaced,
+        "site-path names: labelled calls whose name slot the site path read through the resolver's pieces, or on its own walk, by why"
     );
     let maker = &site.maker_names;
     tracing::debug!(
