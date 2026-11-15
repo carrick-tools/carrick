@@ -251,8 +251,8 @@ pub struct SiteRows {
     pub dry_run_names: crate::name_census::DryRunNames,
     /// The request lines whose every deciding call the summaries or the site
     /// pass named: the lines whose callers the summaries read, save direct
-    /// calls made where a module is loaded, each of which the site pass
-    /// decided to that request (carrick#4121); and the labelled calls whose
+    /// calls made where a module is loaded, each of which holds one site the
+    /// site pass found for that request, a lead included (carrick#4121); and the labelled calls whose
     /// every deciding call only makes the function that sends
     /// ([`held_at_maker_sites`], carrick#4319). The fold withdraws the
     /// request line's reader row where a fact row stands at every one of
@@ -2035,6 +2035,9 @@ pub fn fold_rows(
                 }))
             });
         if !facts_stand {
+            *out.held_kept
+                .entry("call_without_fact".to_string())
+                .or_default() += 1;
             continue;
         }
         let readers: Vec<usize> = calls
@@ -2043,8 +2046,14 @@ pub fn fold_rows(
             .filter(|(_, row)| is_reader(row) && at(row, &held.file, held.line))
             .map(|(index, _)| index)
             .collect();
-        if let [index] = readers.as_slice() {
-            stated_at_module.push((*index, held));
+        match readers.as_slice() {
+            [index] => stated_at_module.push((*index, held)),
+            [] => *out.held_kept.entry("no_reader".to_string()).or_default() += 1,
+            _ => {
+                *out.held_kept
+                    .entry("several_readers".to_string())
+                    .or_default() += 1
+            }
         }
     }
     stated_at_module.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
