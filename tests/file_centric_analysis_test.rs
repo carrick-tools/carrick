@@ -345,6 +345,7 @@ fn test_processing_stats_tracking() {
         model_only_rows: 0,
         model_rows_stated_at_callers: 0,
         request_lines_carried_to_callers: 0,
+        base_path_rows_stated_at_callers: 0,
         candidates_awaiting_model: 0,
         total_mounts: 3,
         total_endpoints: 10,

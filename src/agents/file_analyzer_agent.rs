@@ -340,6 +340,20 @@ impl ResolutionSource {
             Self::Model | Self::InlineLiteral | Self::RequestDescriptor
         )
     }
+
+    /// Whether a row with this source is a request line's own reading of
+    /// its call: the model's, or a base-path rule's ([`Self::EnvBasePath`],
+    /// [`Self::LiteralBasePath`]). Where the line leaves its path to its
+    /// callers and their rows state the request (carrick#3961,
+    /// carrick#4121), such a row is that request stated once more, and goes
+    /// (carrick#4531). The one test the PHASE 3 join, the held request lines,
+    /// the site fold's held-open step and the removal after it read.
+    pub fn reads_its_own_line(self) -> bool {
+        matches!(
+            self,
+            Self::Model | Self::EnvBasePath | Self::LiteralBasePath
+        )
+    }
 }
 
 /// Result of analyzing a single endpoint definition
@@ -705,7 +719,9 @@ pub struct HeldRequestLine {
     pub file: String,
     pub span_start: u32,
     pub line: u32,
-    /// The model's row at the request line.
+    /// The row that reads the request line itself: the model's, or a
+    /// base-path rule's ([`ResolutionSource::reads_its_own_line`]). Its type
+    /// anchors move to the stating callers.
     pub model: DataCallResult,
     /// The calls whose summary rows state the request, by file and span
     /// start, each with whether its function hands back the request's own

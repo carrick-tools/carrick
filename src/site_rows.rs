@@ -2051,7 +2051,7 @@ pub fn fold_rows(
         let readers: Vec<usize> = calls
             .iter()
             .enumerate()
-            .filter(|(_, row)| is_reader(row) && at(row, &held.file, held.line))
+            .filter(|(_, row)| reads_held_line(row) && at(row, &held.file, held.line))
             .map(|(index, _)| index)
             .collect();
         match readers.as_slice() {
@@ -2123,6 +2123,18 @@ fn code_decided(row: &ApiEndpointDetails) -> bool {
 /// A row the file reader stated, which no site answer has touched.
 fn is_reader(row: &ApiEndpointDetails) -> bool {
     row.resolution_source == Some(ResolutionSource::Model) && row.inference.is_none()
+}
+
+/// The row at a held request line ([`SiteRows::held_open`]) that reads the
+/// line itself, which no site answer has touched: the file reader's, or a
+/// base-path rule's ([`ResolutionSource::reads_its_own_line`],
+/// carrick#4531). Read only by the held-open step; [`is_reader`] answers
+/// every other step.
+fn reads_held_line(row: &ApiEndpointDetails) -> bool {
+    row.inference.is_none()
+        && row
+            .resolution_source
+            .is_some_and(ResolutionSource::reads_its_own_line)
 }
 
 /// Whether `row` is one an old-path pass states ([`is_old_path_source`]).
