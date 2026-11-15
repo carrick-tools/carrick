@@ -990,8 +990,9 @@ fn unread_at(blob: &serde_json::Value, file: &str, line: u64) -> Option<String> 
 }
 
 /// carrick#4445: the kit sends through values another call made, and the app
-/// never calls those members itself. The bus send (line 9) is read by nothing,
-/// so it is saved as `missed_inside`; the controls that construct a maker and
+/// never calls those members itself. The bus send (line 9) is a member of a
+/// `new`'s value: it is keyed by that value's type, as a held one is
+/// (carrick#4498), and saved `unanswered`; the controls that construct a maker and
 /// call `addEventListener` hold nothing. Lines 2 and 7 hold a `missed_inside`
 /// row too until the declaration ask reads them (carrick#4445 T1); they are
 /// not asserted here. The answer key is
@@ -1009,7 +1010,7 @@ fn a_send_a_sibling_makes_on_a_value_nothing_reads_is_saved_as_missed_inside() {
     let relay = "services/app/src/relay.ts";
     assert_eq!(
         unread_at(app, relay, 9).as_deref(),
-        Some("missed_inside callee"),
+        Some("unanswered name"),
         "{}",
         app["unread_sites"]
     );

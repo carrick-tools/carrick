@@ -686,6 +686,16 @@ pub(crate) fn receiver_object(callee: &Expr) -> Option<(u32, u32, ObjectForm)> {
     Some((span.lo.0, span.hi.0, form))
 }
 
+/// What one receiver read gives (see `Walker::receiver_end`).
+enum ReceiverEnd {
+    /// The compiler has no row at the receiver: stop reading receivers.
+    Unread,
+    /// The receiver is a labelled export, or holds a class that is.
+    Reached((SiteEnd, ReachedBy)),
+    /// The receiver reads no labelled export: try the next one.
+    Nothing,
+}
+
 /// What holds the receiver a labelled call is made on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2340,7 +2350,9 @@ impl<'a> Walker<'a> {
     /// - with the receiver trace on, a member whose declaration a verified
     ///   op claim resolves to, whatever holds the receiver
     ///   ([`MemberDeclarations`]). A declaration that stands for more than
-    ///   one op ([`Self::one_op`]) is no site, and is counted.
+    ///   one op ([`Self::one_op`]) is no site, and is counted;
+    /// - a call's or a `new`'s value, by the type the compiler gives it, where
+    ///   no declared op reached it.
     fn library_end(
         &self,
         file: &Path,
@@ -2441,76 +2453,135 @@ impl<'a> Walker<'a> {
         if let Some(positions) = inputs.positions.as_ref() {
             for (lo, hi, member, _) in &call.receiver_spans {
                 let kind = if *member { Kind::Member } else { Kind::Ident };
-                let Ok(receiver) =
-                    positions.lookup(file, ir.swc_start(*lo), ir.swc_start(*hi), kind)
-                else {
-                    break;
-                };
-                let root = receiver.type_text().and_then(type_root);
-                for name in [receiver.symbol(), root].into_iter().flatten() {
-                    for package in &packages {
-                        if let Some(claims) = self.labels.get(package, name) {
-                            return Some((
-                                end(package, name, Some(symbol), claims),
-                                ReachedBy::Name,
-                            ));
-                        }
-                    }
-                }
-                // A member the class inherits is declared in its base's
-                // package, so `packages` is the base's. The class the
-                // receiver holds is declared elsewhere, and the compiler
-                // engine writes it at the receiver as `receiver_type` rows
-                // (one per class of an intersection or union; an alias is
-                // already resolved). Read only where that export's claims
-                // state this member as an op (carrick#3390). A class the
-                // store does not label states nothing; two that both claim
-                // the member state nothing, and are counted.
-                let held = positions
-                    .receiver_declarations(file, ir.swc_start(*lo), ir.swc_start(*hi))
-                    .unwrap_or_default();
-                if held.iter().any(|row| row.flags() & FLAG_TOO_MANY != 0) {
-                    continue;
-                }
-                let mut claiming: Vec<(String, &str)> = Vec::new();
-                for row in held {
-                    // A declared type is how `procedure_end` reads a proxy;
-                    // widening this read to it is its own measured change.
-                    if row.flags() & FLAG_DECLARED_TYPE != 0 {
-                        continue;
-                    }
-                    let Some(name) = row.symbol() else {
-                        continue;
-                    };
-                    for package in store_keys(row, self.labels.exports) {
-                        let stated = self
-                            .labels
-                            .get(&package, name)
-                            .is_some_and(|claims| claims_member(claims, symbol));
-                        if stated && !claiming.contains(&(package.clone(), name)) {
-                            claiming.push((package, name));
-                        }
-                    }
-                }
-                match claiming.as_slice() {
-                    [] => {}
-                    [(package, name)] => {
-                        if let Some(claims) = self.labels.get(package, name) {
-                            return Some((
-                                end(package, name, Some(symbol), claims),
-                                ReachedBy::Name,
-                            ));
-                        }
-                    }
-                    _ => self.ambiguous.set(self.ambiguous.get() + 1),
+                match self.receiver_end(
+                    file,
+                    ir,
+                    positions,
+                    (*lo, *hi, kind),
+                    symbol,
+                    &packages,
+                    invoke,
+                ) {
+                    ReceiverEnd::Unread => break,
+                    ReceiverEnd::Reached(found) => return Some(found),
+                    ReceiverEnd::Nothing => {}
                 }
             }
         }
         // `app.get(…)` on an app handed in as a parameter, held in a field
         // or returned by a call: the member's declaration is one a verified
         // op claim resolves to (carrick#2474 R1).
-        self.declared_op(row, invoke)
-            .map(|end| (end, ReachedBy::Declaration))
+        if let Some(declared) = self.declared_op(row, invoke) {
+            return Some((declared, ReachedBy::Declaration));
+        }
+        // `new Hub().region(…)`, `connect(…).queue(…)`: the member is read on
+        // a call's or a `new`'s value. The compiler's `call` row there gives
+        // the type that value has, read as a held name's type is
+        // (carrick#4498). Only the type: that row's symbol is the callee.
+        // After the declared op, so a verified op keeps its declaration
+        // reach; only with the receiver trace on, so the file reader's
+        // look-ahead lane keeps the `package_unmatched` word it holds files
+        // out by.
+        self.labels.declarations?;
+        let positions = inputs.positions.as_ref()?;
+        let (lo, hi, ObjectForm::Call | ObjectForm::Other) = call.receiver_object? else {
+            return None;
+        };
+        if !call.receiver_spans.is_empty() {
+            return None;
+        }
+        match self.receiver_end(
+            file,
+            ir,
+            positions,
+            (lo, hi, Kind::Call),
+            symbol,
+            &packages,
+            invoke,
+        ) {
+            ReceiverEnd::Reached(found) => Some(found),
+            ReceiverEnd::Unread | ReceiverEnd::Nothing => None,
+        }
+    }
+
+    /// What the compiler's rows at one receiver say about the member called
+    /// on it: the labelled export that receiver is, the class it holds, or
+    /// nothing. `kind` is the receiver's row kind; a `call` row's symbol is
+    /// the callee, so only its type is read there (carrick#4498).
+    #[allow(clippy::too_many_arguments)]
+    fn receiver_end(
+        &self,
+        file: &Path,
+        ir: &FileIr,
+        positions: &crate::position_rows::PositionIndex,
+        (lo, hi, kind): (u32, u32, Kind),
+        symbol: &str,
+        packages: &[String],
+        invoke: Invoke<'_>,
+    ) -> ReceiverEnd {
+        let Ok(receiver) = positions.lookup(file, ir.swc_start(lo), ir.swc_start(hi), kind) else {
+            return ReceiverEnd::Unread;
+        };
+        let root = receiver.type_text().and_then(type_root);
+        let own = (kind != Kind::Call).then(|| receiver.symbol()).flatten();
+        for name in [own, root].into_iter().flatten() {
+            for package in packages {
+                if let Some(claims) = self.labels.get(package, name) {
+                    return ReceiverEnd::Reached((
+                        self.end_at(invoke, package, name, Some(symbol), claims),
+                        ReachedBy::Name,
+                    ));
+                }
+            }
+        }
+        // A member the class inherits is declared in its base's
+        // package, so `packages` is the base's. The class the
+        // receiver holds is declared elsewhere, and the compiler
+        // engine writes it at the receiver as `receiver_type` rows
+        // (one per class of an intersection or union; an alias is
+        // already resolved). Read only where that export's claims
+        // state this member as an op (carrick#3390). A class the
+        // store does not label states nothing; two that both claim
+        // the member state nothing, and are counted.
+        let held = positions
+            .receiver_declarations(file, ir.swc_start(lo), ir.swc_start(hi))
+            .unwrap_or_default();
+        if held.iter().any(|row| row.flags() & FLAG_TOO_MANY != 0) {
+            return ReceiverEnd::Nothing;
+        }
+        let mut claiming: Vec<(String, &str)> = Vec::new();
+        for row in held {
+            // A declared type is how `procedure_end` reads a proxy;
+            // widening this read to it is its own measured change.
+            if row.flags() & FLAG_DECLARED_TYPE != 0 {
+                continue;
+            }
+            let Some(name) = row.symbol() else {
+                continue;
+            };
+            for package in store_keys(row, self.labels.exports) {
+                let stated = self
+                    .labels
+                    .get(&package, name)
+                    .is_some_and(|claims| claims_member(claims, symbol));
+                if stated && !claiming.contains(&(package.clone(), name)) {
+                    claiming.push((package, name));
+                }
+            }
+        }
+        match claiming.as_slice() {
+            [] => {}
+            [(package, name)] => {
+                if let Some(claims) = self.labels.get(package, name) {
+                    return ReceiverEnd::Reached((
+                        self.end_at(invoke, package, name, Some(symbol), claims),
+                        ReachedBy::Name,
+                    ));
+                }
+            }
+            _ => self.ambiguous.set(self.ambiguous.get() + 1),
+        }
+        ReceiverEnd::Nothing
     }
 
     /// The call `invoke` is when the member `row` reads is declared where a
