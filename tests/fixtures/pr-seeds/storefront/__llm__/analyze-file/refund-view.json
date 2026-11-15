@@ -1,0 +1,23 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:4",
+      "line_number": 4,
+      "target": "/api/v1/refunds/${refundId}",
+      "method": "GET",
+      "pattern_matched": "getRefund(",
+      "call_expression_text": "getRefund(",
+      "call_expression_line": 4,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "RefundBody",
+      "type_import_source": "./gen/refunds.gen.js"
+    }
+  ],
+  "graphql_operations": [],
+  "pubsub_operations": [],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}
