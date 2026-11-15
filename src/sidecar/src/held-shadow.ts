@@ -28,8 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
-import { WriteGuard, judgeTscPath } from './capture/index.js';
-import { jsonWireDeclarations, jsonWireRule, judgeTolerances, type JudgeTolerances } from './capture/check-probe.js';
+import { WriteGuard, judgeTscPath, jsonWireDeclarations, jsonWireRule, judgeTolerances, type JudgeTolerances } from './capture/index.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {

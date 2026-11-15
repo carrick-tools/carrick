@@ -9,7 +9,7 @@
  */
 
 import { ts } from 'ts-morph';
-import { nodeByExpressionText } from './capture/anchors.js';
+import { nodeByExpressionText } from './capture/index.js';
 
 export type SiteAnswer =
   | { start: number; end: number }
