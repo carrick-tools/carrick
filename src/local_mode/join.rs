@@ -143,6 +143,15 @@ pub struct LocalJoin {
     /// whose output the indexer swallows, so a skip reaches the build's
     /// output and `carrick status` only through this (carrick#1490).
     pub type_check: JoinTypeCheck,
+    /// How many pairs the type check judged rather than took from a scan's
+    /// stored outcome (the join's settle terms, `engine/pair_settle.rs`). `None`
+    /// when the check did not run, ran with the settle off, or judged the
+    /// settled pairs too. A check that joins kept copies without re-scanning
+    /// keeps its answer only at `Some(0)`: the join cannot retype a pair, so
+    /// one it judged could read otherwise than a re-scan
+    /// ([`super::recheck`], "current").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_misses: Option<usize>,
 }
 
 /// Whether the join's type check ran, and why not when it did not.
@@ -273,6 +282,7 @@ impl LocalJoin {
             findings,
             unmatched,
             type_check,
+            settle_misses: None,
         }
     }
 

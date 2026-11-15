@@ -4170,6 +4170,161 @@ fn check_changed_re_extracts_only_the_services_that_own_a_changed_file() {
     assert_eq!(code, Some(1), "{json:#}");
 }
 
+/// The route of [`monorepo_workspace`], repo-relative to the workspace.
+const MONO_ROUTE: &str = "mono/catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+
+/// The producer stops sending a field its consumer reads.
+fn drop_active_count(root: &Path) {
+    let route = root.join(MONO_ROUTE);
+    edit(&route, "  activeCount: number;\n", "");
+    edit(&route, ", activeCount: 3", "");
+}
+
+/// `check --changed --json`: the exit code, the answer without how it was
+/// reached, and whether a scan child started (its `scan` timing line).
+fn changed_scanned(root: &Path, env: &[(&str, &str)]) -> (Option<i32>, serde_json::Value, bool) {
+    let (code, json, scanned, _) = changed_scanned_walked(root, env);
+    (code, json, scanned)
+}
+
+/// [`changed_scanned`], and whether the check walked who reads the edits to
+/// decide what is current (its `check/current-copies/readers-walk` line).
+fn changed_scanned_walked(
+    root: &Path,
+    env: &[(&str, &str)],
+) -> (Option<i32>, serde_json::Value, bool, bool) {
+    let mut env = env.to_vec();
+    env.extend([("CARRICK_RECHECK_TIMING", "1"), ("CARRICK_MOCK_ALL", "1")]);
+    let (code, json, stderr) = check_changed_json_with(root, &env);
+    (
+        code,
+        without_how(&json),
+        stderr.contains("recheck-timing scan took "),
+        stderr.contains("recheck-timing check/current-copies/readers-walk took "),
+    )
+}
+
+/// [`monorepo_workspace`], with the route's name read from a file outside
+/// every service's directory.
+fn monorepo_with_a_shared_label() -> tempfile::TempDir {
+    let workspace = monorepo_workspace();
+    let mono = workspace.path().join("mono");
+    std::fs::create_dir_all(mono.join("shared")).expect("create shared");
+    std::fs::write(
+        mono.join("shared/label.ts"),
+        "export const LABEL = \"hex-key\";\n",
+    )
+    .expect("write the shared label");
+    let route = workspace.path().join(MONO_ROUTE);
+    edit(
+        &route,
+        "export type Widget",
+        "import { LABEL } from \"../../../shared/label\";\n\nexport type Widget",
+    );
+    edit(&route, "name: \"hex-key\"", "name: LABEL");
+    commit_all(&mono, "a shared label");
+    workspace
+}
+
+/// B8 (T5): after the per-edit re-check has read an edit, `check --changed`
+/// on the same tree starts no scan: the edited service is joined from the
+/// copy the re-check kept, and the answer is a cold `--changed`'s.
+#[test]
+#[serial]
+fn check_changed_after_a_recheck_of_the_edit_joins_its_copy() {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    index(root);
+    drop_active_count(root);
+    // Cold: no copy is read or kept under the switch.
+    let (cold_code, cold, scanned) = changed_scanned(root, &[("CARRICK_CHECK_RESCAN", "always")]);
+    assert!(scanned, "the cold check scans");
+
+    recheck_json(root, MONO_ROUTE, &AMPLE);
+    let (_, raw, _) = check_changed_json_with(
+        root,
+        &[("CARRICK_MOCK_ALL", "1"), ("CARRICK_RECHECK_TIMING", "1")],
+    );
+    assert_eq!(
+        rescan_of(&raw, "mono").as_deref(),
+        Some("current"),
+        "{raw:#}"
+    );
+    let (code, json, scanned) = changed_scanned(root, &[]);
+    assert!(!scanned, "no scan child starts:\n{json:#}");
+    assert_eq!(json, cold, "the answer is the cold check's");
+    assert_eq!(code, cold_code);
+    assert_eq!(code, Some(1), "{json:#}");
+
+    edit(
+        &root.join(MONO_ROUTE),
+        "export async function loader",
+        "export const extra = 1;\n\nexport async function loader",
+    );
+    let (_, _, scanned) = changed_scanned(root, &[]);
+    assert!(scanned, "a further edit to the service re-scans it");
+}
+
+/// B8 (T5): a cold `check --changed` walks nothing of its own to decide what
+/// is current: no service has a copy, so none can be. The copies it keeps
+/// are not whole (it did not walk who reads the edits), so a repeat
+/// re-scans too, still without the walk.
+#[test]
+#[serial]
+fn check_changed_cold_walks_nothing_and_its_copies_do_not_stand_in() {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    index(root);
+    drop_active_count(root);
+    let (first_code, first, scanned, walked) = changed_scanned_walked(root, &[]);
+    assert!(scanned, "the cold check scans");
+    assert!(!walked, "and walks nothing to decide what is current");
+
+    let (code, second, scanned, walked) = changed_scanned_walked(root, &[]);
+    assert!(scanned, "its copies are not whole:\n{second:#}");
+    assert!(!walked, "so the repeat walks nothing either");
+    assert_eq!(second, first);
+    assert_eq!(code, first_code);
+}
+
+/// B8 (T5): a service that reads a path edited outside its own directories
+/// is re-scanned, whatever its copy says: its digest covers only its own
+/// files.
+#[test]
+#[serial]
+fn check_changed_rescans_a_service_reading_an_outside_edit() {
+    let workspace = monorepo_with_a_shared_label();
+    let root = workspace.path();
+    index(root);
+    drop_active_count(root);
+    recheck_json(root, MONO_ROUTE, &AMPLE);
+
+    edit(&root.join("mono/shared/label.ts"), "hex-key", "hex-nut");
+    let (_, json, scanned, walked) = changed_scanned_walked(root, &[]);
+    assert!(walked, "the re-check's whole copy is worth the walk");
+    assert!(scanned, "the reader is re-scanned:\n{json:#}");
+}
+
+/// B8 (T5): a copy read while a file outside the service was edited is not
+/// joined after that file is put back. The copy's digest still matches and
+/// the service no longer reads an edited path, but the copy was read against
+/// the other content.
+#[test]
+#[serial]
+fn check_changed_never_joins_a_copy_read_beside_an_outside_edit() {
+    let workspace = monorepo_with_a_shared_label();
+    let root = workspace.path();
+    index(root);
+    let label = root.join("mono/shared/label.ts");
+    edit(&label, "hex-key", "hex-nut");
+    drop_active_count(root);
+    recheck_json(root, MONO_ROUTE, &AMPLE);
+
+    edit(&label, "hex-nut", "hex-key");
+    let (_, json, scanned) = changed_scanned(root, &[]);
+    assert!(scanned, "the copy does not stand in:\n{json:#}");
+}
+
 /// carrick#2827: several named files are one pass across repos, with the
 /// summary line and the exit code `--changed` gives. The handler edit is
 /// uncommitted and on no branch: the files are named, not found by git.
@@ -6311,12 +6466,14 @@ fn a_re_check_states_how_long_each_phase_took_when_asked() {
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
+    // The timed run first: a second re-check of the same edit is joined from
+    // the copy the first kept and starts no scan.
+    let said = run_it(true);
     let quiet = run_it(false);
     assert!(
         !quiet.contains("recheck-timing"),
         "no timing lines unless asked:\n{quiet}"
     );
-    let said = run_it(true);
     for phase in [
         "held-read",
         "plan-make/readers-of-the-edit",

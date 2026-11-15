@@ -2709,6 +2709,7 @@ mod tests {
             type_check: super::super::JoinTypeCheck::Skipped {
                 reason: "compiler engine not found".to_string(),
             },
+            settle_misses: None,
         };
         let skipped = type_check_summary(&join, &[], &BTreeMap::new());
         assert_eq!(
