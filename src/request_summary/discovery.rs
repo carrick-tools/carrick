@@ -9848,7 +9848,12 @@ export async function pushEnvOne() { await openEnvOne(process.env.JOB_QUEUE).add
     /// record may hold none. #4418 and #4419 were two paths into the
     /// fallback; a failure here is a new one, named by fixture, file and
     /// line.
+    ///
+    /// Ignored: on CI it ran 272 s and added about 210 s to its shard
+    /// (limit 120 s, carrick#4500). The census line in main's check guards
+    /// it; run with `-- --ignored` (about 7 minutes).
     #[test]
+    #[ignore = "272 s on CI; guarded by the census line in main's check"]
     fn no_lead_record_in_the_fixture_suite_holds_no_reason() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut names: Vec<String> = std::fs::read_dir(&root)
