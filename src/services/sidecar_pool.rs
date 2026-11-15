@@ -461,6 +461,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             producer_type: "{ id: string; }".to_string(),
             producer_unwidened_type: None,
             wire: true,
+            procedure_path: None,
         }
     }
 
