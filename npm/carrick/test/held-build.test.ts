@@ -9,7 +9,10 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { serve, type HeldLine, type ServiceInit, type ServiceRuntime } from "../src/held/daemon.ts";
+import { spawn } from "node:child_process";
 import { askHeld, ensureHeld } from "../src/held/client.ts";
+import { alive, takeLock } from "../src/hook/lock.ts";
+import { lockPath } from "../src/held/paths.ts";
 import { backedOff, BACK_OFF_MS, CRASH_WINDOW_MS, recordCrash } from "../src/held/backoff.ts";
 import { heldBuildId } from "../src/held/build.ts";
 import { crashesPath, socketPath } from "../src/held/paths.ts";
@@ -171,3 +174,49 @@ test("the build id changes when any one input file's bytes change, and is stable
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A daemon from before the hello says nothing a hello says: another build by definition.
+for (const [name, reply] of [
+  ["answers no hello", null],
+  ["answers a request-shaped reply", { state: "ready", lines: [LINE], ms: 1 }],
+  ["answers a hello without a build id", { hello: { pid: 1, root: "/x" } }],
+  ["answers something that is not JSON", "garbage"],
+] as const) {
+  test(`a daemon that ${name} is never asked, is ended through the lock's pid, and is replaced`, async () => {
+    const w = world();
+    const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { stdio: "ignore" });
+    const childPid = child.pid!;
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    fs.mkdirSync(path.dirname(socketPath(w.root, w.home)), { recursive: true });
+    assert.equal(takeLock(lockPath(w.root, w.home), childPid, Date.now(), 30_000), true);
+    const frames: string[] = [];
+    const server = net.createServer((conn) => {
+      let buffer = "";
+      conn.on("error", () => undefined);
+      conn.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+          const frame = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
+          buffer = buffer.slice(end + 1);
+          frames.push(frame["hello"] === true ? "hello" : frame["exit"] === true ? "exit" : "request");
+          if (reply !== null && frame["hello"] === true) conn.write(`${typeof reply === "string" ? reply : JSON.stringify(reply)}\n`);
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath(w.root, w.home), resolve));
+    const started: string[] = [];
+    try {
+      const answer = await askHeld(w.root, [w.file], { env: ON, home: w.home, session: "s", kind: "edit", buildId: "mine", waitMs: 2_000, start: () => void started.push("start") });
+      assert.equal(answer.state, "cold");
+      assert.deepEqual(answer.lines, []);
+      assert.ok(!frames.includes("request"), `never asked: ${frames.join(",")}`);
+      await exited;
+      assert.equal(alive(childPid), false, "the old daemon was ended");
+      assert.deepEqual(started, ["start"], "a new daemon was started");
+    } finally {
+      child.kill("SIGKILL");
+      server.close();
+      w.done();
+    }
+  });
+}

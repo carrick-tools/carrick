@@ -2,6 +2,7 @@
 // checkout (`ensureHeld`), and ask it within a hard wait (`askHeld`). Both do
 // nothing unless the switch is on (`compilerLinesEnabled`).
 
+import fs from "node:fs";
 import net from "node:net";
 import { compilerLinesEnabled } from "../facts/enabled.ts";
 import { createLogger } from "../log.ts";
@@ -14,6 +15,9 @@ import type { HeldAnswer, HeldHello, HeldRequest } from "./daemon.ts";
 import { lockPath, LOCK_CAP_MS, socketPath } from "./paths.ts";
 
 const log = createLogger("carrick-held-client");
+
+/** How long a daemon has to answer the hello; one that does not is another build, and is replaced. */
+export const HELLO_WAIT_MS = 200;
 
 let ownBuildId: string | null = null;
 /** This client's build id, hashed once per process unless a test names one. */
@@ -106,12 +110,14 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     let buffer = "";
     let settled = false;
     let greeted = false;
+    let replacing = false;
     const finish = (answer: AskAnswer): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       resolve(answer);
       if (options.seq === undefined) {
+        clearTimeout(helloTimer);
         conn.destroy();
         return;
       }
@@ -123,8 +129,40 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
     };
     const conn = net.createConnection(socketPath(root, options.home));
     const timer = setTimeout(() => finish(none("late", started)), waitMs);
+    /**
+     * A daemon of another build, or one that says nothing a hello says, is never
+     * asked: it is replaced and this ask answers cold. One that knows the
+     * protocol is told to exit over the socket; one that does not is ended
+     * through the lock's pid.
+     */
+    const replace = (viaSocket: boolean): void => {
+      if (replacing) return;
+      replacing = true;
+      clearTimeout(helloTimer);
+      const startNew = (): void => {
+        ensureHeld(root, { env, buildId, ...(options.home === undefined ? {} : { home: options.home }), ...(options.start === undefined ? {} : { start: options.start }) });
+        finish(none("cold", started));
+      };
+      if (viaSocket) {
+        conn.write(`${JSON.stringify({ exit: true })}\n`);
+        // The reply `bye` (below) starts the new daemon; a daemon that does not reply is ended instead.
+        byeTimer = setTimeout(() => {
+          endStale(root, options.home);
+          startNew();
+        }, HELLO_WAIT_MS);
+        startNewAfterBye = startNew;
+      } else {
+        endStale(root, options.home);
+        startNew();
+      }
+    };
+    let byeTimer: NodeJS.Timeout | undefined;
+    let startNewAfterBye: (() => void) | undefined;
     // The hello comes first and the request only after it matched: a daemon of
-    // another build is never asked, so its rules never reach an agent.
+    // another build is never asked, so its rules never reach an agent. One that
+    // does not answer it within a short fixed wait is another build by definition.
+    const helloTimer = setTimeout(() => replace(false), HELLO_WAIT_MS);
+    helloTimer.unref();
     conn.write(`${JSON.stringify({ hello: true })}\n`);
     conn.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
@@ -132,31 +170,52 @@ export function askHeld(root: string, files: string[], options: AskOptions): Pro
       if (end < 0) return;
       const line = buffer.slice(0, end);
       buffer = buffer.slice(end + 1);
+      let parsed: { hello?: Partial<HeldHello>; bye?: boolean } & Partial<AskAnswer>;
       try {
-        const parsed = JSON.parse(line) as { hello?: HeldHello; bye?: boolean } & Partial<AskAnswer>;
-        if (!greeted && parsed.bye !== true) {
-          if (parsed.hello?.build_id === buildId) {
-            greeted = true;
-            conn.write(`${JSON.stringify(request)}\n`);
-            if (settled) conn.end();
-          } else {
-            // Another build (or one that does not say): told to exit, then
-            // replaced; this ask answers cold at once.
-            conn.write(`${JSON.stringify({ exit: true })}\n`);
-          }
-          return;
-        }
-        if (parsed.bye === true) {
-          ensureHeld(root, { env, buildId, ...(options.home === undefined ? {} : { home: options.home }), ...(options.start === undefined ? {} : { start: options.start }) });
-          finish(none("cold", started));
-          return;
-        }
-        finish(parsed as AskAnswer);
+        parsed = JSON.parse(line) as typeof parsed;
       } catch {
-        finish(none("unavailable", started));
+        replace(false);
+        return;
+      }
+      if (parsed.bye === true) {
+        clearTimeout(byeTimer);
+        startNewAfterBye?.();
+        return;
+      }
+      if (greeted) {
+        finish(parsed as AskAnswer);
+        return;
+      }
+      const theirs = parsed.hello?.build_id;
+      if (typeof theirs !== "string") replace(false);
+      else if (theirs !== buildId) replace(true);
+      else {
+        greeted = true;
+        clearTimeout(helloTimer);
+        conn.write(`${JSON.stringify(request)}\n`);
+        if (settled) conn.end();
       }
     });
     conn.on("error", () => finish(none("unavailable", started)));
     conn.on("close", () => finish(none("unavailable", started)));
   });
+}
+
+/**
+ * End the daemon behind this checkout's socket when it cannot be told over it:
+ * the lock's own pid, when the lock is live and is not this process (a daemon
+ * holds the lock once its socket exists). Never a pattern kill. Its lock and
+ * socket go with it, so the replacement can take them.
+ */
+function endStale(root: string, home: string | undefined): void {
+  const lock = lockPath(root, home);
+  const held = readJson<Lock>(lock);
+  if (held === null || held.pid === process.pid || !lockHeld(held, Date.now(), LOCK_CAP_MS)) return;
+  try {
+    process.kill(held.pid, "SIGTERM");
+  } catch {
+    // Already gone.
+  }
+  releaseLock(lock, held.pid);
+  fs.rmSync(socketPath(root, home), { force: true });
 }
