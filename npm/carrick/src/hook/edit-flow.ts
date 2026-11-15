@@ -46,9 +46,10 @@ export async function editFlow(
     cwd: string | null;
     session: string | undefined;
     /**
-     * The payload carries an `agent_id`: a sub-agent's edit. Nothing reads a
-     * sub-agent's late answers once it ends, so its edit keeps the probe's
-     * whole answer in hand, fact file or not (R46.3).
+     * The payload carries an `agent_id`: a sub-agent's edit. It takes the
+     * same path as the main session's (P5): with a fact file it is queued in
+     * place of the probe, and its late answer is read by the late-answer
+     * adoption (#4110).
      */
     subAgent?: boolean;
     channel: Channel;
@@ -154,10 +155,10 @@ export async function editFlow(
   // and every file is queued in place of the probe's verdict: its answer,
   // problem and uses lines and leads included, arrives on the next carrier
   // (T12-2). The probe still runs beside the fact lines and its similar-function
-  // block prints now. A sub-agent's edit keeps the probe's whole answer (R46.3),
-  // and a file the queue did not take is rendered from it in hand as before
+  // block prints now. A sub-agent's edit takes the same path (P5, #4110), and a
+  // file the queue did not take is rendered from the probe in hand as before
   // (R46.1).
-  const insteadOfProbe = queueable && store !== null && !input.subAgent;
+  const insteadOfProbe = queueable && store !== null;
   const facts = hook
     ? await run.factLines(
         choice.root,

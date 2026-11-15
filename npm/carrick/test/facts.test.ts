@@ -1434,8 +1434,8 @@ test("with a fact file, a deferred answer is named at Stop as before, once, and 
   assert.equal(context(next.stdout), second === "" ? clean : "");
 });
 
-// R46.3: a sub-agent's edit keeps the probe; nothing reads its late answers.
-test("with a fact file, a sub-agent's edit is probed in hand and queues nothing in place of the probe", async (t) => {
+// P5 (#4110): a sub-agent's edit takes the fact-file path like the main session's.
+test("with a fact file, a sub-agent's edit probes once, prints no problem line in hand and is queued in place of the probe", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const file = ws.at("orders-api/src/routes/orders.ts");
@@ -1445,14 +1445,29 @@ test("with a fact file, a sub-agent's edit is probed in hand and queues nothing 
     probe: "check-counterpart.json",
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
-  const said = context(run.stdout);
-  assert.ok(said.startsWith(`${PROBLEM_HEAD}\n- `), said);
+  assert.equal(context(run.stdout), GET_ORDER_LINE);
   assert.equal(probeCalls(argvLog), 1);
-  for (const { entry } of newestPerFile("parent.sub1", ws.home).values()) assert.equal(entry.instead_of_probe, undefined);
+  const entries = [...newestPerFile("parent.sub1", ws.home).values()];
+  assert.equal(entries.length, 1);
+  for (const { entry } of entries) assert.equal(entry.instead_of_probe, true);
 });
 
-// R46.3 on the shell path: a sub-agent's shell write is probed in hand too.
-test("with a fact file, a sub-agent's shell write is probed in hand and queues nothing in place of the probe", async (t) => {
+test("with a fact file, a sub-agent's edit holds the similar-function block in its own result", async (t) => {
+  const ws = await factsWorkspace(t);
+  const argvLog = path.join(ws.home, "argv.log");
+  const file = ws.at("orders-api/src/routes/orders.ts");
+  const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
+    session: "parent-lead",
+    agent: "sub1",
+    probe: "check-deferred-similar.json",
+    env: { CARRICK_FAKE_ARGV_LOG: argvLog },
+  });
+  assert.equal(context(run.stdout), `${SIMILAR_LEAD}\n\n${GET_ORDER_LINE}`);
+  assert.equal(probeCalls(argvLog), 1);
+});
+
+// P5 on the shell path: a sub-agent's shell write takes the same path.
+test("with a fact file, a sub-agent's shell write probes once, prints no problem line in hand and is queued in place of the probe", async (t) => {
   const ws = await factsWorkspace(t);
   const argvLog = path.join(ws.home, "argv.log");
   const file = ws.at("orders-api/src/events/publish.ts");
@@ -1474,8 +1489,11 @@ test("with a fact file, a sub-agent's shell write is probed in hand and queues n
       CARRICK_FAKE_ARGV_LOG: argvLog,
     }),
   });
-  assert.equal(probeCalls(argvLog), 1, `probed in hand: ${run.stdout}`);
-  for (const { entry } of newestPerFile("parent.sub1", ws.home).values()) assert.equal(entry.instead_of_probe, undefined);
+  assert.ok(!context(run.stdout).startsWith(PROBLEM_HEAD), `no problem line in hand: ${run.stdout}`);
+  assert.equal(probeCalls(argvLog), 1, `probed once: ${run.stdout}`);
+  const entries = [...newestPerFile("parent.sub1", ws.home).values()];
+  assert.ok(entries.length >= 1);
+  for (const { entry } of entries) assert.equal(entry.instead_of_probe, true);
 });
 
 // R46.5: an answer the binary refused (no index) states nothing at Stop, as
