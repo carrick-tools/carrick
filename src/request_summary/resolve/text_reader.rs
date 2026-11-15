@@ -2020,17 +2020,16 @@ impl<'a> Resolver<'a> {
     }
 
     /// The one own function `call`, written in `file`, runs, with the file
-    /// that writes it: the in-repo definition its row reaches, else the one
-    /// function the key of a module object its callee reads holds
-    /// (`ROUTES.byId(…)` on a `const` no importer changes,
-    /// [`Self::key_values`]), as discovery reads such a callee. `None` for
-    /// any other callee, or one that may run more than one function.
+    /// that writes it: the one the maker reads ([`Self::factory_of`], the
+    /// definition the call's row reaches), else the one function the key of
+    /// a module object its callee reads holds (`ROUTES.byId(…)` on a `const`
+    /// no importer changes, [`Self::key_values`]), as discovery reads such a
+    /// callee. `None` for any other callee, or one that may run more than
+    /// one function. Pinned with both readers by
+    /// `one_call_runs_one_function_for_every_reader`.
     fn builder_of(&self, file: &'a Path, call: &'a CallIr) -> Option<(&'a Path, &'a FnIr)> {
-        if let Reach::Function(target, key) =
-            self.inputs_for(file)
-                .reach(file, call.site.lo, call.site.hi)
-        {
-            return self.function(&target, &key);
+        if let Some(found) = self.factory_of(file, call.site.lo, call.site.hi, &[]) {
+            return Some(found);
         }
         let invoke = Invoke {
             file,
@@ -3208,6 +3207,56 @@ mod tests {
             rows(&[("hole:unread_expression", &[])])
         );
         assert_eq!(read("p_build_self"), rows(&[("hole:recursion", &[])]));
+    }
+
+    /// carrick#3815 (review D2): one call of an own function is run through
+    /// every reader of "which own function does this call run" and gets one
+    /// answer: the maker's (`factory_of`) for a call whose row reaches a
+    /// definition, the key read discovery uses (`key_values`) for a callee
+    /// that is a key of a module object, and the text reader's, which asks
+    /// those two and no lookup of its own.
+    #[test]
+    fn one_call_runs_one_function_for_every_reader() {
+        let Some(on) = walked("resolve-text", "services/web", "web", &[], true) else {
+            return;
+        };
+        let resolver = Resolver::new(&on.inputs, &[]);
+        for (probe, keyed) in [("p_build_lit", false), ("p_build_member", true)] {
+            let (path, term) = arg_in(&on, "src/builders.ts", probe);
+            let ValueAt::Unstated { lo, hi } = term else {
+                panic!("{probe}: {term:?}");
+            };
+            let (path, _) = resolver
+                .inputs_for(&path)
+                .files
+                .get_key_value(&path)
+                .unwrap();
+            let path: &Path = path.as_path();
+            let call = resolver.written_call(path, lo).unwrap();
+            let own = resolver.builder_of(path, call).expect(probe);
+            let maker = resolver.factory_of(path, lo, hi, &[]);
+            let invoke = Invoke {
+                file: path,
+                call,
+                construction: false,
+                bound: 0,
+            };
+            let key = call
+                .callee_key
+                .as_ref()
+                .and_then(|key| resolver.key_values(&mut Bodies, path, key, invoke));
+            if keyed {
+                assert!(maker.is_none(), "{probe}: the maker reads no key");
+                let held = key.unwrap();
+                let [Held::Reached(Body::Written(file, function))] = held.as_slice() else {
+                    panic!("{probe}: discovery's key read holds one written function");
+                };
+                assert!(own.0 == *file && std::ptr::eq(own.1, *function), "{probe}");
+            } else {
+                let maker = maker.expect(probe);
+                assert!(own.0 == maker.0 && std::ptr::eq(own.1, maker.1), "{probe}");
+            }
+        }
     }
 
     /// carrick#3678 S6-2: read as parts, a field is passed through its
