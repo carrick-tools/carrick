@@ -12323,7 +12323,7 @@ impl Composer<'_> {
         &mut self,
         file: &Path,
         ir: &FnIr,
-        shape: crate::return_flow::ReturnShape,
+        shape: &crate::return_flow::ReturnShape,
     ) -> bool {
         if shape.kind != crate::return_flow::ShapeKind::Value {
             return false;
