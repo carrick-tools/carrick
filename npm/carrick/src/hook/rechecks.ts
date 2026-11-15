@@ -435,8 +435,8 @@ export type OwedEarly = { owner: string; early: EarlyAnswer };
  * ended sub-agent's (carrick#4074), oldest first. One a newer entry of the
  * same file superseded is claimed here unprinted, so it is never read again.
  */
-export function earlyOwedFor(reader: string, home?: string): OwedEarly[] {
-  const listing = sessionListing(home);
+export function earlyOwedFor(reader: string, home?: string, given?: readonly string[]): OwedEarly[] {
+  const listing = given ?? sessionListing(home);
   const out: OwedEarly[] = [];
   for (const owner of [reader, ...endedAgents(reader, listing)]) {
     const all = sessionNames(owner, home, listing);
@@ -879,8 +879,8 @@ export type Owed = { owner: string; answer: Answer };
  * answer under `owner`, so an adopted answer is never said twice. One listing
  * of the sessions folder serves the reader and every ended agent.
  */
-export function owedFor(reader: string, home?: string): Owed[] {
-  let listing = sessionListing(home);
+export function owedFor(reader: string, home?: string, given?: readonly string[]): Owed[] {
+  let listing = given ?? sessionListing(home);
   const own = endedFile(reader, home);
   if (own !== null && listing.includes(`${reader}${ENDED}`)) {
     try {

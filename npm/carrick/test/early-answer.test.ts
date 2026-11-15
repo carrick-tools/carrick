@@ -429,6 +429,168 @@ test("10: a dispatch row's early item carries the label's parts, so its item lab
   assert.equal(item.line, 7, "the row's line, never the send's");
 });
 
+const callRow = (after: string, over: Record<string, unknown> = {}) => ({
+  file: "ext/src/view4.ts",
+  line: 4,
+  role: "call",
+  method: "GET",
+  path: "/tasks",
+  before: "compatible",
+  after,
+  counterparts: after === "no_route" ? [] : ["api src/tasks.ts:2"],
+  reason: "the consumer's end of the same route",
+  not_judged_before: false,
+  ...over,
+});
+
+/** The stand-in engine's break on a route in another file of the same service. */
+const otherFile = (ws: Ws): HeldLine =>
+  broken(ws, {
+    row_key: "contract::api::src/other.ts::producer::GET /others::0",
+    label: "GET /others",
+    row_file: "src/other.ts",
+    row_line: 6,
+    row_path: ws.at("api/src/other.ts"),
+    places: [{ service: "ext", file: "src/view7.ts", line: 7 }],
+  });
+
+const otherMoved = (over: Record<string, unknown> = {}) => ({
+  file: "api/src/other.ts",
+  line: 6,
+  role: "route",
+  method: "GET",
+  path: "/others",
+  before: "compatible",
+  after: "type_mismatch",
+  counterparts: ["ext src/view7.ts:7"],
+  reason: "the reply lost name",
+  not_judged_before: false,
+  ...over,
+});
+
+test("B1: a part-2 consumer call row of another kind at the early row's place is printed, and the record is differ", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  const first = context((await edit(ws, "eb1", part2(ws, [], [callRow("no_route")]))).stdout);
+  assert.equal(statesBreak([first]), 1, first);
+  await settled(ws, "eb1");
+  const next = await carrier(ws, "eb1");
+  assert.ok(next.includes("ext/src/view4.ts:4") && next.includes("left it with none"), next);
+  assert.equal(record(ws)?.held, "differ");
+});
+
+test("B1: a call row of the same kind at the place is still a mirror; one of method_mismatch is printed", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  await edit(ws, "eb1b", part2(ws, [], [callRow("method_mismatch")]));
+  await settled(ws, "eb1b");
+  const next = await carrier(ws, "eb1b");
+  assert.ok(next.includes("ext/src/view4.ts:4"), next);
+  assert.equal(record(ws)?.held, "differ");
+});
+
+test("B2: a part-2 request-side break on the route the early answer flagged is printed, and counts as part2_only", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)]);
+  const request = { ...SAME, direction: "request" };
+  const first = context((await edit(ws, "eb2", part2(ws, [request]))).stdout);
+  assert.equal(statesBreak([first]), 1, first);
+  await settled(ws, "eb2");
+  const next = await carrier(ws, "eb2");
+  assert.ok(next.includes("route GET /tasks"), next);
+  assert.equal(record(ws)?.held_rows?.part2_only, 1);
+  assert.equal(record(ws)?.held_rows?.same, 0);
+});
+
+test("a break on a route in another file: printed once, part 2's same row is not said again, the record is same", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [otherFile(ws)]);
+  const first = context((await edit(ws, "eo1", part2(ws, [], [otherMoved()]))).stdout);
+  assert.ok(first.includes("route GET /others"), first);
+  await settled(ws, "eo1");
+  const next = await carrier(ws, "eo1");
+  assert.ok(!next.includes("GET /others"), next);
+  assert.equal(record(ws)?.held, "same");
+});
+
+test("a break on a route in another file that part 2 holds no row for stands: nothing more, part3_only with p2_state absent", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [otherFile(ws)]);
+  const first = context((await edit(ws, "eo2", part2(ws, []))).stdout);
+  assert.ok(first.includes("route GET /others"), first);
+  await settled(ws, "eo2");
+  assert.equal(await carrier(ws, "eo2"), "");
+  assert.equal(record(ws)?.held, "part3_only");
+  assert.equal(record(ws)?.p2_state, "absent");
+});
+
+test("N3: Stop counts an early break on a route in another file and never says both sides agree beside it", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [otherFile(ws)]);
+  await edit(ws, "en3", part2(ws, [route("/tasks", 2, { state: "resolved", result: "compatible" })]));
+  await settled(ws, "en3");
+  const stop = stopAnswers("en3", { home: ws.home, ensure: () => false }).lines.join("\n");
+  assert.ok(stop.includes("1 contract problem"), stop);
+  assert.ok(!stop.includes("both sides agree"), stop);
+});
+
+test("the full answer landing before the early one: the break prints once, and the daemon's held row is the one record", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)], 1500);
+  const first = context((await edit(ws, "ef1", part2(ws, [SAME]))).stdout);
+  await waitForSessionAnswers(ws.home, "ef1");
+  await drainRunner(ws.root);
+  assert.ok(!names(ws, "ef1").some((n) => n.endsWith(".early.json")), "the full answer is first");
+  await until(() => names(ws, "ef1").some((n) => n.endsWith(".early.json")));
+  await until(() => readTimings(ws.root).some((r) => r.hook === "held"));
+  const next = await carrier(ws, "ef1");
+  assert.equal(statesBreak([first, next]), 1, `${first}\n--\n${next}`);
+  const held = readTimings(ws.root).filter((r) => r.hook === "held");
+  assert.equal(held.length, 1);
+  assert.equal(held[0]?.held, "same");
+  assert.equal(readTimings(ws.root).filter((r) => r.held !== undefined).length, 1);
+});
+
+test("the full answer landing before the early one and not judging the route: the early break stands and prints once", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)], 1500);
+  const first = context((await edit(ws, "ef2", part2(ws, []))).stdout);
+  await waitForSessionAnswers(ws.home, "ef2");
+  await drainRunner(ws.root);
+  await until(() => names(ws, "ef2").some((n) => n.endsWith(".early.json")));
+  const next = await carrier(ws, "ef2");
+  assert.equal(statesBreak([first, next]), 1, `${first}\n--\n${next}`);
+  assert.equal(await carrier(ws, "ef2"), "");
+  assert.equal(readTimings(ws.root).find((r) => r.hook === "held")?.held, "part3_only");
+});
+
+test("N5: the early-answer reader uses the listing it is given and reads the folder no more", async (t) => {
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [broken(ws)], 900);
+  await edit(ws, "en5", { ...part2(ws, []), CARRICK_FAKE_FULL_DELAY_MS: "3000" });
+  await until(() => names(ws, "en5").some((n) => n.endsWith(".early.json")));
+  const { earlyOwedFor } = await import("../src/hook/rechecks.ts");
+  assert.equal(earlyOwedFor("en5", ws.home).length, 1);
+  assert.equal(earlyOwedFor("en5", ws.home, []).length, 0, "a given empty listing is believed");
+});
+
+test("compareEarly: a call item of another kind at the place is not a mirror; of the same kind it is", async () => {
+  const { compareEarly } = await import("../src/hook/confirm.ts");
+  const early: CheckResult = {
+    schema: "carrick.check/0",
+    file: "src/tasks.ts",
+    items: [{ ...SAME, counterparts: [{ role: "consumer", service: "ext", file: "src/tasks.ts", line: 9 }] }],
+  };
+  const call = (result: string): CheckItem => ({ kind: "call", method: "GET", path: "/tasks", line: 9, source: "fact", verdict: { state: "resolved", result } });
+  const full = (result: string): CheckResult => ({ schema: "carrick.check/0", file: "src/tasks.ts", items: [call(result)] });
+  const other = compareEarly(early, full("no_route"));
+  assert.equal(other.mirrors.length, 0);
+  assert.equal(other.rows[0]?.outcome, "differ");
+  const same = compareEarly(early, full("type_mismatch"));
+  assert.equal(same.mirrors.length, 1);
+  assert.equal(same.part2Only.length, 0);
+});
+
 // Re-homed from the held lane's tests: supersede, the shared claim, switch off.
 
 test("a newer entry of the same file supersedes an older ask: only the newest reaches the compiler, and only it is filed", async (t) => {

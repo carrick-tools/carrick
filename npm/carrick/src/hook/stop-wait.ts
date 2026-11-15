@@ -45,6 +45,7 @@ import {
   enqueueChanged,
   ensureRunner,
   owedFor,
+  sessionListing,
   isChanged,
   newestPerFile,
   pendingFor,
@@ -130,8 +131,9 @@ function collect(session: string, home: string | undefined, now: number): { own:
   // Early answers (part 3, B1) still owed are findings: said as the carriers
   // say them, once, before the full answers they are compared with. Stop never
   // waits for one.
-  const early = deliverEarlies(session, new Set(), home, now);
-  for (const { owner, answer } of owedFor(session, home)) {
+  const listing = sessionListing(home);
+  const early = deliverEarlies(session, new Set(), home, now, listing);
+  for (const { owner, answer } of owedFor(session, home, listing)) {
     if (answer.instead_of_probe && !hasFindings(confirmAnswer(answer, home).answer)) continue;
     if (!claimDelivery(owner, answer.seq, home, now)) continue;
     (owner === session ? own : adopted).push(answer);

@@ -11,7 +11,7 @@ import { resolveChannel } from "../channel.ts";
 import { problemItems } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import { answersTheEdit, changedCleanLine, changedLines, correctionLine, movedLines, renderPostToolUse } from "../render.ts";
-import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, owedFor, readAnswer, readEarly } from "./rechecks.ts";
+import { claimDelivery, claimEarly, earlyOwedFor, earlySaid, isChanged, owedFor, readAnswer, readEarly, sessionListing } from "./rechecks.ts";
 import type { Answer, EarlyAnswer } from "./rechecks.ts";
 import { confirmedResult, earlyRows, keepRows, standingEarly } from "./confirm.ts";
 import { markLed, markSaid, markTold, toldKey, wasLed, wasSaid, wasTold } from "./reuse.ts";
@@ -113,8 +113,8 @@ export function deliverEarly(owner: string, early: EarlyAnswer, seen: Set<string
 }
 
 /** Every early answer `session` is owed, printed oldest first (`deliverEarly`). */
-export function deliverEarlies(session: string, seen: Set<string>, home?: string, now: number = Date.now()): string[] {
-  return earlyOwedFor(session, home).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now }));
+export function deliverEarlies(session: string, seen: Set<string>, home?: string, now: number = Date.now(), listing?: readonly string[]): string[] {
+  return earlyOwedFor(session, home, listing).flatMap(({ owner, early }) => deliverEarly(owner, early, seen, { home, now }));
 }
 
 /**
@@ -202,8 +202,10 @@ export function deliverLate(
   try {
     // Early answers first, so a full answer delivered beside its entry's
     // early one is compared with it (`confirmAnswer`), never said twice.
-    contexts.push(...deliverEarlies(session, seen, home, now));
-    for (const { owner, answer } of owedFor(session, home)) {
+    // One listing of the sessions folder serves both readers.
+    const listing = sessionListing(home);
+    contexts.push(...deliverEarlies(session, seen, home, now, listing));
+    for (const { owner, answer } of owedFor(session, home, listing)) {
       if (!claimDelivery(owner, answer.seq, home, now)) continue;
       if (answer.failure) log("background re-check failed", answer.relative, answer.failure);
       if (owner !== session) {
