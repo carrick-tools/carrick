@@ -184,7 +184,8 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
     }
     // A parameter of a nested callback shadows the factory's function by
     // name, so the body declares the name twice and nothing here says which
-    // one `return request` means: a possible call with its reason, not a row
+    // one `return request` means: the send at line 4 is a possible call with
+    // its reason, and the caller at line 8 states no row
     // (carrick#4609; one answerer for a body function's value).
     if rows
         .iter()
@@ -194,9 +195,9 @@ fn a_closure_over_a_factory_parameter_states_its_row_at_the_caller() {
     }
     if !leads
         .iter()
-        .any(|lead| lead.ends_with("src/s-closure-shadowed.ts:8 callback_parameter"))
+        .any(|lead| lead.ends_with("src/s-closure-shadowed.ts:4 callback_parameter"))
     {
-        wrong.push("no callback_parameter possible call at s-closure-shadowed.ts:8".to_string());
+        wrong.push("no callback_parameter possible call at s-closure-shadowed.ts:4".to_string());
     }
     // The maker call fills `send` with a function that sends nothing.
     if rows
