@@ -144,7 +144,7 @@ impl Walked {
             Some(rows) => crate::position_rows::load_index(rows, &self.scan_root, &self.label)
                 .unwrap_or_else(|error| {
                     warn!("{}", unreadable_rows(&self.label, &error));
-                    PositionIndex::walk_lost(&self.scan_root)
+                    PositionIndex::missing(&self.scan_root)
                 }),
             None if self.lost.is_some() => PositionIndex::walk_lost(&self.scan_root),
             None => PositionIndex::missing(&self.scan_root),
