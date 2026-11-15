@@ -1,0 +1,7 @@
+{
+  "services": [
+    { "name": "app", "directory": "services/app", "tsconfig": "tsconfig.json" },
+    { "name": "mid", "directory": "packages/mid", "tsconfig": "tsconfig.json" },
+    { "name": "base", "directory": "packages/base", "tsconfig": "tsconfig.json" }
+  ]
+}

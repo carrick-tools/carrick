@@ -1,0 +1,33 @@
+{
+  "library_claims": [
+    {
+      "package": "lib:lib.dom.d.ts",
+      "version": "6.0.2",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "lib:lib.dom.d.ts",
+          "export": "fetch",
+          "role": "http_client",
+          "side": "client",
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": null,
+              "on": "export",
+              "name": { "arg": 0 },
+              "method_key": { "arg": 1, "key": "method" },
+              "method_default": "GET",
+              "picker": "fixture-picker"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

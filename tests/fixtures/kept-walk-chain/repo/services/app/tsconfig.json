@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@fixture/mid": ["../../packages/mid/src/index.ts"]
+    },
+    "lib": ["es2022"]
+  },
+  "include": ["src/**/*", "app/**/*"]
+}
