@@ -9733,7 +9733,7 @@ export async function pushDirect() { await new Queue('direct-q').add('task', { n
         let maker_call = ir
             .functions
             .values()
-            .flat_map(|function| function.calls.iter())
+            .flat_map(|function| function.calls.iter().chain(&function.constructions))
             .find(|call| (call.site.span_start, call.site.span_end) == gamma.span)
             .expect("the maker call");
         let term = dry_run_term(maker_call, &ArgSlot { arg: 0, key: None })
