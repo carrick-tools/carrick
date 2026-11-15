@@ -73,8 +73,8 @@ pub use pairing::{
 #[cfg(feature = "wasm")]
 pub use similar::SimilarRanker;
 pub use similar::{
-    Bag, SIMILAR_ROWS, SimilarDoc, SimilarIndex, SimilarQuery, SimilarRow, bag as similar_bag,
-    tokenize as similar_tokenize,
+    Bag, SIMILAR_QUIET_BELOW, SIMILAR_ROWS, SimilarDoc, SimilarIndex, SimilarQuery, SimilarRow,
+    bag as similar_bag, tokenize as similar_tokenize,
 };
 
 /// The kind of source evidence backing one side of a match: a route

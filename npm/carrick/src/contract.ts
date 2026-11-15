@@ -310,7 +310,8 @@ export type NewFunction = {
   line: number;
   /**
    * Indexed functions this one may already exist as, best first, at most six.
-   * No score floor: empty or absent only when none shares a word with it.
+   * Empty or absent when none shares a word with it, or when the best row
+   * scores under 0.30 of the new function's word weight.
    */
   similar?: SimilarFunction[];
 };

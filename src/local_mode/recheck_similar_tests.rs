@@ -320,3 +320,79 @@ fn a_ranker_read_back_answers_as_built() {
     assert!(some_called, "the fixture has a row another file calls");
     assert_eq!(back.size(), built.size());
 }
+
+// The list is empty when the best row matches too little of what the new
+// function says (`SIMILAR_QUIET_BELOW`). The rows below are synthetic.
+
+/// Three held functions that each share only the word `limit` with the new one.
+const UNRELATED: &str = "export function formatBanner(title: string, limit: number) {\n  \
+    return title.toUpperCase().padEnd(limit, '*');\n}\n\
+    export function openSocket(host: string, limit: number) {\n  \
+    return new WebSocket(`ws://${host}`, { limit });\n}\n\
+    export function sumPrices(items: number[], limit: number) {\n  \
+    return items.reduce((total, price) => total + price, 0) + limit;\n}\n";
+
+/// A new function with a long body that mentions `limit` once.
+const WORDY: &str = "export function reconcileLedgerBalances(ledger: Ledger, limit: number) {\n  \
+    const pending = ledger.entries.filter((entry) => entry.settled === false);\n  \
+    const settled = pending.map((entry) => entry.amount).sort();\n  \
+    return settled.slice(0, limit);\n}\n";
+
+fn best(rows: &[SimilarFunction]) -> f64 {
+    rows.iter().map(|row| row.score).fold(0.0, f64::max)
+}
+
+#[test]
+fn a_list_whose_best_row_is_under_the_floor_is_empty() {
+    let rows = only_rows(similar(&[here(UNRELATED, &[])], WORDY));
+    assert_eq!(rows, [], "{rows:?}");
+}
+
+/// The same corpus with a row that shares most of the new function's words.
+#[test]
+fn one_row_over_the_floor_brings_the_list_back() {
+    let twin = WORDY.replace("reconcileLedgerBalances", "settleLedgerEntries");
+    let held = format!("{UNRELATED}{twin}");
+    let rows = only_rows(similar(&[here(&held, &[])], WORDY));
+    assert!(names(&rows).contains(&"settleLedgerEntries"), "{rows:?}");
+    assert!(
+        best(&rows) >= carrick_match::SIMILAR_QUIET_BELOW,
+        "{rows:?}"
+    );
+}
+
+/// A same-name row sits first whatever its score: the floor reads the highest
+/// score, never row 1's.
+#[test]
+fn a_weak_same_name_row_first_does_not_silence_a_strong_row() {
+    let twin = WORDY.replace("reconcileLedgerBalances", "settleLedgerEntries");
+    let namesake = "export function reconcileLedgerBalances(limit: number) {\n  \
+        return limit;\n}\n";
+    let held = vec![
+        here(&twin, &[]),
+        HeldFile {
+            file: "src/namesake.ts",
+            ..here(namesake, &[])
+        },
+    ];
+    let rows = only_rows(similar(&held, WORDY));
+    assert_eq!(rows[0].name, "reconcileLedgerBalances", "{rows:?}");
+    assert!(
+        rows[0].score < carrick_match::SIMILAR_QUIET_BELOW,
+        "{rows:?}"
+    );
+    assert!(names(&rows).contains(&"settleLedgerEntries"), "{rows:?}");
+}
+
+/// A partial twin: its best score sits a little over the floor and is listed.
+#[test]
+fn a_row_a_little_over_the_floor_is_listed() {
+    let partial = "export function settleEntries(ledger: Ledger, limit: number) {\n  \
+        const pending = ledger.entries.filter((entry) => entry.settled === false);\n  \
+        const settled = pending.map((entry) => entry.amount);\n  \
+        return settled.slice(0, limit);\n}\n";
+    let rows = only_rows(similar(&[here(partial, &[])], WORDY));
+    assert_eq!(names(&rows), ["settleEntries"], "{rows:?}");
+    let score = best(&rows);
+    assert!((0.30..0.45).contains(&score), "{rows:?}");
+}

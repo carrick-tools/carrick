@@ -5,7 +5,8 @@
 //! asked by what one parse gives: its name, its body tokens and its written
 //! signature. The ranking is [`carrick_match::SimilarIndex`], the one answerer
 //! of the question (BM25 over a bag of each function's name, intent, tokens and
-//! signature, no score floor, at most [`carrick_match::SIMILAR_ROWS`] rows).
+//! signature, at most [`carrick_match::SIMILAR_ROWS`] rows, none at all when
+//! the best score is under [`carrick_match::SIMILAR_QUIET_BELOW`]).
 //! This module reads the blobs the re-check already holds in memory (local
 //! blobs and the cached hosted snapshot, every repo), gives each indexed
 //! function to the ranker with its own intent and signature when the index has
