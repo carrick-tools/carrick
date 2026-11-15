@@ -1,0 +1,11 @@
+{
+  "name": "chained-member-receivers",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "fixture-courier": "^1.0.0",
+    "fixture-hub": "^1.0.0",
+    "fixture-jobs": "^1.0.0",
+    "fixture-tap": "^1.0.0"
+  }
+}

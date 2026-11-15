@@ -1,0 +1,342 @@
+{
+ "library_claims": [
+  {
+   "package": "fixture-courier",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "fixture-courier",
+     "export": "Courier",
+     "role": "http_client",
+     "label": "http_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "call",
+       "member": "connect",
+       "base": {
+        "arg": 0,
+        "key": "baseURL"
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-courier",
+     "export": "Area",
+     "role": "http_client",
+     "label": "http_client",
+     "side": "client",
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "call",
+       "member": "open",
+       "base": {
+        "arg": 0,
+        "key": "baseURL"
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "op": "request",
+       "member": "get",
+       "of": "instance:open",
+       "name": {
+        "arg": 0
+       },
+       "method": "GET",
+       "picker": "fixture-picker"
+      },
+      {
+       "op": "request",
+       "member": "post",
+       "of": "instance:open",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "method": "POST",
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  },
+  {
+   "package": "fixture-hub",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "fixture-hub",
+     "export": "Hub",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-hub",
+     "export": "Region",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-hub",
+     "export": "Channel",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "publish",
+       "of": "instance:new",
+       "op": "send",
+       "name": {
+        "bound": "maker"
+       },
+       "payload": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  },
+  {
+   "package": "fixture-jobs",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "fixture-jobs",
+     "export": "Jobs",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-jobs",
+     "export": "connect",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "call",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-jobs",
+     "export": "Queue",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "add",
+       "of": "instance:new",
+       "op": "send",
+       "name": {
+        "arg": 0
+       },
+       "payload": {
+        "arg": 1
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  },
+  {
+   "package": "fixture-tap",
+   "version": "1.0.0",
+   "status": "answered",
+   "surface_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "exports": [
+    {
+     "specifier": "fixture-tap",
+     "export": "Tap",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-tap",
+     "export": "Pool",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    },
+    {
+     "specifier": "fixture-tap",
+     "export": "Pipe",
+     "role": "broker",
+     "label": "broker",
+     "side": null,
+     "classifier": "fixture-classifier",
+     "makes": [
+      {
+       "form": "new",
+       "member": null,
+       "name": {
+        "arg": 0
+       },
+       "key_labels": {
+        "label": "name"
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "scopes": [],
+     "ops": [
+      {
+       "member": "write",
+       "of": "instance:new",
+       "op": "send",
+       "name": {
+        "bound": "maker"
+       },
+       "payload": {
+        "arg": 0
+       },
+       "picker": "fixture-picker"
+      }
+     ],
+     "reserved": [],
+     "calls": [],
+     "patterns": []
+    }
+   ]
+  }
+ ]
+}
