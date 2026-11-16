@@ -115,6 +115,9 @@ const PAIRS: CheckPairSpec[] = [
   // an absent `id` is served; a leaf mismatch breaks.
   gql('rf-cycle', 'Node_Sent', 'NodeId_Exp', 'node'),
   gql('rf-cycle-leaf', 'Node_Sent', 'NodeBad_Exp', 'node'),
+  // The same two against consumers that name themselves (no fixed depth).
+  gql('rf-cycle-rec', 'Node_Sent', 'NodeIdRec_Exp', 'node'),
+  gql('rf-cycle-rec-leaf', 'Node_Sent', 'NodeBadRec_Exp', 'node'),
 ];
 
 function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
@@ -150,6 +153,8 @@ describe('check_v2: a field the served schema declares and the record lacks is u
         'export type LabelList_Exp = { id: string; label: string }[];',
         'export type NodeId_Exp = { id: string; at: number; parent: { id: string; at: number } | null };',
         'export type NodeBad_Exp = { at: string; parent: { at: string } | null };',
+        'export interface NodeIdRec_Exp { id: string; at: number; parent: NodeIdRec_Exp | null }',
+        'export interface NodeBadRec_Exp { at: string; parent: NodeBadRec_Exp | null }',
       ].join('\n') + '\n'
     );
     const stubs: CheckStubInput[] = [
@@ -220,6 +225,14 @@ describe('check_v2: a field the served schema declares and the record lacks is u
     const v = verdict('rf-cycle-leaf');
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
     assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+  });
+
+  it('a consumer that names itself reads the same: unverifiable, and a leaf mismatch a break', () => {
+    assertResolverServed('rf-cycle-rec');
+    const v = verdict('rf-cycle-rec-leaf');
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+    assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+    assert.ok(!v.codes.includes(2589), JSON.stringify(v.codes));
   });
 });
 
