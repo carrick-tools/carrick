@@ -557,7 +557,7 @@ export function wireFormUnknownReason(side: Side): string {
  * "Types not verified".
  */
 export function graphqlFieldResolverReason(): string {
-  return "the producer's resolver returns a record without a field the served schema declares, so a field resolver may supply it; Carrick cannot verify that field from the record";
+  return "the root resolver's return type lacks at least one schema field, and Carrick does not read the field resolvers that usually supply it";
 }
 
 /**
