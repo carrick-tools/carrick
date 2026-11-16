@@ -2528,6 +2528,8 @@ struct MainSnapshot {
     shelf_reach: ReachObjects,
     jobs_rows: Vec<CloudRepoData>,
     jobs_reach: ReachObjects,
+    parcel_rows: Vec<CloudRepoData>,
+    parcel_reach: ReachObjects,
 }
 
 static MAIN: tokio::sync::OnceCell<MainSnapshot> = tokio::sync::OnceCell::const_new();
@@ -2566,6 +2568,8 @@ impl MainSnapshot {
             "shelf_reach": reach(&self.shelf_reach),
             "jobs_rows": self.jobs_rows,
             "jobs_reach": reach(&self.jobs_reach),
+            "parcel_rows": self.parcel_rows,
+            "parcel_reach": reach(&self.parcel_reach),
         })
     }
 }
@@ -2601,6 +2605,9 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
     scan_seed_repo(&jobs_store, &jobs_sender).await;
     scan_seed_repo(&jobs_store, &jobs_worker).await;
     scan_seed_repo(&jobs_store, &jobs_sender).await;
+    let parcel = seed_repo(trees, "parcel-desk");
+    let parcel_store = Store::default();
+    scan_seed_repo(&parcel_store, &parcel).await;
     MainSnapshot {
         trees: unlinked(trees),
         shared_rows: shared.repos.lock().unwrap().clone(),
@@ -2613,6 +2620,8 @@ async fn build_snapshot(trees: &Path) -> MainSnapshot {
         shelf_reach: shelf_store.type_reach.lock().unwrap().clone(),
         jobs_rows: jobs_store.repos.lock().unwrap().clone(),
         jobs_reach: jobs_store.type_reach.lock().unwrap().clone(),
+        parcel_rows: parcel_store.repos.lock().unwrap().clone(),
+        parcel_reach: parcel_store.type_reach.lock().unwrap().clone(),
     }
 }
 
@@ -2660,6 +2669,8 @@ fn read_snapshot(dir: &Path) -> MainSnapshot {
         shelf_reach: reach("shelf_reach"),
         jobs_rows: rows("jobs_rows"),
         jobs_reach: reach("jobs_reach"),
+        parcel_rows: rows("parcel_rows"),
+        parcel_reach: reach("parcel_reach"),
     }
 }
 
@@ -2770,6 +2781,7 @@ async fn snapshot_from_cache_equals_fresh_scan() {
         .chain(&cached.rpc_rows)
         .chain(&cached.shelf_rows)
         .chain(&cached.jobs_rows)
+        .chain(&cached.parcel_rows)
     {
         assert_eq!(
             head(&cached.trees.join(&row.repo_name)),
@@ -2904,6 +2916,7 @@ async fn seed_payload_from(
         "rpc-api" => (&main.rpc_rows, &main.rpc_reach),
         "rpc-shelf" => (&main.shelf_rows, &main.shelf_reach),
         "jobs-sender" | "jobs-worker" => (&main.jobs_rows, &main.jobs_reach),
+        "parcel-desk" => (&main.parcel_rows, &main.parcel_reach),
         _ => (&main.shared_rows, &main.shared_reach),
     };
     let store = Store {
@@ -3452,6 +3465,75 @@ async fn seed_graphql_document_import_absent_root_rename() {
         Some("src/order-summary.ts:5"),
     );
     assert_delta(&payload, &["QUERY orderSummaries"], &["QUERY orderSummary"]);
+}
+
+/// The PR removes `Consignment.total` from the one printed schema file the
+/// service names (and from the code that serves it); the client's `.gql`
+/// operation still selects it, and its call passes `ConsignmentDocument` from
+/// a generated module that is not in the tree, so the consumer is untyped
+/// (carrick#4642). Only the selection reading can decide the pair, and the
+/// PR's own diff of the printed file lifts its doubt. The row is placed at the
+/// call, not at the `.gql` file. Today main's side is unjudged at an untyped
+/// caller, so the break is `possible` (see the `_marking` test).
+#[tokio::test]
+async fn seed_graphql_printed_schema_field_removed_untyped_call() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-printed-schema-field-removed-untyped-call").await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "QUERY",
+        "consignment",
+        Some("web/src/pages/ConsignmentPage.tsx:5"),
+    );
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+    assert_eq!(finding["edge_source"], "fact", "{finding:#}");
+    assert!(
+        finding["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("Consignment.total")),
+        "{finding:#}"
+    );
+    assert_eq!(
+        finding["on_main_unknown"], "main_types_unjudged",
+        "{finding:#}"
+    );
+    assert_eq!(finding["break"], "possible", "{finding:#}");
+    assert_eq!(
+        findings_of(&payload)
+            .iter()
+            .filter(|f| f["kind"] == "type_mismatch")
+            .count(),
+        1,
+        "{payload:#}"
+    );
+    assert!(
+        findings_of(&payload)
+            .iter()
+            .all(|f| f["call_sites"].as_array().is_none_or(|sites| sites
+                .iter()
+                .all(|s| s != "web/src/graphql/consignment.gql:1"))),
+        "a row at the .gql file: {payload:#}"
+    );
+}
+
+/// The correct marking: main had the field, so the PR introduced the break.
+#[tokio::test]
+#[ignore = "carrick#4670: main side unjudged at an untyped caller"]
+async fn seed_graphql_printed_schema_field_removed_untyped_call_marking() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-printed-schema-field-removed-untyped-call").await;
+    let finding = seed_finding(
+        &payload,
+        "type_mismatch",
+        "QUERY",
+        "consignment",
+        Some("web/src/pages/ConsignmentPage.tsx:5"),
+    );
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+    assert_eq!(finding["break"], "certain", "{finding:#}");
+    assert!(finding.get("break_reason").is_none(), "{finding:#}");
 }
 
 /// No mismatch is raised at `site`: the positive posts nothing today.

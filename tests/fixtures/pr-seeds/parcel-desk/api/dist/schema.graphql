@@ -1,0 +1,9 @@
+type Query {
+  consignment(id: ID!): Consignment
+}
+
+type Consignment {
+  id: ID!
+  weightGrams: Int
+  total: Int
+}

@@ -5,14 +5,16 @@
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
     "shelf": ["rpc-shelf"],
-    "jobs": ["jobs-sender", "jobs-worker"]
+    "jobs": ["jobs-sender", "jobs-worker"],
+    "parcel": ["parcel-desk"]
   },
   "main_scans": {
     "shared": ["orders-api", "storefront", "orders-api"],
     "admin": ["admin-api"],
     "rpc": ["rpc-api"],
     "shelf": ["rpc-shelf"],
-    "jobs": ["jobs-sender", "jobs-worker", "jobs-sender"]
+    "jobs": ["jobs-sender", "jobs-worker", "jobs-sender"],
+    "parcel": ["parcel-desk"]
   },
   "seeds": [
     {
@@ -1228,6 +1230,23 @@
           {"kind": "removed_still_called", "label": "QUERY orderSummary"}
         ]
       }
+    },
+    {
+      "name": "graphql-printed-schema-field-removed-untyped-call",
+      "protocol": "graphql",
+      "change": "shape_break",
+      "repo": "parcel-desk",
+      "edits": [
+        {"op": "replace", "file": "api/dist/schema.graphql", "pairs": [["  total: Int\n", ""]]},
+        {"op": "replace", "file": "api/src/server.ts", "pairs": [["    total: { type: GraphQLInt },\n", ""]]},
+        {"op": "replace", "file": "__llm__/analyze-file/server.json", "pairs": [["\"@line:39\"", "\"@line:38\""], ["\"line_number\": 39", "\"line_number\": 38"], ["\"response_expression_line\": 39", "\"response_expression_line\": 38"], ["\"resolver_line\": 30", "\"resolver_line\": 29"]]}
+      ],
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [{"kind": "risk_introduced", "label": "QUERY consignment", "site": "web/src/pages/ConsignmentPage.tsx:5"}]
+      },
+      "known_miss": {"stage": "shown", "issues": ["carrick-cloud#2829"]}
     }
   ]
 }
