@@ -155,6 +155,7 @@ export type GateName =
   | 'sent:form'
   | 'sent:bytes'
   | 'sent:wire_form'
+  | 'sent:field_resolver'
   | 'expected:any'
   | 'expected:unknown'
   | 'expected:never'
@@ -651,6 +652,24 @@ export function buildProbe(
       );
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
+      // carrick#1875: a root resolver's record often lacks fields the schema
+      // declares (relations, computed fields), which field resolvers the
+      // check does not read supply. The gate fires where the wire line fails
+      // and filling every SDL-declared field the record lacks with `any`
+      // makes it pass: the verdict then hangs on a resolver nobody read. A
+      // field the SDL does not declare, and a leaf that mismatches beside the
+      // absent fields, still fail with the filling, so they stay breaks.
+      // Every line sits after the wire line, so no line above it moves.
+      push(
+        `type GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlSdlFilled<C[K], I, GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlSdlFilled<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } & { [K in Exclude<keyof GqlTypes[T], keyof C>]: any } : C) : C) : C;`
+      );
+      push(
+        `type SdlFieldDecides = [GqlWire] extends [GqlExpected] ? false : [GqlSdlFilled<GqlWire, GqlComparandLeaf>] extends [GqlExpected] ? true : false;`
+      );
+      gateLines.set(
+        push(`type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;`),
+        'sent:field_resolver'
+      );
     }
   } else {
     assignmentLine = push(`const expected: Expected = sent;`);
