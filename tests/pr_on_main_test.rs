@@ -3436,6 +3436,24 @@ async fn seed_query_hook_quiet() {
     assert_indirect_caller_quiet(&payload);
 }
 
+/// A hook is passed a generated document module the clean tree does not
+/// hold (carrick#4642), so its call is placed at the operation its name
+/// states. The root it queries is renamed: the missing producer is stated at
+/// the call, not at the `.gql` file that holds the document.
+#[tokio::test]
+async fn seed_graphql_document_import_absent_root_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("graphql-document-import-absent-root-rename").await;
+    seed_finding(
+        &payload,
+        "missing_endpoint",
+        "QUERY",
+        "orderSummary",
+        Some("src/order-summary.ts:5"),
+    );
+    assert_delta(&payload, &["QUERY orderSummaries"], &["QUERY orderSummary"]);
+}
+
 /// No mismatch is raised at `site`: the positive posts nothing today.
 fn assert_no_mismatch_at(payload: &serde_json::Value, site: &str) {
     let at_site = findings_of(payload).into_iter().any(|f| {

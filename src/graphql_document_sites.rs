@@ -276,12 +276,14 @@ pub struct DocumentSiteSummary {
 /// the analysis drops, and the documents each call executes, placed once the
 /// rows are built ([`DocumentSiteConsumers::apply`]). `siblings` are the
 /// run's other services, read as the resolver reads them. `workspace`
-/// resolves the specifier of a document file imported whole.
+/// resolves the specifier of a document file imported whole. `walk_roots`
+/// are the service's GraphQL walk roots; they are walked only when a call
+/// passes an import nothing resolves.
 pub fn read_document_sites(
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     workspace: Option<&WorkspaceIndex>,
-    document_files: &[PathBuf],
+    walk_roots: &[crate::graphql::WalkRoot],
 ) -> (DocumentSites, DocumentSiteConsumers) {
     let mut reader = DocumentReader::new(workspace);
     let calls = crate::request_summary::document_calls(inputs, siblings, &mut reader);
@@ -299,7 +301,7 @@ pub fn read_document_sites(
     let named_operations = calls
         .iter()
         .any(|call| call.documents.is_empty() && !call.unresolved_imports.is_empty())
-        .then(|| named_document_operations(document_files));
+        .then(|| named_document_operations(&crate::graphql::service_document_files(walk_roots)));
     for call in &calls {
         let file = call.file.to_string_lossy().into_owned();
         // A generated document module absent from the tree: `<Op>Document`
@@ -1913,8 +1915,8 @@ export function RetryButton() {
         (key.to_string(), file.to_string(), line)
     }
 
-    const SHOP_ORDERS: &str = "query Orders {\n  orders { id }\n}\n";
-    const SHOP_PAY: &str = "mutation Pay($id: ID!) {\n  pay(id: $id) { ok }\n}\n";
+    /// One document file with two operations: the second, `Pay`, is not at line 1.
+    const SHOP_DOCUMENTS: &str = "query Orders {\n  orders { id }\n}\n\nmutation Pay($id: ID!) {\n  pay(id: $id) { ok }\n}\n";
 
     /// The documents of these pages come from a generated module the clean
     /// tree does not hold.
@@ -1948,8 +1950,7 @@ export function MissingPage() {
         // hold, so the call is that operation's site, and the call is a
         // document site: it has no HTTP twin either.
         let Some(walked) = walk(&[
-            ("src/graphql/orders.gql", SHOP_ORDERS),
-            ("src/graphql/pay.gql", SHOP_PAY),
+            ("src/graphql/shop.gql", SHOP_DOCUMENTS),
             ("src/pages/OrdersPage.tsx", SHOP_ORDERS_PAGE),
             ("src/pages/PayButton.tsx", SHOP_PAY_BUTTON),
             ("src/pages/MissingPage.tsx", SHOP_MISSING_PAGE),
@@ -1960,14 +1961,11 @@ export function MissingPage() {
         let orders = key(&walked, "src/pages/OrdersPage.tsx");
         let pay = key(&walked, "src/pages/PayButton.tsx");
         let missing = key(&walked, "src/pages/MissingPage.tsx");
-        let document_files = vec![
-            root.join("src/graphql/orders.gql"),
-            root.join("src/graphql/pay.gql"),
-        ];
-        let mut files = document_files.clone();
+        let walk_roots = vec![crate::graphql::WalkRoot::from(root.clone())];
+        let mut files = vec![root.join("src/graphql/shop.gql")];
         files.extend([&orders, &pay, &missing].map(PathBuf::from));
 
-        let (sites, consumers) = read_document_sites(&walked.inputs, &[], None, &document_files);
+        let (sites, consumers) = read_document_sites(&walked.inputs, &[], None, &walk_roots);
         let mut results = HashMap::from([
             (
                 orders.clone(),
@@ -2007,8 +2005,8 @@ export function MissingPage() {
         assert_eq!(
             rows(&extraction, &root),
             vec![
-                row("graphql|mutation|pay", "src/graphql/pay.gql", 2),
-                row("graphql|query|orders", "src/graphql/orders.gql", 2),
+                row("graphql|mutation|pay", "src/graphql/shop.gql", 6),
+                row("graphql|query|orders", "src/graphql/shop.gql", 2),
             ],
             "the document files' rows before the calls are read"
         );

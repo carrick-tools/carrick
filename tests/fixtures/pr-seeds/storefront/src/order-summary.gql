@@ -1,0 +1,5 @@
+query OrderSummary($id: ID!) {
+  orderSummary(id: $id) {
+    id
+  }
+}
