@@ -52,6 +52,7 @@ describe('capture imports a printed name from the declaration the inference name
   let repoDir: string;
   let outDir: string;
   let surfaceText: string;
+  let stubDependencies: Record<string, string>;
   let stub: {
     checker: ts.TypeChecker;
     alias: (name: string) => ts.Type;
@@ -74,7 +75,23 @@ describe('capture imports a printed name from the declaration the inference name
     const kit = path.join(repoDir, 'node_modules', 'kit');
     fs.mkdirSync(kit, { recursive: true });
     fs.writeFileSync(path.join(kit, 'package.json'), JSON.stringify({ name: 'kit', version: '1.0.0', types: 'index.d.ts' }));
-    fs.writeFileSync(path.join(kit, 'index.d.ts'), 'export type Ext = { x: number };\n');
+    fs.writeFileSync(
+      path.join(kit, 'index.d.ts'),
+      "export type Ext = { x: number };\nexport type { Dec } from 'kit-utils';\n"
+    );
+    // A package kit re-exports from: the record names it, not kit.
+    const kitUtils = path.join(repoDir, 'node_modules', 'kit-utils');
+    fs.mkdirSync(kitUtils, { recursive: true });
+    fs.writeFileSync(
+      path.join(kitUtils, 'package.json'),
+      JSON.stringify({ name: 'kit-utils', version: '1.0.0', types: 'index.d.ts' })
+    );
+    fs.writeFileSync(path.join(kitUtils, 'index.d.ts'), 'export type Dec = { d: number };\n');
+    // Another copy of kit than the one the entry resolves.
+    const otherKit = path.join(repoDir, 'vendor', 'node_modules', 'kit');
+    fs.mkdirSync(otherKit, { recursive: true });
+    fs.writeFileSync(path.join(otherKit, 'package.json'), JSON.stringify({ name: 'kit', version: '2.0.0', types: 'index.d.ts' }));
+    fs.writeFileSync(path.join(otherKit, 'index.d.ts'), 'export type Ext = { y: string };\n');
     fs.writeFileSync(path.join(repoDir, 'src', 'model.ts'), MODEL_TS);
     fs.writeFileSync(path.join(repoDir, 'src', 'legacy.ts'), LEGACY_TS);
     // The model and the package reach the program the way a route's types
@@ -83,7 +100,8 @@ describe('capture imports a printed name from the declaration the inference name
       path.join(repoDir, 'src', 'repo.ts'),
       "export type { Status, Color, Billing } from './model';\n" +
         "export type { Status as LegacyStatus } from './legacy';\n" +
-        "export type { Ext } from 'kit';\n"
+        "export type { Ext, Dec } from 'kit';\n" +
+        "export type { Ext as OtherExt } from './vendor/node_modules/kit';\n"
     );
     fs.writeFileSync(path.join(repoDir, 'src', 'router.ts'), ROUTER_TS);
     outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1836-out-'));
@@ -128,6 +146,14 @@ describe('capture imports a printed name from the declaration the inference name
         literal('Endpoint_package_Response', '{ ext: Ext; }', [
           { name: 'Ext', file: path.join(repoDir, 'node_modules', 'kit', 'index.d.ts'), export_path: ['Ext'] },
         ]),
+        // kit re-exports Dec from kit-utils; the record names kit-utils.
+        literal('Endpoint_transitive_Response', '{ dec: Dec; }', [
+          { name: 'Dec', file: path.join(repoDir, 'node_modules', 'kit-utils', 'index.d.ts'), export_path: ['Dec'] },
+        ]),
+        // The specifier resolves from the entry to another copy: stays bare.
+        literal('Endpoint_othercopy_Response', '{ other: Ext; }', [
+          { name: 'Ext', file: path.join(repoDir, 'vendor', 'node_modules', 'kit', 'index.d.ts'), export_path: ['Ext'] },
+        ]),
         // An export path the module does not have names nothing.
         literal('Endpoint_stale_Response', '{ status: Status; }', [
           { name: 'Status', file: model, export_path: ['Statuses'] },
@@ -139,6 +165,7 @@ describe('capture imports a printed name from the declaration the inference name
     assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
 
     const surface = path.join(result.stub_dir, 'types', 'surface.d.ts');
+    stubDependencies = JSON.parse(fs.readFileSync(path.join(result.stub_dir, 'package.json'), 'utf-8')).dependencies ?? {};
     surfaceText = fs.readFileSync(surface, 'utf-8').replace(/\s+/g, ' ');
     const program = ts.createProgram([surface], {
       strict: true,
@@ -218,9 +245,19 @@ describe('capture imports a printed name from the declaration the inference name
     assert.match(surfaceText, /export type Endpoint_ambiguous_Response = \{ status: Status; \};/);
   });
 
-  it('a package type is not imported by path', () => {
-    assert.match(surfaceText, /export type Endpoint_package_Response = \{ ext: Ext; \};/);
+  it('a package type is imported from the package specifier, never by path (#1855)', () => {
+    assert.match(surfaceText, /export type Endpoint_package_Response = \{ ext: import\("kit"\)\.Ext; \};/);
     assert.ok(!surfaceText.includes('node_modules'), surfaceText);
+    assert.strictEqual(stubDependencies['kit'], '1.0.0');
+  });
+
+  it('a package reached through another package is imported from its own specifier (#1855)', () => {
+    assert.match(surfaceText, /export type Endpoint_transitive_Response = \{ dec: import\("kit-utils"\)\.Dec; \};/);
+    assert.strictEqual(stubDependencies['kit-utils'], '1.0.0');
+  });
+
+  it('a package file the entry does not reach by that specifier stays bare (#1855)', () => {
+    assert.match(surfaceText, /export type Endpoint_othercopy_Response = \{ other: Ext; \};/);
   });
 
   it('a record whose export path the module lacks changes nothing', () => {
@@ -237,5 +274,68 @@ describe('capture imports a printed name from the declaration the inference name
       .map((d) => /Cannot find (?:name|namespace) '([^']+)'/.exec(d.text)?.[1] ?? d.text)
       .sort();
     assert.deepStrictEqual(unresolved, ['Ext', 'Status', 'Status', 'Status']);
+  });
+});
+
+describe('capture imports a printed name from a package installed outside the repo (#1855)', () => {
+  let parentDir: string;
+  let outDir: string;
+  let surfaceText: string;
+  let dependencies: Record<string, string>;
+
+  before(() => {
+    parentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1855-capture-')));
+    const repoDir = path.join(parentDir, 'repo');
+    // The package lives beside the repo, not in it: the repo's node_modules
+    // holds a link, so the compiler resolves it to a real path outside.
+    const store = path.join(parentDir, 'store', 'node_modules', 'kit');
+    fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'node_modules'), { recursive: true });
+    fs.mkdirSync(store, { recursive: true });
+    fs.writeFileSync(path.join(store, 'package.json'), JSON.stringify({ name: 'kit', version: '1.0.0', types: 'index.d.ts' }));
+    fs.writeFileSync(path.join(store, 'index.d.ts'), 'export type Ext = { x: number };\n');
+    fs.symlinkSync(store, path.join(repoDir, 'node_modules', 'kit'), 'dir');
+    fs.writeFileSync(
+      path.join(repoDir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: { strict: true, target: 'es2022', module: 'esnext', moduleResolution: 'bundler' },
+        include: ['src'],
+      })
+    );
+    fs.writeFileSync(path.join(repoDir, 'src', 'repo.ts'), "export type { Ext } from 'kit';\n");
+    fs.writeFileSync(
+      path.join(repoDir, 'src', 'router.ts'),
+      "import type * as Repo from './repo';\nexport function handler(_p?: Repo.Ext): void {}\n"
+    );
+    outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-1855-out-'));
+    const result = captureStub({
+      repoRoot: repoDir,
+      serviceName: 'printed-outside',
+      outDir,
+      anchors: [
+        {
+          kind: 'literal',
+          alias: 'Endpoint_outside_Response',
+          type_text: '{ ext: Ext; }',
+          anchor_origin: 'deterministic-infer',
+          source_file: 'src/router.ts',
+          printed_names: [{ name: 'Ext', file: path.join(store, 'index.d.ts'), export_path: ['Ext'] }],
+        },
+      ],
+    });
+    assert.ok(result.success, `capture failed: ${JSON.stringify(result.errors)}`);
+    surfaceText = fs.readFileSync(path.join(result.stub_dir, 'types', 'surface.d.ts'), 'utf-8').replace(/\s+/g, ' ');
+    dependencies = JSON.parse(fs.readFileSync(path.join(result.stub_dir, 'package.json'), 'utf-8')).dependencies ?? {};
+  });
+
+  after(() => {
+    fs.rmSync(parentDir, { recursive: true, force: true });
+    fs.rmSync(outDir, { recursive: true, force: true });
+  });
+
+  it('the name comes from the package specifier and the stub pins the package', () => {
+    assert.match(surfaceText, /export type Endpoint_outside_Response = \{ ext: import\("kit"\)\.Ext; \};/);
+    assert.ok(!surfaceText.includes(path.sep + 'store' + path.sep), surfaceText);
+    assert.strictEqual(dependencies['kit'], '1.0.0');
   });
 });

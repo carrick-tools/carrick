@@ -803,7 +803,7 @@ function qualifyNamesFromSource(
       if (chosen) found = { spec, exportPath: [chosen.getName()] };
     }
     if (!found && atSource) found = packageImportOf(program, atSource, args.resolveFromEntry);
-    if (!found && !atSource) found = printedImportOf(program, name, printed, specOf);
+    if (!found && !atSource) found = printedImportOf(program, name, printed, specOf, args.resolveFromEntry);
     imports.set(name, found);
     return found;
   };
@@ -918,9 +918,7 @@ function packageImportOf(
   const moduleSymbol = checker.getSymbolAtLocation(statement.moduleSpecifier);
   const moduleFile = moduleSymbol?.declarations?.find(ts.isSourceFile);
   if (!moduleSymbol || !moduleFile) return undefined;
-  const installed = installedPackageSpecifier(moduleFile.fileName, exportName);
-  const fromEntry = installed && resolveFromEntry(installed.specifier);
-  if (!fromEntry || realPath(fromEntry) !== realPath(moduleFile.fileName)) return undefined;
+  if (!reachesFromEntry(moduleFile.fileName, exportName, resolveFromEntry)) return undefined;
 
   const spec = moduleFile.fileName;
   const exported = new Set(checker.getExportsOfModule(moduleSymbol).map((symbol) => symbol.getName()));
@@ -929,27 +927,52 @@ function packageImportOf(
 }
 
 /**
+ * True when `file` lies in an installed package whose bare specifier resolves
+ * from the entry to the same real file: the one gate for importing a name
+ * from a package instead of by path (carrick#1855).
+ */
+function reachesFromEntry(
+  file: string,
+  exportName: string | undefined,
+  resolveFromEntry: (specifier: string) => string | undefined
+): boolean {
+  const installed = installedPackageSpecifier(file, exportName);
+  const fromEntry = installed && resolveFromEntry(installed.specifier);
+  return !!fromEntry && realPath(fromEntry) === realPath(file);
+}
+
+/**
  * carrick#1836: the import for `name` from the one declaration the inference
  * recorded printing it for, or undefined.
  *
  * Undefined when the name was recorded for no declaration or for several,
  * when the recorded module is not in this program or not inside the repo
- * (`specOf`), and when its export path does not lead to a type there: a record
+ * (`specOf`) unless a package gives it a bare specifier the entry resolves
+ * to the same file, and when its export path does not lead to a type there: a record
  * that does not check out names nothing, and the text stays as written.
  */
 function printedImportOf(
   program: ts.Program,
   name: string,
   printed: readonly PrintedName[] | undefined,
-  specOf: (file: ts.SourceFile) => string | undefined
+  specOf: (file: ts.SourceFile) => string | undefined,
+  resolveFromEntry: ((specifier: string) => string | undefined) | undefined
 ): ImportedName | undefined {
   const recorded = (printed ?? []).filter((entry) => entry.name === name);
   const identities = new Set(recorded.map((entry) => `${entry.file}\0${entry.export_path.join('.')}`));
   if (identities.size !== 1) return undefined;
   const entry = recorded[0];
   const declaring = program.getSourceFile(entry.file);
-  const spec = declaring && specOf(declaring);
-  if (!declaring || !spec) return undefined;
+  if (!declaring) return undefined;
+  // A file the repo does not own (a package, installed in or outside the
+  // checkout) is imported from its package specifier when that resolves from
+  // the entry to this same file; the stub rewrite turns the path into it.
+  const spec =
+    specOf(declaring) ??
+    (resolveFromEntry && reachesFromEntry(declaring.fileName, entry.export_path[0], resolveFromEntry)
+      ? declaring.fileName
+      : undefined);
+  if (!spec) return undefined;
   const checker = program.getTypeChecker();
   let current = checker.getSymbolAtLocation(declaring);
   for (const part of entry.export_path) {
