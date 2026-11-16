@@ -1095,11 +1095,20 @@ fn a_move_rewrites_the_local_index_the_hooks_read() {
     )
     .unwrap();
     git(&repo, &["commit", "-qam", "the branch's own work"]);
+    // What a run killed between the two renames of the swap leaves: the old
+    // blobs moved aside into its build folder. The next rebuild sweeps it.
+    let interrupted = root.join(".carrick/build-interrupted");
+    std::fs::create_dir_all(interrupted.join("replaced")).unwrap();
+    std::fs::write(interrupted.join("replaced/0.json"), "{}").unwrap();
 
     run(
         root,
         &["refresh", "--hosted-only", "--workspace", "."],
         Some(TOKEN),
+    );
+    assert!(
+        !interrupted.exists(),
+        "an interrupted swap's folder is swept"
     );
 
     assert_eq!(index_commits(root), vec![b.clone()]);
@@ -1221,4 +1230,186 @@ fn check_changed_that_meets_a_rebuilding_read_model_states_no_problem() {
 
     assert_eq!(answer["problems"], json!([]), "{answer:#}");
     assert!(met_a_rebuild(&answer), "{answer:#}");
+}
+
+/// A snapshot holding several local repos, each its own connected repo.
+fn snapshot_of(root: &Path, repos: &[(&str, &[Value])]) {
+    let mut hash = Sha256::new();
+    hash.update(b"https://api.carrick.tools\0");
+    hash.update(TOKEN.as_bytes());
+    let data: Vec<Value> = repos
+        .iter()
+        .flat_map(|(_, blobs)| blobs.iter().cloned())
+        .collect();
+    let value = json!({
+        "identity":format!("{:x}",hash.finalize()), "checked_at":"2026-09-10T10:00:00Z",
+        "resolution": {
+            "schema":"carrick.resolve-repos/0", "workspace":{"slug":"fixture","billing_tier":"free","installed":true},
+            "allowance_sentence":"Candidates not refreshed since 2026-09-09.",
+            "repos":repos.iter().map(|(local, blobs)| json!({"full_name":format!("example/{local}"),"connected":true,"project_id":"project-1","project_slug":"fixture",
+                "services":blobs.iter().map(|b| json!({"service":b["service_name"].as_str().unwrap_or(local),"hash":b["commit_hash"],"updated_at":"2026-09-09T10:00:00Z","scanner_version":"0.3.58"})).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+            "project_repos":[{"project_slug":"fixture","repos":repos.iter().map(|(local, _)| format!("example/{local}")).collect::<Vec<_>>() }]
+        },
+        "projects":{"project-1":data}
+    });
+    save_snapshot(root, &value);
+}
+
+/// One small service repo at `root/<name>`, committed once, with its origin.
+fn service_repo(root: &Path, name: &str) -> PathBuf {
+    let repo = root.join(name);
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(
+        repo.join("app.ts"),
+        format!("declare const app: {{ get(path: string, handler: () => unknown): void }};\nfunction handler() {{ return {{ id: 1 }}; }}\napp.get(\"/{name}\", handler);\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("carrick.json"),
+        format!(r#"{{"service_name":"{name}","include":["."]}}"#),
+    )
+    .unwrap();
+    init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/example/{name}.git"),
+        ],
+    );
+    repo
+}
+
+/// A move of one repo while `.carrick/repos` is missing (a run killed
+/// mid-swap) does not write an index that holds the other repo with no
+/// services: the rebuild refuses, and both files stay as they were.
+#[test]
+fn a_move_with_the_local_blobs_missing_keeps_the_unmoved_repo() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let orders = service_repo(root, "orders");
+    service_repo(root, "billing");
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        r#"{"repos":["orders","billing"]}"#,
+    )
+    .unwrap();
+    run(root, &["refresh", "--workspace", "."], None);
+    let of = |name: &str| -> Vec<Value> {
+        blobs(root)
+            .into_iter()
+            .filter(|blob| blob["repo_name"] == name)
+            .collect()
+    };
+    snapshot_of(
+        root,
+        &[("orders", &of("orders")), ("billing", &of("billing"))],
+    );
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+    let services = |index: &Value, name: &str| -> usize {
+        index["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|repo| repo["name"] == name)
+            .map_or(0, |repo| repo["services"].as_array().unwrap().len())
+    };
+    let read_index = || -> Value {
+        serde_json::from_slice(&std::fs::read(root.join(".carrick/index.json")).unwrap()).unwrap()
+    };
+    assert_eq!(services(&read_index(), "billing"), 1);
+
+    // orders moves on to B; billing does not.
+    std::fs::write(orders.join("notes.ts"), "export const notes = 1;\n").unwrap();
+    git(&orders, &["add", "notes.ts"]);
+    git(&orders, &["commit", "-qm", "main moves on"]);
+    let b = git(&orders, &["rev-parse", "HEAD"]);
+    let mut moved = of("orders").remove(0);
+    moved["commit_hash"] = json!(b);
+    snapshot_of(root, &[("orders", &[moved]), ("billing", &of("billing"))]);
+    // A run killed between the two renames left no `.carrick/repos`.
+    std::fs::rename(root.join(".carrick/repos"), root.join("repos-away")).unwrap();
+    let before = std::fs::read(root.join(".carrick/index.json")).unwrap();
+
+    run(
+        root,
+        &["refresh", "--hosted-only", "--workspace", "."],
+        Some(TOKEN),
+    );
+
+    assert_eq!(
+        std::fs::read(root.join(".carrick/index.json")).unwrap(),
+        before
+    );
+    assert_eq!(services(&read_index(), "billing"), 1);
+}
+
+/// A checkout behind main ran `carrick refresh`, which wrote main's hosted
+/// index into the snapshot and scanned the tree at its own commit; then it
+/// pulled. The no-network repair applies the move's own test of what it may
+/// read in: a snapshot in another cache format is not read in.
+#[test]
+fn a_snapshot_the_move_would_refuse_is_not_healed_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (repo, a) = indexed_at_hosted(root);
+    let branch = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    split_at_a_new_commit(root, &repo, |mut moved| {
+        moved["cache_version"] = json!(1);
+        vec![moved]
+    });
+    git(&repo, &["checkout", "-q", "--detach", &a]);
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+    assert_eq!(index_commits(root), vec![a.clone()]);
+    git(&repo, &["checkout", "-q", &branch]);
+
+    run(
+        root,
+        &["refresh", "--hosted-only", "--workspace", "."],
+        Some(TOKEN),
+    );
+
+    assert_eq!(index_commits(root), vec![a]);
+}
+
+/// The full re-check meets the read model mid-swap: it judges nothing and
+/// answers deferred, so the runner keeps the edit queued; it does not tell
+/// the reader to run it again.
+#[test]
+fn a_full_recheck_that_meets_a_rebuilding_read_model_defers() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (repo, _) = indexed_at_hosted(root);
+    std::fs::write(
+        repo.join("app.ts"),
+        "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 2 }; }\napp.get(\"/orders\", handler);\n",
+    )
+    .unwrap();
+    std::fs::rename(root.join(".carrick/repos"), root.join("repos-away")).unwrap();
+
+    let output = spawn(
+        root,
+        &[
+            "check",
+            "orders/app.ts",
+            "--workspace",
+            ".",
+            "--recheck",
+            "--json",
+        ],
+        Some(TOKEN),
+    );
+    let answer: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+
+    assert_eq!(answer["recheck"]["deferred"], json!(true), "{answer:#}");
+    let reason = answer["recheck"]["reason"].as_str().unwrap_or_default();
+    assert!(!reason.contains("run it again"), "{answer:#}");
 }

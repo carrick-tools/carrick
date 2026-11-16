@@ -656,9 +656,12 @@ pub struct Recheck {
     /// True on a `none` from `check --recheck --no-rescan` for an edit the
     /// probe did not answer without a re-scan or a walk of every service's
     /// imports: the call was asked to do neither, so the rows are the indexed
-    /// ones and a later `check --recheck` gives the answer. Absent
-    /// on every other answer, including a re-check that did run and missed
-    /// its budget (`known_miss`, `reason`).
+    /// ones and a later `check --recheck` gives the answer. Also true on a
+    /// full `check --recheck` that met the local read model being rebuilt
+    /// (`.carrick/repos` not the model `index.json` names): it judged nothing,
+    /// and the background runner keeps the edit queued. Absent on every
+    /// other answer, including a re-check that did run and missed its budget
+    /// (`known_miss`, `reason`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
     /// True on a `none` whose re-check started and ran past its budget, so the

@@ -11,17 +11,17 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   answerInHand,
-  askForward,
+  askJob,
   CHANGED_BUDGET_MS,
   claimDelivery,
   enqueue,
   enqueueChanged,
   ensureRunner,
   finishedFor,
-  forwardRequestPath,
   lockPath,
   pendingFor,
   queueDir,
+  requestPath,
   runQueue,
   takenDir,
 } from "../src/hook/rechecks.ts";
@@ -88,37 +88,66 @@ test("a lock naming a dead pid is replaced and one runner starts", () => {
   }
 });
 
-test("a hosted move is run by the runner under its lock, after the queued re-checks", async () => {
+function argvs(log: string): string[][] {
+  return fs
+    .readFileSync(log, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as { argv: string[] }).argv);
+}
+
+test("the refresh and the hosted move are run by the runner under its lock, after the queued re-checks", async () => {
   const s = scratch();
   try {
     const now = Date.now();
     enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
     const started: string[][] = [];
-    // The hook's side: the request, and a runner started under the hook's claim.
-    assert.equal(askForward(s.root, { now, start: (_command, args) => void started.push(args) }), true);
+    // The hook's side: the requests, and one runner started under the hook's claim.
+    const start = (_command: string, args: string[]) => void started.push(args);
+    assert.equal(askJob(s.root, "forward", { now, start }), true);
+    assert.equal(askJob(s.root, "refresh", { now, start }), false);
     assert.equal(started.length, 1);
-    assert.ok(fs.existsSync(forwardRequestPath(s.root)));
-    let heldDuringMove = false;
-    const moveEnv = env(s);
+    assert.ok(fs.existsSync(requestPath(s.root, "forward")));
+    assert.ok(fs.existsSync(requestPath(s.root, "refresh")));
+    let rebuildsBeforeRelease = 0;
     await runQueue(s.root, {
-      env: moveEnv,
+      env: env(s),
       home: s.home,
       spawner: process.pid,
       afterRelease: () => {
-        // The move ran before the lock went.
-        heldDuringMove = calls(s.log).includes("--hosted-only");
+        // Both rebuilds ran before the lock went.
+        rebuildsBeforeRelease = argvs(s.log).filter((argv) => argv[0] === "refresh").length;
       },
     });
-    assert.deepEqual(calls(s.log), ["a.ts", "--hosted-only"]);
-    assert.equal(heldDuringMove, true);
-    const move = fs
-      .readFileSync(s.log, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => (JSON.parse(line) as { argv: string[] }).argv)
-      .find((argv) => argv.includes("--hosted-only"));
-    assert.deepEqual(move, ["refresh", "--hosted-only", "--workspace", s.root]);
-    assert.equal(fs.existsSync(forwardRequestPath(s.root)), false);
+    const run = argvs(s.log);
+    assert.equal(run[0]![1], "a.ts");
+    assert.deepEqual(run.slice(1), [
+      ["refresh", "--workspace", s.root],
+      ["refresh", "--hosted-only", "--workspace", s.root],
+    ]);
+    assert.equal(rebuildsBeforeRelease, 2);
+    assert.equal(fs.existsSync(requestPath(s.root, "forward")), false);
+    assert.equal(fs.existsSync(requestPath(s.root, "refresh")), false);
+    assert.equal(fs.existsSync(lockPath(s.root)), false);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a full re-check that met a read model being rebuilt keeps the edit queued, unanswered", async () => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    const [entry] = enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
+    // The binary's answer when `.carrick/repos` is not the model `index.json`
+    // names: nothing judged, `deferred`.
+    await runQueue(s.root, {
+      env: env(s, { CARRICK_FAKE_FIXTURE: fixturePath("check-deferred.json") }),
+      home: s.home,
+    });
+    assert.deepEqual(calls(s.log), ["a.ts"]);
+    assert.ok(fs.existsSync(path.join(queueDir(s.root), `${entry!.seq}.json`)));
+    assert.deepEqual(finishedFor("s1", s.home), []);
     assert.equal(fs.existsSync(lockPath(s.root)), false);
   } finally {
     s.cleanup();

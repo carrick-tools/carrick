@@ -29,9 +29,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { binary } from "../cli.ts";
 import type { StatusResult } from "../contract.ts";
-import { askForward } from "./rechecks.ts";
+import { askJob } from "./rechecks.ts";
 
 /** Default gap between unattended refreshes of one workspace. */
 export const REFRESH_COOLDOWN_MS = 60 * 60_000;
@@ -161,14 +160,11 @@ export function refreshInBackground(
   const cooldown = cooldownMs(env);
   if (now - lastHostedRead(status, marker) < cooldown) return null;
   if (!claimRefresh(marker, now, cooldown)) return null;
-  // Nobody started this refresh and nobody is reading it, so it does not keep
-  // the machine awake: that hold is for a scan a person is waiting on, and it
-  // comes with a line saying so that this one has nowhere to print
-  // (carrick#1889).
-  (options.start ?? startDetached)(binary(env), ["refresh", "--workspace", root], {
-    ...env,
-    CARRICK_NO_KEEP_AWAKE: "1",
-  });
+  // The refresh rebuilds the read model every re-check reads, so the re-check
+  // runner runs it under its lock, as it runs the move (READY-A2 P11). Nobody
+  // started it and nobody is reading it, so it does not keep the machine
+  // awake: that hold is for a scan a person is waiting on (carrick#1889).
+  askJob(root, "refresh", { env, now, ...(options.start ? { start: options.start } : {}) });
   return "Carrick: a repo here is connected with no hosted index yet, so a refresh is running in the background. Its rows arrive in the next session.";
 }
 
@@ -216,6 +212,6 @@ export function forwardInBackground(
   if (!claimRefresh(markerPath(root, FORWARD_MARKER), now, cooldown)) return false;
   // The move rebuilds the read model every re-check reads, so the re-check
   // runner runs it under its own lock (READY-A2 P11).
-  askForward(root, { env, now, ...(options.start ? { start: options.start } : {}) });
+  askJob(root, "forward", { env, now, ...(options.start ? { start: options.start } : {}) });
   return true;
 }

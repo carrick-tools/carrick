@@ -425,6 +425,11 @@ pub fn run(
                 took("held-read", started);
                 Source::Read(Box::new(held))
             }
+            // The same for the full re-check: it judges nothing and answers
+            // deferred, and the runner keeps the edit queued.
+            Err(reason) if reason == REBUILDING => {
+                return Err(Box::new(deferred(Vec::new(), started)));
+            }
             Err(reason) => return Err(Box::new(unread(reason, started))),
         },
     };
@@ -1580,7 +1585,7 @@ impl Held {
 /// Whether `local` (`.carrick/repos`) holds the blob of every service the
 /// index names for `repo`, at the commit it names: the read model `index.json`
 /// was built with, for that repo.
-fn holds_repo(
+pub(super) fn holds_repo(
     local: &[crate::cloud_storage::CloudRepoData],
     repo: &super::read_model::IndexedRepo,
 ) -> bool {
@@ -1593,9 +1598,10 @@ fn holds_repo(
     })
 }
 
-/// Why a reader judged nothing: the local index changed under it. Agent- and
-/// user-facing, inside `check --changed`'s "the check did not finish" and a
-/// re-check's reason; the probe defers instead, so the edit stays queued.
+/// Why a reader judged nothing: the local index changed under it. User-facing
+/// only inside `check --changed`'s "the check did not finish"; the probe and
+/// the full re-check answer deferred instead, so the edit stays queued.
+/// Wording pending the copy pass (a lasting mismatch is not cured by "again").
 pub(super) const REBUILDING: &str =
     "the local index was being rebuilt while this check read it; run it again";
 

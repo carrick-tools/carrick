@@ -710,11 +710,7 @@ impl Reader {
                 blobs.iter().map(|blob| &blob.commit_hash).collect();
             if blobs.is_empty()
                 || came != checked.iter().collect()
-                || blobs.iter().any(|blob| {
-                    is_moved
-                        && (blob.cache_version != Some(crate::engine::CACHE_VERSION)
-                            || blob.dirty == Some(true))
-                })
+                || (is_moved && !carried_as_is(&blobs))
             {
                 return (
                     Forward::Kept(
@@ -726,6 +722,17 @@ impl Reader {
         }
         (Forward::Moved(moved), after.snapshot)
     }
+}
+
+/// Whether a moved repo's blobs can be read in as they are: this build's cache
+/// format and a clean tree. The one test of what a move may carry, for the
+/// network move and for [`heal`] (a snapshot `hosted::refresh` wrote was never
+/// put to it).
+fn carried_as_is(blobs: &[CloudRepoData]) -> bool {
+    !blobs.is_empty()
+        && blobs.iter().all(|blob| {
+            blob.cache_version == Some(crate::engine::CACHE_VERSION) && blob.dirty != Some(true)
+        })
 }
 
 /// Whether one repo's copy may move from the commits it holds (`held`) to
@@ -874,10 +881,13 @@ fn forward_with(
     };
     // A heal is a move of the read model to the snapshot already held, so it
     // is what this run did when the cloud had nothing newer.
+    // A heal that rebuilt moved the read model, whatever the cloud said; one
+    // that failed is the run's news unless the network move rebuilt after it.
     let outcome = match (outcome, healed) {
-        (Forward::Current, Some(Ok(moved))) => Forward::Moved(moved),
-        (Forward::Current, Some(Err(reason))) => not_rebuilt(&reason),
-        (outcome, _) => outcome,
+        (outcome @ Forward::Moved(_), _) => outcome,
+        (_, Some(Ok(moved))) => Forward::Moved(moved),
+        (_, Some(Err(reason))) => not_rebuilt(&reason),
+        (outcome, None) => outcome,
     };
     // Only a run the cloud answered says where the hosted index stands; any
     // other keeps the last record, whose own time says how old it is.
@@ -962,17 +972,17 @@ fn heal(
             .filter(|repo| Path::new(&repo.path) == path)
             .flat_map(|repo| repo.services.iter().map(|service| service.commit.clone()))
             .collect();
-        let held: std::collections::BTreeSet<String> = input
-            .local_blobs(path)
-            .into_iter()
-            .map(|blob| blob.commit_hash)
-            .collect();
+        let blobs = input.local_blobs(path);
+        let held: std::collections::BTreeSet<String> =
+            blobs.iter().map(|blob| blob.commit_hash.clone()).collect();
         if built.is_empty() || held.is_empty() || built.contains("") {
             continue;
         }
         match may_move(path, name, &built, &held) {
             Err(_) => return None,
             Ok(None) => {}
+            // What the network move would refuse to carry, the heal refuses.
+            Ok(Some(_)) if !carried_as_is(&blobs) => return None,
             Ok(Some(to)) => moved.push((path.clone(), to)),
         }
     }

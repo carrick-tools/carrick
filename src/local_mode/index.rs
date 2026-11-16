@@ -135,6 +135,34 @@ impl Pass {
     }
 }
 
+/// Why a forwarded rebuild refused (inside "the local index could not be
+/// rebuilt from the moved copy: …"). Wording pending the copy pass.
+const NO_INDEX_TO_REBUILD: &str = "this workspace has no local index to rebuild";
+const ANOTHER_ACCOUNT: &str = "the local index was not built from this account's hosted index";
+const ANOTHER_REPO_SET: &str = "the local index was built for a different set of repos";
+const UNMOVED_NOT_HELD: &str =
+    "is missing from this machine's local index files; run `carrick refresh`";
+
+/// Remove the build folders a run left after it moved `.carrick/repos` aside
+/// and before it put the new one in place (a crash between the two renames):
+/// each holds a `replaced` folder no live build keeps for longer than one
+/// rename.
+fn sweep_interrupted_swaps(index_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(index_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_build = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("build-"));
+        if is_build && path.join("replaced").is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// What a build produced: an index, or a set of jobs somebody will collect.
 pub enum Built {
     Indexed(Box<IndexOutcome>),
@@ -166,6 +194,7 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
     // this build starts: whatever it wrote, this run is writing a newer index
     // (carrick#1007 item 4).
     super::scan_state::forget_finished(&workspace.index_dir());
+    sweep_interrupted_swaps(&workspace.index_dir());
     // A forwarded rebuild reads the snapshot `hosted::forward` has just
     // written and checked; downloading again could take a newer index that
     // nothing checked against HEAD.
@@ -203,22 +232,34 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
         // differs here; what must not differ is whose index this is, or the
         // retained repos would carry another account's rows.
         Pass::Forwarded(moved) => {
-            let same_reader = previous.as_ref().is_some_and(|index| {
-                (
-                    index.hosted_identity.clone(),
-                    index.hosted_workspace.clone(),
-                ) == hosted.identity()
-                    && index
-                        .repos
-                        .iter()
-                        .map(|r| PathBuf::from(&r.path))
-                        .collect::<Vec<_>>()
-                        == workspace.repos
-            });
-            if !same_reader {
-                return Err(
-                    "the local index was not built from this account's hosted index".into(),
-                );
+            let Some(index) = previous.as_ref() else {
+                return Err(NO_INDEX_TO_REBUILD.into());
+            };
+            if (
+                index.hosted_identity.clone(),
+                index.hosted_workspace.clone(),
+            ) != hosted.identity()
+            {
+                return Err(ANOTHER_ACCOUNT.into());
+            }
+            if index
+                .repos
+                .iter()
+                .map(|r| PathBuf::from(&r.path))
+                .collect::<Vec<_>>()
+                != workspace.repos
+            {
+                return Err(ANOTHER_REPO_SET.into());
+            }
+            // The repos it does not move are retained from `.carrick/repos`,
+            // so that folder must be the model `index.json` names for them:
+            // a run killed mid-swap leaves it missing, and an index built over
+            // it would hold those repos with no services. The readers' rule.
+            let local = read_blobs(&workspace.blobs_dir())?;
+            if let Some(repo) = index.repos.iter().find(|repo| {
+                !moved.contains(Path::new(&repo.path)) && !super::recheck::holds_repo(&local, repo)
+            }) {
+                return Err(format!("{} {}", repo.name, UNMOVED_NOT_HELD));
             }
             workspace
                 .repos
