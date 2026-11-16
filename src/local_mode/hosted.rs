@@ -834,7 +834,7 @@ pub(super) fn forward(workspace: &Workspace) -> Forward {
 /// What a rebuild that failed records: the move did not happen.
 fn not_rebuilt(reason: &str) -> Forward {
     Forward::Kept(format!(
-        "the local index could not be rebuilt from the moved copy: {reason}"
+        "the local index could not be rebuilt from the newer copy: {reason}"
     ))
 }
 
@@ -3526,7 +3526,7 @@ mod tests {
         assert_eq!(
             outcome,
             Forward::Kept(
-                "the local index could not be rebuilt from the moved copy: the join failed".into()
+                "the local index could not be rebuilt from the newer copy: the join failed".into()
             )
         );
         assert_eq!(asked.into_inner(), vec![vec![repo.clone()]]);

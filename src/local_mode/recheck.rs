@@ -1612,9 +1612,9 @@ pub(super) fn holds_repo(
 /// Why a reader judged nothing: the local index changed under it. User-facing
 /// only inside `check --changed`'s "the check did not finish"; the probe and
 /// the full re-check answer deferred instead, so the edit stays queued.
-/// Wording pending the copy pass (a lasting mismatch is not cured by "again").
-pub(super) const REBUILDING: &str =
-    "the local index was being rebuilt while this check read it; run it again";
+/// Wording from the copy pass: a retry is right, and `carrick refresh` mends a
+/// mismatch that lasts.
+pub(super) const REBUILDING: &str = "the local index changed while this check read it; try again, and run `carrick refresh` if it happens again";
 
 /// The functions `relative` declares in the working tree that the index does
 /// not hold for it, from one parse of the file (carrick#2849).

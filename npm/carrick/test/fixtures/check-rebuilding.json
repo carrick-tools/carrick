@@ -11,7 +11,7 @@
     "ran": "none",
     "elapsed_ms": 0,
     "stale_since": "2026-09-06T21:14:03Z",
-    "reason": "the local index was being rebuilt while this check read it; run it again",
+    "reason": "the local index changed while this check read it; try again, and run `carrick refresh` if it happens again",
     "rebuilding": true
   }
 }

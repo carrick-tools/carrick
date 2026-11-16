@@ -1044,7 +1044,7 @@ fn changed(root: &Path) -> Value {
 fn met_a_rebuild(answer: &Value) -> bool {
     answer["not_checked"]
         .as_str()
-        .is_some_and(|reason| reason.contains("being rebuilt"))
+        .is_some_and(|reason| reason.contains("the local index changed while this check read it"))
 }
 
 fn index_commits(root: &Path) -> Vec<String> {

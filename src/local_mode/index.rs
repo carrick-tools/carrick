@@ -136,12 +136,13 @@ impl Pass {
 }
 
 /// Why a forwarded rebuild refused (inside "the local index could not be
-/// rebuilt from the moved copy: …"). Wording pending the copy pass.
-const NO_INDEX_TO_REBUILD: &str = "this workspace has no local index to rebuild";
-const ANOTHER_ACCOUNT: &str = "the local index was not built from this account's hosted index";
-const ANOTHER_REPO_SET: &str = "the local index was built for a different set of repos";
+/// rebuilt from the newer copy: …"). Wording from the copy pass.
+const NO_INDEX_TO_REBUILD: &str = "there is no local index in this workspace to rebuild";
+const ANOTHER_ACCOUNT: &str = "the local index was built from another account's hosted index";
+const ANOTHER_REPO_SET: &str = "this workspace's repos are not the ones the local index was built for; run `carrick refresh` to rebuild it";
+/// Follows the repo's name.
 const UNMOVED_NOT_HELD: &str =
-    "is missing from this machine's local index files; run `carrick refresh`";
+    "'s files are missing from the local index; run `carrick refresh` to rebuild it";
 
 /// Remove the build folders a run left after it moved `.carrick/repos` aside
 /// and before it put the new one in place (a crash between the two renames):
@@ -259,7 +260,7 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
             if let Some(repo) = index.repos.iter().find(|repo| {
                 !moved.contains(Path::new(&repo.path)) && !super::recheck::holds_repo(&local, repo)
             }) {
-                return Err(format!("{} {}", repo.name, UNMOVED_NOT_HELD));
+                return Err(format!("{}{}", repo.name, UNMOVED_NOT_HELD));
             }
             workspace
                 .repos
@@ -400,7 +401,7 @@ fn run_generation(
         // stricter test here would refuse a move it approved.
         let read_in = match pass {
             Pass::Forwarded(_) if hosted_blobs.is_empty() => {
-                return Err(format!("the moved copy holds no index for {name}"));
+                return Err(format!("the newer copy holds no index for {name}"));
             }
             Pass::Forwarded(_) => Some(hosted_blobs.clone()),
             Pass::Facts => current_hosted_blobs(repo, &hosted_blobs),
