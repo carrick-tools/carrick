@@ -31,7 +31,7 @@ function list(): Record<string, Entry> {
 describe('type-reasons.json is the one list', () => {
   it('holds every word, each with a sentence and one of three decided values', () => {
     const entries = list();
-    assert.equal(Object.keys(entries).length, 19);
+    assert.equal(Object.keys(entries).length, 20);
     for (const [word, entry] of Object.entries(entries)) {
       assert.match(word, /^[a-z_]+$/, word);
       assert.ok(entry.sentence.length > 0, `${word} has no sentence`);
