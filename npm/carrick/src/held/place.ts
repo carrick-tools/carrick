@@ -26,7 +26,7 @@ export type Value = { file: string; start: number; end: number };
 
 /** Why a value has no check. */
 export type ValueReason = "value_not_a_node" | "not_wrappable" | "value_edited";
-export type UnplacedReason = ValueReason | "javascript_file";
+export type UnplacedReason = ValueReason | "javascript_file" | "top_type";
 
 /** One changed stretch of text: the old and the new bounds (BOM not counted). */
 export type Region = { oldStart: number; oldEnd: number; newStart: number; newEnd: number };
@@ -42,8 +42,16 @@ export type Diag = { start: number; code: number; message: string };
 
 export type UnarmedReason = "twin_passes" | "decl_error" | `clean_check_fails:TS${number}`;
 
+/**
+ * A GraphQL send-form check (a resolver's returned value, the caller's expected
+ * result held fixed). `leaf` is the root field's SDL leaf as JSON (the engine's
+ * `write_shadow` answer), which selects the judge's scalar form; null selects
+ * its JSON form. Which of the two a root takes is the engine's call, never ours.
+ */
+export type GraphqlForm = { kind: "graphql"; leaf: string | null };
+
 /** One (row, position) pair, numbered across the overlay, with one stated type per group. */
-export type CheckInput = { n: number; value: Value; groups: Array<{ type: string }> };
+export type CheckInput = { n: number; value: Value; groups: Array<{ type: string }>; form?: GraphqlForm };
 
 export type Check = {
   n: number;
@@ -52,8 +60,13 @@ export type Check = {
   k: string;
   /** The whole check expression: `__C.send<k>(` through `, (o) => o)`. */
   span: [number, number];
-  /** The check's two declaration lines in the appended namespace. */
+  /** The check's declaration lines in the appended namespace. */
   declSpan: [number, number];
+  /**
+   * A GraphQL form check only: where the callback's body (the `o` of
+   * `, (o) => o)`) starts. Its own diagnostics start exactly there (P8).
+   */
+  callback?: number;
 };
 
 export type Overlay = {
@@ -129,6 +142,24 @@ export function checkWire(wire: string[], tolerances: string[]): string[] {
   ];
 }
 
+/** What the judge's bytes gate reads (`IsByteBody`, `check-probe.ts`), by name. */
+const BYTE_NAMES = "Blob|ArrayBuffer|SharedArrayBuffer|ArrayBufferView|Buffer|DataView|(?:Big)?(?:Int|Uint|Float)(?:8|16|32|64)(?:Clamped)?Array|ReadableStream(?:<[^>]*>)?";
+const TOP_OR_BYTES = new RegExp(`^(?:any|unknown|never|${BYTE_NAMES})$`);
+
+/**
+ * A stated type that is `any`, `unknown`, `never` or bytes (alone, or with
+ * `null` / `undefined`). The judge reads none of these as a contract
+ * (`sent:` and `expected:` gates), and the engine's GraphQL form composes only
+ * two of its gates, so a GraphQL check never arms on one: held silence is not
+ * compatible, and a held check never speaks on a top type.
+ */
+export function isTopOrBytes(type: string): boolean {
+  let t = type.trim();
+  while (t.startsWith("(") && t.endsWith(")")) t = t.slice(1, -1).trim();
+  const members = t.split("|").map((m) => m.trim()).filter((m) => m !== "null" && m !== "undefined" && m !== "");
+  return members.length > 0 && members.every((m) => TOP_OR_BYTES.test(m));
+}
+
 const delta = (r: Region): number => r.newEnd - r.newStart - (r.oldEnd - r.oldStart);
 
 /**
@@ -158,6 +189,8 @@ export async function resolveValue(value: Value, regions: Region[], oldText: str
 type Op = { at: number; s: string; side: "pre" | "post"; seq: number; start: number; end: number };
 
 const POST = ", (o) => o)";
+/** Where the callback's body starts inside `POST`. */
+const POST_BODY = POST.indexOf("=> o") + 3;
 
 /**
  * The file with every placeable value wrapped. `wire` is `checkWire`'s text (it holds
@@ -177,16 +210,28 @@ export function overlay(file: string, text: string, checks: CheckInput[], wire: 
     if (js) { unplaced.push({ n: input.n, reason: "javascript_file" }); continue; }
     const start = input.value.start + bom;
     const end = input.value.end + bom;
+    const form = input.form;
+    let placed = 0;
     input.groups.forEach((g, group) => {
+      if (form && isTopOrBytes(g.type)) return;
+      placed += 1;
       const k = `${input.n}_${group}`;
       const stated = mode === "twin" ? `(${g.type}) & { readonly __carrick_never: true }` : `(${g.type})`;
       decls.push(`  type O${k} = ${stated};`);
-      decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Sent<V, O${k}>) => O${k}): V;`);
+      if (form) {
+        const leaf = form.leaf !== null;
+        if (leaf) decls.push(`  type L${k} = ${form.leaf};`);
+        const sent = leaf ? `__carrick_GqlSentS<Awaited<V>, O${k}, L${k}>` : `__carrick_GqlSent<Awaited<V>, O${k}>`;
+        decls.push(`  function send${k}<V>(v: V, c: (o: ${sent}) => __carrick_GqlExpected<O${k}>): V;`);
+      } else {
+        decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_Sent<V, O${k}>) => O${k}): V;`);
+      }
       ops.push({ at: start, s: `__C.send${k}(`, side: "pre", seq, start, end });
       ops.push({ at: end, s: POST, side: "post", seq, start, end });
       seq += 1;
-      made.push({ n: input.n, group, k, span: [0, 0], declSpan: [0, 0] });
+      made.push({ n: input.n, group, k, span: [0, 0], declSpan: [0, 0], ...(form ? { callback: 0 } : {}) });
     });
+    if (form && placed === 0) unplaced.push({ n: input.n, reason: "top_type" });
   }
   // Wraps at one offset must nest. Opening: the wider value first, later group outside.
   // Closing: the mirror image. A close at an offset comes before an open there.
@@ -210,6 +255,7 @@ export function overlay(file: string, text: string, checks: CheckInput[], wire: 
   out += "\n" + ["declare namespace __C {", ...wire.map((l) => `  ${l}`), ...decls, "}"].join("\n") + "\n";
   made.forEach((c, i) => {
     c.span = [pos.get(`${i}:pre`)!, pos.get(`${i}:post`)! + POST.length];
+    if (c.callback !== undefined) c.callback = pos.get(`${i}:post`)! + POST_BODY;
     const declAt = out.indexOf(`  type O${c.k} = `, bodyEnd);
     c.declSpan = [declAt, out.indexOf("\n", out.indexOf(`function send${c.k}<`, declAt))];
   });
@@ -235,7 +281,7 @@ export function attribute(ov: Overlay, diags: Diag[]): { lines: Map<string, Diag
     const decl = ov.checks.find((c) => inside(d.start, c.declSpan));
     if (decl) { declErrors.add(decl.k); continue; }
     const own = ov.checks
-      .filter((c) => inside(d.start, c.span) && names(d.message, c.k))
+      .filter((c) => (c.callback === undefined ? inside(d.start, c.span) && names(d.message, c.k) : d.start === c.callback))
       .sort((a, b) => a.span[1] - a.span[0] - (b.span[1] - b.span[0]));
     if (own.length === 0) { outside.push(d); continue; }
     const k = own[0]!.k;

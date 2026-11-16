@@ -1,2 +1,2 @@
-fa1f55aba3e512f93563d401ae5a00618f1a1acfdc1e262e9bef427a0266b4cc  edit-facts.s1.ndjson
-# carrick-cloud at 7c017bd6d (#3589), lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 9 (HTTP request contract rows carry wording)
+3012bf2ba88486caeaa95c4fdcc3385ca1cf697ac548af5fd7e2bedb3d92c2e1  edit-facts.s1.ndjson
+# carrick-cloud at 93679b47b (#3621), lambdas/mcp-server/src/facts/__fixtures__/edit-facts.s1.ndjson, writer 12 (GraphQL producer response rows carry graphql_root; one gqltypes row per service)
