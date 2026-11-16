@@ -23,8 +23,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::agents::file_analyzer_agent::{
-    DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, MountResult,
+    DataCallResult, EmissionStyle, EndpointResult, FileAnalysisResult, GraphqlOperation,
+    MountResult, PubsubOperation,
 };
+use crate::dispatch::DispatchTable;
 use crate::git_state::{Hunk, changed_hunks, file_at_commit, map_line};
 use crate::swc_scanner::{CandidateTarget, SwcScanner};
 
@@ -184,11 +186,15 @@ fn other_lists_not_carried(relative: &str, answer: &FileAnalysisResult, carry: &
         ("dispatch_tables", answer.dispatch_tables.len()),
     ] {
         for _ in 0..count {
-            carry
-                .not_carried
-                .push(format!("{relative} {NOT_CARRIED_PREFIX}{field}"));
+            count_not_carried(relative, field, carry);
         }
     }
+}
+
+fn count_not_carried(relative: &str, field: &str, carry: &mut FileCarry) {
+    carry
+        .not_carried
+        .push(format!("{relative} {NOT_CARRIED_PREFIX}{field}"));
 }
 
 /// Carry one file's rows. Pure over its inputs: the old text, the new text and
@@ -261,7 +267,38 @@ pub fn carry_file(
             )),
         }
     }
-    other_lists_not_carried(relative, answer, &mut carry);
+    for row in &answer.graphql_operations {
+        match ctx.graphql_operation(row) {
+            Some(carried) => {
+                carry.carried += 1;
+                carry.answer.graphql_operations.push(carried);
+            }
+            None => count_not_carried(relative, "graphql_operations", &mut carry),
+        }
+    }
+    for row in &answer.pubsub_operations {
+        match ctx.pubsub_operation(row) {
+            Some(carried) => {
+                carry.carried += 1;
+                carry.answer.pubsub_operations.push(carried);
+            }
+            None => count_not_carried(relative, "pubsub_operations", &mut carry),
+        }
+    }
+    for row in &answer.dispatch_tables {
+        match ctx.dispatch_table(row) {
+            Some(carried) => {
+                carry.carried += 1;
+                carry.answer.dispatch_tables.push(carried);
+            }
+            None => count_not_carried(relative, "dispatch_tables", &mut carry),
+        }
+    }
+    // A consumer locate states a field and a type symbol and no line or text
+    // the carry could check against the edited file: it is never carried.
+    for _ in &answer.graphql_consumer_locates {
+        count_not_carried(relative, "graphql_consumer_locates", &mut carry);
+    }
     carry
 }
 
@@ -469,6 +506,70 @@ impl Context<'_> {
             Hint::Changed => return Err(HINT_OUTSIDE_REGISTRATION_CHANGED),
         }
         Ok(carried)
+    }
+
+    /// The line `old_line` moved to, when the edit left it alone and every
+    /// text in `texts` still stands there. `None` when any of it cannot be
+    /// proven.
+    fn anchored_at(&self, old_line: Option<i64>, texts: &[&str]) -> Option<i32> {
+        let line = u32::try_from(old_line?).ok().filter(|line| *line > 0)?;
+        let mapped = map_line(self.hunks, line)?;
+        texts
+            .iter()
+            .all(|text| self.text_stands(mapped, text))
+            .then_some(mapped as i32)
+    }
+
+    /// A resolver is carried when its function line is unchanged and still
+    /// names the function and the return type the row states. A resolver-less
+    /// row (no function, no line) has no anchor and is not carried.
+    fn graphql_operation(&self, row: &GraphqlOperation) -> Option<GraphqlOperation> {
+        let name = row.resolver_function.as_deref()?;
+        let mut texts = vec![name];
+        texts.extend(row.primary_type_symbol.as_deref());
+        let line = self.anchored_at(row.resolver_line.map(i64::from), &texts)?;
+        let mut carried = row.clone();
+        carried.resolver_line = Some(line);
+        Some(carried)
+    }
+
+    /// A pub/sub row is carried when its line is unchanged and still holds the
+    /// topic and the payload type symbol, and its payload hint stands.
+    fn pubsub_operation(&self, row: &PubsubOperation) -> Option<PubsubOperation> {
+        let mut texts = vec![row.topic.as_str()];
+        texts.extend(row.primary_type_symbol.as_deref());
+        let line = self.anchored_at(Some(i64::from(row.line_number)), &texts)?;
+        let mut carried = row.clone();
+        carried.line_number = line;
+        match self.hint(&row.payload_expression_text, row.payload_expression_line) {
+            Hint::Kept(at) => carried.payload_expression_line = at,
+            Hint::Changed => return None,
+        }
+        Some(carried)
+    }
+
+    /// A dispatch table is carried only when the edit provably left the
+    /// switch alone: every hunk ends strictly above the table's line in the
+    /// old file, so everything from the switch line down is byte-identical and
+    /// only shifted, and the line still names the field. Any hunk at or below
+    /// the switch line (an added case label, or an edit after the switch's
+    /// end, which is refused on purpose: the switch's extent is not known)
+    /// means not carried. The handler name sits on the function line, which is
+    /// not checked.
+    fn dispatch_table(&self, row: &DispatchTable) -> Option<DispatchTable> {
+        let old_line = row.line_number?;
+        // A hunk with no old lines is an insertion after `old_start`.
+        if !self
+            .hunks
+            .iter()
+            .all(|h| h.old_start + h.old_count.max(1) - 1 < old_line)
+        {
+            return None;
+        }
+        let line = self.anchored_at(row.line_number.map(i64::from), &[row.field.as_str()])?;
+        let mut carried = row.clone();
+        carried.line_number = Some(line as u32);
+        Some(carried)
     }
 
     fn mount(&self, row: &MountResult) -> Option<MountResult> {
@@ -831,5 +932,182 @@ export async function run() {
         assert_eq!(carry.not_carried, Vec::<String>::new());
         assert_eq!(carry.carried, 1);
         assert_eq!(carry.answer.data_calls[0].line_number, 6);
+    }
+
+    const OTHER: &str = "\
+export function resolveWidget(): WidgetView {
+  return { id: '1' };
+}
+export async function emit(bus: Bus) {
+  bus.publish('widget.made', { id: '1' });
+}
+export async function handle(body: Body) {
+  switch (body.verb) {
+    case 'make':
+      return 1;
+    case 'drop':
+      return 2;
+  }
+}
+";
+
+    fn other_answer() -> FileAnalysisResult {
+        serde_json::from_value(json!({
+            "mounts": [], "endpoints": [], "data_calls": [],
+            "graphql_operations": [{
+                "kind": "query", "field": "widget",
+                "resolver_function": "resolveWidget", "resolver_line": 1,
+                "primary_type_symbol": "WidgetView", "type_import_source": null,
+            }],
+            "pubsub_operations": [{
+                "topic": "widget.made", "role": "publisher", "line_number": 5,
+                "primary_type_symbol": null, "type_import_source": null,
+                "payload_expression_text": "{ id: '1' }", "payload_expression_line": 5,
+            }],
+            "graphql_consumer_locates": [{
+                "kind": "query", "field": "widget",
+                "result_type_symbol": "WidgetView", "result_type_source": null,
+            }],
+            "dispatch_tables": [{
+                "location": "body", "field": "verb", "values": ["make", "drop"],
+                "handler_name": "handle", "file_path": "other.ts", "line_number": 8,
+            }],
+        }))
+        .expect("answer parses")
+    }
+
+    fn two_lines_above() -> Vec<Hunk> {
+        vec![Hunk {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 2,
+        }]
+    }
+
+    fn replaced(old_line: u32) -> Vec<Hunk> {
+        vec![Hunk {
+            old_start: old_line,
+            old_count: 1,
+            new_start: old_line,
+            new_count: 1,
+        }]
+    }
+
+    fn other(new: &str, hunks: &[Hunk]) -> FileCarry {
+        carry_file("other.ts", OTHER, new, hunks, &other_answer())
+    }
+
+    #[test]
+    fn a_resolver_row_moves_with_its_line_and_is_dropped_when_its_name_changes() {
+        let new = format!("// one\n// two\n{OTHER}");
+        let carry = other(&new, &two_lines_above());
+        assert_eq!(carry.answer.graphql_operations[0].resolver_line, Some(3));
+        let edited = OTHER.replace("resolveWidget", "resolveGadget");
+        let carry = other(&edited, &replaced(1));
+        assert!(carry.answer.graphql_operations.is_empty());
+        assert!(
+            carry
+                .not_carried
+                .contains(&"other.ts not_carried_graphql_operations".to_string())
+        );
+        // The return type the row states changed on the same line.
+        let edited = OTHER.replace("WidgetView {", "GadgetView {");
+        let carry = other(&edited, &replaced(1));
+        assert!(carry.answer.graphql_operations.is_empty());
+    }
+
+    #[test]
+    fn a_pubsub_row_moves_with_its_line_and_is_dropped_when_its_topic_changes() {
+        let new = format!("// one\n// two\n{OTHER}");
+        let carry = other(&new, &two_lines_above());
+        let row = &carry.answer.pubsub_operations[0];
+        assert_eq!((row.line_number, row.payload_expression_line), (7, Some(7)));
+        let edited = OTHER.replace("widget.made", "widget.gone");
+        let carry = other(&edited, &replaced(5));
+        assert!(carry.answer.pubsub_operations.is_empty());
+        assert!(
+            carry
+                .not_carried
+                .contains(&"other.ts not_carried_pubsub_operations".to_string())
+        );
+    }
+
+    #[test]
+    fn a_dispatch_table_moves_with_its_line_and_is_dropped_when_its_field_changes() {
+        let new = format!("// one\n// two\n{OTHER}");
+        let carry = other(&new, &two_lines_above());
+        assert_eq!(carry.answer.dispatch_tables[0].line_number, Some(10));
+        let edited = OTHER.replace("body.verb", "body.kind");
+        let carry = other(&edited, &replaced(8));
+        assert!(carry.answer.dispatch_tables.is_empty());
+        assert!(
+            carry
+                .not_carried
+                .contains(&"other.ts not_carried_dispatch_tables".to_string())
+        );
+    }
+
+    fn dispatch_not_carried(carry: &FileCarry) -> bool {
+        carry.answer.dispatch_tables.is_empty()
+            && carry
+                .not_carried
+                .contains(&"other.ts not_carried_dispatch_tables".to_string())
+    }
+
+    #[test]
+    fn a_case_label_added_inside_the_switch_is_not_carried() {
+        let edited = OTHER.replace(
+            "    case 'drop':",
+            "    case 'move':\n      return 3;\n    case 'drop':",
+        );
+        let hunks = vec![Hunk {
+            old_start: 10,
+            old_count: 0,
+            new_start: 11,
+            new_count: 2,
+        }];
+        assert!(dispatch_not_carried(&other(&edited, &hunks)));
+    }
+
+    #[test]
+    fn an_edit_below_the_switch_is_not_carried_by_design() {
+        // Conservative: the switch's end is not known, so any hunk at or below
+        // its line refuses the carry, even one after the closing brace.
+        let edited = format!("{OTHER}// tail\n");
+        let hunks = vec![Hunk {
+            old_start: 14,
+            old_count: 0,
+            new_start: 15,
+            new_count: 1,
+        }];
+        assert!(dispatch_not_carried(&other(&edited, &hunks)));
+    }
+
+    #[test]
+    fn a_consumer_locate_has_no_anchor_and_is_always_counted() {
+        let new = format!("// one\n// two\n{OTHER}");
+        let carry = other(&new, &two_lines_above());
+        assert!(carry.answer.graphql_consumer_locates.is_empty());
+        assert_eq!(
+            carry
+                .not_carried
+                .iter()
+                .filter(|r| r.ends_with("not_carried_graphql_consumer_locates"))
+                .count(),
+            1
+        );
+        assert_eq!((carry.examined, carry.carried), (4, 3));
+        assert_eq!(carry.answer.dispatch_tables.len(), 1);
+    }
+
+    #[test]
+    fn an_unedited_file_carries_the_four_lists_as_before() {
+        let carry = other(OTHER, &[]);
+        let a = &carry.answer;
+        assert_eq!(a.graphql_operations[0].resolver_line, Some(1));
+        assert_eq!(a.pubsub_operations[0].line_number, 5);
+        assert_eq!(a.dispatch_tables[0].line_number, Some(8));
+        assert_eq!(carry.carried, 3);
     }
 }
