@@ -11,6 +11,9 @@ import { heldDir } from "./paths.ts";
 import type { SiteFinder, ValueReason } from "./place.ts";
 import type { ServiceInit } from "./daemon.ts";
 
+/** The three compiler options that change whether one type is assignable to another (the engine's `FitOptions`). */
+export type FitOptions = { strictNullChecks: boolean; strictFunctionTypes: boolean; exactOptionalPropertyTypes: boolean };
+
 /** What the daemon reads of `write_shadow`'s answer. */
 export type ShadowAnswer = {
   /** Absolute path of the generated `w/tsconfig.json`. */
@@ -23,6 +26,8 @@ export type ShadowAnswer = {
   wire: string[];
   /** The judge's other tolerances: the helper types a check composes (S1). The literal-widened one is an export suffix of a stub, and a laptop has no stub. */
   tolerances: { unwidened_alias_suffix: string; declarations: string[] };
+  /** The options that decide whether one type fits another: as the shadow program was written, and as the judge checks. */
+  options: { service: FitOptions; judge: FitOptions };
 };
 
 const SHADOW_TIMEOUT_MS = 10 * 60_000;

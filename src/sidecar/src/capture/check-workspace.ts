@@ -363,3 +363,30 @@ export const CHECKER_TSCONFIG =
     null,
     2
   ) + '\n';
+
+/**
+ * The options that decide whether one type fits another: the three whose value
+ * changes the answer of an assignability check. The others change the type an
+ * expression HAS, and a sent type is read under the service's own options on
+ * both the early and the scan path.
+ */
+export interface FitOptions {
+  strictNullChecks: boolean;
+  strictFunctionTypes: boolean;
+  exactOptionalPropertyTypes: boolean;
+}
+
+/** The effective fit options of a compiler-options object: `strict` implies the first two when they are unset. */
+export function fitOptionsOf(options: { strict?: boolean; strictNullChecks?: boolean; strictFunctionTypes?: boolean; exactOptionalPropertyTypes?: boolean; [k: string]: unknown }): FitOptions {
+  const strict = options.strict ?? false;
+  return {
+    strictNullChecks: options.strictNullChecks ?? strict,
+    strictFunctionTypes: options.strictFunctionTypes ?? strict,
+    exactOptionalPropertyTypes: options.exactOptionalPropertyTypes ?? false,
+  };
+}
+
+/** The judge's fit options, read from the one tsconfig it checks under (`CHECKER_TSCONFIG`). */
+export function judgeFitOptions(): FitOptions {
+  return fitOptionsOf(JSON.parse(CHECKER_TSCONFIG).compilerOptions);
+}
