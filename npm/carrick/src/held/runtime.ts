@@ -22,7 +22,7 @@ import ts from "typescript";
 import { diffAgainst, textAtCommit } from "../facts/diff.ts";
 import { contractKey } from "../facts/lines.ts";
 import { commitsOf, indexedCommit } from "../facts/peers.ts";
-import { factsPath, openFacts, type ContractRow } from "../facts/store.ts";
+import { factsPath, openFacts, type ContractRow, type GraphqlTypeTable } from "../facts/store.ts";
 import { createLogger } from "../log.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit, ServiceRuntime, StartResult } from "./daemon.ts";
 import { Ts7Lsp, type Diag as LspDiag, type Engine } from "./engine.ts";
@@ -31,18 +31,20 @@ import {
   arm,
   attribute,
   checkWire,
+  isTopOrBytes,
   overlay,
   regionOfEdit,
   regionsFromHunks,
   resolveValue,
   type CheckInput,
   type Diag,
+  type GraphqlForm,
   type Overlay,
   type Region,
   type SiteFinder,
   type Value,
 } from "./place.ts";
-import { engineEntry, engineSiteFinder, writeShadow, type FitOptions } from "./shadow.ts";
+import { engineEntry, engineSiteFinder, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -56,8 +58,10 @@ export type RuntimeDeps = {
   env?: NodeJS.ProcessEnv;
   /** The built compiler engine's entry; found from the environment when unset. */
   entry?: string | null;
-  /** The producer response rows now. Default: the fact file's. */
+  /** The producer response rows now, HTTP and GraphQL. Default: the fact file's. */
   rows?: () => Promise<ContractRow[]>;
+  /** A service's GraphQL SDL table now, or null. Default: the fact file's `gqltypes` row. */
+  graphqlTypes?: (repo: string, service: string) => Promise<GraphqlTypeTable | null>;
   /** Each repo's index commit, as the fact file's header names it. Default: the fact file's. */
   commits?: () => Promise<Record<string, string> | null>;
   /** Changes when the rows may have: the fact file's size and mtime by default. */
@@ -68,7 +72,28 @@ export type RuntimeDeps = {
   site?: SiteFinder;
 };
 
-type Unarmed = { label: string; file: string; reason: string; group: number; position: number | null };
+type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null };
+type Armed = { label: string; protocol: string; file: string; group: number; position: number };
+
+/** A GraphQL row's checks stay unarmed: the service's table is absent, or the compiler engine refused it. */
+const GRAPHQL_TABLE_UNUSABLE = "graphql_table_unusable";
+/** A GraphQL row's checks stay unarmed until the next start: the table or the roots the engine answered for changed (P15). */
+const GRAPHQL_TABLE_CHANGED = "graphql_table_changed";
+
+const isGraphql = (row: ContractRow): boolean => row.protocol === "graphql";
+
+/** The roots a service's GraphQL rows answer, each once, in a stable order. */
+function rootsOf(rows: ContractRow[]): ShadowGraphql["roots"] {
+  const roots = new Map<string, ShadowGraphql["roots"][number]>();
+  for (const row of rows) if (isGraphql(row) && row.graphql_root) roots.set(`${row.graphql_root.type}.${row.graphql_root.field}`, row.graphql_root);
+  return [...roots].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, root]) => ({ type: root.type, field: root.field }));
+}
+
+/** What the engine's GraphQL answer was given: a changed one means the answer no longer holds. */
+const graphqlInput = (rows: ContractRow[], table: GraphqlTypeTable | null): string => JSON.stringify([table, rootsOf(rows)]);
+
+/** The service's GraphQL checks: the declarations a file with one appends, each scalar-form root's leaf, and why none arms. */
+type GraphqlChecks = { wire: string[]; leaves: Map<string, string>; reason: string | null; input: string };
 
 const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}`;
 const groupKey = (row: ContractRow, group: number): string => `${identity(row)}\0${row.groups[group]!.type}`;
@@ -107,7 +132,7 @@ function readText(file: string): string | null {
   }
 }
 
-function writePlaced(file: string, service: string, armed: Array<{ label: string; file: string; group: number; position: number }>, unarmed: Unarmed[]): void {
+function writePlaced(file: string, service: string, armed: Armed[], unarmed: Unarmed[]): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), service, armed, unarmed }, null, 2));
@@ -161,24 +186,27 @@ class HeldService implements ServiceEngine {
   private afterTimer = new StepTimer();
 
   private readonly init: ServiceInit;
-  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
+  private readonly deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv };
   private readonly engine: Engine;
   private readonly w: string;
   private readonly wire: string[];
+  private readonly gql: GraphqlChecks;
 
   constructor(
     init: ServiceInit,
-    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
+    deps: Required<Pick<RuntimeDeps, "rows" | "stamp" | "commits" | "site" | "graphqlTypes">> & { root: string; home?: string; env: NodeJS.ProcessEnv },
     engine: Engine,
     w: string,
     ownFiles: string[],
     wire: string[],
+    gql: GraphqlChecks,
   ) {
     this.init = init;
     this.deps = deps;
     this.engine = engine;
     this.w = w;
     this.wire = wire;
+    this.gql = gql;
     this.ownFiles = new Set(ownFiles);
     this.program = new Set(ownFiles);
     for (const rel of this.ownFiles) this.sigs.set(rel, this.sigOf(rel));
@@ -258,7 +286,7 @@ class HeldService implements ServiceEngine {
       const key = checkKey(p.row, g, p.at);
       if (onlyNew && decided(key)) return;
       this.armed.delete(key);
-      this.unarmed.set(key, { label: p.row.label, file: rel, reason, group: g, position: p.at });
+      this.unarmed.set(key, { label: p.row.label, protocol: p.row.protocol, file: rel, reason, group: g, position: p.at });
     };
     const noneFor = (reason: string): void => {
       for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
@@ -279,6 +307,10 @@ class HeldService implements ServiceEngine {
     if (typeof base === "string") return noneFor(base);
     const entries: Entry[] = [];
     for (const p of positions) {
+      if (isGraphql(p.row) && this.gql.reason !== null) {
+        p.row.groups.forEach((_, g) => no(p, g, this.gql.reason!));
+        continue;
+      }
       const span = p.row.values![p.at]!.span;
       let placed: Value | string;
       try {
@@ -292,11 +324,14 @@ class HeldService implements ServiceEngine {
         continue;
       }
       this.values.set(p.id, placed);
-      entries.push({ pos: p, value: placed, groups: p.row.groups.map((_, g) => g) });
+      // A GraphQL check never arms on a stated top type or bytes (L-G1a): the engine's form composes none of the judge's gates for them.
+      const groups = p.row.groups.map((_, g) => g).filter((g) => !(isGraphql(p.row) && isTopOrBytes(p.row.groups[g]!.type)));
+      p.row.groups.forEach((_, g) => { if (!groups.includes(g)) no(p, g, "top_type"); });
+      if (groups.length > 0) entries.push({ pos: p, value: placed, groups });
     }
     const shadow = this.shadow(rel);
     const inputs = this.inputsOf(entries);
-    const clean = overlay(shadow, text, inputs, this.wire, "clean");
+    const clean = this.overlayOf(rel, text, inputs, "clean");
     for (const u of clean.unplaced) {
       const e = entries[u.n]!;
       e.groups.forEach((g) => no(e.pos, g, u.reason));
@@ -305,7 +340,7 @@ class HeldService implements ServiceEngine {
       try {
         this.engine.set(shadow, clean.text);
         const cleanDiags = offsetDiags(clean.text, (await this.engine.pull([shadow])).get(shadow));
-        const twin = overlay(shadow, text, inputs, this.wire, "twin");
+        const twin = this.overlayOf(rel, text, inputs, "twin");
         this.engine.set(shadow, twin.text);
         const twinDiags = offsetDiags(twin.text, (await this.engine.pull([shadow])).get(shadow));
         const verdict = arm(clean, cleanDiags, twinDiags);
@@ -330,7 +365,22 @@ class HeldService implements ServiceEngine {
 
   /** The checks' inputs: one per entry, numbered by its place in `entries`. */
   private inputsOf(entries: Entry[]): CheckInput[] {
-    return entries.map((e, n) => ({ n, value: e.value, groups: e.groups.map((g) => ({ type: e.pos.row.groups[g]!.type })) }));
+    return entries.map((e, n) => {
+      const form = this.formOf(e.pos.row);
+      return { n, value: e.value, groups: e.groups.map((g) => ({ type: e.pos.row.groups[g]!.type })), ...(form ? { form } : {}) };
+    });
+  }
+
+  /** A GraphQL row's form: the scalar form where the engine gave its root a leaf, else the JSON form (P5). */
+  private formOf(row: ContractRow): GraphqlForm | undefined {
+    if (!isGraphql(row)) return undefined;
+    const root = row.graphql_root;
+    return { kind: "graphql", leaf: (root && this.gql.leaves.get(`${root.type}.${root.field}`)) ?? null };
+  }
+
+  /** `overlay` with the wire its checks read: a file with a GraphQL check also appends the engine's GraphQL rules; any other keeps its text. */
+  private overlayOf(rel: string, text: string, inputs: CheckInput[], mode: "clean" | "twin"): Overlay {
+    return overlay(this.shadow(rel), text, inputs, inputs.some((i) => i.form) ? this.gql.wire : this.wire, mode);
   }
 
   /** The armed groups of each position of `rel`, placed where they are now. */
@@ -355,23 +405,23 @@ class HeldService implements ServiceEngine {
       return;
     }
     const inputs = this.inputsOf(entries);
-    const ov = overlay(this.shadow(rel), text, inputs, this.wire, "clean");
+    const ov = this.overlayOf(rel, text, inputs, "clean");
     this.engine.set(this.shadow(rel), ov.text);
     this.views.set(rel, { ov, inputs, entries, text });
   }
 
   private writePlaced(): void {
-    const armed: Array<{ label: string; file: string; group: number; position: number }> = [];
+    const armed: Armed[] = [];
     const unarmed: Unarmed[] = [];
     for (const row of this.rows) {
       if (!hasValues(row)) {
-        row.groups.forEach((_, g) => unarmed.push({ label: row.label, file: row.file, reason: "no_values", group: g, position: null }));
+        row.groups.forEach((_, g) => unarmed.push({ label: row.label, protocol: row.protocol, file: row.file, reason: "no_values", group: g, position: null }));
         continue;
       }
       row.values!.forEach((v, at) => {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
-          if (this.armed.has(key)) armed.push({ label: row.label, file: v.file, group: g, position: at });
+          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at });
           else if (this.unarmed.has(key)) unarmed.push(this.unarmed.get(key)!);
         });
       });
@@ -454,6 +504,27 @@ class HeldService implements ServiceEngine {
     this.stampSeen = stamp;
     this.loadRows(await this.deps.rows());
     this.needsGate = true;
+    if (this.gql.reason === null && this.rows.some(isGraphql)) {
+      const now = graphqlInput(this.rows, await this.deps.graphqlTypes(this.init.repo, this.init.service));
+      if (now !== this.gql.input) this.unarmGraphql(GRAPHQL_TABLE_CHANGED);
+    }
+  }
+
+  /** P15: the engine's GraphQL answer no longer holds; every GraphQL check is unarmed until the next start. */
+  private unarmGraphql(reason: string): void {
+    this.gql.reason = reason;
+    const files = new Set<string>();
+    for (const row of this.rows.filter(isGraphql)) {
+      (row.values ?? []).forEach((v, at) => {
+        files.add(v.file);
+        row.groups.forEach((_, g) => {
+          const key = checkKey(row, g, at);
+          this.armed.delete(key);
+          this.unarmed.set(key, { label: row.label, protocol: row.protocol, file: v.file, reason, group: g, position: at });
+        });
+      });
+    }
+    for (const rel of files) this.setView(rel);
   }
 
   async answer(files: string[], request: HeldRequest): Promise<{ lines: HeldLine[]; steps: Steps; after: () => Promise<Steps> }> {
@@ -533,7 +604,7 @@ class HeldService implements ServiceEngine {
   private async twinPass(): Promise<void> {
     const twins = [...this.views].map(([rel, view]) => {
       const shadow = this.shadow(rel);
-      return { rel, view, shadow, twin: overlay(shadow, view.text, view.inputs, this.wire, "twin") };
+      return { rel, view, shadow, twin: this.overlayOf(rel, view.text, view.inputs, "twin") };
     });
     if (twins.length === 0) return;
     try {
@@ -603,11 +674,25 @@ async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
   try {
-    return store.producerResponses();
+    return [...store.producerResponses(), ...store.graphqlProducerResponses()];
   } finally {
     store.close();
   }
 }
+
+async function factTable(root: string, repo: string, service: string): Promise<GraphqlTypeTable | null> {
+  const store = await openFacts(root);
+  if (store === null) return null;
+  try {
+    return store.graphqlTypes(repo, service);
+  } finally {
+    store.close();
+  }
+}
+
+/** Every row of `rows` unarmed, each for the reason `why` gives it. */
+const allUnarmed = (rows: ContractRow[], why: (row: ContractRow) => string): Unarmed[] =>
+  rows.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, protocol: row.protocol, file: row.file, reason: why(row), group: g, position: null })));
 
 export function createRuntime(options: RuntimeDeps): ServiceRuntime {
   const env = options.env ?? process.env;
@@ -617,6 +702,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
     rows: options.rows ?? (() => factRows(options.root)),
     stamp: options.stamp ?? (() => factStamp(options.root)),
     commits: options.commits ?? (() => factCommits(options.root)),
+    graphqlTypes: options.graphqlTypes ?? ((repo: string, service: string) => factTable(options.root, repo, service)),
     env,
   };
   return {
@@ -625,31 +711,45 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       if (entry === null) return { state: "error", reason: "the compiler engine is not built" };
       const out = shadowDir(options.root, init.service, options.home);
       fs.rmSync(out, { recursive: true, force: true });
-      const shadow = await writeShadow(entry, init, out, env, options.home);
-      if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service && row.direction === "response");
+      // GraphQL rows (P5, P15): the engine is told the service's table and roots once, here. With no table, or one the
+      // engine refuses, they stay unarmed with one reason, and the shadow is written as for HTTP alone.
+      const table = mine.some(isGraphql) ? await deps.graphqlTypes(init.repo, init.service) : null;
+      const ask: ShadowGraphql | undefined = table === null ? undefined : { types: table, roots: rootsOf(mine) };
+      let graphqlReason = mine.some(isGraphql) && table === null ? GRAPHQL_TABLE_UNUSABLE : null;
+      let shadow: ShadowAnswer;
+      try {
+        shadow = await writeShadow(entry, init, out, env, options.home, ask);
+      } catch (error) {
+        if (ask === undefined) throw error;
+        log(`the compiler engine refused ${init.service}'s GraphQL table; its GraphQL rows stay unarmed`, String(error));
+        fs.rmSync(out, { recursive: true, force: true });
+        shadow = await writeShadow(entry, init, out, env, options.home);
+        graphqlReason = GRAPHQL_TABLE_UNUSABLE;
+      }
+      if (ask !== undefined && shadow.graphql === undefined) graphqlReason = GRAPHQL_TABLE_UNUSABLE;
+      if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
-        writePlaced(
-          placedPath(options.root, init.service, options.home),
-          init.service,
-          [],
-          mine.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, file: row.file, reason: "options_differ", group: g, position: null }))),
-        );
+        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
         return { engine: new IdleService() };
       }
-      if (!mine.some((row) => (row.values?.length ?? 0) > 0)) {
-        writePlaced(
-          placedPath(options.root, init.service, options.home),
-          init.service,
-          [],
-          mine.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, file: row.file, reason: "no_values", group: g, position: null }))),
-        );
+      const armable = (row: ContractRow): boolean => hasValues(row) && !(isGraphql(row) && graphqlReason !== null);
+      if (!mine.some(armable)) {
+        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, (row) => (hasValues(row) ? graphqlReason! : "no_values")));
         return { engine: new IdleService() };
       }
       const w = path.dirname(shadow.tsconfig);
       const engine = (options.makeEngine ?? ((command, cwd) => new Ts7Lsp(command, cwd)))(shadow.native_tsc, w);
       const site = options.site ?? engineSiteFinder(entry, env, options.home);
-      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, checkWire(shadow.wire, shadow.tolerances.declarations));
+      const wire = checkWire(shadow.wire, shadow.tolerances.declarations);
+      const answered = graphqlReason === null ? shadow.graphql : undefined;
+      const gql: GraphqlChecks = {
+        wire: answered ? [...wire, ...answered.lines, ...(answered.types_decl === null ? [] : [answered.types_decl])] : wire,
+        leaves: new Map(Object.entries(answered?.leaves ?? {}).map(([root, leaf]) => [root, JSON.stringify(leaf)])),
+        reason: graphqlReason,
+        input: graphqlInput(mine, table),
+      };
+      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql);
       try {
         service.loadRows(mine);
         await service.gate(false);

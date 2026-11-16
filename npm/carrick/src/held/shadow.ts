@@ -10,6 +10,7 @@ import { askEngine } from "../engine-ask.ts";
 import { heldDir } from "./paths.ts";
 import type { SiteFinder, ValueReason } from "./place.ts";
 import type { ServiceInit } from "./daemon.ts";
+import type { GraphqlRootRef, GraphqlTypeTable } from "../facts/store.ts";
 
 /** The three compiler options that change whether one type is assignable to another (the engine's `FitOptions`). */
 export type FitOptions = { strictNullChecks: boolean; strictFunctionTypes: boolean; exactOptionalPropertyTypes: boolean };
@@ -28,7 +29,17 @@ export type ShadowAnswer = {
   tolerances: { unwidened_alias_suffix: string; declarations: string[] };
   /** The options that decide whether one type fits another: as the shadow program was written, and as the judge checks. */
   options: { service: FitOptions; judge: FitOptions };
+  /**
+   * Present when the request carried the service's GraphQL table: the judge's
+   * GraphQL rules (`lines`), the one table declaration they read (`types_decl`),
+   * and the leaf of each root the judge reads in its scalar form, by
+   * `Type.field`. A root with no leaf is the judge's JSON form (S-G1).
+   */
+  graphql?: { lines: string[]; types_decl: string | null; leaves: Record<string, unknown> };
 };
+
+/** What `write_shadow` is told of the service's GraphQL: its SDL table and the roots its rows answer. */
+export type ShadowGraphql = { types: GraphqlTypeTable; roots: GraphqlRootRef[] };
 
 const SHADOW_TIMEOUT_MS = 10 * 60_000;
 const SITE_TIMEOUT_MS = 30_000;
@@ -50,7 +61,7 @@ export function engineEntry(env: NodeJS.ProcessEnv = process.env): string | null
  * outside every checkout, because the loader resolves `types` references from
  * its working directory.
  */
-export async function writeShadow(entry: string, init: ServiceInit, out: string, env: NodeJS.ProcessEnv, home?: string): Promise<ShadowAnswer> {
+export async function writeShadow(entry: string, init: ServiceInit, out: string, env: NodeJS.ProcessEnv, home?: string, graphql?: ShadowGraphql): Promise<ShadowAnswer> {
   const cwd = heldDir(home);
   fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
   const frames = await askEngine(
@@ -63,7 +74,7 @@ export async function writeShadow(entry: string, init: ServiceInit, out: string,
         scan_root: init.scan_root,
         ...(init.tsconfig === null ? {} : { tsconfig_path: init.tsconfig }),
       },
-      { action: "write_shadow", request_id: "shadow", out_dir: out },
+      { action: "write_shadow", request_id: "shadow", out_dir: out, ...(graphql === undefined ? {} : { graphql }) },
     ],
     { cwd, env, timeoutMs: SHADOW_TIMEOUT_MS },
   );
