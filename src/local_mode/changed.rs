@@ -123,9 +123,12 @@ pub struct ChangedRepo {
     /// [`EXIT_NOTHING_COVERED`] when no repo covered a file.
     #[serde(skip)]
     pub no_base: bool,
-    /// Whether this repo's changed files were re-read (`ran`), or read the
+    /// Whether this repo's changed files were re-read (`ran`), read the
     /// same as the index's copy and were answered from it (`not_needed`,
-    /// carrick#3245). Absent for a repo with no changed file to judge.
+    /// carrick#3245), or were all read by an earlier check of the same edits
+    /// and joined from the copies it kept (`current`,
+    /// [`super::recheck::rejoin`]). Absent for a repo with no changed file to
+    /// judge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rescan: Option<Rescan>,
 }
@@ -136,6 +139,7 @@ pub struct ChangedRepo {
 pub enum Rescan {
     Ran,
     NotNeeded,
+    Current,
 }
 
 /// Set to `always` to re-scan every changed repo even when nothing the scan
@@ -483,7 +487,10 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     let mut unmoved: BTreeMap<String, BTreeMap<String, LineMap>> = BTreeMap::new();
     let mut rescan: Vec<Tree> = Vec::new();
     let mut rescanned: BTreeSet<&String> = BTreeSet::new();
+    // Per repo, the services the walk below named, where it ran.
+    let mut walked: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, (tree, _)) in &changed {
+        let mut readers = None;
         let lines = if always {
             None
         } else {
@@ -491,8 +498,11 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
                 .repos
                 .iter()
                 .find(|indexed| &indexed.name == name)
-                .and_then(|indexed| reads_the_same(&root, tree, indexed))
+                .and_then(|indexed| reads_the_same(&root, tree, indexed, &mut readers))
         };
+        if let Some(readers) = readers {
+            walked.insert(name.clone(), readers);
+        }
         match lines {
             Some(lines) => {
                 narrator.phase(
@@ -525,9 +535,15 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // time), and `judge` prints it, so the join runs, and the answer stays
     // the re-scan's.
     let began = Instant::now();
+    //
+    // A repo whose every edit an earlier check already read is joined from
+    // the copies that check kept, and re-scanned when the join cannot stand
+    // for the re-scan (`super::recheck::rejoin`). `CARRICK_CHECK_RESCAN=always`
+    // re-scans it too.
     let rejoined = super::recheck::rejoin(
         &workspace,
-        &rescan,
+        &index,
+        (&rescan, (!always).then_some(&walked)),
         &generation,
         started + budget(),
         Some(&narrator),
@@ -538,7 +554,15 @@ fn answer(root: Option<&Path>, started: Instant, selection: Selection) -> Change
     // re-check's does.
     let _ = std::fs::remove_dir_all(&generation);
     let rejoined = match rejoined {
-        Ok(rejoined) => rejoined,
+        Ok((rejoined, current)) => {
+            for entry in &mut output.repos {
+                let name = super::index::repo_label(Path::new(&entry.repo));
+                if current.contains(&name) {
+                    entry.rescan = Some(Rescan::Current);
+                }
+            }
+            rejoined
+        }
         Err(reason) => {
             output.not_checked = Some(format!("the check did not finish: {reason}"));
             return output;
@@ -907,10 +931,15 @@ pub(super) fn answers_lost<'a>(
 /// takes the re-scan (carrick#3245), unless no service reads the file
 /// ([`super::recheck::services_reading`]: a test file that loads what it
 /// loaded).
+///
+/// When that walk runs, `readers` is set to the services it names: the ones
+/// that read a changed file the scan reads differently. A check that decides
+/// which services are current reads it instead of walking again.
 fn reads_the_same(
     workspace_root: &Path,
     tree: &Tree,
     indexed: &IndexedRepo,
+    readers: &mut Option<Vec<String>>,
 ) -> Option<BTreeMap<String, LineMap>> {
     let repo = tree.checkout.as_path();
     // A repo the hosted index stood in for (`read_from_hosted`) is covered
@@ -934,11 +963,11 @@ fn reads_the_same(
     }
     // A change the scan reads differently is still no change when no service
     // reads the file (the carry rule `--changed-only` uses, one walk for all).
-    if !unmapped.is_empty()
-        && !super::recheck::services_reading(workspace_root, tree, indexed, &unmapped)
-            .is_some_and(|readers| readers.is_empty())
-    {
-        return None;
+    if !unmapped.is_empty() {
+        *readers = super::recheck::services_reading(workspace_root, tree, indexed, &unmapped);
+        if !readers.as_ref().is_some_and(Vec::is_empty) {
+            return None;
+        }
     }
     Some(lines)
 }

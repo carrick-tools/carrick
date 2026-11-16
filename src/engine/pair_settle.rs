@@ -132,6 +132,10 @@ pub(crate) struct SettleFrom {
     join: HashMap<String, Result<HashMap<String, StoredPairOutcome>, JoinMiss>>,
     /// The join also judges each settled pair and counts the differences.
     verify: bool,
+    /// How many times [`Self::join_settled`] refused a pair, shared with the
+    /// join's caller ([`Self::join_misses`]): a local check that joins from
+    /// kept copies without re-scanning keeps that answer only when none was.
+    misses: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Why the join judged a pair instead of taking its stored outcome.
@@ -260,6 +264,7 @@ impl SettleFrom {
             side: SettleSide::PullRequest,
             join: HashMap::new(),
             verify: false,
+            misses: Default::default(),
         }
     }
 
@@ -294,11 +299,27 @@ impl SettleFrom {
             side: SettleSide::Join,
             join,
             verify,
+            misses: Default::default(),
         }
+    }
+
+    /// The count of pairs [`Self::join_settled`] refused, read after the
+    /// check that asked it has run.
+    pub(crate) fn join_misses(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.misses)
     }
 
     /// The join's stored outcome for `pair`, or why it is judged instead.
     pub(crate) fn join_settled(&self, pair: &BuiltPair) -> Result<&StoredPairOutcome, JoinMiss> {
+        let settled = self.join_settled_or_why(pair);
+        if settled.is_err() {
+            self.misses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        settled
+    }
+
+    fn join_settled_or_why(&self, pair: &BuiltPair) -> Result<&StoredPairOutcome, JoinMiss> {
         if !self.join.contains_key(&pair.producer_service) {
             return Err(JoinMiss::NoProducer);
         }

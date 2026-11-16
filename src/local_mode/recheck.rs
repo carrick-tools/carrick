@@ -880,12 +880,14 @@ pub(super) fn adopt_index_state(workspace: &Workspace, built: &Path, generation:
 struct Plan {
     generation: String,
     services: Vec<String>,
-    /// Digest of each re-read service's edits since the index; absent where
-    /// the service has none.
-    digests: std::collections::BTreeMap<String, String>,
+    /// Each service's own edits since the index and who reads an edit.
+    copies: Copies,
     /// The copy a service's last re-check left, for each service outside the
     /// scope whose edits since then are exactly the ones it was read for.
     working: std::collections::BTreeMap<String, crate::cloud_storage::CloudRepoData>,
+    /// The blobs that stand in for the re-scan when every re-read service is
+    /// current ([`Copies::current`]).
+    current: Option<Vec<crate::cloud_storage::CloudRepoData>>,
     files: std::collections::BTreeMap<String, usize>,
     scope: RecheckScope,
 }
@@ -895,7 +897,336 @@ struct Plan {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkingCopy {
     digest: String,
+    /// Whether the service read no path edited outside its own directories
+    /// when it was read ([`readers_of_the_edit`]). The digest covers only its
+    /// own files, so a copy read beside an outside edit that was undone since
+    /// would match the digest and still hold the other content: only a whole
+    /// copy may stand in for a re-scan ([`current_copy`]).
+    whole: bool,
+    /// The hosted snapshot the copy was read with
+    /// ([`super::hosted::HostedInput::source_key`]); `None` signed out. A copy
+    /// stands in only under the same snapshot, and never signed out: the
+    /// join would read other hosted services than the copy was judged
+    /// against, or none.
+    hosted: Option<String>,
     blob: crate::cloud_storage::CloudRepoData,
+    /// The carried services the same scan wrote because its join moved
+    /// their pair outcomes (`index::carried_services`): the join reads them
+    /// in place of their indexed blobs when this copy stands in.
+    carried: Vec<crate::cloud_storage::CloudRepoData>,
+}
+
+/// What one check knows of one repo's services before it re-scans: the
+/// digest of each service's own edits since the index and which services
+/// read a path edited outside their own directories. Both checks decide from
+/// it which services are current ([`Copies::current`]); the per-edit
+/// re-check keeps what its scan read ([`Copies::keep`]). `check --changed`
+/// keeps nothing: its copies were never whole, so their one use was as a
+/// re-check's stand-in, labelled after a scan an edit could have run beside.
+#[derive(Default)]
+struct Copies {
+    repo: std::path::PathBuf,
+    services: Vec<IndexedService>,
+    generation: String,
+    /// The services of the repo with edits of their own since the index.
+    digests: std::collections::BTreeMap<String, String>,
+    /// The services that read a path edited outside their own directories,
+    /// or whose reads are unknown here.
+    readers: std::collections::BTreeSet<String>,
+    /// Whether `readers` was walked. Unwalked, no service is current and no
+    /// copy kept is whole: a cold `--changed` walks nothing of its own.
+    walked: bool,
+    /// The services git could not say what changed in.
+    unlisted: std::collections::BTreeSet<String>,
+    /// The hosted snapshot this check reads
+    /// ([`super::hosted::HostedInput::source_key`]); `None` signed out.
+    hosted: Option<String>,
+}
+
+impl Copies {
+    /// Whether any of `services` has a copy kept for this index and build.
+    fn any_kept(workspace: &Workspace, generation: &str, services: &[IndexedService]) -> bool {
+        kept_dir(workspace, "working", generation).is_some_and(|dir| {
+            services
+                .iter()
+                .any(|service| dir.join(working_name(&service.name)).is_file())
+        })
+    }
+
+    /// Digests of every service of `services` in `repo`; `readers`, when
+    /// walked, names the ones that read a path edited outside their own
+    /// directories ([`readers_of_the_edit`]).
+    fn of(
+        repo: &Path,
+        services: &[IndexedService],
+        generation: &str,
+        readers: Option<std::collections::BTreeSet<String>>,
+        hosted: Option<String>,
+    ) -> Self {
+        let (digests, unlisted) = digests_of(repo, services, |_| true);
+        Self {
+            repo: repo.to_path_buf(),
+            services: services.to_vec(),
+            generation: generation.to_string(),
+            digests,
+            walked: readers.is_some(),
+            readers: readers.unwrap_or_default(),
+            unlisted,
+            hosted,
+        }
+    }
+
+    /// Whether a walk of who reads the edits could make this repo current:
+    /// git listed every service, and every service with edits of its own has
+    /// a copy [`current_copy`] takes, short of the walk. Otherwise the repo
+    /// is re-scanned whatever the walk would say, so `--changed` does not
+    /// walk.
+    fn worth_walking(&self, workspace: &Workspace) -> bool {
+        self.unlisted.is_empty()
+            && !self.digests.is_empty()
+            && self.digests.iter().all(|(service, digest)| {
+                current_copy(
+                    workspace,
+                    &self.generation,
+                    service,
+                    Some(digest),
+                    false,
+                    self.hosted.as_deref(),
+                )
+                .is_some()
+            })
+    }
+
+    /// `None`: git cannot say what changed in `service`. `Some(None)`:
+    /// nothing did.
+    fn digest(&self, service: &str) -> Option<Option<&String>> {
+        (!self.unlisted.contains(service)).then(|| self.digests.get(service))
+    }
+
+    /// The services a `--changed` scan of the repo would read for its edits:
+    /// each with edits of its own and each reading an edited path outside
+    /// its own directories. Every one must be current for the repo to be
+    /// joined without a re-scan.
+    fn reached(&self) -> Vec<String> {
+        self.digests
+            .keys()
+            .chain(&self.readers)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// The blobs the join reads in place of a re-scan of `reached`, when
+    /// every one of them is current ([`current_copy`]): each service's copy
+    /// and the carried services its scan wrote. A carried copy never
+    /// replaces a service with edits of its own, and one service carried
+    /// differently by two copies is not known: then nothing is current, as
+    /// it is whenever git could not say what changed or `reached` is empty.
+    fn current(
+        &self,
+        workspace: &Workspace,
+        reached: &[String],
+    ) -> Option<Vec<crate::cloud_storage::CloudRepoData>> {
+        if !self.walked || !self.unlisted.is_empty() || reached.is_empty() {
+            return None;
+        }
+        let mut own = Vec::new();
+        let mut carried: std::collections::BTreeMap<String, crate::cloud_storage::CloudRepoData> =
+            Default::default();
+        for service in reached {
+            let copy = current_copy(
+                workspace,
+                &self.generation,
+                service,
+                self.digests.get(service),
+                self.readers.contains(service),
+                self.hosted.as_deref(),
+            )?;
+            own.push(copy.blob);
+            for blob in copy.carried {
+                let id = service_id(&blob);
+                if self.digests.contains_key(&id) {
+                    continue;
+                }
+                match carried.get(&id) {
+                    Some(seen)
+                        if serde_json::to_vec(seen).ok() != serde_json::to_vec(&blob).ok() =>
+                    {
+                        return None;
+                    }
+                    Some(_) => {}
+                    None => {
+                        carried.insert(id, blob);
+                    }
+                }
+            }
+        }
+        own.extend(carried.into_values());
+        Some(own)
+    }
+
+    /// Keep what one re-check's scan of this repo wrote: each service it
+    /// analysed with edits of its own, with its digest, whether it was
+    /// whole, the hosted snapshot it was read with, and every carried
+    /// service the scan wrote. `analysed` is the list the scan was told to
+    /// analyse; a service on it is never a carried one.
+    ///
+    /// A copy is kept only when the service's own edits are what they were
+    /// before the scan: an edit made while it ran, then undone, would leave a
+    /// copy labelled with the undone digest and holding the edit; then the
+    /// service's copy goes. A written service with edits of its own that the
+    /// scan did not analyse (a consumer whose pair outcomes it moved) keeps
+    /// its copy marked not whole: it is older than what this scan wrote for
+    /// it, so it never stands in for a re-scan ([`current_copy`]), and the
+    /// next re-check still judges against it as its last re-check left it.
+    fn keep(
+        &self,
+        workspace: &Workspace,
+        fresh: &[crate::cloud_storage::CloudRepoData],
+        analysed: &[String],
+    ) {
+        let carried: Vec<crate::cloud_storage::CloudRepoData> = fresh
+            .iter()
+            .filter(|blob| {
+                let id = service_id(blob);
+                !self.digests.contains_key(&id)
+                    && !self.readers.contains(&id)
+                    && !analysed.contains(&id)
+            })
+            .cloned()
+            .collect();
+        let began = Instant::now();
+        let (after, _) = digests_of(&self.repo, &self.services, |service| {
+            self.digests.contains_key(service) && analysed.iter().any(|name| name == service)
+        });
+        took("after-scan/own-edit-digests", began);
+        for blob in fresh {
+            let id = service_id(blob);
+            let Some(digest) = self.digests.get(&id) else {
+                continue;
+            };
+            if !analysed.contains(&id) {
+                if let Some(mut older) = read_working(workspace, &self.generation, &id, digest) {
+                    older.whole = false;
+                    keep_working(workspace, &self.generation, &older);
+                }
+                continue;
+            }
+            if after.get(&id) != Some(digest) {
+                forget_working(workspace, &self.generation, &id);
+                continue;
+            }
+            keep_working(
+                workspace,
+                &self.generation,
+                &WorkingCopy {
+                    digest: digest.clone(),
+                    whole: self.walked && !self.readers.contains(&id),
+                    hosted: self.hosted.clone(),
+                    blob: blob.clone(),
+                    carried: carried.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// The digest of each of `services` that `wanted` names and has edits of its
+/// own since the index ([`service_digest`]), and the services git could not
+/// list, from one listing per distinct indexed commit.
+fn digests_of(
+    repo: &Path,
+    services: &[IndexedService],
+    wanted: impl Fn(&str) -> bool,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut listings: std::collections::BTreeMap<String, Option<HashSet<String>>> =
+        Default::default();
+    let mut digests = std::collections::BTreeMap::new();
+    let mut unlisted = std::collections::BTreeSet::new();
+    for service in services.iter().filter(|service| wanted(&service.name)) {
+        let changed = listings
+            .entry(service.commit.clone())
+            .or_insert_with(|| super::query::changed_since(repo, &service.commit));
+        match changed {
+            Some(changed) => {
+                if let Some(digest) = service_digest(repo, changed, service, services) {
+                    digests.insert(service.name.clone(), digest);
+                }
+            }
+            None => {
+                unlisted.insert(service.name.clone());
+            }
+        }
+    }
+    (digests, unlisted)
+}
+
+/// The one rule for "this service's blob is current", read by both checks
+/// (`check --changed` and the per-edit re-check): the service has edits of
+/// its own, reads no path edited outside its own directories, and its last
+/// re-check kept a whole copy read for exactly those edits under the hosted
+/// snapshot this check reads. Such a service is joined from that copy
+/// instead of re-scanned. Anything else is re-scanned, and so is every
+/// service of a machine that is signed out (`hosted` is `None`).
+fn current_copy(
+    workspace: &Workspace,
+    generation: &str,
+    service: &str,
+    digest: Option<&String>,
+    reads_outside: bool,
+    hosted: Option<&str>,
+) -> Option<WorkingCopy> {
+    if reads_outside {
+        return None;
+    }
+    let hosted = hosted?;
+    read_working(workspace, generation, service, digest?).filter(|copy| {
+        copy.whole
+            && copy.hosted.as_deref() == Some(hosted)
+            && !std::iter::once(&copy.blob)
+                .chain(&copy.carried)
+                .any(read_short)
+    })
+}
+
+/// Whether the scan that wrote `blob` was short of an answer a re-scan now
+/// may get: the library store or the model's replayed answers. Such a copy
+/// never stands in for a re-scan; the re-scan says what is missing, or
+/// reads it.
+fn read_short(blob: &crate::cloud_storage::CloudRepoData) -> bool {
+    blob.boundary.as_ref().is_some_and(|boundary| {
+        boundary.library_ask_failed.is_some() || boundary.model_answers_unavailable.is_some()
+    })
+}
+
+/// Write one service's copy where [`read_working`] finds it.
+fn keep_working(workspace: &Workspace, generation: &str, copy: &WorkingCopy) {
+    let id = service_id(&copy.blob);
+    let Some(dir) = kept_dir(workspace, "working", generation) else {
+        return;
+    };
+    if let Some(parent) = dir.parent() {
+        prune_other_generations(parent, &dir);
+    }
+    let Ok(bytes) = serde_json::to_vec(copy) else {
+        return;
+    };
+    let kept = dir.join(working_name(&id));
+    let staged = dir.join(format!("{}.{}.tmp", working_name(&id), std::process::id()));
+    let _ = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&staged, bytes))
+        .and_then(|()| std::fs::rename(&staged, &kept));
+}
+
+/// Remove `service`'s kept copy, so nothing stands in for it.
+fn forget_working(workspace: &Workspace, generation: &str, service: &str) {
+    if let Some(dir) = kept_dir(workspace, "working", generation) {
+        let _ = std::fs::remove_file(dir.join(working_name(service)));
+    }
 }
 
 impl Plan {
@@ -907,12 +1238,18 @@ impl Plan {
         held: &Held,
     ) -> Self {
         let began = Instant::now();
-        let mut readers = readers_of_the_edit(repo, reach, held);
+        // Every service's, the re-read ones too: a re-read service that reads
+        // an outside edit is never current, and its copy is not whole.
+        let mut readers = readers_of_the_edit(repo, reach.services.iter(), held);
         took("plan-make/readers-of-the-edit", began);
         let began = Instant::now();
-        let mut listings: std::collections::BTreeMap<String, Option<HashSet<String>>> =
-            Default::default();
-        let mut digests = std::collections::BTreeMap::new();
+        let copies = Copies::of(
+            repo,
+            &reach.services,
+            generation,
+            Some(readers.keys().cloned().collect()),
+            held.hosted.source_key(),
+        );
         let mut working = std::collections::BTreeMap::new();
         let mut scope = RecheckScope {
             reread: reach.reread.clone(),
@@ -920,17 +1257,8 @@ impl Plan {
             stale: Vec::new(),
         };
         for service in &reach.services {
-            let changed = listings
-                .entry(service.commit.clone())
-                .or_insert_with(|| super::query::changed_since(repo, &service.commit));
-            // `None`: git cannot say what changed. `Some(None)`: nothing did.
-            let digest = changed
-                .as_ref()
-                .map(|changed| service_digest(repo, changed, service, &reach.services));
+            let digest = copies.digest(&service.name);
             if reach.reread.contains(&service.name) {
-                if let Some(Some(digest)) = digest {
-                    digests.insert(service.name.clone(), digest);
-                }
                 continue;
             }
             let operations = service.routes + service.calls;
@@ -941,19 +1269,19 @@ impl Plan {
             let reason = match digest {
                 _ if reader.is_some() => {
                     if let Some(Some(digest)) = digest
-                        && let Some(blob) =
-                            read_working(workspace, generation, &service.name, &digest)
+                        && let Some(copy) =
+                            read_working(workspace, generation, &service.name, digest)
                     {
-                        working.insert(service.name.clone(), blob);
+                        working.insert(service.name.clone(), copy.blob);
                     }
                     scope.stale.push(service.name.clone());
                     reader.as_deref().unwrap_or_default()
                 }
                 Some(None) => "no edits since the index; judged at its indexed version",
                 Some(Some(digest)) => {
-                    match read_working(workspace, generation, &service.name, &digest) {
-                        Some(blob) => {
-                            working.insert(service.name.clone(), blob);
+                    match read_working(workspace, generation, &service.name, digest) {
+                        Some(copy) => {
+                            working.insert(service.name.clone(), copy.blob);
                             "judged at your last re-check of it"
                         }
                         None => {
@@ -973,12 +1301,14 @@ impl Plan {
                 reason: reason.to_string(),
             });
         }
+        let current = copies.current(workspace, &reach.reread);
         took("plan-make/digests-and-working-reads", began);
         Self {
             generation: generation.to_string(),
             services: reach.reread.clone(),
-            digests,
+            copies,
             working,
+            current,
             files: reach.files.clone(),
             scope,
         }
@@ -1002,34 +1332,6 @@ impl Plan {
             budget_ms: budget.as_millis() as u64,
             files,
         })
-    }
-
-    /// Keep a re-read service's fresh blob for the next re-check. A service
-    /// with no edits since the index has nothing to keep: its indexed blob is
-    /// the newest there is.
-    fn keep(&self, workspace: &Workspace, blob: &crate::cloud_storage::CloudRepoData) {
-        let id = service_id(blob);
-        let Some(digest) = self.digests.get(&id) else {
-            return;
-        };
-        let Some(dir) = kept_dir(workspace, "working", &self.generation) else {
-            return;
-        };
-        if let Some(parent) = dir.parent() {
-            prune_other_generations(parent, &dir);
-        }
-        let copy = WorkingCopy {
-            digest: digest.clone(),
-            blob: blob.clone(),
-        };
-        let Ok(bytes) = serde_json::to_vec(&copy) else {
-            return;
-        };
-        let kept = dir.join(working_name(&id));
-        let staged = dir.join(format!("{}.{}.tmp", working_name(&id), std::process::id()));
-        let _ = std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(&staged, bytes))
-            .and_then(|()| std::fs::rename(&staged, &kept));
     }
 }
 
@@ -1055,14 +1357,14 @@ fn read_working(
     generation: &str,
     service: &str,
     digest: &str,
-) -> Option<crate::cloud_storage::CloudRepoData> {
+) -> Option<WorkingCopy> {
     let path = kept_dir(workspace, "working", generation)?.join(working_name(service));
     let copy: WorkingCopy = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    (copy.digest == digest && service_id(&copy.blob) == service).then_some(copy.blob)
+    (copy.digest == digest && service_id(&copy.blob) == service).then_some(copy)
 }
 
-/// The reason for each service outside the re-read scope that reads a path
-/// edited since its index, by service name.
+/// The reason for each of `services` that reads a path edited since its
+/// index, by service name.
 ///
 /// The type-use record lists the operations that read a type the edited file
 /// declares; it does not list one that reads a constant, a wrapper or a type
@@ -1073,20 +1375,16 @@ fn read_working(
 /// no service's own edit, so it stays in the listing (carrick#4390). A service whose closure cannot be
 /// walked (no stored config on this machine) is named too: it is not known to
 /// be untouched.
-fn readers_of_the_edit(
+fn readers_of_the_edit<'a>(
     repo: &Path,
-    reach: &Reach,
+    services: impl Iterator<Item = &'a IndexedService>,
     held: &Held,
 ) -> std::collections::BTreeMap<String, String> {
     let repo_path = repo.to_string_lossy().to_string();
     let mut readers = std::collections::BTreeMap::new();
     // One listing of what changed, shared by every service's view of it.
     let listing = crate::change_scope::ChangedSince::new(&repo_path, &[], &[]);
-    for service in reach
-        .services
-        .iter()
-        .filter(|service| !reach.reread.contains(&service.name))
-    {
+    for service in services {
         let config = held
             .local
             .iter()
@@ -1407,16 +1705,56 @@ fn inside(
     before: &super::read_model::LocalIndex,
 ) -> Result<Fresh, String> {
     let name = repo_label(&tree.repo);
-    let rejoined = rejoin_held(
-        workspace,
-        held,
-        std::slice::from_ref(tree),
-        generation,
-        deadline,
-        None,
-        Some(plan),
-        &plan.generation,
-    )?;
+    let rescan = Rescans {
+        listed: Some(plan.services.as_slice()),
+        stand_in: Some(&plan.working),
+        keep: std::iter::once((name.clone(), &plan.copies)).collect(),
+        current: Default::default(),
+    };
+    // Every re-read service current: the join from its copies, kept only
+    // when it judged no pair; otherwise the re-scan, as with no copy.
+    // `Err` carries the answer the copies gave; `Ok`, what the re-scan reads.
+    let held = match plan.current.as_deref() {
+        Some(set) => {
+            let how = Rescans {
+                listed: rescan.listed,
+                stand_in: rescan.stand_in,
+                keep: Default::default(),
+                current: std::iter::once((name.clone(), set)).collect(),
+            };
+            let joined = rejoin_held(
+                workspace,
+                held,
+                std::slice::from_ref(tree),
+                generation,
+                deadline,
+                None,
+                &how,
+                &plan.generation,
+            );
+            match joined {
+                Ok(rejoined) => Err(rejoined),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(generation);
+                    Ok(Held::read(workspace)?)
+                }
+            }
+        }
+        None => Ok(held),
+    };
+    let rejoined = match held {
+        Err(rejoined) => rejoined,
+        Ok(held) => rejoin_held(
+            workspace,
+            held,
+            std::slice::from_ref(tree),
+            generation,
+            deadline,
+            None,
+            &rescan,
+            &plan.generation,
+        )?,
+    };
     // A re-scan that could not replay the index's model answers has lost every
     // row only the model stated: not a pass, as in the plain check's `answer`
     // (carrick#3413).
@@ -1654,27 +1992,232 @@ pub(super) struct Rejoined {
 /// a command after some seconds of silence read the silence as a hang. The
 /// per-edit re-check passes `None`: it answers inside a hook's budget and a
 /// line on its stderr has no reader.
+///
+/// `index` is what the check read. With `current` (per repo, the services
+/// the reads-the-same walk named, where it ran), a repo whose every reached
+/// service is current ([`Copies::current`]), and none of whose other
+/// services the re-scan would read again ([`rescan_rereads_beyond`]), is
+/// joined from the kept copies without a scan. The answer stands only when
+/// the join settled every pair it read; otherwise the whole pass runs again
+/// as it would with no copy at all. It keeps no copy of its own. The second
+/// value names the repos joined from copies.
 pub(super) fn rejoin(
     workspace: &Workspace,
-    repos: &[Tree],
+    index: &super::read_model::LocalIndex,
+    (repos, current): (
+        &[Tree],
+        Option<&std::collections::BTreeMap<String, Vec<String>>>,
+    ),
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
     index_generation: &str,
-) -> Result<Rejoined, String> {
+) -> Result<(Rejoined, std::collections::BTreeSet<String>), String> {
     let began = Instant::now();
     let held = Held::read(workspace)?;
     took("held-read", began);
-    rejoin_held(
+    let began = Instant::now();
+    let hosted = held.hosted.source_key();
+    let mut sets = std::collections::BTreeMap::new();
+    for (tree, walked) in repos
+        .iter()
+        .filter_map(|tree| Some((tree, current?.get(&repo_label(&tree.repo)))))
+    {
+        let name = repo_label(&tree.repo);
+        let Some(indexed) = index.repos.iter().find(|repo| repo.name == name) else {
+            continue;
+        };
+        // A cold check reads no digest and walks nothing of its own.
+        if !Copies::any_kept(workspace, index_generation, &indexed.services) {
+            continue;
+        }
+        let mut repo_copies = Copies::of(
+            &tree.checkout,
+            &indexed.services,
+            index_generation,
+            None,
+            hosted.clone(),
+        );
+        // Only a repo whose every edited service has a current copy can be
+        // current. Then the services with edits of their own are walked, and
+        // the rest are read from the walk reads-the-same already ran, where
+        // it ran: a service with no edits of its own that reads a changed
+        // file reads an outside one.
+        if !repo_copies.worth_walking(workspace) {
+            continue;
+        }
+        let began = Instant::now();
+        let others = walked.is_none();
+        let mut readers: std::collections::BTreeSet<String> = readers_of_the_edit(
+            &tree.checkout,
+            indexed
+                .services
+                .iter()
+                .filter(|service| others || repo_copies.digests.contains_key(&service.name)),
+            &held,
+        )
+        .into_keys()
+        .collect();
+        readers.extend(
+            walked
+                .into_iter()
+                .flatten()
+                .filter(|service| !repo_copies.digests.contains_key(*service))
+                .cloned(),
+        );
+        repo_copies.readers = readers;
+        repo_copies.walked = true;
+        took("check/current-copies/readers-walk", began);
+        let reached = repo_copies.reached();
+        let Some(set) = repo_copies.current(workspace, &reached) else {
+            continue;
+        };
+        let began = Instant::now();
+        let rereads = rescan_rereads_beyond(&held, tree, &reached);
+        took("check/current-copies/stored-gate", began);
+        if !rereads {
+            sets.insert(name, set);
+        }
+    }
+    took("check/current-copies", began);
+    if sets.is_empty() {
+        let rejoined = rejoin_held(
+            workspace,
+            held,
+            repos,
+            generation,
+            deadline,
+            narrator,
+            &Rescans::default(),
+            index_generation,
+        )?;
+        return Ok((rejoined, Default::default()));
+    }
+    let how = Rescans {
+        current: sets
+            .iter()
+            .map(|(name, set)| (name.clone(), set.as_slice()))
+            .collect(),
+        ..Rescans::default()
+    };
+    if let Ok(rejoined) = rejoin_held(
         workspace,
         held,
         repos,
         generation,
         deadline,
         narrator,
-        None,
+        &how,
         index_generation,
-    )
+    ) {
+        return Ok((rejoined, sets.into_keys().collect()));
+    }
+    // The copies did not stand in: the pass runs as it would without them.
+    // A repo the first attempt scanned is scanned again inside the same
+    // deadline: reading its finished scan back is `rejoin_held`'s to offer.
+    let _ = std::fs::remove_dir_all(generation);
+    let held = Held::read(workspace)?;
+    let rejoined = rejoin_held(
+        workspace,
+        held,
+        repos,
+        generation,
+        deadline,
+        narrator,
+        &Rescans::default(),
+        index_generation,
+    )?;
+    Ok((rejoined, Default::default()))
+}
+
+/// Whether the `--changed-only` scan of `tree` would read again a service
+/// outside `reached`, the services the edits reach: the change scope's gate
+/// on each one's stored blob ([`crate::change_scope::stored_gate`]: no blob,
+/// another cache, read from uncommitted changes, owed work, another config),
+/// asked as the scan's child asks it, of the services it resolves against
+/// the same previous list. Such a repo is re-scanned: its copies would be
+/// joined beside a blob the re-scan would not keep. `true` when the services
+/// cannot be resolved. The per-edit re-check does not ask it: its scan is
+/// told its list and carries every other service whatever its blob says.
+fn rescan_rereads_beyond(held: &Held, tree: &Tree, reached: &[String]) -> bool {
+    let name = repo_label(&tree.repo);
+    let previous = previous_list(
+        held.hosted.local_blobs(&tree.repo),
+        held.local.iter().filter(|blob| blob.repo_name == name),
+    );
+    let Ok(configs) =
+        crate::service_derivation::resolve_with_hosted(&tree.checkout, Some(&previous))
+    else {
+        return true;
+    };
+    // The re-scan is a facts-only pass (`rescan_command`): it asks no model.
+    let this_run = crate::change_scope::ThisRun {
+        scanner_version: env!("CARGO_PKG_VERSION"),
+        cache_version: crate::engine::CACHE_VERSION,
+        asks_model: false,
+    };
+    configs.iter().any(|config| {
+        let stored = previous
+            .iter()
+            .find(|blob| blob.service_name == config.service_name);
+        let id = stored
+            .map(service_id)
+            .or_else(|| config.service_name.clone())
+            .unwrap_or_else(|| name.clone());
+        !reached.contains(&id)
+            && crate::change_scope::stored_gate(
+                stored,
+                this_run,
+                serde_json::to_string(config).ok().as_deref(),
+            )
+            .is_err()
+    })
+}
+
+/// What the last index held for one repo, as its re-scan reads it
+/// (`previous`): the hosted snapshot's copy of each service, and the local
+/// blob of every service the snapshot does not hold.
+fn previous_list<'a>(
+    hosted: Vec<crate::cloud_storage::CloudRepoData>,
+    local: impl Iterator<Item = &'a crate::cloud_storage::CloudRepoData>,
+) -> Vec<crate::cloud_storage::CloudRepoData> {
+    let hosted_ids: std::collections::BTreeSet<String> = hosted.iter().map(service_id).collect();
+    let mut previous = hosted;
+    previous.extend(
+        local
+            .filter(|blob| !hosted_ids.contains(&service_id(blob)))
+            .cloned(),
+    );
+    previous
+}
+
+/// What one [`rejoin_held`] does besides re-scanning each repo it is handed.
+#[derive(Default)]
+struct Rescans<'a> {
+    /// The services the scan is told to analyse: the per-edit re-check's.
+    /// `None` leaves the scan's own change scope to decide.
+    listed: Option<&'a [String]>,
+    /// The newest known copy of a service outside the scope, standing in for
+    /// its indexed blob in every repo's previous list.
+    stand_in: Option<&'a std::collections::BTreeMap<String, crate::cloud_storage::CloudRepoData>>,
+    /// Per repo, by label: what its scan keeps for the next check. Only the
+    /// per-edit re-check keeps, under its `listed` services.
+    keep: std::collections::BTreeMap<String, &'a Copies>,
+    /// Per repo, by label: the blobs that stand in for its scan. Such a repo
+    /// is not scanned, and the answer stands only when the join settled every
+    /// pair; otherwise the rejoin fails and the caller re-scans.
+    current: std::collections::BTreeMap<String, &'a [crate::cloud_storage::CloudRepoData]>,
+}
+
+/// Why a rejoin from kept copies was not kept.
+const NOT_CURRENT: &str = "a kept copy did not stand in for the re-scan";
+
+/// Whether a join over kept copies stands for the re-scan. It cannot retype
+/// a pair (only a consumer a scan read can be), so it stands only when it
+/// ran the type check and settled every pair it read: no count (the settle
+/// off, or only verifying) is not that.
+fn copies_stand(type_check: &super::JoinTypeCheck, settle_misses: Option<usize>) -> bool {
+    *type_check == super::JoinTypeCheck::Ran && settle_misses == Some(0)
 }
 
 /// [`rejoin`], over an index already read. Both checks keep the type checker's
@@ -1682,11 +2225,10 @@ pub(super) fn rejoin(
 /// so a run that moves no type finds the index's own answer, or the last run's,
 /// in `.carrick/judged`.
 ///
-/// `plan` is the per-edit re-check's: it narrows the re-scan to the services
-/// it names, stands the newest known copy in for the rest, keeps what the
-/// scan read, and keeps the type checker's answers per index. `None` is the
-/// several-file check, which re-reads whatever the change scope reaches and
-/// keeps nothing.
+/// `how` says what else the pass does ([`Rescans`]): the per-edit re-check
+/// narrows the re-scan to the services it names and stands the newest known
+/// copy in for the rest, and keeps what its scan read; both checks may join a
+/// repo from its current copies instead of scanning it.
 #[allow(clippy::too_many_arguments)]
 fn rejoin_held(
     workspace: &Workspace,
@@ -1695,7 +2237,7 @@ fn rejoin_held(
     generation: &Path,
     deadline: Instant,
     narrator: Option<&Narrator>,
-    plan: Option<&Plan>,
+    how: &Rescans,
     index_generation: &str,
 ) -> Result<Rejoined, String> {
     let exe =
@@ -1748,28 +2290,31 @@ fn rejoin_held(
     // own pair once its scan has finished.
     for (position, tree) in repos.iter().enumerate() {
         let name = repo_label(&tree.repo);
-        let mut previous_data = hosted.local_blobs(&tree.repo);
-        write_json(&staged(generation, "hosted", position), &previous_data)?;
-        let hosted_ids: std::collections::BTreeSet<String> =
-            previous_data.iter().map(service_id).collect();
-        let local: Vec<&crate::cloud_storage::CloudRepoData> = indexed
-            .iter()
-            .filter(|blob| blob.repo_name == name)
-            .collect();
-        previous_data.extend(
-            local
-                .iter()
-                .filter(|blob| !hosted_ids.contains(&service_id(blob)))
-                .map(|blob| (*blob).clone()),
+        let hosted_data = hosted.local_blobs(&tree.repo);
+        write_json(&staged(generation, "hosted", position), &hosted_data)?;
+        let mut previous_data = previous_list(
+            hosted_data,
+            indexed.iter().filter(|blob| blob.repo_name == name),
         );
         // A service outside the scope stands in at the copy its last re-check
         // left, so this one judges against the edits already made to it.
-        if let Some(plan) = plan {
+        if let Some(stand_in) = how.stand_in {
             for blob in &mut previous_data {
-                if let Some(newer) = plan.working.get(&service_id(blob)) {
+                if let Some(newer) = stand_in.get(&service_id(blob)) {
                     *blob = newer.clone();
                 }
             }
+        }
+        // A repo joined from its current copies: each copy takes its
+        // service's place, as a scan that wrote them would leave it. A copy
+        // of a service the list does not hold is not that.
+        for newer in how.current.get(&name).copied().unwrap_or_default() {
+            let id = service_id(newer);
+            let place = previous_data
+                .iter_mut()
+                .find(|blob| service_id(blob) == id)
+                .ok_or_else(|| NOT_CURRENT.to_string())?;
+            *place = newer.clone();
         }
         write_json(&staged(generation, "previous", position), &previous_data)?;
     }
@@ -1781,39 +2326,44 @@ fn rejoin_held(
         let name = repo_label(&tree.repo);
         let previous = staged(generation, "previous", position);
         let scan_dir = generation.join(format!("scan-{position}"));
-        let mut scan = rescan_command(&exe, tree, &scan_dir, &previous);
-        scan.env(JUDGE_ANSWERS_ENV, &judged);
-        if let Some(plan) = plan {
-            scan.env(
-                crate::change_scope::RECHECK_SERVICES_ENV,
-                serde_json::to_string(&plan.services).map_err(|e| e.to_string())?,
-            );
-        }
         // The rows the last `refresh` (or an earlier check, below) kept stand
         // in for a walk of a carried service. The scan only reads them; the
         // walks it had to do are kept after it succeeds.
         let kept = workspace
             .index_dir()
             .join(crate::position_rows::POSITIONS_DIR);
-        scan.env(crate::position_rows::KEPT_DIR_ENV, &kept);
-        if let Some(narrator) = narrator {
-            // The scan states its per-service counts on stderr only when a
-            // parent asks; the narrator is that parent here.
-            scan.env(crate::progress::PROGRESS_ENV, "1");
-            narrator.repo(Instant::now(), &name, position + 1, repos.len());
-        }
-        took("scan-starts", Instant::now());
-        let began = Instant::now();
-        bounded(scan, "re-scan", deadline, narrator)?;
-        took("scan", began);
-        let began = Instant::now();
-        let fresh = read_blobs(&scan_dir)?;
-        if let Some(plan) = plan {
-            for blob in &fresh {
-                plan.keep(workspace, blob);
+        // A repo joined from its current copies starts no scan: its copies
+        // already stand in its previous list, and it writes nothing fresh.
+        let fresh = if how.current.contains_key(&name) {
+            Vec::new()
+        } else {
+            let mut scan = rescan_command(&exe, tree, &scan_dir, &previous);
+            scan.env(JUDGE_ANSWERS_ENV, &judged);
+            if let Some(listed) = how.listed {
+                scan.env(
+                    crate::change_scope::RECHECK_SERVICES_ENV,
+                    serde_json::to_string(listed).map_err(|e| e.to_string())?,
+                );
             }
-        }
-        took("after-scan/read-fresh-and-keep", began);
+            scan.env(crate::position_rows::KEPT_DIR_ENV, &kept);
+            if let Some(narrator) = narrator {
+                // The scan states its per-service counts on stderr only when
+                // a parent asks; the narrator is that parent here.
+                scan.env(crate::progress::PROGRESS_ENV, "1");
+                narrator.repo(Instant::now(), &name, position + 1, repos.len());
+            }
+            took("scan-starts", Instant::now());
+            let began = Instant::now();
+            bounded(scan, "re-scan", deadline, narrator)?;
+            took("scan", began);
+            let began = Instant::now();
+            let fresh = read_blobs(&scan_dir)?;
+            if let (Some(copies), Some(listed)) = (how.keep.get(&name), how.listed) {
+                copies.keep(workspace, &fresh, listed);
+            }
+            took("after-scan/read-fresh-and-keep", began);
+            fresh
+        };
         let began = Instant::now();
         let hosted_data = read_staged(&staged(generation, "hosted", position))?;
         let previous_data = read_staged(&previous)?;
@@ -1828,16 +2378,16 @@ fn rejoin_held(
         // analysed service's rows.
         // The scan also writes a carried service whose pairs the join moved, so
         // it is in `fresh`, not `carried`, though it was walked as a carried
-        // one: with a plan, every written service the plan did not re-read is
-        // one of those.
-        let written_carried: Vec<crate::cloud_storage::CloudRepoData> =
-            carried
-                .iter()
-                .chain(fresh.iter().filter(|blob| {
-                    plan.is_some_and(|plan| !plan.services.contains(&service_id(blob)))
-                }))
-                .cloned()
-                .collect();
+        // one: with a re-check's list, every written service it did not list
+        // is one of those. `--changed` names no list, so it keeps only `carried`.
+        let written_carried: Vec<crate::cloud_storage::CloudRepoData> = carried
+            .iter()
+            .chain(fresh.iter().filter(|blob| {
+                how.listed
+                    .is_some_and(|listed| !listed.contains(&service_id(blob)))
+            }))
+            .cloned()
+            .collect();
         super::index::keep_carried_walks(&scan_dir, &kept, &written_carried);
         took("after-scan/carried-and-kept-walks", began);
         let began = Instant::now();
@@ -1882,6 +2432,9 @@ fn rejoin_held(
         .map_err(|e| format!("the re-join wrote no result to {}: {e}", out.display()))?;
     let joined: super::LocalJoin =
         serde_json::from_str(&text).map_err(|e| format!("could not read the re-join: {e}"))?;
+    if !how.current.is_empty() && !copies_stand(&joined.type_check, joined.settle_misses) {
+        return Err(NOT_CURRENT.to_string());
+    }
 
     // The same fold the indexer performs, over the same shapes, so a re-checked
     // row and an indexed row can never be built two different ways.
@@ -2674,8 +3227,9 @@ mod tests {
         let plan = Plan {
             generation: "g1".to_string(),
             services: vec!["types-owner".to_string(), "big-reader".to_string()],
-            digests: Default::default(),
+            copies: Copies::default(),
             working: Default::default(),
+            current: None,
             files: [
                 ("types-owner".to_string(), 3),
                 ("big-reader".to_string(), 900),
@@ -2902,8 +3456,9 @@ mod tests {
         let plan = Plan {
             generation: "g1".to_string(),
             services: vec!["catalog".to_string(), "ledger".to_string()],
-            digests: Default::default(),
+            copies: Copies::default(),
             working: Default::default(),
+            current: None,
             files: [("catalog".to_string(), 3), ("ledger".to_string(), 2)]
                 .into_iter()
                 .collect(),
@@ -3010,6 +3565,212 @@ mod tests {
             names(additions(&services, dir.path(), "src/a.ts", &indexed)),
             vec!["added".to_string()]
         );
+    }
+
+    /// The hosted snapshot every copy below was read with.
+    const SNAPSHOT: &str = "snapshot-one";
+
+    /// A committed repo of two services, `api` and `web`, and a workspace
+    /// beside it (so its kept state is not an untracked file of the repo).
+    /// `web_commit` is the commit `web` was indexed at.
+    struct TwoServices {
+        repo: tempfile::TempDir,
+        _root: tempfile::TempDir,
+        workspace: Workspace,
+        services: Vec<IndexedService>,
+    }
+
+    fn two_services(web_commit: Option<&str>) -> TwoServices {
+        let (repo, head) = crate::git_state::tests::committed_repo(&[
+            ("api/a.ts", "export const a = 1;\n"),
+            ("web/b.ts", "export const b = 1;\n"),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace {
+            root: root.path().to_path_buf(),
+            repos: Vec::new(),
+            missing: Vec::new(),
+            repos_detected_by: String::new(),
+            repos_added: Vec::new(),
+            repos_excluded: Vec::new(),
+            parent_proposal: None,
+        };
+        let service = |name: &str, commit: &str| -> IndexedService {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "directory": name, "commit": commit, "dirty": false,
+                "indexed_at": "t", "routes": 0, "calls": 0,
+            }))
+            .expect("an indexed service")
+        };
+        TwoServices {
+            services: vec![
+                service("api", &head),
+                service("web", web_commit.unwrap_or(&head)),
+            ],
+            repo,
+            _root: root,
+            workspace,
+        }
+    }
+
+    impl TwoServices {
+        fn write(&self, relative: &str, text: &str) {
+            std::fs::write(self.repo.path().join(relative), text).unwrap();
+        }
+
+        fn copies(&self) -> Copies {
+            Copies::of(
+                self.repo.path(),
+                &self.services,
+                "g1",
+                Some(Default::default()),
+                Some(SNAPSHOT.to_string()),
+            )
+        }
+
+        fn kept(&self, copies: &Copies, service: &str) -> Option<WorkingCopy> {
+            read_working(&self.workspace, "g1", service, &copies.digests[service])
+        }
+
+        /// What a re-check of `service` kept for `copies`' digest, carrying
+        /// `carried`.
+        fn keep_copy(
+            &self,
+            copies: &Copies,
+            service: &str,
+            carried: Vec<crate::cloud_storage::CloudRepoData>,
+        ) {
+            keep_working(
+                &self.workspace,
+                "g1",
+                &WorkingCopy {
+                    digest: copies.digests[service].clone(),
+                    whole: true,
+                    hosted: Some(SNAPSHOT.to_string()),
+                    blob: blob_of(service, "abc"),
+                    carried,
+                },
+            );
+        }
+    }
+
+    fn blob_of(service: &str, commit: &str) -> crate::cloud_storage::CloudRepoData {
+        serde_json::from_value(serde_json::json!({
+            "repo_name": "repo", "service_name": service, "endpoints": [], "calls": [],
+            "mounts": [], "apps": {}, "imported_handlers": [], "function_definitions": {},
+            "last_updated": "2026-11-15T10:00:00Z", "commit_hash": commit, "file_results": {},
+        }))
+        .expect("a blob")
+    }
+
+    /// PR #4634 review, B4: the re-check of `web` also writes `api` (its join moved
+    /// `api`'s pair outcomes) without analysing it. `api`'s copy from its own
+    /// earlier re-check is older than that: it is kept, for the re-check to
+    /// judge against, but marked not whole, so no copy-only answer reads it.
+    #[test]
+    fn a_written_edited_service_the_scan_did_not_analyse_keeps_a_copy_that_never_stands_in() {
+        let two = two_services(None);
+        two.write("api/a.ts", "export const a = 2;\n");
+        two.write("web/b.ts", "export const b = 2;\n");
+        let copies = two.copies();
+        two.keep_copy(&copies, "api", Vec::new());
+        let api = ["api".to_string()];
+        assert!(
+            copies.current(&two.workspace, &api).is_some(),
+            "api's own copy stands in"
+        );
+
+        copies.keep(
+            &two.workspace,
+            &[blob_of("web", "abc"), blob_of("api", "abc")],
+            &["web".to_string()],
+        );
+        let older = two.kept(&copies, "api").expect("api's older copy is kept");
+        assert!(!older.whole, "marked not whole");
+        assert!(
+            copies.current(&two.workspace, &api).is_none(),
+            "so it stands in for no re-scan"
+        );
+        assert!(two.kept(&copies, "web").is_some(), "web's is kept");
+    }
+
+    /// PR #4634 review, N1: an edit made while the re-check's scan ran keeps no
+    /// copy, so undoing it leaves nothing labelled with the undone digest
+    /// that holds the edit. Edits that held still keep one.
+    #[test]
+    fn a_copy_is_kept_only_when_its_own_edits_held_still_through_the_scan() {
+        let two = two_services(None);
+        two.write("api/a.ts", "export const a = 2;\n");
+        let copies = two.copies();
+        two.write("api/a.ts", "export const a = 3;\n");
+        copies.keep(
+            &two.workspace,
+            &[blob_of("api", "abc")],
+            &["api".to_string()],
+        );
+        two.write("api/a.ts", "export const a = 2;\n");
+        assert!(
+            two.kept(&copies, "api").is_none(),
+            "edited during the scan: no copy"
+        );
+
+        copies.keep(
+            &two.workspace,
+            &[blob_of("api", "abc")],
+            &["api".to_string()],
+        );
+        assert!(two.kept(&copies, "api").is_some(), "held still: kept");
+    }
+
+    /// A repo where git cannot say what changed in one service is never
+    /// current, whatever copies the others hold.
+    #[test]
+    fn a_repo_with_a_service_git_cannot_list_is_never_current() {
+        let two = two_services(Some("0000000000000000000000000000000000000000"));
+        two.write("api/a.ts", "export const a = 2;\n");
+        let copies = two.copies();
+        assert!(copies.unlisted.contains("web"), "git cannot list web");
+        two.keep_copy(&copies, "api", Vec::new());
+        assert!(
+            copies
+                .current(&two.workspace, &["api".to_string()])
+                .is_none()
+        );
+    }
+
+    /// One service carried differently by two copies is not known: nothing
+    /// is current. Carried the same, both copies stand in.
+    #[test]
+    fn two_copies_that_carry_one_service_differently_are_not_current() {
+        let two = two_services(None);
+        two.write("api/a.ts", "export const a = 2;\n");
+        two.write("web/b.ts", "export const b = 2;\n");
+        let copies = two.copies();
+        let both = ["api".to_string(), "web".to_string()];
+        two.keep_copy(&copies, "api", vec![blob_of("lib", "one")]);
+        two.keep_copy(&copies, "web", vec![blob_of("lib", "two")]);
+        assert!(copies.current(&two.workspace, &both).is_none());
+
+        two.keep_copy(&copies, "web", vec![blob_of("lib", "one")]);
+        let set = copies
+            .current(&two.workspace, &both)
+            .expect("carried the same, they stand in");
+        assert_eq!(set.len(), 3, "api, web and the one lib");
+    }
+
+    /// The join over copies stands only when it ran the type check and
+    /// settled every pair: a skipped type check, no settle count (the settle
+    /// off or verifying) or a pair left to judge re-scans.
+    #[test]
+    fn copies_stand_only_on_a_type_check_that_settled_every_pair() {
+        use super::super::JoinTypeCheck;
+        assert!(copies_stand(&JoinTypeCheck::Ran, Some(0)));
+        assert!(!copies_stand(&JoinTypeCheck::Ran, Some(1)));
+        assert!(!copies_stand(&JoinTypeCheck::Ran, None));
+        let skipped = JoinTypeCheck::Skipped {
+            reason: "the compiler engine is unavailable".to_string(),
+        };
+        assert!(!copies_stand(&skipped, Some(0)));
     }
 }
 

@@ -27,6 +27,9 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/signed_in.rs"]
+mod signed_in;
+
 fn carrick() -> &'static str {
     env!("CARGO_BIN_EXE_carrick")
 }
@@ -769,4 +772,138 @@ fn pubsub_pair_prints_the_same_with_the_join_settle_off() {
     // type-checked"), so pub/sub stays unmeasured here (carrick#3887): this
     // only proves the settle moves nothing.
     assert_settle_moves_nothing(&on, &off);
+}
+
+/// `check --changed --json` under the phase timing lines: the answer without
+/// its elapsed time and per-repo `rescan`, its exit, and whether a scan child
+/// started.
+fn changed_scanned(root: &Path, env: &[(&str, &str)]) -> (Value, Option<i32>, bool) {
+    let mut env = env.to_vec();
+    env.push(("CARRICK_RECHECK_TIMING", "1"));
+    let out = command(root, &["check", "--changed", "--json"], &env)
+        .output()
+        .expect("spawn check --changed --json");
+    let mut json: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{}", String::from_utf8_lossy(&out.stdout)));
+    json.as_object_mut()
+        .expect("an object")
+        .remove("elapsed_ms");
+    for repo in json["repos"].as_array_mut().into_iter().flatten() {
+        repo.as_object_mut().expect("a repo").remove("rescan");
+    }
+    let scanned = String::from_utf8_lossy(&out.stderr).contains("recheck-timing scan took ");
+    (json, out.status.code(), scanned)
+}
+
+/// A cold `check --changed`: the switch re-scans and keeps no copy.
+const COLD: [(&str, &str); 1] = [("CARRICK_CHECK_RESCAN", "always")];
+
+/// The per-edit re-check of the producer route, as the hook runs it.
+fn recheck_the_route(root: &Path) {
+    let out = command(
+        root,
+        &["check", PRODUCER_ROUTE, "--recheck", "--json"],
+        &[("CARRICK_RECHECK_BUDGET_MS", "600000")],
+    )
+    .output()
+    .expect("spawn check --recheck");
+    assert!(
+        out.status.success(),
+        "the re-check answered: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The edited route, workspace-relative.
+const PRODUCER_ROUTE: &str = "mono/apps/api/app/routes/api.v1.widgets.$widgetId.ts";
+
+/// The producer edit of the retype case, indexed first.
+fn indexed_and_edited() -> tempfile::TempDir {
+    let workspace = http_workspace();
+    let root = workspace.path();
+    let indexed = command(root, &["refresh"], &[])
+        .output()
+        .expect("spawn refresh");
+    assert!(
+        indexed.status.success(),
+        "refresh: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let route = root.join("mono/apps/api/app/routes/api.v1.widgets.$widgetId.ts");
+    edit(&route, "activeCount: number", "active: number");
+    edit(&route, "activeCount: 3", "active: 3");
+    signed_in::sign_in(root, "one");
+    workspace
+}
+
+/// B8 (T5): `check --changed` after the per-edit re-check of the edit is
+/// joined from the copies the re-check kept, the retype's verdict on the
+/// carried consumer among them, so the pair the retype decided reads the
+/// same break as a cold check.
+#[test]
+#[serial]
+fn check_changed_joined_from_copies_reads_the_retypes_verdict() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let workspace = indexed_and_edited();
+    let root = workspace.path();
+    let (cold, cold_exit, scanned) = changed_scanned(root, &COLD);
+    assert!(scanned, "the cold check scans");
+    assert!(
+        cold.to_string().contains("'activeCount' does not exist"),
+        "the retype's break:\n{cold:#}"
+    );
+
+    recheck_the_route(root);
+    let (joined, exit, scanned) = changed_scanned(root, &[]);
+    assert!(
+        !scanned,
+        "the check after the re-check starts no scan:\n{joined:#}"
+    );
+    assert_eq!(joined, cold, "and reads what the cold check read");
+    assert_eq!(exit, cold_exit);
+}
+
+/// B8 (T5): a kept consumer record that no longer settles (its stored
+/// `spec_hash` differs) is not joined: the check re-scans and answers as a
+/// cold check, since the join cannot retype the pair.
+#[test]
+#[serial]
+fn check_changed_rescans_when_a_kept_record_no_longer_settles() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let workspace = indexed_and_edited();
+    let root = workspace.path();
+    let (cold, cold_exit, _) = changed_scanned(root, &COLD);
+
+    recheck_the_route(root);
+    let copies = files_under(&root.join(".carrick/working"), "json");
+    assert!(!copies.is_empty(), "the re-check kept its copies");
+    let another_input = |blob: &mut Value| {
+        for outcome in blob["pair_outcomes"]["outcomes"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            outcome["spec_hash"] = Value::from("another input");
+        }
+    };
+    for path in copies {
+        let mut copy = read_json(&path);
+        another_input(&mut copy["blob"]);
+        for blob in copy["carried"].as_array_mut().into_iter().flatten() {
+            another_input(blob);
+        }
+        std::fs::write(&path, serde_json::to_vec(&copy).expect("serialise"))
+            .expect("write the copy back");
+    }
+
+    let (again, exit, scanned) = changed_scanned(root, &[]);
+    assert!(scanned, "the copies do not stand in:\n{again:#}");
+    assert_eq!(again, cold, "the re-scan answers as the cold check");
+    assert_eq!(exit, cold_exit);
 }

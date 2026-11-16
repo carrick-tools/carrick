@@ -1417,11 +1417,25 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
         // Each scan already judged and retyped its own pairs and stored the
         // outcome on its consumer's blob: the join takes it (carrick#3884).
         let settle = join_settle(&all_repo_data);
+        // A join that also judges what it settled (`verify`) states no count:
+        // its answer is not the settled one alone.
+        let misses = settle
+            .as_ref()
+            .filter(|settle| !settle.verifies())
+            .map(pair_settle::SettleFrom::join_misses);
         let (analyzer, type_check) =
             build_cross_repo_analyzer(all_repo_data, Vec::new(), sidecar, settle).await?;
         let results = analyzer.get_results();
-        crate::local_mode::LocalJoin::from_results(&results, type_check, &analyzer.call_bases())
-            .write(&out_path)?;
+        let mut join = crate::local_mode::LocalJoin::from_results(
+            &results,
+            type_check,
+            &analyzer.call_bases(),
+        );
+        if join.type_check == crate::local_mode::JoinTypeCheck::Ran {
+            join.settle_misses =
+                misses.map(|misses| misses.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        join.write(&out_path)?;
         logging::finish_spinner(
             &sp,
             &format!(
