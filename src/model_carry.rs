@@ -548,21 +548,25 @@ impl Context<'_> {
         Some(carried)
     }
 
-    /// A dispatch table is carried when the line its switch opens on is
-    /// unchanged and still names the field (the handler name sits on the function line, which is
-    /// not checked), and every value it
-    /// lists still appears in the file. A case label the edit added is not
-    /// seen, so such a table lists fewer values than the file answers.
+    /// A dispatch table is carried only when the edit provably left the
+    /// switch alone: every hunk ends strictly above the table's line in the
+    /// old file, so everything from the switch line down is byte-identical and
+    /// only shifted, and the line still names the field. Any hunk at or below
+    /// the switch line (an added case label, or an edit after the switch's
+    /// end, which is refused on purpose: the switch's extent is not known)
+    /// means not carried. The handler name sits on the function line, which is
+    /// not checked.
     fn dispatch_table(&self, row: &DispatchTable) -> Option<DispatchTable> {
-        let line = self.anchored_at(row.line_number.map(i64::from), &[row.field.as_str()])?;
-        let whole: String = self.new_lines.concat();
-        if !row
-            .values
+        let old_line = u32::try_from(row.line_number?).ok()?;
+        // A hunk with no old lines is an insertion after `old_start`.
+        if !self
+            .hunks
             .iter()
-            .all(|value| whole.contains(value.as_str()))
+            .all(|h| h.old_start + h.old_count.max(1) - 1 < old_line)
         {
             return None;
         }
+        let line = self.anchored_at(row.line_number.map(i64::from), &[row.field.as_str()])?;
         let mut carried = row.clone();
         carried.line_number = Some(line as u32);
         Some(carried)
@@ -1042,10 +1046,42 @@ export async function handle(body: Body) {
                 .not_carried
                 .contains(&"other.ts not_carried_dispatch_tables".to_string())
         );
-        // A listed value the edit removed.
-        let edited = OTHER.replace("'drop'", "'keep'");
-        let carry = other(&edited, &replaced(11));
-        assert!(carry.answer.dispatch_tables.is_empty());
+    }
+
+    fn dispatch_not_carried(carry: &FileCarry) -> bool {
+        carry.answer.dispatch_tables.is_empty()
+            && carry
+                .not_carried
+                .contains(&"other.ts not_carried_dispatch_tables".to_string())
+    }
+
+    #[test]
+    fn a_case_label_added_inside_the_switch_is_not_carried() {
+        let edited = OTHER.replace(
+            "    case 'drop':",
+            "    case 'move':\n      return 3;\n    case 'drop':",
+        );
+        let hunks = vec![Hunk {
+            old_start: 10,
+            old_count: 0,
+            new_start: 11,
+            new_count: 2,
+        }];
+        assert!(dispatch_not_carried(&other(&edited, &hunks)));
+    }
+
+    #[test]
+    fn an_edit_below_the_switch_is_not_carried_by_design() {
+        // Conservative: the switch's end is not known, so any hunk at or below
+        // its line refuses the carry, even one after the closing brace.
+        let edited = format!("{OTHER}// tail\n");
+        let hunks = vec![Hunk {
+            old_start: 14,
+            old_count: 0,
+            new_start: 15,
+            new_count: 1,
+        }];
+        assert!(dispatch_not_carried(&other(&edited, &hunks)));
     }
 
     #[test]
