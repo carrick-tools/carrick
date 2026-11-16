@@ -113,6 +113,8 @@ export {
   graphqlComparandLeafRule,
   graphqlComparandRule,
   graphqlExpectedRule,
+  graphqlFieldResolverDeclarations,
+  graphqlFieldResolverRule,
   graphqlGenericDeclarations,
   graphqlLeafWalkDeclarations,
   graphqlScalarWireRule,

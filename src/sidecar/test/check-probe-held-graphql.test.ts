@@ -16,7 +16,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildProbe, jsonWireDeclarations, jsonWireRule, judgeTolerances } from '../src/capture/check-probe.js';
+import {
+  buildProbe,
+  graphqlFieldResolverDeclarations,
+  graphqlFieldResolverRule,
+  jsonWireDeclarations,
+  jsonWireRule,
+  judgeTolerances,
+} from '../src/capture/check-probe.js';
 import { runCheck } from '../src/capture/index.js';
 import { heldGraphql, heldWire } from '../src/held-shadow.js';
 import type { CheckPairSpec, CheckStubInput, CheckVerdict } from '../src/capture/api.js';
@@ -42,6 +49,26 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
 
   it('the golden file holds exactly the fixed specs', () => {
     assert.deepEqual(Object.keys(GOLDEN).sort(), FIXED_SPECS.map((s) => s.pair_key).sort());
+  });
+
+  it('the record-field rule (carrick#1875) follows the wire line in every scalar-form probe', () => {
+    const rule = [
+      ...graphqlFieldResolverDeclarations(''),
+      `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
+      'type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;',
+    ].join('\n');
+    for (const key of Object.keys(GOLDEN)) {
+      if (key.startsWith('scalar-')) assert.ok(GOLDEN[key].endsWith(`const expectedWire: GqlExpected = sentWire;\n${rule}\n`), key);
+      else assert.ok(!GOLDEN[key].includes('GqlSdlFilled'), key);
+    }
+  });
+
+  it('the record-field rule names only prefixed declarations under a prefix', () => {
+    const text = [
+      ...graphqlFieldResolverDeclarations('__carrick_'),
+      graphqlFieldResolverRule('W', 'X', 'L', '__carrick_'),
+    ].join('\n');
+    assert.deepEqual(text.match(/(?<!__carrick_)\bGql\w+/g), null);
   });
 });
 
