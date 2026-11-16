@@ -679,3 +679,68 @@ test("switch off: nothing is asked, no early answer is filed", async (t) => {
   assert.equal(live.requests.length, 0);
   assert.ok(!names(ws, "s4").some((n) => n.includes(".early.")), names(ws, "s4").join(" "));
 });
+
+// L-G1b (P11, measured at step 0): part 2 states a GraphQL resolver as a route
+// item, `method` the operation kind and `path` the root field, with the
+// resolver's line and no `direction`. The early GraphQL line joins it by label.
+
+const gqlLine = (root: string, file: string, over: Partial<HeldLine> = {}): HeldLine => ({
+  row_key: "contract::gateway::src/resolvers.ts::producer::QUERY order::0",
+  group: 0,
+  label: "QUERY order",
+  consumer: "web",
+  file: "src/resolvers.ts",
+  line: 9,
+  message: "Type 'string' is not assignable to type 'O0_0'.",
+  row_file: "src/resolvers.ts",
+  row_line: 6,
+  row_path: path.join(root, file),
+  places: [{ service: "web", file: "src/order.ts", line: 4 }],
+  expected: "{ order: { id: string; } | null; }",
+  ...over,
+});
+
+/** Part 2's item for a resolver, in the shape step 0 read. */
+const gqlItem = (verdict: CheckItem["verdict"]): CheckItem => ({ kind: "route", method: "QUERY", path: "order", line: 6, source: "fact", verdict });
+
+test("GraphQL: the early QUERY item joins part 2's resolver item by label: same break, compatible (one correction), not checked (stands)", async () => {
+  const { earlyResult } = await import("../src/held/early.ts");
+  const { compareEarly, itemLabel } = await import("../src/hook/confirm.ts");
+  const root = fs.realpathSync(os.tmpdir());
+  const early = earlyResult({ file: path.join(root, "src/resolvers.ts"), root }, [gqlLine(root, "src/resolvers.ts")]);
+  const item = early.items![0]!;
+  assert.deepEqual([item.method, item.path, itemLabel(item), item.line], ["QUERY", "order", "QUERY order", 6]);
+  assert.equal(item.expected_type, "{ order: { id: string; } | null; }");
+  const full = (verdict: CheckItem["verdict"]): CheckResult => ({ schema: "carrick.check/0", file: "src/resolvers.ts", items: [gqlItem(verdict)], recheck: { ran: "extraction+types", elapsed_ms: 1 } });
+  assert.equal(compareEarly(early, full({ state: "resolved", result: "type_mismatch" })).rows[0]?.outcome, "same");
+  const fixed = compareEarly(early, full({ state: "resolved", result: "compatible" })).rows[0]!;
+  assert.deepEqual([fixed.outcome, fixed.corrected], ["differ", true]);
+  const open = compareEarly(early, full({ state: "not_checked", result: null })).rows[0]!;
+  assert.deepEqual([open.outcome, open.p2_state], ["part3_only", "not_judged"]);
+});
+
+test("GraphQL: a break on a resolver in another file is a moved row that joins part 2's moved row by file and label", async () => {
+  const { earlyResult } = await import("../src/held/early.ts");
+  const { compareEarly } = await import("../src/hook/confirm.ts");
+  const root = fs.realpathSync(os.tmpdir());
+  const early = earlyResult({ file: path.join(root, "src/types.ts"), root }, [gqlLine(root, "src/resolvers.ts")]);
+  const moved = early.recheck!.moved![0]!;
+  assert.deepEqual([moved.file, moved.method, moved.path, moved.after], ["src/resolvers.ts", "QUERY", "order", "type_mismatch"]);
+  const full: CheckResult = { schema: "carrick.check/0", file: "src/types.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 1, moved: [{ ...moved, reason: "part 2" }] } };
+  assert.equal(compareEarly(early, full).rows[0]?.outcome, "same");
+});
+
+test("GraphQL through the hook: the early QUERY break prints once through the one renderer; part 2 calling it compatible corrects it once", async (t) => {
+  const query = (ws: Ws): HeldLine =>
+    broken(ws, { row_key: "contract::api::src/tasks.ts::producer::QUERY task::0", label: "QUERY task", message: "Type 'string' is not assignable to type 'O0_0'." });
+  const item = (verdict: CheckItem["verdict"]): CheckItem => ({ kind: "route", method: "QUERY", path: "task", line: 2, source: "fact", counterparts: [{ role: "consumer", service: "ext", file: "src/view4.ts", line: 4 }], verdict });
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [query(ws)]);
+  const first = context((await edit(ws, "eg1", part2(ws, [item({ state: "resolved", result: "compatible" })]))).stdout);
+  assert.ok(first.includes("route QUERY task type_mismatch: Type 'string' is not assignable to type the type it expects."), first);
+  assert.ok(!/__C|\bsend\d|\bO\d/.test(first), first);
+  await settled(ws, "eg1");
+  const next = await carrier(ws, "eg1");
+  assert.equal(next.split("\n").filter((line) => line.includes("found QUERY task compatible")).length, 1, next);
+  assert.equal(record(ws)?.held, "differ");
+});
