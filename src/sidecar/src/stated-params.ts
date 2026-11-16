@@ -515,6 +515,25 @@ export class StatedParams {
     return payload ?? 'none';
   }
 
+  /**
+   * Whether the type has a member the server labels name as a send or a set:
+   * the shape of a reply object (a response, a context that replies). Read
+   * from declarations, never from names.
+   */
+  holdsReplyMember(type: Type): boolean {
+    if (this.labels.sends.size === 0 && this.labels.sets.size === 0) return false;
+    return type.getProperties().some((property) => {
+      const declarations = (property.getDeclarations() ?? []).map((d) => d.compilerNode);
+      return this.sendSlotOf(declarations) !== undefined || this.setSlotOf(declarations) !== undefined;
+    });
+  }
+
+  /** Whether the symbol is a member the server labels name as a request body. */
+  isBodyMember(symbol: TsSymbol | undefined): boolean {
+    if (!symbol || this.labels.bodies.size === 0) return false;
+    return (symbol.getDeclarations() ?? []).some((d) => this.labels.bodies.has(declarationKey(d.compilerNode)));
+  }
+
   /** The payload slot a labelled send member takes, by any of its declarations. */
   private sendSlotOf(declarations: readonly ts.Node[]): ClaimSlot | undefined {
     for (const declaration of declarations) {

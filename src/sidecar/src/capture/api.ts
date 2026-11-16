@@ -258,6 +258,10 @@ export type SelfCheckOutcome = 'ok' | 'allowlisted_external' | 'decayed_internal
  *    located argument is a call's request config and does not set the member
  *    the call takes its body from, so the call sends no body
  *    (carrick-cloud#1366).
+ *  - `reply_state`: the located request read is a member of the server's reply
+ *    object (its locals), state the server's own code keeps there and not what
+ *    a caller sends, so no request body contract is published
+ *    (carrick#4690).
  *  - `projected_value_only`: every read of a call's result takes a member out
  *    of it and none reads the value itself, so the site states a part of a
  *    payload rather than the payload a caller receives (carrick#1375).
