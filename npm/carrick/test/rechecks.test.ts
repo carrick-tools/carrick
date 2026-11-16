@@ -11,12 +11,14 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   answerInHand,
+  askForward,
   CHANGED_BUDGET_MS,
   claimDelivery,
   enqueue,
   enqueueChanged,
   ensureRunner,
   finishedFor,
+  forwardRequestPath,
   lockPath,
   pendingFor,
   queueDir,
@@ -81,6 +83,43 @@ test("a lock naming a dead pid is replaced and one runner starts", () => {
     // The holder (this process) is alive and fresh: no second runner.
     assert.equal(ensureRunner(s.root, { start }), false);
     assert.equal(started.length, 1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a hosted move is run by the runner under its lock, after the queued re-checks", async () => {
+  const s = scratch();
+  try {
+    const now = Date.now();
+    enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
+    const started: string[][] = [];
+    // The hook's side: the request, and a runner started under the hook's claim.
+    assert.equal(askForward(s.root, { now, start: (_command, args) => void started.push(args) }), true);
+    assert.equal(started.length, 1);
+    assert.ok(fs.existsSync(forwardRequestPath(s.root)));
+    let heldDuringMove = false;
+    const moveEnv = env(s);
+    await runQueue(s.root, {
+      env: moveEnv,
+      home: s.home,
+      spawner: process.pid,
+      afterRelease: () => {
+        // The move ran before the lock went.
+        heldDuringMove = calls(s.log).includes("--hosted-only");
+      },
+    });
+    assert.deepEqual(calls(s.log), ["a.ts", "--hosted-only"]);
+    assert.equal(heldDuringMove, true);
+    const move = fs
+      .readFileSync(s.log, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => (JSON.parse(line) as { argv: string[] }).argv)
+      .find((argv) => argv.includes("--hosted-only"));
+    assert.deepEqual(move, ["refresh", "--hosted-only", "--workspace", s.root]);
+    assert.equal(fs.existsSync(forwardRequestPath(s.root)), false);
+    assert.equal(fs.existsSync(lockPath(s.root)), false);
   } finally {
     s.cleanup();
   }

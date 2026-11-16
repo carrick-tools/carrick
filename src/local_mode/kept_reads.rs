@@ -328,15 +328,22 @@ pub(super) fn keep(
 
 /// What `index` keeps once it has written its blobs and its index: the reads
 /// of every repo it holds, and the ranker.
-pub(super) fn keep_index(workspace: &Workspace, generation: &str, paths: &[PathBuf]) {
+pub(super) fn keep_index(workspace: &Workspace, index: &super::read_model::LocalIndex) {
     let Some(before) = Inputs::now(workspace) else {
         return;
     };
-    let Ok(held) = Held::read(workspace) else {
+    let Ok(held) = Held::read(workspace, index) else {
         return;
     };
-    let built = Built::of(&held, paths);
-    keep(workspace, generation, &before, &built.repos, &built.similar);
+    let paths: Vec<PathBuf> = index.repos.iter().map(|r| PathBuf::from(&r.path)).collect();
+    let built = Built::of(&held, &paths);
+    keep(
+        workspace,
+        &index.indexed_at,
+        &before,
+        &built.repos,
+        &built.similar,
+    );
 }
 
 /// Write `value` whole: to a name of its own, then renamed over `path`, so a

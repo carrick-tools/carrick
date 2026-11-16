@@ -675,47 +675,16 @@ impl Reader {
             if now.is_empty() && held.is_empty() {
                 continue;
             }
-            // A push scan rescans only the services the push reached, so one
-            // repo's services can sit at several commits of one line: the
-            // newest stands for the repo when it holds every other.
-            let repo = path.to_string_lossy();
-            let (Some(to), Some(from)) = (newest_commit(&repo, &now), newest_commit(&repo, &held))
-            else {
-                return (
-                    Forward::Kept(format!(
-                        "{name}: the hosted index or this machine's copy spans commits that are \
-                         not one line of history"
-                    )),
-                    None,
-                );
-            };
-            if now == held {
-                approved.insert(path.clone(), now);
-                continue;
+            match may_move(path, name, &held, &now) {
+                Err(reason) => return (Forward::Kept(reason), None),
+                Ok(None) => {
+                    approved.insert(path.clone(), now);
+                }
+                Ok(Some(to)) => {
+                    approved.insert(path.clone(), now);
+                    moved.push((path.clone(), to));
+                }
             }
-            let head = crate::git_state::head_commit(&repo).unwrap_or_default();
-            if !crate::git_state::is_ancestor(&repo, &to, &head) {
-                return (
-                    Forward::Kept(format!(
-                        "{name}: the hosted index is at {}, which this checkout's HEAD does not \
-                         hold",
-                        short(&to)
-                    )),
-                    None,
-                );
-            }
-            if !crate::git_state::is_ancestor(&repo, &from, &to) {
-                return (
-                    Forward::Kept(format!(
-                        "{name}: the hosted index at {} does not descend from {}",
-                        short(&to),
-                        short(&from)
-                    )),
-                    None,
-                );
-            }
-            approved.insert(path.clone(), now);
-            moved.push((path.clone(), to));
         }
         if moved.is_empty() {
             return (Forward::Current, None);
@@ -759,6 +728,50 @@ impl Reader {
     }
 }
 
+/// Whether one repo's copy may move from the commits it holds (`held`) to
+/// `now`: the one rule every move of this machine's copy is decided by
+/// ([`Reader::forward`], and [`heal`] for a local index left behind its
+/// snapshot). `Ok(None)` when the two are the same, `Ok(Some(commit))` with
+/// the commit it moves to, and `Err` with the reason it may not.
+///
+/// A push scan rescans only the services the push reached, so one repo's
+/// services can sit at several commits of one line: the newest stands for
+/// the repo when it holds every other. The move is only forward along HEAD's
+/// history: the newest of `now` must hold the newest of `held` and be held by
+/// HEAD.
+fn may_move(
+    path: &Path,
+    name: &str,
+    held: &std::collections::BTreeSet<String>,
+    now: &std::collections::BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    let repo = path.to_string_lossy();
+    let (Some(to), Some(from)) = (newest_commit(&repo, now), newest_commit(&repo, held)) else {
+        return Err(format!(
+            "{name}: the hosted index or this machine's copy spans commits that are not one \
+             line of history"
+        ));
+    };
+    if now == held {
+        return Ok(None);
+    }
+    let head = crate::git_state::head_commit(&repo).unwrap_or_default();
+    if !crate::git_state::is_ancestor(&repo, &to, &head) {
+        return Err(format!(
+            "{name}: the hosted index is at {}, which this checkout's HEAD does not hold",
+            short(&to)
+        ));
+    }
+    if !crate::git_state::is_ancestor(&repo, &from, &to) {
+        return Err(format!(
+            "{name}: the hosted index at {} does not descend from {}",
+            short(&to),
+            short(&from)
+        ));
+    }
+    Ok(Some(to))
+}
+
 /// The commit of `commits` that holds every other one in its history, or
 /// `None` when there is none (the set is empty, or spans two lines). The rule
 /// the release kit's preflight reads a multi-commit hosted index by.
@@ -792,10 +805,37 @@ pub(super) enum Forward {
 
 /// Move this machine's copy of the hosted index forward to the one the cloud
 /// holds now, when that one is further along HEAD's history
-/// ([`Reader::forward`]). Writes only `.carrick/hosted/snapshot.json`: no
-/// scan, no join, no model. Run by `carrick refresh --hosted-only`, which the
-/// session-start hook starts in the background.
+/// ([`Reader::forward`]), and rebuild the local read model from the moved
+/// copy in the same run, so every reader takes one generation: no scan, no
+/// model, no second download ([`super::index::Pass::Forwarded`]). Run by
+/// `carrick refresh --hosted-only`, which the hooks start in the background
+/// under the re-check runner's lock.
+///
+/// First, with no network, it heals a local index left behind its snapshot
+/// ([`heal`]).
 pub(super) fn forward(workspace: &Workspace) -> Forward {
+    forward_with(workspace, &|moved| {
+        super::index::run(
+            workspace,
+            None,
+            &super::index::Pass::Forwarded(moved.iter().cloned().collect()),
+        )
+        .map(|_| ())
+    })
+}
+
+/// What a rebuild that failed records: the move did not happen.
+fn not_rebuilt(reason: &str) -> Forward {
+    Forward::Kept(format!(
+        "the local index could not be rebuilt from the moved copy: {reason}"
+    ))
+}
+
+/// [`forward`] with the rebuild handed in, so a test can make it fail.
+fn forward_with(
+    workspace: &Workspace,
+    rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
+) -> Forward {
     let (remotes, _) = origins_of(workspace);
     let credential = match Credential::load() {
         Ok(Some(credential)) => credential,
@@ -805,6 +845,7 @@ pub(super) fn forward(workspace: &Workspace) -> Forward {
     let Some(old) = read_snapshot(workspace, &credential) else {
         return Forward::Kept("this machine holds no hosted index to move".into());
     };
+    let healed = heal(workspace, &remotes, &old, rebuild);
     let result = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -816,20 +857,27 @@ pub(super) fn forward(workspace: &Workspace) -> Forward {
     .join()
     .unwrap_or_else(|_| Err("Hosted reader failed".into()));
     let (outcome, synced) = match result {
-        Ok((Forward::Moved(moved), Some(snapshot), synced)) => {
-            match persist(
+        Ok((Forward::Moved(moved), Some(snapshot), synced)) => (
+            move_and_rebuild(
                 &workspace.index_dir().join("hosted/snapshot.json"),
                 &snapshot,
-            ) {
-                Ok(()) => (Forward::Moved(moved), synced),
-                Err(reason) => (Forward::Kept(reason), synced),
-            }
-        }
+                moved,
+                rebuild,
+            ),
+            synced,
+        ),
         Ok((Forward::Moved(_), None, synced)) => {
             (Forward::Kept("no snapshot to write".into()), synced)
         }
         Ok((outcome, _, synced)) => (outcome, synced),
         Err(reason) => (Forward::Kept(reason), None),
+    };
+    // A heal is a move of the read model to the snapshot already held, so it
+    // is what this run did when the cloud had nothing newer.
+    let outcome = match (outcome, healed) {
+        (Forward::Current, Some(Ok(moved))) => Forward::Moved(moved),
+        (Forward::Current, Some(Err(reason))) => not_rebuilt(&reason),
+        (outcome, _) => outcome,
     };
     // Only a run the cloud answered says where the hosted index stands; any
     // other keeps the last record, whose own time says how old it is.
@@ -838,6 +886,101 @@ pub(super) fn forward(workspace: &Workspace) -> Forward {
         let _ = record.write(&workspace.index_dir().join(SYNC_RECORD));
     }
     outcome
+}
+
+/// Write the moved snapshot, then rebuild the read model from it. A rebuild
+/// that fails puts the old snapshot bytes back, so the snapshot and the read
+/// model never split: the move is kept, with the rebuild's reason.
+fn move_and_rebuild(
+    path: &Path,
+    snapshot: &Snapshot,
+    moved: Vec<(PathBuf, String)>,
+    rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
+) -> Forward {
+    let old = std::fs::read(path).ok();
+    if let Err(reason) = persist(path, snapshot) {
+        return Forward::Kept(reason);
+    }
+    let paths: Vec<PathBuf> = moved.iter().map(|(path, _)| path.clone()).collect();
+    match rebuild(&paths) {
+        Ok(()) => Forward::Moved(moved),
+        Err(reason) => {
+            if let Some(old) = old {
+                let _ = put_back(path, &old);
+            }
+            not_rebuilt(&reason)
+        }
+    }
+}
+
+/// `bytes` back at `path`, whole, with the snapshot's own permissions.
+fn put_back(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = path.parent().ok_or("Invalid hosted cache directory")?;
+    let pending = dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&pending).map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&pending, path).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(pending);
+    result
+}
+
+/// Rebuild a local index left behind the snapshot it should read, with no
+/// network: where `index.json`'s commits for a repo differ from the
+/// snapshot's and [`may_move`] lets the copy move from the first to the
+/// second, for every such repo. `None` when nothing differs or a repo may not
+/// move (the network move then decides), otherwise the rebuild's outcome.
+///
+/// Before the move rebuilt the read model, a move wrote only the snapshot, so
+/// a workspace can hold an index at one commit and a snapshot at a later one.
+fn heal(
+    workspace: &Workspace,
+    remotes: &BTreeMap<PathBuf, String>,
+    snapshot: &Snapshot,
+    rebuild: &dyn Fn(&[PathBuf]) -> Result<(), String>,
+) -> Option<Result<Vec<(PathBuf, String)>, String>> {
+    let index = super::read_model::LocalIndex::read(&workspace.index_file()).ok()?;
+    let input = HostedInput {
+        snapshot: Some(snapshot.clone()),
+        remotes: remotes.clone(),
+        ..Default::default()
+    };
+    let mut moved: Vec<(PathBuf, String)> = Vec::new();
+    for (path, name) in remotes {
+        let built: std::collections::BTreeSet<String> = index
+            .repos
+            .iter()
+            .filter(|repo| Path::new(&repo.path) == path)
+            .flat_map(|repo| repo.services.iter().map(|service| service.commit.clone()))
+            .collect();
+        let held: std::collections::BTreeSet<String> = input
+            .local_blobs(path)
+            .into_iter()
+            .map(|blob| blob.commit_hash)
+            .collect();
+        if built.is_empty() || held.is_empty() || built.contains("") {
+            continue;
+        }
+        match may_move(path, name, &built, &held) {
+            Err(_) => return None,
+            Ok(None) => {}
+            Ok(Some(to)) => moved.push((path.clone(), to)),
+        }
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    let paths: Vec<PathBuf> = moved.iter().map(|(path, _)| path.clone()).collect();
+    Some(rebuild(&paths).map(|()| moved))
 }
 
 /// Where [`forward`] records what it found, under the index directory. Small,
@@ -3347,6 +3490,51 @@ mod tests {
         assert!(matches!(outcome, Forward::Kept(_)), "{outcome:?}");
         assert!(snapshot.is_none());
         assert_eq!(requests.join().unwrap().len(), 1, "it downloaded anyway");
+    }
+
+    /// A move writes the snapshot and then rebuilds the read model from it.
+    /// A rebuild that fails puts the old snapshot bytes back and keeps the
+    /// move with the rebuild's reason, so the two never read two generations
+    /// (READY-A2 P4).
+    #[test]
+    fn a_rebuild_that_fails_puts_the_old_snapshot_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosted/snapshot.json");
+        persist(&path, &held_at("a")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let repo = dir.path().join("api");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let outcome = move_and_rebuild(
+            &path,
+            &held_at("b"),
+            vec![(repo.clone(), "b".to_string())],
+            &|paths| {
+                asked.borrow_mut().push(paths.to_vec());
+                Err("the join failed".into())
+            },
+        );
+        assert_eq!(
+            outcome,
+            Forward::Kept(
+                "the local index could not be rebuilt from the moved copy: the join failed".into()
+            )
+        );
+        assert_eq!(asked.into_inner(), vec![vec![repo.clone()]]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // And one that succeeds leaves the moved snapshot in place.
+        let outcome = move_and_rebuild(
+            &path,
+            &held_at("b"),
+            vec![(repo.clone(), "b".to_string())],
+            &|_| Ok(()),
+        );
+        assert_eq!(outcome, Forward::Moved(vec![(repo, "b".to_string())]));
+        let written: Snapshot = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&written).unwrap(),
+            serde_json::to_value(held_at("b")).unwrap()
+        );
     }
 
     /// A checkout behind the hosted commit keeps the copy, and the answer says

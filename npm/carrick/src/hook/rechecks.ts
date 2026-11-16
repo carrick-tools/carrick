@@ -23,7 +23,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { binary, check, checkChanged } from "../cli.ts";
+import { binary, check, checkChanged, refreshHostedOnly } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import {
@@ -183,6 +183,10 @@ export function takenDir(root: string, pid: number): string {
 }
 export function lockPath(root: string): string {
   return path.join(rechecksDir(root), "runner.lock");
+}
+/** Where a hook asks the runner for a hosted move (`askForward`). */
+export function forwardRequestPath(root: string): string {
+  return path.join(rechecksDir(root), "forward.request");
 }
 
 /** `<id>.recheck.<seq>.<kind>` in the sessions directory, or null for an unusable id. */
@@ -506,6 +510,34 @@ export function ensureRunner(root: string, options: EnsureOptions = {}): boolean
   return true;
 }
 
+/**
+ * Ask for `carrick refresh --hosted-only`, which the runner runs under its
+ * lock between re-checks (READY-A2 P11): the move rebuilds `.carrick/repos`,
+ * `judged/` and `working/`, which every re-check reads, so it never runs
+ * beside one. Starts a runner when none is alive; a live one takes the request
+ * before it releases the lock. Returns whether a runner was started.
+ */
+export function askForward(root: string, options: EnsureOptions = {}): boolean {
+  const now = options.now ?? Date.now();
+  fs.mkdirSync(rechecksDir(root), { recursive: true });
+  writeAtomic(forwardRequestPath(root), `${new Date(now).toISOString()}\n`);
+  return ensureRunner(root, options);
+}
+
+/**
+ * Take the move's request, once. `stuck` is a request this runner cannot
+ * remove: it is not run, and not waited for again, so the runner never spins
+ * on it.
+ */
+function takeForward(root: string): "taken" | "none" | "stuck" {
+  try {
+    fs.unlinkSync(forwardRequestPath(root));
+    return "taken";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "none" : "stuck";
+  }
+}
+
 // --- the runner ------------------------------------------------------------
 
 export type RunOptions = {
@@ -676,6 +708,9 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
   // that refuses the rename): answered once, then left alone for its life.
   const unclaimable = new Set<string>();
   const waiting = () => names(queueDir(root)).filter((name) => !unclaimable.has(name.replace(/\.json$/, "")));
+  // A move request this runner could not remove, the same way: left alone.
+  let forwardStuck = false;
+  const forwardWaiting = () => !forwardStuck && fs.existsSync(forwardRequestPath(root));
   for (;;) {
     recoverTaken(root, pid, clock(), options.home);
     for (;;) {
@@ -740,11 +775,32 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       });
       remove(taken);
     }
+    // A hosted move asked for (`askForward`), run while this runner holds the
+    // lock and no re-check is reading; edits queued while it runs are taken
+    // before the lock goes.
+    const asked = forwardStuck ? "none" : takeForward(root);
+    if (asked === "stuck") {
+      forwardStuck = true;
+      log("the hosted move's request could not be taken", forwardRequestPath(root));
+    }
+    if (asked === "taken") {
+      const keep = setInterval(() => touchLock(lockPath(root), pid, clock()), LOCK_TOUCH_MS);
+      const moved = await refreshHostedOnly({
+        cwd: root,
+        workspace: root,
+        limitMs: CHANGED_BUDGET_MS + CALL_SLACK_MS,
+        env: changedEnv,
+        bin,
+      });
+      clearInterval(keep);
+      if (moved.failure) log("the hosted move failed", moved.failure);
+      continue;
+    }
     releaseLock(lockPath(root), pid);
     await options.afterRelease?.();
     // Anything queued between the last look and the release would otherwise
     // wait for the next hook to notice: look once more, and go on if so.
-    if (waiting().length === 0) return;
+    if (waiting().length === 0 && !forwardWaiting()) return;
     if (!takeLock(lockPath(root), pid, clock(), cap)) return;
   }
 }

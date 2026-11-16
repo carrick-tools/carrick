@@ -18,6 +18,7 @@ import {
   refreshInBackground,
 } from "../src/hook/refresh.ts";
 import { STATUS_SCHEMA, type StatusResult, type StatusService } from "../src/contract.ts";
+import { forwardRequestPath } from "../src/hook/rechecks.ts";
 
 function statusWith(
   states: Array<StatusService["hosted_state"]>,
@@ -203,13 +204,15 @@ test("a workspace reading a hosted index moves it forward in the background, onc
     const env = { CARRICK_BIN: "carrick" };
     const now = Date.parse("2026-10-27T09:00:00Z");
     assert.equal(forwardInBackground(root, statusWith(["enriched"]), { now, start, env }), true);
-    assert.deepEqual(started, [
-      {
-        command: "carrick",
-        args: ["refresh", "--hosted-only", "--workspace", root],
-        env: { CARRICK_BIN: "carrick", CARRICK_NO_KEEP_AWAKE: "1" },
-      },
-    ]);
+    // The move is asked of the re-check runner, which runs it under its lock
+    // (READY-A2 P11): the request is written and the runner started, never
+    // the binary on its own.
+    assert.equal(started.length, 1);
+    assert.equal(started[0]!.command, process.execPath);
+    assert.match(started[0]!.args[0]!, /recheck-run\.(ts|js)$/);
+    assert.equal(started[0]!.args[1], root);
+    assert.equal(started[0]!.env["CARRICK_NO_KEEP_AWAKE"], "1");
+    assert.ok(fs.existsSync(forwardRequestPath(root)));
     assert.ok(fs.existsSync(markerPath(root, FORWARD_MARKER)));
     // Inside the cooldown, nothing.
     assert.equal(

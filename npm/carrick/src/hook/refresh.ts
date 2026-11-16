@@ -31,6 +31,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { binary } from "../cli.ts";
 import type { StatusResult } from "../contract.ts";
+import { askForward } from "./rechecks.ts";
 
 /** Default gap between unattended refreshes of one workspace. */
 export const REFRESH_COOLDOWN_MS = 60 * 60_000;
@@ -179,8 +180,9 @@ export function refreshInBackground(
 // one-line edit re-read the whole repository.
 // `carrick refresh --hosted-only` moves this machine's copy of the hosted index to the cloud's newer one when
 // that commit is in HEAD's history: one metadata request, a download only when
-// it moves, no scan. Detached like the refresh above, and silent: nothing is
-// waiting on it, and the next check simply starts from the newer base.
+// it moves, and a rebuild of the local read model from the moved copy, no scan.
+// The re-check runner runs it in the background under its lock, and silent:
+// nothing is waiting on it, and the next check simply starts from the newer base.
 
 /**
  * Default gap between two background moves of one workspace: shorter than the
@@ -198,9 +200,9 @@ export function readsHostedIndex(status: StatusResult): boolean {
 }
 
 /**
- * Start a background `carrick refresh --hosted-only` when this workspace reads
- * a hosted index and has not asked within the cooldown. Prints nothing:
- * returns whether it started.
+ * Ask the re-check runner for a background `carrick refresh --hosted-only`
+ * when this workspace reads a hosted index and has not asked within the
+ * cooldown. Prints nothing: returns whether it asked.
  */
 export function forwardInBackground(
   root: string,
@@ -212,10 +214,8 @@ export function forwardInBackground(
   if (!readsHostedIndex(status)) return false;
   const cooldown = cooldownMs(env, "CARRICK_FORWARD_COOLDOWN_MS", FORWARD_COOLDOWN_MS);
   if (!claimRefresh(markerPath(root, FORWARD_MARKER), now, cooldown)) return false;
-  (options.start ?? startDetached)(
-    binary(env),
-    ["refresh", "--hosted-only", "--workspace", root],
-    { ...env, CARRICK_NO_KEEP_AWAKE: "1" },
-  );
+  // The move rebuilds the read model every re-check reads, so the re-check
+  // runner runs it under its own lock (READY-A2 P11).
+  askForward(root, { env, now, ...(options.start ? { start: options.start } : {}) });
   return true;
 }
