@@ -1074,11 +1074,12 @@ impl Copies {
     ///
     /// A copy is kept only when the service's own edits are what they were
     /// before the scan: an edit made while it ran, then undone, would leave a
-    /// copy labelled with the undone digest and holding the edit. A written
-    /// service with edits of its own that the scan did not analyse (a
-    /// consumer whose pair outcomes it moved) loses its copy: the copy is
-    /// older than what this scan wrote for it. Either way the next check
-    /// re-scans the service.
+    /// copy labelled with the undone digest and holding the edit; then the
+    /// service's copy goes. A written service with edits of its own that the
+    /// scan did not analyse (a consumer whose pair outcomes it moved) keeps
+    /// its copy marked not whole: it is older than what this scan wrote for
+    /// it, so it never stands in for a re-scan ([`current_copy`]), and the
+    /// next re-check still judges against it as its last re-check left it.
     fn keep(
         &self,
         workspace: &Workspace,
@@ -1105,7 +1106,14 @@ impl Copies {
             let Some(digest) = self.digests.get(&id) else {
                 continue;
             };
-            if !analysed.contains(&id) || after.get(&id) != Some(digest) {
+            if !analysed.contains(&id) {
+                if let Some(mut older) = read_working(workspace, &self.generation, &id, digest) {
+                    older.whole = false;
+                    keep_working(workspace, &self.generation, &older);
+                }
+                continue;
+            }
+            if after.get(&id) != Some(digest) {
                 forget_working(workspace, &self.generation, &id);
                 continue;
             }
@@ -3657,23 +3665,32 @@ mod tests {
 
     /// PR #4634 review, B4: the re-check of `web` also writes `api` (its join moved
     /// `api`'s pair outcomes) without analysing it. `api`'s copy from its own
-    /// earlier re-check is older than that, so it goes and nothing stands in
-    /// for `api`.
+    /// earlier re-check is older than that: it is kept, for the re-check to
+    /// judge against, but marked not whole, so no copy-only answer reads it.
     #[test]
-    fn a_written_edited_service_the_scan_did_not_analyse_loses_its_copy() {
+    fn a_written_edited_service_the_scan_did_not_analyse_keeps_a_copy_that_never_stands_in() {
         let two = two_services(None);
         two.write("api/a.ts", "export const a = 2;\n");
         two.write("web/b.ts", "export const b = 2;\n");
         let copies = two.copies();
         two.keep_copy(&copies, "api", Vec::new());
-        assert!(two.kept(&copies, "api").is_some(), "api's own copy");
+        let api = ["api".to_string()];
+        assert!(
+            copies.current(&two.workspace, &api).is_some(),
+            "api's own copy stands in"
+        );
 
         copies.keep(
             &two.workspace,
             &[blob_of("web", "abc"), blob_of("api", "abc")],
             &["web".to_string()],
         );
-        assert!(two.kept(&copies, "api").is_none(), "api's older copy goes");
+        let older = two.kept(&copies, "api").expect("api's older copy is kept");
+        assert!(!older.whole, "marked not whole");
+        assert!(
+            copies.current(&two.workspace, &api).is_none(),
+            "so it stands in for no re-scan"
+        );
         assert!(two.kept(&copies, "web").is_some(), "web's is kept");
     }
 

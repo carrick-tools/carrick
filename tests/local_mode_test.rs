@@ -4518,6 +4518,50 @@ fn check_changed_rescans_when_the_join_settle_is_off_or_verifies() {
     assert!(!scanned, "with the settle on they do:\n{json:#}");
 }
 
+/// B8 (T5, B4): the consumer re-checked, then the producer route twice. The
+/// route's scan also writes the consumer without analysing it, so the
+/// consumer's copy is kept marked not whole: the route's next re-check still
+/// judges against it as its last re-check left it, and `--changed` gives no
+/// answer from it but re-scans.
+#[test]
+#[serial]
+fn a_consumer_rechecked_before_its_producer_is_still_judged_at_its_last_recheck() {
+    let workspace = monorepo_workspace();
+    let root = workspace.path();
+    index(root);
+    let consumer = "mono/inventory-svc/src/client.ts";
+    edit(
+        &root.join(consumer),
+        "export class CatalogClient",
+        "export const retries = 2;\n\nexport class CatalogClient",
+    );
+    drop_active_count(root);
+    sign_in(root, "one");
+
+    recheck_json(root, consumer, &AMPLE);
+    recheck_json(root, MONO_ROUTE, &AMPLE);
+    let third = recheck_json(root, MONO_ROUTE, &AMPLE);
+    let scope = &third["recheck"]["scope"];
+    let reason = scope["not_reread"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["service"] == "inventory-svc")
+        .map(|entry| entry["reason"].clone());
+    assert_eq!(
+        reason,
+        Some(serde_json::json!("judged at your last re-check of it")),
+        "{scope:#}"
+    );
+    assert_eq!(scope["stale"], serde_json::json!([]), "{scope:#}");
+
+    let (_, json, scanned) = changed_scanned(root, &[]);
+    assert!(
+        scanned,
+        "the not-whole copy stands in for no re-scan:\n{json:#}"
+    );
+}
+
 /// B8 (T5, B4): both services edited, the consumer re-checked before the
 /// producer. `--changed` answers as a cold check, whichever copies stand in.
 #[test]
