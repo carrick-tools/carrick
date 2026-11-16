@@ -5410,8 +5410,20 @@ fn a_named_handler_whose_body_changed_is_not_carried() {
     );
 }
 
-/// Point every stored blob at `commit`, as an index written elsewhere would be.
+/// Point every stored blob at `commit`, as an index written elsewhere would be:
+/// the blobs and the services `index.json` names for them, together, since a
+/// build writes both from one blob and a reader refuses the two disagreeing.
 fn stored_blobs_say_commit(root: &Path, commit: &str) {
+    let index_file = root.join(".carrick/index.json");
+    let mut index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&index_file).expect("read the index"))
+            .expect("the index is JSON");
+    for repo in index["repos"].as_array_mut().expect("repos") {
+        for service in repo["services"].as_array_mut().expect("services") {
+            service["commit"] = serde_json::json!(commit);
+        }
+    }
+    std::fs::write(&index_file, serde_json::to_vec(&index).expect("serialise")).expect("write");
     let dir = root.join(".carrick/repos");
     for entry in std::fs::read_dir(&dir).expect("read the stored blobs") {
         let path = entry.expect("dir entry").path();
