@@ -40,6 +40,9 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 ### check-pre-rendered-boundary.json :: renderPostToolUse
 (silent)
 
+### check-rebuilding.json :: renderPostToolUse
+(silent)
+
 ### check-silent.json :: renderPostToolUse
 (silent)
 
