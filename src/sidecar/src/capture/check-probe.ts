@@ -339,17 +339,130 @@ export function graphqlScalarDeclarations(
   reachable: Record<string, Record<string, unknown>>,
   rootLeaf: unknown
 ): string[] {
+  const [sent, ...walk] = graphqlLeafWalkDeclarations('');
+  return [
+    sent,
+    `type GqlTypes = ${JSON.stringify(reachable)};`,
+    `type GqlRootLeaf = ${JSON.stringify(rootLeaf)};`,
+    ...walk,
+  ];
+}
+
+/**
+ * The leaf walk's declarations without the two table lines, namespaced by
+ * `prefix` as `jsonWireDeclarations` is: `<p>GqlScalarSent`, `<p>GqlTypeOf`,
+ * `<p>GqlFieldOf` and `<p>GqlLeafSent`. They read `<p>GqlTypes`, the service's
+ * table, which the caller declares (once per file in the held check). The
+ * probe's `GqlScalarSent` comes first, then the three walk lines.
+ */
+export function graphqlLeafWalkDeclarations(prefix: string): string[] {
+  const p = prefix;
   const sent = Object.entries(GRAPHQL_SCALAR_SENT)
     .map(([name, type]) => `${name}: ${type}`)
     .join('; ');
   return [
-    `type GqlScalarSent = { ${sent} };`,
-    `type GqlTypes = ${JSON.stringify(reachable)};`,
-    `type GqlRootLeaf = ${JSON.stringify(rootLeaf)};`,
-    `type GqlTypeOf<F> = [F] extends [{ non_null: infer I }] ? GqlTypeOf<I> : [F] extends [{ type: infer T }] ? T : never;`,
-    `type GqlFieldOf<T, K> = [T] extends [never] ? unknown : [T] extends [keyof GqlTypes] ? ([K] extends [keyof GqlTypes[T]] ? GqlTypes[T][K] : unknown) : unknown;`,
-    `type GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlLeafSent<C[K], I, GqlDepth[D]> } : JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof GqlScalarSent ? GqlScalarSent[N] : JsonWire<C>) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlLeafSent<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } : JsonWire<C>) : JsonWire<C>) : JsonWire<C>;`,
+    `type ${p}GqlScalarSent = { ${sent} };`,
+    `type ${p}GqlTypeOf<F> = [F] extends [{ non_null: infer I }] ? ${p}GqlTypeOf<I> : [F] extends [{ type: infer T }] ? T : never;`,
+    `type ${p}GqlFieldOf<T, K> = [T] extends [never] ? unknown : [T] extends [keyof ${p}GqlTypes] ? ([K] extends [keyof ${p}GqlTypes[T]] ? ${p}GqlTypes[T][K] : unknown) : unknown;`,
+    `type ${p}GqlLeafSent<C, F, D extends number = 15> = [D] extends [never] ? ${p}JsonWire<C> : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlLeafSent<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlLeafSent<C[K], I, ${p}GqlDepth[D]> } : ${p}JsonWire<C>) : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : ${p}JsonWire<C>) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? ${p}JsonWire<C> : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: ${p}GqlLeafSent<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } : ${p}JsonWire<C>) : ${p}JsonWire<C>) : ${p}JsonWire<C>;`,
   ];
+}
+
+/**
+ * The comparison helpers every GraphQL line reads, namespaced by `prefix`:
+ * the envelope test (`<p>GqlPayloadOf`, `<p>GqlReadsOuter`), the `__typename`
+ * relax (`<p>GqlTypenameOptional`) and the depth bound they share. Ten
+ * declarations, in the order the probe writes them. The probe passes `''`,
+ * the held check `__carrick_`, so both read one text.
+ */
+export function graphqlGenericDeclarations(prefix: string): string[] {
+  const p = prefix;
+  return [
+    `type ${p}GqlObjLike<V> = [V] extends [readonly unknown[]] ? ([V] extends [readonly (infer E)[]] ? ([E] extends [readonly unknown[]] ? false : ([E] extends [object] ? true : false)) : false) : ([V] extends [object] ? true : false);`,
+    `type ${p}GqlIsUnion<T, U = T> = [T extends unknown ? ([U] extends [T] ? false : true) : never] extends [false] ? false : true;`,
+    `type ${p}GqlPayloadKeys<T> = { [K in keyof T]-?: [${p}GqlObjLike<T[K]>] extends [true] ? K : never }[keyof T];`,
+    `type ${p}GqlSingleKey<K> = [K] extends [never] ? never : ([${p}GqlIsUnion<K>] extends [false] ? K : never);`,
+    `type ${p}GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [${p}GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([${p}GqlSingleKey<${p}GqlPayloadKeys<S>>] extends [never] ? never : S[${p}GqlSingleKey<${p}GqlPayloadKeys<S>> & keyof S]) : never;`,
+    `type ${p}GqlNames<T> = T extends object ? keyof T : never;`,
+    `type ${p}GqlReadsOuter<S, E> = [Extract<Exclude<${p}GqlNames<S>, ${p}GqlNames<${p}GqlPayloadOf<S>>>, Exclude<${p}GqlNames<E>, '__typename'>>] extends [never] ? false : true;`,
+    `type ${p}GqlDepth = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];`,
+    `type ${p}GqlTypenameParts<T, D extends number> = { [K in keyof T as K extends '__typename' ? never : K]: ${p}GqlTypenameOptional<T[K], ${p}GqlDepth[D]> } & { [K in keyof T as K extends '__typename' ? K : never]?: T[K] };`,
+    `type ${p}GqlTypenameOptional<T, D extends number = 16> = [D] extends [never] ? T : T extends (...args: any[]) => any ? T : T extends object ? ('__typename' extends keyof T ? { [K in keyof ${p}GqlTypenameParts<T, D>]: ${p}GqlTypenameParts<T, D>[K] } : { [K in keyof T]: ${p}GqlTypenameOptional<T[K], ${p}GqlDepth[D]> }) : T;`,
+  ];
+}
+
+/**
+ * The consumer's reading with `__typename` optional (carrick#1759): the
+ * declared type itself whenever relaxing changes nothing observable.
+ */
+export function graphqlExpectedRule(expected: string, prefix: string): string {
+  return `[${prefix}GqlTypenameOptional<${expected}>] extends [${expected}] ? ${expected} : ${prefix}GqlTypenameOptional<${expected}>`;
+}
+
+/**
+ * The envelope unwrap: the payload under a single-payload envelope, else the
+ * sent type. `relaxed` is the text of `graphqlExpectedRule`'s result, a name
+ * in the probe and an application in the held check.
+ */
+export function graphqlComparandRule(
+  sent: string,
+  expected: string,
+  relaxed: string,
+  prefix: string
+): string {
+  const p = prefix;
+  return `[${sent}] extends [${relaxed}] ? ${sent} : ([${p}GqlPayloadOf<${sent}>] extends [never] ? ${sent} : [${p}GqlReadsOuter<${sent}, ${expected}>] extends [true] ? ${sent} : ${p}GqlPayloadOf<${sent}>)`;
+}
+
+/**
+ * The SDL leaf the comparand is declared as: the root's own, or, after an
+ * envelope unwrap, the envelope field's when the SDL declares it.
+ */
+export function graphqlComparandLeafRule(
+  sent: string,
+  expected: string,
+  relaxed: string,
+  rootLeaf: string,
+  prefix: string
+): string {
+  const p = prefix;
+  const field = `${p}GqlFieldOf<${p}GqlTypeOf<${rootLeaf}>, ${p}GqlSingleKey<${p}GqlPayloadKeys<${sent}>>>`;
+  return `[${sent}] extends [${relaxed}] ? ${rootLeaf} : ([${p}GqlPayloadOf<${sent}>] extends [never] ? ${rootLeaf} : [${p}GqlReadsOuter<${sent}, ${expected}>] extends [true] ? ${rootLeaf} : ([unknown] extends [${field}] ? ${rootLeaf} : ${field}))`;
+}
+
+/** The scalar form's wire line over the comparand (carrick#4403): each leaf as its scalar sends it. */
+export function graphqlScalarWireRule(
+  comparand: string,
+  relaxed: string,
+  leaf: string,
+  prefix: string
+): string {
+  const p = prefix;
+  return `[${comparand}] extends [${relaxed}] ? ${comparand} : (${p}JsonWireSame<${p}GqlLeafSent<${comparand}, ${leaf}>, ${comparand}> extends true ? ${comparand} : ${p}GqlLeafSent<${comparand}, ${leaf}>)`;
+}
+
+/**
+ * The field-resolver gate's filling (carrick#1875): every SDL-declared field
+ * the record lacks is typed `any`, since a resolver the check does not read
+ * supplies it. Reads `<p>GqlTypes`, `<p>GqlFieldOf` and `<p>GqlDepth`.
+ */
+export function graphqlSdlFilledDeclaration(prefix: string): string {
+  const p = prefix;
+  return `type ${p}GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C>]: any } : C) : C) : C;`;
+}
+
+/**
+ * Whether the verdict hangs on a field resolver (`sent:field_resolver`): the
+ * wire line fails and passes once the absent SDL fields are filled. The probe
+ * asserts it false; the held check answers silence where it is true.
+ */
+export function graphqlSdlDecidesRule(
+  wire: string,
+  relaxed: string,
+  leaf: string,
+  prefix: string
+): string {
+  return `[${wire}] extends [${relaxed}] ? false : [${prefix}GqlSdlFilled<${wire}, ${leaf}>] extends [${relaxed}] ? true : false`;
 }
 
 export function decisiveAssignmentLine(plan: ProbePlan): number {
@@ -548,27 +661,9 @@ export function buildProbe(
     //     types fail both its array and its object arm), and the comparand is
     //     re-gated below anyway — the v2 port of v1's comparand re-guard, so
     //     a payload decayed to a top type can never read compatible.
-    push(
-      `type GqlObjLike<V> = [V] extends [readonly unknown[]] ? ([V] extends [readonly (infer E)[]] ? ([E] extends [readonly unknown[]] ? false : ([E] extends [object] ? true : false)) : false) : ([V] extends [object] ? true : false);`
-    );
-    push(
-      `type GqlIsUnion<T, U = T> = [T extends unknown ? ([U] extends [T] ? false : true) : never] extends [false] ? false : true;`
-    );
-    push(
-      `type GqlPayloadKeys<T> = { [K in keyof T]-?: [GqlObjLike<T[K]>] extends [true] ? K : never }[keyof T];`
-    );
-    push(
-      `type GqlSingleKey<K> = [K] extends [never] ? never : ([GqlIsUnion<K>] extends [false] ? K : never);`
-    );
-    push(
-      `type GqlPayloadOf<S> = [S] extends [readonly unknown[]] ? never : [GqlIsUnion<S>] extends [true] ? never : [S] extends [object] ? ([GqlSingleKey<GqlPayloadKeys<S>>] extends [never] ? never : S[GqlSingleKey<GqlPayloadKeys<S>> & keyof S]) : never;`
-    );
-    // The field names a reading declares: the keys of every object member, so
-    // a nullable or union consumer names what each member names.
-    push(`type GqlNames<T> = T extends object ? keyof T : never;`);
-    push(
-      `type GqlReadsOuter<S, E> = [Extract<Exclude<GqlNames<S>, GqlNames<GqlPayloadOf<S>>>, Exclude<GqlNames<E>, '__typename'>>] extends [never] ? false : true;`
-    );
+    //   - `GqlNames` is the field names a reading declares: the keys of every
+    //     object member, so a nullable or union consumer names what each
+    //     member names.
     // carrick#1759: the server supplies `__typename` on every object a
     // selection asks for, so the consumer's `__typename` is read as OPTIONAL,
     // at any depth. It keeps its declared type: a producer that states a
@@ -589,19 +684,9 @@ export function buildProbe(
     // The envelope short-circuit below tests the RELAXED consumer: a consumer
     // that names only fields the payload shares would otherwise fail it on
     // `__typename` alone and unwrap onto that payload.
-    push(`type GqlDepth = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];`);
-    push(
-      `type GqlTypenameParts<T, D extends number> = { [K in keyof T as K extends '__typename' ? never : K]: GqlTypenameOptional<T[K], GqlDepth[D]> } & { [K in keyof T as K extends '__typename' ? K : never]?: T[K] };`
-    );
-    push(
-      `type GqlTypenameOptional<T, D extends number = 16> = [D] extends [never] ? T : T extends (...args: any[]) => any ? T : T extends object ? ('__typename' extends keyof T ? { [K in keyof GqlTypenameParts<T, D>]: GqlTypenameParts<T, D>[K] } : { [K in keyof T]: GqlTypenameOptional<T[K], GqlDepth[D]> }) : T;`
-    );
-    push(
-      `type GqlExpected = [GqlTypenameOptional<Expected>] extends [Expected] ? Expected : GqlTypenameOptional<Expected>;`
-    );
-    push(
-      `type GqlComparand = [Sent] extends [GqlExpected] ? Sent : ([GqlPayloadOf<Sent>] extends [never] ? Sent : [GqlReadsOuter<Sent, Expected>] extends [true] ? Sent : GqlPayloadOf<Sent>);`
-    );
+    for (const line of graphqlGenericDeclarations('')) push(line);
+    push(`type GqlExpected = ${graphqlExpectedRule('Expected', '')};`);
+    push(`type GqlComparand = ${graphqlComparandRule('Sent', 'Expected', 'GqlExpected', '')};`);
     gateLines.set(
       push(`type _G_comparand_any = Assert<Not<IsAny<GqlComparand>>>;`),
       'sent:any'
@@ -645,10 +730,10 @@ export function buildProbe(
       // is the envelope field's, when the SDL declares the envelope. When it
       // does not, the root leaf already describes the payload.
       push(
-        `type GqlComparandLeaf = [Sent] extends [GqlExpected] ? GqlRootLeaf : ([GqlPayloadOf<Sent>] extends [never] ? GqlRootLeaf : [GqlReadsOuter<Sent, Expected>] extends [true] ? GqlRootLeaf : ([unknown] extends [GqlFieldOf<GqlTypeOf<GqlRootLeaf>, GqlSingleKey<GqlPayloadKeys<Sent>>>] ? GqlRootLeaf : GqlFieldOf<GqlTypeOf<GqlRootLeaf>, GqlSingleKey<GqlPayloadKeys<Sent>>>));`
+        `type GqlComparandLeaf = ${graphqlComparandLeafRule('Sent', 'Expected', 'GqlExpected', 'GqlRootLeaf', '')};`
       );
       push(
-        `type GqlWire = [GqlComparand] extends [GqlExpected] ? GqlComparand : (JsonWireSame<GqlLeafSent<GqlComparand, GqlComparandLeaf>, GqlComparand> extends true ? GqlComparand : GqlLeafSent<GqlComparand, GqlComparandLeaf>);`
+        `type GqlWire = ${graphqlScalarWireRule('GqlComparand', 'GqlExpected', 'GqlComparandLeaf', '')};`
       );
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
@@ -660,11 +745,9 @@ export function buildProbe(
       // field the SDL does not declare, and a leaf that mismatches beside the
       // absent fields, still fail with the filling, so they stay breaks.
       // Every line sits after the wire line, so no line above it moves.
+      push(graphqlSdlFilledDeclaration(''));
       push(
-        `type GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlSdlFilled<C[K], I, GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlSdlFilled<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } & { [K in Exclude<keyof GqlTypes[T], keyof C>]: any } : C) : C) : C;`
-      );
-      push(
-        `type SdlFieldDecides = [GqlWire] extends [GqlExpected] ? false : [GqlSdlFilled<GqlWire, GqlComparandLeaf>] extends [GqlExpected] ? true : false;`
+        `type SdlFieldDecides = ${graphqlSdlDecidesRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`
       );
       gateLines.set(
         push(`type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;`),

@@ -109,12 +109,27 @@ export {
 // reaches it only through this door (index.js).
 export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
-export { jsonWireDeclarations, jsonWireRule, judgeTolerances, wireFormFor, type JudgeTolerances } from './check-probe.js';
+export {
+  graphqlComparandLeafRule,
+  graphqlComparandRule,
+  graphqlExpectedRule,
+  graphqlGenericDeclarations,
+  graphqlLeafWalkDeclarations,
+  graphqlScalarWireRule,
+  graphqlSdlDecidesRule,
+  graphqlSdlFilledDeclaration,
+  jsonWireDeclarations,
+  jsonWireRule,
+  judgeTolerances,
+  wireFormFor,
+  type JudgeTolerances,
+} from './check-probe.js';
 export { fitOptionsOf, judgeFitOptions, type FitOptions } from './check-workspace.js';
 export { nodeByExpressionText, isPreferredTarget } from './anchors.js';
 export {
   graphqlDeclaresType,
   graphqlFieldLeaf,
+  graphqlReachableFields,
   graphqlRootLeaf,
   graphqlScalarSent,
   withoutNonNull,

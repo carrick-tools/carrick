@@ -949,7 +949,7 @@ function handleWriteShadow(request: SidecarRequest & { action: 'write_shadow' })
   try {
     const loader = initializedLoader();
     const startTime = performance.now();
-    const result = writeShadow(loader, request.out_dir);
+    const result = writeShadow(loader, request.out_dir, request.graphql);
     log(`Wrote the shadow of ${result.own_files.length} own file(s) in ${Math.round(performance.now() - startTime)}ms`);
     return { request_id: request.request_id, status: 'success', ...result };
   } catch (err) {

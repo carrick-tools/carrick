@@ -28,7 +28,29 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
-import { WriteGuard, judgeTscPath, jsonWireDeclarations, jsonWireRule, judgeTolerances, fitOptionsOf, judgeFitOptions, type FitOptions, type JudgeTolerances } from './capture/index.js';
+import {
+  WriteGuard,
+  graphqlComparandLeafRule,
+  graphqlComparandRule,
+  graphqlExpectedRule,
+  graphqlGenericDeclarations,
+  graphqlLeafWalkDeclarations,
+  graphqlReachableFields,
+  graphqlRootLeaf,
+  graphqlScalarWireRule,
+  graphqlSdlDecidesRule,
+  graphqlSdlFilledDeclaration,
+  judgeTscPath,
+  jsonWireDeclarations,
+  jsonWireRule,
+  judgeTolerances,
+  fitOptionsOf,
+  judgeFitOptions,
+  wireFormFor,
+  type FitOptions,
+  type JudgeTolerances,
+} from './capture/index.js';
+import type { GraphqlLeaf, GraphqlRoot, GraphqlTypes } from './capture/api.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {
@@ -55,6 +77,14 @@ export interface ShadowResult {
   wire: string[];
   /** The judge's three tolerances, read from its own code (`judgeTolerances('__carrick_')`): declarations to append beside `wire`. */
   tolerances: JudgeTolerances;
+  /**
+   * Present when the request carried the service's GraphQL table: the judge's
+   * GraphQL rules as declarations (`lines`), the one table declaration they
+   * read (`types_decl`, null when no root is read in the scalar form), and the
+   * leaf of each root the judge reads in the scalar form, by `Type.field`
+   * (`wireFormFor`). A root with no leaf is checked in the JSON form.
+   */
+  graphql?: HeldGraphql;
   /** The fit options this shadow program was written with, and the judge's: a held check is armed only when they agree. */
   options: { service: FitOptions; judge: FitOptions };
   /** The native TypeScript 7 executable, or null when only TypeScript 6's tsc is installed. */
@@ -115,7 +145,11 @@ function isLibraryFile(program: ts.Program, fileName: string): boolean {
  * must be outside the scan root). Reads the program; changes nothing in the
  * checkout.
  */
-export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult {
+export function writeShadow(
+  loader: ProjectLoader,
+  outDir: string,
+  graphql?: { types: GraphqlTypes; roots: GraphqlRoot[] }
+): ShadowResult {
   const scanRoot = loader.getScanRoot();
   const program = loader.getProject().getProgram().compilerObject;
   const internal = program as unknown as InternalProgram;
@@ -260,6 +294,7 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     path_conflicts: pathConflicts,
     bare_specifiers: Object.keys(paths).sort(),
     wire: heldWire(),
+    ...(graphql === undefined ? {} : { graphql: heldGraphql(graphql.types, graphql.roots) }),
     tolerances: judgeTolerances('__carrick_'),
     options: { service: fitOptionsOf(compilerOptions), judge: judgeFitOptions() },
     native_tsc: nativeTscPath(),
@@ -272,6 +307,78 @@ export function heldWire(): string[] {
     ...jsonWireDeclarations('__carrick_'),
     `type __carrick_Wire<S, E> = ${jsonWireRule('S', 'E', '__carrick_')};`,
   ];
+}
+
+/** What a held GraphQL check appends (see `ShadowResult.graphql`). */
+export interface HeldGraphql {
+  lines: string[];
+  types_decl: string | null;
+  leaves: Record<string, GraphqlLeaf>;
+}
+
+/**
+ * The judge's GraphQL rules as declarations a held check appends beside `wire`
+ * and `tolerances` (prefix `__carrick_`). Every rule is the judge's own text
+ * (`check-probe.ts`), so a held check and the probe answer from one writer:
+ *
+ *  - `__carrick_GqlSent<S, E>`: the JSON form, `S` the resolver's value and
+ *    `E` the caller's expected type;
+ *  - `__carrick_GqlSentS<S, E, R>`: the scalar form, `R` the root's leaf
+ *    (`leaves`); it reads `__carrick_GqlTypes` (`types_decl`). Where the wire
+ *    line fails and the SDL-filled record would pass, the verdict hangs on a
+ *    field resolver (`sent:field_resolver`): the judge reads that unverifiable,
+ *    so it answers the relaxed expected type, which no callback can disagree
+ *    with. A declared-void caller states no contract, and is likewise kept.
+ *
+ * `scalar` adds the scalar form's lines; they name `__carrick_GqlTypes`, so
+ * they are written only when the table is declared.
+ */
+export function heldGraphqlWire(scalar: boolean): string[] {
+  const p = '__carrick_';
+  const relaxed = `${p}GqlExpected<E>`;
+  const comparand = `${p}GqlComparand<S, E>`;
+  const lines = [
+    ...graphqlGenericDeclarations(p),
+    `type ${p}GqlExpected<E> = ${graphqlExpectedRule('E', p)};`,
+    `type ${p}GqlComparand<S, E> = ${graphqlComparandRule('S', 'E', relaxed, p)};`,
+    `type ${p}GqlSent<S, E> = ${p}IsVoid<E> extends true ? E : ${p}Wire<${comparand}, ${relaxed}>;`,
+  ];
+  if (!scalar) return lines;
+  const leaf = `${p}GqlComparandLeaf<S, E, R>`;
+  const form = `${p}GqlWireForm<S, E, R>`;
+  return [
+    ...lines,
+    ...graphqlLeafWalkDeclarations(p),
+    graphqlSdlFilledDeclaration(p),
+    `type ${p}GqlComparandLeaf<S, E, R> = ${graphqlComparandLeafRule('S', 'E', relaxed, 'R', p)};`,
+    `type ${p}GqlWireForm<S, E, R> = ${graphqlScalarWireRule(comparand, relaxed, leaf, p)};`,
+    `type ${p}GqlSdlDecides<S, E, R> = ${graphqlSdlDecidesRule(form, relaxed, leaf, p)};`,
+    `type ${p}GqlWire<S, E, R> = [${p}GqlSdlDecides<S, E, R>] extends [true] ? ${relaxed} : ${form};`,
+    `type ${p}GqlSentS<S, E, R> = ${p}IsVoid<E> extends true ? E : ${p}GqlWire<S, E, R>;`,
+  ];
+}
+
+/**
+ * The GraphQL answer for a service's table and roots: a leaf only for a root
+ * whose form the judge reads as `graphql_scalars` (`wireFormFor`), the table
+ * every such leaf reaches, and the declarations.
+ */
+export function heldGraphql(types: GraphqlTypes, roots: GraphqlRoot[]): HeldGraphql {
+  const leaves: Record<string, GraphqlLeaf> = {};
+  const reachable: Record<string, Record<string, unknown>> = {};
+  for (const root of roots) {
+    if (wireFormFor('graphql', 'response', 'producer', { graphql: { types, root } }) !== 'graphql_scalars') continue;
+    const leaf = graphqlRootLeaf(types, root)!;
+    leaves[`${root.type}.${root.field}`] = leaf;
+    Object.assign(reachable, graphqlReachableFields(types, leaf));
+  }
+  const scalar = Object.keys(leaves).length > 0;
+  const table = Object.fromEntries(Object.keys(reachable).sort().map((name) => [name, reachable[name]]));
+  return {
+    lines: heldGraphqlWire(scalar),
+    types_decl: scalar ? `type __carrick_GqlTypes = ${JSON.stringify(table)};` : null,
+    leaves,
+  };
 }
 
 function safeRealpath(p: string): string {

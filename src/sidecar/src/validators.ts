@@ -381,6 +381,7 @@ export const ListProgramFilesRequestSchema = BaseRequestSchema.extend({
 export const WriteShadowRequestSchema = BaseRequestSchema.extend({
   action: z.literal('write_shadow'),
   out_dir: z.string().min(1),
+  graphql: z.object({ types: GraphqlTypesSchema, roots: z.array(GraphqlRootSchema) }).optional(),
 });
 
 export const FindSiteRequestSchema = BaseRequestSchema.extend({
