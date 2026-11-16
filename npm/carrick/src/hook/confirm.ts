@@ -114,6 +114,9 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
   const items = usable?.items ?? [];
   const moved = usable?.recheck?.moved ?? [];
   const fullFile = usable?.file ?? early.file ?? "";
+  // A full answer that ran nothing (deadline, queued behind another check, read model rebuilding, edit not re-read)
+  // holds the index's stored verdicts for an older file state: it judged no row, so it corrects none.
+  const judged = usable?.recheck?.ran !== "none";
   const matched = new Set<CheckItem | MovedRow>();
   let compared: RowCompared[] = rows.map((row) => {
     if (row.item) {
@@ -122,7 +125,7 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
       const verdict = match?.verdict ?? null;
       if (match === null) return { row, outcome: "part3_only", p2_state: "absent", corrected: false, match };
       if (verdict?.state === "unresolved") return { row, outcome: "part3_only", p2_state: "unresolved", corrected: false, match };
-      if (verdict?.state === "resolved" && verdict.result === "compatible") return { row, outcome: "differ", corrected: true, match };
+      if (judged && verdict?.state === "resolved" && verdict.result === "compatible") return { row, outcome: "differ", corrected: true, match };
       if (verdict?.result != null && verdict.result !== "compatible") {
         return { row, outcome: verdict.result === row.item.verdict?.result ? "same" : "differ", corrected: false, match };
       }

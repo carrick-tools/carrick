@@ -175,14 +175,14 @@ async function liveDaemon(t: { after: (fn: () => void | Promise<void>) => void }
 }
 
 /** Part 2's answer for the edited file, as the fake binary prints it to the runner. */
-function part2(ws: Ws, items: CheckItem[], moved: unknown[] = []): Record<string, string> {
+function part2(ws: Ws, items: CheckItem[], moved: unknown[] = [], recheck: Record<string, unknown> = {}): Record<string, string> {
   const result = {
     schema: "carrick.check/0",
     file: "src/tasks.ts",
     service: "api",
     stale: false,
     items,
-    recheck: { ran: "extraction+types", elapsed_ms: 5, ...(moved.length > 0 ? { moved } : {}) },
+    recheck: { ran: "extraction+types", elapsed_ms: 5, ...(moved.length > 0 ? { moved } : {}), ...recheck },
   };
   const file = path.join(ws.home, `part2-${Math.random().toString(36).slice(2)}.json`);
   fs.writeFileSync(file, JSON.stringify(result));
@@ -311,6 +311,24 @@ test("4: the full answer calls the route compatible: one correction line; the re
   const corrections = next.split("\n").filter((line) => line.includes("found GET /tasks compatible"));
   assert.equal(corrections.length, 1, next);
   assert.equal(record(ws)?.held, "differ");
+});
+
+test("4b: a full answer that ran nothing never retracts, whatever it holds for the route (deadline, or an older file state)", async (t) => {
+  const stored = { state: "resolved", result: "compatible" } as const;
+  for (const [name, recheck] of [
+    ["deadline", { ran: "none", deadline: true, stale_since: "2026-01-01T00:00:00Z", reason: "the re-scan ran past the budget" }],
+    ["older", { ran: "none", stale_since: "2026-01-01T00:00:00Z", reason: "queued behind another check; verdicts are the index's" }],
+  ] as const) {
+    const ws = await workspace(t);
+    await liveDaemon(t, ws, () => [broken(ws)]);
+    const first = context((await edit(ws, `e4b-${name}`, part2(ws, [route("/tasks", 2, stored)], [], recheck))).stdout);
+    await settled(ws, `e4b-${name}`);
+    const next = await carrier(ws, `e4b-${name}`);
+    assert.equal(statesBreak([first]), 1, `${name}: ${first}`);
+    assert.ok(!next.includes("compatible"), `${name}: ${next}`);
+    assert.equal(record(ws)?.held, "part3_only", name);
+    assert.equal(record(ws)?.p2_state, "not_judged", name);
+  }
 });
 
 test("5: the full answer leaves the route unresolved, or holds no row for it: nothing more; the record is part3_only with p2_state", async (t) => {
