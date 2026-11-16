@@ -262,7 +262,7 @@ test("the switch needs the contract line on too", async (t) => {
   const ws = await workspace(t);
   const daemon = await fakeDaemon(ws, ready([broken()]));
   t.after(() => daemon.close());
-  await edit(ws, "h-needs", { CARRICK_COMPILER_LINES: "1" });
+  await edit(ws, "h-needs", { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "0" });
   assert.equal(daemon.requests.length, 0);
 });
 

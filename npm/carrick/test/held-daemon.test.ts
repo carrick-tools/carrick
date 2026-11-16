@@ -134,7 +134,8 @@ async function settle(): Promise<void> {
 
 test("the switch needs CARRICK_COMPILER_LINES=1 and the contract line on", () => {
   assert.equal(compilerLinesEnabled({}), false);
-  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1" }), false);
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1" }), true, "the contract line is on by default");
+  assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "0" }), false);
   assert.equal(compilerLinesEnabled({ CARRICK_CONTRACT_LINES: "1" }), false);
   assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" }), true);
   assert.equal(compilerLinesEnabled({ CARRICK_COMPILER_LINES: "true", CARRICK_CONTRACT_LINES: "1" }), false);
@@ -391,7 +392,7 @@ test("a second ensureHeld starts nothing; with the switch off, none starts", () 
     const started: string[][] = [];
     const start = (_c: string, args: string[]) => void started.push(args);
     assert.equal(ensureHeld(w.root, { env: {}, home: w.home, start }), false);
-    assert.equal(ensureHeld(w.root, { env: { CARRICK_COMPILER_LINES: "1" }, home: w.home, start }), false);
+    assert.equal(ensureHeld(w.root, { env: { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "0" }, home: w.home, start }), false);
     assert.equal(started.length, 0);
     assert.equal(fs.existsSync(heldLockPath(w.root, w.home)), false);
     assert.equal(ensureHeld(w.root, { env: ON, home: w.home, start }), true);

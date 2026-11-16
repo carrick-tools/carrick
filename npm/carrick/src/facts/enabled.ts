@@ -9,24 +9,24 @@ export function factsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
- * The contract line's switch: opt-in, on only when `CARRICK_CONTRACT_LINES` is
- * exactly `"1"` and fact lines are on. Contract rows are stored either way;
+ * The contract line's switch: on by default; off only when
+ * `CARRICK_CONTRACT_LINES` is exactly `"0"` or fact lines are off. Contract rows are stored either way;
  * this decides only whether a line is printed from them (and, in `fetch.ts`,
  * whether a file without the `contracts` table is replaced).
  */
 export function contractLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env["CARRICK_CONTRACT_LINES"] === "1" && factsEnabled(env);
+  return env["CARRICK_CONTRACT_LINES"] !== "0" && factsEnabled(env);
 }
 
 /**
- * The chain line's switch: opt-in, on only when `CARRICK_CHAIN_LINES` is
- * exactly `"1"` and the contract line is on (a chain line ends in a contract
+ * The chain line's switch: on by default; off only when `CARRICK_CHAIN_LINES`
+ * is exactly `"0"` or the contract line is off (a chain line ends in a contract
  * row's words). Chain rows are stored either way; this decides only whether a
  * line is printed from them (and, in `fetch.ts`, whether a file without the
  * `chains` table is replaced).
  */
 export function chainLinesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env["CARRICK_CHAIN_LINES"] === "1" && contractLinesEnabled(env);
+  return env["CARRICK_CHAIN_LINES"] !== "0" && contractLinesEnabled(env);
 }
 
 /**

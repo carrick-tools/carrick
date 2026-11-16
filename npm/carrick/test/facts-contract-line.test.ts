@@ -1,5 +1,5 @@
 // The contract line: what an edit of a file that holds contract rows prints
-// (`facts/lines.ts`), behind the opt-in switch `CARRICK_CONTRACT_LINES=1`.
+// (`facts/lines.ts`), on by default, off with `CARRICK_CONTRACT_LINES=0`.
 // Every service, file and type here is invented. Wire: carrick-cloud
 // `docs/internal/reference/edit-facts-wire.md`, section `k: "contract"`.
 
@@ -296,6 +296,13 @@ test("the contract kind comes before the op kind and shares the cap of MAX_FACT_
 const hookEdit = (ws: Ws, session: string, env: Record<string, string>) =>
   patchEdit(ws, ws.at("api/src/tasks.ts"), [{ newStart: lineOf(ws.at("api/src/tasks.ts"), IN_LIST), lines: [`+  ${IN_LIST}`] }], { session, env });
 
+test("with neither switch set an edit prints the contract line", async (t) => {
+  const ws = await workspace(t, only(taskRows(), "listTasks"));
+  const out = await hookEdit(ws, "hook-default", {});
+  assert.equal(out.code, 0);
+  assert.ok(context(out.stdout).includes(lineFor("GET /tasks", `ext/src/view4.ts:4${NOTE}`)), context(out.stdout));
+});
+
 test("with CARRICK_CONTRACT_LINES=1 an edit prints the contract line; a Read prints none", async (t) => {
   const ws = await workspace(t, only(taskRows(), "listTasks"));
   const out = await hookEdit(ws, "hook-on", { CARRICK_CONTRACT_LINES: "1" });
@@ -385,7 +392,7 @@ function snapshot(dir: string): Map<string, string> {
   return seen;
 }
 
-test("with CARRICK_CONTRACT_LINES unset or 0, the hook's stdout, exit code and files written are the same whether or not the fact file holds contract rows", async (t) => {
+test("with CARRICK_CONTRACT_LINES=0, the hook's stdout, exit code and files written are the same whether or not the fact file holds contract rows", async (t) => {
   const observe = async (rows: Array<Record<string, unknown>>, env: Record<string, string>) => {
     const ws = await workspace(t, rows);
     const before = [snapshot(ws.root), snapshot(ws.home)];
@@ -402,7 +409,7 @@ test("with CARRICK_CONTRACT_LINES unset or 0, the hook's stdout, exit code and f
   };
   const rows = only(taskRows(), "listTasks");
   const op = rows.find((row) => row["k"] === "op")!;
-  for (const env of [{} as Record<string, string>, { CARRICK_CONTRACT_LINES: "0" }]) {
+  for (const env of [{ CARRICK_CONTRACT_LINES: "0" } as Record<string, string>]) {
     const withRows = await observe(rows, env);
     const without = await observe([op], env);
     assert.equal(withRows.code, 0);
@@ -411,6 +418,8 @@ test("with CARRICK_CONTRACT_LINES unset or 0, the hook's stdout, exit code and f
     assert.deepEqual(withRows.written, without.written);
   }
   // The proof is not vacuous: with the switch on the same file prints the contract line instead.
-  const on = await observe(rows, { CARRICK_CONTRACT_LINES: "1" });
-  assert.notEqual(context(on.stdout), "op line for listTasks");
+  for (const env of [{}, { CARRICK_CONTRACT_LINES: "1" }] as Array<Record<string, string>>) {
+    const on = await observe(rows, env);
+    assert.notEqual(context(on.stdout), "op line for listTasks", JSON.stringify(env));
+  }
 });
