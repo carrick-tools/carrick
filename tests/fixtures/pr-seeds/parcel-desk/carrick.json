@@ -1,0 +1,13 @@
+{
+  "services": [
+    {
+      "serviceName": "desk-api",
+      "directory": "api",
+      "graphqlSchemas": ["api/dist/schema.graphql"]
+    },
+    {
+      "serviceName": "desk-web",
+      "directory": "web"
+    }
+  ]
+}

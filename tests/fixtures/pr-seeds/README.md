@@ -53,6 +53,16 @@ miss moves the declaration in the same PR. A seed is removed only by
   (`shelf.gone`) is to a procedure nothing serves; it is no row. Its library
   answers are the server labels of `rpc-api` plus the client's.
 
+- `parcel-desk` is two services in one repo, with a store of
+  its own: `desk-api` builds a GraphQL schema in code and prints it to
+  `api/dist/schema.graphql`, the one served schema file, named in its
+  `graphqlSchemas` (so a reading against it carries `PrintedFromCode`, which a
+  PR that removes the field lifts); `desk-web` selects `Consignment.total` in
+  `web/src/graphql/consignment.gql` and passes `ConsignmentDocument` from a
+  generated module that is not in the tree. It holds exactly one schema file
+  because a second one would make every reading `SeveralSchemas`, which is
+  never lifted (`orders-api` serves two, so it cannot host a removal seed).
+
 This tree is an answer key. Do not edit it, or a seed's edit, to make a run
 pass. A seed that fails today is `#[ignore]` with the issue that fixes it; that
 issue removes the ignore.
@@ -126,6 +136,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `queue-job-renamed` (`jobs-sender`) | `new Queue("welcome-mail")` to `"welcome-email"` (`src/mail.ts:3`); the worker still listens on the old name | `removed_still_called` `PUBSUB welcome-mail`; the payload carries the `missing_endpoint` at `src/mail.ts:10` | scanner stages right; shown waits on carrick-cloud#2829, #3438 |
 | `queue-payload-field-removed` (`jobs-sender`) | `.add` drops `locale` from its payload (`src/mail.ts:10`), which the worker reads | `type_mismatch` `PUBSUB welcome-mail` at `src/mail.ts:10` | stops at judged: the send has no resolved expected type; carrick#3547, #3782 |
 | `graphql-document-import-absent-root-rename` | `orderSummary` to `orderSummaries` (`src/summary.graphql`, `src/summary.ts`, the answer); `storefront`'s only consumer, `src/order-summary.ts`, passes `OrderSummaryDocument` from a generated module that is not in the tree (carrick#4642) | `missing_endpoint` `QUERY orderSummary` at `src/order-summary.ts:5`, not at its `.gql` file; delta | passes |
+| `graphql-printed-schema-field-removed-untyped-call` (`parcel-desk`) | `total` dropped from the printed schema and the code that serves it (`api/dist/schema.graphql`, `api/src/server.ts`, the answer's lines 39 and 30); `desk-web`'s call passes `ConsignmentDocument` from a module that is not in the tree | `type_mismatch` `QUERY consignment` at `web/src/pages/ConsignmentPage.tsx:5` (the call, not the `.gql` file), `resolved`, `edge_source: fact`; today `on_main_unknown: main_types_unjudged`, `break: possible`; no delta row | passes; shown waits on carrick-cloud#2829; `_marking` ignored, carrick#4670 |
 
 ## Type-reach seeds (carrick#3102)
 
