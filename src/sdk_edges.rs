@@ -1527,6 +1527,7 @@ mod tests {
             producer_surface_hash: None,
             consumer_surface_hash: None,
             left_to_consumer: false,
+            decided_by_pr_diff: false,
         }
     }
 

@@ -4547,6 +4547,7 @@ fn outcome_for(
         producer_surface_hash: pair.producer_surface_hash.clone(),
         consumer_surface_hash: pair.consumer_surface_hash.clone(),
         left_to_consumer: false,
+        decided_by_pr_diff: false,
     }
 }
 
@@ -5628,6 +5629,7 @@ mod tests {
             producer_surface_hash: None,
             consumer_surface_hash: None,
             left_to_consumer: false,
+            decided_by_pr_diff: false,
         };
         apply_retype(&mut outcome, answer);
         outcome
@@ -9799,6 +9801,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             producer_surface_hash: None,
             consumer_surface_hash: None,
             left_to_consumer: false,
+            decided_by_pr_diff: false,
         };
         let before = vec![
             outcome("app", "app", VerdictBucket::Incompatible),

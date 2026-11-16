@@ -21420,6 +21420,7 @@ unfollowed_member_calls_total: 0,
             producer_surface_hash: None,
             consumer_surface_hash: None,
             left_to_consumer: false,
+            decided_by_pr_diff: false,
         }];
         crate::cloud_storage::attach_compat_verdicts(
             &mut payloads,
