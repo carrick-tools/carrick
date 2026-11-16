@@ -33,6 +33,7 @@ import ts from 'typescript';
 import type { ProbePlan, Side } from './check-probe.js';
 import type { ProbeProgram } from './check-deep.js';
 import { memberPath } from './member-name.js';
+import { constituentsOf } from './result-label.js';
 
 /** What kind of difference one field path carries. */
 export type FieldDifferenceNature =
@@ -55,7 +56,19 @@ export interface FieldDifference {
   sentText?: string;
   /** Printed member type on the receiving side, for `type_differs`. */
   expectedText?: string;
+  /**
+   * For `type_differs`: set when the sent leaf is OPEN (carrick#4685), wider
+   * than the expected one in the way a database or JSON column types it: a
+   * bare `string`/`number`/`boolean` where every expected member is a literal
+   * of that primitive, or the generic recursive JSON value where the expected
+   * side names an object shape. Present only when proven. It only words the
+   * difference; the verdict stays the break it is.
+   */
+  openLeaf?: OpenLeafKind;
 }
+
+/** What an open sent leaf is: a primitive wider than literals, or a JSON value. */
+export type OpenLeafKind = 'string' | 'number' | 'boolean' | 'json';
 
 export interface PairFieldReport {
   /** Named differences, capped and ordered deterministically. */
@@ -346,6 +359,7 @@ function walk(
       nature: 'type_differs',
       sentText: printType(sentType, ctx),
       expectedText: printType(expectedType, ctx),
+      ...openLeafOf(sentType, expectedType, ctx),
     });
   }
 
@@ -360,6 +374,91 @@ function walk(
     if (expectedProps.has(name)) continue;
     ctx.found.push({ path: memberPath(path, sentProp, checker), nature: 'extra_in_sent' });
   }
+}
+
+/** The `openLeaf` field of a difference, when the leaf is proven open. */
+function openLeafOf(
+  sent: ts.Type,
+  expected: ts.Type,
+  ctx: WalkContext
+): { openLeaf: OpenLeafKind } | Record<string, never> {
+  const kind = openLeafKind(sent, expected, ctx);
+  return kind === undefined ? {} : { openLeaf: kind };
+}
+
+/**
+ * Whether a sent leaf the compiler rejects is OPEN (carrick#4685), and which
+ * kind. Positive only: anything not proven open is not.
+ *
+ * - A bare `string`, `number` or `boolean` where every expected member is a
+ *   literal of that same primitive. The expected side's own `null` and
+ *   `undefined` are set aside: the sent primitive carries neither.
+ * - The generic recursive JSON value where the expected side names an object
+ *   (not an array) shape, recognised by structure, never by name.
+ */
+function openLeafKind(sent: ts.Type, expected: ts.Type, ctx: WalkContext): OpenLeafKind | undefined {
+  const { checker } = ctx;
+  const expectedMembers = constituentsOf(checker.getNonNullableType(expected));
+  if (expectedMembers.length === 0) return undefined;
+  const primitive: [ts.TypeFlags, ts.TypeFlags, OpenLeafKind][] = [
+    [ts.TypeFlags.String, ts.TypeFlags.StringLiteral, 'string'],
+    [ts.TypeFlags.Number, ts.TypeFlags.NumberLiteral, 'number'],
+    [ts.TypeFlags.Boolean, ts.TypeFlags.BooleanLiteral, 'boolean'],
+  ];
+  for (const [flag, literalFlag, kind] of primitive) {
+    if (sent.flags & flag) {
+      return expectedMembers.every((member) => (member.flags & literalFlag) !== 0) ? kind : undefined;
+    }
+  }
+  if (!isJsonValue(sent, ctx)) return undefined;
+  return expectedMembers.length === 1 &&
+    (expectedMembers[0].flags & ts.TypeFlags.Object) !== 0 &&
+    !checker.isArrayLikeType(expectedMembers[0])
+    ? 'json'
+    : undefined;
+}
+
+/**
+ * Whether a type is the generic JSON value: the recursive union of `string`,
+ * `number`, `boolean`, `null`, an array of itself and a string-keyed object of
+ * itself, every one present and nothing else. Read by structure, so every
+ * spelling of it (an alias, an interface extending `Array`, a mapped object
+ * whose values may be absent) is the same type here.
+ */
+function isJsonValue(type: ts.Type, ctx: WalkContext): boolean {
+  if (!type.isUnion()) return false;
+  const { checker, isAssignableTo } = ctx;
+  const itself = (other: ts.Type): boolean =>
+    other === type || (isAssignableTo(other, type) && isAssignableTo(type, other));
+  const seen = new Set<string>();
+  for (const member of type.types) {
+    const flags = member.flags;
+    if (flags & ts.TypeFlags.String) seen.add('string');
+    else if (flags & ts.TypeFlags.Number) seen.add('number');
+    else if (flags & ts.TypeFlags.BooleanLiteral) seen.add(member === checker.getTrueType() ? 'true' : 'false');
+    else if (flags & ts.TypeFlags.Null) seen.add('null');
+    else if ((flags & ts.TypeFlags.Object) === 0) return false;
+    else if (checker.isArrayLikeType(member)) {
+      const element = checker.getIndexTypeOfType(member, ts.IndexKind.Number);
+      if (checker.isTupleType(member) || !element || !itself(element)) return false;
+      seen.add('array');
+    } else {
+      const infos = checker.getIndexInfosOfType(member);
+      if (member.getProperties().length > 0 || infos.length !== 1) return false;
+      const [info] = infos;
+      if ((info.keyType.flags & ts.TypeFlags.String) === 0) return false;
+      const values = constituentsOf(info.type).filter(
+        (value) => (value.flags & ts.TypeFlags.Undefined) === 0
+      );
+      // The values, with an absent one set aside, are the union itself.
+      if (values.length === 0 || !values.every((value) => isAssignableTo(value, type))) {
+        return false;
+      }
+      if (!isAssignableTo(type, info.type)) return false;
+      seen.add('object');
+    }
+  }
+  return seen.size === 7;
 }
 
 function isOptional(symbol: ts.Symbol): boolean {
@@ -422,7 +521,24 @@ export function fieldReportNotes(
     if (difference.nature !== 'optional_in_expected') continue;
     notes.push(`${describeDifference(difference, sentSide, expectedSide)}.`);
   }
+  for (const difference of report.differences) {
+    if (difference.nature !== 'type_differs' || difference.openLeaf === undefined) continue;
+    notes.push(openLeafNote(difference, sentSide, expectedSide));
+  }
   return notes;
+}
+
+/**
+ * Why an open sent leaf is still a mismatch (carrick#4685): the reader can
+ * tighten the sender's type. Words the difference only; the verdict stays
+ * incompatible.
+ */
+function openLeafNote(difference: FieldDifference, sentSide: Side, expectedSide: Side): string {
+  const at = `'${difference.path}'`;
+  if (difference.openLeaf === 'json') {
+    return `${at}: the ${sentSide} types it as any JSON value, the ${expectedSide} as a specific object shape`;
+  }
+  return `${at}: the ${sentSide} types it as any ${difference.openLeaf}, the ${expectedSide} only as specific literal values`;
 }
 
 /**
