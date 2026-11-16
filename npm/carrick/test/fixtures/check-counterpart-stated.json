@@ -9,6 +9,7 @@
   "changed_since_index": 0,
   "stale": false,
   "deleted": false,
+  "recheck": { "ran": "extraction+types", "elapsed_ms": 900 },
   "items": [
     {
       "kind": "call",

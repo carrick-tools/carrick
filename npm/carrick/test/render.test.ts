@@ -139,8 +139,8 @@ test("T3: a GraphQL row is silent unless stated, and stated when the judge said 
   assert.match(text, /route QUERY user/);
 });
 
-test("G03 shape: a safe edit to a file holding existing mismatches states none; a real break in the same file is stated", () => {
-  const onMain = [mismatchAt(538), mismatchAt(1234, { method: "GET", source: "candidate", resolution_source: "model" })];
+test("a safe edit to a file holding mismatches already on main states none; a real break in the same file is stated", () => {
+  const onMain = [mismatchAt(40), mismatchAt(90, { method: "GET", source: "candidate", resolution_source: "model" })];
   const safe = recheckOf(onMain);
   assert.equal(renderPostToolUse(safe, undefined, { late: true }), null);
   const stop = sessionCheckedLines([{ result: safe, where: "src/routes/orders.ts" }], [{ result: safe, where: "src/routes/orders.ts" }]);
@@ -151,7 +151,7 @@ test("G03 shape: a safe edit to a file holding existing mismatches states none; 
   const text = renderPostToolUse(broken, undefined, { late: true }) ?? "";
   assert.match(text, /: 1 contract problem\./);
   assert.match(text, /:700/);
-  assert.doesNotMatch(text, /:538|:1234/);
+  assert.doesNotMatch(text, /:40:|:90:|orders\/40|orders\/90/);
   const after = sessionCheckedLines([{ result: broken, where: "src/routes/orders.ts" }], []);
   assert.match(after.text, /1 contract problem\./);
 });

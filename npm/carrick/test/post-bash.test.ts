@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { bashTargets, movesTreeInBulk, searchedNames } from "../src/hook/bash-targets.ts";
 import { bringUpToDate, updateHooks } from "../src/init/self-update.ts";
 import { carrickHooks } from "../src/init/settings.ts";
-import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
+import { answerEnv, editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
 
 const USES_LINE =
   "- CatalogClient.readWidget (line 12) has 2 caller(s) outside this file: src/inventory.ts:9, src/inventory.ts:17";
@@ -195,7 +195,7 @@ function writeEnv(w: { base: string; home: string }, extra: Record<string, strin
   return fakeEnv({
     HOME: w.home,
     CARRICK_FAKE_ARGV_LOG: path.join(w.base, "argv.log"),
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
+    ...answerEnv("check-counterpart-stated.json"),
     ...extra,
   });
 }
@@ -219,7 +219,8 @@ test("a heredoc that creates a TS file runs the post-edit flow for it", async (t
   });
   assert.equal(run.code, 0);
   assert.deepEqual(checkedFiles(path.join(w.base, "argv.log")), [".claude/worktrees/wt/src/argv.ts"]);
-  assert.match(contextOf(run.stdout), /^Carrick re-checked .* after this edit: 1 contract problem\./);
+  // The in-hand probe judges nothing, so it states no problem (A1, P5).
+  assert.doesNotMatch(contextOf(run.stdout), /contract problem/);
 });
 
 test("a heredoc write of a TS file whose check is clean prints nothing", async (t) => {
@@ -285,8 +286,8 @@ test("an Edit and then a Bash write of the same file keep one queue entry each, 
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const env = fakeEnv({
     HOME: home,
+    ...answerEnv("check-counterpart-stated.json"),
     CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
   });
   const session = "sess-w5";
   await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });

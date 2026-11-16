@@ -54,6 +54,16 @@ export function asStated(result: CheckResult): CheckResult {
   };
 }
 
+/**
+ * The fake binary's env to answer with fixture `name`. A `-stated` fixture is a
+ * re-check answer whose judge stated its break; the `--no-rescan` probe, which
+ * judges nothing, answers with the same rows unmarked (A1, P5).
+ */
+export function answerEnv(name: string): Record<string, string> {
+  const probe = name.replace(/-stated\.json$/, ".json");
+  return { CARRICK_FAKE_FIXTURE: fixturePath(name), ...(probe === name ? {} : { CARRICK_FAKE_PROBE_FIXTURE: fixturePath(probe) }) };
+}
+
 export function statusFixture(name: string): StatusResult {
   const parsed = parseStatusResult(fs.readFileSync(fixturePath(name), "utf8"));
   if (!parsed) throw new Error(`fixture ${name} is not a carrick.status/0 payload`);
