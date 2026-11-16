@@ -557,7 +557,7 @@ impl Context<'_> {
     /// means not carried. The handler name sits on the function line, which is
     /// not checked.
     fn dispatch_table(&self, row: &DispatchTable) -> Option<DispatchTable> {
-        let old_line = u32::try_from(row.line_number?).ok()?;
+        let old_line = row.line_number?;
         // A hunk with no old lines is an insertion after `old_start`.
         if !self
             .hunks
