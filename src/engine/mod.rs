@@ -2171,9 +2171,6 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     for line in crate::scan_health::library_pending_lines() {
         crate::progress::announce(&line);
     }
-    if let Some(line) = crate::scan_health::declarations_unswept_line() {
-        crate::progress::announce(&line);
-    }
     if let Some(summary) = crate::scan_health::summary_line() {
         warn!("{summary}");
     }
@@ -4373,25 +4370,24 @@ fn drop_unheld_type_names(
         .collect();
     let held = |name: &str| held_aliases.contains(type_reach::base_alias(name));
     let service = data.service_name.clone();
-    let mut unparsed = 0;
+    let mut unparsed: Vec<String> = Vec::new();
     // A text that does not parse stays as it was and is said so: one line in
-    // the log and one in the scan's health, each naming the service, the text
-    // and where the parser stopped.
+    // the log and one reason on the service's boundary
+    // (`declarations_unparsed`, carrick#4226), each naming the text and where
+    // the parser stopped.
     let mut sweep =
         |text: &str, what: &str| match crate::type_manifest::drop_alias_declarations(text, &held) {
             Ok(swept) => swept,
             Err(failure) => {
-                unparsed += 1;
                 let name = service.as_deref().unwrap_or("(root)");
                 warn!(
                     "Service '{name}': the {what} type declarations did not parse ({failure}); the \
                  type names no manifest entry holds stay in them"
                 );
-                crate::scan_health::record_declarations_unswept(
-                    service.as_deref(),
-                    what,
-                    &failure.to_string(),
-                );
+                unparsed.push(format!(
+                    "{what}: line {}, column {}: {}",
+                    failure.line, failure.column, failure.message
+                ));
                 (text.to_string(), 0)
             }
         };
@@ -4450,9 +4446,17 @@ fn drop_unheld_type_names(
     debug!(
         "Type names no manifest entry holds, dropped after the row passes ({}): {bundle} bundle, \
          {stub} stub, {records} stub records, {reached} reach aliases, {provisional} provisional \
-         leaf entries, {unparsed} unparsed",
-        data.service_name.as_deref().unwrap_or(&data.repo_name)
+         leaf entries, {} unparsed",
+        data.service_name.as_deref().unwrap_or(&data.repo_name),
+        unparsed.len()
     );
+    // The one writer of `declarations_unparsed`: every service the sweep ran
+    // on says how many of its texts did not parse, zero included. It never
+    // creates a boundary; the stopped-run landing and the payload both read
+    // `data.boundary` after this.
+    if let Some(boundary) = data.boundary.as_mut() {
+        boundary.declarations_unparsed = Some(crate::boundary::Counted::from_reasons(unparsed));
+    }
 }
 
 fn type_reach_objects(runs: &[ServiceRun]) -> TypeReachObjects {
@@ -17076,14 +17080,15 @@ mod tests {
     }
 
     /// A bundle whose declarations do not parse (an unquoted hyphenated key)
-    /// stays as it was, and the scan's health says so, naming the service and
-    /// where the parser stopped.
+    /// stays as it was, and the service's boundary says so: where the parser
+    /// stopped, and none of the text's own bytes (carrick#4226).
     #[test]
-    fn a_bundle_that_does_not_parse_is_recorded_in_the_scan_health() {
+    fn a_bundle_that_does_not_parse_is_saved_on_the_boundary() {
         let mut held = consumer_entry("Endpoint_aaaa_Response");
         held.key = OperationKey::http("GET", "/orders/:id");
         let mut data = bare_blob();
         data.service_name = Some("sweep-unparsed-svc".to_string());
+        data.boundary = Some(crate::boundary::ServiceBoundary::default());
         data.type_manifest = Some(vec![held]);
         let dts = "export type Endpoint_aaaa_Response = { id: string };\n\
                    export type Endpoint_bbbb_Response = { a-b: number };\n";
@@ -17093,12 +17098,44 @@ mod tests {
         drop_unheld_type_names(&mut data, &mut reach);
 
         assert_eq!(data.bundled_types.as_deref(), Some(dts));
-        let recorded = crate::scan_health::declarations_unswept_for(Some("sweep-unparsed-svc"));
-        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let written = serde_json::to_value(&data).unwrap();
+        let unparsed = &written["boundary"]["declarations_unparsed"];
+        assert_eq!(unparsed["total"], 1, "{unparsed}");
+        let reason = unparsed["reasons"][0].as_str().unwrap();
         assert!(
-            recorded[0].starts_with("bundle: ") && recorded[0].contains("line 2"),
-            "{recorded:?}"
+            reason.starts_with("bundle: line 2, column ") && !reason.contains("a-b"),
+            "{reason}"
         );
+    }
+
+    /// A text that parses is a known zero, not an absent key.
+    #[test]
+    fn a_bundle_that_parses_is_a_known_zero_on_the_boundary() {
+        let mut data = bare_blob();
+        data.boundary = Some(crate::boundary::ServiceBoundary::default());
+        data.bundled_types = Some("export type Endpoint_aaaa_Response = { id: string };\n".into());
+        let mut reach = None;
+
+        drop_unheld_type_names(&mut data, &mut reach);
+
+        let written = serde_json::to_value(&data).unwrap();
+        assert_eq!(
+            written["boundary"]["declarations_unparsed"],
+            serde_json::json!({"total": 0})
+        );
+    }
+
+    /// The sweep never creates a boundary: a service without one stays so.
+    #[test]
+    fn the_sweep_does_not_create_a_boundary() {
+        let mut data = bare_blob();
+        data.boundary = None;
+        data.bundled_types = Some("export type Endpoint_aaaa_Response = { a-b: number };\n".into());
+        let mut reach = None;
+
+        drop_unheld_type_names(&mut data, &mut reach);
+
+        assert!(data.boundary.is_none());
     }
 
     /// A second answer beside `bare_blob`'s, for the file the tests edit.

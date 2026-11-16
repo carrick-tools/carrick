@@ -188,6 +188,14 @@ fn a_file_too_large_to_analyse_is_lost_for_good_and_the_scan_succeeds() {
         blob["boundary"]
     );
     assert_eq!(blob["boundary"]["files_lost"]["total"], 1);
+    // The end-of-run sweep's write reaches the uploaded payload (carrick#4226):
+    // both declaration texts parsed, so the service says zero, not nothing.
+    assert_eq!(
+        blob["boundary"]["declarations_unparsed"],
+        serde_json::json!({"total": 0}),
+        "the sweep's record is on the boundary:\n{:#}",
+        blob["boundary"]
+    );
 }
 
 /// A source file the parser refuses (a closing brace with no

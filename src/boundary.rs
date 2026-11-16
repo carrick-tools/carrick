@@ -295,6 +295,16 @@ pub struct ServiceBoundary {
     /// and route rows stand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_rows_lost: Option<Counted>,
+    /// Declaration texts of this service the end-of-run sweep could not parse
+    /// (carrick#4226): one reason each, `bundle: line L, column C: <parser
+    /// message>` or `stub: ...`, never the text's own bytes. `Some` with
+    /// `total` 0 on every service the sweep ran on; `None` when it did not
+    /// (a carried service, a held-back one, a scanner that did not write the
+    /// field). A reader may conclude: every row and type of the service
+    /// stands, a type quoted from that text may not be valid TypeScript, and
+    /// the declarations no operation uses were not removed from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declarations_unparsed: Option<Counted>,
 }
 
 fn unprepared_not_stated(rows: &Option<Vec<crate::preflight::UnpreparedRow>>) -> bool {
@@ -417,6 +427,8 @@ impl ServiceBoundary {
             unread_sites: unread_sites(data),
             // Written by the service's job, which holds its walk.
             walk_rows_lost: None,
+            // Written by the end-of-run sweep, which runs after `collect`.
+            declarations_unparsed: None,
         }
     }
 
@@ -505,6 +517,14 @@ impl ServiceBoundary {
         {
             out.push(format!(
                 "  No compiler rows for this service because {reason}. Calls that needed them are listed as unread (walk_lost)."
+            ));
+        }
+        if let Some(unparsed) = &self.declarations_unparsed
+            && let Some(reason) = unparsed.reasons.first()
+        {
+            out.push(format!(
+                "  {} type declaration text(s) did not parse ({reason}). Routes, calls and types still stand, but a type quoted from those texts may not be valid TypeScript.",
+                unparsed.total
             ));
         }
         if self.model_only_rows > 0 {
@@ -1239,6 +1259,53 @@ mod tests {
         older.as_object_mut().unwrap().remove("files_not_parsed");
         let older: ServiceBoundary = serde_json::from_value(older).unwrap();
         assert_eq!(older.files_not_parsed, None);
+    }
+
+    /// carrick#4226: a declaration text that did not parse is on the blob as
+    /// one counted reason, texts that parsed as a known zero, and a blob
+    /// without the key reads as `None`. Only a failure prints.
+    #[test]
+    fn a_declaration_text_that_did_not_parse_is_counted_on_the_blob() {
+        let mut boundary = ServiceBoundary::default();
+        assert_eq!(boundary.declarations_unparsed, None);
+        assert!(
+            serde_json::to_value(&boundary)
+                .unwrap()
+                .get("declarations_unparsed")
+                .is_none()
+        );
+        boundary.declarations_unparsed = Some(Counted::default());
+        assert!(
+            boundary
+                .lines("app")
+                .iter()
+                .all(|line| !line.contains("did not parse")),
+            "{:?}",
+            boundary.lines("app")
+        );
+        boundary.declarations_unparsed = Some(Counted::from_reasons(vec![
+            "bundle: line 2, column 13: Expected '{', got 'ident'".to_string(),
+        ]));
+        let written = serde_json::to_value(&boundary).unwrap();
+        assert_eq!(
+            written["declarations_unparsed"],
+            serde_json::json!({"total": 1, "reasons": ["bundle: line 2, column 13: Expected '{', got 'ident'"]})
+        );
+        assert!(
+            boundary
+                .lines("app")
+                .iter()
+                .any(|line| line.contains("did not parse (bundle: line 2")),
+            "{:?}",
+            boundary.lines("app")
+        );
+        let mut older = written;
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("declarations_unparsed");
+        let older: ServiceBoundary = serde_json::from_value(older).unwrap();
+        assert_eq!(older.declarations_unparsed, None);
     }
 
     /// carrick#4247: a walk that wrote no rows is on the blob as one counted
