@@ -31,6 +31,10 @@
     "sentence": "the request read located here is a path parameter or a query the route validates rather than a body, so the scan compared nothing at this site",
     "decided": "always"
   },
+  "reply_state": {
+    "sentence": "the request read located here is state the server keeps on its reply object, filled by its own code, not what a caller sends, so nothing was compared at this site",
+    "decided": "always"
+  },
   "projected_value_only": {
     "sentence": "every read of the call's result takes a member out of it, so the site states part of a payload rather than a whole one and the scan compared nothing here",
     "decided": "always"

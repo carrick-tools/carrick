@@ -8182,7 +8182,7 @@ mod tests {
     #[test]
     fn every_listed_reason_decides_as_the_list_says() {
         let list: BTreeMap<String, serde_json::Value> = serde_json::from_str(TYPE_REASONS).unwrap();
-        assert_eq!(list.len(), 19, "{:?}", list.keys());
+        assert_eq!(list.len(), 20, "{:?}", list.keys());
         for (reason, row) in &list {
             let decided = row["decided"].as_str().unwrap();
             for kind in [InferKind::CallResult, InferKind::ResponseBody] {
@@ -8213,6 +8213,16 @@ mod tests {
                 assert!(!inference_decided_no_contract(&shaped), "{reason} {kind:?}");
             }
         }
+        assert!(reason_decided("reply_state", &InferKind::RequestBody));
+        let mut reply_state = inferred("Endpoint_x_Request", "unknown", None, None);
+        reply_state.infer_kind = InferKind::RequestBody;
+        reply_state.any_provenance = vec![crate::services::type_sidecar::TypeProvenance {
+            path: String::new(),
+            kind: "unknown".to_string(),
+            reason: "reply_state".to_string(),
+            detail: None,
+        }];
+        assert!(inference_decided_no_contract(&reply_state));
         assert!(reason_decided(
             "no_success_payload",
             &InferKind::ResponseBody

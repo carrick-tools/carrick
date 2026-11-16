@@ -4727,6 +4727,32 @@ export class TypeInferrer {
       return null;
     }
 
+    // carrick#4690: the locator named a member of the server's reply object
+    // (`res.locals`). That is state the server's own code keeps on the reply,
+    // not what a caller sends, so publishing its type states the whole
+    // locals as the request. The reply object is the one whose type holds a
+    // member the server labels name as a send or a set; a member those labels
+    // name as the body is the body and is read as before. Without labels the
+    // read is unchanged. A decided abstain, never a bare null: capture would
+    // re-read the same text and publish the locals.
+    const replyStateRead = this.unwrapExpressionNode(located);
+    if (
+      Node.isPropertyAccessExpression(replyStateRead) &&
+      this.statedParams.holdsReplyMember(replyStateRead.getExpression().getType()) &&
+      !this.statedParams.isBodyMember(replyStateRead.getNameNode().getSymbol())
+    ) {
+      this.log(
+        `Request locator at ${request.file_path}:${request.line_number} names a member of the ` +
+          "server's reply object; the state the server keeps there is not a request body"
+      );
+      return this.decidedAbstain(request, this.getNodeLocation(located), {
+        path: '',
+        kind: 'unknown',
+        reason: 'reply_state',
+        detail: `\`${replyStateRead.getText()}\` is a member of the reply object`,
+      });
+    }
+
     // Mirror inferCallResult: strip `await`/`as`/parens/`!` so the inner
     // expression's type (not the surrounding `Promise<any>`) is read.
     let unwrapped = this.unwrapExpressionNode(located);
