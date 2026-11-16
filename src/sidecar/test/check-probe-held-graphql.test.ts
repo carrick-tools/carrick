@@ -79,6 +79,8 @@ interface Case {
   root?: string;
   /** The judge's bucket for the pair. */
   bucket: 'compatible' | 'incompatible' | 'unverifiable';
+  /** The judge's gate, for an `unverifiable` pair. */
+  gate?: string;
 }
 
 const CASES: Case[] = [
@@ -98,6 +100,14 @@ const CASES: Case[] = [
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
+  // carrick#4708: where the judge's record-field gate reads the pair unverifiable, the held form is silent.
+  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  // The same gate must not hide a real break: a leaf mismatch beside an absent field, a sub-field the schema does not declare.
+  { key: 'rf-leaf-beside-absent', root: 'order', sent: '{ id: string; total: number }', expected: '{ label: string; total: string }', bucket: 'incompatible' },
+  { key: 'rf-undeclared-sub-field', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { hint: string }[] }', bucket: 'incompatible' },
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },
 ];
@@ -179,6 +189,7 @@ describe('the held GraphQL form agrees with the judge over typed pairs (P13)', (
       const v = verdicts.get(c.key);
       assert.ok(v, `verdict for ${c.key}`);
       assert.strictEqual(v.bucket, c.bucket, JSON.stringify(v));
+      if (c.gate !== undefined) assert.strictEqual(v.gate, c.gate, JSON.stringify(v));
       const errors = tscErrors(heldSource(c));
       if (c.bucket === 'incompatible') assert.ok(errors.length > 0, 'held should speak');
       else assert.deepEqual(errors, []);
