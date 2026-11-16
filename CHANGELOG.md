@@ -1,5 +1,77 @@
 # Changelog
 
+## [0.3.158](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.157...carrick-v0.3.158) (2026-11-15)
+
+
+### Features
+
+* **compiler engine:** judge a procedure call by the consumer's own code in the retype ([#937](https://github.com/carrick-tools/carrick/issues/937) T-A) ([#4578](https://github.com/carrick-tools/carrick/issues/4578)) ([f49ba0c](https://github.com/carrick-tools/carrick/commit/f49ba0cc04a473d78326ad699aa2a570880e0695))
+* **engine:** one wire rule and the judge's tolerances for the held check; site finder action (S1) ([#4527](https://github.com/carrick-tools/carrick/issues/4527)) ([116e0e3](https://github.com/carrick-tools/carrick/commit/116e0e31c78588ff53066d2a37b17ff95d7a2f0f))
+* **held:** place checks at the producer's send positions and read them in the runtime (part 3 L1 + L2) ([#4528](https://github.com/carrick-tools/carrick/issues/4528)) ([ad399c2](https://github.com/carrick-tools/carrick/commit/ad399c2eed31b02ef88bb1ca91f2b354229422eb))
+* **held:** the daemon knows its build; a daemon of another build is replaced ([#4629](https://github.com/carrick-tools/carrick/issues/4629)) ([9109967](https://github.com/carrick-tools/carrick/commit/9109967cc95800f126c13a3f645edcc7c46aaaee))
+* **held:** the daemon's request log names where each answer's time went ([#4563](https://github.com/carrick-tools/carrick/issues/4563)) ([2f69eac](https://github.com/carrick-tools/carrick/commit/2f69eac8aa2a7d3018be1aa47b90d3cca117adf8))
+* **hook:** a dropped fact-line candidate saves its stop word ([#4607](https://github.com/carrick-tools/carrick/issues/4607)) ([67e3c51](https://github.com/carrick-tools/carrick/commit/67e3c513e038bc8428fb6bdbb6288cfb5612ddf1))
+* **hook:** a similar row says which repo it is in and whether this machine has it ([#4549](https://github.com/carrick-tools/carrick/issues/4549)) ([fa0e0be](https://github.com/carrick-tools/carrick/commit/fa0e0be189ee06e2be9d05d14428de04407b7eee))
+* **hooks:** one entry with an early answer; the held lane deleted (B1) ([#4623](https://github.com/carrick-tools/carrick/issues/4623)) ([a98fc96](https://github.com/carrick-tools/carrick/commit/a98fc96cacc2301d0205b2cf576abeefe8b98a91))
+* **hooks:** state which index each part reads, and start the move on a new fact file (Refs [#3434](https://github.com/carrick-tools/carrick/issues/3434)) ([#4596](https://github.com/carrick-tools/carrick/issues/4596)) ([0b1db2c](https://github.com/carrick-tools/carrick/commit/0b1db2c562e96a7404397f8395691e27d364fa3f))
+* **hooks:** the compiler engine's verdict rides part 2's late carrier (part 3 T9) ([#4564](https://github.com/carrick-tools/carrick/issues/4564)) ([6b888cd](https://github.com/carrick-tools/carrick/commit/6b888cda44975a7e0940dba3e173db3e1d2fc29d))
+* **lister:** mark abstract construct signatures ([#4626](https://github.com/carrick-tools/carrick/issues/4626)) ([d1e7160](https://github.com/carrick-tools/carrick/commit/d1e71604e66641a006f27f9b075103ca7c6fd27a))
+* **local-mode:** held-compiler request path (part 3 T5b) ([#4518](https://github.com/carrick-tools/carrick/issues/4518)) ([bd6f420](https://github.com/carrick-tools/carrick/commit/bd6f42083a86d0d40f2a59556d93233d1ab70b1f))
+* **local-mode:** part 2 does not repeat a part-3 line (part 3 T7) ([#4557](https://github.com/carrick-tools/carrick/issues/4557)) ([6f026bc](https://github.com/carrick-tools/carrick/commit/6f026bc64033220335577663d6d3f092bab0cbe3))
+* **local-mode:** the held compiler's line in the post-edit hook (part 3 T6) ([#4522](https://github.com/carrick-tools/carrick/issues/4522)) ([bde9f21](https://github.com/carrick-tools/carrick/commit/bde9f2115e08664a24f58230a7dad99b1522e99b))
+* **request-summary:** the instance walk keeps own-factory calls (QW-2a) ([#4579](https://github.com/carrick-tools/carrick/issues/4579)) ([6e31c24](https://github.com/carrick-tools/carrick/commit/6e31c24dd20d3020aa0b4cde364dfcfe56c2d684))
+* save non-budget unchecked library checks as label_unchecked ([#4162](https://github.com/carrick-tools/carrick/issues/4162)) ([#4169](https://github.com/carrick-tools/carrick/issues/4169)) ([4934ee9](https://github.com/carrick-tools/carrick/commit/4934ee93d926e0084a61af26d79e15eea165b12a))
+* **scanner:** a key read off a loop head over a stated list of objects is each element's ([#4266](https://github.com/carrick-tools/carrick/issues/4266)) ([#4323](https://github.com/carrick-tools/carrick/issues/4323)) ([a298624](https://github.com/carrick-tools/carrick/commit/a29862466a4433d57486111a948f95d1664bd3e3))
+* **scanner:** empty similar list when the best row scores under 0.30 ([#4551](https://github.com/carrick-tools/carrick/issues/4551)) ([f2f1b26](https://github.com/carrick-tools/carrick/commit/f2f1b26c1034ae3cce883801d6a166037d79859b))
+* **scanner:** save handler_not_located on a GraphQL root field no reader places ([#3989](https://github.com/carrick-tools/carrick/issues/3989)) ([#4168](https://github.com/carrick-tools/carrick/issues/4168)) ([b5de43a](https://github.com/carrick-tools/carrick/commit/b5de43a1499b140e79767d56f26c2e103ffcb899))
+* **scanner:** the value readers read block entries and functions declared in a body ([#3794](https://github.com/carrick-tools/carrick/issues/3794) T3) ([#3837](https://github.com/carrick-tools/carrick/issues/3837)) ([6061b1f](https://github.com/carrick-tools/carrick/commit/6061b1f08640a4e8de68c5d0b90322766c4b75df))
+
+
+### Bug Fixes
+
+* **call-through:** settle the fact through-row with the call-through walk ([#4078](https://github.com/carrick-tools/carrick/issues/4078)) ([#4087](https://github.com/carrick-tools/carrick/issues/4087)) ([d19beef](https://github.com/carrick-tools/carrick/commit/d19beefc30fc4bb625eb83c365549687ee80a772))
+* **change-scope:** the root path resolves to the empty relative path ([#4569](https://github.com/carrick-tools/carrick/issues/4569)) ([#4577](https://github.com/carrick-tools/carrick/issues/4577)) ([4099bfe](https://github.com/carrick-tools/carrick/commit/4099bfea3170a634711a0ea64e6adf256f2fcb47))
+* **compiler engine:** an RPC procedure's wire form is unknown until its transformer is ([#4402](https://github.com/carrick-tools/carrick/issues/4402)) ([#4487](https://github.com/carrick-tools/carrick/issues/4487)) ([6a6c8b8](https://github.com/carrick-tools/carrick/commit/6a6c8b8b28e5008e81ad446c1b4a3c8384a86838))
+* **decided-sites:** maker-bound names read through the resolver's caller chain (B10-2c1) ([#4571](https://github.com/carrick-tools/carrick/issues/4571)) ([4d8e709](https://github.com/carrick-tools/carrick/commit/4d8e709999315cd5eb1072f870c6ce57855e7ab1))
+* **discovery:** a stop in a sibling's function beside an end is saved at the call ([#4474](https://github.com/carrick-tools/carrick/issues/4474)) ([#4504](https://github.com/carrick-tools/carrick/issues/4504)) ([34db18f](https://github.com/carrick-tools/carrick/commit/34db18f4cb7365559fdc1ced7460ab141c32dcb7))
+* **engine:** a root abstain reason makes a manifest entry unknown ([#4307](https://github.com/carrick-tools/carrick/issues/4307)) ([83c9e57](https://github.com/carrick-tools/carrick/commit/83c9e57439c6e98eb4bf75dbc52b9c17369830fb))
+* **graphql:** one GraphQL type table per service, read from the producer's root ([#4403](https://github.com/carrick-tools/carrick/issues/4403) T-B1) ([#4447](https://github.com/carrick-tools/carrick/issues/4447)) ([3f66716](https://github.com/carrick-tools/carrick/commit/3f6671690e7fcaf3e6df593de2414e19e8c3463f))
+* **held:** find_site places a value by its parent slot, not its old text ([#4556](https://github.com/carrick-tools/carrick/issues/4556)) ([#4558](https://github.com/carrick-tools/carrick/issues/4558)) ([fc37ebf](https://github.com/carrick-tools/carrick/commit/fc37ebf07aab3a114fdd8a6c458f9ae4abd30f68))
+* **hooks:** a sub-agent's edit takes the fact-file path like the main session's ([#4615](https://github.com/carrick-tools/carrick/issues/4615)) ([#4615](https://github.com/carrick-tools/carrick/issues/4615)) ([722f065](https://github.com/carrick-tools/carrick/commit/722f06523963659516f02b862db36dab30a16121))
+* **hooks:** print the similar-function block in a fact-file edit's own result ([#4633](https://github.com/carrick-tools/carrick/issues/4633)) ([1c6accd](https://github.com/carrick-tools/carrick/commit/1c6accde7d5d18ae70380b17e90d85112c86ddbf)), closes [#4632](https://github.com/carrick-tools/carrick/issues/4632)
+* **match:** a same-name row is moved first only if it is in the score top six ([#4548](https://github.com/carrick-tools/carrick/issues/4548)) ([e54fcee](https://github.com/carrick-tools/carrick/commit/e54fcee9a022567b7573a13da20b93cfd1b5aa6a))
+* **npm:** the hook's root is the one .carrick folder a check reads (carrick[#1534](https://github.com/carrick-tools/carrick/issues/1534)) ([#4593](https://github.com/carrick-tools/carrick/issues/4593)) ([af07dd7](https://github.com/carrick-tools/carrick/commit/af07dd7db525da343a8d0991a0972c5fa0667935))
+* **recheck:** keep the walks of carried services the re-check's scan also writes ([#4620](https://github.com/carrick-tools/carrick/issues/4620)) ([c5a9f0d](https://github.com/carrick-tools/carrick/commit/c5a9f0d61ec2622de01f6baa4862113d096086fb))
+* **request_summary:** a name slot over a lost walk says walk_lost ([#4452](https://github.com/carrick-tools/carrick/issues/4452)) ([#4488](https://github.com/carrick-tools/carrick/issues/4488)) ([53dc916](https://github.com/carrick-tools/carrick/commit/53dc916b1831632b46d85353768e133a05b3d9c4))
+* **request_summary:** one answerer for a body function's value ([#4613](https://github.com/carrick-tools/carrick/issues/4613)) ([d33763a](https://github.com/carrick-tools/carrick/commit/d33763af3514a94e418b22a4586622757e2d2add))
+* **request-summary:** a base-path row at a line its callers state goes (carrick[#4531](https://github.com/carrick-tools/carrick/issues/4531)) ([#4589](https://github.com/carrick-tools/carrick/issues/4589)) ([bf7d5bf](https://github.com/carrick-tools/carrick/commit/bf7d5bf867d31358d2913a89d12bc4c0f6328630))
+* **request-summary:** a two-row caller states its own request (carrick[#4532](https://github.com/carrick-tools/carrick/issues/4532)) ([#4606](https://github.com/carrick-tools/carrick/issues/4606)) ([9fd01e1](https://github.com/carrick-tools/carrick/commit/9fd01e14a43523dcad2ddade1f30cf0accfb0ec0))
+* **request-summary:** each spelling of a package asks its own maker (carrick[#4562](https://github.com/carrick-tools/carrick/issues/4562)) ([#4575](https://github.com/carrick-tools/carrick/issues/4575)) ([65a5fa7](https://github.com/carrick-tools/carrick/commit/65a5fa71b4b63a6a4f993c7c6bef9704ed140f26))
+* **request-summary:** the declaration ask covers the siblings' members (carrick[#4445](https://github.com/carrick-tools/carrick/issues/4445) T1) ([#4481](https://github.com/carrick-tools/carrick/issues/4481)) ([3c7e45e](https://github.com/carrick-tools/carrick/commit/3c7e45e91c812ca177ab49cea0f149ac5aacfcc0))
+* **scanner:** a call through a computed key on a library receiver is saved with its key's reason ([#4327](https://github.com/carrick-tools/carrick/issues/4327) T0) ([#4363](https://github.com/carrick-tools/carrick/issues/4363)) ([0bdc84d](https://github.com/carrick-tools/carrick/commit/0bdc84d8365d69d51f96a7ceb9a5fe44d73f3c4d))
+* **scanner:** a guard in a loop body drops the element it skips ([#4265](https://github.com/carrick-tools/carrick/issues/4265)) ([#4322](https://github.com/carrick-tools/carrick/issues/4322)) ([6d7b836](https://github.com/carrick-tools/carrick/commit/6d7b836b09599f05a38374f131a9fd8b54719105))
+* **scanner:** a lead whose name is unread says why ([#4500](https://github.com/carrick-tools/carrick/issues/4500)) ([#4550](https://github.com/carrick-tools/carrick/issues/4550)) ([250738c](https://github.com/carrick-tools/carrick/commit/250738c6277439b27e9492e4a38ae84e050c95d4))
+* **scanner:** an unread procedure site makes its removed rows candidates ([#4554](https://github.com/carrick-tools/carrick/issues/4554)) ([0500517](https://github.com/carrick-tools/carrick/commit/0500517acae94f853b45db26bfbe5602a17fa53e))
+* **scanner:** the held-open fold step says why it keeps a request line ([#4374](https://github.com/carrick-tools/carrick/issues/4374)) ([#4533](https://github.com/carrick-tools/carrick/issues/4533)) ([bc39ccf](https://github.com/carrick-tools/carrick/commit/bc39ccf1a3a8485be7356022891f2e11fd4ff1bf))
+* **scanner:** the model row at a maker site's labelled call goes ([#4319](https://github.com/carrick-tools/carrick/issues/4319) T2) ([#4505](https://github.com/carrick-tools/carrick/issues/4505)) ([71cd8b4](https://github.com/carrick-tools/carrick/commit/71cd8b4939ec2a69ebb810c50d6a05d582cfb8ec))
+* **sidecar:** a GraphQL leaf is compared and stored in its scalar's sent type ([#4403](https://github.com/carrick-tools/carrick/issues/4403) T-B2) ([#4459](https://github.com/carrick-tools/carrick/issues/4459)) ([ac525a9](https://github.com/carrick-tools/carrick/commit/ac525a9824e5115bed0f5b94ec4b9c058d9a1777))
+* **trpc:** a removed procedure a client still calls states a break row ([#4559](https://github.com/carrick-tools/carrick/issues/4559)) ([a1027f8](https://github.com/carrick-tools/carrick/commit/a1027f8e4a98dce5452b5d55e0c1dfb423c409d1))
+* **url-normalizer:** an expression path segment keeps its true row ([#4514](https://github.com/carrick-tools/carrick/issues/4514) T1) ([#4523](https://github.com/carrick-tools/carrick/issues/4523)) ([96a4308](https://github.com/carrick-tools/carrick/commit/96a4308c7ca0a9cd7cccd9cdfcb6a941775a1a67))
+
+
+### Performance
+
+* **held:** no twin pass after a request that changed no text ([#4567](https://github.com/carrick-tools/carrick/issues/4567)) ([604e236](https://github.com/carrick-tools/carrick/commit/604e2366ebf8f361924483201f872e44b2310367))
+* **held:** the twin pass asks the compiler for all armed files at once ([#4568](https://github.com/carrick-tools/carrick/issues/4568)) ([1180f44](https://github.com/carrick-tools/carrick/commit/1180f44ee306111e51f32cb5c229a0c94e951038))
+* **hook:** run the post-edit probe beside the fact lines ([#4594](https://github.com/carrick-tools/carrick/issues/4594)) ([1ca6194](https://github.com/carrick-tools/carrick/commit/1ca61948b3ab9a43bc0f0dac74eb5a140daa8e68))
+* **local-mode:** one --each probe reads once ([#4389](https://github.com/carrick-tools/carrick/issues/4389)) ([#4507](https://github.com/carrick-tools/carrick/issues/4507)) ([3606814](https://github.com/carrick-tools/carrick/commit/3606814ceef21eeb3ceb3a013974d2f60ae5d643))
+
+
+### CI/CD
+
+* rebalance Rust test shards and install nextest from a pinned binary ([#4566](https://github.com/carrick-tools/carrick/issues/4566)) ([2c6230d](https://github.com/carrick-tools/carrick/commit/2c6230dc0d87c4d66d972f3e60de0e1f9a0bacc1))
+* shed the slowest Rust test shards onto the lightest ([#4580](https://github.com/carrick-tools/carrick/issues/4580)) ([0e447de](https://github.com/carrick-tools/carrick/commit/0e447dec489aac1375f4d70c3c41f4123d9b2474))
+
 ## [0.3.157](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.156...carrick-v0.3.157) (2026-11-14)
 
 
