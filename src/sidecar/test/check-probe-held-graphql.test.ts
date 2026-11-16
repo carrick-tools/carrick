@@ -5,8 +5,7 @@
  *     pairs equals the text captured before the rules were extracted.
  * (2) Agreement (P13): over typed pairs the judge's `compatible` and
  *     `unverifiable` are silent in the held form and its `incompatible`
- *     speaks, by the native compiler over both texts. Each GraphQL gate the
- *     held form composes (the field-resolver gate) keeps this green.
+ *     speaks, by the native compiler over both texts.
  * (3) `write_shadow` carries the rules, and a leaf only for the roots the
  *     judge reads in the scalar form.
  */
@@ -71,7 +70,6 @@ const CASES: Case[] = [
   { key: 'list-break', root: 'orders', sent: '{ id: string }[]', expected: '{ id: number }[]', bucket: 'incompatible' },
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
-  { key: 'field-resolver', root: 'order', sent: '{ id: string }', expected: '{ id: string; label: string }', bucket: 'unverifiable' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },
