@@ -1461,6 +1461,11 @@ pub(super) fn services_reading(
     let Ok(local) = read_blobs(&workspace.blobs_dir()) else {
         return None;
     };
+    // A model being rebuilt answers nothing here: read against no blobs,
+    // every file would read as one no service reads.
+    if !holds_repo(&local, indexed) {
+        return None;
+    }
     let name = repo_label(&tree.repo);
     let hosted = super::hosted::cached(&workspace).local_blobs(&tree.repo);
     let blobs: Vec<&crate::cloud_storage::CloudRepoData> = local
@@ -1562,16 +1567,7 @@ impl Held {
         index: &super::read_model::LocalIndex,
     ) -> Result<Self, String> {
         let local = read_blobs(&workspace.blobs_dir())?;
-        let whole = index.repos.iter().all(|repo| {
-            repo.services.iter().all(|service| {
-                local.iter().any(|blob| {
-                    blob.repo_name == repo.name
-                        && service_id(blob) == service.name
-                        && blob.commit_hash == service.commit
-                })
-            })
-        });
-        if !whole {
+        if !index.repos.iter().all(|repo| holds_repo(&local, repo)) {
             return Err(REBUILDING.to_string());
         }
         Ok(Self {
@@ -1579,6 +1575,22 @@ impl Held {
             hosted: super::hosted::cached(workspace),
         })
     }
+}
+
+/// Whether `local` (`.carrick/repos`) holds the blob of every service the
+/// index names for `repo`, at the commit it names: the read model `index.json`
+/// was built with, for that repo.
+fn holds_repo(
+    local: &[crate::cloud_storage::CloudRepoData],
+    repo: &super::read_model::IndexedRepo,
+) -> bool {
+    repo.services.iter().all(|service| {
+        local.iter().any(|blob| {
+            blob.repo_name == repo.name
+                && service_id(blob) == service.name
+                && blob.commit_hash == service.commit
+        })
+    })
 }
 
 /// Why a reader judged nothing: the local index changed under it. Agent- and

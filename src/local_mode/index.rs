@@ -555,8 +555,23 @@ fn run_generation(
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
+    // A forwarded rebuild retains every repo it did not move as the last
+    // build left it, including whether the hosted index stood in for it.
+    let retained_from_hosted: Vec<String> = match pass {
+        Pass::Forwarded(_) => LocalIndex::read(&workspace.index_file())
+            .map(|last| {
+                last.repos
+                    .into_iter()
+                    .filter(|repo| repo.read_from_hosted)
+                    .map(|repo| repo.name)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     for repo in &mut index.repos {
-        repo.read_from_hosted = fetched.contains(&repo.name);
+        repo.read_from_hosted =
+            fetched.contains(&repo.name) || retained_from_hosted.contains(&repo.name);
     }
     index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();

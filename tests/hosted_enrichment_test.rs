@@ -1029,6 +1029,24 @@ fn indexed_at_hosted(root: &Path) -> (PathBuf, String) {
     (repo, a)
 }
 
+/// `check --changed --json`, whatever it exits with.
+fn changed(root: &Path) -> Value {
+    let output = spawn(
+        root,
+        &["check", "--changed", "--workspace", ".", "--json"],
+        Some(TOKEN),
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)))
+}
+
+/// Whether a `check --changed` answer refused a read model being rebuilt.
+fn met_a_rebuild(answer: &Value) -> bool {
+    answer["not_checked"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("being rebuilt"))
+}
+
 fn index_commits(root: &Path) -> Vec<String> {
     let index: Value =
         serde_json::from_slice(&std::fs::read(root.join(".carrick/index.json")).unwrap()).unwrap();
@@ -1091,6 +1109,10 @@ fn a_move_rewrites_the_local_index_the_hooks_read() {
         .collect();
     assert_eq!(local, vec![json!(b)]);
     assert_eq!(check(root, "orders/app.ts")["index_commit"], json!(b));
+    // And the rebuilt model is whole: a reader of `.carrick/repos` takes it.
+    std::fs::write(repo.join("notes.ts"), "export const notes = 2;\n").unwrap();
+    let after = changed(root);
+    assert!(!met_a_rebuild(&after), "{after:#}");
 }
 
 /// A rebuild that fails changes neither file: the snapshot and the read model
@@ -1190,21 +1212,13 @@ fn check_changed_that_meets_a_rebuilding_read_model_states_no_problem() {
         "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 2 }; }\napp.get(\"/orders/:id\", handler);\n",
     )
     .unwrap();
+    // The whole model is read: the edit is checked.
+    let whole = changed(root);
+    assert!(!met_a_rebuild(&whole), "{whole:#}");
     std::fs::rename(root.join(".carrick/repos"), root.join("repos-away")).unwrap();
 
-    let output = spawn(
-        root,
-        &["check", "--changed", "--workspace", ".", "--json"],
-        Some(TOKEN),
-    );
-    let answer: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+    let answer = changed(root);
 
     assert_eq!(answer["problems"], json!([]), "{answer:#}");
-    assert!(
-        answer["not_checked"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("being rebuilt")),
-        "{answer:#}"
-    );
+    assert!(met_a_rebuild(&answer), "{answer:#}");
 }
