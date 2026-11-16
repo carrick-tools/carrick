@@ -108,7 +108,9 @@ test("a written fact file starts the move", async (t) => {
   };
   assert.equal(await runFactsRefresh(ws.root, { request: stage("d1"), env, forward }), "written");
   assert.equal(started.length, 1);
-  assert.deepEqual(started[0]!.slice(0, 2), ["refresh", "--hosted-only"]);
+  // Asked of the re-check runner, which runs `refresh --hosted-only` under its lock.
+  assert.equal(started[0]!.at(-1), ws.root);
+  assert.ok(fs.existsSync(path.join(ws.root, ".carrick", "rechecks", "forward.request")));
   // The digest the file already holds: the cloud says unchanged and nothing starts.
   const unchanged = (async () => new Response(JSON.stringify({ success: true, unchanged: true }))) as unknown as typeof fetch;
   assert.equal(await runFactsRefresh(ws.root, { request: unchanged, env, forward }), "unchanged");

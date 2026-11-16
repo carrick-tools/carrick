@@ -171,3 +171,19 @@ export async function status(
 export async function checkChanged(options: RunOptions): Promise<RunOutcome<ChangedResult>> {
   return await run(["check", "--changed", "--json"], options, parseChangedResult);
 }
+
+/**
+ * `carrick refresh`, run from the workspace root: rebuild the local read model.
+ * With `hostedOnly`, move this machine's copy of the hosted index forward and
+ * rebuild from it (READY-A2 T1). It prints on stderr, so the result is whether
+ * it exited 0. Only the background runner calls it, under its lock.
+ */
+export async function refresh(
+  options: RunOptions & { workspace: string; hostedOnly: boolean },
+): Promise<RunOutcome<true>> {
+  return await run(
+    ["refresh", ...(options.hostedOnly ? ["--hosted-only"] : []), "--workspace", options.workspace],
+    options,
+    (_stdout, exit) => (exit === 0 ? true : null),
+  );
+}

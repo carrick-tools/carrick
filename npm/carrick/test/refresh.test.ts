@@ -18,6 +18,7 @@ import {
   refreshInBackground,
 } from "../src/hook/refresh.ts";
 import { STATUS_SCHEMA, type StatusResult, type StatusService } from "../src/contract.ts";
+import { requestPath } from "../src/hook/rechecks.ts";
 
 function statusWith(
   states: Array<StatusService["hosted_state"]>,
@@ -68,7 +69,13 @@ test("a workspace waiting for its first CI scan refreshes once, in the backgroun
       env: { CARRICK_BIN: "carrick" },
     });
     assert.match(line ?? "", /background/);
-    assert.deepEqual(started, [{ command: "carrick", args: ["refresh", "--workspace", root] }]);
+    // Asked of the re-check runner, which runs `carrick refresh` under its
+    // lock (READY-A2 P11): the request is written and the runner started.
+    assert.equal(started.length, 1);
+    assert.equal(started[0]!.command, process.execPath);
+    assert.match(started[0]!.args[0]!, /recheck-run\.(ts|js)$/);
+    assert.equal(started[0]!.args[1], root);
+    assert.ok(fs.existsSync(requestPath(root, "refresh")));
 
     // The next session start, inside the cooldown, asks for nothing.
     assert.equal(
@@ -107,7 +114,8 @@ test("a background refresh does not keep the machine awake", () => {
       start: (_command, _args, env) => void environments.push(env),
       env: { CARRICK_BIN: "carrick" },
     });
-    assert.deepEqual(environments, [{ CARRICK_BIN: "carrick", CARRICK_NO_KEEP_AWAKE: "1" }]);
+    assert.equal(environments.length, 1);
+    assert.equal(environments[0]!["CARRICK_NO_KEEP_AWAKE"], "1");
   } finally {
     cleanup();
   }
@@ -182,9 +190,10 @@ test("the cooldown can be stated for a machine that wants it shorter", () => {
       env: { CARRICK_REFRESH_COOLDOWN_MS: "0" },
     };
     const now = Date.parse("2026-09-11T12:00:00Z");
-    refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now });
-    refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now: now + 1 });
-    assert.equal(started, 2);
+    assert.ok(refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now }));
+    assert.ok(refreshInBackground(root, statusWith(["no_index_yet"]), { ...options, now: now + 1 }));
+    // Both asked; the one runner the first started serves the second.
+    assert.equal(started, 1);
   } finally {
     cleanup();
   }
@@ -203,13 +212,15 @@ test("a workspace reading a hosted index moves it forward in the background, onc
     const env = { CARRICK_BIN: "carrick" };
     const now = Date.parse("2026-10-27T09:00:00Z");
     assert.equal(forwardInBackground(root, statusWith(["enriched"]), { now, start, env }), true);
-    assert.deepEqual(started, [
-      {
-        command: "carrick",
-        args: ["refresh", "--hosted-only", "--workspace", root],
-        env: { CARRICK_BIN: "carrick", CARRICK_NO_KEEP_AWAKE: "1" },
-      },
-    ]);
+    // The move is asked of the re-check runner, which runs it under its lock
+    // (READY-A2 P11): the request is written and the runner started, never
+    // the binary on its own.
+    assert.equal(started.length, 1);
+    assert.equal(started[0]!.command, process.execPath);
+    assert.match(started[0]!.args[0]!, /recheck-run\.(ts|js)$/);
+    assert.equal(started[0]!.args[1], root);
+    assert.equal(started[0]!.env["CARRICK_NO_KEEP_AWAKE"], "1");
+    assert.ok(fs.existsSync(requestPath(root, "forward")));
     assert.ok(fs.existsSync(markerPath(root, FORWARD_MARKER)));
     // Inside the cooldown, nothing.
     assert.equal(

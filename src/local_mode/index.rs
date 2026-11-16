@@ -91,12 +91,18 @@ pub enum Pass {
     /// whose content still matches take their answer from the job; anything
     /// that has changed since is analysed now.
     Resume(BTreeMap<PathBuf, Resumption>),
+    /// `carrick refresh --hosted-only` after the hosted snapshot moved: the
+    /// read model is rebuilt from the moved snapshot for these repos, and
+    /// every other repo is retained as it is. It reads each moved repo's blobs
+    /// straight from the snapshot (`hosted::forward` already checked them) and
+    /// never scans, infers, uploads or downloads.
+    Forwarded(std::collections::BTreeSet<PathBuf>),
 }
 
 impl Pass {
     /// Whether this pass asks the model anything at all.
     pub fn infers(&self) -> bool {
-        !matches!(self, Pass::Facts)
+        !matches!(self, Pass::Facts | Pass::Forwarded(_))
     }
 
     /// Whether what this pass takes is what the next `carrick index` should be
@@ -125,6 +131,35 @@ impl Pass {
             split
         } else {
             crate::scan_timing::Split::default()
+        }
+    }
+}
+
+/// Why a forwarded rebuild refused (inside "the local index could not be
+/// rebuilt from the newer copy: …"). Wording from the copy pass.
+const NO_INDEX_TO_REBUILD: &str = "there is no local index in this workspace to rebuild";
+const ANOTHER_ACCOUNT: &str = "the local index was built from another account's hosted index";
+const ANOTHER_REPO_SET: &str = "this workspace's repos are not the ones the local index was built for; run `carrick refresh` to rebuild it";
+/// Follows the repo's name.
+const UNMOVED_NOT_HELD: &str =
+    "'s files are missing from the local index; run `carrick refresh` to rebuild it";
+
+/// Remove the build folders a run left after it moved `.carrick/repos` aside
+/// and before it put the new one in place (a crash between the two renames):
+/// each holds a `replaced` folder no live build keeps for longer than one
+/// rename.
+fn sweep_interrupted_swaps(index_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(index_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_build = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("build-"));
+        if is_build && path.join("replaced").is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
 }
@@ -160,7 +195,14 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
     // this build starts: whatever it wrote, this run is writing a newer index
     // (carrick#1007 item 4).
     super::scan_state::forget_finished(&workspace.index_dir());
-    let hosted = super::hosted::refresh(workspace);
+    sweep_interrupted_swaps(&workspace.index_dir());
+    // A forwarded rebuild reads the snapshot `hosted::forward` has just
+    // written and checked; downloading again could take a newer index that
+    // nothing checked against HEAD.
+    let hosted = match pass {
+        Pass::Forwarded(_) => super::hosted::cached(workspace),
+        _ => super::hosted::refresh(workspace),
+    };
     let previous = LocalIndex::read(&workspace.index_file()).ok();
     let same_sources = previous.as_ref().is_some_and(|index| {
         index.hosted_source_key == hosted.source_key()
@@ -186,6 +228,47 @@ pub fn run(workspace: &Workspace, only: Option<&str>, pass: &Pass) -> Result<Bui
             .filter(|repo| resuming.contains_key(*repo))
             .cloned()
             .collect(),
+        // The moved repos, and every other one retained as the last build
+        // left it. The snapshot's bytes moved, so the source key always
+        // differs here; what must not differ is whose index this is, or the
+        // retained repos would carry another account's rows.
+        Pass::Forwarded(moved) => {
+            let Some(index) = previous.as_ref() else {
+                return Err(NO_INDEX_TO_REBUILD.into());
+            };
+            if (
+                index.hosted_identity.clone(),
+                index.hosted_workspace.clone(),
+            ) != hosted.identity()
+            {
+                return Err(ANOTHER_ACCOUNT.into());
+            }
+            if index
+                .repos
+                .iter()
+                .map(|r| PathBuf::from(&r.path))
+                .collect::<Vec<_>>()
+                != workspace.repos
+            {
+                return Err(ANOTHER_REPO_SET.into());
+            }
+            // The repos it does not move are retained from `.carrick/repos`,
+            // so that folder must be the model `index.json` names for them:
+            // a run killed mid-swap leaves it missing, and an index built over
+            // it would hold those repos with no services. The readers' rule.
+            let local = read_blobs(&workspace.blobs_dir())?;
+            if let Some(repo) = index.repos.iter().find(|repo| {
+                !moved.contains(Path::new(&repo.path)) && !super::recheck::holds_repo(&local, repo)
+            }) {
+                return Err(format!("{}{}", repo.name, UNMOVED_NOT_HELD));
+            }
+            workspace
+                .repos
+                .iter()
+                .filter(|repo| moved.contains(*repo))
+                .cloned()
+                .collect()
+        }
         _ if same_sources => requested
             .map(|path| vec![path])
             .unwrap_or_else(|| workspace.repos.clone()),
@@ -313,9 +396,18 @@ fn run_generation(
         // A facts-only pass over a tree the hosted index already describes
         // would re-read every file to write what it downloaded: fetched, not
         // re-read (carrick#985).
-        if matches!(pass, Pass::Facts)
-            && let Some(current) = current_hosted_blobs(repo, &hosted_blobs)
-        {
+        // A forwarded rebuild reads the moved snapshot's blobs as they are:
+        // `hosted::forward` checked their commits against HEAD, and a second,
+        // stricter test here would refuse a move it approved.
+        let read_in = match pass {
+            Pass::Forwarded(_) if hosted_blobs.is_empty() => {
+                return Err(format!("the newer copy holds no index for {name}"));
+            }
+            Pass::Forwarded(_) => Some(hosted_blobs.clone()),
+            Pass::Facts => current_hosted_blobs(repo, &hosted_blobs),
+            _ => None,
+        };
+        if let Some(current) = read_in {
             for (service, blob) in current.iter().enumerate() {
                 let file = format!("local-{position}-{service}.json");
                 write_blob(&blobs.join(&file), blob)?;
@@ -505,8 +597,23 @@ fn run_generation(
     timing.local_secs += join_started.elapsed().as_secs_f64();
 
     let mut index = build(workspace, blobs, &join, &remote_services)?;
+    // A forwarded rebuild retains every repo it did not move as the last
+    // build left it, including whether the hosted index stood in for it.
+    let retained_from_hosted: Vec<String> = match pass {
+        Pass::Forwarded(_) => LocalIndex::read(&workspace.index_file())
+            .map(|last| {
+                last.repos
+                    .into_iter()
+                    .filter(|repo| repo.read_from_hosted)
+                    .map(|repo| repo.name)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     for repo in &mut index.repos {
-        repo.read_from_hosted = fetched.contains(&repo.name);
+        repo.read_from_hosted =
+            fetched.contains(&repo.name) || retained_from_hosted.contains(&repo.name);
     }
     index.type_check = Some(type_check_summary(&join, &uploaded_blobs, &positions));
     index.hosted_checked_at = hosted.checked_at();
@@ -542,10 +649,11 @@ fn run_generation(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.to_string()),
     }
-    if persistent.exists() {
-        std::fs::remove_dir_all(&persistent).map_err(|e| e.to_string())?;
-    }
-    std::fs::create_dir_all(&persistent).map_err(|e| e.to_string())?;
+    // Written whole beside the old folder and renamed into place, so a reader
+    // never lists a half-written one: it sees the old blobs, the new ones, or
+    // (between the two renames) none, which it reads as a model being rebuilt.
+    let staged = generation.join("persist");
+    std::fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
     for (position, blob) in scanned_blobs
         .iter()
         .filter(|b| {
@@ -555,11 +663,16 @@ fn run_generation(
         .enumerate()
     {
         std::fs::write(
-            persistent.join(format!("{position}.json")),
+            staged.join(format!("{position}.json")),
             serde_json::to_vec(blob).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
     }
+    // The old folder goes into this build's generation, which `run` removes.
+    if persistent.exists() {
+        std::fs::rename(&persistent, generation.join("replaced")).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&staged, &persistent).map_err(|e| e.to_string())?;
     index
         .write(&workspace.index_file())
         .map_err(|e| format!("could not write {}: {e}", workspace.index_file().display()))?;
@@ -567,8 +680,7 @@ fn run_generation(
     // it starts from, and the older index's are dropped.
     super::recheck::adopt_index_state(workspace, &built_judged, &index.indexed_at);
     // What the edit probe reads, kept beside it so the probe opens no blob.
-    let repo_paths: Vec<PathBuf> = index.repos.iter().map(|r| PathBuf::from(&r.path)).collect();
-    super::kept_reads::keep_index(workspace, &index.indexed_at, &repo_paths);
+    super::kept_reads::keep_index(workspace, &index);
     // The marker is written last. An interrupted replacement cannot combine a
     // new account's read model with the preceding account's retained blobs.
     std::fs::write(
@@ -927,7 +1039,7 @@ pub(super) fn scan_command(
                 }
             }
         }
-        Pass::Facts | Pass::Infer => {}
+        Pass::Facts | Pass::Infer | Pass::Forwarded(_) => {}
     }
     match peers.filter(|_| pass.infers()) {
         Some(peers) => {

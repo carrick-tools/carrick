@@ -170,6 +170,10 @@ pub struct Degraded {
     /// (carrick#3860): the answer is the indexed one because time ran out,
     /// not because nothing needed reading.
     pub deadline: bool,
+    /// The local read model was being rebuilt (`.carrick/repos` is not the
+    /// model `index.json` names), so nothing was judged: the background
+    /// runner keeps the edit queued and asks again.
+    pub rebuilding: bool,
     /// Which services were to be re-read, once that was decided.
     pub scope: Option<RecheckScope>,
 }
@@ -411,14 +415,27 @@ pub fn run(
     };
     let source = match kept {
         Some(reads) => Source::Kept(reads),
-        None if !rescan => match probe.held_of(workspace, started) {
+        None if !rescan => match probe.held_of(workspace, before, started) {
             Ok(held) => Source::Shared(held),
+            // The read model changed under the probe: the full re-check
+            // answers once it is whole.
+            Err(reason) if reason == REBUILDING => {
+                return Err(Box::new(deferred(Vec::new(), started)));
+            }
             Err(reason) => return Err(Box::new(unread(reason, started))),
         },
-        None => match Held::read(workspace) {
+        None => match Held::read(workspace, before) {
             Ok(held) => {
                 took("held-read", started);
                 Source::Read(Box::new(held))
+            }
+            // The full re-check judges nothing either, and says so: the
+            // runner keeps the edit queued and asks again.
+            Err(reason) if reason == REBUILDING => {
+                return Err(Box::new(Degraded {
+                    rebuilding: true,
+                    ..unread(reason, started)
+                }));
             }
             Err(reason) => return Err(Box::new(unread(reason, started))),
         },
@@ -478,7 +495,7 @@ pub fn run(
             // A kept probe file read, and the ranker beside it is not current:
             // the blobs give it, as they did before the probe kept anything.
             (None, Source::Kept(_)) => {
-                probe.kept_similar(workspace, index_generation, inputs.as_ref())
+                probe.kept_similar(workspace, before, index_generation, inputs.as_ref())
             }
         }
     });
@@ -495,6 +512,7 @@ pub fn run(
             known_miss: true,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
         }));
     }
@@ -551,6 +569,7 @@ pub fn run(
                 known_miss: false,
                 deferred: false,
                 deadline: missed,
+                rebuilding: false,
                 scope: Some(plan.scope.clone()),
             }))
         }
@@ -595,10 +614,15 @@ impl ProbeReads {
             .clone()
     }
 
-    fn held_of(&mut self, workspace: &Workspace, started: Instant) -> Result<Rc<Held>, String> {
+    fn held_of(
+        &mut self,
+        workspace: &Workspace,
+        index: &super::read_model::LocalIndex,
+        started: Instant,
+    ) -> Result<Rc<Held>, String> {
         self.held
             .get_or_insert_with(|| {
-                let read = Held::read(workspace);
+                let read = Held::read(workspace, index);
                 if read.is_ok() {
                     took("held-read", started);
                 }
@@ -626,6 +650,7 @@ impl ProbeReads {
     fn kept_similar(
         &mut self,
         workspace: &Workspace,
+        index: &super::read_model::LocalIndex,
         generation: &str,
         inputs: Option<&Inputs>,
     ) -> Rc<Similar> {
@@ -635,10 +660,11 @@ impl ProbeReads {
         let kept = inputs
             .and_then(|now| kept_reads::read_similar(workspace, generation, now))
             .map(Rc::new);
-        let similar = kept.unwrap_or_else(|| match self.held_of(workspace, Instant::now()) {
-            Ok(held) => Rc::new(similar_of(&held)),
-            Err(_) => Rc::new(Similar::build(std::iter::empty())),
-        });
+        let similar =
+            kept.unwrap_or_else(|| match self.held_of(workspace, index, Instant::now()) {
+                Ok(held) => Rc::new(similar_of(&held)),
+                Err(_) => Rc::new(Similar::build(std::iter::empty())),
+            });
         self.similar = Some(Rc::clone(&similar));
         similar
     }
@@ -653,6 +679,7 @@ fn unread(reason: String, started: Instant) -> Degraded {
         known_miss: false,
         deferred: false,
         deadline: false,
+        rebuilding: false,
         scope: None,
     }
 }
@@ -666,6 +693,7 @@ fn deferred(new_functions: Vec<super::contract::NewFunction>, started: Instant) 
         known_miss: false,
         deferred: true,
         deadline: false,
+        rebuilding: false,
         scope: None,
     }
 }
@@ -1449,6 +1477,11 @@ pub(super) fn services_reading(
     let Ok(local) = read_blobs(&workspace.blobs_dir()) else {
         return None;
     };
+    // A model being rebuilt answers nothing here: read against no blobs,
+    // every file would read as one no service reads.
+    if !holds_repo(&local, indexed) {
+        return None;
+    }
     let name = repo_label(&tree.repo);
     let hosted = super::hosted::cached(&workspace).local_blobs(&tree.repo);
     let blobs: Vec<&crate::cloud_storage::CloudRepoData> = local
@@ -1540,13 +1573,48 @@ pub(super) struct Held {
 }
 
 impl Held {
-    pub(super) fn read(workspace: &Workspace) -> Result<Self, String> {
+    /// The blobs `index` names, or [`REBUILDING`] when `.carrick/repos` is not
+    /// the read model `index` was built with: missing, or a service at another
+    /// commit. A rebuild swaps the folder whole (`index::run_generation`), so
+    /// a reader that meets one mid-swap, or reads the new blobs before the new
+    /// index, judges nothing rather than one generation against another.
+    pub(super) fn read(
+        workspace: &Workspace,
+        index: &super::read_model::LocalIndex,
+    ) -> Result<Self, String> {
+        let local = read_blobs(&workspace.blobs_dir())?;
+        if !index.repos.iter().all(|repo| holds_repo(&local, repo)) {
+            return Err(REBUILDING.to_string());
+        }
         Ok(Self {
-            local: read_blobs(&workspace.blobs_dir())?,
+            local,
             hosted: super::hosted::cached(workspace),
         })
     }
 }
+
+/// Whether `local` (`.carrick/repos`) holds the blob of every service the
+/// index names for `repo`, at the commit it names: the read model `index.json`
+/// was built with, for that repo.
+pub(super) fn holds_repo(
+    local: &[crate::cloud_storage::CloudRepoData],
+    repo: &super::read_model::IndexedRepo,
+) -> bool {
+    repo.services.iter().all(|service| {
+        local.iter().any(|blob| {
+            blob.repo_name == repo.name
+                && service_id(blob) == service.name
+                && blob.commit_hash == service.commit
+        })
+    })
+}
+
+/// Why a reader judged nothing: the local index changed under it. User-facing
+/// only inside `check --changed`'s "the check did not finish"; the probe and
+/// the full re-check answer deferred instead, so the edit stays queued.
+/// Wording from the copy pass: a retry is right, and `carrick refresh` mends a
+/// mismatch that lasts.
+pub(super) const REBUILDING: &str = "the local index changed while this check read it; try again, and run `carrick refresh` if it happens again";
 
 /// The functions `relative` declares in the working tree that the index does
 /// not hold for it, from one parse of the file (carrick#2849).
@@ -1736,7 +1804,7 @@ fn inside(
                 Ok(rejoined) => Err(rejoined),
                 Err(_) => {
                     let _ = std::fs::remove_dir_all(generation);
-                    Ok(Held::read(workspace)?)
+                    Ok(Held::read(workspace, before)?)
                 }
             }
         }
@@ -2014,7 +2082,7 @@ pub(super) fn rejoin(
     index_generation: &str,
 ) -> Result<(Rejoined, std::collections::BTreeSet<String>), String> {
     let began = Instant::now();
-    let held = Held::read(workspace)?;
+    let held = Held::read(workspace, index)?;
     took("held-read", began);
     let began = Instant::now();
     let hosted = held.hosted.source_key();
@@ -2116,7 +2184,7 @@ pub(super) fn rejoin(
     // A repo the first attempt scanned is scanned again inside the same
     // deadline: reading its finished scan back is `rejoin_held`'s to offer.
     let _ = std::fs::remove_dir_all(generation);
-    let held = Held::read(workspace)?;
+    let held = Held::read(workspace, index)?;
     let rejoined = rejoin_held(
         workspace,
         held,

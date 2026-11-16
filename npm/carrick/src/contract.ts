@@ -251,6 +251,12 @@ export type Recheck = {
    * are the indexed ones because time ran out (carrick#3860). Absent otherwise.
    */
   deadline?: boolean;
+  /**
+   * True on a `none` from a full re-check that met the local read model being
+   * rebuilt: nothing was judged, and the background runner keeps the edit
+   * queued (READY-A2 P11). Absent otherwise.
+   */
+  rebuilding?: boolean;
   /** Which services this re-check read and which it judged at another version. */
   scope?: RecheckScope;
   /**

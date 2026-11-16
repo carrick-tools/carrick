@@ -23,7 +23,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { binary, check, checkChanged } from "../cli.ts";
+import { binary, check, checkChanged, refresh } from "../cli.ts";
 import type { ChangedResult, CheckResult } from "../contract.ts";
 import { createLogger } from "../log.ts";
 import {
@@ -183,6 +183,15 @@ export function takenDir(root: string, pid: number): string {
 }
 export function lockPath(root: string): string {
   return path.join(rechecksDir(root), "runner.lock");
+}
+/**
+ * The rebuilds a hook asks the runner for (`askJob`): `refresh` is
+ * `carrick refresh`, `forward` is `carrick refresh --hosted-only`.
+ */
+export type Job = "refresh" | "forward";
+/** Where a hook asks the runner for `job`. */
+export function requestPath(root: string, job: Job): string {
+  return path.join(rechecksDir(root), `${job}.request`);
 }
 
 /** `<id>.recheck.<seq>.<kind>` in the sessions directory, or null for an unusable id. */
@@ -506,6 +515,44 @@ export function ensureRunner(root: string, options: EnsureOptions = {}): boolean
   return true;
 }
 
+/**
+ * Ask for a rebuild of the local read model, which the runner runs under its
+ * lock between re-checks (READY-A2 P11): a rebuild rewrites `.carrick/repos`,
+ * `judged/` and `working/`, which every re-check reads, so it never runs
+ * beside one, nor beside another rebuild. Starts a runner when none is alive;
+ * a live one takes the request before it releases the lock. Returns whether a
+ * runner was started.
+ */
+export function askJob(root: string, job: Job, options: EnsureOptions = {}): boolean {
+  const now = options.now ?? Date.now();
+  fs.mkdirSync(rechecksDir(root), { recursive: true });
+  writeAtomic(requestPath(root, job), `${new Date(now).toISOString()}\n`);
+  return ensureRunner(root, options);
+}
+
+/**
+ * Take a job's request, once. `stuck` is a request this runner cannot remove:
+ * it is not run, and not waited for again, so the runner never spins on it.
+ */
+function takeJob(root: string, job: Job): "taken" | "none" | "stuck" {
+  try {
+    fs.unlinkSync(requestPath(root, job));
+    return "taken";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "none" : "stuck";
+  }
+}
+
+/**
+ * The longest one rebuild may run under the lock: a full `carrick refresh`
+ * scans every repo, which the CLI already bounds at three hours (its keep-awake
+ * cap); the move is a read-in and a join, bounded like `check --changed`.
+ */
+const JOB_LIMIT_MS: Record<Job, number> = {
+  refresh: 3 * 60 * 60_000,
+  forward: CHANGED_BUDGET_MS,
+};
+
 // --- the runner ------------------------------------------------------------
 
 export type RunOptions = {
@@ -648,6 +695,15 @@ function take(root: string, entry: QueueEntry, pid: number): string | null {
   }
 }
 
+/** Return a taken entry to the queue, unanswered. */
+function putBack(root: string, entry: QueueEntry, taken: string): void {
+  try {
+    fs.renameSync(taken, path.join(queueDir(root), `${entry.seq}.json`));
+  } catch (error) {
+    log("could not return an edit to the queue", String(error));
+  }
+}
+
 /**
  * The runner's loop: one `carrick check <file> --recheck --json` at a time, in
  * queue order, each answer written when its call ends. Returns when the queue
@@ -676,6 +732,13 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
   // that refuses the rename): answered once, then left alone for its life.
   const unclaimable = new Set<string>();
   const waiting = () => names(queueDir(root)).filter((name) => !unclaimable.has(name.replace(/\.json$/, "")));
+  // A rebuild request this runner could not remove, the same way: left alone.
+  const stuck = new Set<Job>();
+  // An edit returned to the queue because the read model was being rebuilt:
+  // this runner stops once the lock goes, rather than take it again at once.
+  let requeued = false;
+  const jobs: Job[] = ["refresh", "forward"];
+  const jobWaiting = () => jobs.some((job) => !stuck.has(job) && fs.existsSync(requestPath(root, job)));
   for (;;) {
     recoverTaken(root, pid, clock(), options.home);
     for (;;) {
@@ -718,6 +781,14 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
         env: callEnv,
         bin,
       });
+      // The local read model was being rebuilt and nothing was judged: the
+      // edit goes back in the queue unanswered, and this runner stops so it
+      // does not take it again at once. The next hook's runner asks again.
+      if (outcome.result?.recheck?.rebuilding === true) {
+        putBack(root, entry, taken);
+        requeued = true;
+        break;
+      }
       const finishedAt = clock();
       const body = outcome.result ? { result: outcome.result } : { failure: outcome.failure ?? "the re-check gave no answer" };
       writeAnswer(entry, "answered", startedAt, finishedAt, body, options.home);
@@ -740,11 +811,37 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       });
       remove(taken);
     }
+    // A rebuild asked for (`askJob`), run while this runner holds the lock and
+    // no re-check is reading; edits queued while it runs are taken before the
+    // lock goes. The full refresh first: the move then starts from it.
+    let ran = false;
+    for (const job of jobs) {
+      const asked = stuck.has(job) ? "none" : takeJob(root, job);
+      if (asked === "stuck") {
+        stuck.add(job);
+        log("a rebuild request could not be taken", requestPath(root, job));
+      }
+      if (asked !== "taken") continue;
+      const limit = JOB_LIMIT_MS[job] + CALL_SLACK_MS;
+      const keep = setInterval(() => touchLock(lockPath(root), pid, clock()), LOCK_TOUCH_MS);
+      const done = await refresh({
+        cwd: root,
+        workspace: root,
+        hostedOnly: job === "forward",
+        limitMs: limit,
+        env: { ...base, CARRICK_NO_KEEP_AWAKE: "1", CARRICK_TIMEOUT_MS: String(limit) },
+        bin,
+      });
+      clearInterval(keep);
+      if (done.failure) log(`the background ${job} failed`, done.failure);
+      ran = true;
+    }
+    if (ran) continue;
     releaseLock(lockPath(root), pid);
     await options.afterRelease?.();
     // Anything queued between the last look and the release would otherwise
     // wait for the next hook to notice: look once more, and go on if so.
-    if (waiting().length === 0) return;
+    if (requeued || (waiting().length === 0 && !jobWaiting())) return;
     if (!takeLock(lockPath(root), pid, clock(), cap)) return;
   }
 }
