@@ -57,8 +57,9 @@ pub(crate) struct DocumentCall {
     /// parameter of the function it is written in, and every value the
     /// callers fill that parameter with is a document.
     pub(crate) through_callers: bool,
-    /// An argument is an import the compiler finds no declaration for.
-    pub(crate) unresolved_import: bool,
+    /// The names (as the module exports them) of the imports an argument
+    /// holds that the compiler finds no declaration for; empty when none.
+    pub(crate) unresolved_imports: Vec<String>,
     /// The callee, as one key across every file of the service: the
     /// declaration its row names (a member call's: the declaration of the
     /// name the member is read on, with the member), else the import it is
@@ -82,7 +83,8 @@ enum Found {
     #[default]
     Other,
     Document(DocumentEnd),
-    Unresolved,
+    /// An import no declaration answers, by the name its module exports.
+    Unresolved(String),
 }
 
 struct Documents<'r, 'a> {
@@ -128,7 +130,7 @@ impl<'a> Follow<'a> for Documents<'_, 'a> {
             let path = self.lookup.document_file(file, &binding.specifier);
             return Some(Found::Document(DocumentEnd::File(path)));
         }
-        import_unresolved(inputs, file, row).then_some(Found::Unresolved)
+        import_unresolved(inputs, file, row).then(|| Found::Unresolved(binding.export.clone()))
     }
 
     fn definition(&mut self, _: PathBuf, _: String, _: Invoke<'a>) -> Found {
@@ -176,7 +178,7 @@ struct Pending<'a> {
     at: (&'a Path, Option<&'a str>, u8),
     call: &'a CallIr,
     params: Vec<(u8, usize, Vec<String>)>,
-    unresolved_import: bool,
+    unresolved_imports: Vec<String>,
 }
 
 /// Every call of the service whose arguments hold a GraphQL document, or
@@ -251,26 +253,29 @@ pub(crate) fn document_calls(
                 && held
                     .iter()
                     .all(|held| matches!(held, Held::Reached(Found::Document(_))));
-            if through_callers || wait.unresolved_import {
+            if through_callers || !wait.unresolved_imports.is_empty() {
                 out.push(document_call(
                     &resolver,
                     wait.at.0,
                     wait.call,
                     Vec::new(),
                     through_callers,
-                    wait.unresolved_import,
+                    wait.unresolved_imports,
                 ));
             }
         }
     } else {
-        for wait in pending.into_iter().filter(|wait| wait.unresolved_import) {
+        for wait in pending
+            .into_iter()
+            .filter(|wait| !wait.unresolved_imports.is_empty())
+        {
             out.push(document_call(
                 &resolver,
                 wait.at.0,
                 wait.call,
                 Vec::new(),
                 false,
-                true,
+                wait.unresolved_imports,
             ));
         }
     }
@@ -339,7 +344,7 @@ fn read_call<'a>(
     }
     let mut documents = Vec::new();
     let mut params = Vec::new();
-    let mut unresolved_import = false;
+    let mut unresolved_imports: Vec<String> = Vec::new();
     for value in leaves {
         if let ValueAt::Param { depth, index, keys } = value {
             params.push((*depth, *index, keys.clone()));
@@ -362,7 +367,11 @@ fn read_call<'a>(
                         documents.push(end);
                     }
                 }
-                Held::Reached(Found::Unresolved) => unresolved_import = true,
+                Held::Reached(Found::Unresolved(name)) => {
+                    if !unresolved_imports.contains(&name) {
+                        unresolved_imports.push(name);
+                    }
+                }
                 Held::Param(depth, index, keys) => params.push((depth, index, keys)),
                 Held::Reached(Found::Other) | Held::Callback | Held::Stop(_) => {}
             }
@@ -375,14 +384,14 @@ fn read_call<'a>(
             call,
             documents,
             false,
-            unresolved_import,
+            unresolved_imports,
         ));
-    } else if !params.is_empty() || unresolved_import {
+    } else if !params.is_empty() || !unresolved_imports.is_empty() {
         pending.push(Pending {
             at,
             call,
             params,
-            unresolved_import,
+            unresolved_imports,
         });
     }
 }
@@ -408,7 +417,7 @@ fn document_call(
     call: &CallIr,
     documents: Vec<DocumentEnd>,
     through_callers: bool,
-    unresolved_import: bool,
+    unresolved_imports: Vec<String>,
 ) -> DocumentCall {
     DocumentCall {
         file: file.to_path_buf(),
@@ -416,7 +425,7 @@ fn document_call(
         line: call.site.line,
         documents,
         through_callers,
-        unresolved_import,
+        unresolved_imports,
         callee: callee_key(resolver, file, call),
     }
 }
