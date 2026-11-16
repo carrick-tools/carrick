@@ -721,8 +721,30 @@ export function buildProbe(
       // field the SDL does not declare, and a leaf that mismatches beside the
       // absent fields, still fail with the filling, so they stay breaks.
       // Every line sits after the wire line, so no line above it moves.
+      //
+      // Rule G: a field the record HAS is filled too when the SDL types it as
+      // an object type (or a list of them, at any depth) and the record's own
+      // type for it is not an object shape: a primitive, or a generic JSON
+      // value. A field resolver converts it. The JSON value is read by its
+      // structure, on the whole field before any union splits: it holds every
+      // JSON primitive, and an array of itself and a string-keyed object of
+      // itself both assign to it. A field that is, or includes, an object
+      // shape is still compared field by field. The root record is never a
+      // field, so it is never filled whole.
       push(
-        `type GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlSdlFilled<C[K], I, GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: GqlSdlFilled<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } & { [K in Exclude<keyof GqlTypes[T], keyof C>]: any } : C) : C) : C;`
+        `type GqlObjectLeaf<F> = [F] extends [{ non_null: infer I }] ? GqlObjectLeaf<I> : [F] extends [{ list: infer I }] ? GqlObjectLeaf<I> : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? true : false) : false;`
+      );
+      push(
+        `type GqlJsonValueLike<X> = [string | number | boolean] extends [X] ? ([X[]] extends [X] ? ([{ [k: string]: X }] extends [X] ? true : false) : false) : false;`
+      );
+      push(
+        `type GqlNotShape<X> = [X] extends [never] ? false : [X] extends [string | number | boolean | bigint] ? true : GqlJsonValueLike<X>;`
+      );
+      push(
+        `type GqlConvertedField<C, F> = [unknown] extends [C] ? false : [GqlObjectLeaf<F>] extends [true] ? GqlNotShape<Exclude<C, null | undefined>> : false;`
+      );
+      push(
+        `type GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: GqlSdlFilled<C[K], I, GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [GqlConvertedField<C[K], GqlFieldOf<T, K>>] extends [true] ? any : GqlSdlFilled<C[K], GqlFieldOf<T, K>, GqlDepth[D]> } & { [K in Exclude<keyof GqlTypes[T], keyof C>]: any } : C) : C) : C;`
       );
       push(
         `type SdlFieldDecides = [GqlWire] extends [GqlExpected] ? false : [GqlSdlFilled<GqlWire, GqlComparandLeaf>] extends [GqlExpected] ? true : false;`

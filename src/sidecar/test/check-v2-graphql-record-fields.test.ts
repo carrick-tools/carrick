@@ -266,3 +266,151 @@ describe('the record-field gate leaves other probes as they were (carrick#1875)'
     assert.ok(gate[0] > p.wireAssignmentLine!, `gate line ${gate[0]}`);
   });
 });
+
+/**
+ * Rule G (carrick#1875): the record HAS the field, typed as a generic JSON
+ * value or a primitive, where the schema declares an object type (or a list
+ * of them). A field resolver converts it; the check reads no resolver, so
+ * the pair is unverifiable. The JSON value is recognised by its structure
+ * (every JSON primitive, arrays of itself, string-keyed objects of itself),
+ * spelled here the way ORM clients emit it. A record field that is an object
+ * shape is still compared field by field.
+ */
+const YARD_TYPES: GraphqlTypes = {
+  Query: { fields: { order: ref('Order') } },
+  Order: {
+    fields: {
+      id: nn(scalar('ID')),
+      warnings: nn(list(nn(ref('Warning')))),
+      lead: nn(ref('Warning')),
+      note: nn(scalar('String')),
+      placed: nn(scalar('String')),
+    },
+  },
+  Warning: { fields: { code: nn(scalar('String')) } },
+};
+
+const yard = (pair_key: string, producerAlias: string, consumerAlias: string): CheckPairSpec => ({
+  pair_key,
+  protocol: 'graphql',
+  type_kind: 'response',
+  producer: { service_name: 'yard', alias: producerAlias },
+  consumer: { service_name: 'dock', alias: consumerAlias },
+  graphql_root: { type: 'Query', field: 'order' },
+});
+
+const YARD_PAIRS: CheckPairSpec[] = [
+  // (1) a JSON value where the schema declares a list of objects.
+  yard('rg-json-list', 'OrderJson_Sent', 'Warnings_Exp'),
+  // (1b) the same beside a Date, so the wire line rewrites the record first.
+  yard('rg-json-list-wire', 'OrderJsonPlaced_Sent', 'WarningsPlaced_Exp'),
+  // (2) a primitive where the schema declares an object type.
+  yard('rg-string-object', 'OrderLeadString_Sent', 'Lead_Exp'),
+  // (3) an object shape lacking a sub-field the schema does not declare.
+  yard('rg-shape-undeclared', 'OrderShape_Sent', 'WarningsHint_Exp'),
+  // (4) a JSON value where the schema declares a scalar the consumer mismatches.
+  yard('rg-json-scalar', 'OrderNoteJson_Sent', 'NoteNumber_Exp'),
+  // An object shape or a string: the shape is compared, so (3)'s gap breaks.
+  yard('rg-shape-or-string', 'OrderLeadEither_Sent', 'LeadHint_Exp'),
+  // An array of strings under a list of objects: not a JSON value, not a
+  // primitive; compared as before.
+  yard('rg-string-array', 'OrderStringArray_Sent', 'Warnings_Exp'),
+];
+
+describe('check_v2: a record field the schema converts to an object type is unverifiable (carrick#1875 rule G)', () => {
+  let groot: string;
+  let verdicts: Map<string, CheckVerdict>;
+
+  before(async () => {
+    groot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-check-v2-gql-record-convert-'));
+    writeStub(
+      groot,
+      'yard',
+      [
+        'export type Blob = string | number | boolean | BlobObject | BlobArray | null;',
+        'export type BlobObject = { [Key in string]?: Blob };',
+        'export interface BlobArray extends Array<Blob> {}',
+        'export type OrderJson_Sent = { id: string; warnings: Blob };',
+        'export type OrderJsonPlaced_Sent = { id: string; placed: Date; warnings: Blob };',
+        'export type OrderLeadString_Sent = { id: string; lead: string };',
+        'export type OrderShape_Sent = { id: string; warnings: { code: string }[] };',
+        'export type OrderNoteJson_Sent = { id: string; note: Blob };',
+        'export type OrderLeadEither_Sent = { id: string; lead: { code: string } | string };',
+        'export type OrderStringArray_Sent = { id: string; warnings: string[] };',
+      ].join('\n') + '\n'
+    );
+    writeStub(
+      groot,
+      'dock',
+      [
+        'export type Warnings_Exp = { id: string; warnings: { code: string }[] };',
+        'export type WarningsPlaced_Exp = { id: string; placed: string; warnings: { code: string }[] };',
+        'export type Lead_Exp = { id: string; lead: { code: string } };',
+        'export type WarningsHint_Exp = { id: string; warnings: { code: string; hint: string }[] };',
+        'export type NoteNumber_Exp = { id: string; note: number };',
+        'export type LeadHint_Exp = { id: string; lead: { code: string; hint: string } };',
+      ].join('\n') + '\n'
+    );
+    const stubs: CheckStubInput[] = [
+      { service_name: 'yard', stub_dir: path.join(groot, 'yard'), graphql_types: YARD_TYPES },
+      { service_name: 'dock', stub_dir: path.join(groot, 'dock') },
+    ];
+    const result = await runCheck({ stubs, pairs: YARD_PAIRS });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.install_ok, true);
+    verdicts = byKey(result.verdicts);
+  });
+
+  after(() => {
+    fs.rmSync(groot, { recursive: true, force: true });
+  });
+
+  const verdict = (key: string): CheckVerdict => {
+    const v = verdicts.get(key);
+    assert.ok(v, `verdict for ${key}`);
+    assert.ok(!v.codes.includes(2589), JSON.stringify(v.codes));
+    return v;
+  };
+
+  const assertConverted = (key: string): void => {
+    const v = verdict(key);
+    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+    assert.strictEqual(v.gate, 'producer:field_resolver', JSON.stringify(v));
+    assert.strictEqual(v.resolved, false);
+    assert.strictEqual(v.unresolved_side, undefined, JSON.stringify(v));
+  };
+
+  const assertBreak = (key: string): void => {
+    const v = verdict(key);
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+    assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+  };
+
+  it('(1) a JSON value where the schema declares a list of objects: unverifiable', () => {
+    assertConverted('rg-json-list');
+  });
+
+  it('(1b) the same after the wire line rewrites the record: unverifiable', () => {
+    assertConverted('rg-json-list-wire');
+  });
+
+  it('(2) a primitive where the schema declares an object type: unverifiable', () => {
+    assertConverted('rg-string-object');
+  });
+
+  it('(3) an object shape lacking a sub-field the schema does not declare stays a break', () => {
+    assertBreak('rg-shape-undeclared');
+  });
+
+  it('(4) a JSON value under a scalar the consumer mismatches stays a break', () => {
+    assertBreak('rg-json-scalar');
+  });
+
+  it('an object shape or a string is compared as a shape and stays a break', () => {
+    assertBreak('rg-shape-or-string');
+  });
+
+  it('an array of strings under a list of objects stays a break', () => {
+    assertBreak('rg-string-array');
+  });
+});
