@@ -255,9 +255,12 @@ function rowKey(row: Pick<FactRow, "repo" | "name" | "file" | "side" | "label">)
 /** The most groups of one contract row that print: its first two (plan: at most 2 lines per operation). */
 const CONTRACT_GROUPS_PRINTED = 2;
 
-/** Whether `row` is one the laptop may print: a response row whose first group carries its wording. */
+/** A request row prints one group: its line follows every response line, so it stays short. */
+const CONTRACT_REQUEST_GROUPS_PRINTED = 1;
+
+/** Whether `row` is one the laptop may print: its first group carries its wording (the cloud decides which rows are worded). */
 function printable(row: ContractRow): boolean {
-  return row.direction === "response" && typeof row.groups[0]?.lead === "string";
+  return typeof row.groups[0]?.lead === "string";
 }
 
 /** A contract row's place in the file, for matching it to the op rows an edit reached. */
@@ -271,8 +274,9 @@ function takenId(row: Pick<ContractRow, "repo" | "side" | "label" | "file" | "li
 }
 
 /** The once-per-session key of a contract row's group `index`. */
-export function contractKey(row: Pick<ContractRow, "repo" | "file" | "side" | "label">, index: number): string {
-  return `contract::${row.repo}::${row.file}::${row.side}::${row.label}::${index}`;
+export function contractKey(row: Pick<ContractRow, "repo" | "file" | "side" | "label"> & { direction?: ContractRow["direction"] }, index: number): string {
+  const direction = row.direction === "request" ? "::request" : "";
+  return `contract::${row.repo}::${row.file}::${row.side}::${row.label}${direction}::${index}`;
 }
 
 /** Contract rows in the order their lines are tried within a tier: by line, then label. */
@@ -413,7 +417,7 @@ export async function factLines(
   const found: Record<Exclude<Kind, "contract">, Candidate[]> = { op: [], fn: [], name: [], pkg: [] };
   // The contract kind, by tier, joined after the loop: every tier-1 line
   // before any tier 2, then the chain lines, then tier 3.
-  const tiers: Candidate[][] = [[], [], [], []];
+  const tiers: Candidate[][] = [[], [], [], [], []];
   const taken = new Set<ContractRow>();
   // The same rows by repo and place, for the chain lines, which read their contract rows afresh.
   const takenIds = new Set<string>();
@@ -491,9 +495,9 @@ export async function factLines(
       }
       return { words: `${parts.join(", ")}${group.more}${group.tail}`, onDisk };
     };
-    // The contract candidates of one row: its first two groups, each a line.
+    // The contract candidates of one row: its first two groups (a request row: its first), each a line.
     const contractCandidates = (at: { repo: string; top: string }, row: ContractRow): Candidate[] =>
-      row.groups.slice(0, CONTRACT_GROUPS_PRINTED).flatMap((group, index) => {
+      row.groups.slice(0, row.direction === "request" ? CONTRACT_REQUEST_GROUPS_PRINTED : CONTRACT_GROUPS_PRINTED).flatMap((group, index) => {
         const composed = groupWords(at, group);
         if (composed === null) return [];
         return [
@@ -520,7 +524,7 @@ export async function factLines(
           chain.routes.flatMap((route) => {
             const row = facts
               .contracts(route.repo, route.file)
-              .find((one) => one.side === route.side && one.label === route.label && one.line === route.line && printable(one));
+              .find((one) => one.side === route.side && one.label === route.label && one.line === route.line && one.direction === "response" && printable(one));
             if (row === undefined || takenIds.has(takenId(row))) return [];
             const group = row.groups[0]!;
             const composed = groupWords(at, group);
@@ -558,15 +562,18 @@ export async function factLines(
       // changed lines and no clean scan. A Read never says a contract line,
       // whatever the caller asked.
       let contractRows: ContractRow[] = [];
+      let requestRows: ContractRow[] = [];
       if (options.contract === true && !edit.read) {
         try {
-          contractRows = facts.contracts(at.repo, at.rel).filter(printable);
+          const printed = facts.contracts(at.repo, at.rel).filter(printable);
+          contractRows = printed.filter((row) => row.direction === "response");
+          requestRows = printed.filter((row) => row.direction === "request");
         } catch (error) {
           log("contract fact lines failed", String(error));
           stopped("rule_failed");
         }
         const prefix = `contract::${at.repo}::${at.rel}::`;
-        const earlier = (key: string) => key.startsWith(prefix);
+        const earlier = (key: string) => key.startsWith(prefix) && !key.includes("::request::");
         const first = ![...said].some(earlier) && !(options.exclude && [...options.exclude].some(earlier));
         if (contractRows.length > 0 && first) rest.push({ at, rows: contractRows });
       }
@@ -629,9 +636,15 @@ export async function factLines(
         reachedOps.push(...rows);
         return rows.map((row) => ({ key: rowKey(row), text: row.text, named: pathsOf(row.others), holds: peersHold(at, row.others) }));
       });
-      if (contractRows.length > 0) {
+      if (contractRows.length > 0 || requestRows.length > 0) {
         try {
           const reached = new Set(reachedOps.map(contractId));
+          // Request rows: the same two tiers, their lines after every response line (tier 5).
+          const askedOne = requestRows.filter((row) => reached.has(contractId(row)));
+          for (const row of askedOne) taken.add(row);
+          const askedTwo = requestRows.filter((row) => !taken.has(row) && bodyCalls(row, requestRows, names, scan));
+          for (const row of askedTwo) taken.add(row);
+          tiers[4]!.push(...byLineThenLabel([...askedOne, ...askedTwo]).flatMap((row) => contractCandidates(at, row)));
           const one = contractRows.filter((row) => reached.has(contractId(row)));
           for (const row of one) taken.add(row);
           const two = contractRows.filter((row) => !taken.has(row) && bodyCalls(row, contractRows, names, scan));

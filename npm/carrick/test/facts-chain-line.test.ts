@@ -211,6 +211,15 @@ test("an edit of a function two calls below a route's handler prints the chain l
   assert.deepEqual(Object.keys(out.claims).sort(), [groupKey(GET, "src/routes/orders.ts"), "chain::orders-api::src/services/lines.ts::buildLines", "orders-api::src/routes/orders.ts::producer::GET /orders/:orderId"].sort());
 });
 
+test("a worded request row stored before the response row does not change the chain line", async (t) => {
+  const getRequest = { ...contractRow(GET, "src/routes/orders.ts", 3, 4), direction: "request" };
+  getRequest.groups = [{ ...getRequest.groups[0]!, lead: `Carrick: ${GET} takes a body from `, tail: ", which sends a request body: { note: string }" }];
+  const ws = await workspace(t, [getRequest, ...baseRows()]);
+  const out = await run(ws, linesEdit(ws));
+  assert.deepEqual(out.lines, [BUILD_GET]);
+  assert.deepEqual(out.claims[groupKey(GET, "src/routes/orders.ts")] !== undefined, true);
+});
+
 test("the depth 1 wording, and a hop with no call line names the file alone", async (t) => {
   const route: RouteSpec = { ...GET_ROUTE, path: [{ file: "src/routes/orders.ts", line: 3, name: "get_orderId_handler", call: null }] };
   const ws = await workspace(t, [contractRow(GET, "src/routes/orders.ts", 3, 4), chainRow("formatOrder", "src/services/format.ts", 2, [route])]);
