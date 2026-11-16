@@ -1526,6 +1526,7 @@ impl SchemaCatalogue {
                 schema: schema_file.to_string_lossy().into_owned(),
                 partial,
                 types: Default::default(),
+                base_declared: false,
             });
             marked += 1;
         }
@@ -1589,6 +1590,7 @@ impl SchemaCatalogue {
                         schema: schema_file.to_string_lossy().into_owned(),
                         partial: None,
                         types,
+                        base_declared: false,
                     })
                 }
             }
@@ -1629,6 +1631,12 @@ impl SchemaCatalogue {
     ///   type needs it is not read here. Only a printed copy read as the one
     ///   schema serving the operation counts, as for removals.
     ///
+    /// Every reading whose base copy is read records whether that copy
+    /// declared each undeclared field (`base_declared`), a hand-written
+    /// schema's reading with no doubt included: a break the base copy did not
+    /// have is one the PR introduced, which main's side then needs no type
+    /// judgement for (carrick#4670, `UndeclaredSelection::decided_by_pr_diff`).
+    ///
     /// Returns how many readings it lifted and how many it found retyped.
     pub fn lift_changes_made_by_pr(
         &self,
@@ -1642,8 +1650,10 @@ impl SchemaCatalogue {
             let Some(selection) = call.undeclared_selection.as_mut() else {
                 continue;
             };
-            let removal = selection.partial == Some(PartialSchema::PrintedFromCode)
-                && !selection.fields.is_empty();
+            let removal = matches!(
+                selection.partial,
+                None | Some(PartialSchema::PrintedFromCode)
+            ) && !selection.fields.is_empty();
             let retype = !selection.types.leaves.is_empty()
                 && !selection.types.several_schemas
                 && self.is_printed_copy(&selection.schema);
@@ -1656,11 +1666,13 @@ impl SchemaCatalogue {
             let Some(base) = base.as_ref() else {
                 continue;
             };
+            selection.base_declared = selection
+                .fields
+                .iter()
+                .all(|f| base.declares(&f.on_type, &f.field));
             if removal
-                && selection
-                    .fields
-                    .iter()
-                    .all(|f| base.declares(&f.on_type, &f.field))
+                && selection.partial == Some(PartialSchema::PrintedFromCode)
+                && selection.base_declared
             {
                 selection.partial = None;
                 lifted += 1;
@@ -5835,5 +5847,107 @@ export const typeDefs = gql`
             vec!["CATALOG_URL", "LEDGER_TOKEN", "LEDGER_URL", "VITE_API_URL"]
         );
         assert!(file_env_reads(&dir.path().join("schema.graphql")).is_empty());
+    }
+
+    /// carrick#4670: the PR's base copy of a schema decides which selection
+    /// breaks the PR introduced. A printed copy's doubt is lifted only when
+    /// the base declared every undeclared field; a hand-written schema's
+    /// reading is read against its base too, and keeps its own `partial`.
+    #[test]
+    fn the_pr_base_copy_decides_which_selection_breaks_are_the_prs() {
+        use crate::analyzer::ApiEndpointDetails;
+        use crate::graphql_selection::{
+            PartialSchema, SelectedLeaf, SelectedTypes, UndeclaredField, UndeclaredSelection,
+        };
+        const BASE: &str = "type Parcel { id: ID!, etaDays: Int }\n\
+                            type Query { parcel(id: ID!): Parcel }\n";
+        let field = |name: &str| UndeclaredField {
+            on_type: "Parcel".to_string(),
+            field: name.to_string(),
+        };
+        let row = |schema: &str,
+                   partial: Option<PartialSchema>,
+                   fields: Vec<UndeclaredField>,
+                   retyped_to: Option<&str>| ApiEndpointDetails {
+            undeclared_selection: Some(UndeclaredSelection {
+                fields,
+                schema: schema.to_string(),
+                partial,
+                types: SelectedTypes {
+                    leaves: retyped_to
+                        .map(|named| SelectedLeaf {
+                            on_type: "Parcel".to_string(),
+                            field: "etaDays".to_string(),
+                            named: named.to_string(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                base_declared: false,
+            }),
+            ..Default::default()
+        };
+        let printed = "api/schema.graphql";
+        let catalogue = SchemaCatalogue {
+            declared: [PathBuf::from(printed)].into(),
+            ..Default::default()
+        };
+        let mut calls = vec![
+            // (a) printed, the base declared the field
+            row(
+                printed,
+                Some(PartialSchema::PrintedFromCode),
+                vec![field("etaDays")],
+                None,
+            ),
+            // (b) hand-written, the base declared the field
+            row("web/schema.graphql", None, vec![field("etaDays")], None),
+            // (c) printed, the base lacked the field too
+            row(
+                printed,
+                Some(PartialSchema::PrintedFromCode),
+                vec![field("note")],
+                None,
+            ),
+            // (d) several schemas: never read
+            row(
+                printed,
+                Some(PartialSchema::SeveralSchemas),
+                vec![field("etaDays")],
+                None,
+            ),
+            // (e) a retype alone
+            row(printed, None, Vec::new(), Some("String")),
+            // (f) a retype beside a field the base lacked
+            row(
+                printed,
+                Some(PartialSchema::PrintedFromCode),
+                vec![field("note")],
+                Some("String"),
+            ),
+            // (g) git cannot read the base copy
+            row("gone/schema.graphql", None, vec![field("etaDays")], None),
+        ];
+        let (lifted, retyped) = catalogue.lift_changes_made_by_pr(&mut calls, |schema| {
+            (schema != "gone/schema.graphql").then(|| BASE.to_string())
+        });
+        let selection = |i: usize| calls[i].undeclared_selection.as_ref().unwrap();
+        let decided: Vec<bool> = (0..calls.len())
+            .map(|i| selection(i).decided_by_pr_diff())
+            .collect();
+        assert_eq!(
+            decided,
+            [true, true, false, false, true, false, false],
+            "{calls:#?}"
+        );
+        assert_eq!(selection(0).partial, None);
+        assert_eq!(selection(1).partial, None);
+        assert_eq!(selection(2).partial, Some(PartialSchema::PrintedFromCode));
+        assert_eq!(selection(3).partial, Some(PartialSchema::SeveralSchemas));
+        assert_eq!(selection(5).partial, Some(PartialSchema::PrintedFromCode));
+        assert!(!selection(3).base_declared, "several schemas are not read");
+        assert!(!selection(6).base_declared, "no base copy, no mark");
+        assert_eq!((lifted, retyped), (1, 2), "the counts keep their meaning");
     }
 }

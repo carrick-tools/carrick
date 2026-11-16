@@ -3473,8 +3473,9 @@ async fn seed_graphql_document_import_absent_root_rename() {
 /// a generated module that is not in the tree, so the consumer is untyped
 /// (carrick#4642). Only the selection reading can decide the pair, and the
 /// PR's own diff of the printed file lifts its doubt. The row is placed at the
-/// call, not at the `.gql` file. Today main's side is unjudged at an untyped
-/// caller, so the break is `possible` (see the `_marking` test).
+/// call, not at the `.gql` file. The PR's base copy declared the field, so the
+/// break is the PR's although main's side cannot type the caller
+/// (carrick#4670, see the `_marking` test).
 #[tokio::test]
 async fn seed_graphql_printed_schema_field_removed_untyped_call() {
     let _serial = SERIAL.lock().await;
@@ -3494,11 +3495,8 @@ async fn seed_graphql_printed_schema_field_removed_untyped_call() {
             .is_some_and(|d| d.contains("Consignment.total")),
         "{finding:#}"
     );
-    assert_eq!(
-        finding["on_main_unknown"], "main_types_unjudged",
-        "{finding:#}"
-    );
-    assert_eq!(finding["break"], "possible", "{finding:#}");
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["break"], "certain", "{finding:#}");
     assert_eq!(
         findings_of(&payload)
             .iter()
@@ -3517,9 +3515,9 @@ async fn seed_graphql_printed_schema_field_removed_untyped_call() {
     );
 }
 
-/// The correct marking: main had the field, so the PR introduced the break.
+/// The correct marking: main had the field, so the PR introduced the break
+/// (carrick#4670).
 #[tokio::test]
-#[ignore = "carrick#4670: main side unjudged at an untyped caller"]
 async fn seed_graphql_printed_schema_field_removed_untyped_call_marking() {
     let _serial = SERIAL.lock().await;
     let payload = manifest_seed_payload("graphql-printed-schema-field-removed-untyped-call").await;
@@ -5576,6 +5574,89 @@ async fn printed_schema_pr_payload(
     pr_payload(&store, &repo).await
 }
 
+/// The PR deletes `Parcel.etaDays` from the code and from its printed copy.
+fn delete_eta_days(repo: &Path) {
+    edit(
+        repo,
+        "apps/api/src/server.ts",
+        &[("    etaDays: { type: GraphQLInt },\n", "")],
+    );
+    edit(
+        repo,
+        "apps/api/dist/schema.graphql",
+        &[("  etaDays: Int\n", "")],
+    );
+    edit(
+        repo,
+        "__llm__/analyze-file/server.json",
+        &[
+            ("\"resolver_line\": 44", "\"resolver_line\": 43"),
+            ("\"resolver_line\": 49", "\"resolver_line\": 48"),
+        ],
+    );
+}
+
+/// The PR retypes `Parcel.etaDays` from an integer to a string scalar in the
+/// code and in its printed copy.
+fn retype_eta_days(repo: &Path) {
+    edit(
+        repo,
+        "apps/api/src/server.ts",
+        &[(
+            "    etaDays: { type: GraphQLInt },\n",
+            "    etaDays: { type: GraphQLString },\n",
+        )],
+    );
+    edit(
+        repo,
+        "apps/api/dist/schema.graphql",
+        &[("  etaDays: Int\n", "  etaDays: String\n")],
+    );
+}
+
+/// The generated module the client imports its document from is not in the
+/// tree, so the call is untyped on main and on the PR (carrick#4642).
+fn drop_generated_documents(repo: &Path) {
+    std::fs::remove_file(repo.join("apps/web/src/generated/graphql.ts")).unwrap();
+}
+
+/// The break at an untyped client that the selection read decided from the
+/// PR's own diff of the printed schema: main declared the field, so the PR
+/// introduced it, whatever main's type check could judge (carrick#4670).
+fn assert_introduced_by_the_pr(payload: &serde_json::Value) {
+    let finding = parcel_page_finding(payload).unwrap_or_else(|| {
+        panic!(
+            "no type_mismatch at the client: {:#?}",
+            findings_of(payload)
+        )
+    });
+    assert_eq!(finding["verdict_state"], "resolved", "{finding:#}");
+    assert_eq!(finding["edge_source"], "fact", "{finding:#}");
+    assert!(finding.get("on_main_unknown").is_none(), "{finding:#}");
+    assert_eq!(finding["on_main"], false, "{finding:#}");
+    assert_eq!(finding["break"], "certain", "{finding:#}");
+    assert!(finding.get("break_reason").is_none(), "{finding:#}");
+}
+
+/// The client's document comes from a generated module the tree does not
+/// hold, so main's side cannot type the call; the base copy of the printed
+/// schema declared the field the PR deletes, so the break is the PR's.
+#[tokio::test]
+async fn a_field_the_pr_deletes_from_a_printed_schema_is_introduced_at_an_untyped_client() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(drop_generated_documents, delete_eta_days).await;
+    assert_introduced_by_the_pr(&payload);
+}
+
+/// The retype twin: the base copy typed the selected field as the client
+/// reads it, so the retype is the PR's.
+#[tokio::test]
+async fn a_selected_field_the_pr_retypes_in_a_printed_schema_is_introduced_at_an_untyped_client() {
+    let _serial = SERIAL.lock().await;
+    let payload = printed_schema_pr_payload(drop_generated_documents, retype_eta_days).await;
+    assert_introduced_by_the_pr(&payload);
+}
+
 fn parcel_page_finding(payload: &serde_json::Value) -> Option<serde_json::Value> {
     findings_of(payload).into_iter().find(|f| {
         f["kind"] == "type_mismatch"
@@ -5591,30 +5672,7 @@ fn parcel_page_finding(payload: &serde_json::Value) -> Option<serde_json::Value>
 #[tokio::test]
 async fn a_field_the_pr_deletes_from_a_printed_schema_breaks_the_client_that_selects_it() {
     let _serial = SERIAL.lock().await;
-    let payload = printed_schema_pr_payload(
-        |_| {},
-        |repo| {
-            edit(
-                repo,
-                "apps/api/src/server.ts",
-                &[("    etaDays: { type: GraphQLInt },\n", "")],
-            );
-            edit(
-                repo,
-                "apps/api/dist/schema.graphql",
-                &[("  etaDays: Int\n", "")],
-            );
-            edit(
-                repo,
-                "__llm__/analyze-file/server.json",
-                &[
-                    ("\"resolver_line\": 44", "\"resolver_line\": 43"),
-                    ("\"resolver_line\": 49", "\"resolver_line\": 48"),
-                ],
-            );
-        },
-    )
-    .await;
+    let payload = printed_schema_pr_payload(|_| {}, delete_eta_days).await;
     let finding = parcel_page_finding(&payload).unwrap_or_else(|| {
         panic!(
             "no type_mismatch at the client: {:#?}",
@@ -5678,26 +5736,7 @@ async fn a_field_deleted_from_one_of_two_served_schemas_stays_unverifiable() {
                 )],
             );
         },
-        |repo| {
-            edit(
-                repo,
-                "apps/api/src/server.ts",
-                &[("    etaDays: { type: GraphQLInt },\n", "")],
-            );
-            edit(
-                repo,
-                "apps/api/dist/schema.graphql",
-                &[("  etaDays: Int\n", "")],
-            );
-            edit(
-                repo,
-                "__llm__/analyze-file/server.json",
-                &[
-                    ("\"resolver_line\": 44", "\"resolver_line\": 43"),
-                    ("\"resolver_line\": 49", "\"resolver_line\": 48"),
-                ],
-            );
-        },
+        delete_eta_days,
     )
     .await;
     assert!(
@@ -5716,25 +5755,7 @@ async fn a_field_deleted_from_one_of_two_served_schemas_stays_unverifiable() {
 #[tokio::test]
 async fn a_selected_field_the_pr_retypes_in_a_printed_schema_breaks_the_client() {
     let _serial = SERIAL.lock().await;
-    let payload = printed_schema_pr_payload(
-        |_| {},
-        |repo| {
-            edit(
-                repo,
-                "apps/api/src/server.ts",
-                &[(
-                    "    etaDays: { type: GraphQLInt },\n",
-                    "    etaDays: { type: GraphQLString },\n",
-                )],
-            );
-            edit(
-                repo,
-                "apps/api/dist/schema.graphql",
-                &[("  etaDays: Int\n", "  etaDays: String\n")],
-            );
-        },
-    )
-    .await;
+    let payload = printed_schema_pr_payload(|_| {}, retype_eta_days).await;
     let finding = parcel_page_finding(&payload).unwrap_or_else(|| {
         panic!(
             "no type_mismatch at the client: {:#?}",
@@ -5811,21 +5832,7 @@ async fn a_field_retyped_in_one_of_two_served_schemas_is_no_finding() {
                 )],
             );
         },
-        |repo| {
-            edit(
-                repo,
-                "apps/api/src/server.ts",
-                &[(
-                    "    etaDays: { type: GraphQLInt },\n",
-                    "    etaDays: { type: GraphQLString },\n",
-                )],
-            );
-            edit(
-                repo,
-                "apps/api/dist/schema.graphql",
-                &[("  etaDays: Int\n", "  etaDays: String\n")],
-            );
-        },
+        retype_eta_days,
     )
     .await;
     assert!(

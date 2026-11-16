@@ -137,6 +137,12 @@ pub struct UndeclaredSelection {
     /// ([`Self::states_something`]).
     #[serde(skip)]
     pub types: SelectedTypes,
+    /// The PR's fork-point copy of `schema` was read and declares every field
+    /// in `fields` (vacuously, when `fields` is empty). Set by
+    /// `SchemaCatalogue::lift_changes_made_by_pr` on a PR run only; never
+    /// written to the index.
+    #[serde(skip)]
+    pub base_declared: bool,
 }
 
 /// A leaf field an operation selects, with the named type the head schema
@@ -184,6 +190,17 @@ impl UndeclaredSelection {
     /// read from the head schema states neither.
     pub fn states_something(&self) -> bool {
         !self.fields.is_empty() || !self.types.retyped.is_empty()
+    }
+
+    /// Whether the break this row states is one the PR's own diff of its
+    /// schema proves (carrick#4670): the fork-point copy declared what the
+    /// operation selects, as the client reads it, so main had no break here.
+    /// A selected field the PR retypes, beside no undeclared field the base
+    /// copy lacked; or undeclared fields with no doubt, every one of which the
+    /// base copy declared.
+    pub fn decided_by_pr_diff(&self) -> bool {
+        (!self.types.retyped.is_empty() && (self.fields.is_empty() || self.base_declared))
+            || (self.partial.is_none() && !self.fields.is_empty() && self.base_declared)
     }
 
     /// The verdict's diagnostic for a pair whose selected fields the PR

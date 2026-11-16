@@ -813,6 +813,7 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
                 outcome.resolved = true;
                 outcome.unresolved_reason = None;
                 outcome.diagnostic = Some(selection.retyped_sentence());
+                outcome.decided_by_pr_diff = selection.decided_by_pr_diff();
             }
             // A row that holds only the types read from the head schema.
             _ if selection.fields.is_empty() => continue,
@@ -821,6 +822,7 @@ fn read_undeclared_selections(calls: &[ApiEndpointDetails], outcomes: &mut [Pair
                 outcome.resolved = true;
                 outcome.unresolved_reason = None;
                 outcome.diagnostic = Some(selection.break_sentence());
+                outcome.decided_by_pr_diff = selection.decided_by_pr_diff();
             }
             Some(partial) if outcome.bucket == VerdictBucket::Compatible => {
                 outcome.bucket = VerdictBucket::Unverifiable;
@@ -2106,6 +2108,11 @@ pub struct PairCheckOutcome {
     /// The judge left the pair to the consumer's own code (its retype), whose
     /// file no hash covers (carrick#3135).
     pub left_to_consumer: bool,
+    /// The GraphQL selection read decided this pair from the PR's own diff of
+    /// its schema ([`crate::graphql_selection::UndeclaredSelection::decided_by_pr_diff`]),
+    /// so main had no break here (carrick#4670). Set only by
+    /// [`read_undeclared_selections`] on a PR run; scan-local, never stored.
+    pub decided_by_pr_diff: bool,
 }
 
 /// The pairing a type-mismatch outcome is about (carrick-cloud#1369): the
@@ -4178,6 +4185,8 @@ impl Analyzer {
                 // aliases hash a site's line, so an edit above the call would
                 // read as a new pair.
                 .with_pair(Some(type_pair_key(outcome)))
+                // A break the PR's own schema diff proves (carrick#4670).
+                .with_decided_by_pr_diff(outcome.decided_by_pr_diff)
             })
             .collect()
     }
@@ -7980,6 +7989,7 @@ mod tests {
             producer_surface_hash: None,
             consumer_surface_hash: None,
             left_to_consumer: false,
+            decided_by_pr_diff: false,
         }
     }
 
@@ -9050,6 +9060,7 @@ mod tests {
                 schema: "api/schema.graphql".to_string(),
                 partial,
                 types: Default::default(),
+                base_declared: false,
             }),
             ..graphql_details(
                 OperationKey::graphql(GraphqlOperationKind::Query, field),
@@ -9149,6 +9160,72 @@ mod tests {
             outcomes[4].bucket,
             VerdictBucket::Compatible,
             "request half"
+        );
+    }
+
+    /// carrick#4670: a selection break the PR's own schema diff proves
+    /// carries that mark onto its finding; a break with no base read behind
+    /// it, and a GraphQL break the type check found, carry none.
+    #[test]
+    fn a_selection_break_the_pr_diff_proves_marks_its_finding() {
+        use crate::graphql_selection::{UndeclaredField, UndeclaredSelection};
+        use crate::operation::GraphqlOperationKind;
+        let row = |field: &str, line: u32, base_declared: bool| ApiEndpointDetails {
+            service_name: Some("consumer-svc".to_string()),
+            undeclared_selection: Some(UndeclaredSelection {
+                fields: vec![UndeclaredField {
+                    on_type: "Order".to_string(),
+                    field: "etaDays".to_string(),
+                }],
+                schema: "api/schema.graphql".to_string(),
+                partial: None,
+                types: Default::default(),
+                base_declared,
+            }),
+            ..graphql_details(
+                OperationKey::graphql(GraphqlOperationKind::Query, field),
+                &format!("web/src/{field}.tsx:{line}"),
+            )
+        };
+        let mut analyzer = Analyzer::new(Config::default());
+        analyzer.calls = vec![row("order", 7, true), row("invoice", 3, false)];
+        let compatible = |field: &str, site: &str| {
+            outcome(
+                "GRAPHQL",
+                &format!("query|{field}"),
+                site,
+                VerdictBucket::Compatible,
+                None,
+            )
+        };
+        analyzer.set_pair_outcomes(vec![
+            compatible("order", "web/src/order.tsx:7"),
+            compatible("invoice", "web/src/invoice.tsx:3"),
+            outcome(
+                "GRAPHQL",
+                "query|refund",
+                "web/src/refund.tsx:4",
+                VerdictBucket::Incompatible,
+                Some("Type 'string' is not assignable to type 'number'."),
+            ),
+        ]);
+        let marks: Vec<(String, bool)> = analyzer
+            .get_type_mismatch_findings()
+            .iter()
+            .map(|finding| {
+                let Finding::TypeMismatch { call_sites, .. } = finding else {
+                    panic!("{finding:?}");
+                };
+                (call_sites.join(","), finding.decided_by_pr_diff())
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                ("web/src/order.tsx:7".to_string(), true),
+                ("web/src/invoice.tsx:3".to_string(), false),
+                ("web/src/refund.tsx:4".to_string(), false),
+            ]
         );
     }
 

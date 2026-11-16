@@ -27,7 +27,9 @@
 //! from the scan that had main's sources, and they count on main's side. When
 //! neither source judged a pairing, or main's copy is not main as this PR's
 //! base has it, the finding says the run could not tell
-//! ([`OnMainUnknown`]) instead of guessing.
+//! ([`OnMainUnknown`]) instead of guessing. A break the PR's own schema diff
+//! proves needs no judgement from main ([`Finding::decided_by_pr_diff`],
+//! carrick#4670): the PR's base copy declared what the client selects.
 //!
 //! A copy another scanner version wrote is judged by how that scanner read the
 //! files the PR left alone ([`untouched_reading`], carrick#1530): read as this
@@ -275,6 +277,11 @@ pub enum MainCopy {
 /// the run could not tell, and the finding carries why. A finding with no
 /// pairing is left as it is.
 ///
+/// A break the PR's own schema diff proves needs no judgement from main
+/// ([`Finding::decided_by_pr_diff`], carrick#4670): it counts as judged, and
+/// every earlier answer (untouched, main has the sites, a stale or
+/// other-scanner copy) and a moved reading still win over it.
+///
 /// A finding both of whose sides read nothing the PR changed
 /// ([`Untouched::holds_for`]) is main's, whatever main's recomputation says:
 /// the PR did not write anything it rests on (carrick#3170).
@@ -328,7 +335,7 @@ pub fn mark_on_main(pr: &mut [Finding], main: &MainSide, copy: MainCopy) {
             finding.set_on_main_unknown(OnMainUnknown::MainIndexStale);
         } else if copy == MainCopy::OtherScanner {
             finding.set_on_main_unknown(OnMainUnknown::MainIndexOtherScanner);
-        } else if short.iter().any(|group| judged(main, group)) {
+        } else if short.iter().any(|group| judged(main, group)) || finding.decided_by_pr_diff() {
             if main
                 .reading_moved
                 .as_ref()
@@ -1869,6 +1876,77 @@ mod tests {
         mark_on_main(&mut pr, &recomputed_only, MainCopy::Current);
         assert_eq!(on_main(&pr[0]), None);
         assert_eq!(unknown(&pr[0]), Some(OnMainUnknown::MainTypesUnjudged));
+    }
+
+    /// carrick#4670: a break the PR's own schema diff proves needs no
+    /// judgement from main. Where main's side cannot type the call, the mark
+    /// alone makes it the PR's; every earlier answer and a moved reading keep
+    /// their priority.
+    #[test]
+    fn a_break_the_pr_schema_diff_proves_is_introduced_where_main_is_unjudged() {
+        use crate::findings::{BreakStatus, EdgeSource, VerdictState};
+        let site = "src/screens/rules.tsx:184";
+        let unjudged = main_with_stored(&main_copy_with(site, "unverifiable", false), site);
+        let decided = || {
+            retyped(site)
+                .with_edge_source(Some(EdgeSource::Fact))
+                .with_verdict_state(Some(VerdictState::Resolved))
+                .with_decided_by_pr_diff(true)
+        };
+        let mark = |finding: Finding, main: &MainSide, copy: MainCopy| {
+            let mut pr = vec![finding];
+            mark_on_main(&mut pr, main, copy);
+            pr.pop().unwrap()
+        };
+
+        let introduced = mark(decided(), &unjudged, MainCopy::Current);
+        assert_eq!(on_main(&introduced), Some(false));
+        assert_eq!(unknown(&introduced), None);
+        assert_eq!(introduced.break_status(), BreakStatus::Certain);
+        // Scan-local: the payload the cloud reads does not change shape.
+        let wire = serde_json::to_value(&introduced).unwrap();
+        assert!(wire.get("decided_by_pr_diff").is_none(), "{wire:#}");
+        assert_eq!(wire["on_main"], false, "{wire:#}");
+
+        let unmarked = mark(retyped(site), &unjudged, MainCopy::Current);
+        assert_eq!(unknown(&unmarked), Some(OnMainUnknown::MainTypesUnjudged));
+
+        let stale = mark(decided(), &unjudged, MainCopy::Stale);
+        assert_eq!(unknown(&stale), Some(OnMainUnknown::MainIndexStale));
+
+        let other = mark(decided(), &unjudged, MainCopy::OtherScanner);
+        assert_eq!(unknown(&other), Some(OnMainUnknown::MainIndexOtherScanner));
+
+        let moved_main = MainSide {
+            reading_moved: Some(ReadingMoved {
+                ours: [("rules-web".to_string(), true)].into(),
+            }),
+            ..main_with_stored(&main_copy_with(site, "unverifiable", false), site)
+        };
+        let moved = mark(decided(), &moved_main, MainCopy::Current);
+        assert_eq!(unknown(&moved), Some(OnMainUnknown::ReadingMoved));
+
+        let main_has_it = main_with_stored(&main_copy_with(site, "incompatible", true), site);
+        assert_eq!(
+            on_main(&mark(decided(), &main_has_it, MainCopy::Current)),
+            Some(true)
+        );
+
+        let untouched_main = MainSide {
+            untouched: Some(Untouched {
+                ours: [
+                    ("rules-api".to_string(), true),
+                    ("rules-web".to_string(), true),
+                ]
+                .into(),
+                peers: BTreeSet::new(),
+            }),
+            ..main_with_stored(&main_copy_with(site, "unverifiable", false), site)
+        };
+        assert_eq!(
+            on_main(&mark(decided(), &untouched_main, MainCopy::Current)),
+            Some(true)
+        );
     }
 
     /// The smoke test's one real row: main's scan retyped the call and found

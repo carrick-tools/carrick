@@ -440,6 +440,12 @@ pub enum Finding {
         /// Why `on_main` is `None` on a PR run (carrick-cloud#1408). Never set
         /// alongside `on_main`.
         on_main_unknown: Option<OnMainUnknown>,
+        /// The GraphQL selection read decided this break from the PR's own
+        /// diff of its schema: the PR's base copy declared what the operation
+        /// selects, so main had no break here and needs no type judgement for
+        /// it (carrick#4670). Scan-local, as `pair` is: never written to the
+        /// wire. The only reader is [`crate::pr_baseline::mark_on_main`].
+        decided_by_pr_diff: bool,
     },
     /// A consumer call matched a producer path but not its method. `method`
     /// is the consumer's attempt; `expected_method` is the producer's.
@@ -609,6 +615,7 @@ impl Finding {
             pair: None,
             on_main: None,
             on_main_unknown: None,
+            decided_by_pr_diff: false,
         }
     }
 
@@ -772,6 +779,29 @@ impl Finding {
             _ => {}
         }
         self
+    }
+
+    /// State that the GraphQL selection read decided this type mismatch from
+    /// the PR's own schema diff (carrick#4670). No-op for every other kind.
+    pub fn with_decided_by_pr_diff(mut self, value: bool) -> Self {
+        if let Finding::TypeMismatch {
+            decided_by_pr_diff, ..
+        } = &mut self
+        {
+            *decided_by_pr_diff = value;
+        }
+        self
+    }
+
+    /// Whether the PR's own schema diff proves this break (carrick#4670).
+    pub fn decided_by_pr_diff(&self) -> bool {
+        matches!(
+            self,
+            Finding::TypeMismatch {
+                decided_by_pr_diff: true,
+                ..
+            }
+        )
     }
 
     /// The pairing a mismatch is about, when its emitter stated one.
@@ -1036,6 +1066,9 @@ impl Serialize for Finding {
                 // Scan-local (carrick-cloud#1369): the comparison key, not a
                 // fact a reader needs.
                 pair: _,
+                // Scan-local (carrick#4670): read only by the comparison with
+                // main, whose answer `on_main` already carries.
+                decided_by_pr_diff: _,
                 // Scan-local (carrick#1517): `detail` already names each read.
                 consumer_reads: _,
                 on_main,
