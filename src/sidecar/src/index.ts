@@ -1140,7 +1140,7 @@ function handleShutdown(request: SidecarRequest & { action: 'shutdown' }): Shutd
   // Schedule exit after response is sent
   setImmediate(() => {
     log('Exiting');
-    process.exit(0);
+    exitAfterDrain(0);
   });
 
   return {
@@ -1206,6 +1206,23 @@ function handleRequest(request: SidecarRequest): SidecarResponse {
         errors: [`Unknown action: ${(request as { action: string }).action}`],
       } as ErrorResponse;
   }
+}
+
+/**
+ * Exit once every byte already written to stdout has left this process.
+ * `process.exit` drops what a pipe has not taken yet, and a pipe takes 64 KiB
+ * at a time, so an answer larger than that was cut mid-frame. An empty write
+ * is queued behind every earlier one; its callback runs when they are done
+ * (or failed, when the reader is gone). The timer bounds the wait on a reader
+ * that is alive but never reads.
+ */
+const DRAIN_LIMIT_MS = 10000;
+let exiting = false;
+function exitAfterDrain(code: number): void {
+  if (exiting) return;
+  exiting = true;
+  setTimeout(() => process.exit(code), DRAIN_LIMIT_MS).unref();
+  process.stdout.write('', () => process.exit(code));
 }
 
 // ===========================================================================
@@ -1327,7 +1344,7 @@ function exitWhenParentIsGone(): void {
   setInterval(() => {
     if (process.ppid !== startedBy) {
       log(`parent ${startedBy} is gone, exiting`);
-      process.exit(0);
+      exitAfterDrain(0);
     }
   }, PARENT_CHECK_MS).unref();
 }
@@ -1348,7 +1365,7 @@ function main(): void {
 
   rl.on('close', () => {
     log('stdin closed, exiting');
-    process.exit(0);
+    exitAfterDrain(0);
   });
 
   exitWhenParentIsGone();
@@ -1356,12 +1373,12 @@ function main(): void {
   // Handle process signals
   process.on('SIGINT', () => {
     log('SIGINT received, exiting');
-    process.exit(0);
+    exitAfterDrain(0);
   });
 
   process.on('SIGTERM', () => {
     log('SIGTERM received, exiting');
-    process.exit(0);
+    exitAfterDrain(0);
   });
 
   // Fail fast on uncaught errors. Continuing after one means serving later
@@ -1372,7 +1389,7 @@ function main(): void {
   process.on('uncaughtException', (err) => {
     logError(`Uncaught exception (exiting): ${err.message}`);
     logError(err.stack || '');
-    process.exit(1);
+    exitAfterDrain(1);
   });
 
   process.on('unhandledRejection', (reason) => {
@@ -1389,7 +1406,7 @@ function main(): void {
       }
     }
     logError(`Unhandled rejection (exiting): ${detail}`);
-    process.exit(1);
+    exitAfterDrain(1);
   });
 }
 
