@@ -48,9 +48,11 @@ import {
   judgeFitOptions,
   wireFormFor,
   type FitOptions,
+  type GraphqlLeaf,
+  type GraphqlRoot,
+  type GraphqlTypes,
   type JudgeTolerances,
 } from './capture/index.js';
-import type { GraphqlLeaf, GraphqlRoot, GraphqlTypes } from './capture/api.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {

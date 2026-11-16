@@ -64,7 +64,7 @@ const CASES: Case[] = [
   // The judge's scalar rule reads any value on a built-in leaf as that scalar's type; the held form says the same.
   // The envelope unwrap moves the leaf to the envelope field's: `id` is read as an `ID` there.
   { key: 'envelope-scalar-leaf', root: 'orderPage', sent: '{ edges: { id: bigint }[]; totalCount: number }', expected: '{ id: string }[]', bucket: 'compatible' },
-  { key: 'scalar-leaf-pinned', root: 'order', sent: '{ paid: string }', expected: '{ paid: boolean }', bucket: 'compatible' },
+  { key: 'scalar-leaf-pinned', root: 'order', sent: '{ pending: string }', expected: '{ pending: boolean }', bucket: 'compatible' },
   { key: 'custom-scalar-ok', root: 'order', sent: '{ price: Date }', expected: '{ price: string }', bucket: 'compatible' },
   { key: 'custom-scalar-break', root: 'order', sent: '{ price: number }', expected: '{ price: string }', bucket: 'incompatible' },
   { key: 'list-ok', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string }[]', bucket: 'compatible' },

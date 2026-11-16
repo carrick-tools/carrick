@@ -24,7 +24,7 @@ export const SHOP_TYPES: GraphqlTypes = {
     fields: {
       id: nn(scalar('ID')),
       total: nn(scalar('Int')),
-      paid: nn(scalar('Boolean')),
+      pending: nn(scalar('Boolean')),
       price: nn(scalar('Money')),
       label: scalar('String'),
       lines: nn(list(nn(ref('Line')))),
