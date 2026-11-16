@@ -523,7 +523,7 @@ impl ServiceBoundary {
             && let Some(reason) = unparsed.reasons.first()
         {
             out.push(format!(
-                "  {} type declaration text(s) did not parse ({reason}). Quoted types may not be valid TypeScript. Routes and calls are unaffected.",
+                "  {} type declaration text(s) did not parse ({reason}). Routes, calls and types still stand, but a type quoted from those texts may not be valid TypeScript.",
                 unparsed.total
             ));
         }
