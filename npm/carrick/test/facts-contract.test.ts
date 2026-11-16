@@ -40,13 +40,14 @@ async function dropContracts(root: string): Promise<void> {
 
 const answer = (body: Record<string, unknown>) => new Response(JSON.stringify(body));
 
-test("the contract switch is opt-in: exactly \"1\" and fact lines on", () => {
-  assert.equal(contractLinesEnabled({}), false, "unset");
-  assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "" }), false, "empty");
+test("the contract switch is on by default: off only for exactly \"0\", or with fact lines off", () => {
+  assert.equal(contractLinesEnabled({}), true, "unset");
+  assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "" }), true, "empty");
   assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "0" }), false, "0");
-  assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "true" }), false, "true");
+  assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "true" }), true, "true");
   assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "1" }), true, "1");
   assert.equal(contractLinesEnabled({ CARRICK_CONTRACT_LINES: "1", CARRICK_FACT_LINES: "0" }), false, "1 with facts off");
+  assert.equal(contractLinesEnabled({ CARRICK_FACT_LINES: "0" }), false, "unset with facts off");
 });
 
 test("the local layout is unchanged by the contract kind", () => {
@@ -164,7 +165,7 @@ test("an answer carrying contract: true is remembered with the file", async (t) 
   unflagged.close();
 });
 
-test("with the switch on, a file without the contracts table is not known; otherwise it is", async (t) => {
+test("with the switch on (the default), a file without the contracts table is not known; otherwise it is", async (t) => {
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (_url: string, init?: RequestInit) => {
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -173,7 +174,7 @@ test("with the switch on, a file without the contracts table is not known; other
   const env = { ...process.env, CARRICK_TOKEN: "t" };
   const root = await workspace(t, wireText());
   await dropContracts(root);
-  await refreshFacts(root, { request, env });
+  await refreshFacts(root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "0" } });
   assert.equal(bodies[0]!["known_digest"] !== undefined, true, "switch off: known");
   await refreshFacts(root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1" } });
   assert.equal("known_digest" in bodies[1]!, false, "switch on, no table: not known");

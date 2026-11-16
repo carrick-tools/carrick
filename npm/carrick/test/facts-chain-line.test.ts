@@ -1,6 +1,6 @@
 // The chain line: what an edit of a function the cloud walked to from routes'
-// handlers prints (`facts/lines.ts`, `k: "chain"`), behind the opt-in switch
-// `CARRICK_CHAIN_LINES=1`, which also needs `CARRICK_CONTRACT_LINES=1`. Also
+// handlers prints (`facts/lines.ts`, `k: "chain"`), on by default,
+// off with `CARRICK_CHAIN_LINES=0`; it also needs the contract line on. Also
 // the store's `chains` table and the refresh's rule for a file without it.
 // Every service, file, route and type here is invented. Wire: carrick-cloud
 // `docs/internal/reference/edit-facts-wire.md`, section `k: "chain"`.
@@ -375,18 +375,22 @@ const hookEdit = (ws: Ws, session: string, env: Record<string, string>) => {
   return patchEdit(ws, file, [{ newStart: lineOf(file, IN_BUILD), lines: [`+  ${IN_BUILD}`] }], { session, env });
 };
 
-test("the chain switch is opt-in: exactly \"1\", with the contract switch on and fact lines on", () => {
-  assert.equal(chainLinesEnabled({}), false, "unset");
-  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "1" }), false, "chain alone");
-  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "true", CARRICK_CONTRACT_LINES: "1" }), false, "true");
-  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "1", CARRICK_CONTRACT_LINES: "1" }), true, "both");
-  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "1", CARRICK_CONTRACT_LINES: "1", CARRICK_FACT_LINES: "0" }), false, "facts off");
+test("the chain switch is on by default: off only for exactly \"0\", with the contract switch off, or with fact lines off", () => {
+  assert.equal(chainLinesEnabled({}), true, "unset");
+  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "" }), true, "empty");
+  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "0" }), false, "0");
+  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "1" }), true, "1");
+  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "true" }), true, "true");
+  assert.equal(chainLinesEnabled({ CARRICK_CONTRACT_LINES: "0" }), false, "contract off");
+  assert.equal(chainLinesEnabled({ CARRICK_CHAIN_LINES: "1", CARRICK_FACT_LINES: "0" }), false, "facts off");
 });
 
-test("the hook prints the chain line only with both switches on, and never with fact lines off", async (t) => {
+test("the hook prints the chain line unless a switch is \"0\", and never with fact lines off", async (t) => {
   const ws = await workspace(t, baseRows());
   const cases: Array<[Record<string, string>, boolean]> = [
-    [{ CARRICK_CHAIN_LINES: "1" }, false],
+    [{ CARRICK_CHAIN_LINES: "0" }, false],
+    [{ CARRICK_CONTRACT_LINES: "0" }, false],
+    [{}, true],
     [{ CARRICK_CHAIN_LINES: "1", CARRICK_CONTRACT_LINES: "1" }, true],
     [{ CARRICK_CHAIN_LINES: "1", CARRICK_CONTRACT_LINES: "1", CARRICK_FACT_LINES: "0" }, false],
   ];
@@ -411,7 +415,7 @@ function snapshot(dir: string): Map<string, string> {
   return seen;
 }
 
-test("with CARRICK_CHAIN_LINES unset or 0, the hook's stdout, exit code and files written are the same whether or not the fact file holds chain rows", async (t) => {
+test("with CARRICK_CHAIN_LINES=0 or CARRICK_CONTRACT_LINES=0, the hook's stdout, exit code and files written are the same whether or not the fact file holds chain rows", async (t) => {
   const observe = async (rows: Array<Record<string, unknown>>, env: Record<string, string>) => {
     const ws = await workspace(t, rows);
     const before = [snapshot(ws.root), snapshot(ws.home)];
@@ -439,7 +443,7 @@ test("with CARRICK_CHAIN_LINES unset or 0, the hook's stdout, exit code and file
   };
   const rows = [...baseRows(), fn];
   const withoutChains = rows.filter((row) => row["k"] !== "chain");
-  const envs: Array<Record<string, string>> = [{}, { CARRICK_CONTRACT_LINES: "1" }, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "0" }];
+  const envs: Array<Record<string, string>> = [{ CARRICK_CHAIN_LINES: "0" }, { CARRICK_CONTRACT_LINES: "0" }, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "0" }];
   for (const env of envs) {
     const withRows = await observe(rows, env);
     const without = await observe(withoutChains, env);
@@ -450,8 +454,10 @@ test("with CARRICK_CHAIN_LINES unset or 0, the hook's stdout, exit code and file
     assert.deepEqual(withRows.written, without.written, JSON.stringify(env));
   }
   // Not vacuous: with both switches on the same file prints the chain line, then the fn line.
-  const on = await observe(rows, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" });
-  assert.equal(context(on.stdout), `${BUILD_GET}\n\nfn line for buildLines`);
+  for (const env of [{}, { CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" }] as Array<Record<string, string>>) {
+    const on = await observe(rows, env);
+    assert.equal(context(on.stdout), `${BUILD_GET}\n\nfn line for buildLines`, JSON.stringify(env));
+  }
 });
 
 // The store and the refresh.
@@ -531,7 +537,7 @@ test("every chain row of the pinned fixture is ingested and answered by function
   store.close();
 });
 
-test("with the chain switch on, a file without the chains table is not known; otherwise it is", async (t) => {
+test("with the chain switch on (the default), a file without the chains table is not known; otherwise it is", async (t) => {
   const bodies: Array<Record<string, unknown>> = [];
   const request = (async (_url: string, init?: RequestInit) => {
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -541,12 +547,12 @@ test("with the chain switch on, a file without the chains table is not known; ot
   const ws = await workspace(t, baseRows());
   await dropChains(ws.root);
   const known = (i: number) => bodies[i]!["known_digest"] !== undefined;
-  await refreshFacts(ws.root, { request, env });
+  await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "0", CARRICK_CHAIN_LINES: "0" } });
   assert.equal(known(0), true, "switches off: known");
-  await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1" } });
+  await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CHAIN_LINES: "0" } });
   assert.equal(known(1), true, "contract on, chain off: known");
-  await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CHAIN_LINES: "1" } });
-  assert.equal(known(2), true, "chain alone (contract off): known");
+  await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "0" } });
+  assert.equal(known(2), true, "chain on but contract off: known");
   await refreshFacts(ws.root, { request, env: { ...env, CARRICK_CONTRACT_LINES: "1", CARRICK_CHAIN_LINES: "1" } });
   assert.equal(known(3), false, "chain on, no table: not known");
   const withTable = await workspace(t, baseRows());
