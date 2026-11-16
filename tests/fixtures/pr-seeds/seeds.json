@@ -1208,6 +1208,26 @@
           {"kind": "risk_introduced", "label": "GET /api/v1/carriers/:carrierId", "site": "src/carrier-hook.ts:9"}
         ]
       }
+    },
+    {
+      "name": "graphql-document-import-absent-root-rename",
+      "protocol": "graphql",
+      "change": "removed_while_used",
+      "repo": "orders-api",
+      "edits": [
+        {"op": "replace", "file": "src/summary.graphql", "pairs": [["  orderSummary(id: ID!)", "  orderSummaries(id: ID!)"]]},
+        {"op": "replace", "file": "src/summary.ts", "pairs": [["    orderSummary: (_parent", "    orderSummaries: (_parent"]]},
+        {"op": "replace", "file": "__llm__/analyze-file/summary.json", "pairs": [["\"field\": \"orderSummary\"", "\"field\": \"orderSummaries\""], ["\"resolver_function\": \"orderSummary\"", "\"resolver_function\": \"orderSummaries\""]]}
+      ],
+      "expect": {
+        "title": "not_clean",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "delta_new", "label": "QUERY orderSummaries"},
+          {"kind": "delta_removed", "label": "QUERY orderSummary"},
+          {"kind": "removed_still_called", "label": "QUERY orderSummary"}
+        ]
+      }
     }
   ]
 }

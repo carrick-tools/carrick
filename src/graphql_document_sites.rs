@@ -276,11 +276,14 @@ pub struct DocumentSiteSummary {
 /// the analysis drops, and the documents each call executes, placed once the
 /// rows are built ([`DocumentSiteConsumers::apply`]). `siblings` are the
 /// run's other services, read as the resolver reads them. `workspace`
-/// resolves the specifier of a document file imported whole.
+/// resolves the specifier of a document file imported whole. `walk_roots`
+/// are the service's GraphQL walk roots; they are walked only when a call
+/// passes an import nothing resolves.
 pub fn read_document_sites(
     inputs: &crate::request_summary::RequestSummaryInputs,
     siblings: &[&crate::request_summary::RequestSummaryInputs],
     workspace: Option<&WorkspaceIndex>,
+    walk_roots: &[crate::graphql::WalkRoot],
 ) -> (DocumentSites, DocumentSiteConsumers) {
     let mut reader = DocumentReader::new(workspace);
     let calls = crate::request_summary::document_calls(inputs, siblings, &mut reader);
@@ -293,15 +296,62 @@ pub fn read_document_sites(
         .collect();
     let mut sites = DocumentSites::default();
     let mut consumers = Vec::new();
+    // The service's own document files, read only when a call passes an
+    // import nothing resolves.
+    let named_operations = calls
+        .iter()
+        .any(|call| call.documents.is_empty() && !call.unresolved_imports.is_empty())
+        .then(|| named_document_operations(&crate::graphql::service_document_files(walk_roots)));
     for call in &calls {
         let file = call.file.to_string_lossy().into_owned();
+        // A generated document module absent from the tree: `<Op>Document`
+        // is the document of the one operation `<Op>` the service's own
+        // document files hold (carrick#4642). The call is a document site
+        // like any other: it places the operation and drops its HTTP twin.
+        if call.documents.is_empty()
+            && let Some(named) = &named_operations
+            && let Some((path, operation)) = call
+                .unresolved_imports
+                .iter()
+                .filter_map(|name| named.get(name.strip_suffix("Document")?))
+                .find_map(|found| match found.as_slice() {
+                    [one] => Some(one),
+                    _ => None,
+                })
+        {
+            debug!(
+                "GraphQL document import not on disk at {}:{} read as the operation {} of {}",
+                file,
+                call.line,
+                operation.name.as_deref().unwrap_or("?"),
+                path.display()
+            );
+            sites
+                .document_sites
+                .entry(file)
+                .or_default()
+                .insert(call.span_start);
+            consumers.push((
+                call.file.clone(),
+                ExecutedDocument {
+                    line: call.line,
+                    document: DeclaredDocument {
+                        file: path.clone(),
+                        line: 1,
+                        operations: vec![operation.clone()],
+                        field_types: HashMap::new(),
+                    },
+                },
+            ));
+            continue;
+        }
         if !call.documents.is_empty() || call.through_callers {
             sites
                 .document_sites
                 .entry(file)
                 .or_default()
                 .insert(call.span_start);
-        } else if call.unresolved_import
+        } else if !call.unresolved_imports.is_empty()
             && call
                 .callee
                 .as_ref()
@@ -348,6 +398,34 @@ pub fn read_document_sites(
             compiled,
         },
     )
+}
+
+/// Name → every operation of that name the service's document files state,
+/// with the file each is written in. Read from the files' text, as the
+/// GraphQL extraction reads their rows ([`document_file_rows`]); an
+/// anonymous operation has no name to be asked for.
+fn named_document_operations(
+    document_files: &[PathBuf],
+) -> HashMap<String, Vec<(PathBuf, DocumentOperation)>> {
+    let mut named: HashMap<String, Vec<(PathBuf, DocumentOperation)>> = HashMap::new();
+    let mut seen = HashSet::new();
+    for file in document_files {
+        if !is_graphql_document_path(file) || !seen.insert(file) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for (operation, _) in text_operations_with_lines(&text) {
+            if let Some(name) = operation.name.clone() {
+                named
+                    .entry(name)
+                    .or_default()
+                    .push((file.clone(), operation));
+            }
+        }
+    }
+    named
 }
 
 impl DocumentSiteConsumers {
@@ -1424,12 +1502,12 @@ export function InvoicesPage() {
         walked: &Walked,
         workspace: Option<&WorkspaceIndex>,
     ) -> DocumentSiteDrops {
-        let (sites, _) = read_document_sites(&walked.inputs, &[], workspace);
+        let (sites, _) = read_document_sites(&walked.inputs, &[], workspace, &[]);
         suppress_document_site_http_rows(file_results, &sites)
     }
 
     fn consumers(walked: &Walked) -> DocumentSiteConsumers {
-        read_document_sites(&walked.inputs, &[], None).1
+        read_document_sites(&walked.inputs, &[], None, &[]).1
     }
 
     fn targets(results: &HashMap<String, FileAnalysisResult>, key: &str) -> Vec<String> {
@@ -1835,6 +1913,122 @@ export function RetryButton() {
 
     fn row(key: &str, file: &str, line: u32) -> (String, String, u32) {
         (key.to_string(), file.to_string(), line)
+    }
+
+    /// One document file with two operations: the second, `Pay`, is not at line 1.
+    const SHOP_DOCUMENTS: &str = "query Orders {\n  orders { id }\n}\n\nmutation Pay($id: ID!) {\n  pay(id: $id) { ok }\n}\n";
+
+    /// The documents of these pages come from a generated module the clean
+    /// tree does not hold.
+    const SHOP_ORDERS_PAGE: &str = r#"import { useQuery } from "@example/gql-client";
+import { OrdersDocument } from "../generated/shop";
+// Commandes — liste
+export function OrdersPage() {
+  const [orders] = useQuery(OrdersDocument);
+  return orders;
+}
+"#;
+    const SHOP_PAY_BUTTON: &str = r#"import { useMutation } from "@example/gql-client";
+import { PayDocument } from "../generated/shop";
+export function PayButton() {
+  const [pay] = useMutation(PayDocument);
+  return pay;
+}
+"#;
+    const SHOP_MISSING_PAGE: &str = r#"import { useQuery } from "@example/gql-client";
+import { MissingDocument } from "../generated/shop";
+export function MissingPage() {
+  const [missing] = useQuery(MissingDocument);
+  return missing;
+}
+"#;
+
+    #[test]
+    fn an_unresolved_document_import_named_for_a_gql_operation_is_placed_at_its_call() {
+        // carrick#4642: the generated module is gitignored and absent. The
+        // import is named for an operation the service's own document files
+        // hold, so the call is that operation's site, and the call is a
+        // document site: it has no HTTP twin either.
+        let Some(walked) = walk(&[
+            ("src/graphql/shop.gql", SHOP_DOCUMENTS),
+            ("src/pages/OrdersPage.tsx", SHOP_ORDERS_PAGE),
+            ("src/pages/PayButton.tsx", SHOP_PAY_BUTTON),
+            ("src/pages/MissingPage.tsx", SHOP_MISSING_PAGE),
+        ]) else {
+            return;
+        };
+        let root = walked.repo.clone();
+        let orders = key(&walked, "src/pages/OrdersPage.tsx");
+        let pay = key(&walked, "src/pages/PayButton.tsx");
+        let missing = key(&walked, "src/pages/MissingPage.tsx");
+        let walk_roots = vec![crate::graphql::WalkRoot::from(root.clone())];
+        let mut files = vec![root.join("src/graphql/shop.gql")];
+        files.extend([&orders, &pay, &missing].map(PathBuf::from));
+
+        let (sites, consumers) = read_document_sites(&walked.inputs, &[], None, &walk_roots);
+        let mut results = HashMap::from([
+            (
+                orders.clone(),
+                result_with(vec![row_at(
+                    SHOP_ORDERS_PAGE,
+                    "useQuery(OrdersDocument",
+                    "POST",
+                    "/graphql",
+                )]),
+            ),
+            (
+                pay.clone(),
+                result_with(vec![row_at(
+                    SHOP_PAY_BUTTON,
+                    "useMutation(PayDocument",
+                    "ALL",
+                    "/graphql",
+                )]),
+            ),
+            (
+                missing.clone(),
+                result_with(vec![row_at(
+                    SHOP_MISSING_PAGE,
+                    "useQuery(MissingDocument",
+                    "POST",
+                    "/graphql",
+                )]),
+            ),
+        ]);
+        let drops = suppress_document_site_http_rows(&mut results, &sites);
+        assert!(targets(&results, &orders).is_empty(), "no HTTP twin");
+        assert!(targets(&results, &pay).is_empty(), "no HTTP twin");
+        assert_eq!(targets(&results, &missing), vec!["POST /graphql"]);
+        assert_eq!(drops.total(), 2);
+
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![
+                row("graphql|mutation|pay", "src/graphql/shop.gql", 6),
+                row("graphql|query|orders", "src/graphql/shop.gql", 2),
+            ],
+            "the document files' rows before the calls are read"
+        );
+        let summary = consumers.apply(&mut extraction);
+
+        assert_eq!(
+            rows(&extraction, &root),
+            vec![
+                row("graphql|mutation|pay", "src/pages/PayButton.tsx", 4),
+                row("graphql|query|orders", "src/pages/OrdersPage.tsx", 5),
+            ],
+            "the two named calls state the operations; the unmatched call states none"
+        );
+        assert_eq!(summary.site_rows, 2);
+        assert_eq!(summary.covered_rows, 2);
+        assert!(
+            extraction
+                .consumers
+                .iter()
+                .all(|op| op.declared_result_type.is_none()),
+            "untyped until the generated type can be read"
+        );
     }
 
     #[test]

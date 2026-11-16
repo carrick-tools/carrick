@@ -125,6 +125,7 @@ seed that is dark today. "Ignored" names the issues it waits on.
 | `pubsub-subscriber-field-added` | the subscriber's `PaymentSettled` gains optional `currency` (the answer's lines move) | as above | passes (carrick#3172) |
 | `queue-job-renamed` (`jobs-sender`) | `new Queue("welcome-mail")` to `"welcome-email"` (`src/mail.ts:3`); the worker still listens on the old name | `removed_still_called` `PUBSUB welcome-mail`; the payload carries the `missing_endpoint` at `src/mail.ts:10` | scanner stages right; shown waits on carrick-cloud#2829, #3438 |
 | `queue-payload-field-removed` (`jobs-sender`) | `.add` drops `locale` from its payload (`src/mail.ts:10`), which the worker reads | `type_mismatch` `PUBSUB welcome-mail` at `src/mail.ts:10` | stops at judged: the send has no resolved expected type; carrick#3547, #3782 |
+| `graphql-document-import-absent-root-rename` | `orderSummary` to `orderSummaries` (`src/summary.graphql`, `src/summary.ts`, the answer); `storefront`'s only consumer, `src/order-summary.ts`, passes `OrderSummaryDocument` from a generated module that is not in the tree (carrick#4642) | `missing_endpoint` `QUERY orderSummary` at `src/order-summary.ts:5`, not at its `.gql` file; delta | passes |
 
 ## Type-reach seeds (carrick#3102)
 

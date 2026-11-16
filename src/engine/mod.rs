@@ -6151,6 +6151,7 @@ async fn analyze_current_repo_incremental(
                     &request_inputs,
                     &sibling_inputs,
                     Some(&service_modules),
+                    &service_graphql_roots(repo_path, config),
                 );
             let (early_answer, first_answer) = tokio::sync::oneshot::channel();
             let (fact_sender, fact_files) = tokio::sync::oneshot::channel();
@@ -15629,6 +15630,7 @@ async fn analyze_current_repo(
         &request_inputs,
         &sibling_inputs,
         Some(&service_modules),
+        &service_graphql_roots(repo_path, service),
     );
     let (early_answer, first_answer) = tokio::sync::oneshot::channel();
     let (fact_sender, fact_files) = tokio::sync::oneshot::channel();

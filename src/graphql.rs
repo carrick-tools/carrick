@@ -605,6 +605,13 @@ fn graphql_files_under(roots: &[WalkRoot]) -> Vec<PathBuf> {
     graphql_files_under_within(roots, crate::file_finder::untrusted_bound)
 }
 
+/// The `.graphql`/`.gql` files a service's own walk reads, for the pass that
+/// reads document calls before the extraction runs
+/// ([`crate::graphql_document_sites::read_document_sites`]).
+pub(crate) fn service_document_files(roots: &[WalkRoot]) -> Vec<PathBuf> {
+    graphql_files_under(roots)
+}
+
 /// One root of a service's GraphQL walk, with the directories it leaves out.
 ///
 /// A service's own directory leaves out its nested services' directories, as
