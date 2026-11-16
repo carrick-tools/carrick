@@ -82,6 +82,15 @@ export type ContractGroup = {
   shortened: boolean;
 };
 
+/** The root field a GraphQL resolver row answers: `{ type: "Query", field: "order" }`. */
+export type GraphqlRootRef = { type: string; field: string };
+
+/**
+ * A service's SDL output types (`k: "gqltypes"`, writer 12), as the wire states
+ * them: type name to its fields. Opaque here; the compiler engine reads it.
+ */
+export type GraphqlTypeTable = Record<string, unknown>;
+
 /** A contract row (`k: "contract"`): the other end of an operation and its type. */
 export type ContractRow = {
   side: "producer" | "consumer";
@@ -101,6 +110,8 @@ export type ContractRow = {
    * older file; `[]` when the scan read none.
    */
   values?: Array<{ file: string; span: [number, number] }>;
+  /** A GraphQL producer response row (writer 12): the root field its resolver answers. Absent on any other row. */
+  graphql_root?: GraphqlRootRef;
   groups: ContractGroup[];
   untyped: Array<{ service: string; repo: string; file: string; line: number | null; reason: string }>;
   total: number;
@@ -138,7 +149,7 @@ export type ChainRow = {
 };
 
 /** This package's table layout; bumped with every table a new row kind adds. */
-export const LOCAL_LAYOUT = 3;
+export const LOCAL_LAYOUT = 4;
 
 export function factsPath(root: string, schema: number = SCHEMA): string {
   return path.join(root, ".carrick", "facts", `edit-facts.s${schema}.l${LOCAL_LAYOUT}.sqlite`);
@@ -198,6 +209,14 @@ export type FactStore = {
    * without the `contracts` table, prepared on the first call as `contracts` is.
    */
   producerResponses: () => ContractRow[];
+  /**
+   * Every GraphQL producer response row, in wire order: the send form's rows
+   * (a resolver edit). A sibling of `producerResponses`, which stays HTTP-only.
+   * `[]` for a file built without the `contracts` table.
+   */
+  graphqlProducerResponses: () => ContractRow[];
+  /** The SDL type table the cloud wrote for `service` of `repo`, or null (no row, or a file an older package built). */
+  graphqlTypes: (repo: string, service: string) => GraphqlTypeTable | null;
   /**
    * The chain rows of function `name` declared in `file` of `repo`, in wire
    * order. `[]` for a file built without the `chains` table, prepared on the
@@ -263,6 +282,8 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     let contracts: ReturnType<typeof open.prepare> | null | undefined;
     let chains: ReturnType<typeof open.prepare> | null | undefined;
     let producerResponses: ReturnType<typeof open.prepare> | null | undefined;
+    let graphqlResponses: ReturnType<typeof open.prepare> | null | undefined;
+    let graphqlTable: ReturnType<typeof open.prepare> | null | undefined;
     handed = true;
     return {
       meta,
@@ -320,6 +341,33 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         }
         if (producerResponses === null) return [];
         return producerResponses.all().map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
+      },
+      graphqlProducerResponses: () => {
+        if (graphqlResponses === undefined) {
+          try {
+            graphqlResponses = open.prepare(
+              "SELECT row FROM contracts WHERE side = 'producer' AND direction = 'response' AND protocol = 'graphql' ORDER BY id",
+            );
+          } catch {
+            // No table: a file an older package built.
+            graphqlResponses = null;
+          }
+        }
+        if (graphqlResponses === null) return [];
+        return graphqlResponses.all().map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
+      },
+      graphqlTypes: (repo, service) => {
+        if (graphqlTable === undefined) {
+          try {
+            graphqlTable = open.prepare("SELECT types FROM gqltypes WHERE repo = ? AND service = ? ORDER BY id LIMIT 1");
+          } catch {
+            // No table: a file an older package built.
+            graphqlTable = null;
+          }
+        }
+        if (graphqlTable === null) return null;
+        const raw = graphqlTable.get(repo, service);
+        return raw ? (JSON.parse(String(raw["types"])) as GraphqlTypeTable) : null;
       },
       chains: (repo, rel, name) => {
         if (chains === undefined) {
@@ -394,7 +442,7 @@ export async function buildFacts(text: string, dest: string, local: LocalRepo[],
 }
 
 /** The row kinds this package reads. */
-const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract", "chain"]);
+const KNOWN_KINDS = new Set(["op", "fn", "name", "pkg", "contract", "chain", "gqltypes"]);
 
 const isText =(value: unknown): value is string => typeof value === "string" && value.length > 0;
 const isLine = (value: unknown): boolean => value === null || (typeof value === "number" && Number.isInteger(value));
@@ -471,6 +519,9 @@ function wholeRow(raw: Record<string, unknown>): boolean {
             (entry["others_text"] === undefined || isText(entry["others_text"])),
         )
       );
+    // A service's SDL type table: the cloud writes one per service whose blob has it.
+    case "gqltypes":
+      return isText(raw["repo"]) && isText(raw["service"]) && isRecord(raw["types"]);
     // A contract row carries no top-level `text`: its words are in its groups.
     case "contract":
       return (
@@ -486,6 +537,7 @@ function wholeRow(raw: Record<string, unknown>): boolean {
         (raw["site"] === undefined || isNameOrNull(raw["site"])) &&
         (raw["locator"] === "registration" || raw["locator"] === "call") &&
         (raw["values"] === undefined || isValues(raw["values"])) &&
+        (raw["graphql_root"] === undefined || (isRecord(raw["graphql_root"]) && isText(raw["graphql_root"]["type"]) && isText(raw["graphql_root"]["field"]))) &&
         Number.isInteger(raw["total"]) &&
         allOf(raw["untyped"], (entry) => isText(entry["repo"]) && isText(entry["file"]) && isLine(entry["line"])) &&
         Array.isArray(raw["groups"]) &&
@@ -550,6 +602,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
         direction TEXT, name TEXT, site TEXT, row TEXT
       );
       CREATE TABLE chains (id INTEGER PRIMARY KEY, repo TEXT, file TEXT, line INTEGER, name TEXT, row TEXT);
+      CREATE TABLE gqltypes (id INTEGER PRIMARY KEY, repo TEXT, service TEXT, types TEXT);
     `);
     const meta = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
     // Each repo's index commit, which the peer proof checks files against
@@ -584,6 +637,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     const contractRow = db.prepare(
       "INSERT INTO contracts (repo, file, line, side, protocol, label, direction, name, site, row) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     );
+    const gqlTypes = db.prepare("INSERT INTO gqltypes (repo, service, types) VALUES (?, ?, ?)");
     const chainRow = db.prepare("INSERT INTO chains (repo, file, line, name, row) VALUES (?, ?, ?, ?, ?)");
     db.exec("BEGIN");
     let skipped = 0;
@@ -610,6 +664,10 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
           typeof raw["site"] === "string" ? raw["site"] : null,
           JSON.stringify(raw),
         );
+        continue;
+      }
+      if (raw["k"] === "gqltypes") {
+        gqlTypes.run(String(raw["repo"]), String(raw["service"]), JSON.stringify(raw["types"]));
         continue;
       }
       if (raw["k"] === "chain") {
@@ -652,7 +710,7 @@ function writeFactsDatabase(sqlite: Sqlite, temp: string, header: FactHeader, li
     }
     db.exec("COMMIT");
     if (skipped > 0) log(`${skipped} fact row(s) missing a field or with a mistyped one; skipped`);
-    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file); CREATE INDEX chains_name ON chains (repo, file, name);");
+    db.exec("CREATE INDEX rows_name ON rows (repo, name); CREATE INDEX rows_file ON rows (repo, file); CREATE INDEX fns_name ON fns (repo, name); CREATE INDEX names_name ON names (name); CREATE INDEX pkgs_package ON pkgs (package); CREATE INDEX contracts_file ON contracts (repo, file); CREATE INDEX chains_name ON chains (repo, file, name); CREATE INDEX gqltypes_service ON gqltypes (repo, service);");
   } finally {
     closeQuietly(db);
   }
