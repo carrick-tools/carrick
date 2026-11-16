@@ -1933,6 +1933,21 @@ pub(super) fn build(
 
     for repo in &mut repos {
         for items in repo.files.values_mut() {
+            // One item per operation place. The same service read from two
+            // copies of its blob (a repo kept under two names) joins twice, so
+            // its operations arrive twice (carrick#4687): the first copy stays.
+            let mut placed = std::collections::HashSet::new();
+            items.retain(|item| {
+                placed.insert((
+                    item.kind.as_str(),
+                    item.service.clone(),
+                    item.key.clone(),
+                    item.method.clone(),
+                    item.path.clone(),
+                    item.line,
+                    item.dispatch.clone(),
+                ))
+            });
             items.sort_by(|a, b| {
                 (a.line, &a.kind.as_str(), &a.method, &a.path).cmp(&(
                     b.line,
