@@ -359,6 +359,15 @@ export interface ListProgramFilesRequest extends BaseRequest {
 export interface WriteShadowRequest extends BaseRequest {
   action: 'write_shadow';
   out_dir: string;
+  /**
+   * The service's SDL output types and the root fields its GraphQL producer
+   * rows answer. With it the answer carries the judge's GraphQL rules and a
+   * scalar-form leaf per root whose form the judge reads that way.
+   */
+  graphql?: {
+    types: import('./capture/api.js').GraphqlTypes;
+    roots: import('./capture/api.js').GraphqlRoot[];
+  };
 }
 
 /**
