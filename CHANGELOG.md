@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.159](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.158...carrick-v0.3.159) (2026-11-16)
+
+
+### Features
+
+* **boundary:** save an unparsed declaration text on the service boundary ([#4226](https://github.com/carrick-tools/carrick/issues/4226)) ([#4650](https://github.com/carrick-tools/carrick/issues/4650)) ([d6a4653](https://github.com/carrick-tools/carrick/commit/d6a46532bff8f90f3ed41bf2411c292e078ad6dd))
+* **facts:** the laptop hook prints request-direction contract lines (A6-L) ([#4646](https://github.com/carrick-tools/carrick/issues/4646)) ([09ffad0](https://github.com/carrick-tools/carrick/commit/09ffad0d0dd04f565834c4cf850e757717052567))
+* **recheck:** one "this service's copy is current" rule for both checks ([#4634](https://github.com/carrick-tools/carrick/issues/4634)) ([02ae5c2](https://github.com/carrick-tools/carrick/commit/02ae5c2050c93566ae8616f4d96875dd0d3de0ae))
+
+
+### Bug Fixes
+
+* **decided-sites:** the site path's name walk reads the resolver's pieces (B10-2b) ([#4582](https://github.com/carrick-tools/carrick/issues/4582)) ([2105c57](https://github.com/carrick-tools/carrick/commit/2105c57b245f93870ef70ef2782fed4a2ff2eba5))
+* **held:** arm the early check only under the judge's fit options; no absent-body drop on a response ([#4640](https://github.com/carrick-tools/carrick/issues/4640)) ([40a3ef5](https://github.com/carrick-tools/carrick/commit/40a3ef57d1216ad2fba17e7f9edfd9cc054e5e77))
+
 ## [0.3.158](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.157...carrick-v0.3.158) (2026-11-15)
 
 
