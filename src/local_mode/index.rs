@@ -1898,6 +1898,18 @@ pub(super) fn build(
             // index clears them, so this is only reachable mid-refresh.
             continue;
         };
+        // A service read from a copy of its blob kept under another repo name
+        // (a folder renamed since, or the hosted name) joins a second time.
+        // The repo that owns the service is the one the scan re-read, so its
+        // operations are the ones that stand; the other copy's are not this
+        // repo's (carrick#4687).
+        if operation
+            .repo
+            .as_deref()
+            .is_some_and(|repo| repo != repos[position].name)
+        {
+            continue;
+        }
         let counterparts = counterparts_for(operation, &join.matches, &producers);
         let verdict = verdict_for(operation, &join.matches, &join.findings);
         // The two type texts come off the same finding the verdict does, so a
