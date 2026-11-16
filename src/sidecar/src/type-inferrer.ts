@@ -9847,11 +9847,18 @@ export class TypeInferrer {
       // B. an `as T` cast (`req.body as TrackRequest`) or a typed binding
       // (`const b: TrackRequest = …`). Read the annotation/cast target.
       if (Node.isAsExpression(descendant)) {
+        // carrick#4709: a cast is a request read only where it casts what the
+        // handler was handed. A cast of any other value (a tuple built and
+        // asserted `as const` in a `.map` callback, a result) types that
+        // value, not the body.
+        if (!this.rootedAtParameterOf(func, descendant.getExpression(), true)) {
+          return;
+        }
+        const typeNode = descendant.getTypeNode();
         // A member read off the cast (`(req as unknown as { body: T }).body`)
         // reads that member: the cast's whole object is one level too many
         // (carrick#4212). The checker types the member access itself.
         const member = this.memberReadOffCast(descendant);
-        const typeNode = descendant.getTypeNode();
         const resolved = member
           ? this.structuralTextFromType(member.getType(), member)
           : typeNode
@@ -9866,6 +9873,70 @@ export class TypeInferrer {
     });
 
     return found;
+  }
+
+  /**
+   * Whether `expression` is a value read off one of `handler`'s own
+   * parameters, named or destructured: the parameter itself, or a member of
+   * it, through parentheses and `!`.
+   *
+   * With `throughReads` (carrick#4709), also a value the handler reads on from
+   * one: through `await`, element access and a cast; a call made on such a
+   * value or handed one (`c.req.json()`, `JSON.parse(raw)`,
+   * `Schema.parse(request.body)`); and one hop through a local the handler
+   * binds from such a read (`const raw = await request.json()`). A literal
+   * the handler builds, or a value made from a local twice removed, is not
+   * one.
+   */
+  private rootedAtParameterOf(handler: FunctionLike, expression: Node, throughReads = false): boolean {
+    const parameters = new Set<Node>(handler.getParameters());
+    const rooted = (start: Node, hops: number): boolean => {
+      let root = start;
+      for (;;) {
+        if (
+          Node.isPropertyAccessExpression(root) ||
+          Node.isNonNullExpression(root) ||
+          Node.isParenthesizedExpression(root)
+        ) {
+          root = root.getExpression();
+        } else if (
+          throughReads &&
+          (Node.isAwaitExpression(root) || Node.isAsExpression(root) || Node.isElementAccessExpression(root))
+        ) {
+          root = root.getExpression();
+        } else if (throughReads && Node.isCallExpression(root)) {
+          const callee = root.getExpression();
+          return (
+            (Node.isPropertyAccessExpression(callee) && rooted(callee.getExpression(), hops)) ||
+            root.getArguments().some((argument) => rooted(argument, hops))
+          );
+        } else {
+          break;
+        }
+      }
+      if (!Node.isIdentifier(root)) return false;
+      return (root.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
+        const parameter = Node.isParameterDeclaration(declaration)
+          ? declaration
+          : Node.isBindingElement(declaration)
+            ? declaration.getFirstAncestorByKind(SyntaxKind.Parameter)
+            : undefined;
+        if (parameter !== undefined) return parameters.has(parameter);
+        if (!throughReads || hops === 0) return false;
+        // `const raw = …` or `const { body } = …`: the binding's initialiser.
+        const binding = Node.isBindingElement(declaration)
+          ? declaration.getFirstAncestorByKind(SyntaxKind.VariableDeclaration)
+          : declaration;
+        if (!binding || !Node.isVariableDeclaration(binding)) return false;
+        const initializer = binding.getInitializer();
+        return (
+          initializer !== undefined &&
+          handler.containsRange(binding.getPos(), binding.getEnd()) &&
+          rooted(initializer, hops - 1)
+        );
+      });
+    };
+    return rooted(expression, 1);
   }
 
   /**
@@ -9889,33 +9960,12 @@ export class TypeInferrer {
    * The first such call in source order: a body is read once.
    */
   private platformBodyReadIn(handler: FunctionLike): CallExpression | undefined {
-    const parameters = new Set<Node>(handler.getParameters());
-    const rootedAtParameter = (expression: Node): boolean => {
-      let root = expression;
-      while (
-        Node.isPropertyAccessExpression(root) ||
-        Node.isNonNullExpression(root) ||
-        Node.isParenthesizedExpression(root)
-      ) {
-        root = root.getExpression();
-      }
-      if (!Node.isIdentifier(root)) return false;
-      return (root.getSymbol()?.getDeclarations() ?? []).some((declaration) => {
-        const parameter = Node.isParameterDeclaration(declaration)
-          ? declaration
-          : Node.isBindingElement(declaration)
-            ? declaration.getFirstAncestorByKind(SyntaxKind.Parameter)
-            : undefined;
-        return parameter !== undefined && parameters.has(parameter);
-      });
-    };
-
     for (const call of handler.getDescendantsOfKind(SyntaxKind.CallExpression)) {
       if (call.getArguments().length > 0) continue;
       const callee = call.getExpression();
       if (!Node.isPropertyAccessExpression(callee)) continue;
       const receiver = callee.getExpression();
-      if (!rootedAtParameter(receiver)) continue;
+      if (!this.rootedAtParameterOf(handler, receiver)) continue;
       const yielded = this.unwrapPromiseType(call.getType());
       if (!yielded.isAny() && !yielded.isUnknown()) continue;
       if (!this.typeIsFrameworkMachinery(receiver.getType())) continue;

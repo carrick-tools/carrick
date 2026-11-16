@@ -458,6 +458,23 @@ export function resolveAnchor(
       };
     }
   }
+  // carrick#4709: a request body asked by line alone names no payload (the
+  // scanner gives it no anchor: `derive_capture_anchors`, `not_located`). A
+  // text that missed leaves this capture with exactly that ask, and the first
+  // expression on the hint line is whatever sits there: the registration call,
+  // a tuple the handler builds, a neighbouring route's read.
+  if (found.by === 'line' && request.infer_kind === 'request_body') {
+    return {
+      request,
+      aliasText: 'unknown',
+      serialization: 'structural_fallback',
+      abstainReason:
+        `the request body's locator found nothing at its span or text and fell back to ` +
+        `${describeNode(sourceFile, request.source_file, found.node)}, the first expression ` +
+        `on its line; a line names no request body, so the anchor abstains`,
+      unreadCause: 'not_located',
+    };
+  }
   // carrick#4232: a call-result anchor reads a call's result. A locator that
   // lands on no call (a JSX element on the call's line, the line's first
   // expression) names nothing to read, the same rule the inferrer applies.
