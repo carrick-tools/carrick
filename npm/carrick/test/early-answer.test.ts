@@ -735,7 +735,8 @@ test("GraphQL: the early QUERY item joins part 2's resolver item by label: same 
   const item = early.items![0]!;
   assert.deepEqual([item.method, item.path, itemLabel(item), item.line], ["QUERY", "order", "QUERY order", 6]);
   assert.equal(item.expected_type, "{ order: { id: string; } | null; }");
-  const full = (verdict: CheckItem["verdict"]): CheckResult => ({ schema: "carrick.check/0", file: "src/resolvers.ts", items: [gqlItem(verdict)], recheck: { ran: "extraction+types", elapsed_ms: 1 } });
+  // Part 2's judge states its mismatch (`stated`), as the CLI writes it.
+  const full = (verdict: CheckItem["verdict"]): CheckResult => asStated({ schema: "carrick.check/0", file: "src/resolvers.ts", items: [gqlItem(verdict)], recheck: { ran: "extraction+types", elapsed_ms: 1 } });
   assert.equal(compareEarly(early, full({ state: "resolved", result: "type_mismatch" })).rows[0]?.outcome, "same");
   const fixed = compareEarly(early, full({ state: "resolved", result: "compatible" })).rows[0]!;
   assert.deepEqual([fixed.outcome, fixed.corrected], ["differ", true]);
