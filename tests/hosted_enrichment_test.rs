@@ -1029,6 +1029,89 @@ fn indexed_at_hosted(root: &Path) -> (PathBuf, String) {
     (repo, a)
 }
 
+/// A repo whose only blob is the hosted copy, held under the hosted
+/// repository's name while the checkout's folder is named differently, and not
+/// re-scanned: its operations are listed once (carrick#4687). The read model
+/// takes the hosted copy under the folder's name, so the copy is the owner's
+/// and its rows stand.
+#[test]
+fn a_hosted_only_repo_under_another_folder_name_lists_its_operations_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let repo = root.join("orders-checkout");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(
+        repo.join("app.ts"),
+        "declare const app: { get(path: string, handler: () => unknown): void };\nfunction handler() { return { id: 1 }; }\napp.get(\"/orders\", handler);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"orders","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("carrick.json"),
+        r#"{"service_name":"orders","include":["."]}"#,
+    )
+    .unwrap();
+    init_repo(&repo);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/orders.git",
+        ],
+    );
+    std::fs::write(
+        root.join("carrick-workspace.json"),
+        r#"{"repos":["orders-checkout"]}"#,
+    )
+    .unwrap();
+    run(root, &["refresh", "--workspace", "."], None);
+    // The hosted copy is named for the repository, not the folder.
+    let hosted: Vec<Value> = blobs(root)
+        .into_iter()
+        .map(|mut blob| {
+            blob["repo_name"] = json!("orders");
+            blob["endpoints"] = json!([{
+                "owner": {"App": "app"},
+                "key": {"protocol": "http", "method": "GET", "path": "/orders"},
+                "params": [], "request_body": null, "response_body": null,
+                "handler_name": "handler", "request_type": null, "response_type": null,
+                "file_path": "app.ts:3", "provenance": "route",
+                "resolution_source": "library_claim",
+                "handler_span": {"start_line": 3, "end_line": 3}
+            }]);
+            blob
+        })
+        .collect();
+    snapshot(root, "orders", &hosted);
+    run(root, &["refresh", "--workspace", "."], Some(TOKEN));
+
+    let answer = run(
+        root,
+        &[
+            "check",
+            "orders-checkout/app.ts",
+            "--workspace",
+            ".",
+            "--json",
+        ],
+        Some(TOKEN),
+    );
+
+    let routes: Vec<String> = answer["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| format!("{} {}", item["method"], item["path"]))
+        .collect();
+    assert_eq!(routes, vec![r#""GET" "/orders""#.to_string()], "{answer:#}");
+}
+
 /// `check --changed --json`, whatever it exits with.
 fn changed(root: &Path) -> Value {
     let output = spawn(
