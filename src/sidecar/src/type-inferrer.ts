@@ -7146,26 +7146,6 @@ export class TypeInferrer {
           payloadType: payloadArg,
         };
       }
-
-      // Try "first useful generic" heuristic. It is a guess about a type's
-      // own arguments and is not extended to an alias's (carrick#1843): the
-      // alias this reaches most often is a result carrier, `Outcome<A, E>`,
-      // whose next argument after an open payload is the error side.
-      for (let i = 0; !reading.viaAlias && i < typeArgs.length; i++) {
-        const argType = typeArgs[i];
-        const text = typeText(argType, node);
-        if (!this.isUselessType(text)) {
-          if (rule.unwrapRecursively) {
-            return recurse(argType);
-          }
-          return {
-            typeString: text,
-            isExplicit: true,
-            wasUnwrapped: true,
-            payloadType: argType,
-          };
-        }
-      }
     }
 
     // 2. Try payloadPropertyPath
