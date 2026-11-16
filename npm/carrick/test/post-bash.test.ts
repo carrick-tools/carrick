@@ -195,7 +195,7 @@ function writeEnv(w: { base: string; home: string }, extra: Record<string, strin
   return fakeEnv({
     HOME: w.home,
     CARRICK_FAKE_ARGV_LOG: path.join(w.base, "argv.log"),
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
     ...extra,
   });
 }
@@ -286,7 +286,7 @@ test("an Edit and then a Bash write of the same file keep one queue entry each, 
   const env = fakeEnv({
     HOME: home,
     CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
   });
   const session = "sess-w5";
   await runHook("post-edit.ts", { payload: { ...editPayload(workspace), session_id: session }, env });

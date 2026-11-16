@@ -24,7 +24,7 @@ test("an edit gets its problems as additionalContext", async (t) => {
 
   const run = await runHook("post-edit.ts", {
     payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json") }),
   });
   assert.equal(run.code, 0);
   const parsed = JSON.parse(run.stdout) as {
@@ -38,6 +38,20 @@ test("an edit gets its problems as additionalContext", async (t) => {
   assert.match(parsed.hookSpecificOutput.additionalContext, /type_mismatch/);
 });
 
+// A1 (carrick#4655): an answer whose mismatch the CLI did not state (the
+// index's own verdict, on main) is no problem of this edit.
+test("an edit whose answer holds only a mismatch the CLI did not state prints no problem", async (t) => {
+  const workspace = makeWorkspace();
+  t.after(() => workspace.cleanup());
+
+  const run = await runHook("post-edit.ts", {
+    payload: editPayload(workspace),
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+  });
+  assert.equal(run.code, 0);
+  assert.doesNotMatch(run.stdout, /contract problem|type_mismatch/);
+});
+
 test("MultiEdit payloads name their file the other way round", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
@@ -48,7 +62,7 @@ test("MultiEdit payloads name their file the other way round", async (t) => {
       cwd: workspace.root,
       tool_input: { edits: [{ file_path: workspace.file }] },
     },
-    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+    env: fakeEnv({ CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json") }),
   });
   assert.equal(run.code, 0);
   assert.match(run.stdout, /additionalContext/);
@@ -169,7 +183,7 @@ test("the hook's own work fits the 300 ms budget", async (t) => {
   // (carrick#1498); cpu-usage.mjs gives the margin.
   const run = await runHook("post-edit.ts", {
     payload: editPayload(workspace),
-    env: fakeEnv({ CARRICK_LOG_QUIET: "0", CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+    env: fakeEnv({ CARRICK_LOG_QUIET: "0", CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json") }),
     nodeArgs: [`--import=${path.join(testDir, "cpu-usage.mjs")}`],
   });
   assert.equal(run.code, 0);
@@ -762,7 +776,7 @@ test("a Read prints the other side of a route or call, and no verdict words", as
 
   const run = await runHook("post-read.ts", {
     payload: readPayload(workspace, "sess-r3"),
-    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json") }),
   });
   const context = contextOf(run.stdout);
   assert.match(
@@ -922,7 +936,7 @@ function deferredEnv(home: string, extra: Record<string, string> = {}): NodeJS.P
   return fakeEnv({
     HOME: home,
     CARRICK_FAKE_PROBE_FIXTURE: fixturePath("check-deferred.json"),
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
     ...extra,
   });
 }
@@ -1077,7 +1091,7 @@ test("an answer in hand prints at once and starts no runner", async (t) => {
 
   const run = await runHook("post-edit.ts", {
     payload: { ...editPayload(workspace), session_id: "sess-b5" },
-    env: fakeEnv({ HOME: home, CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json") }),
+    env: fakeEnv({ HOME: home, CARRICK_FAKE_ARGV_LOG: argvLog, CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json") }),
   });
   assert.match(contextOf(run.stdout), /^Carrick re-checked user-service\/src\/routes\/users\.ts after this edit: 1 contract problem\./);
   const calls = fs.readFileSync(argvLog, "utf8").trim().split("\n").map((l) => (JSON.parse(l) as { argv: string[] }).argv);

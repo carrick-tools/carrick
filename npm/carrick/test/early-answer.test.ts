@@ -13,7 +13,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { drainRunner, fakeEnv, fixturePath, runHook, waitForSessionAnswers } from "./helpers.ts";
+import { asStated, drainRunner, fakeEnv, fixturePath, runHook, waitForSessionAnswers } from "./helpers.ts";
 import { commitRepos } from "./facts-repos.ts";
 import { context, lineOf } from "./facts-helpers.ts";
 import type { Ws } from "./facts-helpers.ts";
@@ -25,7 +25,7 @@ import { heldDir, socketPath } from "../src/held/paths.ts";
 import { HeldDaemon } from "../src/held/daemon.ts";
 import { heldBuildId } from "../src/held/build.ts";
 import type { HeldLine, HeldRequest, ServiceEngine, ServiceInit } from "../src/held/daemon.ts";
-import type { CheckItem, CheckResult } from "../src/contract.ts";
+import type { CheckItem, CheckResult, MovedRow } from "../src/contract.ts";
 
 const SLUG = "early-answer-demo";
 const COMMIT = "abcdef0123456789abcdef0123456789abcdef01";
@@ -174,16 +174,22 @@ async function liveDaemon(t: { after: (fn: () => void | Promise<void>) => void }
   return live;
 }
 
-/** Part 2's answer for the edited file, as the fake binary prints it to the runner. */
-function part2(ws: Ws, items: CheckItem[], moved: unknown[] = [], recheck: Record<string, unknown> = {}): Record<string, string> {
-  const result = {
+/**
+ * Part 2's answer for the edited file, as the fake binary prints it to the
+ * runner: its judge states every mismatch and moved row as the edit's
+ * (`stated`), unless `unstated` (a row it holds but does not state, such as
+ * one only the model reads).
+ */
+function part2(ws: Ws, items: CheckItem[], moved: unknown[] = [], recheck: Record<string, unknown> = {}, unstated = false): Record<string, string> {
+  const base: CheckResult = {
     schema: "carrick.check/0",
     file: "src/tasks.ts",
     service: "api",
     stale: false,
     items,
-    recheck: { ran: "extraction+types", elapsed_ms: 5, ...(moved.length > 0 ? { moved } : {}), ...recheck },
+    recheck: { ran: "extraction+types", elapsed_ms: 5, ...(moved.length > 0 ? { moved: moved as MovedRow[] } : {}), ...recheck },
   };
+  const result = unstated ? base : asStated(base);
   const file = path.join(ws.home, `part2-${Math.random().toString(36).slice(2)}.json`);
   fs.writeFileSync(file, JSON.stringify(result));
   return { CARRICK_FAKE_FIXTURE: file };
@@ -601,9 +607,9 @@ test("compareEarly: a call item of another kind at the place is not a mirror; of
   const early: CheckResult = {
     schema: "carrick.check/0",
     file: "src/tasks.ts",
-    items: [{ ...SAME, counterparts: [{ role: "consumer", service: "ext", file: "src/tasks.ts", line: 9 }] }],
+    items: [{ ...SAME, counterparts: [{ role: "consumer", service: "ext", file: "src/tasks.ts", line: 9 }], stated: true }],
   };
-  const call = (result: string): CheckItem => ({ kind: "call", method: "GET", path: "/tasks", line: 9, source: "fact", verdict: { state: "resolved", result } });
+  const call = (result: string): CheckItem => ({ kind: "call", method: "GET", path: "/tasks", line: 9, source: "fact", verdict: { state: "resolved", result }, stated: true });
   const full = (result: string): CheckResult => ({ schema: "carrick.check/0", file: "src/tasks.ts", items: [call(result)] });
   const other = compareEarly(early, full("no_route"));
   assert.equal(other.mirrors.length, 0);
@@ -611,6 +617,24 @@ test("compareEarly: a call item of another kind at the place is not a mirror; of
   const same = compareEarly(early, full("type_mismatch"));
   assert.equal(same.mirrors.length, 1);
   assert.equal(same.part2Only.length, 0);
+});
+
+// A1: part 2 says a break only where the CLI stated it. The same mismatch held
+// but not stated (here read off a model-only row) leaves the early break
+// standing, as an unresolved row does (R5a), so it still prints and Stop still
+// counts it; a stated one is `same`.
+test("compareEarly: part 2's same mismatch it did not state leaves the early break standing", async () => {
+  const { compareEarly, standingEarly, withEarlyBreaks } = await import("../src/hook/confirm.ts");
+  const { problemItems } = await import("../src/contract.ts");
+  const early: CheckResult = { schema: "carrick.check/0", file: "src/tasks.ts", items: [{ ...SAME, stated: true }] };
+  const unstated: CheckResult = { schema: "carrick.check/0", file: "src/tasks.ts", items: [{ ...SAME, source: "candidate" }], recheck: { ran: "extraction+types", elapsed_ms: 5 } };
+  const compared = compareEarly(early, unstated);
+  assert.equal(compared.rows[0]?.outcome, "part3_only");
+  assert.equal(problemItems(standingEarly(early, unstated)).length, 1, "the early break still prints");
+  assert.equal(problemItems(withEarlyBreaks(unstated, early)).length, 1, "and Stop counts it once");
+  const stated: CheckResult = { ...unstated, items: [{ ...SAME, stated: true }] };
+  assert.equal(compareEarly(early, stated).rows[0]?.outcome, "same");
+  assert.equal(problemItems(withEarlyBreaks(stated, early)).length, 1);
 });
 
 // Re-homed from the held lane's tests: supersede, the shared claim, switch off.

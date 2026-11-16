@@ -21,7 +21,8 @@
       "unconfirmed": false,
       "outside_the_change": false,
       "other_build": false,
-      "fails": true
+      "fails": true,
+      "stated": true
     }
   ],
   "failing": 1,

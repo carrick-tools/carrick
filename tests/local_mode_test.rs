@@ -3828,6 +3828,82 @@ fn a_mismatch_the_index_already_holds() -> (tempfile::TempDir, PathBuf) {
     (workspace, route)
 }
 
+/// The route item of a per-file re-check that ran: its re-scan read the edit
+/// and the judge compared it with the index.
+fn rechecked_route_item(root: &Path, route: &str) -> (serde_json::Value, serde_json::Value) {
+    let answer = recheck_json(root, route, &[("CARRICK_RECHECK_BUDGET_MS", "600000")]);
+    assert_ne!(
+        answer["recheck"]["ran"],
+        serde_json::json!("none"),
+        "the judge ran on the edit:\n{answer:#}"
+    );
+    let item = answer["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["kind"] == "route"))
+        .cloned()
+        .unwrap_or_else(|| panic!("a route item:\n{answer:#}"));
+    (item, answer)
+}
+
+/// A1 (carrick#4655): an edit that breaks a pair the index held compatible
+/// is stated as the edit's problem on the re-check's item: the one rule a
+/// plain `check --changed` lists on.
+#[test]
+#[serial]
+fn a_break_the_edit_made_is_stated_on_the_rechecked_item() {
+    let workspace = workspace("local-mode-workspace", &["catalog-web", "inventory-svc"]);
+    let root = workspace.path();
+    let route = "catalog-web/app/routes/api.v1.widgets.$widgetId.ts";
+    index(root);
+    let route_file = root.join(route);
+    edit(&route_file, "  activeCount: number;\n", "");
+    edit(&route_file, ", activeCount: 3", "");
+
+    let (item, answer) = rechecked_route_item(root, route);
+    assert_eq!(
+        item["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "{answer:#}"
+    );
+    assert_eq!(
+        item["stated"],
+        serde_json::json!(true),
+        "the break is stated:\n{answer:#}"
+    );
+}
+
+/// A1 (carrick#4655): an edit the scan reads, to a file whose mismatch the
+/// index already held, states no problem: the mismatch is on main, not this
+/// edit's. The judge ran on the edit, so the silence is its answer.
+#[test]
+#[serial]
+fn a_mismatch_already_in_the_index_is_not_stated_after_an_unrelated_edit() {
+    let (workspace, route) = a_mismatch_the_index_already_holds();
+    let root = workspace.path();
+    edit(
+        &route,
+        "export async function loader",
+        "export function widgetLabel(name: string): string {\n  return name.toUpperCase();\n}\n\nexport async function loader",
+    );
+    let shown = route
+        .strip_prefix(root)
+        .expect("in the workspace")
+        .to_string_lossy()
+        .into_owned();
+
+    let (item, answer) = rechecked_route_item(root, &shown);
+    assert_eq!(
+        item["verdict"]["result"],
+        serde_json::json!("type_mismatch"),
+        "the mismatch is still there:\n{answer:#}"
+    );
+    assert_eq!(
+        item.get("stated"),
+        None,
+        "and is not stated as this edit's:\n{answer:#}"
+    );
+}
+
 /// carrick#3245: a comment nothing reads, added above the route, starts no
 /// re-scan. The answer is the re-scan's answer, with the mismatch at the line
 /// the code moved to.

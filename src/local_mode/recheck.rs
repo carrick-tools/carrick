@@ -1850,8 +1850,8 @@ fn inside(
         .and_then(|rebuilt| rebuilt.unread.get(relative))
         .cloned()
         .unwrap_or_default();
-    let (moved, no_route) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
-    state_no_route(&mut items, &no_route);
+    let (moved, inside) = judge_edit(workspace, before, &rejoined, tree, relative, plan);
+    state_judged(&mut items, &inside);
     // No rows where the index held some is an answer, not a failure: the edit
     // took the last route out of this file, and the fresh (empty) list is what
     // says so.
@@ -1878,31 +1878,46 @@ fn inside(
     })
 }
 
-/// Say, on the edited file's own call rows, that no service serves them: the
-/// rows `check --changed` lists for this file without `--all`. The rebuilt
-/// index stores no verdict for a call with no counterpart, so the item would
-/// read `result: null`, "nothing pairs", and the answer `judge` computed
-/// would be dropped. The shape is `producer_removed`'s: `not_checked` for the
-/// type layer, `no_route` for the routing fact.
-fn state_no_route(items: &mut [IndexedItem], no_route: &[super::changed::Problem]) {
-    for problem in no_route {
+/// Copy the judge's answer onto the edited file's own rows: each in-file
+/// problem's `stated` onto the item it is about, matched by kind, line,
+/// method, path and dispatch case, so the hook states a row only when the
+/// rule `check --changed` lists on holds for it (`changed.rs`,
+/// `Problem::listed_without_all`). A row the index already held as a
+/// mismatch, or one only the model states, is not stated.
+///
+/// A call no service serves also gets its verdict here: the rebuilt index
+/// stores no verdict for a call with no counterpart, so the item would read
+/// `result: null`, "nothing pairs", and the answer `judge` computed would be
+/// dropped. The shape is `producer_removed`'s: `not_checked` for the type
+/// layer, `no_route` for the routing fact. Only a stated one is written, as
+/// before.
+fn state_judged(items: &mut [IndexedItem], inside: &[super::changed::Problem]) {
+    for problem in inside {
+        let no_route = problem.kind == super::changed::ProblemKind::NoRoute;
         for item in items.iter_mut().filter(|item| {
-            item.kind == super::read_model::ItemKind::Call
-                && item.verdict.is_none()
+            item.kind.as_str() == problem.role
                 && item.line == problem.line
                 && item.method == problem.method
                 && item.path == problem.path
+                && item.dispatch == problem.dispatch
+                && (!no_route || item.verdict.is_none())
         }) {
-            let note = if problem.other_build {
-                " (not checked: the index is from another scanner build)"
-            } else {
-                ""
-            };
-            item.verdict = Some(super::read_model::StoredVerdict {
-                state: "not_checked".to_string(),
-                result: Some("no_route".to_string()),
-                detail: format!("{}{note}", problem.reason),
-            });
+            if no_route {
+                if !problem.stated {
+                    continue;
+                }
+                let note = if problem.other_build {
+                    " (not checked: the index is from another scanner build)"
+                } else {
+                    ""
+                };
+                item.verdict = Some(super::read_model::StoredVerdict {
+                    state: "not_checked".to_string(),
+                    result: Some("no_route".to_string()),
+                    detail: format!("{}{note}", problem.reason),
+                });
+            }
+            item.stated = problem.stated;
         }
     }
 }
@@ -1917,8 +1932,8 @@ fn state_no_route(items: &mut [IndexedItem], no_route: &[super::changed::Problem
 /// Rows of the edited repo and of every repo holding a re-read service are
 /// read; a call in any repo counts when the index matched it. The rows of the
 /// edited file itself are the `items` of the answer, so they are left out of
-/// the moved list; its calls that reach no route and that a plain
-/// `check --changed` lists come back apart, for [`state_no_route`].
+/// the moved list; its own problems come back apart, for [`state_judged`].
+/// A moved row carries `stated` by the same rule as an item.
 fn judge_edit(
     workspace: &Workspace,
     before: &super::read_model::LocalIndex,
@@ -1957,12 +1972,6 @@ fn judge_edit(
         .problems
         .into_iter()
         .partition(|problem| problem.outside_the_change);
-    let no_route = inside
-        .into_iter()
-        .filter(|problem| {
-            problem.kind == super::changed::ProblemKind::NoRoute && problem.listed_without_all()
-        })
-        .collect();
     let moved = outside
         .into_iter()
         .map(|problem| super::contract::MovedRow {
@@ -1982,9 +1991,10 @@ fn judge_edit(
             reason: problem.reason,
             not_judged_before: problem.not_judged_before,
             other_build: problem.other_build,
+            stated: problem.stated,
         })
         .collect();
-    (moved, no_route)
+    (moved, inside)
 }
 
 /// What a check says when the re-scan could not read the library store
@@ -2967,6 +2977,98 @@ mod tests {
     }
 
     use super::*;
+
+    /// A route row of the edited file, at line 12, as the rebuilt index holds
+    /// it: a type mismatch, for the dispatch case `dispatch`.
+    fn mismatch_row(dispatch: Option<&str>) -> IndexedItem {
+        serde_json::from_value(serde_json::json!({
+            "kind": "route", "service": "api", "key": "http|POST|/orders", "dispatch": dispatch,
+            "method": "POST", "path": "/orders", "line": 12, "col": null, "source": "fact",
+            "resolution_source": null, "evidence": null, "counterparts": [],
+            "verdict": {"state": "resolved", "result": "type_mismatch", "detail": "differs"}
+        }))
+        .expect("an item")
+    }
+
+    /// A call row at line 30 with no counterpart and no verdict.
+    fn unmatched_call() -> IndexedItem {
+        serde_json::from_value(serde_json::json!({
+            "kind": "call", "service": "api", "key": "http|GET|/gone", "dispatch": null,
+            "method": "GET", "path": "/gone", "line": 30, "col": null, "source": "fact",
+            "resolution_source": null, "evidence": null, "counterparts": [], "verdict": null
+        }))
+        .expect("an item")
+    }
+
+    /// The judge's problem for one of those rows.
+    fn judged_problem(
+        kind: super::super::changed::ProblemKind,
+        item: &IndexedItem,
+        stated: bool,
+    ) -> super::super::changed::Problem {
+        super::super::changed::Problem {
+            kind,
+            file: "api/orders.ts".to_string(),
+            line: item.line,
+            role: item.kind.as_str().to_string(),
+            method: item.method.clone(),
+            path: item.path.clone(),
+            other: Vec::new(),
+            reason: "no service in this workspace serves it".to_string(),
+            source: "fact".to_string(),
+            descriptor: false,
+            already_indexed: !stated,
+            unconfirmed: false,
+            outside_the_change: false,
+            not_judged_before: false,
+            moved_outside: false,
+            after: String::new(),
+            other_build: false,
+            fails: stated,
+            stated,
+            dispatch: item.dispatch.clone(),
+        }
+    }
+
+    /// The edited file's items carry the judge's `stated`, matched by kind,
+    /// line, method, path and dispatch case: a stated mismatch is marked, one
+    /// the judge did not state (already in the index, or model-only) is not,
+    /// and a sibling dispatch case at the same line, method and path is not
+    /// marked by its sibling's problem. A call no service serves gets its
+    /// `no_route` verdict and the mark, as before.
+    #[test]
+    fn state_judged_marks_only_the_rows_the_judge_stated() {
+        use super::super::changed::ProblemKind;
+        let case_a = mismatch_row(Some("{\"field\":\"type\",\"value\":\"a\"}"));
+        let case_b = mismatch_row(Some("{\"field\":\"type\",\"value\":\"b\"}"));
+        let plain = mismatch_row(None);
+        let call = unmatched_call();
+        let mut items = vec![case_a.clone(), case_b.clone(), call.clone()];
+        let inside = vec![
+            judged_problem(ProblemKind::Incompatible, &case_a, true),
+            judged_problem(ProblemKind::Incompatible, &case_b, false),
+            judged_problem(ProblemKind::NoRoute, &call, true),
+        ];
+        state_judged(&mut items, &inside);
+        assert!(items[0].stated, "case a: {:?}", items[0]);
+        assert!(!items[1].stated, "case b: {:?}", items[1]);
+        assert!(items[2].stated, "call: {:?}", items[2]);
+        let verdict = items[2].verdict.as_ref().expect("a no_route verdict");
+        assert_eq!(verdict.result.as_deref(), Some("no_route"));
+
+        // A problem the judge did not state leaves its row unmarked, and an
+        // unstated no-route call gets no verdict.
+        let mut held = vec![plain.clone(), call.clone()];
+        state_judged(
+            &mut held,
+            &[
+                judged_problem(ProblemKind::Incompatible, &plain, false),
+                judged_problem(ProblemKind::NoRoute, &call, false),
+            ],
+        );
+        assert!(!held[0].stated && !held[1].stated, "{held:?}");
+        assert!(held[1].verdict.is_none(), "{:?}", held[1]);
+    }
 
     /// carrick#2826: a re-scan holds every sidecar to its own heap cap, which
     /// is what the scan sizes its width from, so the services a change

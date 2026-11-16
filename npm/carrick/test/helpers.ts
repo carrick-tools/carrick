@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   parseCheckResult,
   parseStatusResult,
+  type CheckItem,
   type CheckResult,
   type StatusResult,
 } from "../src/contract.ts";
@@ -35,6 +36,22 @@ export function fixture(name: string): CheckResult {
   const parsed = parseCheckResult(fs.readFileSync(fixturePath(name), "utf8"));
   if (!parsed) throw new Error(`fixture ${name} is not a carrick.check/0 payload`);
   return parsed;
+}
+
+/**
+ * `result` as the CLI writes it when its re-check judge states every
+ * non-compatible row as the edit's problem: each such item and moved row
+ * carries `stated`. What a re-check answer standing for a new break looks like.
+ */
+export function asStated(result: CheckResult): CheckResult {
+  const states = (item: CheckItem): boolean => item.verdict?.result != null && item.verdict.result !== "compatible";
+  return {
+    ...result,
+    items: (result.items ?? []).map((item) => (states(item) ? { ...item, stated: true } : item)),
+    ...(result.recheck
+      ? { recheck: { ...result.recheck, ...(result.recheck.moved ? { moved: result.recheck.moved.map((row) => ({ ...row, stated: true })) } : {}) } }
+      : {}),
+  };
 }
 
 export function statusFixture(name: string): StatusResult {

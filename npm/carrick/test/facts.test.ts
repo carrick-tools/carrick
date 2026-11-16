@@ -1197,7 +1197,7 @@ test("no fact file: post-edit prints what it printed before fact files", async (
   const ws = await factsWorkspace(t, { ndjson: null });
   const argvLog = path.join(ws.home, "argv.log");
   const run = await edit(ws, ws.at("orders-api/src/routes/orders.ts"), 'const order = await db.orders.find(req.params["id"]);', {
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   const snapshot = fs
@@ -1225,7 +1225,7 @@ test("with CARRICK_FACT_LINES=0 and a fact file on disk, an Edit, a Write that c
   const env = fakeEnv({
     HOME: ws.home,
     CLAUDE_PROJECT_DIR: ws.root,
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
     CARRICK_FAKE_ARGV_LOG: argvLog,
     CARRICK_FACT_LINES: "0",
   });
@@ -1315,13 +1315,13 @@ test("with a fact file, the probe's problem line arrives on the next carrier", a
   const ws = await factsWorkspace(t);
   const run = await edit(ws, ws.at("orders-api/src/routes/orders.ts"), 'const order = await db.orders.find(req.params["id"]);', {
     session: "late-problem",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
   await waitForAnswer(ws, "late-problem");
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", {
     session: "late-problem",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
   });
   const text = context(next.stdout);
   assert.match(text, /contract problem/);
@@ -1373,7 +1373,7 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
   // A plain file where the queue folder goes.
   fs.writeFileSync(path.join(ws.root, ".carrick", "rechecks"), "");
   t.after(() => fs.rmSync(path.join(ws.root, ".carrick", "rechecks"), { force: true }));
-  const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart.json" })).stdout);
+  const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart-stated.json" })).stdout);
   assert.ok(refused.startsWith(`${PROBLEM_HEAD}\n- `), refused);
   assert.ok(refused.endsWith(`\n\n${GET_ORDER_LINE}`), refused);
   // What this Stop said with CARRICK_FACT_LINES unset (review run, S3).
@@ -1387,7 +1387,7 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
     }),
   );
   fs.rmSync(path.join(ws.root, ".carrick", "rechecks"));
-  const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart.json" })).stdout);
+  const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart-stated.json" })).stdout);
   assert.ok(unsafe.startsWith(`${PROBLEM_HEAD}\n- `), unsafe);
 });
 
@@ -1442,7 +1442,7 @@ test("with a fact file, a sub-agent's edit probes once, prints no problem line i
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "parent",
     agent: "sub1",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
@@ -1485,7 +1485,7 @@ test("with a fact file, a sub-agent's shell write probes once, prints no problem
     env: fakeEnv({
       HOME: ws.home,
       CLAUDE_PROJECT_DIR: ws.root,
-      CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+      CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart-stated.json"),
       CARRICK_FAKE_ARGV_LOG: argvLog,
     }),
   });

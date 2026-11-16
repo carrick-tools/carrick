@@ -115,6 +115,12 @@ export type CheckItem = {
    * service holds which flips with the direction.
    */
   actual_type?: string;
+  /**
+   * The re-check judged this row a problem of the edit (`Item::stated` in
+   * `src/local_mode/contract.rs`): it fails, or rests on an index another build
+   * wrote. Absent when false, and on every answer that judged nothing.
+   */
+  stated?: boolean;
 };
 
 /** `UnreadItem` from src/local_mode/contract.rs: one call the scan did not read. */
@@ -293,6 +299,8 @@ export type MovedRow = {
    * because the build changed, not because of the edit. Absent when false.
    */
   other_build?: boolean;
+  /** Stated as this edit's problem, by the rule `CheckItem.stated` follows. Absent when false. */
+  stated?: boolean;
 };
 
 /** The `scope` of a `recheck` block (`docs/local-mode-output.md`, "recheck"). */
@@ -716,22 +724,21 @@ export function isCandidate(item: CheckItem): boolean {
 }
 
 /**
- * Items worth reporting: a verdict that states a result other than
- * `compatible`.
- *
- * The result decides, not the state. `state` is the type layer's word, and
- * `not_checked` covers the routing findings (`method_mismatch`,
- * `producer_removed`) as well as the rows nothing bears on, so filtering on it
- * would drop real findings. A null result is the "nothing is claimed" case in
- * every state. Both channels report this same set, so a diagnostic and a hook
- * line never disagree about what is wrong.
+ * The items a hook states as problems of the edit: the ones the CLI marked
+ * `stated`, by the rule a plain `carrick check --changed` lists on (it fails,
+ * or rests on an index another build wrote). A mismatch the index already
+ * held, a row only the model states, and every verdict of an answer that
+ * judged nothing carry no mark and are not stated. The LSP's diagnostics,
+ * which say what the index holds rather than what an edit broke, read their
+ * own set (`diagnostics.ts`).
  */
 export function problemItems(result: CheckResult): CheckItem[] {
-  return (result.items ?? []).filter((item) => {
-    const verdict = item.verdict;
-    if (!verdict) return false;
-    return verdict.result != null && verdict.result !== "compatible";
-  });
+  return (result.items ?? []).filter((item) => item.stated === true);
+}
+
+/** The rows outside the edited file a hook states as moved by the edit: the ones the CLI marked `stated`. */
+export function statedMoved(result: CheckResult): MovedRow[] {
+  return (result.recheck?.moved ?? []).filter((row) => row.stated === true);
 }
 
 /** One problem of a `carrick.check-changed/0` answer (`Problem` in `src/local_mode/changed.rs`). */
@@ -745,6 +752,8 @@ export type ChangedProblem = {
   other: string[];
   reason: string;
   fails: boolean;
+  /** Listed by a plain `check --changed` (`Problem::stated`): it fails, or rests on an index another build wrote. Absent when false. */
+  stated?: boolean;
 };
 
 /**

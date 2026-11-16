@@ -49,7 +49,6 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   isCandidate,
-  problemItems,
   type CheckItem,
   type CheckResult,
   type Counterpart,
@@ -58,6 +57,23 @@ import { boundaryFor, stateWord, typedMismatchClause } from "./render.ts";
 import { DEFAULT_SURFACES, type Surfaces } from "./surfaces.ts";
 
 export const SOURCE = "carrick";
+
+/**
+ * A verdict that states a result other than `compatible`, on this one row: what
+ * a diagnostic and a code lens show. They answer "what the index states about
+ * this file", not "did this edit break it", so they read the verdict and never
+ * the hook's `stated` mark (the LSP runs plain `check`, which judges no edit).
+ *
+ * The result decides, not the state. `state` is the type layer's word, and
+ * `not_checked` covers the routing findings (`method_mismatch`,
+ * `producer_removed`) as well as the rows nothing bears on, so filtering on it
+ * would drop real findings. A null result is the "nothing is claimed" case in
+ * every state.
+ */
+export function isMismatch(item: CheckItem): boolean {
+  const verdict = item.verdict;
+  return Boolean(verdict && verdict.result != null && verdict.result !== "compatible");
+}
 
 export const SEVERITY = { error: 1, warning: 2, information: 3, hint: 4 } as const;
 
@@ -455,7 +471,7 @@ export function toDiagnostics(
   };
 
   if (surfaces.diagnostics) {
-    for (const item of problemItems(result)) {
+    for (const item of (result.items ?? []).filter(isMismatch)) {
       const groups = groupCounterparts(item.counterparts ?? [], exists);
       // A routing finding whose other side is not on this disk cannot be gone
       // and looked at, so it is stated as a warning rather than asserted.

@@ -12,7 +12,7 @@ import path from "node:path";
 
 import { spawn } from "node:child_process";
 
-import { fakeEnv, fixture, fixturePath, makeWorkspace, pluginDir, runHook, type HookRun } from "./helpers.ts";
+import { asStated, fakeEnv, fixture, fixturePath, makeWorkspace, pluginDir, runHook, type HookRun } from "./helpers.ts";
 import { parseChangedResult, type CheckResult } from "../src/contract.ts";
 import {
   answerInHand,
@@ -26,6 +26,8 @@ import type { Answer, QueueEntry } from "../src/hook/rechecks.ts";
 import { checkedSinceLastEdit, checkMarkerPath } from "../src/hook/checked.ts";
 import { readSession, recordEdit, sessionRecords, sessionsDir, writeAtomic } from "../src/hook/reuse.ts";
 import { stopAnswers } from "../src/hook/stop-wait.ts";
+import { adoptedLine, hasFindings } from "../src/hook/late.ts";
+import { changedLines } from "../src/render.ts";
 import { carrickHooks } from "../src/init/settings.ts";
 
 const SESSION = "stop-sess";
@@ -69,9 +71,9 @@ function answer(home: string, entry: QueueEntry, result: CheckResult): void {
   writeAtomic(path.join(sessionsDir(home), `${entry.session}.recheck.${entry.seq}.answer.json`), `${JSON.stringify(body)}\n`);
 }
 
-/** A mismatch the re-check answered for: its problems print. */
+/** A mismatch the re-check answered for, its judge stating both as the edit's: its problems print. */
 function problem(): CheckResult {
-  return { ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 1 } };
+  return asStated({ ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 1 } });
 }
 
 function clean(): CheckResult {
@@ -1128,4 +1130,39 @@ test("an answer the main session adopted is not delivered again to the resumed s
   assert.match(said(await promptHook(home, workspace.root)), /contract problem/);
 
   assert.equal(said(await subagentCarrier(home, workspace.root)), "", "claimed once, under its owner's key");
+});
+
+// A1 (carrick#4655, T4): an answer whose only mismatch the re-check's judge
+// did not state (it was on main) holds no finding: the late carrier and a
+// parent adopting it say nothing.
+test("T4: an answer whose only problem the judge did not state has no finding and no adopted line", () => {
+  const onMain: Answer = {
+    seq: "1",
+    session: "s",
+    file: "/w/src/routes/users.ts",
+    relative: "src/routes/users.ts",
+    root: "/w",
+    state: "answered",
+    enqueued_at: new Date().toISOString(),
+    started_at: null,
+    finished_at: new Date().toISOString(),
+    result: { ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 1 } },
+  };
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "carrick-t4-"));
+  assert.equal(hasFindings(onMain), false);
+  assert.equal(adoptedLine(onMain, home), null);
+  const stated: Answer = { ...onMain, result: problem() };
+  assert.equal(hasFindings(stated), true);
+  assert.match(adoptedLine(stated, home) ?? "", /contract problem/);
+});
+
+// A1 (D1): the `--changed` line states what a plain `check --changed` lists,
+// the per-file rule, including a break resting on another build's index (exit 2).
+test("the --changed line states the listed problems, on exit 1 and on exit 2", () => {
+  const base = parseChangedResult(fs.readFileSync(fixturePath("check-changed-problem.json"), "utf8"), 1)!;
+  assert.match(changedLines(base), /: 1 contract problem in 1 changed file\./);
+  const otherBuild = { ...base, exit: 2, failing: 0, problems: base.problems.map((p) => ({ ...p, fails: false, other_build: true })) };
+  assert.match(changedLines(otherBuild), /: 1 contract problem in 1 changed file\./);
+  const unlisted = { ...base, problems: base.problems.map((p) => ({ ...p, stated: false })) };
+  assert.equal(changedLines(unlisted), "");
 });

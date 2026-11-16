@@ -805,6 +805,7 @@ fn project(
         expected_type: typed.then(|| item.expected_type.clone()).flatten(),
         actual_type: typed.then(|| item.actual_type.clone()).flatten(),
         direction: typed.then(|| item.direction.clone()).flatten(),
+        stated: item.stated,
     }
 }
 

@@ -147,7 +147,7 @@ test("the uses-count line still prints where the fn lookup did not run for the f
 
 /** A full re-check answer with a contract problem and the uses lines (for a late answer). */
 function lateFixture(t: { after: (fn: () => void) => void }): string {
-  const counterpart = JSON.parse(fs.readFileSync(fixturePath("check-counterpart.json"), "utf8")) as Record<string, unknown>;
+  const counterpart = JSON.parse(fs.readFileSync(fixturePath("check-counterpart-stated.json"), "utf8")) as Record<string, unknown>;
   const uses = JSON.parse(fs.readFileSync(fixturePath("check-uses.json"), "utf8")) as Record<string, unknown>;
   const file = path.join(fs.realpathSync(os.tmpdir()), `carrick-late-uses-${process.pid}-${Date.now()}.json`);
   fs.writeFileSync(file, JSON.stringify({ ...counterpart, uses: uses["uses"], uses_lines: uses["uses_lines"] }));

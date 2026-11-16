@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LspClient } from "./lsp-client.ts";
-import { editPayload, fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
+import { asStated, editPayload, fakeEnv, fixture, makeWorkspace, runHook } from "./helpers.ts";
 
 export type Shape = {
   name: string;
@@ -74,8 +74,8 @@ export async function measure(shape: Shape): Promise<Counts> {
   // answered for the edit: the mismatch fixture carries its problems, and this
   // marks the re-check as having run so the hook has something to say.
   const answered = path.join(workspace.root, "check-answered.json");
-  const body = JSON.parse(fs.readFileSync(fixturePath("check-mismatch.json"), "utf8")) as Record<string, unknown>;
-  body["recheck"] = { ran: "extraction", elapsed_ms: 40 };
+  // Its judge states the mismatches as the edit's (`stated`), as the CLI does.
+  const body = asStated({ ...fixture("check-mismatch.json"), recheck: { ran: "extraction", elapsed_ms: 40 } });
   fs.writeFileSync(answered, JSON.stringify(body));
   const env = fakeEnv({ CARRICK_FAKE_FIXTURE: answered, ...shape.env });
   let hookContexts = 0;
