@@ -110,6 +110,7 @@ export {
 export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export { jsonWireDeclarations, jsonWireRule, judgeTolerances, wireFormFor, type JudgeTolerances } from './check-probe.js';
+export { fitOptionsOf, judgeFitOptions, type FitOptions } from './check-workspace.js';
 export { nodeByExpressionText, isPreferredTarget } from './anchors.js';
 export {
   graphqlDeclaresType,

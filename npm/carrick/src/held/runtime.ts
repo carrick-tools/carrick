@@ -42,7 +42,7 @@ import {
   type SiteFinder,
   type Value,
 } from "./place.ts";
-import { engineEntry, engineSiteFinder, writeShadow } from "./shadow.ts";
+import { engineEntry, engineSiteFinder, writeShadow, type FitOptions } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
 const log = createLogger("carrick-held-runtime");
@@ -568,6 +568,11 @@ class HeldService implements ServiceEngine {
   }
 }
 
+/** Whether the service's options and the judge's agree on everything that decides whether one type fits another. */
+function sameFitOptions(a: FitOptions, b: FitOptions): boolean {
+  return a.strictNullChecks === b.strictNullChecks && a.strictFunctionTypes === b.strictFunctionTypes && a.exactOptionalPropertyTypes === b.exactOptionalPropertyTypes;
+}
+
 /** A service that holds no compiler: no route framework, or no row to check. */
 class IdleService implements ServiceEngine {
   answer = async (): Promise<{ lines: HeldLine[] }> => ({ lines: [] });
@@ -623,6 +628,15 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
       const shadow = await writeShadow(entry, init, out, env, options.home);
       if (shadow.native_tsc === null) return { state: "no_compiler", reason: "only TypeScript 6 is installed" };
       const mine = (await deps.rows()).filter((row) => row.repo === init.repo && row.service === init.service && row.direction === "response");
+      if (!sameFitOptions(shadow.options.service, shadow.options.judge)) {
+        writePlaced(
+          placedPath(options.root, init.service, options.home),
+          init.service,
+          [],
+          mine.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, file: row.file, reason: "options_differ", group: g, position: null }))),
+        );
+        return { engine: new IdleService() };
+      }
       if (!mine.some((row) => (row.values?.length ?? 0) > 0)) {
         writePlaced(
           placedPath(options.root, init.service, options.home),

@@ -113,17 +113,19 @@ export function regionsFromHunks(oldText: string, newText: string, diffU0: strin
 
 /**
  * The text a check appends: the engine's wire declarations and its tolerance
- * helpers (K-a: a receiver declared void states no contract; an absent body
- * the receiver admits is dropped), composed into the one type a check's
- * callback receives. Nothing here restates a rule: it only names the order
- * the judge applies them in. The literal-widened tolerance reads an export
+ * helpers (K-a: a receiver declared void states no contract), composed into
+ * the one type a check's callback receives. The judge's absent-body rule is
+ * not applied: it reads a request, a socket or a pub/sub payload, never an HTTP
+ * response (`check-probe.ts`, `absentBodyAllowed`), and this check reads only
+ * responses. Nothing here restates a rule: it only names the order the judge
+ * applies them in. The literal-widened tolerance reads an export
  * of a scan's stub, so it cannot apply here.
  */
 export function checkWire(wire: string[], tolerances: string[]): string[] {
   return [
     ...wire,
     ...tolerances,
-    "type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true ? E : __carrick_Wire<__carrick_AbsentBody<S, E>, E>;",
+    "type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true ? E : __carrick_Wire<S, E>;",
   ];
 }
 

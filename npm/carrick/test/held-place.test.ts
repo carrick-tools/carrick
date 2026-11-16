@@ -249,5 +249,6 @@ test("hunksOf reads every `-U0` header, with the counts git omits as 1; the offs
 test("checkWire composes the engine's declarations and tolerance helpers into the one type a check receives", () => {
   const text = checkWire(["W1"], ["T1", "T2"]);
   assert.deepEqual(text.slice(0, 3), ["W1", "T1", "T2"]);
-  assert.match(text[3]!, /^type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true \? E : __carrick_Wire<__carrick_AbsentBody<S, E>, E>;$/);
+  assert.match(text[3]!, /^type __carrick_Sent<S, E> = __carrick_IsVoid<E> extends true \? E : __carrick_Wire<S, E>;$/);
+  assert.ok(!text.join("\n").includes("AbsentBody<S, E>, E>"), "an HTTP response gets no absent-body drop");
 });

@@ -28,7 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ts } from 'ts-morph';
 import type { ProjectLoader } from './project-loader.js';
-import { WriteGuard, judgeTscPath, jsonWireDeclarations, jsonWireRule, judgeTolerances, type JudgeTolerances } from './capture/index.js';
+import { WriteGuard, judgeTscPath, jsonWireDeclarations, jsonWireRule, judgeTolerances, fitOptionsOf, judgeFitOptions, type FitOptions, type JudgeTolerances } from './capture/index.js';
 
 /** What `write_shadow` answers. */
 export interface ShadowResult {
@@ -55,6 +55,8 @@ export interface ShadowResult {
   wire: string[];
   /** The judge's three tolerances, read from its own code (`judgeTolerances('__carrick_')`): declarations to append beside `wire`. */
   tolerances: JudgeTolerances;
+  /** The fit options this shadow program was written with, and the judge's: a held check is armed only when they agree. */
+  options: { service: FitOptions; judge: FitOptions };
   /** The native TypeScript 7 executable, or null when only TypeScript 6's tsc is installed. */
   native_tsc: string | null;
 }
@@ -228,7 +230,7 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     'noImplicitAny', 'strictNullChecks', 'noUnusedLocals', 'noUnusedParameters', 'exactOptionalPropertyTypes',
     'noImplicitOverride', 'noImplicitReturns', 'noFallthroughCasesInSwitch', 'noUncheckedIndexedAccess',
     'useUnknownInCatchVariables', 'verbatimModuleSyntax', 'isolatedModules', 'experimentalDecorators',
-    'emitDecoratorMetadata', 'useDefineForClassFields', 'noPropertyAccessFromIndexSignature',
+    'emitDecoratorMetadata', 'useDefineForClassFields', 'strictFunctionTypes', 'noPropertyAccessFromIndexSignature',
   ] as const;
   const compilerOptions = {
     // Options TypeScript 7 removed (baseUrl, node10 resolution, es5, esModuleInterop: false) are never carried.
@@ -259,6 +261,7 @@ export function writeShadow(loader: ProjectLoader, outDir: string): ShadowResult
     bare_specifiers: Object.keys(paths).sort(),
     wire: heldWire(),
     tolerances: judgeTolerances('__carrick_'),
+    options: { service: fitOptionsOf(compilerOptions), judge: judgeFitOptions() },
     native_tsc: nativeTscPath(),
   };
 }

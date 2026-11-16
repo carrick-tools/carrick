@@ -13,6 +13,7 @@ import {
   unwidenedAliasOf,
   voidReceiverDeclaration,
 } from '../src/capture/check-probe.js';
+import { judgeFitOptions } from '../src/capture/index.js';
 import { nativeTsc, scratch, writeShadow } from './held-shadow-support.js';
 import { SIDECAR_PATH } from './helpers.js';
 
@@ -105,6 +106,34 @@ describe('the wire rule from one writer', () => {
     assert.deepEqual(tscErrors(src('void')), []);
     assert.ok(tscErrors(src('any')).length > 0);
     assert.ok(tscErrors(src('{ a: 1 }')).length > 0);
+  });
+});
+
+describe('the options a held check is armed under', () => {
+  const optionsOf = (compilerOptions: Record<string, unknown>): { service: unknown; judge: unknown } => {
+    const repo = scratch('held-fit-options-');
+    fs.mkdirSync(path.join(repo, 'src'));
+    fs.writeFileSync(path.join(repo, 'src', 'a.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(repo, 'tsconfig.json'), JSON.stringify({ compilerOptions: { noEmit: true, ...compilerOptions }, include: ['src'] }));
+    return (writeShadow(repo, scratch('held-fit-out-')) as unknown as { options: { service: unknown; judge: unknown } }).options;
+  };
+  const fit = (snc: boolean, sft: boolean, exact: boolean): object => ({ strictNullChecks: snc, strictFunctionTypes: sft, exactOptionalPropertyTypes: exact });
+
+  it('(i) the judge\'s set is read from its own tsconfig', () => {
+    assert.deepEqual(optionsOf({ strict: true }).judge, fit(true, true, false));
+    assert.deepEqual(judgeFitOptions(), fit(true, true, false));
+  });
+
+  it('(j) strict implies the two strict options when they are unset; an explicit value wins', () => {
+    assert.deepEqual(optionsOf({ strict: true }).service, fit(true, true, false));
+    assert.deepEqual(optionsOf({}).service, fit(false, false, false));
+    assert.deepEqual(optionsOf({ strict: true, strictNullChecks: false }).service, fit(false, true, false));
+    assert.deepEqual(optionsOf({ strict: true, strictFunctionTypes: false }).service, fit(true, false, false));
+    assert.deepEqual(optionsOf({ strict: true, exactOptionalPropertyTypes: true }).service, fit(true, true, true));
+  });
+
+  it('(k) an option that changes the type an expression has is not one of them', () => {
+    assert.deepEqual(optionsOf({ strict: true, noUncheckedIndexedAccess: true }).service, fit(true, true, false));
   });
 });
 
