@@ -1,0 +1,23 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:5",
+      "line_number": 5,
+      "target": "/api/v1/returns/${returnId}",
+      "method": "GET",
+      "pattern_matched": "queryClient.fetchQuery(",
+      "call_expression_text": "queryClient.fetchQuery(",
+      "call_expression_line": 5,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "ReturnBody",
+      "type_import_source": "./gen/returns.options.js"
+    }
+  ],
+  "graphql_operations": [],
+  "pubsub_operations": [],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}

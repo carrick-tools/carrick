@@ -1,0 +1,23 @@
+{
+  "mounts": [],
+  "endpoints": [],
+  "data_calls": [
+    {
+      "candidate_id": "@line:6",
+      "line_number": 6,
+      "target": "/api/v1/parcels/${parcelId}",
+      "method": "GET",
+      "pattern_matched": "api.get<Parcel>(",
+      "call_expression_text": "api.get<Parcel>(",
+      "call_expression_line": 6,
+      "payload_expression_text": null,
+      "payload_expression_line": null,
+      "primary_type_symbol": "Envelope",
+      "type_import_source": "./envelope-api.js"
+    }
+  ],
+  "graphql_operations": [],
+  "pubsub_operations": [],
+  "graphql_consumer_locates": [],
+  "dispatch_tables": []
+}

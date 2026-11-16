@@ -3384,6 +3384,105 @@ async fn seed_http_handler_body() {
     assert_quiet(&payload, &["/api/v1/orders"]);
 }
 
+// ---- Indirect callers (storefront) -------------------------------------
+//
+// Four ways a call reaches its route without a plain `fetch` at the call
+// site: a client wrapper that returns an envelope, a generated client
+// declaration, `fetchQuery` with generated options, and a query hook. Each
+// has a quiet seed (the PR edits the caller's file, no contract changes) and
+// a positive (the PR renames a field the caller reads through the shape).
+// The model answers are in `storefront/__llm__/analyze-file/` and name the
+// type the way a model does (the envelope, the generated body, the hook's
+// result type). A positive that posts nothing, or posts at a lower class, is
+// held to its stage by `known_miss`: it is the proof that quiet is not silence.
+
+/// The quiet seeds' shared check: nothing the PR introduces.
+fn assert_indirect_caller_quiet(payload: &serde_json::Value) {
+    assert_quiet(payload, &["/api/v1/parcels", "/api/v1/refunds"]);
+    assert_quiet(payload, &["/api/v1/returns", "/api/v1/carriers"]);
+    assert!(
+        findings_of(payload)
+            .iter()
+            .all(|f| f["kind"] != "type_mismatch"),
+        "a type_mismatch on a quiet PR: {payload:#}"
+    );
+}
+
+#[tokio::test]
+async fn seed_wrapper_envelope_quiet() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("wrapper-envelope-quiet").await;
+    assert_indirect_caller_quiet(&payload);
+}
+
+#[tokio::test]
+async fn seed_generated_client_decl_quiet() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("generated-client-decl-quiet").await;
+    assert_indirect_caller_quiet(&payload);
+}
+
+#[tokio::test]
+async fn seed_fetchquery_options_quiet() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("fetchquery-options-quiet").await;
+    assert_indirect_caller_quiet(&payload);
+}
+
+#[tokio::test]
+async fn seed_query_hook_quiet() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("query-hook-quiet").await;
+    assert_indirect_caller_quiet(&payload);
+}
+
+/// No mismatch is raised at `site`: the positive posts nothing today.
+fn assert_no_mismatch_at(payload: &serde_json::Value, site: &str) {
+    let at_site = findings_of(payload).into_iter().any(|f| {
+        f["kind"] == "type_mismatch"
+            && f["call_sites"]
+                .as_array()
+                .is_some_and(|sites| sites.iter().any(|s| s == site))
+    });
+    assert!(!at_site, "a mismatch at {site}: {payload:#}");
+}
+
+/// The envelope's `data` is read; the route's `weight` becomes `mass`.
+#[tokio::test]
+async fn seed_wrapper_envelope_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("wrapper-envelope-field-rename").await;
+    assert_no_mismatch_at(&payload, "src/parcel-view.ts:6");
+}
+
+/// The generated declaration's call is the one the model states, and the
+/// route's `amount` becomes `sum`.
+#[tokio::test]
+async fn seed_generated_client_decl_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("generated-client-decl-field-rename").await;
+    assert_no_mismatch_at(&payload, "src/refund-view.ts:4");
+}
+
+/// The route's `items` becomes `count`. The pair rests on a model-stated row,
+/// so it is a candidate, and it also posts at the generated options' fetch.
+#[tokio::test]
+async fn seed_fetchquery_options_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("fetchquery-options-field-rename").await;
+    let finding = seed_finding_at(&payload, "type_mismatch", "src/return-view.ts:5");
+    assert_marks(&finding, Some(false), Some("candidate"), Some("resolved"));
+}
+
+/// The route's `rating` becomes `score`; the hook's fetch is the call row.
+#[tokio::test]
+async fn seed_query_hook_field_rename() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("query-hook-field-rename").await;
+    let finding = seed_finding_at(&payload, "type_mismatch", "src/carrier-hook.ts:9");
+    assert_marks(&finding, Some(false), Some("candidate"), Some("resolved"));
+}
+
 /// A PR that touches no code.
 #[tokio::test]
 async fn seed_non_code_edit() {

@@ -1020,6 +1020,194 @@
           {"kind": "checked_line", "optional": true}
         ]
       }
+    },
+    {
+      "name": "wrapper-envelope-quiet",
+      "protocol": "http",
+      "change": "quiet",
+      "repo": "storefront",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "src/parcel-view.ts",
+          "pairs": [
+            ["return res.data.weight;", "return res.data.weight + 0;"]
+          ]
+        }
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true}
+        ]
+      }
+    },
+    {
+      "name": "wrapper-envelope-field-rename",
+      "protocol": "http",
+      "change": "shape_break",
+      "repo": "orders-api",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "app/routes/api.v1.parcels.$parcelId.ts",
+          "pairs": [
+            ["weight: number;", "mass: number;"],
+            ["weight: 420", "mass: 420"]
+          ]
+        }
+      ],
+      "known_miss": {"stage": "judged", "issues": ["carrick#2910", "carrick#1162"]},
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/parcels/:parcelId", "site": "src/parcel-view.ts:6"}
+        ]
+      }
+    },
+    {
+      "name": "generated-client-decl-quiet",
+      "protocol": "http",
+      "change": "quiet",
+      "repo": "storefront",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "src/refund-view.ts",
+          "pairs": [
+            ["return data.amount;", "return data.amount + 0;"]
+          ]
+        }
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true}
+        ]
+      }
+    },
+    {
+      "name": "generated-client-decl-field-rename",
+      "protocol": "http",
+      "change": "shape_break",
+      "repo": "orders-api",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "app/routes/api.v1.refunds.$refundId.ts",
+          "pairs": [
+            ["amount: number;", "sum: number;"],
+            ["amount: 350", "sum: 350"]
+          ]
+        }
+      ],
+      "known_miss": {"stage": "judged", "issues": ["carrick#527", "carrick#2448"]},
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/refunds/:refundId", "site": "src/refund-view.ts:4"}
+        ]
+      }
+    },
+    {
+      "name": "fetchquery-options-quiet",
+      "protocol": "http",
+      "change": "quiet",
+      "repo": "storefront",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "src/return-view.ts",
+          "pairs": [
+            ["return found.items;", "return found.items + 0;"]
+          ]
+        }
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true}
+        ]
+      }
+    },
+    {
+      "name": "fetchquery-options-field-rename",
+      "protocol": "http",
+      "change": "shape_break",
+      "repo": "orders-api",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "app/routes/api.v1.returns.$returnId.ts",
+          "pairs": [
+            ["items: number;", "count: number;"],
+            ["items: 2", "count: 2"]
+          ]
+        }
+      ],
+      "known_miss": {"stage": "shown", "issues": ["carrick#3481"]},
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/returns/:returnId", "site": "src/return-view.ts:5"}
+        ]
+      }
+    },
+    {
+      "name": "query-hook-quiet",
+      "protocol": "http",
+      "change": "quiet",
+      "repo": "storefront",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "src/carrier-hook.ts",
+          "pairs": [
+            ["return data?.rating;", "return data?.rating ?? undefined;"]
+          ]
+        }
+      ],
+      "expect": {
+        "title": "no_contract_changes",
+        "conclusion": "success",
+        "quiet": true,
+        "rows": [
+          {"kind": "checked_line", "optional": true}
+        ]
+      }
+    },
+    {
+      "name": "query-hook-field-rename",
+      "protocol": "http",
+      "change": "shape_break",
+      "repo": "orders-api",
+      "edits": [
+        {
+          "op": "replace",
+          "file": "app/routes/api.v1.carriers.$carrierId.ts",
+          "pairs": [
+            ["rating: number;", "score: number;"],
+            ["rating: 4", "score: 4"]
+          ]
+        }
+      ],
+      "known_miss": {"stage": "shown", "issues": ["carrick#3743", "carrick#1371"]},
+      "expect": {
+        "title": "risks_introduced",
+        "conclusion": "failure",
+        "rows": [
+          {"kind": "risk_introduced", "label": "GET /api/v1/carriers/:carrierId", "site": "src/carrier-hook.ts:9"}
+        ]
+      }
     }
   ]
 }
