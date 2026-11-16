@@ -729,3 +729,18 @@ test("GraphQL: a break on a resolver in another file is a moved row that joins p
   const full: CheckResult = { schema: "carrick.check/0", file: "src/types.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 1, moved: [{ ...moved, reason: "part 2" }] } };
   assert.equal(compareEarly(early, full).rows[0]?.outcome, "same");
 });
+
+test("GraphQL through the hook: the early QUERY break prints once through the one renderer; part 2 calling it compatible corrects it once", async (t) => {
+  const query = (ws: Ws): HeldLine =>
+    broken(ws, { row_key: "contract::api::src/tasks.ts::producer::QUERY task::0", label: "QUERY task", message: "Type 'string' is not assignable to type 'O0_0'." });
+  const item = (verdict: CheckItem["verdict"]): CheckItem => ({ kind: "route", method: "QUERY", path: "task", line: 2, source: "fact", counterparts: [{ role: "consumer", service: "ext", file: "src/view4.ts", line: 4 }], verdict });
+  const ws = await workspace(t);
+  await liveDaemon(t, ws, () => [query(ws)]);
+  const first = context((await edit(ws, "eg1", part2(ws, [item({ state: "resolved", result: "compatible" })]))).stdout);
+  assert.ok(first.includes("route QUERY task type_mismatch: Type 'string' is not assignable to type the type it expects."), first);
+  assert.ok(!/__C|\bsend\d|\bO\d/.test(first), first);
+  await settled(ws, "eg1");
+  const next = await carrier(ws, "eg1");
+  assert.equal(next.split("\n").filter((line) => line.includes("found QUERY task compatible")).length, 1, next);
+  assert.equal(record(ws)?.held, "differ");
+});

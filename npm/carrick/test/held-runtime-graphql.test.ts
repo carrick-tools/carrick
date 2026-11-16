@@ -57,7 +57,7 @@ for (const r of lines) {
     own_files: ${JSON.stringify([RESOLVERS, HTTP])}, native_tsc: "/bin/true",
     wire: ["type __carrick_Wire<S, E> = S;"], tolerances: { unwidened_alias_suffix: "", declarations: ["type __carrick_IsVoid<E> = false;"] },
     options: { service: fit, judge: fit },
-    ...(r.graphql ? { graphql: { lines: ${JSON.stringify(GQL_LINES)}, types_decl: ${JSON.stringify(TYPES_DECL)}, leaves } } : {}),
+    ...(r.graphql && !process.env.FAKE_NO_GRAPHQL ? { graphql: { lines: ${JSON.stringify(GQL_LINES)}, types_decl: ${JSON.stringify(TYPES_DECL)}, leaves } } : {}),
   }));
 }
 `;
@@ -145,7 +145,7 @@ type Rig = {
   facts: (rows: Wire[], table: unknown) => Promise<void>;
 };
 
-async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown, startCompiler = true): Promise<Rig | { placed: Rig["placed"]; asked: Rig["asked"] }> {
+async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows: Wire[], table: unknown, startCompiler = true, extraEnv: Record<string, string> = {}): Promise<Rig | { placed: Rig["placed"]; asked: Rig["asked"] }> {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "held-gql-runtime-")));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "ws");
@@ -173,7 +173,7 @@ async function rig(t: { after: (fn: () => void | Promise<void>) => void }, rows:
   const compiler = new FakeCompiler();
   const init: ServiceInit = { repo: REPO, service: SERVICE, repo_path: root, sidecar_root: root, tsconfig: null, scan_root: root };
   const runtime = createRuntime({
-    root, home, entry, env: { ...process.env, FAKE_ENGINE_LOG: log },
+    root, home, entry, env: { ...process.env, FAKE_ENGINE_LOG: log, ...extraEnv },
     site: async () => ({ reason: "value_edited" }),
     makeEngine: () => {
       assert.ok(startCompiler, "no held compiler may start here");
@@ -269,4 +269,22 @@ test("a changed table unarms every GraphQL check with graphql_table_changed unti
   assert.deepEqual(summary(r.placed().armed), ["http GET /ok#0"]);
   assert.deepEqual(summary(r.placed().unarmed), ["graphql MUTATION createOrder#0:graphql_table_changed", "graphql QUERY order#0:graphql_table_changed"]);
   assert.equal(r.asked().length, 1, "no engine run per refresh");
+});
+
+test("an engine that answers without the GraphQL rules leaves the GraphQL rows unarmed graphql_table_unusable", async (t) => {
+  const r = (await rig(t, rowsOf(true), TABLE, true, { FAKE_NO_GRAPHQL: "1" })) as Rig;
+  assert.deepEqual(summary(r.placed().armed), ["http GET /ok#0"]);
+  assert.deepEqual(summary(r.placed().unarmed), ["graphql MUTATION createOrder#0:graphql_table_unusable", "graphql QUERY order#0:graphql_table_unusable"]);
+  assert.equal(r.asked().length, 1, "no second run: the engine did not refuse");
+});
+
+test("a GraphQL row whose root the engine was not asked about at start unarms the GraphQL checks; it never falls to the JSON form", async (t) => {
+  const first = rowsOf(true).filter((row) => row["label"] !== "MUTATION createOrder");
+  const r = (await rig(t, first, TABLE)) as Rig;
+  assert.deepEqual(summary(r.placed().armed), ["graphql QUERY order#0", "http GET /ok#0"]);
+  await r.facts(rowsOf(true), TABLE);
+  await r.edit(HTTP, HTTP_TEXT);
+  assert.deepEqual(summary(r.placed().unarmed), ["graphql MUTATION createOrder#0:graphql_table_changed", "graphql QUERY order#0:graphql_table_changed"]);
+  assert.ok(!shadowText(r, RESOLVERS).includes("__C."), "no GraphQL check stays placed");
+  assert.deepEqual(summary(r.placed().armed), ["http GET /ok#0"]);
 });
