@@ -269,3 +269,47 @@ fn recheck_lists_each_resolver_field_once() {
     let doubled: Vec<_> = items.iter().filter(|(_, count)| **count > 1).collect();
     assert!(doubled.is_empty(), "listed more than once: {doubled:#?}");
 }
+
+/// The two copies differ: an edit above the resolvers moves every field one
+/// line down in the re-scanned copy, and the copy kept under the other repo
+/// name still holds the lines the index had. The answer is the re-scanned
+/// copy's, once each, and the kept copy's places do not appear beside them.
+#[test]
+#[serial]
+fn recheck_answers_from_the_rescanned_copy_when_the_copies_differ() {
+    if !sidecar_built() {
+        eprintln!("Skipping test: sidecar not built (cd src/sidecar && npm run build)");
+        return;
+    }
+    let dir = resolver_workspace();
+    let root = dir.path();
+    let indexed = command(root, &["refresh"]).output().expect("refresh");
+    assert!(
+        indexed.status.success(),
+        "refresh: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    leave_a_copy_under_another_repo_name(root);
+    let resolvers = root.join("mono/services/backend/src/resolvers.ts");
+    let text = std::fs::read_to_string(&resolvers).expect("the resolver file");
+    std::fs::write(&resolvers, format!("export const edited = 1;\n{text}"))
+        .expect("edit the resolver file");
+    let items = recheck_items(root, "mono/services/backend/src/resolvers.ts");
+    eprintln!("{items:#?}");
+    let places: Vec<&str> = items.keys().map(String::as_str).collect();
+    assert_eq!(
+        places,
+        [
+            "\"route\" \"MUTATION\" \"renameThing\" line 20 dispatch null",
+            "\"route\" \"QUERY\" \"byString\" line 25 dispatch null",
+            "\"route\" \"QUERY\" \"described\" line 40 dispatch null",
+            "\"route\" \"QUERY\" \"everything\" line 35 dispatch null",
+            "\"route\" \"QUERY\" \"me\" line 15 dispatch null",
+            "\"route\" \"QUERY\" \"plain\" line 50 dispatch null",
+            "\"route\" \"QUERY\" \"viaOptions\" line 45 dispatch null",
+            "\"route\" \"SUBSCRIPTION\" \"events\" line 30 dispatch null",
+        ],
+        "the re-scanned copy's places, each once"
+    );
+    assert!(items.values().all(|count| *count == 1), "{items:#?}");
+}

@@ -41,6 +41,11 @@ pub struct JoinedOperation {
     /// `service_name ?? repo_name` — the one identity both sides of an edge
     /// use.
     pub service: String,
+    /// The repo whose blob the row was read from (`CloudRepoData::repo_name`).
+    /// A service can be read from two blobs under two repo names; this says
+    /// which copy a row is of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// `OperationKey::canonical()`, the identity an edge names.
     pub key: String,
     /// HTTP method, GraphQL kind, or socket direction.
@@ -444,6 +449,7 @@ fn project(op: &ApiEndpointDetails, role: Role) -> JoinedOperation {
             .clone()
             .or_else(|| op.repo_name.clone())
             .unwrap_or_default(),
+        repo: op.repo_name.clone(),
         key: op.key.canonical(),
         method,
         path,

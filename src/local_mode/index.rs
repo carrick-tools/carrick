@@ -1898,6 +1898,18 @@ pub(super) fn build(
             // index clears them, so this is only reachable mid-refresh.
             continue;
         };
+        // A service read from a copy of its blob kept under another repo name
+        // (a folder renamed since, or the hosted name) joins a second time.
+        // The repo that owns the service is the one the scan re-read, so its
+        // operations are the ones that stand; the other copy's are not this
+        // repo's (carrick#4687).
+        if operation
+            .repo
+            .as_deref()
+            .is_some_and(|repo| repo != repos[position].name)
+        {
+            continue;
+        }
         let counterparts = counterparts_for(operation, &join.matches, &producers);
         let verdict = verdict_for(operation, &join.matches, &join.findings);
         // The two type texts come off the same finding the verdict does, so a
@@ -1933,21 +1945,6 @@ pub(super) fn build(
 
     for repo in &mut repos {
         for items in repo.files.values_mut() {
-            // One item per operation place. The same service read from two
-            // copies of its blob (a repo kept under two names) joins twice, so
-            // its operations arrive twice (carrick#4687): the first copy stays.
-            let mut placed = std::collections::HashSet::new();
-            items.retain(|item| {
-                placed.insert((
-                    item.kind.as_str(),
-                    item.service.clone(),
-                    item.key.clone(),
-                    item.method.clone(),
-                    item.path.clone(),
-                    item.line,
-                    item.dispatch.clone(),
-                ))
-            });
             items.sort_by(|a, b| {
                 (a.line, &a.kind.as_str(), &a.method, &a.path).cmp(&(
                     b.line,
