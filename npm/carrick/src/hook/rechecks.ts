@@ -784,7 +784,7 @@ export async function runQueue(root: string, options: RunOptions = {}): Promise<
       // The local read model was being rebuilt and nothing was judged: the
       // edit goes back in the queue unanswered, and this runner stops so it
       // does not take it again at once. The next hook's runner asks again.
-      if (outcome.result?.recheck?.deferred === true) {
+      if (outcome.result?.recheck?.rebuilding === true) {
         putBack(root, entry, taken);
         requeued = true;
         break;

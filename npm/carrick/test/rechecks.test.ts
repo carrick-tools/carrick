@@ -140,9 +140,9 @@ test("a full re-check that met a read model being rebuilt keeps the edit queued,
     const now = Date.now();
     const [entry] = enqueue(s.root, "s1", [s.file("a.ts")], now, { home: s.home });
     // The binary's answer when `.carrick/repos` is not the model `index.json`
-    // names: nothing judged, `deferred`.
+    // names: nothing judged, `rebuilding`.
     await runQueue(s.root, {
-      env: env(s, { CARRICK_FAKE_FIXTURE: fixturePath("check-deferred.json") }),
+      env: env(s, { CARRICK_FAKE_FIXTURE: fixturePath("check-rebuilding.json") }),
       home: s.home,
     });
     assert.deepEqual(calls(s.log), ["a.ts"]);

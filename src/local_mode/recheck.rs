@@ -170,6 +170,10 @@ pub struct Degraded {
     /// (carrick#3860): the answer is the indexed one because time ran out,
     /// not because nothing needed reading.
     pub deadline: bool,
+    /// The local read model was being rebuilt (`.carrick/repos` is not the
+    /// model `index.json` names), so nothing was judged: the background
+    /// runner keeps the edit queued and asks again.
+    pub rebuilding: bool,
     /// Which services were to be re-read, once that was decided.
     pub scope: Option<RecheckScope>,
 }
@@ -425,10 +429,13 @@ pub fn run(
                 took("held-read", started);
                 Source::Read(Box::new(held))
             }
-            // The same for the full re-check: it judges nothing and answers
-            // deferred, and the runner keeps the edit queued.
+            // The full re-check judges nothing either, and says so: the
+            // runner keeps the edit queued and asks again.
             Err(reason) if reason == REBUILDING => {
-                return Err(Box::new(deferred(Vec::new(), started)));
+                return Err(Box::new(Degraded {
+                    rebuilding: true,
+                    ..unread(reason, started)
+                }));
             }
             Err(reason) => return Err(Box::new(unread(reason, started))),
         },
@@ -505,6 +512,7 @@ pub fn run(
             known_miss: true,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
         }));
     }
@@ -561,6 +569,7 @@ pub fn run(
                 known_miss: false,
                 deferred: false,
                 deadline: missed,
+                rebuilding: false,
                 scope: Some(plan.scope.clone()),
             }))
         }
@@ -670,6 +679,7 @@ fn unread(reason: String, started: Instant) -> Degraded {
         known_miss: false,
         deferred: false,
         deadline: false,
+        rebuilding: false,
         scope: None,
     }
 }
@@ -683,6 +693,7 @@ fn deferred(new_functions: Vec<super::contract::NewFunction>, started: Instant) 
         known_miss: false,
         deferred: true,
         deadline: false,
+        rebuilding: false,
         scope: None,
     }
 }

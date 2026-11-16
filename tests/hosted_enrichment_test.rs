@@ -1380,10 +1380,10 @@ fn a_snapshot_the_move_would_refuse_is_not_healed_in() {
 }
 
 /// The full re-check meets the read model mid-swap: it judges nothing and
-/// answers deferred, so the runner keeps the edit queued; it does not tell
-/// the reader to run it again.
+/// says `rebuilding`, which the runner reads as "keep the edit queued", and
+/// it is not a clean result (exit 2).
 #[test]
-fn a_full_recheck_that_meets_a_rebuilding_read_model_defers() {
+fn a_full_recheck_that_meets_a_rebuilding_read_model_keeps_the_edit_queued() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let (repo, _) = indexed_at_hosted(root);
@@ -1409,7 +1409,7 @@ fn a_full_recheck_that_meets_a_rebuilding_read_model_defers() {
     let answer: Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
 
-    assert_eq!(answer["recheck"]["deferred"], json!(true), "{answer:#}");
-    let reason = answer["recheck"]["reason"].as_str().unwrap_or_default();
-    assert!(!reason.contains("run it again"), "{answer:#}");
+    assert_eq!(answer["recheck"]["ran"], json!("none"), "{answer:#}");
+    assert_eq!(answer["recheck"]["rebuilding"], json!(true), "{answer:#}");
+    assert_eq!(output.status.code(), Some(2), "{answer:#}");
 }

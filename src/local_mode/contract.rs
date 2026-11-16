@@ -656,12 +656,9 @@ pub struct Recheck {
     /// True on a `none` from `check --recheck --no-rescan` for an edit the
     /// probe did not answer without a re-scan or a walk of every service's
     /// imports: the call was asked to do neither, so the rows are the indexed
-    /// ones and a later `check --recheck` gives the answer. Also true on a
-    /// full `check --recheck` that met the local read model being rebuilt
-    /// (`.carrick/repos` not the model `index.json` names): it judged nothing,
-    /// and the background runner keeps the edit queued. Absent on every
-    /// other answer, including a re-check that did run and missed its budget
-    /// (`known_miss`, `reason`).
+    /// ones and a later `check --recheck` gives the answer. Absent
+    /// on every other answer, including a re-check that did run and missed
+    /// its budget (`known_miss`, `reason`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
     /// True on a `none` whose re-check started and ran past its budget, so the
@@ -671,6 +668,12 @@ pub struct Recheck {
     /// Absent on every other answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deadline: bool,
+    /// True on a `none` from a full re-check that met the local read model
+    /// being rebuilt (`.carrick/repos` is not the model `index.json` names):
+    /// it judged nothing, and the background runner keeps the edit queued.
+    /// Never a clean result. Absent on every other answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebuilding: bool,
     /// Which services this re-check read, and which it judged against their
     /// newest known copy (`docs/local-mode-output.md`, "`recheck`"). Absent on
     /// a `none` that had no service to name.
@@ -800,11 +803,12 @@ pub struct SimilarFunction {
 impl Recheck {
     /// Whether this answer is a re-check that was warranted and did not
     /// finish inside its budget: it ran past it (`deadline`), or an earlier
-    /// one of the same service did against this index (`known_miss`). The
-    /// rows are the indexed ones, from before the edit, so the answer is not
-    /// a check of the edit (carrick#3860).
+    /// one of the same service did against this index (`known_miss`), or the
+    /// local read model was being rebuilt (`rebuilding`). The rows are the
+    /// indexed ones, from before the edit, so the answer is not a check of
+    /// the edit (carrick#3860).
     pub fn not_checked(&self) -> bool {
-        self.ran == "none" && (self.deadline || self.known_miss)
+        self.ran == "none" && (self.deadline || self.known_miss || self.rebuilding)
     }
 
     /// The line a terminal and a hook both print for this block. Keyed on
@@ -1613,6 +1617,7 @@ mod tests {
             known_miss: false,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready: None,
@@ -1660,6 +1665,7 @@ mod tests {
             known_miss: false,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready,
@@ -1688,6 +1694,7 @@ mod tests {
             known_miss: false,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready: None,
@@ -1711,6 +1718,7 @@ mod tests {
             known_miss: false,
             deferred: false,
             deadline: true,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready: None,
@@ -1745,6 +1753,7 @@ mod tests {
             known_miss: true,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready: None,
@@ -1773,6 +1782,7 @@ mod tests {
             known_miss: false,
             deferred: false,
             deadline: false,
+            rebuilding: false,
             scope: None,
             moved: Vec::new(),
             engine_ready: None,
