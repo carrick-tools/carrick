@@ -8,7 +8,8 @@ import {
   isCandidate,
 } from "../src/contract.ts";
 import { renderSessionStart } from "../src/render.ts";
-import { fixture } from "./helpers.ts";
+import { isMismatch } from "../src/diagnostics.ts";
+import { asStated, fixture } from "./helpers.ts";
 
 test("a payload with the right schema parses", () => {
   const result = fixture("check-mismatch.json");
@@ -41,9 +42,13 @@ test("a field the plugin does not know is dropped, not fatal", () => {
   assert.equal("future_field" in result, false);
 });
 
-test("problem items are the verdicts that are not compatible", () => {
+// A1 (carrick#4655): a problem is what the re-check's judge stated, never a
+// verdict read off the index.
+test("problem items are the items the CLI stated, not every verdict that is not compatible", () => {
   const result = fixture("check-mismatch.json");
-  const problems = problemItems(result);
+  assert.equal(problemItems(result).length, 0, "an index answer states no problem of an edit");
+  const stated = asStated(result);
+  const problems = problemItems(stated);
   assert.equal(problems.length, 2);
   assert.equal(
     problems.some((item) => item.verdict?.result === "compatible"),
@@ -56,7 +61,7 @@ test("connected items are the ones naming another service", () => {
   assert.equal(connectedItems(result).length, 5);
 });
 
-test("the result decides what is a problem, not the state", () => {
+test("the result decides what a diagnostic shows, not the state", () => {
   const result = fixture("check-mismatch.json");
   const items = result.items ?? [];
   // A routing finding carries `not_checked`, because no TYPE verdict bears on
@@ -64,10 +69,10 @@ test("the result decides what is a problem, not the state", () => {
   const routing = items.find((item) => item.verdict?.result === "method_mismatch");
   assert.ok(routing);
   assert.equal(routing.verdict?.state, "not_checked");
-  assert.equal(problemItems(result).includes(routing), true);
+  assert.equal(isMismatch(routing), true);
   // A null result claims nothing, in whatever state.
   for (const item of items.filter((entry) => entry.verdict?.result == null)) {
-    assert.equal(problemItems(result).includes(item), false);
+    assert.equal(isMismatch(item), false);
   }
 });
 

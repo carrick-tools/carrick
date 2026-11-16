@@ -22,7 +22,7 @@
 // A part-2 break with no early row is `part2_only` and prints as today.
 
 import type { CheckItem, CheckResult, MovedRow } from "../contract.ts";
-import { problemItems } from "../contract.ts";
+import { problemItems, statedMoved } from "../contract.ts";
 
 /** The label a check item has as a contract row: `METHOD path{ dispatch}`. */
 export function itemLabel(item: CheckItem): string | null {
@@ -64,7 +64,7 @@ export function earlyRows(early: CheckResult): EarlyRow[] {
     const places = (item.counterparts ?? []).flatMap((c) => (c.file && c.line !== undefined ? [{ file: c.file, line: c.line }] : []));
     out.push({ key: keyOf(file, label), label, item, places });
   }
-  for (const row of early.recheck?.moved ?? []) {
+  for (const row of statedMoved(early)) {
     const label = `${row.method} ${row.path}`;
     out.push({ key: keyOf(row.file, label), label, moved: row, places: row.counterparts.map(placeOf).filter((p): p is Place => p !== null) });
   }
@@ -112,7 +112,10 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
   const rows = earlyRows(early);
   const usable = full && !full.error ? full : undefined;
   const items = usable?.items ?? [];
-  const moved = usable?.recheck?.moved ?? [];
+  // Part 2 says a break only where the CLI marked it `stated`: a mismatch it
+  // holds but does not state (one it reads as model-only, or on main) leaves
+  // the early break standing, as an unresolved row does (R5a).
+  const moved = usable ? statedMoved(usable) : [];
   const fullFile = usable?.file ?? early.file ?? "";
   // A full answer that ran nothing (deadline, queued behind another check, read model rebuilding, edit not re-read)
   // holds the index's stored verdicts for an older file state: it judged no row, so it corrects none.
@@ -126,7 +129,7 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
       if (match === null) return { row, outcome: "part3_only", p2_state: "absent", corrected: false, match };
       if (verdict?.state === "unresolved") return { row, outcome: "part3_only", p2_state: "unresolved", corrected: false, match };
       if (judged && verdict?.state === "resolved" && verdict.result === "compatible") return { row, outcome: "differ", corrected: true, match };
-      if (verdict?.result != null && verdict.result !== "compatible") {
+      if (match.stated === true && verdict?.result != null && verdict.result !== "compatible") {
         return { row, outcome: verdict.result === row.item.verdict?.result ? "same" : "differ", corrected: false, match };
       }
       return { row, outcome: "part3_only", p2_state: "not_judged", corrected: false, match };
@@ -234,7 +237,7 @@ export function keepRows(early: CheckResult, keep: (row: EarlyRow) => boolean): 
 
 /** An early break on a route in another file, as the item Stop counts: it is never listed, only counted and named. */
 function movedBreak(row: MovedRow): CheckItem {
-  return { kind: "route", method: row.method, path: row.path, direction: "response", verdict: { state: "resolved", result: row.after, detail: row.reason } };
+  return { kind: "route", method: row.method, path: row.path, direction: "response", verdict: { state: "resolved", result: row.after, detail: row.reason }, stated: true };
 }
 
 /**

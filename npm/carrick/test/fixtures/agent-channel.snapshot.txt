@@ -8,9 +8,12 @@ Carrick ran `carrick check --changed` for this session's change: 1 contract prob
 ### check-clean.json :: renderPostToolUse
 (silent)
 
-### check-counterpart.json :: renderPostToolUse
+### check-counterpart-stated.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract problem.
 - user-service/src/routes/users.ts:18:3 call GET /api/users/:id [fact, imported_member] type_mismatch: the response no longer carries `email`, which this call reads. Read off the client member this call goes through. Producers: user-service src/routes/users.ts:42
+
+### check-counterpart.json :: renderPostToolUse
+(silent)
 
 ### check-deferred-similar.json :: renderPostToolUse
 (silent)
@@ -23,7 +26,6 @@ Carrick re-checked user-service/src/routes/users.ts after this edit: 1 contract 
 
 ### check-deleted.json :: renderPostToolUse
 Carrick: user-service/src/routes/users.ts is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.
-- user-service/src/routes/users.ts:42:3 route GET /api/users/:id [fact, file_based_route] producer_removed (no type verdict): the file is gone from disk and one consumer still calls this route. Read off loader export claimed by a file-route convention. Consumers: order-service src/clients/users.ts:18
 
 ### check-mismatch.json :: renderPostToolUse
 (silent)
@@ -49,10 +51,13 @@ Carrick: user-service/src/routes/users.ts is gone from disk and the index still 
 ### check-stale-uses.json :: renderPostToolUse
 Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.
 
-### check-types.json :: renderPostToolUse
+### check-types-stated.json :: renderPostToolUse
 Carrick re-checked user-service/src/routes/users.ts after this edit: 2 contract problems.
 - user-service/src/routes/users.ts:42:3 route GET /api/users [fact, file_based_route] response is UsersResponse { users: UserV2[] }, consumer at notification-service server.ts:25 reads number. Type 'UsersResponse' is not assignable to type 'number'. Consumers: notification-service server.ts:25
 - user-service/src/routes/users.ts:71:5 call POST /api/users [fact, imported_member] request is { name: string }, producer at identity-service src/routes/users.ts:14 expects CreateUser { name: string; email: string }. Property 'email' is missing in type '{ name: string }'. Producers: identity-service src/routes/users.ts:14
+
+### check-types.json :: renderPostToolUse
+(silent)
 
 ### check-uses.json :: renderPostToolUse
 Other files use what this file declares: `carrick check user-service/src/routes/users.ts` lists the 2 uses; open them if this edit changed a signature or a type.

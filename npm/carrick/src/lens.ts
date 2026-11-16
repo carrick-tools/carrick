@@ -32,7 +32,7 @@ import {
   type Counterpart,
 } from "./contract.ts";
 import { boundaryFor } from "./render.ts";
-import { rangeAt, resolveCounterpart } from "./diagnostics.ts";
+import { isMismatch, rangeAt, resolveCounterpart } from "./diagnostics.ts";
 import { DEFAULT_SURFACES, type Surfaces } from "./surfaces.ts";
 
 /** The command a client invokes when a lens is clicked. */
@@ -70,12 +70,6 @@ export type LensOptions = {
   exists?: (target: string) => boolean;
   surfaces?: Surfaces;
 };
-
-/** A verdict that states a result other than `compatible`, on this one row. */
-function isMismatch(item: CheckItem): boolean {
-  const verdict = item.verdict;
-  return Boolean(verdict && verdict.result != null && verdict.result !== "compatible");
-}
 
 /**
  * How many of the other side there are, in the word for what they are.

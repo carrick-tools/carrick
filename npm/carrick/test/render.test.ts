@@ -6,6 +6,7 @@ import {
   boundaryFor,
   boundaryLines,
   itemLine,
+  movedLines,
   renderPostRead,
   renderPostToolUse,
   renderSessionStart,
@@ -19,15 +20,15 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import type { Boundary, CheckItem, CheckResult } from "../src/contract.ts";
-import { fixture, statusFixture, testDir } from "./helpers.ts";
+import { asStated, fixture, statusFixture, testDir } from "./helpers.ts";
 
 // What an edit is told (the post-edit hook): only what this edit changed or
 // what needs action, a few lines at most. Never the index's stored verdict
 // list: on a large repo that was 8.7 KB of rows the edit did not touch.
 
-/** The mismatch fixture as the re-check answers it from the working tree. */
+/** The mismatch fixture as the re-check answers it from the working tree, its judge stating both mismatches as the edit's. */
 function rechecked(): CheckResult {
-  return { ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 900 } };
+  return asStated({ ...fixture("check-mismatch.json"), recheck: { ran: "extraction+types", elapsed_ms: 900 } });
 }
 
 /** `count` routes that name a consumer and claim nothing: the bulk of a stale answer. */
@@ -90,6 +91,78 @@ test("a re-checked edit lists its problems and nothing that is fine", () => {
   for (const quiet of [":12:3", ":80:5", ":95:7", "compatible"]) {
     assert.equal(context.includes(quiet), false, quiet);
   }
+});
+
+// A1 (carrick#4655): the hook states a row only when the re-check's judge
+// stated it. A mismatch the index already held (on main), a row only the model
+// states, and a non-HTTP row the judge did not state print nothing.
+
+/** A re-check answer for `src/routes/orders.ts` that ran, holding `items`. */
+function recheckOf(items: CheckItem[]): CheckResult {
+  return {
+    schema: "carrick.check/0",
+    file: "src/routes/orders.ts",
+    stale: true,
+    items,
+    recheck: { ran: "extraction+types", elapsed_ms: 900 },
+  };
+}
+
+/** A resolved route mismatch at `line` in that file. */
+function mismatchAt(line: number, extra: Partial<CheckItem> = {}): CheckItem {
+  return {
+    kind: "route",
+    method: "POST",
+    path: `/api/orders/${line}`,
+    line,
+    source: "fact",
+    counterparts: [{ role: "consumer", service: "web", file: "src/client.ts", line: 7 }],
+    verdict: { state: "resolved", result: "type_mismatch", detail: "a field differs" },
+    ...extra,
+  };
+}
+
+test("T1: a re-check answer whose mismatch the judge did not state (on main) prints nothing", () => {
+  assert.equal(renderPostToolUse(recheckOf([mismatchAt(12)])), null);
+  assert.equal(renderPostToolUse(recheckOf([mismatchAt(12)]), undefined, { late: true }), null);
+});
+
+test("T2: a model-only mismatch the judge did not state prints nothing", () => {
+  assert.equal(renderPostToolUse(recheckOf([mismatchAt(12, { source: "candidate", resolution_source: "model" })])), null);
+});
+
+test("T3: a GraphQL row is silent unless stated, and stated when the judge said so", () => {
+  const graphql = mismatchAt(12, { method: "QUERY", path: "user" });
+  assert.equal(renderPostToolUse(recheckOf([graphql])), null);
+  const text = renderPostToolUse(recheckOf([{ ...graphql, stated: true }])) ?? "";
+  assert.match(text, /1 contract problem\./);
+  assert.match(text, /route QUERY user/);
+});
+
+test("a safe edit to a file holding mismatches already on main states none; a real break in the same file is stated", () => {
+  const onMain = [mismatchAt(40), mismatchAt(90, { method: "GET", source: "candidate", resolution_source: "model" })];
+  const safe = recheckOf(onMain);
+  assert.equal(renderPostToolUse(safe, undefined, { late: true }), null);
+  const stop = sessionCheckedLines([{ result: safe, where: "src/routes/orders.ts" }], [{ result: safe, where: "src/routes/orders.ts" }]);
+  assert.doesNotMatch(stop.text, /contract problem/);
+  assert.doesNotMatch(stop.text, /both sides agree/);
+
+  const broken = recheckOf([...onMain, mismatchAt(700, { stated: true })]);
+  const text = renderPostToolUse(broken, undefined, { late: true }) ?? "";
+  assert.match(text, /: 1 contract problem\./);
+  assert.match(text, /:700/);
+  assert.doesNotMatch(text, /:40:|:90:|orders\/40|orders\/90/);
+  const after = sessionCheckedLines([{ result: broken, where: "src/routes/orders.ts" }], []);
+  assert.match(after.text, /1 contract problem\./);
+});
+
+test("T6: Stop never names a mismatch the judge did not state as agreeing", () => {
+  const compatible: CheckItem = { ...mismatchAt(5), verdict: { state: "resolved", result: "compatible", detail: "" } };
+  const result = recheckOf([compatible, mismatchAt(12)]);
+  const text = sessionCheckedLines([{ result, where: "src/routes/orders.ts" }], []).text;
+  assert.match(text, /POST \/api\/orders\/5 at src\/routes\/orders\.ts:5\): both sides agree/);
+  assert.doesNotMatch(text, /\/api\/orders\/12/);
+  assert.doesNotMatch(text, /contract problem/);
 });
 
 test("a re-checked edit with many problems prints three and counts the rest", () => {
@@ -293,15 +366,16 @@ test("evidence rides the item line when the row states it", () => {
   assert.match(line, /Read off loader export claimed by a file-route convention/);
 });
 
-test("a deleted file says so and names the problem it leaves", () => {
+// A1 (D5): the deleted-file line stays; its `producer_removed` rows are the
+// index's, not a break the re-check judge stated, so they are not listed.
+test("a deleted file says so, and its index rows are not stated as problems", () => {
   const context = renderPostToolUse(fixture("check-deleted.json")) ?? "";
   const lines = context.split("\n");
   assert.equal(
     lines[0],
     "Carrick: src/routes/users.ts is gone from disk and the index still holds 1 row(s) for it, with 1 counterpart(s) still on the other side.",
   );
-  assert.match(lines[1] ?? "", /^- src\/routes\/users\.ts:42:3 route GET \/api\/users\/:id .*producer_removed/);
-  assert.equal(lines.length, 2);
+  assert.equal(lines.length, 1, context);
 });
 
 /** A deleted file whose index answer holds `rows` rows, each with `counterparts` counterparts. */
@@ -647,7 +721,7 @@ test("a session that starts while a scan is running is told so, not told there i
 // carrick#1033: the two shapes the compiler compared, in the line itself.
 
 test("a response mismatch names both types and the consumer that reads one", () => {
-  const context = renderPostToolUse(fixture("check-types.json")) ?? "";
+  const context = renderPostToolUse(asStated(fixture("check-types.json"))) ?? "";
   const line = context.split("\n").find((text) => text.includes("GET /api/users"));
   assert.ok(line);
   assert.ok(
@@ -661,7 +735,7 @@ test("a response mismatch names both types and the consumer that reads one", () 
 });
 
 test("a request mismatch swaps the roles and the row says it is the reader", () => {
-  const context = renderPostToolUse(fixture("check-types.json")) ?? "";
+  const context = renderPostToolUse(asStated(fixture("check-types.json"))) ?? "";
   const line = context.split("\n").find((text) => text.includes("POST /api/users"));
   assert.ok(line);
   assert.ok(
@@ -821,7 +895,9 @@ test("a payload without uses lines renders exactly as before", () => {
   }
 });
 
-test("an edit names the rows outside the file that it moved, and calls an unjudged one no break", () => {
+// A1 (P11, D2): a moved row prints when the CLI stated it; one the index
+// never judged is never stated, and prints nothing.
+test("an edit names the rows outside the file that it moved and the CLI stated, and nothing else", () => {
   const result = rechecked();
   result.recheck = {
     ran: "extraction+types",
@@ -838,6 +914,7 @@ test("an edit names the rows outside the file that it moved, and calls an unjudg
         counterparts: [],
         reason: "the index matched this call, and no service serves it now",
         not_judged_before: false,
+        stated: true,
       },
       {
         file: "api/src/widgets.ts",
@@ -858,7 +935,35 @@ test("an edit names the rows outside the file that it moved, and calls an unjudg
     text,
     /- web\/src\/client\.ts:14: this call GET \/api\/v2\/widgets\/:id matched a route in the index and this edit left it with none\./,
   );
-  assert.match(text, /api\/src\/widgets\.ts:9: this route GET .* against web web\/src\/client\.ts:20 reads type_mismatch now; the index never judged it, so this edit may not be the cause\./);
+  assert.doesNotMatch(text, /api\/src\/widgets\.ts/);
+  assert.doesNotMatch(text, /never judged/);
+});
+
+test("a moved row the CLI did not state prints nothing (T5)", () => {
+  const result: CheckResult = {
+    ...rechecked(),
+    items: [],
+    recheck: {
+      ran: "extraction+types",
+      elapsed_ms: 900,
+      moved: [
+        {
+          file: "api/src/widgets.ts",
+          line: 9,
+          role: "route",
+          method: "GET",
+          path: "/api/widgets/:id",
+          before: "compatible",
+          after: "type_mismatch",
+          counterparts: ["web web/src/client.ts:20"],
+          reason: "x",
+          not_judged_before: false,
+        },
+      ],
+    },
+  };
+  assert.deepEqual(movedLines(result), []);
+  assert.equal(renderPostToolUse(result), null);
 });
 
 test("a moved row of another build's index says that build may be the cause", () => {
@@ -879,6 +984,7 @@ test("a moved row of another build's index says that build may be the cause", ()
         reason: "x",
         not_judged_before: false,
         other_build: true,
+        stated: true,
       },
     ],
   };

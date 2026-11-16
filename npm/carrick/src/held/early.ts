@@ -6,7 +6,10 @@
 // A row in the edited file is a `CheckItem`; a row in another file is a
 // `recheck.moved` row. The compiler's message is the verdict's detail, with the
 // check's own alias replaced; a message that still names the check's machinery
-// is never written.
+// is never written. Every row is `stated`: the daemon checks only a row its
+// gate armed, whose clean check was silent before the edit (`held/place.ts`,
+// `arm`), so each break is this edit's. The full answer's rows carry the
+// CLI's own mark.
 
 import path from "node:path";
 import type { CheckItem, CheckResult, Counterpart, MovedRow } from "../contract.ts";
@@ -88,6 +91,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
         verdict: { state: "resolved", result: "type_mismatch", detail },
         expected_type: line.expected.length > MAX_TYPE ? `${line.expected.slice(0, MAX_TYPE - 3)}...` : line.expected,
         counterparts,
+        stated: true,
       });
       continue;
     }
@@ -110,6 +114,7 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
       counterparts: places,
       reason: detail,
       not_judged_before: false,
+      stated: true,
     });
   }
   return {

@@ -1935,6 +1935,7 @@ pub(super) fn build(
             expected_type: typed.and_then(|finding| finding.expected_type.clone()),
             actual_type: typed.and_then(|finding| finding.actual_type.clone()),
             direction: typed.and_then(|finding| finding.direction.clone()),
+            stated: false,
         };
         repos[position]
             .files

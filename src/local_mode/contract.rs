@@ -231,6 +231,13 @@ pub struct Item {
     /// because it is the same fact the type check keyed its outcome on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// The re-check judged this row a problem of the edit, by the rule a plain
+    /// `check --changed` lists on (`changed.rs`, `Problem::listed_without_all`):
+    /// it fails, or rests on an index another build wrote. Absent on every
+    /// answer that judged nothing (no re-check, or one that ran none): those
+    /// verdicts are the index's own, on main.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stated: bool,
 }
 
 /// How much printed type text one item carries.
@@ -723,6 +730,9 @@ pub struct MovedRow {
     /// (carrick#2911, `changed.rs`, `Problem::other_build`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub other_build: bool,
+    /// Stated as this edit's problem, by the rule [`Item::stated`] follows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stated: bool,
 }
 
 /// The services one re-check re-read, and what it did about the rest.
@@ -1317,6 +1327,7 @@ mod tests {
                 expected_type: None,
                 actual_type: None,
                 direction: None,
+                stated: false,
             }],
             boundary: None,
             boundary_note: super::super::NOT_CLASSIFIED_LOCALLY.to_string(),

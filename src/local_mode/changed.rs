@@ -218,6 +218,18 @@ pub struct Problem {
     /// [`EXIT_NOTHING_COVERED`] when nothing else fails.
     pub other_build: bool,
     pub fails: bool,
+    /// [`Problem::listed_without_all`], written once by [`judge`] after every
+    /// flag above is set: the one rule for a problem stated as this change's
+    /// (it fails, or rests on an index another build wrote). The per-edit
+    /// re-check copies it onto its items and moved rows (`recheck.rs`,
+    /// `state_judged`), and the hook states only what carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stated: bool,
+    /// The joined operation's dispatch case, so the per-edit re-check marks
+    /// the item of this case and not a sibling case at the same line, method
+    /// and path.
+    #[serde(skip)]
+    pub dispatch: Option<String>,
 }
 
 /// A matched route or call in a changed file whose pair the type check could
@@ -1138,7 +1150,11 @@ pub(super) fn judge(
             .files
             .get(&operation.file)?
             .iter()
-            .find(|item| item.key == operation.key && item.line == operation.line)
+            .find(|item| {
+                item.key == operation.key
+                    && item.line == operation.line
+                    && item.dispatch == operation.dispatch
+            })
     };
 
     let strict = states_dispatch(before);
@@ -1313,6 +1329,8 @@ pub(super) fn judge(
             after: verdict.result.clone().unwrap_or_default(),
             other_build: certain && !same_build,
             fails: certain && same_build,
+            stated: false,
+            dispatch: operation.dispatch.clone(),
         });
         // Only a pair the index held compatible moved; one with no earlier
         // verdict is listed and counted apart, as "not judged before".
@@ -1402,6 +1420,8 @@ pub(super) fn judge(
                     after: "no_route".to_string(),
                     other_build,
                     fails: new_fact && !other_build,
+                    stated: false,
+                    dispatch: operation.dispatch.clone(),
                 });
             }
         }
@@ -1522,7 +1542,12 @@ pub(super) fn judge(
             moved_outside: false,
             after: "no_route".to_string(),
             fails: confirmed,
+            stated: false,
+            dispatch: operation.dispatch.clone(),
         });
+    }
+    for problem in &mut judged.problems {
+        problem.stated = problem.listed_without_all();
     }
     judged.problems.sort();
     judged.problems.dedup();
@@ -2022,6 +2047,8 @@ mod tests {
             after: String::new(),
             other_build: false,
             fails,
+            stated: fails,
+            dispatch: None,
         }
     }
 
@@ -2639,21 +2666,31 @@ mod tests {
         assert_eq!(unjudged, 1, "{:?}", judged.problems);
     }
 
-    /// One consumer call at `client.ts:10`, edited in this change and now a
-    /// type mismatch, whose finding states `edge_source` (`None`: the
-    /// SDK-mediated case, which states none). Whether the run fails on it.
-    fn mismatch_fails(edge_source: Option<&str>) -> bool {
+    /// One consumer call at `client.ts:10` keyed `key` (method `method`, path
+    /// `path`), edited in this change and now a type mismatch, whose finding
+    /// states `edge_source` (`None`: the SDK-mediated case, which states
+    /// none). The index held it with the result `before` (`compatible` or a
+    /// mismatch) and was written by this build when `same_build`. The one
+    /// problem `judge` gives.
+    fn judged_mismatch(
+        key: &str,
+        method: &str,
+        path: &str,
+        edge_source: Option<&str>,
+        before: &str,
+        same_build: bool,
+    ) -> Problem {
         let row = |verdict: serde_json::Value| {
             serde_json::json!({
-                "kind": "call", "service": "web", "key": "http|GET|/a", "dispatch": null,
-                "method": "GET", "path": "/a", "line": 10, "col": null, "source": "fact",
+                "kind": "call", "service": "web", "key": key, "dispatch": null,
+                "method": method, "path": path, "line": 10, "col": null, "source": "fact",
                 "resolution_source": null, "evidence": null,
                 "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
                 "verdict": verdict
             })
         };
         let before = index_of(vec![row(
-            serde_json::json!({"state": "resolved", "result": "compatible", "detail": ""}),
+            serde_json::json!({"state": "resolved", "result": before, "detail": ""}),
         )]);
         let rebuilt = index_of(vec![row(
             serde_json::json!({"state": "resolved", "result": "type_mismatch", "detail": "differs"}),
@@ -2661,13 +2698,13 @@ mod tests {
         let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
             "scanner_version": "0",
             "operations": [{
-                "role": "consumer", "service": "web", "key": "http|GET|/a",
-                "method": "GET", "path": "/a", "file": "client.ts", "line": 10,
+                "role": "consumer", "service": "web", "key": key,
+                "method": method, "path": path, "file": "client.ts", "line": 10,
                 "resolution_source": null, "handler": null, "dispatch": null
             }],
             "matches": [], "unmatched": [],
             "findings": [{
-                "kind": "type_mismatch", "service": "web", "method": "GET", "path": "/a",
+                "kind": "type_mismatch", "service": "web", "method": method, "path": path,
                 "call_sites": ["client.ts:10"], "detail": "differs",
                 "verdict_state": null, "direction": null, "expected_type": null,
                 "actual_type": null, "edge_source": edge_source
@@ -2680,14 +2717,156 @@ mod tests {
         let judged = judge(
             Path::new("/w"),
             &before,
-            true,
+            same_build,
             &rebuilt,
             &join,
             &changed,
             &Touched::new(),
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
-        judged.problems[0].fails
+        judged.problems[0].clone()
+    }
+
+    /// Two dispatch cases of one call at one line, `client.ts:10`: the index
+    /// held both agreeing, and the rebuild reads the case at `broken` as a
+    /// type mismatch and the other as compatible. The problems `judge` gives.
+    fn judged_dispatch_pair(broken: usize) -> Vec<Problem> {
+        let cases = [dispatch_key("create"), dispatch_key("delete")];
+        let row = |dispatch: &str, result: &str| {
+            serde_json::json!({
+                "kind": "call", "service": "web", "key": "http|POST|/jobs",
+                "dispatch": dispatch, "method": "POST", "path": "/jobs", "line": 10,
+                "col": null, "source": "fact", "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
+                "verdict": {"state": "resolved", "result": result, "detail": "differs"}
+            })
+        };
+        let before = index_of(cases.iter().map(|c| row(c, "compatible")).collect());
+        let rebuilt = index_of(
+            cases
+                .iter()
+                .enumerate()
+                .map(|(n, c)| {
+                    row(
+                        c,
+                        if n == broken {
+                            "type_mismatch"
+                        } else {
+                            "compatible"
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": cases.iter().map(|c| serde_json::json!({
+                "role": "consumer", "service": "web", "key": "http|POST|/jobs",
+                "method": "POST", "path": "/jobs", "file": "client.ts", "line": 10,
+                "resolution_source": null, "handler": null, "dispatch": c
+            })).collect::<Vec<_>>(),
+            "matches": [], "unmatched": [],
+            "findings": [{
+                "kind": "type_mismatch", "service": "web", "method": "POST", "path": "/jobs",
+                "call_sites": ["client.ts:10"], "detail": "differs",
+                "verdict_state": null, "direction": null, "expected_type": null,
+                "actual_type": null, "edge_source": "fact"
+            }],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let edited: BTreeSet<String> = ["client.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+        judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &Touched::new(),
+        )
+        .problems
+    }
+
+    /// Each dispatch case is judged on its own rebuilt row: of two cases at
+    /// one line, only the broken one is a problem and stated, whichever of
+    /// the two it is.
+    #[test]
+    fn two_dispatch_cases_at_one_line_state_only_the_broken_one() {
+        for broken in [0, 1] {
+            let problems = judged_dispatch_pair(broken);
+            let want = [dispatch_key("create"), dispatch_key("delete")][broken].clone();
+            assert_eq!(problems.len(), 1, "case {broken}: {problems:?}");
+            assert_eq!(
+                problems[0].dispatch.as_deref(),
+                Some(want.as_str()),
+                "{problems:?}"
+            );
+            assert!(problems[0].stated && problems[0].fails, "{problems:?}");
+        }
+    }
+
+    /// Whether the run fails on [`judged_mismatch`]'s HTTP call, broken by
+    /// this change on an index this build wrote.
+    fn mismatch_fails(edge_source: Option<&str>) -> bool {
+        judged_mismatch("http|GET|/a", "GET", "/a", edge_source, "compatible", true).fails
+    }
+
+    /// `stated` is the plain listing rule, written by `judge` itself: a fact
+    /// mismatch the change caused is stated whether this build or another
+    /// wrote the index (the hook must not go silent on a break because the
+    /// CLI was upgraded); a mismatch the index already held, and one only the
+    /// model states, are not.
+    #[test]
+    fn judge_states_a_new_fact_break_on_any_build_and_not_one_already_held() {
+        let new = judged_mismatch("http|GET|/a", "GET", "/a", Some("fact"), "compatible", true);
+        assert!(new.fails && new.stated, "{new:?}");
+        let other = judged_mismatch(
+            "http|GET|/a",
+            "GET",
+            "/a",
+            Some("fact"),
+            "compatible",
+            false,
+        );
+        assert!(
+            !other.fails && other.other_build && other.stated,
+            "{other:?}"
+        );
+        let held = judged_mismatch(
+            "http|GET|/a",
+            "GET",
+            "/a",
+            Some("fact"),
+            "type_mismatch",
+            true,
+        );
+        assert!(held.already_indexed && !held.stated, "{held:?}");
+        let model = judged_mismatch(
+            "http|GET|/a",
+            "GET",
+            "/a",
+            Some("candidate"),
+            "compatible",
+            false,
+        );
+        assert!(!model.stated, "{model:?}");
+        assert_eq!(new.listed_without_all(), new.stated);
+    }
+
+    /// The judge has no protocol filter: a certain GraphQL or pub/sub
+    /// mismatch fails and is stated as an HTTP one is (every protocol with an
+    /// operation key).
+    #[test]
+    fn a_certain_graphql_or_pubsub_mismatch_fails_and_is_stated() {
+        for (key, method, path) in [
+            ("graphql|query|user", "QUERY", "user"),
+            ("pubsub|metrics.page_view", "PUBSUB", "metrics.page_view"),
+        ] {
+            let problem = judged_mismatch(key, method, path, Some("fact"), "compatible", true);
+            assert!(problem.fails && problem.stated, "{key}: {problem:?}");
+        }
     }
 
     /// An SDK-mediated mismatch states no source by design: the PR comment

@@ -8,6 +8,7 @@
 import {
   connectedItems,
   problemItems,
+  statedMoved,
   type Boundary,
   type ChangedResult,
   type CheckItem,
@@ -291,12 +292,12 @@ export const MAX_EDIT_PROBLEMS = 3;
 export const MAX_MOVED_ROWS = 3;
 
 /**
- * The rows outside the edited file that this edit moved (`recheck.moved`):
- * one line each, naming the row and, for a pair, its counterpart. A row the
- * index never judged is not called a break.
+ * The rows outside the edited file that this edit moved and the CLI stated
+ * (`recheck.moved` rows marked `stated`): one line each, naming the row and,
+ * for a pair, its counterpart. A row the index never judged is never stated.
  */
 export function movedLines(result: CheckResult): string[] {
-  const moved = result.recheck?.moved ?? [];
+  const moved = statedMoved(result);
   const lines = moved.slice(0, MAX_MOVED_ROWS).map((row) => {
     const at = `${row.file}${row.line ? `:${row.line}` : ""}`;
     const what = `${row.role} ${row.method} ${row.path}`;
@@ -306,9 +307,7 @@ export function movedLines(result: CheckResult): string[] {
     const other = row.counterparts.length > 0 ? ` against ${row.counterparts.join(", ")}` : "";
     const verdict = row.other_build
       ? `reads ${row.after} now; the index was built by another carrick version, so this edit may not be the cause`
-      : row.not_judged_before
-        ? `reads ${row.after} now; the index never judged it, so this edit may not be the cause`
-        : `agreed in the index and now reads ${row.after}`;
+      : `agreed in the index and now reads ${row.after}`;
     return cutLine(`- ${at}: this ${what}${other} ${verdict}.`);
   });
   if (moved.length > MAX_MOVED_ROWS) {
@@ -414,7 +413,7 @@ export function sessionCheckedLines(
     });
     const items = result.items ?? [];
     if (judgedAnyPair(result)) {
-      judged.push(...items.filter((item) => item.verdict?.state === "resolved" && item.verdict.result != null).map(named));
+      judged.push(...items.filter((item) => item.verdict?.state === "resolved" && item.verdict.result === "compatible").map(named));
     } else if (items.length > 0) {
       unjudged.push(...items.map(named));
       unjudgedResult ??= result;
@@ -450,10 +449,13 @@ export function notCoveredLine(gaps: ReadonlyArray<{ file: string; reason: strin
 export function changedLines(changed: ChangedResult): string {
   const head = "Carrick ran `carrick check --changed` for this session's change";
   const files = `${changed.files} changed ${changed.files === 1 ? "file" : "files"}`;
-  if (changed.exit === 1) {
-    const failing = changed.problems.filter((problem) => problem.fails);
+  // The problems a plain `check --changed` lists (`stated`): the rule the
+  // per-file lines follow, so the two never differ. One resting on an index
+  // another build wrote is stated though the run exits 2.
+  const failing = changed.problems.filter((problem) => problem.stated === true);
+  if (failing.length > 0) {
     const lines = [
-      `${head}: ${changed.failing} contract ${changed.failing === 1 ? "problem" : "problems"} in ${files}.`,
+      `${head}: ${failing.length} contract ${failing.length === 1 ? "problem" : "problems"} in ${files}.`,
     ];
     for (const problem of failing.slice(0, MAX_EDIT_PROBLEMS)) {
       const at = `${problem.file}${problem.line ? `:${problem.line}` : ""}`;
@@ -465,8 +467,8 @@ export function changedLines(changed: ChangedResult): string {
     }
     return lines.join("\n");
   }
-  // Exit 0 (clean), exit 2 (could not check) and a run that gave no answer say
-  // nothing: only a problem is worth the agent's attention (hook-wording audit T3).
+  // A run with no stated problem, and a run that gave no answer, say nothing:
+  // only a problem is worth the agent's attention (hook-wording audit T3).
   return "";
 }
 

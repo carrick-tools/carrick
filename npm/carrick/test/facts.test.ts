@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { drainRunner, fakeEnv, fixturePath, pluginDir, runHook, settleRunner, testDir, waitForSessionAnswers } from "./helpers.ts";
+import { answerEnv, drainRunner, fakeEnv, fixturePath, pluginDir, runHook, settleRunner, testDir, waitForSessionAnswers } from "./helpers.ts";
 import { commitAll, commitRepos } from "./facts-repos.ts";
 import { buildFacts, factsPath, loadSqlite, SCHEMA } from "../src/facts/store.ts";
 import { factLines } from "../src/facts/lines.ts";
@@ -79,7 +79,7 @@ function edit(
     env: fakeEnv({
       HOME: ws.home,
       CLAUDE_PROJECT_DIR: ws.root,
-      CARRICK_FAKE_FIXTURE: fixturePath(options.probe ?? "check-silent.json"),
+      ...answerEnv(options.probe ?? "check-silent.json"),
       ...options.env,
     }),
   });
@@ -1197,7 +1197,7 @@ test("no fact file: post-edit prints what it printed before fact files", async (
   const ws = await factsWorkspace(t, { ndjson: null });
   const argvLog = path.join(ws.home, "argv.log");
   const run = await edit(ws, ws.at("orders-api/src/routes/orders.ts"), 'const order = await db.orders.find(req.params["id"]);', {
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   const snapshot = fs
@@ -1225,7 +1225,7 @@ test("with CARRICK_FACT_LINES=0 and a fact file on disk, an Edit, a Write that c
   const env = fakeEnv({
     HOME: ws.home,
     CLAUDE_PROJECT_DIR: ws.root,
-    CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+    ...answerEnv("check-counterpart-stated.json"),
     CARRICK_FAKE_ARGV_LOG: argvLog,
     CARRICK_FACT_LINES: "0",
   });
@@ -1315,13 +1315,13 @@ test("with a fact file, the probe's problem line arrives on the next carrier", a
   const ws = await factsWorkspace(t);
   const run = await edit(ws, ws.at("orders-api/src/routes/orders.ts"), 'const order = await db.orders.find(req.params["id"]);', {
     session: "late-problem",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
   await waitForAnswer(ws, "late-problem");
   const next = await edit(ws, ws.at("web-app/src/api/orders.ts"), "text this file does not hold", {
     session: "late-problem",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
   });
   const text = context(next.stdout);
   assert.match(text, /contract problem/);
@@ -1373,22 +1373,14 @@ test("with a fact file, a file the queue refuses is probed in hand and printed a
   // A plain file where the queue folder goes.
   fs.writeFileSync(path.join(ws.root, ".carrick", "rechecks"), "");
   t.after(() => fs.rmSync(path.join(ws.root, ".carrick", "rechecks"), { force: true }));
-  const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart.json" })).stdout);
-  assert.ok(refused.startsWith(`${PROBLEM_HEAD}\n- `), refused);
-  assert.ok(refused.endsWith(`\n\n${GET_ORDER_LINE}`), refused);
-  // What this Stop said with CARRICK_FACT_LINES unset (review run, S3).
-  assert.equal(
-    await stop(ws, "refused"),
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext: "Carrick checked the 1 file this session edited (order-service): 1 contract problem.",
-      },
-    }),
-  );
+  const refused = context((await edit(ws, file, text, { session: "refused", probe: "check-counterpart-stated.json" })).stdout);
+  // The in-hand probe judges nothing, so its mismatch is not stated (A1, P5):
+  // only the fact line prints, and Stop counts no problem.
+  assert.equal(refused, GET_ORDER_LINE);
+  assert.doesNotMatch(await stop(ws, "refused"), /contract problem/);
   fs.rmSync(path.join(ws.root, ".carrick", "rechecks"));
-  const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart.json" })).stdout);
-  assert.ok(unsafe.startsWith(`${PROBLEM_HEAD}\n- `), unsafe);
+  const unsafe = context((await edit(ws, file, text, { session: "bad:id", probe: "check-counterpart-stated.json" })).stdout);
+  assert.equal(unsafe, GET_ORDER_LINE);
 });
 
 // R46.2 end to end (the review's S4): a deferred answer is named at its first
@@ -1442,7 +1434,7 @@ test("with a fact file, a sub-agent's edit probes once, prints no problem line i
   const run = await edit(ws, file, 'const order = await db.orders.find(req.params["id"]);', {
     session: "parent",
     agent: "sub1",
-    probe: "check-counterpart.json",
+    probe: "check-counterpart-stated.json",
     env: { CARRICK_FAKE_ARGV_LOG: argvLog },
   });
   assert.equal(context(run.stdout), GET_ORDER_LINE);
@@ -1485,7 +1477,7 @@ test("with a fact file, a sub-agent's shell write probes once, prints no problem
     env: fakeEnv({
       HOME: ws.home,
       CLAUDE_PROJECT_DIR: ws.root,
-      CARRICK_FAKE_FIXTURE: fixturePath("check-counterpart.json"),
+      ...answerEnv("check-counterpart-stated.json"),
       CARRICK_FAKE_ARGV_LOG: argvLog,
     }),
   });

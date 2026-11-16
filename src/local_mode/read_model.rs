@@ -142,6 +142,11 @@ pub struct IndexedItem {
     pub actual_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// The per-edit re-check's judge stated this row as the edit's problem
+    /// (`changed.rs`, `Problem::stated`). Relative to one `before`, so it is
+    /// never read from or written to `.carrick/index.json`.
+    #[serde(skip)]
+    pub stated: bool,
 }
 
 /// One service of one repo, as the index recorded it.
