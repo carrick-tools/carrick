@@ -1,0 +1,1 @@
+{ "name": "legacy", "private": true, "version": "1.0.0", "dependencies": { "@remix-run/node": "2.0.0" } }

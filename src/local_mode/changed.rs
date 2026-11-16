@@ -1238,6 +1238,8 @@ pub(super) fn judge(
                 unresolved.then_some(VerdictState::Unresolved),
                 on_main,
                 None,
+                // The stored edge source already reads `candidate` for it.
+                false,
             ) == BreakStatus::Certain
         });
         // Outside the change a sibling's mismatch at another line says

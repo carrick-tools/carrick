@@ -733,6 +733,23 @@ type ConsumerRowKey = (crate::operation::Protocol, String, String, String, u32);
 /// pairs with (carrick#1663). Two rows on one line with one key and two
 /// namespaces share a [`ConsumerRowKey`], and the verdict cannot say which
 /// it is about; the last one read wins.
+/// One producer row behind a compat verdict: the service that serves it,
+/// whether it is a real route (not a mock or test handler), and the source
+/// that stated it ([`Analyzer::producer_resolution_sources_for`]).
+struct ProducerRowSource {
+    service: Option<String>,
+    is_route: bool,
+    source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
+}
+
+/// What [`Analyzer::edge_source_of`] says about one pairing: the folded source,
+/// and whether several services serve the route the call names (carrick#4617),
+/// which forces the source to a candidate and gives the break its own reason.
+struct EdgeSourceAnswer {
+    source: Option<crate::findings::EdgeSource>,
+    several_producers: bool,
+}
+
 #[derive(Clone, Copy)]
 struct ConsumerRow<'a> {
     source: Option<crate::agents::file_analyzer_agent::ResolutionSource>,
@@ -2279,7 +2296,7 @@ impl Analyzer {
             );
             let source = *memo
                 .entry(input)
-                .or_insert_with(|| self.edge_source_of(outcome, row));
+                .or_insert_with(|| self.edge_source_of(outcome, row).source);
             directions
                 .edge_sources
                 .entry(verdict_key_of_outcome(outcome))
@@ -4129,7 +4146,10 @@ impl Analyzer {
                     &outcome.producer_service,
                     consumer,
                 );
-                let edge_source = self.edge_source_of(outcome, consumer_row);
+                let EdgeSourceAnswer {
+                    source: edge_source,
+                    several_producers,
+                } = self.edge_source_of(outcome, consumer_row);
                 let detail = outcome
                     .diagnostic
                     .clone()
@@ -4167,6 +4187,7 @@ impl Analyzer {
                 .with_consumer_reads(consumer_reads)
                 .with_producer_provenance(producer_provenance)
                 .with_edge_source(edge_source)
+                .with_several_producers(several_producers)
                 .with_verdict_state(Some(verdict_state_for(outcome)))
                 // Which half of the contract this outcome is about
                 // (carrick#1033). The pair outcome knows it outright, so the
@@ -4270,11 +4291,15 @@ impl Analyzer {
         path: &str,
         producer_service: &str,
         consumer: carrick_match::ScopedRow<'_>,
-    ) -> Vec<Option<crate::agents::file_analyzer_agent::ResolutionSource>> {
+    ) -> Vec<ProducerRowSource> {
         if exact_key_protocol(method).is_some() {
             return self
                 .exact_key_producers(method, path, producer_service, consumer)
-                .map(|endpoint| endpoint.resolution_source)
+                .map(|endpoint| ProducerRowSource {
+                    service: Some(producer_service.to_string()),
+                    is_route: endpoint.provenance == crate::operation::EndpointProvenance::Route,
+                    source: endpoint.resolution_source,
+                })
                 .collect();
         }
         let Some(mount_graph) = self.mount_graph.as_ref() else {
@@ -4293,7 +4318,14 @@ impl Analyzer {
                     && carrick_match::method_matches(&endpoint.method, method)
                     && carrick_match::route_identity(&endpoint.full_path) == want
             })
-            .map(|endpoint| endpoint.resolution_source)
+            .map(|endpoint| ProducerRowSource {
+                service: endpoint
+                    .service_name
+                    .clone()
+                    .or_else(|| endpoint.repo_name.clone()),
+                is_route: endpoint.provenance == crate::operation::EndpointProvenance::Route,
+                source: endpoint.resolution_source,
+            })
             .collect()
     }
 
@@ -4302,25 +4334,46 @@ impl Analyzer {
     /// [`crate::findings::EdgeSource::fold`]. The one fold both the
     /// `type_mismatch` finding and the stored verdict site read (plan B1,
     /// cloud#1421), so the blob never states a source the finding does not.
+    ///
+    /// A route several services serve is not a pairing the scan can state:
+    /// nothing names the service the call's base reaches (carrick#4617). It is
+    /// a candidate with its own reason. The consumer's own service and a mock
+    /// or test handler do not count as another service serving the call.
     fn edge_source_of(
         &self,
         outcome: &PairCheckOutcome,
         consumer_row: Option<ConsumerRow<'_>>,
-    ) -> Option<crate::findings::EdgeSource> {
-        match consumer_row {
+    ) -> EdgeSourceAnswer {
+        let source = match consumer_row {
             Some(row) => {
                 let consumer = carrick_match::ScopedRow {
                     service: &outcome.consumer_service,
                     name_scope: row.name_scope,
                 };
-                let mut sources = self.producer_resolution_sources_for(
+                let sources = self.producer_resolution_sources_for(
                     &outcome.pseudo_method,
                     &outcome.identity,
                     &outcome.producer_service,
                     consumer,
                 );
-                sources.push(row.source);
-                crate::findings::EdgeSource::fold(sources)
+                let several_producers = sources
+                    .iter()
+                    .filter(|row| row.is_route)
+                    .filter_map(|row| row.service.as_deref())
+                    .filter(|service| *service != outcome.consumer_service)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    >= 2;
+                let mut folded: Vec<_> = sources.into_iter().map(|row| row.source).collect();
+                folded.push(row.source);
+                return EdgeSourceAnswer {
+                    source: if several_producers {
+                        Some(crate::findings::EdgeSource::Candidate)
+                    } else {
+                        crate::findings::EdgeSource::fold(folded)
+                    },
+                    several_producers,
+                };
             }
             // The verdict was reached at a consumer call this graph holds no
             // row for (a peer whose calls did not merge). A pairing with a
@@ -4329,6 +4382,10 @@ impl Analyzer {
             // silence: that is a row the scan holds which states no source,
             // and stays unstated.
             None => Some(crate::findings::EdgeSource::Candidate),
+        };
+        EdgeSourceAnswer {
+            source,
+            several_producers: false,
         }
     }
 
@@ -8174,6 +8231,73 @@ mod tests {
             matches[3].type_verdict, None,
             "an edge no outcome reached stays verdict-absent"
         );
+    }
+
+    /// carrick#4617: the answer `edge_source_of` gives for a call whose route
+    /// is served by `serving` (service, provenance) under one key, with the
+    /// consumer in `consumer-svc`. Every row is a deterministic stated source.
+    fn edge_source_answer_for(
+        serving: &[(&str, crate::operation::EndpointProvenance)],
+    ) -> EdgeSourceAnswer {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::mount_graph::ResolvedEndpoint;
+
+        let mut analyzer = Analyzer::new(Config::default());
+        let mut mount_graph = MountGraph::new();
+        for (service, provenance) in serving {
+            mount_graph.endpoints.push(ResolvedEndpoint {
+                method: "GET".to_string(),
+                path: "/refunds/:id".to_string(),
+                full_path: "/refunds/:id".to_string(),
+                owner: "http".to_string(),
+                file_location: "routes/refunds.ts:5".to_string(),
+                service_name: Some((*service).to_string()),
+                provenance: *provenance,
+                evidence: carrick_match::MatchEvidence::RouteDefinition,
+                resolution_source: Some(ResolutionSource::FileBasedRoute),
+                ..Default::default()
+            });
+        }
+        analyzer.mount_graph = Some(mount_graph);
+        let outcome = outcome(
+            "GET",
+            "/refunds/:id",
+            PAYMENTS_CONSUMER_LOC,
+            VerdictBucket::Incompatible,
+            Some("boom"),
+        );
+        analyzer.edge_source_of(
+            &outcome,
+            Some(ConsumerRow {
+                source: Some(ResolutionSource::FileBasedRoute),
+                name_scope: None,
+            }),
+        )
+    }
+
+    /// Two services serve the route the call names, so the pairing is a
+    /// candidate and says why; one service, the consumer's own service and a
+    /// mock handler do not make it so.
+    #[test]
+    fn several_services_serving_a_route_make_its_pairing_a_candidate() {
+        use crate::findings::EdgeSource;
+        use crate::operation::EndpointProvenance::{Mock, Route};
+
+        let several = edge_source_answer_for(&[("api", Route), ("legacy", Route)]);
+        assert_eq!(several.source, Some(EdgeSource::Candidate));
+        assert!(several.several_producers);
+
+        let one = edge_source_answer_for(&[("api", Route)]);
+        assert_eq!(one.source, Some(EdgeSource::Fact));
+        assert!(!one.several_producers);
+
+        let own = edge_source_answer_for(&[("api", Route), ("consumer-svc", Route)]);
+        assert_eq!(own.source, Some(EdgeSource::Fact));
+        assert!(!own.several_producers, "the consumer's own service");
+
+        let mock = edge_source_answer_for(&[("api", Route), ("legacy", Mock)]);
+        assert_eq!(mock.source, Some(EdgeSource::Fact));
+        assert!(!mock.several_producers, "a mock handler");
     }
 
     /// The reconstruction used by the verified-endpoint verdict join must equal
