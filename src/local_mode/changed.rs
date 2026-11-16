@@ -1150,7 +1150,11 @@ pub(super) fn judge(
             .files
             .get(&operation.file)?
             .iter()
-            .find(|item| item.key == operation.key && item.line == operation.line)
+            .find(|item| {
+                item.key == operation.key
+                    && item.line == operation.line
+                    && item.dispatch == operation.dispatch
+            })
     };
 
     let strict = states_dispatch(before);
@@ -2721,6 +2725,86 @@ mod tests {
         );
         assert_eq!(judged.problems.len(), 1, "{:?}", judged.problems);
         judged.problems[0].clone()
+    }
+
+    /// Two dispatch cases of one call at one line, `client.ts:10`: the index
+    /// held both agreeing, and the rebuild reads the case at `broken` as a
+    /// type mismatch and the other as compatible. The problems `judge` gives.
+    fn judged_dispatch_pair(broken: usize) -> Vec<Problem> {
+        let cases = [dispatch_key("create"), dispatch_key("delete")];
+        let row = |dispatch: &str, result: &str| {
+            serde_json::json!({
+                "kind": "call", "service": "web", "key": "http|POST|/jobs",
+                "dispatch": dispatch, "method": "POST", "path": "/jobs", "line": 10,
+                "col": null, "source": "fact", "resolution_source": null, "evidence": null,
+                "counterparts": [{"role": "producer", "service": "api", "file": "h.ts", "line": 1}],
+                "verdict": {"state": "resolved", "result": result, "detail": "differs"}
+            })
+        };
+        let before = index_of(cases.iter().map(|c| row(c, "compatible")).collect());
+        let rebuilt = index_of(
+            cases
+                .iter()
+                .enumerate()
+                .map(|(n, c)| {
+                    row(
+                        c,
+                        if n == broken {
+                            "type_mismatch"
+                        } else {
+                            "compatible"
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let join: super::super::LocalJoin = serde_json::from_value(serde_json::json!({
+            "scanner_version": "0",
+            "operations": cases.iter().map(|c| serde_json::json!({
+                "role": "consumer", "service": "web", "key": "http|POST|/jobs",
+                "method": "POST", "path": "/jobs", "file": "client.ts", "line": 10,
+                "resolution_source": null, "handler": null, "dispatch": c
+            })).collect::<Vec<_>>(),
+            "matches": [], "unmatched": [],
+            "findings": [{
+                "kind": "type_mismatch", "service": "web", "method": "POST", "path": "/jobs",
+                "call_sites": ["client.ts:10"], "detail": "differs",
+                "verdict_state": null, "direction": null, "expected_type": null,
+                "actual_type": null, "edge_source": "fact"
+            }],
+            "type_check": {"state": "ran"}
+        }))
+        .expect("a join");
+        let edited: BTreeSet<String> = ["client.ts".to_string()].into();
+        let changed: BTreeMap<String, &BTreeSet<String>> = [("web".to_string(), &edited)].into();
+        judge(
+            Path::new("/w"),
+            &before,
+            true,
+            &rebuilt,
+            &join,
+            &changed,
+            &Touched::new(),
+        )
+        .problems
+    }
+
+    /// Each dispatch case is judged on its own rebuilt row: of two cases at
+    /// one line, only the broken one is a problem and stated, whichever of
+    /// the two it is.
+    #[test]
+    fn two_dispatch_cases_at_one_line_state_only_the_broken_one() {
+        for broken in [0, 1] {
+            let problems = judged_dispatch_pair(broken);
+            let want = [dispatch_key("create"), dispatch_key("delete")][broken].clone();
+            assert_eq!(problems.len(), 1, "case {broken}: {problems:?}");
+            assert_eq!(
+                problems[0].dispatch.as_deref(),
+                Some(want.as_str()),
+                "{problems:?}"
+            );
+            assert!(problems[0].stated && problems[0].fails, "{problems:?}");
+        }
     }
 
     /// Whether the run fails on [`judged_mismatch`]'s HTTP call, broken by
