@@ -16,7 +16,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildProbe, jsonWireDeclarations, jsonWireRule, judgeTolerances } from '../src/capture/check-probe.js';
+import {
+  buildProbe,
+  graphqlFieldResolverDeclarations,
+  graphqlFieldResolverRule,
+  jsonWireDeclarations,
+  jsonWireRule,
+  judgeTolerances,
+} from '../src/capture/check-probe.js';
 import { runCheck } from '../src/capture/index.js';
 import { heldGraphql, heldWire } from '../src/held-shadow.js';
 import type { CheckPairSpec, CheckStubInput, CheckVerdict } from '../src/capture/api.js';
@@ -43,6 +50,26 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
   it('the golden file holds exactly the fixed specs', () => {
     assert.deepEqual(Object.keys(GOLDEN).sort(), FIXED_SPECS.map((s) => s.pair_key).sort());
   });
+
+  it('the record-field rule (carrick#1875) follows the wire line in every scalar-form probe', () => {
+    const rule = [
+      ...graphqlFieldResolverDeclarations(''),
+      `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
+      'type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;',
+    ].join('\n');
+    for (const key of Object.keys(GOLDEN)) {
+      if (key.startsWith('scalar-')) assert.ok(GOLDEN[key].endsWith(`const expectedWire: GqlExpected = sentWire;\n${rule}\n`), key);
+      else assert.ok(!GOLDEN[key].includes('GqlSdlFilled'), key);
+    }
+  });
+
+  it('the record-field rule names only prefixed declarations under a prefix', () => {
+    const text = [
+      ...graphqlFieldResolverDeclarations('__carrick_'),
+      graphqlFieldResolverRule('W', 'X', 'L', '__carrick_'),
+    ].join('\n');
+    assert.deepEqual(text.match(/(?<!__carrick_)\bGql\w+/g), null);
+  });
 });
 
 interface Case {
@@ -52,6 +79,8 @@ interface Case {
   root?: string;
   /** The judge's bucket for the pair. */
   bucket: 'compatible' | 'incompatible' | 'unverifiable';
+  /** The judge's gate, for an `unverifiable` pair. */
+  gate?: string;
 }
 
 const CASES: Case[] = [
@@ -71,6 +100,14 @@ const CASES: Case[] = [
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
+  // carrick#4708: where the judge's record-field gate reads the pair unverifiable, the held form is silent.
+  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'unverifiable', gate: 'producer:field_resolver' },
+  // The same gate must not hide a real break: a leaf mismatch beside an absent field, a sub-field the schema does not declare.
+  { key: 'rf-leaf-beside-absent', root: 'order', sent: '{ id: string; total: number }', expected: '{ label: string; total: string }', bucket: 'incompatible' },
+  { key: 'rf-undeclared-sub-field', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { hint: string }[] }', bucket: 'incompatible' },
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },
 ];
@@ -152,6 +189,7 @@ describe('the held GraphQL form agrees with the judge over typed pairs (P13)', (
       const v = verdicts.get(c.key);
       assert.ok(v, `verdict for ${c.key}`);
       assert.strictEqual(v.bucket, c.bucket, JSON.stringify(v));
+      if (c.gate !== undefined) assert.strictEqual(v.gate, c.gate, JSON.stringify(v));
       const errors = tscErrors(heldSource(c));
       if (c.bucket === 'incompatible') assert.ok(errors.length > 0, 'held should speak');
       else assert.deepEqual(errors, []);

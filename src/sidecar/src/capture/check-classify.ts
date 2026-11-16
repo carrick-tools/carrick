@@ -358,6 +358,22 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
+  // 4c''. A GraphQL root record that lacks fields the served schema declares
+  //       (carrick#1875): the wire line fails, and passes once every such
+  //       field is filled, so the verdict hangs on field resolvers the check
+  //       does not read. Not a fact either way, and no side to retype: a
+  //       retype would read the same record.
+  if (firedGates.has('sent:field_resolver')) {
+    const { side } = sideForGate('sent:field_resolver', plan);
+    return {
+      ...base,
+      bucket: 'unverifiable',
+      gate: `${side}:field_resolver`,
+      diagnostic: `${graphqlFieldResolverReason()}.`,
+      ...notAFact(graphqlFieldResolverReason()),
+    };
+  }
+
   // 4d. A body read as raw text (carrick#1842): a `.text()` read, or a request
   //     library's text format, takes the body unparsed, so `string` there
   //     states no structural contract. Like bytes, the pair is not compared,
@@ -533,6 +549,15 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
  */
 export function wireFormUnknownReason(side: Side): string {
   return `the ${side} sends this payload through an RPC router whose transformer decides how a Date travels; the types match in one form and not the other, so Carrick cannot verify them without knowing the transformer`;
+}
+
+/**
+ * Why a GraphQL pair whose producer record lacks a field the served schema
+ * declares is not compared (carrick#1875). Customer-facing: it prints after
+ * "Types not verified".
+ */
+export function graphqlFieldResolverReason(): string {
+  return "the root resolver's return type lacks a schema field or holds it as a JSON value or primitive where the schema declares an object, and Carrick does not read the field resolvers that usually supply or convert it";
 }
 
 /**

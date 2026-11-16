@@ -4430,7 +4430,7 @@ fn pre_verdict_outcome(pair: &BuiltPair, pre_verdict: &PreVerdict) -> PairCheckO
 /// Every other gate comes from the two types and settles: the capture's
 /// pre-gate (`capture:<side>:<kind>`), the probe gates (`<side>:any`,
 /// `:unknown`, `:never`, `:void`, `:form`, `:bytes`, `:text`, `:envelope`,
-/// `:wire_form`, `:union`), `poison:<side>`, `foreign:<side>`, `import:<side>`, `assignment:other`, and the
+/// `:wire_form`, `:field_resolver`, `:union`), `poison:<side>`, `foreign:<side>`, `import:<side>`, `assignment:other`, and the
 /// gates this module sets (`producer:mode`, `same_service`, `retype:consumer`,
 /// `producer:` and `consumer:unwidened_out_of_budget`, whose mark is stored
 /// in the blob and so read alike by every run of it).

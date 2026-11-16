@@ -155,6 +155,7 @@ export type GateName =
   | 'sent:form'
   | 'sent:bytes'
   | 'sent:wire_form'
+  | 'sent:field_resolver'
   | 'expected:any'
   | 'expected:unknown'
   | 'expected:never'
@@ -440,6 +441,54 @@ export function graphqlScalarWireRule(
   return `[${comparand}] extends [${relaxed}] ? ${comparand} : (${p}JsonWireSame<${p}GqlLeafSent<${comparand}, ${leaf}>, ${comparand}> extends true ? ${comparand} : ${p}GqlLeafSent<${comparand}, ${leaf}>)`;
 }
 
+/**
+ * The record-field rule's helpers (carrick#1875), namespaced by `prefix`:
+ * `<p>GqlObjectLeaf`, `<p>GqlJsonValueLike`, `<p>GqlNotShape`,
+ * `<p>GqlConvertedField` and `<p>GqlSdlFilled`. They read `<p>GqlTypes`,
+ * `<p>GqlFieldOf` and `<p>GqlDepth`, so they follow the leaf walk's lines.
+ *
+ * `GqlSdlFilled<C, F>` is `C` with every field the SDL type `F` declares and
+ * the record lacks filled with `any`: a root resolver's record often lacks
+ * fields (relations, computed fields) that field resolvers the check does not
+ * read supply. A field the SDL does not declare, and a leaf that mismatches
+ * beside the absent fields, still fail with the filling, so they stay breaks.
+ *
+ * Rule G: a field the record HAS is filled too when the SDL types it as an
+ * object type (or a list of them, at any depth) and the record's own type for
+ * it is not an object shape: a primitive, or a generic JSON value. A field
+ * resolver converts it. The JSON value is read by its structure, on the whole
+ * field before any union splits: it holds every JSON primitive, and an array
+ * of itself and a string-keyed object of itself both assign to it. A field
+ * that is, or includes, an object shape is still compared field by field. The
+ * root record is never a field, so it is never filled whole.
+ */
+export function graphqlFieldResolverDeclarations(prefix: string): string[] {
+  const p = prefix;
+  return [
+    `type ${p}GqlObjectLeaf<F> = [F] extends [{ non_null: infer I }] ? ${p}GqlObjectLeaf<I> : [F] extends [{ list: infer I }] ? ${p}GqlObjectLeaf<I> : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? true : false) : false;`,
+    `type ${p}GqlJsonValueLike<X> = [string | number | boolean] extends [X] ? ([X[]] extends [X] ? ([{ [k: string]: X }] extends [X] ? true : false) : false) : false;`,
+    `type ${p}GqlNotShape<X> = [X] extends [never] ? false : [X] extends [string | number | boolean | bigint] ? true : ${p}GqlJsonValueLike<X>;`,
+    `type ${p}GqlConvertedField<C, F> = [unknown] extends [C] ? false : [${p}GqlObjectLeaf<F>] extends [true] ? ${p}GqlNotShape<Exclude<C, null | undefined>> : false;`,
+    `type ${p}GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [${p}GqlConvertedField<C[K], ${p}GqlFieldOf<T, K>>] extends [true] ? any : ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C>]: any } : C) : C) : C;`,
+  ];
+}
+
+/**
+ * The record-field gate's question (carrick#1875): true when the wire line
+ * fails and the wire type with SDL-declared fields filled
+ * (`graphqlFieldResolverDeclarations`) passes, so the verdict hangs on a
+ * field resolver nobody read. `wire` is the scalar form's wire type, `leaf`
+ * the comparand's SDL leaf.
+ */
+export function graphqlFieldResolverRule(
+  wire: string,
+  relaxed: string,
+  leaf: string,
+  prefix: string
+): string {
+  return `[${wire}] extends [${relaxed}] ? false : [${prefix}GqlSdlFilled<${wire}, ${leaf}>] extends [${relaxed}] ? true : false`;
+}
+
 export function decisiveAssignmentLine(plan: ProbePlan): number {
   return plan.wireAssignmentLine ?? plan.assignmentLine;
 }
@@ -712,6 +761,16 @@ export function buildProbe(
       );
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
+      // carrick#1875: the record-field gate (`graphqlFieldResolverRule`).
+      // Every line sits after the wire line, so no line above it moves.
+      for (const line of graphqlFieldResolverDeclarations('')) push(line);
+      push(
+        `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`
+      );
+      gateLines.set(
+        push(`type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;`),
+        'sent:field_resolver'
+      );
     }
   } else {
     assignmentLine = push(`const expected: Expected = sent;`);
