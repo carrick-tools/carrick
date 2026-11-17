@@ -88,12 +88,11 @@ pub struct GraphqlOp {
     /// `None` whenever `resolver_file` is `None`.
     pub resolver_line: Option<u32>,
     /// PRODUCER-only: where the schema-keyed field reader placed this root
-    /// field (carrick#1295). It moves where the row is served and nothing
-    /// else: the type anchor stays `resolver_file`/`resolver_line` (the
-    /// model's) or the schema line, because the code at the field's property
-    /// returns its in-process value, not the field's wire type (a `Date`
-    /// that a `DateTime` scalar sends as a string). `None` when the reader
-    /// did not claim the field.
+    /// field (carrick#1295). It is the one answer to where the resolver is:
+    /// it serves the row and, as `resolver_file`/`resolver_line`, anchors the
+    /// producer's type. The model's resolver and backing-type claims are
+    /// ignored for a field the reader placed. `None` when the reader did not
+    /// claim the field.
     pub schema_keyed_place: Option<SchemaKeyedPlace>,
     /// PRODUCER-only fallback (#248): the co-located TS type that declares this
     /// field's response shape when NO resolver function exists (e.g. an SDL
