@@ -496,10 +496,15 @@ export function graphqlScalarWireRule(
  *  - non-null strips `null`, a nullable field adds `| null`, a list maps its
  *    elements;
  *  - a built-in scalar is the type it sends (`GqlScalarSent`); a custom
- *    scalar, an enum and a type the table does not hold are `any`, since the
- *    table holds no enum values and no scalar's wire form. The leaf walk
- *    (`GqlLeafSent`) does the same for a field the record has: it keeps the
- *    record's own form and states no constraint of its own;
+ *    scalar and a type the table does not hold are `any`, since the table
+ *    holds no scalar's wire form. An enum is a string on the wire whose values
+ *    the table does not hold (carrick#4747): where the consumer's reading can
+ *    hold a string (`GqlStringy`: `string`, a literal or union with one, a
+ *    template literal, a string enum, `any`/`unknown`, null ignored) it states
+ *    no constraint (`any`);
+ *    where it can never hold one (`number`, `boolean`, an object, an array, a
+ *    numeric enum) the field is `string`, so the pair breaks. A literal union
+ *    that misses a value is not told apart until the table carries values;
  *  - an object type maps each consumer key the schema type declares to its
  *    declared type. A key it does not declare (a union member's or an
  *    interface implementation's field read through a fragment, an alias) is
@@ -530,9 +535,10 @@ export function graphqlDeclaredDeclarations(prefix: string): string[] {
     `type ${p}GqlConvertedField<C, F> = [unknown] extends [C] ? false : [${p}GqlObjectLeaf<F>] extends [true] ? ${p}GqlNotShape<Exclude<C, null | undefined>> : false;`,
     `type ${p}GqlAt<E, K> = E extends object ? (K extends keyof E ? E[K] : never) : never;`,
     `type ${p}GqlElemOf<E> = E extends readonly (infer X)[] ? X : never;`,
+    `type ${p}GqlStringy<E> = [E] extends [never] ? true : [unknown] extends [E] ? true : [Extract<NonNullable<E>, string>] extends [never] ? false : true;`,
     `type ${p}GqlUnread = { readonly __carrick_unread: never };`,
     `type ${p}GqlSdlObject<E, T extends keyof ${p}GqlTypes, D extends number, U> = [E] extends [never] ? {} : E extends readonly unknown[] ? {} : E extends (...args: any[]) => any ? {} : E extends object ? { [K in keyof E]: K extends keyof ${p}GqlTypes[T] ? ${p}GqlSdlDeclared<E[K], ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> : K extends '__typename' ? any : U } : {};`,
-    `type ${p}GqlSdlInner<E, F, U, D extends number> = [F] extends [{ list: infer I }] ? ${p}GqlSdlDeclared<${p}GqlElemOf<E>, I, U, ${p}GqlDepth[D]>[] : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : any) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? ${p}GqlSdlObject<Exclude<E, null | undefined>, T, D, U> : any) : any;`,
+    `type ${p}GqlSdlInner<E, F, U, D extends number> = [F] extends [{ list: infer I }] ? ${p}GqlSdlDeclared<${p}GqlElemOf<E>, I, U, ${p}GqlDepth[D]>[] : [F] extends [{ enum: any }] ? ([${p}GqlStringy<E>] extends [true] ? any : string) : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : any) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? ${p}GqlSdlObject<Exclude<E, null | undefined>, T, D, U> : any) : any;`,
     `type ${p}GqlSdlDeclared<E, F, U, D extends number = 15> = [D] extends [never] ? any : [E] extends [never] ? any : [unknown] extends [E] ? E : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlInner<E, I, U, D> : ${p}GqlSdlInner<E, F, U, D> | null;`,
     `type ${p}GqlSdlFilled<C, F, E, U, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, E, U, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlElemOf<E>, U, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [${p}GqlConvertedField<C[K], ${p}GqlFieldOf<T, K>>] extends [true] ? ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> : ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlAt<E, K>, U, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C> & ${p}GqlNames<E>]: ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> } : C) : C) : C;`,
   ];

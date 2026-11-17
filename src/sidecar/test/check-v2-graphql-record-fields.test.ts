@@ -505,14 +505,30 @@ const DEPOT_CONSUMERS: Record<string, string> = {
   Fi2_Exp: '{ contact: { name: number; email: string } | null }',
   // The same alias read as another type: the table cannot answer it either.
   Falias2_Exp: '{ owner: { who: number } }',
-  // An absent enum read as a number: the leaf rule's limit (enums carry no values).
+  // An enum is a string on the wire (carrick#4747): a reading that can never hold
+  // a string breaks; one that can hold a string is left alone.
   Fenum_Exp: '{ id: string; state: number }',
+  Fenumbool_Exp: '{ state: boolean }',
+  Fenumobj_Exp: '{ state: { name: string } }',
+  Fenumarr_Exp: '{ state: string[] }',
+  Fenumnum_Exp: '{ state: Num }',
+  Fenumnull_Exp: '{ state: number | null }',
+  Fenumstr_Exp: '{ state: string }',
+  Fenumcover_Exp: "{ state: 'OPEN' | 'DONE' }",
+  Fenummiss_Exp: "{ state: 'OPEN' }",
+  Fenumse_Exp: '{ state: Se }',
+  Fenumsn_Exp: '{ state: string | null }',
+  Fenumtpl_Exp: '{ state: `ST_${string}` }',
+  // The record has the field.
+  Fenumpres_Exp: '{ state: number }',
+  Fenumpresok_Exp: "{ state: 'OPEN' | 'DONE' }",
 };
 
 describe('check_v2: fields the record lacks or converts compare in the type the schema declares (carrick#4726)', () => {
   let droot: string;
   let verdicts: Map<string, CheckVerdict>;
   const key = (alias: string) => `df-${alias.replace(/_Exp$/, '').slice(1).toLowerCase()}`;
+  const presentKeys = new Set(['Fenumpres_Exp', 'Fenumpresok_Exp'].map(key));
 
   before(async () => {
     droot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-check-v2-gql-declared-'));
@@ -525,6 +541,7 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
         'export interface BlobArray extends Array<Blob> {}',
         // Two object-valued fields, so no consumer here reads the record as an envelope.
         'export type DepotOrder_Sent = { id: string; total: number; lines: { qty: number }[]; notes: Blob; audit: { by: string } };',
+        "export type DepotOrderP_Sent = { id: string; total: number; lines: { qty: number }[]; notes: Blob; audit: { by: string }; state: 'OPEN' | 'DONE' };",
       ].join('\n') + '\n'
     );
     writeStub(
@@ -532,13 +549,18 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
       'kiosk',
       Object.entries(DEPOT_CONSUMERS)
         .map(([alias, type]) => `export type ${alias} = ${type};`)
+        .concat(['enum Num { A, B }', "enum Se { A = 'OPEN', B = 'DONE' }"].map((l) => `export ${l}`))
         .join('\n') + '\n'
     );
     const stubs: CheckStubInput[] = [
       { service_name: 'depot', stub_dir: path.join(droot, 'depot'), graphql_types: DEPOT_TYPES },
       { service_name: 'kiosk', stub_dir: path.join(droot, 'kiosk') },
     ];
-    const pairs = Object.keys(DEPOT_CONSUMERS).map((alias) => depot(key(alias), alias));
+    const pairs = Object.keys(DEPOT_CONSUMERS).map((alias) => {
+      const spec = depot(key(alias), alias);
+      if (presentKeys.has(spec.pair_key)) spec.producer.alias = 'DepotOrderP_Sent';
+      return spec;
+    });
     const result = await runCheck({ stubs, pairs });
     assert.strictEqual(result.success, true, JSON.stringify(result.errors));
     assert.strictEqual(result.install_ok, true);
@@ -650,11 +672,20 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
     assertUnread('Falias2_Exp');
   });
 
-  it('the leaf rule: an absent enum compares as nothing, so a number read reads compatible (gap filed)', () => {
-    // The leaf walk keeps a present enum's own form and states nothing of its
-    // own (check-probe.ts GqlLeafSent); the fill does the same. An enum is a
-    // string on the wire, so this is a gap: carrick#4747.
-    assertCompatible('Fenum_Exp');
+  it('an enum is a string on the wire: a reading that can never hold a string breaks, naming the field', () => {
+    for (const a of ['Fenum_Exp', 'Fenumbool_Exp', 'Fenumobj_Exp', 'Fenumarr_Exp', 'Fenumnum_Exp', 'Fenumnull_Exp', 'Fenumpres_Exp']) {
+      assertBreak(a, 'state');
+    }
+  });
+
+  it('an enum read as something that can hold a string compares as before (values are unmeasured)', () => {
+    // `Fenummiss_Exp` (a union missing a value) stays compatible until the
+    // table carries enum values (carrick#4747).
+    for (const a of ['Fenumstr_Exp', 'Fenumcover_Exp', 'Fenummiss_Exp', 'Fenumse_Exp', 'Fenumsn_Exp', 'Fenumtpl_Exp']) {
+      assertCompatible(a);
+    }
+    // A present field already assigns on the wire line: no fill, no note.
+    assert.strictEqual(verdict('Fenumpresok_Exp').bucket, 'compatible');
   });
 
   it('a declared sub-field beside undeclared keys still breaks', () => {
