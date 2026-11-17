@@ -57,6 +57,9 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
       `type GqlDeclared = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
       'declare const sentDeclared: GqlDeclared;',
       'const expectedDeclared: GqlExpected = sentDeclared;',
+      `type GqlDeclaredRead = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '', 'unread')};`,
+      'declare const sentDeclaredRead: GqlDeclaredRead;',
+      'const expectedDeclaredRead: GqlExpected = sentDeclaredRead;',
     ].join('\n');
     for (const key of Object.keys(GOLDEN)) {
       if (key.startsWith('scalar-')) assert.ok(GOLDEN[key].endsWith(`const expectedWire: GqlExpected = sentWire;\n${rule}\n`), key);
@@ -68,6 +71,7 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
     const text = [
       ...graphqlDeclaredDeclarations('__carrick_'),
       graphqlDeclaredRule('W', 'X', 'L', '__carrick_'),
+      graphqlDeclaredRule('W', 'X', 'L', '__carrick_', 'unread'),
     ].join('\n');
     assert.deepEqual(text.match(/(?<!__carrick_)\bGql\w+/g), null);
   });
@@ -107,6 +111,8 @@ const CASES: Case[] = [
   { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'compatible' },
   { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'compatible' },
   { key: 'rf-absent-typename', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: "{ __typename: 'Order'; id: string; lines: { __typename: 'Line'; sku: string }[] }", bucket: 'compatible' },
+  // A key the table cannot answer (an alias) inside an absent object: the judge abstains, the held form is silent.
+  { key: 'rf-absent-alias', root: 'order', sent: '{ id: string }', expected: '{ id: string; lines: { code: string }[] }', bucket: 'unverifiable', gate: 'producer:undeclared_selection' },
   // The declared type decides, so it breaks too: a nullable field read as non-null, a scalar read as another, a list read as a string.
   { key: 'rf-absent-nullable-read-non-null', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'incompatible' },
   { key: 'rf-absent-wrong-scalar', root: 'order', sent: '{ id: string }', expected: '{ id: string; total: string }', bucket: 'incompatible' },

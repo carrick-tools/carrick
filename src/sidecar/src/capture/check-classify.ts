@@ -423,8 +423,9 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   if (assignDiag && plan.declaredAssignmentLine !== undefined) {
     const from = plan.assignmentLine + 1;
     const to = plan.declaredAssignmentLine;
+    const last = plan.declaredReadLine ?? to;
     const unjudged = probeDiags.find(
-      (d) => d.line >= from && d.line <= to && !ASSIGNMENT_CODES.has(d.code)
+      (d) => d.line >= from && d.line <= last && !ASSIGNMENT_CODES.has(d.code)
     );
     if (unjudged) {
       return {
@@ -441,6 +442,22 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
       };
     }
     assignDiag = probeDiags.find((d) => d.line === to && ASSIGNMENT_CODES.has(d.code));
+    // It passed, but only through a key the table could not answer (a
+    // fragment on a union or interface member, an alias): the read line,
+    // where such a key assigns to nothing, fails. Not a fact either way.
+    const unread =
+      assignDiag === undefined &&
+      plan.declaredReadLine !== undefined &&
+      probeDiags.some((d) => d.line === plan.declaredReadLine && ASSIGNMENT_CODES.has(d.code));
+    if (unread) {
+      return {
+        ...base,
+        bucket: 'unverifiable',
+        gate: 'producer:undeclared_selection',
+        diagnostic: `${GRAPHQL_UNDECLARED_SELECTION_REASON}.`,
+        ...notAFact(GRAPHQL_UNDECLARED_SELECTION_REASON),
+      };
+    }
     declaredCleared = assignDiag === undefined;
   }
   // 5a. Unless the mismatch is a sent union the expected type takes in part,
@@ -577,8 +594,18 @@ export function wireFormUnknownReason(side: Side): string {
 /**
  * The note on a GraphQL pair the declared line cleared (carrick#4726): the
  * wire line failed on fields the root record lacks or converts, and the pair
- * agrees once they take the type the served schema declares.
+ * agrees once they take the type the served schema declares, every key the
+ * consumer reads answered by the schema table (the read line passed too).
  */
+/**
+ * Why a GraphQL pair the declared line passed only through a consumer key the
+ * schema table could not answer is not compared (carrick#4726).
+ * Customer-facing: it prints after "Types not verified".
+ */
+export const GRAPHQL_UNDECLARED_SELECTION_REASON =
+  "the consumer reads a field that the schema type does not declare and the root resolver's record lacks, " +
+  'such as an alias or a fragment on a union or interface member; Carrick does not read field resolvers';
+
 export const GRAPHQL_DECLARED_FIELDS_NOTE =
   "fields the root resolver's record lacks or converts were compared in the type the served schema declares; " +
   'Carrick did not read their field resolvers';

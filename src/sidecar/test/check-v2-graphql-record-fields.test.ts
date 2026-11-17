@@ -503,6 +503,10 @@ const DEPOT_CONSUMERS: Record<string, string> = {
   Falias_Exp: '{ owner: { who: string } }',
   // A declared sub-field beside the undeclared keys still decides.
   Fi2_Exp: '{ contact: { name: number; email: string } | null }',
+  // The same alias read as another type: the table cannot answer it either.
+  Falias2_Exp: '{ owner: { who: number } }',
+  // An absent enum read as a number: the leaf rule's limit (enums carry no values).
+  Fenum_Exp: '{ id: string; state: number }',
 };
 
 describe('check_v2: fields the record lacks or converts compare in the type the schema declares (carrick#4726)', () => {
@@ -621,20 +625,36 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
   });
 
   // carrick#4726 ruling: inside a filled object, a consumer key the schema
-  // type does not declare is `any`; whether a selection is declared is the
-  // selection reader's question (carrick#3201). Main read these three
-  // unverifiable (the record-field gate); they now read compatible, never
-  // incompatible.
-  it('a union-typed field read through fragments: compatible', () => {
-    assertCompatible('Fs1_Exp');
+  // type does not declare is a key the table cannot answer. A pair whose
+  // declared line passes only through such a key reads unverifiable, as main
+  // read these (the record-field gate), never compatible or incompatible.
+  const assertUnread = (alias: string): void => {
+    const v = verdict(alias);
+    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+    assert.strictEqual(v.gate, 'producer:undeclared_selection', JSON.stringify(v));
+    assert.strictEqual(v.resolved, false);
+    assert.strictEqual(v.unresolved_side, undefined, JSON.stringify(v));
+    assert.ok(!v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
+  };
+
+  it('a union-typed field read through fragments: unverifiable', () => {
+    assertUnread('Fs1_Exp');
   });
 
-  it('an interface-typed field read through a fragment: compatible', () => {
-    assertCompatible('Fi1_Exp');
+  it('an interface-typed field read through a fragment: unverifiable', () => {
+    assertUnread('Fi1_Exp');
   });
 
-  it('an aliased selection inside an absent object field: compatible', () => {
-    assertCompatible('Falias_Exp');
+  it('an aliased selection inside an absent object field: unverifiable, whatever its type', () => {
+    assertUnread('Falias_Exp');
+    assertUnread('Falias2_Exp');
+  });
+
+  it('the leaf rule: an absent enum compares as nothing, so a number read reads compatible (gap filed)', () => {
+    // The leaf walk keeps a present enum's own form and states nothing of its
+    // own (check-probe.ts GqlLeafSent); the fill does the same. An enum is a
+    // string on the wire, so this is a gap: carrick#4747.
+    assertCompatible('Fenum_Exp');
   });
 
   it('a declared sub-field beside undeclared keys still breaks', () => {
@@ -662,7 +682,8 @@ describe('a too-deep declared line never reads compatible (carrick#4726, carrick
   it('a TS2589 on any line of the declared block, with the wire line failing: unverifiable', () => {
     const { from, line } = declaredLines(plan);
     assert.ok(from !== undefined && line !== undefined, 'the probe carries the declared block');
-    for (let at = from!; at <= line!; at++) {
+    const read = (plan as unknown as { declaredReadLine?: number }).declaredReadLine ?? line!;
+    for (let at = from!; at <= read; at++) {
       const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(at, 2589)]);
       assert.strictEqual(v.bucket, 'unverifiable', `line ${at}: ${JSON.stringify(v)}`);
       assert.strictEqual(v.gate, 'assignment:other', `line ${at}`);
@@ -674,6 +695,23 @@ describe('a too-deep declared line never reads compatible (carrick#4726, carrick
     const v = classify([diag(plan.wireAssignmentLine!, 2322)]);
     assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
     assert.ok(v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
+  });
+
+  it('a non-assignment diagnostic on the wire alias lines, the wire line failing: unverifiable', () => {
+    const at = plan.assignmentLine + 1;
+    const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(at, 2589)]);
+    assert.strictEqual(v.bucket, 'unverifiable', `line ${at}: ${JSON.stringify(v)}`);
+    assert.strictEqual(v.gate, 'assignment:other');
+  });
+
+  it('the declared line passing and the read line failing: unverifiable, no note', () => {
+    const { line } = declaredLines(plan);
+    const read = (plan as unknown as { declaredReadLine?: number }).declaredReadLine;
+    assert.ok(read !== undefined && read > line!, `read line ${read}`);
+    const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(read!, 2322)]);
+    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+    assert.strictEqual(v.gate, 'producer:undeclared_selection');
+    assert.ok(!v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
   });
 
   it('the declared line failing: incompatible', () => {
