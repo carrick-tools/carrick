@@ -301,6 +301,11 @@ pub fn read_document_sites(
         .collect();
     let mut sites = DocumentSites::default();
     let mut consumers = Vec::new();
+    // The document files the not-on-disk arm read a call's import as an
+    // operation of, and whether any call passes an unresolved import that
+    // arm could not read as exactly one operation.
+    let mut matched_files: HashSet<PathBuf> = HashSet::new();
+    let mut unmatched_import = false;
     // The service's own document files, read only when a call passes an
     // import nothing resolves.
     let named_operations = calls
@@ -309,6 +314,16 @@ pub fn read_document_sites(
         .then(|| named_document_operations(&crate::graphql::service_document_files(walk_roots)));
     for call in &calls {
         let file = call.file.to_string_lossy().into_owned();
+        if let Some(named) = &named_operations {
+            unmatched_import |= call.unresolved_imports.iter().any(|name| {
+                !name
+                    .strip_suffix("Document")
+                    .and_then(|operation| named.get(operation))
+                    .is_some_and(|found| found.len() == 1)
+            });
+        } else {
+            unmatched_import |= !call.unresolved_imports.is_empty();
+        }
         // A generated document module absent from the tree: `<Op>Document`
         // is the document of the one operation `<Op>` the service's own
         // document files hold (carrick#4642). The call is a document site
@@ -336,6 +351,7 @@ pub fn read_document_sites(
                 .entry(file)
                 .or_default()
                 .insert(call.span_start);
+            matched_files.insert(path.clone());
             consumers.push((
                 call.file.clone(),
                 ExecutedDocument {
@@ -395,6 +411,21 @@ pub fn read_document_sites(
                 if let Some(name) = &operation.name {
                     compiled.insert((operation.kind, name.clone(), operation.fields.clone()));
                 }
+            }
+        }
+    }
+    // A document file a call's absent import was read from is that module's
+    // source: the service holds its operations as compiled declarations, so
+    // one no call executes has no consumer, as it has where the generated
+    // module is on disk. Only when every unresolved import a call passes was
+    // read: "no call executes it" cannot be told from "a call executes it
+    // under a name the arm could not read" otherwise.
+    if !unmatched_import && let Some(named) = &named_operations {
+        for (path, operation) in named.values().flatten() {
+            if matched_files.contains(path)
+                && let Some(name) = &operation.name
+            {
+                compiled.insert((operation.kind, name.clone(), operation.fields.clone()));
             }
         }
     }
@@ -2045,6 +2076,88 @@ export function MissingPage() {
                 .iter()
                 .all(|op| op.document_module_absent),
             "each row placed by the not-on-disk arm says its module is absent"
+        );
+    }
+
+    /// A document file with a third operation no page imports.
+    const SHOP_DOCUMENTS_WITH_UNUSED: &str = "query Orders {\n  orders { id }\n}\n\nmutation Pay($id: ID!) {\n  pay(id: $id) { ok }\n}\n\nquery Unused {\n  unusedField { id }\n}\n";
+    const ELSEWHERE_DOCUMENTS: &str = "query Elsewhere {\n  elsewhere { id }\n}\n";
+
+    /// The consumer rows the `src/graphql` document files and the pages leave
+    /// on a tree whose generated module is absent, with each page given.
+    fn clean_tree_rows(pages: &[(&str, &str)]) -> Option<Vec<(String, String, u32)>> {
+        let mut layout = vec![
+            ("src/graphql/shop.gql", SHOP_DOCUMENTS_WITH_UNUSED),
+            ("src/graphql/elsewhere.gql", ELSEWHERE_DOCUMENTS),
+        ];
+        layout.extend_from_slice(pages);
+        let walked = walk(&layout)?;
+        let root = walked.repo.clone();
+        let walk_roots = vec![crate::graphql::WalkRoot::from(root.clone())];
+        let mut files = vec![
+            root.join("src/graphql/shop.gql"),
+            root.join("src/graphql/elsewhere.gql"),
+        ];
+        files.extend(
+            pages
+                .iter()
+                .map(|(path, _)| PathBuf::from(key(&walked, path))),
+        );
+        let (_, consumers) = read_document_sites(&walked.inputs, &[], None, &walk_roots);
+        let mut extraction = crate::graphql::scan_repo(&[root.join("src")], &[], &files);
+        consumers.apply(&mut extraction);
+        assert!(
+            extraction
+                .consumers
+                .iter()
+                .filter(|op| !is_graphql_document_path(&op.file_path))
+                .all(|op| op.document_module_absent),
+            "every row placed at a call whose module is absent says so"
+        );
+        Some(rows(&extraction, &root))
+    }
+
+    #[test]
+    fn an_operation_no_call_runs_has_no_row_on_a_tree_without_the_generated_module() {
+        // The pages import the module's `Orders` and `Pay`; nothing runs
+        // `Unused`. Where the module is on disk the service holds `Unused` as
+        // a compiled declaration and its row is dropped; on this tree the
+        // document file that named the calls is read as that module's source.
+        let Some(rows) = clean_tree_rows(&[
+            ("src/pages/OrdersPage.tsx", SHOP_ORDERS_PAGE),
+            ("src/pages/PayButton.tsx", SHOP_PAY_BUTTON),
+        ]) else {
+            return;
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row("graphql|mutation|pay", "src/pages/PayButton.tsx", 4),
+                row("graphql|query|elsewhere", "src/graphql/elsewhere.gql", 2),
+                row("graphql|query|orders", "src/pages/OrdersPage.tsx", 5),
+            ],
+            "`unusedField` has no consumer; a document file no call read keeps its rows"
+        );
+    }
+
+    #[test]
+    fn an_import_no_operation_answers_keeps_every_row_of_the_document_files() {
+        // `MissingDocument` names no operation: a call may run `Unused` under
+        // a name the arm cannot read, so no row is dropped.
+        let Some(rows) = clean_tree_rows(&[
+            ("src/pages/OrdersPage.tsx", SHOP_ORDERS_PAGE),
+            ("src/pages/PayButton.tsx", SHOP_PAY_BUTTON),
+            ("src/pages/MissingPage.tsx", SHOP_MISSING_PAGE),
+        ]) else {
+            return;
+        };
+        assert!(
+            rows.contains(&row(
+                "graphql|query|unusedField",
+                "src/graphql/shop.gql",
+                10
+            )),
+            "{rows:?}"
         );
     }
 
