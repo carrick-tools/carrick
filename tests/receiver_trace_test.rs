@@ -2837,6 +2837,146 @@ fn matched_producers(name: &str) -> Vec<String> {
     out
 }
 
+/// One offline scan of a committed copy of the Deno workspace fixture
+/// `name`, twice over one `DENO_DIR`: the blobs of the first, and the
+/// projection (`cross_repo_matches`) of the second. The packages are the
+/// real ones the fixture's `deno.lock` pins, fetched by a real
+/// `deno install --frozen` (network, as `deno_npm_specifier_test.rs` does;
+/// CI installs the pinned Deno): Deno owns module resolution in the
+/// sidecar, so a stand-in package cannot stand for them. The library
+/// store's answer is the fixture's `library-claims.json`.
+fn deno_workspace_scan(name: &str, entrypoints: &[&str]) -> (Blobs, serde_json::Value) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let repo = tmp.path().join("workspace");
+    copy_dir(&fixture_dir(name).join("repo"), &repo);
+    let deno_dir = tmp.path().join("deno");
+    let install = Command::new("deno")
+        .args([
+            "install",
+            "--frozen",
+            "--node-modules-dir=none",
+            "--entrypoint",
+        ])
+        .args(entrypoints)
+        .current_dir(&repo)
+        .env("DENO_DIR", &deno_dir)
+        .env("DENO_NO_UPDATE_CHECK", "1")
+        .output()
+        .expect("a real `deno` must be on PATH for this test");
+    assert!(
+        install.status.success(),
+        "deno install failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    run_git(&repo, &["init", "-q"]);
+    run_git(&repo, &["add", "-A"]);
+    run_git(&repo, &["commit", "-q", "-m", "init"]);
+    let scan = |storage: &Path, projection: bool| {
+        std::fs::create_dir_all(storage).unwrap();
+        let mut cmd = scan_cmd(name, tmp.path(), &repo, storage, &tmp.path().join("home"));
+        cmd.env("CARRICK_LOCAL_STORAGE_ISOLATE", "1")
+            .env("DENO_DIR", &deno_dir)
+            .env_remove("CARRICK_PROGRESS");
+        if projection {
+            cmd.env("CARRICK_OUTPUT_JSON", "1");
+        }
+        cmd
+    };
+    let storage = tmp.path().join("storage");
+    let (blobs, _) = run_scan(&mut scan(&storage, false), &storage);
+    let output = scan(&tmp.path().join("projection-storage"), true)
+        .output()
+        .expect("spawn carrick");
+    assert!(
+        output.status.success(),
+        "scan exited non-zero:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let projection =
+        serde_json::from_slice(&output.stdout).expect("the scan prints its projection");
+    (blobs, projection)
+}
+
+/// carrick#4070 shape on a tRPC router, as one Deno workspace reads it: the
+/// packages are declared only in `deno.jsonc` (`npm:` specifiers, an `@/`
+/// alias) and `deno.lock`; the router builder is an alias (`proc =
+/// t.procedure`); the adapter is mounted by a web app's `use` inside a
+/// function; the client service imports the router's type by a relative
+/// path across services. The store's labels are the three kinds that read
+/// it (the router's `collects` and procedure ops, the web app's `use` mount
+/// that takes a handler, the client proxy's ops); each is load-bearing, and
+/// dropping any one leaves the row or the call unread. This passes on main
+/// (carrick N1, 0.3.160): a guard, not a fix.
+#[test]
+fn a_deno_workspace_router_alias_pairs_its_cross_service_client() {
+    let (blobs, projection) = deno_workspace_scan(
+        "deno-workspace-procs",
+        &["svc-api/src/index.ts", "svc-web/src/hooks.ts"],
+    );
+    let mut rows = Vec::new();
+    let mut calls = Vec::new();
+    for text in blobs.values() {
+        let blob: serde_json::Value = serde_json::from_str(text).unwrap();
+        for row in blob["endpoints"].as_array().cloned().unwrap_or_default() {
+            if row["procedure"].is_null() {
+                continue;
+            }
+            rows.push(format!(
+                "{} {} {} {}",
+                row["key"]["method"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                procedure_of(&row),
+                row["resolution_source"].as_str().unwrap_or_default(),
+            ));
+        }
+        for row in blob["calls"].as_array().cloned().unwrap_or_default() {
+            if row["procedure"].is_null() {
+                continue;
+            }
+            calls.push(format!(
+                "{} {} {:?} {} {}",
+                row["file_path"].as_str().unwrap_or_default(),
+                row["key"]["method"].as_str().unwrap_or_default(),
+                row["key"]["path"].as_str().unwrap_or_default(),
+                procedure_of(&row),
+                row["resolution_source"].as_str().unwrap_or_default(),
+            ));
+        }
+    }
+    rows.sort();
+    let router = "workspace:svc-api/src/rpc.ts#shopRouter";
+    assert_eq!(
+        rows,
+        vec![
+            format!("GET /rpc/ping {router} ping library_claim"),
+            format!("POST /rpc/place {router} place library_claim"),
+        ]
+    );
+    assert_eq!(
+        calls,
+        vec![format!(
+            "svc-web/src/hooks.ts:7 POST \"\" {router} place request_summary"
+        )]
+    );
+    let edges: Vec<String> = projection["cross_repo_matches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|edge| {
+            format!(
+                "{} <- {}",
+                edge["producer_key"].as_str().unwrap_or_default(),
+                edge["consumer_key"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    assert_eq!(
+        edges,
+        vec!["http|POST|/rpc/place <- http|POST|".to_string()]
+    );
+}
+
 /// The rows `procedure-client` states at its client calls (carrick#3186).
 /// Each client form is a proxy whose members are the router's keys: a
 /// vanilla client (`query`/`mutate`), hooks (`useQuery`/`useMutation`), and

@@ -1,0 +1,10 @@
+{
+  "name": "@fixture/svc-api",
+  "exports": "./src/index.ts",
+  "imports": {
+    "hono": "npm:hono@4.12.12",
+    "@hono/trpc-server": "npm:@hono/trpc-server@0.4.2",
+    "@trpc/server": "npm:@trpc/server@11.16.0",
+    "@/": "./src/"
+  }
+}
