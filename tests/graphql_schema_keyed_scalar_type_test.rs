@@ -1,5 +1,5 @@
-//! Placing a root field from the service's schema moves where the field is
-//! served, never what type it serves (carrick#1295).
+//! A root field the service's schema places is typed from the code at its
+//! property, and a custom scalar keeps its wire form (carrick#1295).
 //!
 //! Drives the real scanner binary offline over
 //! `tests/fixtures/graphql-schema-keyed-scalar-type/` with the type sidecar
@@ -15,18 +15,10 @@
 //!
 //! | row | served at | producer type anchor | verdict |
 //! |---|---|---|---|
-//! | `mutation scheduleShipment` | `shipments.ts:13` (the schema-keyed reader) | the schema line, as with no reader | unverifiable, as with no reader |
+//! | `mutation scheduleShipment` | `shipments.ts:13` (the schema-keyed reader) | the same place, read from the code (`deterministic-infer`) | compatible: the scalar's wire form is a string |
 //!
-//! The resolver's in-process return type is not the field's wire type: read
-//! as the producer type, its `Date` can judge the client's `string`
-//! incompatible, a break the wire does not have. Whether a GraphQL producer
-//! type may ever come from the resolver, through the scalar's wire mapping,
-//! is carrick#1875, not this placement. The schema alone gives this field no
-//! type the capture can read, so the verdict stays unverifiable, as it is
-//! with no reader. Read from the code at the field's property (the stub's
-//! `deterministic-infer` anchor), the capture's JSON wire transform turns the
-//! `Date` into a string and the verdict moves to compatible here; on a
-//! resolver whose `Date` it does not transform it moves to incompatible.
+//! The in-process `Date` is not what the wire carries; the capture keeps the
+//! JSON wire form of a custom scalar, so the client's `string` agrees.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -174,14 +166,14 @@ fn verdict(blobs: &[serde_json::Value]) -> serde_json::Value {
 }
 
 #[test]
-fn a_schema_keyed_field_keeps_its_schema_type_anchor() {
+fn a_schema_keyed_field_is_typed_from_its_place() {
     let blobs = scan();
 
     // Where: the schema-keyed reader serves the field at its property.
     assert_eq!(served_at(&blobs), "apps/api/src/graphql/shipments.ts:13");
 
-    // What: the producer type is anchored where it was before the reader
-    // placed the field, not at the resolver's in-process return type.
+    // What: the producer type is anchored at the same place, read from the
+    // code at the field's property.
     let files = producer_type_files(&blobs);
     assert!(
         !files.is_empty(),
@@ -190,13 +182,13 @@ fn a_schema_keyed_field_keeps_its_schema_type_anchor() {
     assert!(
         files
             .iter()
-            .all(|file| file == "apps/api/dist/schema.graphql"),
-        "the producer type stays at the schema: {files:?}"
+            .all(|file| file == "apps/api/src/graphql/shipments.ts"),
+        "the producer type is anchored at the field's place: {files:?}"
     );
-    assert_ne!(
+    assert_eq!(
         producer_anchor_origin(&blobs).as_deref(),
         Some("deterministic-infer"),
-        "the producer type is not inferred from the code at the field's property"
+        "the producer type is inferred from the code at the field's property"
     );
     let response = verdict(&blobs);
     assert_ne!(
@@ -204,7 +196,7 @@ fn a_schema_keyed_field_keeps_its_schema_type_anchor() {
         "a DateTime the server sends as a string is not a break: {response}"
     );
     assert_eq!(
-        response["verdict"], "unverifiable",
-        "the verdict is the one the schema alone gives: {response}"
+        response["verdict"], "compatible",
+        "the scalar's wire form is a string, as the client reads it: {response}"
     );
 }
