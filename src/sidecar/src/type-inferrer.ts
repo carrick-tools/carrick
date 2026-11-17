@@ -3625,7 +3625,9 @@ export class TypeInferrer {
     const anchor = this.unwrapArrayLevels(held);
     return this.createInferredType(
       request,
-      text,
+      // A type the service declares but does not export (`interface Note`)
+      // has no name the capture's declarations can follow: print its members.
+      this.expandResolvedTypeStructural(held, text),
       false,
       this.getNodeLocation(deciding),
       undefined,
