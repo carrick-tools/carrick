@@ -10580,6 +10580,7 @@ fn protocol_relative(root: &Path, file: &Path) -> PathBuf {
 /// candidate everywhere a source is read (carrick#1626). An op the scanner's
 /// pass backfilled into the same list (`PubsubOperation::backfilled`) states
 /// no source.
+#[allow(clippy::too_many_arguments)]
 fn append_pubsub_operations(
     cloud_data: &mut CloudRepoData,
     file_results: &HashMap<String, crate::agents::file_analyzer_agent::FileAnalysisResult>,
