@@ -41,7 +41,7 @@ export function getTask(req, res) {
 const IN_LIST = "res.json({ id: req.id });";
 const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
 const EARLY_HEAD = "Carrick's compiler engine checked api/src/tasks.ts";
-const DETAIL = "Type '{ name: string; }' is not assignable to type the type it expects.";
+const DETAIL = "This code sends '{ name: string; }'; the caller expects '{ id: string }'.";
 
 const group = (label: string, file: string, line: number) => ({
   type: A,
@@ -762,7 +762,7 @@ test("GraphQL through the hook: the early QUERY break prints once through the on
   const ws = await workspace(t);
   await liveDaemon(t, ws, () => [query(ws)]);
   const first = context((await edit(ws, "eg1", part2(ws, [item({ state: "resolved", result: "compatible" })]))).stdout);
-  assert.ok(first.includes("route QUERY task type_mismatch: Type 'string' is not assignable to type the type it expects."), first);
+  assert.ok(first.includes("route QUERY task type_mismatch: This code sends 'string'; the caller expects '{ id: string }'."), first);
   assert.ok(!/__C|\bsend\d|\bO\d/.test(first), first);
   await settled(ws, "eg1");
   const next = await carrier(ws, "eg1");

@@ -173,7 +173,7 @@ test("row 1 (K-c): a break prints the early answer IN ADDITION to part 1's contr
   t.after(() => daemon.close());
   const out = await edit(ws, "h1");
   const said = context(out.stdout);
-  assert.ok(said.includes(`${EARLY}\n- api/src/tasks.ts:2:1 route GET /tasks type_mismatch: Type '{ name: string; }' is not assignable to type the type it expects. Consumers: ext src/view4.ts:4`), said);
+  assert.ok(said.includes(`${EARLY}\n- api/src/tasks.ts:2:1 route GET /tasks type_mismatch: This code sends '{ name: string; }'; the caller expects '{ id: string }'. Consumers: ext src/view4.ts:4`), said);
   assert.ok(said.includes("is called from"), "part 1's line stays: " + said);
   assert.ok(!FORBIDDEN.test(said), said);
   assert.equal(daemon.requests.length, 1);
@@ -329,16 +329,10 @@ test("the Read hook with the switch off asks nothing", async (t) => {
 
 // The detail (D13): the compiler's message in words an agent may read.
 
-test("the alias becomes the group's symbol, or the type it expects when there is none", () => {
+test("the alias becomes the group's symbol, or the expected type when there is none", () => {
   const message = "Type 'string' is not assignable to type 'O12_3'.";
-  assert.equal(heldDetail(broken({ message, symbol: "TaskView" })), "Type 'string' is not assignable to type 'TaskView'.");
-  assert.equal(heldDetail(broken({ message })), "Type 'string' is not assignable to type the type it expects.");
-});
-
-test("a quoted inline object type over 80 characters becomes the reply; a short one stays", () => {
-  const long = `'{ ${"alpha: string; ".repeat(6)}}'`;
-  assert.ok(heldDetail(broken({ message: `Type ${long} is not assignable to type 'O1_0'.` }))!.includes("Type the reply is not assignable"));
-  assert.ok(heldDetail(broken({ message: "Type '{ id: number; }' is not assignable to type 'O1_0'." }))!.includes("'{ id: number; }'"));
+  assert.equal(heldDetail(broken({ message, symbol: "TaskView" })), "This code sends 'string'; the caller expects 'TaskView'.");
+  assert.equal(heldDetail(broken({ message })), "This code sends 'string'; the caller expects '{ id: string }'.");
 });
 
 test("a detail is one line, cut to its cap", () => {
