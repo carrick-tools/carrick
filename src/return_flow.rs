@@ -969,6 +969,10 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
     let mut expr = expr;
     let mut part = false;
     let mut key = None;
+    // The key names the call's member only when one part hop leads to the
+    // call: `const { data } = await call(); const { items } = data` holds
+    // `data.items`, which no one key names (carrick#4513).
+    let mut part_hops = 0;
     for _ in 0..MAX_NAME_HOPS {
         expr = match expr {
             Expr::Await(awaited) => &awaited.arg,
@@ -984,7 +988,11 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
                     Some([only]) => {
                         if scope.parts.contains_key(name) {
                             part = true;
-                            key = scope.part_keys.get(name).cloned();
+                            part_hops += 1;
+                            key = match part_hops {
+                                1 => scope.part_keys.get(name).cloned(),
+                                _ => None,
+                            };
                         }
                         only
                     }
@@ -998,6 +1006,17 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
 }
 
 fn classify(returned: &Expr, scope: &Scope) -> Option<Returned> {
+    // `return body || null`, `return body ?? undefined`: the value or no
+    // body, as a second `return null` would hand back (carrick#4513).
+    if let Expr::Bin(bin) = returned
+        && matches!(
+            bin.op,
+            swc_ecma_ast::BinaryOp::LogicalOr | swc_ecma_ast::BinaryOp::NullishCoalescing
+        )
+        && matches!(classify(&bin.right, scope), Some(Returned::NoBody))
+    {
+        return classify(&bin.left, scope);
+    }
     let value = resolve(returned, scope);
     let base_of = |obj: &Expr| -> Option<Span> {
         let obj = resolve(obj, scope);
@@ -1313,6 +1332,31 @@ mod tests {
         );
         let whole = whole_shape("function f(o) { return call(o); }");
         assert_eq!(whole.and_then(|shape| shape.step()), None);
+    }
+
+    /// carrick#4513: a name destructured twice holds a member of a member,
+    /// which no one key names; a value or no body reads as the value.
+    #[test]
+    fn a_chained_destructure_names_no_key_and_a_fallback_to_null_is_the_value() {
+        let chained = whole_shape(
+            "async function f(o) { const { data } = await call(o); const { items } = data; return items; }",
+        );
+        assert_eq!(
+            chained.and_then(|shape| shape.step()),
+            Some(Step::Member(String::new()))
+        );
+        for source in [
+            "async function f(o) { const r = await call(o); return r.data || null; }",
+            "async function f(o) { const r = await call(o); return r.data ?? undefined; }",
+        ] {
+            let step = whole_shape(source).and_then(|shape| shape.step());
+            assert_eq!(step, Some(Step::Member("data".to_string())), "{source}");
+        }
+        // A fallback to a value of the function's own is not the value.
+        let own = whole_shape(
+            "async function f(o) { const r = await call(o); return r.data || 'none'; }",
+        );
+        assert_eq!(own, None);
     }
 
     /// carrick#4371 R2: the one accept test, row by row.

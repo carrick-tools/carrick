@@ -3509,6 +3509,18 @@ export class TypeInferrer {
   }
 
   /**
+   * The type of `call` as the call `through_call` names instantiates the
+   * wrapper it is made in (carrick#4375): `typeAtThroughCall`, with no
+   * answer recorded. A request that names no call, or a call that binds
+   * nothing the type holds, reads the call's own type.
+   */
+  private callTypeAsCallerBinds(call: CallExpression, request: InferRequestItem): Type {
+    if (!request.through_call) return call.getType();
+    const atCaller = this.typeAtThroughCall(call, request);
+    return atCaller.kind === 'instantiated' ? atCaller.type : call.getType();
+  }
+
+  /**
    * A call's result as the caller reads it. A request made below a wrapper
    * (`through_call` names the call that reaches the wrapper) is read at the
    * call it names, where the caller states what it reads, in two cases:
@@ -3986,7 +3998,12 @@ export class TypeInferrer {
     // type. Where no rule matched that type as the names peel it, the same
     // protocol reading the text takes is read here, so a subclass of
     // `Promise` anchors the row on what it resolves to and never on itself.
-    let callPayloadType = this.unwrapPromiseType(callExpr.getType());
+    //
+    // carrick#4513: a call read below a wrapper is anchored on its payload as
+    // the call `through_call` names instantiates it, as its text is
+    // (`callResultAtThroughCall`): read inside a generic wrapper, the call's
+    // own type holds the wrapper's type parameter, which is never an anchor.
+    let callPayloadType = this.unwrapPromiseType(this.callTypeAsCallerBinds(callExpr, request));
     let callUnwrap = this.unwrapTypeWithConfig(callPayloadType, callExpr, extractionConfig);
     let readByProtocol = false;
     if (!callUnwrap.wasUnwrapped) {
