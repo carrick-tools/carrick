@@ -123,7 +123,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           base === 'default-library.ts' ||
           base === 'held-shadow.ts' ||
           base === 'site-find.ts' ||
-          base === 'type-structural-expander.ts'
+          base === 'type-structural-expander.ts' ||
+          base === 'stated-params.ts'
         ) {
           // Shared Deno resolution, the options every program carries
           // (`sidecarCompilerOptions`, carrick#2019), and the response-table
@@ -138,7 +139,8 @@ describe('capture bundle seam (pinned decision 11a)', () => {
           // the guard and finds the native compiler the judge runs and the site finder reuses the capture's
           // exact-text finder. The structural print reads a GraphQL
           // response's SDL leaves through the probe's one lookup
-          // (carrick#4403).
+          // (carrick#4403). The stated-params labels read a send's status
+          // through the one reply-status reader.
           assert.strictEqual(
             spec,
             './capture/index.js',
