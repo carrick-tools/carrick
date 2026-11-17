@@ -49,15 +49,35 @@ const PROP_MISSING = new RegExp(`Property '([^']+)' is missing in type ${TYPE} b
 const NOT_ASSIGNABLE = new RegExp(`^Type ${TYPE} is not assignable to type ${TYPE}\\.?$`);
 const PROP_PATH = /^Types of property '([^']+)' are incompatible\.?$/;
 
+/**
+ * The voice table (HM4 D4): who sends and who reads, by which end of the check
+ * this code is. The sentences are built from these two subjects in one place.
+ * In the compiler's "Type S is not assignable to type E", S is always the
+ * "sends" slot and E the "expects" slot; only the subjects move. DRAFT wording
+ * for the two consumer rows (copy-pass owed).
+ */
+type Voice = { sender: string; reader: string };
+const PRODUCER_VOICE: Voice = { sender: "This code", reader: "the caller" };
+const SOCKET_EMIT_VOICE: Voice = { sender: "This code", reader: "the listener" };
+const HTTP_CALL_VOICE: Voice = { sender: "The route", reader: "this code" };
+
+/** The voice of one line, or null for a consumer combination with no row yet. */
+function voiceOf(line: Pick<HeldLine, "side" | "reads" | "protocol">): Voice | null {
+  if (line.side !== "consumer") return PRODUCER_VOICE;
+  if (line.reads !== true && line.protocol === "socket") return SOCKET_EMIT_VOICE;
+  if (line.reads === true && line.protocol === "http") return HTTP_CALL_VOICE;
+  return null;
+}
+
 /** The detail's wording for the three kinds of leaf the compiler gives. */
-function missingDetail(prop: string, sent: string, expected: string): string {
-  return `'${prop}' is missing. This code sends ${sent}; the caller expects ${expected}.`;
+function missingDetail(v: Voice, prop: string, sent: string, expected: string): string {
+  return `'${prop}' is missing. ${v.sender} sends ${sent}; ${v.reader} expects ${expected}.`;
 }
-function differsDetail(prop: string, sent: string, expected: string): string {
-  return `'${prop}' has a different type. This code sends ${sent}; the caller expects ${expected}.`;
+function differsDetail(v: Voice, prop: string, sent: string, expected: string): string {
+  return `'${prop}' has a different type. ${v.sender} sends ${sent}; ${v.reader} expects ${expected}.`;
 }
-function wholeDetail(sent: string, expected: string): string {
-  return `This code sends ${sent}; the caller expects ${expected}.`;
+function wholeDetail(v: Voice, sent: string, expected: string): string {
+  return `${v.sender} sends ${sent}; ${v.reader} expects ${expected}.`;
 }
 
 /**
@@ -66,26 +86,30 @@ function wholeDetail(sent: string, expected: string): string {
  * missing property, or a property path ending in two types. Returns null when
  * the message is none of those.
  */
-function leafDetail(message: string): string | null {
+function leafDetail(message: string, v: Voice): string | null {
   const lines = message.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter((l) => l !== "");
   const last = lines[lines.length - 1];
   if (last === undefined) return null;
   const missing = PROP_MISSING.exec(last);
   if (missing) {
     const path = lines.slice(0, -1).flatMap((l) => PROP_PATH.exec(l)?.[1] ?? []);
-    return missingDetail([...path, missing[1]!].join("."), shortSide(missing[2]!), shortSide(missing[3]!));
+    return missingDetail(v, [...path, missing[1]!].join("."), shortSide(missing[2]!), shortSide(missing[3]!));
   }
   const path = lines.slice(0, -1).flatMap((l) => PROP_PATH.exec(l)?.[1] ?? []);
   const pair = NOT_ASSIGNABLE.exec(last);
   if (pair === null) return null;
   const [sent, expected] = [shortSide(pair[1]!), shortSide(pair[2]!)];
-  return path.length > 0 ? differsDetail(path.join("."), sent, expected) : wholeDetail(sent, expected);
+  return path.length > 0 ? differsDetail(v, path.join("."), sent, expected) : wholeDetail(v, sent, expected);
 }
 
 /** The compiler's message for one break, in words an agent may read, or null when it still shows the check's machinery. */
-export function heldDetail(line: Pick<HeldLine, "message" | "symbol"> & { expected?: string }): string | null {
+export function heldDetail(
+  line: Pick<HeldLine, "message" | "symbol"> & Partial<Pick<HeldLine, "side" | "reads" | "protocol">> & { expected?: string },
+): string | null {
+  const voice = voiceOf(line);
+  if (voice === null) return null;
   const aliased = line.message.replace(ALIAS, () => expectedName(line));
-  const message = (leafDetail(aliased) ?? aliased.replace(INLINE_OBJECT, (whole) => shortSide(whole)))
+  const message = (leafDetail(aliased, voice) ?? aliased.replace(INLINE_OBJECT, (whole) => shortSide(whole)))
     .replace(/\s+/g, " ")
     .trim();
   if (MACHINERY.test(message)) return null;

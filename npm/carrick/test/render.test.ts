@@ -1157,3 +1157,21 @@ test("the Read hook never prints an identical line twice, and keeps its cap", ()
   assert.equal(many.split("\n").filter((line) => line.startsWith("- index.ts")).length, 12, many);
   assert.match(many, /more are listed by/);
 });
+
+// HM4 T3: an early answer's moved-rows headline follows the moved rows' roles.
+test("moved call rows head their early block as calls, routes as routes, a mix as both", () => {
+  const row = (role: "route" | "call") => ({
+    file: "src/orders.ts", line: 6, role, method: "CLIENT->SERVER", path: "order:update",
+    before: "compatible" as const, after: "type_mismatch" as const, counterparts: ["listener src/listen.ts:3"],
+    reason: "x", not_judged_before: false, stated: true,
+  });
+  const head = (roles: Array<"route" | "call">) =>
+    renderPostToolUse(
+      { schema: "carrick.check/0", file: "src/types.ts", items: [], recheck: { ran: "extraction+types", elapsed_ms: 1, moved: roles.map(row) } },
+      "src/types.ts",
+      { early: true },
+    )?.split("\n")[0];
+  assert.match(head(["call"])!, /; calls in other files broke:$/);
+  assert.match(head(["route"])!, /; routes in other files broke:$/);
+  assert.match(head(["route", "call"])!, /; routes and calls in other files broke:$/);
+});

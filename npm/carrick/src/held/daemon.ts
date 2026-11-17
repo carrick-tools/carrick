@@ -75,6 +75,14 @@ export type HeldLine = {
   /** The group's places (the consumers that read the type) and the type they expect. */
   places: Array<{ service: string; file: string; line: number | null }>;
   expected: string;
+  /** Present on a consumer-side line (a socket emit, later an HTTP call): the edited side is the consumer. Absent on a producer line. */
+  side?: "consumer";
+  /** True when the check form wraps this code's expectation (a receiver form); absent when it wraps what this code sends. */
+  reads?: true;
+  /** The row's protocol (`http`, `socket`, ...): names the other side in the sentence. */
+  protocol?: string;
+  /** A consumer line's call line on the current text, for joining part 2's call row. */
+  call_line?: number | null;
 };
 
 export type HeldState = "none" | "cold" | "ready" | "capped" | "no_compiler" | "error";

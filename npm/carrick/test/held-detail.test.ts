@@ -64,3 +64,67 @@ test("a message of another shape still reads without the placeholder", () => {
   assert.ok(!text.includes("the reply"));
   assert.ok(text.includes("'x' does not exist"));
 });
+
+// HM4 T3: the sentence is chosen by which end of the check this code is. Every
+// name is invented. The producer's sentence stays byte for byte.
+const SEND_MISSING = "Property 'status' is missing in type '{ id: string; }' but required in type 'O1_0'.";
+const SEND_DIFFERS =
+  "Type '{ id: string; status: number; }' is not assignable to type 'O1_0'.\n  Types of property 'status' are incompatible.\n    Type 'number' is not assignable to type 'string'.";
+const SEND_WHOLE = "Type 'string' is not assignable to type 'O1_0'.";
+const form = (extra: Record<string, unknown>, message: string, symbol?: string) =>
+  heldDetail({ message, symbol: symbol ?? null, ...extra } as never);
+const EMIT = { side: "consumer", protocol: "socket" };
+const CALL = { side: "consumer", protocol: "http", reads: true };
+
+test("today's producer sentence, byte for byte", () => {
+  assert.equal(
+    say(SEND_DIFFERS),
+    "'status' has a different type. This code sends 'number'; the caller expects 'string'.",
+  );
+  assert.equal(
+    say(SEND_MISSING, "OrderView"),
+    "'status' is missing. This code sends '{ id: string; }'; the caller expects 'OrderView'.",
+  );
+  assert.equal(say(SEND_WHOLE, "OrderView"), "This code sends 'string'; the caller expects 'OrderView'.");
+});
+
+test("a socket emitter's break names the listener, and the edited side as this code", () => {
+  assert.equal(
+    form(EMIT, SEND_DIFFERS),
+    "'status' has a different type. This code sends 'number'; the listener expects 'string'.",
+  );
+  assert.equal(
+    form(EMIT, SEND_MISSING, "OrderUpdate"),
+    "'status' is missing. This code sends '{ id: string; }'; the listener expects 'OrderUpdate'.",
+  );
+  assert.equal(form(EMIT, SEND_WHOLE, "OrderUpdate"), "This code sends 'string'; the listener expects 'OrderUpdate'.");
+  // The edited side sends.
+  assert.match(form(EMIT, SEND_DIFFERS)!, /This code sends /);
+});
+
+test("an HTTP caller's break names the route as sender and this code as reader", () => {
+  assert.equal(
+    form(CALL, SEND_DIFFERS),
+    "'status' has a different type. The route sends 'number'; this code expects 'string'.",
+  );
+  assert.equal(
+    form(CALL, SEND_MISSING, "OrderView"),
+    "'status' is missing. The route sends '{ id: string; }'; this code expects 'OrderView'.",
+  );
+  assert.equal(form(CALL, SEND_WHOLE, "OrderView"), "The route sends 'string'; this code expects 'OrderView'.");
+  // The edited side expects.
+  assert.match(form(CALL, SEND_DIFFERS)!, /this code expects /);
+});
+
+test("a consumer line of another protocol or form states nothing", () => {
+  assert.equal(form({ side: "consumer", protocol: "pubsub" }, SEND_DIFFERS), null);
+  assert.equal(form({ side: "consumer", protocol: "graphql", reads: true }, SEND_DIFFERS), null);
+  assert.equal(form({ side: "consumer", protocol: "http" }, SEND_DIFFERS), null);
+  assert.equal(form({ side: "consumer" }, SEND_DIFFERS), null);
+  assert.equal(form({ side: "consumer", protocol: "socket", reads: true }, SEND_DIFFERS), null);
+});
+
+test("a producer line of any protocol keeps the producer sentence", () => {
+  assert.equal(form({ protocol: "http" }, SEND_WHOLE, "OrderView"), say(SEND_WHOLE, "OrderView"));
+  assert.equal(form({ protocol: "graphql" }, SEND_WHOLE, "OrderView"), say(SEND_WHOLE, "OrderView"));
+});
