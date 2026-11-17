@@ -449,6 +449,69 @@ jobs:
           echo "$MISSING"
           echo "$MISSING" | grep -q "is not installed"
 
+      # The agent hooks after the default Node changes (carrick#4759). Every hook
+      # entry calls a launcher that finds the install again; before it, they
+      # called a bare `carrick`, which stopped resolving the moment the default
+      # Node moved and said nothing. Installed under nvm's Node 24, then 22
+      # made the default, then each entry init writes run in a shell that holds
+      # no carrick, and then with no install anywhere. One leg: it asks about
+      # the launcher, not about the platform.
+      - name: Hooks survive a Node switch
+        if: matrix.name == 'npm, Linux x64'
+        run: |
+          set -euo pipefail
+          export NVM_DIR="$HOME/.nvm"
+          curl -fsSo- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash
+          . "$NVM_DIR/nvm.sh"
+          nvm install 24 >/dev/null
+          npm install -g --ignore-scripts --omit=optional "$PWD/$(ls pack/carrick-*.tgz)"
+          nvm install 22 >/dev/null
+          nvm alias default 22 >/dev/null
+          NODE22="$(dirname "$(nvm which 22)")"
+          GLOBAL="$(npm root -g)/carrick"
+
+          PROJ="$RUNNER_TEMP/hook-project"
+          mkdir -p "$PROJ/.claude"
+          # The entries and the launcher exactly as `carrick init` writes them.
+          node --input-type=module -e '
+            import { pathToFileURL } from "node:url";
+            const [root, project] = process.argv.slice(1);
+            const { carrickHooks } = await import(pathToFileURL(`${root}/dist/init/settings.js`));
+            const { writeLauncher } = await import(pathToFileURL(`${root}/dist/init/launcher.js`));
+            writeLauncher(`${project}/.claude`);
+            for (const groups of Object.values(carrickHooks())) {
+              for (const group of groups) for (const hook of group.hooks) console.log(hook.command);
+            }
+          ' "$GLOBAL" "$PROJ" > "$RUNNER_TEMP/entries.txt"
+          test "$(wc -l < "$RUNNER_TEMP/entries.txt")" -eq 8
+
+          # A shell on the new default Node, which has no carrick of its own.
+          shell() { env -i HOME="$HOME" PATH="$NODE22:/usr/bin:/bin" CLAUDE_PROJECT_DIR="$PROJ" CARRICK_NO_UPDATE_CHECK=1 bash -c "$1" </dev/null; }
+          if shell 'command -v carrick' >/dev/null; then
+            echo "::error::a bare carrick resolves on the new default Node, so this step proves nothing"
+            exit 1
+          fi
+          while IFS= read -r ENTRY; do
+            echo "entry: $ENTRY"
+            shell "$ENTRY"
+          done < "$RUNNER_TEMP/entries.txt"
+          # An answer from the install under the other Node, run with its own Node.
+          WANT="$(node -p "require('$GLOBAL/package.json').version")"
+          shell "sh \"\$CLAUDE_PROJECT_DIR/.claude/carrick-hook.sh\" --version" | tee "$RUNNER_TEMP/version.txt"
+          grep -qF "$WANT" "$RUNNER_TEMP/version.txt"
+
+          # No install anywhere: exit 0, one line at session start, nothing else.
+          EMPTY="$(mktemp -d)"
+          bare() { env -i HOME="$EMPTY" PATH=/usr/bin:/bin CLAUDE_PROJECT_DIR="$PROJ" bash -c "$1" </dev/null; }
+          while IFS= read -r ENTRY; do
+            OUT="$(bare "$ENTRY")"
+            case "$ENTRY" in
+              *"hook session-start") test "$(printf '%s\n' "$OUT" | wc -l)" -eq 1 && test -n "$OUT" ;;
+              *) test -z "$OUT" ;;
+            esac
+          done < "$RUNNER_TEMP/entries.txt"
+          echo "no install anywhere: exit 0, one line at session start, nothing else"
+
       # The verdict is the whole point of the local tier and the one thing the
       # steps above cannot see: the check phase spawns a vendored pnpm and tsc,
       # they live somewhere else in an install than in a checkout, and a miss

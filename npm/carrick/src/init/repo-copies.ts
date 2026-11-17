@@ -31,6 +31,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { writeIfChanged } from "./files.ts";
+import { LAUNCHER_FILE, launcherSource } from "./launcher.ts";
 import { mergeCarrickHooks, mergeHookSet, removeCarrickHooks } from "./settings.ts";
 import { CODEX_HOOKS_FILE, codexHooks, isEmptyHooksDocument } from "./codex.ts";
 import {
@@ -51,10 +52,12 @@ export const EXCLUDE_END = "# End of carrick init lines";
 
 /** The personal Claude Code settings file, which is the one a repo copy uses. */
 export const LOCAL_SETTINGS = path.join(".claude", "settings.local.json");
+const CLAUDE_LAUNCHER = path.join(".claude", LAUNCHER_FILE);
+const CODEX_LAUNCHER = path.join(".codex", LAUNCHER_FILE);
 
 /** Every file a repo copy can hold, relative to the repo. */
 export function repoCopyPaths(): string[] {
-  return [LOCAL_SETTINGS, CODEX_HOOKS_FILE, ...taskSkillPaths()];
+  return [LOCAL_SETTINGS, CLAUDE_LAUNCHER, CODEX_HOOKS_FILE, CODEX_LAUNCHER, ...taskSkillPaths()];
 }
 
 /** A relative path as an exclude line: anchored to the repo root, `/`-separated. */
@@ -163,7 +166,7 @@ function readOrNull(target: string): string | null {
  * every body is decided before the first write. Returns the paths written,
  * relative to the repo.
  */
-export function writeRepoCopy(repo: string, command: string, scope: SkillScope): string[] | null {
+export function writeRepoCopy(repo: string, scope: SkillScope): string[] | null {
   if (!ownRepository(repo)) return null;
   const exclude = excludeFile(repo);
   const tracked = exclude === null ? null : trackedPaths(repo, repoCopyPaths());
@@ -173,11 +176,13 @@ export function writeRepoCopy(repo: string, command: string, scope: SkillScope):
   const writes: Array<{ relative: string; body: string }> = [];
   if (!tracked.has(LOCAL_SETTINGS)) {
     const existing = readOrNull(path.join(repo, LOCAL_SETTINGS));
-    writes.push({ relative: LOCAL_SETTINGS, body: mergeCarrickHooks(existing, command).body });
+    writes.push({ relative: LOCAL_SETTINGS, body: mergeCarrickHooks(existing).body });
+    writes.push({ relative: CLAUDE_LAUNCHER, body: launcherSource() });
   }
   if (!tracked.has(CODEX_HOOKS_FILE)) {
     const existing = readOrNull(path.join(repo, CODEX_HOOKS_FILE));
-    writes.push({ relative: CODEX_HOOKS_FILE, body: mergeHookSet(existing, codexHooks(command)).body });
+    writes.push({ relative: CODEX_HOOKS_FILE, body: mergeHookSet(existing, codexHooks()).body });
+    writes.push({ relative: CODEX_LAUNCHER, body: launcherSource() });
   }
   for (const root of SKILL_ROOTS) {
     if (skillRootLink(repo, root) !== null) continue;
@@ -243,6 +248,9 @@ export function removeRepoCopy(repo: string): string[] | null {
   const recorded = new Set(copy.recorded);
   for (const relative of [LOCAL_SETTINGS, CODEX_HOOKS_FILE]) {
     if (recorded.has(relative)) stripHooks(path.join(repo, relative));
+  }
+  for (const relative of [CLAUDE_LAUNCHER, CODEX_LAUNCHER]) {
+    if (recorded.has(relative)) fs.rmSync(path.join(repo, relative), { force: true });
   }
   removeTaskSkills(repo, (relative) => recorded.has(relative));
   for (const directory of [".claude", ".codex", ".agents"]) {

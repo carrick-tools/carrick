@@ -25,6 +25,7 @@ import {
   versionMismatch,
   versionNoticeFile,
 } from "../src/init/outdated.ts";
+import { writeLauncher } from "../src/init/launcher.ts";
 import { carrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "../src/init/settings.ts";
 import { skillFile, SKILL_ROOTS, stamped, writeTaskSkills } from "../src/init/task-skills.ts";
 
@@ -41,14 +42,15 @@ function workspace(): string {
 function currentHooks(dir: string): void {
   const file = path.join(dir, SETTINGS_FILES[0]!);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, mergeCarrickHooks(null, "carrick").body);
+  fs.writeFileSync(file, mergeCarrickHooks(null).body);
+  writeLauncher(path.dirname(file));
 }
 
 /** The same file as an older version left it: one entry with a former timeout. */
 function olderHooks(dir: string): void {
   const file = path.join(dir, SETTINGS_FILES[0]!);
-  const document = JSON.parse(mergeCarrickHooks(null, "carrick").body);
-  const [event] = Object.keys(carrickHooks("carrick"));
+  const document = JSON.parse(mergeCarrickHooks(null).body);
+  const [event] = Object.keys(carrickHooks());
   document.hooks[event!][0].hooks[0].timeout = 99;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${JSON.stringify(document, null, 2)}\n`);

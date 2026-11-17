@@ -7,30 +7,16 @@
 // this CLI, and leaves the rest of the file — keys, order and formatting of
 // what it does not own — as it found it.
 //
-// The command it writes is `carrick` when `carrick` resolves on PATH, and this
-// install's own entry point when it does not: `npx carrick init` puts the shim
-// on PATH for the length of that one command, so a bare `carrick` in a settings
-// file it wrote would fail on every edit afterwards, silently, because the hook
-// is built never to fail an edit (#837).
+// The command it writes calls the launcher beside the settings file
+// (`launcher.ts`), never a bare `carrick`: a bare name stops resolving when the
+// default Node changes, and the hook is built never to fail an edit, so nothing
+// would say why (carrick#4759).
 
 import path from "node:path";
 
 import { sameText } from "./files.ts";
-import { packageRoot } from "../native.ts";
+import { CLAUDE_LAUNCHER_CALL, LAUNCHER_FILE } from "./launcher.ts";
 import { STOP_TIMEOUT_S } from "../hook/rechecks.ts";
-
-/**
- * The entry point in this package, for a settings file that must name a path.
- *
- * A hook command is a line handed to a shell, so this file has to be runnable
- * on its own: it carries a `#!/usr/bin/env node` shebang, it is executable in
- * the repository, and npm sets the mode on a `bin` target at install time
- * (verified 2026-09-09 against a packed tarball installed with
- * `--ignore-scripts`: 644 in the archive, 755 once installed).
- */
-export function ownEntryPoint(root: string = packageRoot()): string {
-  return path.join(root, "bin", "carrick.mjs");
-}
 
 /**
  * The settings files a workspace can hold our hook entries in.
@@ -44,28 +30,6 @@ export const SETTINGS_FILES = [
   path.join(".claude", "settings.local.json"),
 ];
 
-export type HookCommandChoice = {
-  /** What a hook entry runs, quoted if it has to be. */
-  command: string;
-  /** True when the bare name resolved and the settings file stays portable. */
-  bare: boolean;
-};
-
-/**
- * The command to write into a settings file.
- *
- * `onPath` is injected so a test can state both machines; in `carrick init` it
- * is `which carrick`.
- */
-export function hookCommand(options: {
-  onPath: (command: string) => boolean;
-  root?: string;
-}): HookCommandChoice {
-  if (options.onPath("carrick")) return { command: "carrick", bare: true };
-  const entry = ownEntryPoint(options.root);
-  return { command: /\s/.test(entry) ? `"${entry}"` : entry, bare: false };
-}
-
 export type HookEntry = {
   type: "command";
   command: string;
@@ -76,7 +40,7 @@ export type HookEntry = {
 export type HookGroup = { matcher?: string; hooks: HookEntry[] };
 
 /** What this package registers, and the only entries it will ever remove. */
-export function carrickHooks(command = "carrick"): Record<string, HookGroup[]> {
+export function carrickHooks(command = CLAUDE_LAUNCHER_CALL): Record<string, HookGroup[]> {
   return {
     // Attached to the tool result, so the verdicts arrive in the same turn as
     // the edit rather than the turn after it.
@@ -154,7 +118,9 @@ export function isOurs(entry: unknown): boolean {
   const match = HOOK_CALL.exec(command.trim());
   if (!match?.[1]) return false;
   const name = path.basename(match[1]);
-  return name === "carrick" || name === "carrick.mjs";
+  // `carrick` and `carrick.mjs` are the bare and absolute-path entries older
+  // versions wrote: still ours to replace and to remove.
+  return name === "carrick" || name === "carrick.mjs" || name === LAUNCHER_FILE;
 }
 
 /** One hook entry of ours, as a settings file holds it. */
@@ -207,7 +173,7 @@ export function installedCarrickHooks(existing: string): InstalledHook[] {
 }
 
 /** What `carrickHooks` writes, flattened the way `installedCarrickHooks` reads. */
-export function expectedCarrickHooks(command = "carrick"): InstalledHook[] {
+export function expectedCarrickHooks(command = CLAUDE_LAUNCHER_CALL): InstalledHook[] {
   return flattenHooks(carrickHooks(command));
 }
 
@@ -225,18 +191,6 @@ export function flattenHooks(set: Record<string, HookGroup[]>): InstalledHook[] 
     }
   }
   return expected;
-}
-
-/**
- * The command an installed entry runs, without the `hook <name>` after it.
- *
- * `"/opt/my tools/carrick/bin/carrick.mjs" hook post-edit` gives the path with
- * its quotes stripped, and a bare `carrick hook post-edit` gives `carrick`, so
- * a caller can ask whether that command still resolves on this machine.
- */
-export function hookTarget(command: string): string | null {
-  const match = HOOK_CALL.exec(command.trim());
-  return match?.[1] ?? null;
 }
 
 /**
@@ -300,7 +254,7 @@ export type MergeResult = {
  * Throws when the existing file is not JSON: a settings file a user has hand
  * edited into invalid JSON is a thing to report, never a thing to overwrite.
  */
-export function mergeCarrickHooks(existing: string | null, command: string | null = "carrick"): MergeResult {
+export function mergeCarrickHooks(existing: string | null, command: string | null = CLAUDE_LAUNCHER_CALL): MergeResult {
   // Adding ours replaces the scaffold's hook pack; removing ours leaves it.
   return mergeHookSet(existing, command === null ? null : carrickHooks(command), command !== null);
 }

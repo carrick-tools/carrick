@@ -48,19 +48,18 @@ import {
   suppressed,
   writeUpdateState,
 } from "../update.ts";
+import { LAUNCHER_FILE, installNode, launcherDiffers, launcherWhere } from "./launcher.ts";
 import { findCarrick, globalCommand, installedVersion, type GlobalCarrick } from "../global-install.ts";
 import { recordedCliVersion } from "./outdated.ts";
 import { repoRoots } from "./repos.ts";
 import { excludedRepos } from "./workspace-file.ts";
 import {
   expectedCarrickHooks,
-  hookTarget,
   installedCarrickHooks,
-  ownEntryPoint,
   SETTINGS_FILES,
   type InstalledHook,
 } from "./settings.ts";
-import { CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
+import { CODEX_DIR, CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
 import { inspectTaskSkills, TASK_SKILLS, type InstalledSkill } from "./task-skills.ts";
 import type { StatusResult } from "../contract.ts";
 
@@ -363,38 +362,19 @@ export function checkWorkflow(repos: ConfiguredRepo[]): Line[] {
 
 /** What the hook check needs to know about this machine. */
 export type HookMachine = {
-  /** The absolute path `command` resolves to on PATH, through symlinks. */
-  resolveOnPath: (command: string) => string | null;
-  /** The real path of a file, or null when it is not on this machine. */
-  realpath: (target: string) => string | null;
-  /** This package's own entry point, the one a settings file would name. */
-  entryPoint: string;
+  /** The `carrick` this shell finds on PATH, or null. */
+  onPath: () => string | null;
+  /** The carrick the launcher would run from this shell, or null (`launcherWhere`). */
+  where: () => string | null;
+  /** The Node this shell runs. */
+  node: string;
 };
 
 export function realMachine(): HookMachine {
   return {
-    resolveOnPath: (command) => {
-      const probe = spawnSync(process.platform === "win32" ? "where" : "which", [command], {
-        encoding: "utf8",
-        timeout: 5000,
-      });
-      if (probe.status !== 0 || typeof probe.stdout !== "string") return null;
-      const first = probe.stdout.split("\n")[0]?.trim();
-      if (!first) return null;
-      try {
-        return fs.realpathSync(first);
-      } catch {
-        return first;
-      }
-    },
-    realpath: (target) => {
-      try {
-        return fs.realpathSync(target);
-      } catch {
-        return null;
-      }
-    },
-    entryPoint: ownEntryPoint(),
+    onPath: () => findCarrick()?.binary ?? null,
+    where: () => launcherWhere(),
+    node: process.versions.node,
   };
 }
 
@@ -403,13 +383,10 @@ export function realMachine(): HookMachine {
  *
  * Three separate questions, and a hook fails silently on all three, because
  * the hook is built never to fail an edit (carrick#837): are the entries
- * there, are they the ones this version writes, and does the command they name
- * still run on this machine?
- *
- * The last one is where an install rots. An entry written as a bare `carrick`
- * needs `carrick` on PATH at every edit; an entry written under `npx` resolves
- * for the length of that one command and never again; an entry naming an
- * absolute path is stale the moment that install is replaced.
+ * there, are they the ones this version writes, and does the launcher they
+ * call still find Carrick on this machine (carrick#4759)? The last is asked of
+ * the launcher itself, so the answer is the one a hook gets; an install under
+ * another Node than this shell's is named as that, not as a failure.
  */
 export function checkHooks(workspace: string, machine: HookMachine): Line[] {
   const lines: Line[] = [];
@@ -442,13 +419,7 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
     return lines;
   }
 
-  // Every entry names the same command, so the first one states which install
-  // the settings file points at and the rest are compared against it. The
-  // prefix is taken as written, quotes and all, because that is what the
-  // writer put there and what the expected entries are rendered from.
-  const prefix = installed[0]!.command.split(/\s+hook\s+/)[0]!;
-  const target = hookTarget(installed[0]!.command);
-  const expected = expectedCarrickHooks(prefix);
+  const expected = expectedCarrickHooks();
   const missing = expected.filter(
     (want) =>
       !installed.some(
@@ -467,79 +438,35 @@ export function checkHooks(workspace: string, machine: HookMachine): Line[] {
           .join(", ")} ${missing.length === 1 ? "is" : "are"} not in ${SETTINGS_FILES.join(" or ")}. Re-run \`carrick init\`.`,
       ),
     );
-  }
-
-  if (target === null) {
-    lines.push(refuse(`A hook entry here runs \`${installed[0]!.command}\`, which names no command.`));
     return lines;
   }
-  const resolved = path.isAbsolute(target) ? machine.realpath(target) : machine.resolveOnPath(target);
-  if (resolved === null) {
+  if (launcherDiffers(path.join(workspace, ".claude"))) {
+    lines.push(
+      warn(`.claude/${LAUNCHER_FILE} is missing or not this version's, and the hook entries here call it. Re-run \`carrick init\`.`),
+    );
+    return lines;
+  }
+
+  const found = machine.where();
+  if (found === null) {
     lines.push(
       refuse(
-        path.isAbsolute(target)
-          ? `The hooks here run ${target}, which is not a file on this machine, so every edit fails silently. Re-run \`carrick init\`.`
-          : `The hooks here run \`${target}\`, which does not resolve on PATH, so every edit fails silently. Install it globally (\`npm install -g carrick\`) or re-run \`carrick init\`, which writes an absolute path when it has to.`,
+        `Carrick is not installed for this shell or under any Node version manager here, so agent hooks do nothing. Run \`npm install -g carrick\`.`,
       ),
     );
     return lines;
   }
-  if (isTransient(resolved)) {
-    lines.push(
-      warn(
-        `The hooks here run \`${target}\`, which resolves to a temporary npx install (${resolved}). It will not resolve on the next edit. Install carrick globally and re-run \`carrick init\`.`,
-      ),
-    );
+  if (machine.onPath() !== null) {
+    lines.push(done(`Agent hooks are installed here and run \`carrick\` on PATH (${found}).`));
     return lines;
   }
-
-  // Which install answers, and whether that question can be answered at all.
-  //
-  // Comparing the resolved path to this package's entry point only means
-  // something when what resolved IS an entry point. A pnpm global install and
-  // every Windows install put a shim on PATH — a shell script, a `.cmd` — and
-  // a shim does not realpath to `bin/carrick.mjs`, so a comparison would
-  // report two installs on a machine that has one. And when `carrick doctor`
-  // is itself run through `npx`, the transient copy is the one asking: the
-  // hooks are pointing at the real install and the sentence would blame them
-  // for it. In both cases the check that matters has already passed — the
-  // command resolves, so the hook will not fail silently — and identity is
-  // reported as what it is: unproven.
-  const own = machine.realpath(machine.entryPoint) ?? machine.entryPoint;
-  const entryPointName = path.basename(machine.entryPoint);
-  if (path.basename(resolved) !== entryPointName) {
-    if (findingCount(lines) === 0) {
-      lines.push(done(`Agent hooks are installed here and run \`${target}\`, which resolves to ${resolved}.`));
-    }
-    return lines;
-  }
-  if (isTransient(own)) {
-    if (findingCount(lines) === 0) {
-      lines.push(
-        done(
-          `Agent hooks are installed here and run ${resolved}. This check is running from a temporary npx install, so it cannot say whether that is the same one.`,
-        ),
-      );
-    }
-    return lines;
-  }
-  if (resolved !== own) {
-    lines.push(
-      warn(
-        `The hooks here run ${resolved}; this is ${own}. Two installs answer for one machine, and the hooks use the other one.`,
-      ),
-    );
-    return lines;
-  }
-  if (findingCount(lines) === 0) {
-    lines.push(done(`Agent hooks are installed here and run this package (${own}).`));
-  }
+  const under = installNode(found);
+  lines.push(
+    warn(
+      `Carrick is installed under ${under === null ? "another Node" : `Node ${under}`} (${found}), but this shell runs Node ${machine.node}. Agent hooks still work. Run \`npm install -g carrick\` under this Node to fix the shell.`,
+    ),
+  );
   return lines;
-}
-
-/** A path inside npm's `_npx` cache: it exists for one command and no longer. */
-function isTransient(target: string): boolean {
-  return target.includes(`${path.sep}_npx${path.sep}`);
 }
 
 /**
@@ -580,11 +507,7 @@ export function checkCodexHooks(workspace: string): Line[] {
       ),
     ];
   }
-  // The prefix the file itself names, so an install that had to write an
-  // absolute path is compared against its own entries and not against a bare
-  // `carrick` it never wrote.
-  const prefix = installed[0]!.command.split(/\s+hook\s+/)[0]!;
-  const missing = expectedCodexHooks(prefix).filter(
+  const missing = expectedCodexHooks().filter(
     (want) =>
       !installed.some(
         (have) =>
@@ -594,6 +517,11 @@ export function checkCodexHooks(workspace: string): Line[] {
           have.timeout === want.timeout,
       ),
   );
+  if (missing.length === 0 && launcherDiffers(path.join(workspace, CODEX_DIR))) {
+    return [
+      warn(`${CODEX_DIR}/${LAUNCHER_FILE} is missing or not this version's, and the Codex hook entries call it. Re-run \`carrick init\`.`),
+    ];
+  }
   if (missing.length === 0) {
     return [done(`Codex hook entries are installed here, in ${CODEX_HOOKS_FILE}.`)];
   }

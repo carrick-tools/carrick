@@ -37,13 +37,14 @@ import path from "node:path";
 
 import { ancestors, hasMarker } from "../root.ts";
 import { installShape, isNewer } from "../update.ts";
-import { CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
+import { CODEX_DIR, CODEX_HOOKS_FILE, codexInUse, expectedCodexHooks, readHooksFile } from "./codex.ts";
 import {
   expectedCarrickHooks,
   installedCarrickHooks,
   SETTINGS_FILES,
   type InstalledHook,
 } from "./settings.ts";
+import { launcherDiffers } from "./launcher.ts";
 import { inspectTaskSkills } from "./task-skills.ts";
 
 /** What is installed here and is not what this version writes. */
@@ -62,13 +63,12 @@ export function outdatedFiles(found: Outdated): string[] {
 /**
  * Whether a hook document holds entries this version no longer writes.
  *
- * The prefix is the file's own, as `carrick doctor` reads it: an install on a
- * machine with no `carrick` on PATH wrote absolute paths, and comparing those
- * against a bare `carrick` would report every entry as wrong on every run.
+ * Compared with what this version writes, so a bare `carrick` or an absolute
+ * path written by an older version reads as stale (carrick#4759).
  * A file holding no entry of ours is not out of date — it is a file init has
  * never written to, which is a different finding and not this one.
  */
-export function entriesAreStale(body: string, expected: (prefix: string) => InstalledHook[]): boolean {
+export function entriesAreStale(body: string, expected: () => InstalledHook[]): boolean {
   let installed: InstalledHook[];
   try {
     installed = installedCarrickHooks(body);
@@ -78,8 +78,7 @@ export function entriesAreStale(body: string, expected: (prefix: string) => Inst
     return false;
   }
   if (installed.length === 0) return false;
-  const prefix = installed[0]!.command.split(/\s+hook\s+/)[0]!;
-  return expected(prefix).some(
+  return expected().some(
     (want) =>
       !installed.some(
         (have) =>
@@ -89,6 +88,15 @@ export function entriesAreStale(body: string, expected: (prefix: string) => Inst
           have.timeout === want.timeout,
       ),
   );
+}
+
+/** Whether a hook file holds our entries and the launcher beside it is missing or not this version's. */
+function launcherIsStale(body: string, folder: string): boolean {
+  try {
+    return installedCarrickHooks(body).length > 0 && launcherDiffers(folder);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -112,11 +120,18 @@ export function outdatedInstall(workspace: string): Outdated {
     } catch {
       continue;
     }
-    if (entriesAreStale(body, expectedCarrickHooks)) hooks.push(relative);
+    if (entriesAreStale(body, expectedCarrickHooks) || launcherIsStale(body, path.join(workspace, path.dirname(relative)))) {
+      hooks.push(relative);
+    }
   }
   if (codexInUse(workspace)) {
     const body = readHooksFile(workspace);
-    if (body !== null && entriesAreStale(body, expectedCodexHooks)) hooks.push(CODEX_HOOKS_FILE);
+    if (
+      body !== null &&
+      (entriesAreStale(body, expectedCodexHooks) || launcherIsStale(body, path.join(workspace, CODEX_DIR)))
+    ) {
+      hooks.push(CODEX_HOOKS_FILE);
+    }
   }
   return { skills, hooks };
 }

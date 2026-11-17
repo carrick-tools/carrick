@@ -11,6 +11,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { PLUGIN_LAUNCHER_CALL } from "../src/init/launcher.ts";
 import { carrickHooks, flattenHooks } from "../src/init/settings.ts";
 import { PLATFORMS, platformPackage } from "../src/native.ts";
 import { manifest } from "../../platform/build.mjs";
@@ -152,7 +153,8 @@ test("the host manifests name this CLI's commands, and travel with the package",
   const hooks = readJson(path.join(repoRoot, "plugin", "hooks", "hooks.json"));
   // One list: the plugin registers exactly what `carrick init` writes, event,
   // matcher, command and timeout (carrick#4084).
-  assert.deepEqual(flattenHooks(hooks["hooks"]), flattenHooks(carrickHooks()));  const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
+  assert.deepEqual(flattenHooks(hooks["hooks"]), flattenHooks(carrickHooks(PLUGIN_LAUNCHER_CALL)));
+  const lsp = readJson(path.join(repoRoot, "plugin", ".lsp.json"));
   assert.equal(lsp["carrick"]["command"], "carrick");
   assert.deepEqual(lsp["carrick"]["args"], ["lsp", "--stdio", "--hooks-installed"]);
 });

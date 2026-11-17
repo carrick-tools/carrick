@@ -22,6 +22,8 @@ import {
   uninstallCodexHooks,
   writeCodexHooks,
 } from "../src/init/codex.ts";
+import { CODEX_LAUNCHER_CALL } from "../src/init/launcher.ts";
+import { mergeHookSet } from "../src/init/settings.ts";
 import { checkCodexHooks, findingCount } from "../src/init/doctor.ts";
 import { outdatedInstall } from "../src/init/outdated.ts";
 
@@ -45,19 +47,19 @@ test("the entries Codex needs are the entries it gets", () => {
   const written = codexHooks();
   // The orienting half (carrick#2848): the map before the agent's first move,
   // no matcher, the same 30 s the Claude entry has.
-  assert.equal(written["SessionStart"]![0]!.hooks[0]!.command, "carrick hook session-start");
+  assert.equal(written["SessionStart"]![0]!.hooks[0]!.command, `${CODEX_LAUNCHER_CALL} hook session-start`);
   assert.equal(written["SessionStart"]![0]!.hooks[0]!.timeout, 30);
   assert.equal(written["SessionStart"]![0]!.matcher, undefined);
   // The recording half. `apply_patch` is the tool name Codex puts on the
   // payload, and a matcher is a regex there, so the bare name matches it.
   assert.equal(written["PostToolUse"]![0]!.matcher, "apply_patch");
-  assert.equal(written["PostToolUse"]![0]!.hooks[0]!.command, "carrick hook post-edit");
+  assert.equal(written["PostToolUse"]![0]!.hooks[0]!.command, `${CODEX_LAUNCHER_CALL} hook post-edit`);
   // One call can carry several files, each a separate check, so this is not the
   // single-file timeout the Claude entry uses.
   assert.equal(written["PostToolUse"]![0]!.hooks[0]!.timeout, 60);
   // The delivering half. Codex refuses `additionalContext` on `Stop`, so
   // finished re-checks ride the next prompt instead, and this event takes no matcher.
-  assert.equal(written["UserPromptSubmit"]![0]!.hooks[0]!.command, "carrick hook user-prompt");
+  assert.equal(written["UserPromptSubmit"]![0]!.hooks[0]!.command, `${CODEX_LAUNCHER_CALL} hook user-prompt`);
   assert.equal(written["UserPromptSubmit"]![0]!.matcher, undefined);
   assert.equal(written["Stop"], undefined, "a Codex Stop hook could only block");
 });
@@ -74,7 +76,7 @@ test("a hooks file the user already has keeps everything in it", (t) => {
   fs.mkdirSync(path.join(root, CODEX_DIR), { recursive: true });
   fs.writeFileSync(hooksFile(root), `${JSON.stringify(theirs, null, 2)}\n`);
 
-  assert.equal(writeCodexHooks(root, "carrick"), "written");
+  assert.equal(writeCodexHooks(root), "written");
   const merged = read(root);
   assert.equal((merged as unknown as { description: string }).description, "our own hooks");
   assert.equal(merged.hooks["PreToolUse"]!.length, 1);
@@ -92,18 +94,18 @@ test("a hooks file the user already has keeps everything in it", (t) => {
 
 test("writing twice changes nothing the second time", (t) => {
   const root = workspace(t);
-  assert.equal(writeCodexHooks(root, "carrick"), "written");
+  assert.equal(writeCodexHooks(root), "written");
   const first = fs.readFileSync(hooksFile(root), "utf8");
-  assert.equal(writeCodexHooks(root, "carrick"), "unchanged");
+  assert.equal(writeCodexHooks(root), "unchanged");
   assert.equal(fs.readFileSync(hooksFile(root), "utf8"), first);
 });
 
 test("a file that was only ever ours goes when the entries do", (t) => {
   const root = workspace(t);
-  writeCodexHooks(root, "carrick");
+  writeCodexHooks(root);
   assert.deepEqual(
     installedCodexHooks(root).map((entry) => entry.command),
-    ["carrick hook session-start", "carrick hook post-edit", "carrick hook user-prompt"],
+    [`${CODEX_LAUNCHER_CALL} hook session-start`, `${CODEX_LAUNCHER_CALL} hook post-edit`, `${CODEX_LAUNCHER_CALL} hook user-prompt`],
   );
 
   assert.equal(uninstallCodexHooks(root), "file removed");
@@ -116,7 +118,7 @@ test("a file that was only ever ours goes when the entries do", (t) => {
 
 test("a .codex holding anything else of Codex's survives the removal", (t) => {
   const root = workspace(t);
-  writeCodexHooks(root, "carrick");
+  writeCodexHooks(root);
   fs.writeFileSync(path.join(root, CODEX_DIR, "config.toml"), "model = \"gpt-5\"\n");
 
   assert.equal(uninstallCodexHooks(root), "file removed");
@@ -137,7 +139,8 @@ test("a document is ours to delete only when nothing but our entries was in it",
 test("an install that had to name a path is recognised as ours", (t) => {
   const root = workspace(t);
   const own = '"/opt/my tools/carrick/bin/carrick.mjs"';
-  writeCodexHooks(root, own);
+  fs.mkdirSync(path.join(root, CODEX_DIR), { recursive: true });
+  fs.writeFileSync(hooksFile(root), mergeHookSet(null, codexHooks(own)).body);
   assert.equal(installedCodexHooks(root).length, 3);
   assert.equal(uninstallCodexHooks(root), "file removed");
 });
@@ -157,7 +160,7 @@ test("a workspace with no .codex is a workspace doctor says nothing about", (t) 
 
 test("doctor reads the Codex entries the way it reads the Claude ones", (t) => {
   const root = workspace(t);
-  writeCodexHooks(root, "carrick");
+  writeCodexHooks(root);
   const healthy = checkCodexHooks(root);
   assert.equal(findingCount(healthy), 0, "a fresh install is not a finding");
   assert.equal(healthy[0]!.level, "done");
@@ -184,7 +187,7 @@ test("doctor reads the Codex entries the way it reads the Claude ones", (t) => {
 
 /** The file an earlier version wrote: the two entries, no SessionStart. */
 function writeTwoEntryFile(root: string): void {
-  writeCodexHooks(root, "carrick");
+  writeCodexHooks(root);
   const older = read(root);
   delete older.hooks["SessionStart"];
   fs.writeFileSync(hooksFile(root), `${JSON.stringify(older, null, 2)}\n`);
@@ -197,10 +200,10 @@ test("an older two-entry file is stale for doctor and outdated, and a re-run add
 
   const drifted = checkCodexHooks(root);
   assert.equal(findingCount(drifted), 1);
-  assert.match(drifted[0]!.text, /SessionStart `carrick hook session-start`/);
+  assert.match(drifted[0]!.text, /SessionStart `.*hook session-start`/);
   assert.deepEqual(outdatedInstall(root).hooks, [CODEX_HOOKS_FILE]);
 
-  assert.equal(writeCodexHooks(root, "carrick"), "written");
+  assert.equal(writeCodexHooks(root), "written");
   assert.equal(findingCount(checkCodexHooks(root)), 0);
   assert.deepEqual(outdatedInstall(root).hooks, []);
   assert.equal(read(root).hooks["SessionStart"]!.length, 1, "added once, not twice");
@@ -214,7 +217,7 @@ test("a user's own SessionStart entry stays beside ours and survives the removal
   fs.mkdirSync(path.join(root, CODEX_DIR), { recursive: true });
   fs.writeFileSync(hooksFile(root), `${JSON.stringify(theirs, null, 2)}\n`);
 
-  writeCodexHooks(root, "carrick");
+  writeCodexHooks(root);
   const merged = read(root).hooks["SessionStart"]!;
   assert.equal(merged.length, 2);
   assert.equal((merged[0]!["hooks"] as Array<{ command: string }>)[0]!.command, "./scripts/greet.sh");

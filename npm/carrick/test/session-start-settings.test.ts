@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import fs from "node:fs";
 import path from "node:path";
+import { writeLauncher } from "../src/init/launcher.ts";
 import { execFileSync } from "node:child_process";
 
 import { fakeEnv, fixturePath, makeWorkspace, runHook } from "./helpers.ts";
@@ -71,7 +72,7 @@ test("a session start rewrites our stale entries, keeps the user's hook and keys
   assert.equal(run.stdout.match(/brought its hook entries/g)?.length, 1);
 
   const after = JSON.parse(fs.readFileSync(file, "utf8"));
-  const expected = carrickHooks("carrick");
+  const expected = carrickHooks();
   const ours = (event: string) =>
     (after.hooks[event] as { hooks: { command: string; timeout?: number }[] }[]).filter((group) =>
       group.hooks.some((entry) => /\bhook\b/.test(entry.command) && !entry.command.startsWith("echo")),
@@ -88,6 +89,7 @@ test("a stale-looking file the merge leaves as it is is neither stamped nor repo
   t.after(() => workspace.cleanup());
   const body = olderSettings();
   const file = put(workspace.root, LOCAL, body);
+  writeLauncher(path.dirname(file));
 
   const reported = updateHooks(workspace.root, workspace.root, running, (existing) => ({
     body: existing ?? "",
@@ -126,7 +128,7 @@ test("a Codex hook file with old entries is byte-identical after", async (t) => 
   assert.equal(fs.readFileSync(codexFile, "utf8"), codexBody);
 });
 
-test("an absolute-path prefix is kept", async (t) => {
+test("an absolute-path entry an older version wrote is replaced by the launcher call", async (t) => {
   const workspace = makeWorkspace();
   t.after(() => workspace.cleanup());
   const prefix = "/opt/tools/carrick.mjs";
@@ -134,8 +136,10 @@ test("an absolute-path prefix is kept", async (t) => {
 
   await session(workspace);
   const body = fs.readFileSync(file, "utf8");
-  assert.match(body, /\/opt\/tools\/carrick\.mjs hook session-start/);
-  assert.doesNotMatch(body, /"command": "carrick hook/);
+  assert.doesNotMatch(body, /\/opt\/tools\/carrick\.mjs/);
+  assert.match(body, /carrick-hook\.sh\\" hook session-start/);
+  // And the file those entries call is written beside them.
+  assert.equal(fs.existsSync(path.join(workspace.root, ".claude", "carrick-hook.sh")), true);
 });
 
 test("a settings file with no entry of ours is untouched", async (t) => {
@@ -218,7 +222,7 @@ test("a session started in a repo of the folder rewrites that repo's entries aft
   assert.deepEqual(updateHooks(workspace.root, workspace.root, running), [LOCAL]);
   assert.deepEqual(updateHooks(workspace.root, repo, running), [LOCAL]);
 
-  const expected = carrickHooks("carrick");
+  const expected = carrickHooks();
   for (const file of [own, inRepo]) {
     const after = JSON.parse(fs.readFileSync(file, "utf8"));
     assert.deepEqual(after.hooks.Stop, expected.Stop, `${file} holds this version's entries`);

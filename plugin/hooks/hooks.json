@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook post-edit",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook post-edit",
             "timeout": 15
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook post-read",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook post-read",
             "timeout": 5
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook post-bash",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook post-bash",
             "timeout": 15
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook post-search",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook post-search",
             "timeout": 5
           }
         ]
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook session-start",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook session-start",
             "timeout": 30
           }
         ]
@@ -58,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook stop",
             "timeout": 10
           }
         ]
@@ -69,7 +69,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook subagent-stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook subagent-stop",
             "timeout": 5
           }
         ]
@@ -80,7 +80,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "carrick hook user-prompt",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/carrick-hook.sh\" hook user-prompt",
             "timeout": 5
           }
         ]
