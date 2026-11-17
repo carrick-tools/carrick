@@ -58,6 +58,17 @@ deciding call.
 | `seed-caught-value` | `.catch(() => ({ rows: [] }))`, a value of its own | `{ rows: string[]; }` | same |
 | `seed-envelope` | `{ body, response }` over an unlabelled `fetch`, body unstated | `unknown` | same |
 
+`seed-same-file` (carrick#4513, the box's shape) declares a generic helper
+and its callers in one file. The helper reads the JSON into its own `T`
+(`const body: T = await res.json()`) and returns `{ status, body }`. The
+model's row at the helper's own `fetch` (`src/seed-same-file.ts:2`) names no
+call to bind `T`, so it states no type: `unknown`, `bound_by_callers`, never
+`T` in the stored text (`bundled_types`). Before, the stored text was `T`.
+Where a caller is named (`through_call`), the read is typed where the caller
+holds it (`body` of the call's awaited result, with its type argument): the
+sidecar test `infer-call-result-below-wrapper` holds those seeds, because the
+same-file wrapper pass reads these callers at their own call.
+
 The `seed-*` rows are carrick#4513's. `seed-chained` holds a member of a
 member, which no one key names, so the response is the labelled call's
 body. `seed-widen` hands back the body or no body (`|| null`, `?? undefined`),

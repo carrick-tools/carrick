@@ -3548,6 +3548,8 @@ export class TypeInferrer {
       ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
       : undefined;
     if (!callerFile || !deciding || !callNamedBy(deciding.compilerNode)) return read;
+    const held = this.heldAtDecidingCall(sourceFile, request, deciding);
+    if (held) return this.markedAtDecidingCall(held, deciding);
     if (read && !this.readIsOnlyTransport(sourceFile, request, read)) {
       return this.markedAtDecidingCall(read, deciding);
     }
@@ -3571,6 +3573,132 @@ export class TypeInferrer {
         `reading it at the call that reaches the wrapper, ${through.file_path}:${decidingRequest.line_number}`
     );
     return atDeciding;
+  }
+
+  /**
+   * carrick#4513: the value a read below a wrapper makes, typed where the
+   * caller holds it. The wrapper the deciding call runs hands that value back
+   * unchanged, as the whole value it returns or as one member of an object it
+   * returns (`return { status: res.status, body }`); the checker then reads
+   * the same spot on the deciding call's awaited result, with the call's type
+   * arguments applied (`call<{ id: number }>(…)` gives `body` that type, and
+   * a declared `Promise<string | null>` keeps its null). Only a call the
+   * store labels no result for is read this way. `undefined` where the
+   * value lands nowhere one spot names, or where the caller's type is a top
+   * type, holds an open type parameter or is transport: the read below then
+   * answers as before.
+   */
+  private heldAtDecidingCall(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    deciding: CallExpression
+  ): InferredType | undefined {
+    // A labelled call's value is not its body: the label names the part that
+    // is, and the read below applies it (carrick#2818).
+    if (request.result) return undefined;
+    const callExpr = this.resolveTargetCallExpression(sourceFile, request);
+    if (!callExpr) return undefined;
+    const func = this.findContainingFunctionForNode(callExpr);
+    if (!func || calledFunction(deciding) !== func) return undefined;
+    const terminal = this.resolveCallResultTerminalNode(callExpr, func).terminal;
+    const landing = this.landingInReturn(terminal, func);
+    if (!landing) return undefined;
+    const awaited = this.unwrapPromiseType(deciding.getType());
+    let held = awaited;
+    if (landing.member !== undefined) {
+      const property = awaited.getProperty(landing.member);
+      if (!property) return undefined;
+      held = property.getTypeAtLocation(deciding);
+    }
+    const text = typeText(held, deciding);
+    if (
+      printedTypeHoldsTopType(text) ||
+      this.openTypeParameterAt(held, deciding) !== undefined ||
+      this.typeIsOrContainsResponseMachinery(held)
+    ) {
+      return undefined;
+    }
+    this.log(
+      `Call result at ${request.file_path}:${request.line_number} lands in what its wrapper returns` +
+        `${landing.member !== undefined ? ` as '${landing.member}'` : ''}; reading it at the call that holds it`
+    );
+    const anchor = this.unwrapArrayLevels(held);
+    return this.createInferredType(
+      request,
+      text,
+      false,
+      this.getNodeLocation(deciding),
+      undefined,
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth,
+      undefined,
+      held,
+      anchor.element
+    );
+  }
+
+  /**
+   * Where the value `terminal` holds lands in what `func` returns: the whole
+   * returned value, or one member of a returned object literal, reached
+   * unchanged (through `await`, parentheses, casts, or one `const` it is
+   * given to). `undefined` for no spot or more than one.
+   */
+  private landingInReturn(terminal: Node, func: FunctionLike): { member?: string } | undefined {
+    let value: Node = terminal;
+    for (let parent = value.getParent(); parent; parent = value.getParent()) {
+      if (
+        Node.isAwaitExpression(parent) ||
+        Node.isParenthesizedExpression(parent) ||
+        Node.isAsExpression(parent) ||
+        Node.isTypeAssertion(parent) ||
+        Node.isSatisfiesExpression(parent) ||
+        Node.isNonNullExpression(parent)
+      ) {
+        value = parent;
+        continue;
+      }
+      break;
+    }
+    const checker = this.project.getTypeChecker().compilerObject;
+    const parent = value.getParent();
+    const local =
+      parent && Node.isVariableDeclaration(parent) && parent.getInitializer() === value
+        ? parent.getNameNode()
+        : undefined;
+    const localSymbol = local && Node.isIdentifier(local) ? local.getSymbol()?.compilerSymbol : undefined;
+    const peel = (node: Node): Node => {
+      let current = peelValueWrappers(node);
+      while (Node.isAwaitExpression(current)) current = peelValueWrappers(current.getExpression());
+      return current;
+    };
+    const holds = (node: Node): boolean =>
+      node === value ||
+      peel(node) === peel(value) ||
+      (localSymbol !== undefined && Node.isIdentifier(peel(node)) && peel(node).getSymbol()?.compilerSymbol === localSymbol);
+    const landings = new Set<string>();
+    for (const returned of this.returnedExpressions(func)) {
+      const expression = peel(returned);
+      if (holds(expression)) {
+        landings.add('');
+        continue;
+      }
+      if (!Node.isObjectLiteralExpression(expression)) continue;
+      for (const property of expression.getProperties()) {
+        if (Node.isShorthandPropertyAssignment(property)) {
+          const symbol = checker.getShorthandAssignmentValueSymbol(property.compilerNode);
+          if (localSymbol !== undefined && symbol === localSymbol) landings.add(`.${property.getName()}`);
+        } else if (Node.isPropertyAssignment(property)) {
+          const name = property.getNameNode();
+          const initializer = property.getInitializer();
+          if ((Node.isIdentifier(name) || Node.isStringLiteral(name)) && initializer && holds(initializer)) {
+            landings.add(`.${Node.isIdentifier(name) ? name.getText() : name.getLiteralText()}`);
+          }
+        }
+      }
+    }
+    if (landings.size !== 1) return undefined;
+    const [landing] = [...landings];
+    return landing === '' ? {} : { member: landing.slice(1) };
   }
 
   /** The read states nothing but transport: a decided envelope, or the response object unstated. */
@@ -3672,6 +3800,16 @@ export class TypeInferrer {
     // model symbol naming an element inside it is not kept as the body.
     const narrowed =
       func && !use.handedUnreadBody ? this.narrowedBodyStatement(terminalNode, func) : undefined;
+    // carrick#4513, carrick#4201: a type the source states inside a generic
+    // wrapper (`const body: T = await res.json()`, `as T`) can name the
+    // wrapper's own type parameter, which only its callers set. Such a read
+    // states no type: the same decided answer as any other read holding it.
+    const statedOpen = [explicitType ? this.explicitTypeNodeFromAncestor(terminalNode) : undefined, narrowed?.typeNode]
+      .map((typeNode) => (typeNode ? this.openTypeParameterAt(typeNode.getType(), terminalNode) : undefined))
+      .find((name) => name !== undefined);
+    if (statedOpen !== undefined) {
+      return this.boundByCallers(request, this.getNodeLocation(terminalNode), statedOpen);
+    }
     if (narrowed) {
       typeString = narrowed.text;
       isExplicit = true;

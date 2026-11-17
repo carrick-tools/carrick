@@ -507,15 +507,23 @@ fn captured_flat(blob: &serde_json::Value, alias: &str) -> String {
         .to_string()
 }
 
-/// carrick#4513: the consumer entries whose symbol is a wrapper's own type
-/// parameter, read inside the wrapper. Only the wrapper's callers set it,
-/// so no entry may name it.
+/// carrick#4513: the consumer entries whose symbol, or whose stored type
+/// text (`bundled_types`), is a wrapper's own type parameter, read inside
+/// the wrapper. Only the wrapper's callers set it, so no entry may name it.
 fn entries_naming_a_type_parameter(blob: &serde_json::Value) -> Vec<String> {
+    let bundled = blob["bundled_types"].as_str().unwrap_or_default();
     blob["type_manifest"]
         .as_array()
         .expect("type_manifest")
         .iter()
-        .filter(|entry| entry["role"] == "consumer" && entry["primary_type_symbol"] == "T")
+        .filter(|entry| entry["role"] == "consumer")
+        .filter(|entry| {
+            let stored = format!(
+                "export type {} = T;",
+                entry["type_alias"].as_str().unwrap_or_default()
+            );
+            entry["primary_type_symbol"] == "T" || bundled.lines().any(|line| line.trim() == stored)
+        })
         .map(|entry| format!("{}:{}", entry["file_path"], entry["line_number"]))
         .collect()
 }

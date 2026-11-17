@@ -52,6 +52,47 @@ export async function readsItself(route: string) {
 }
 `;
 
+// carrick#4513 box shape: one generic helper and its callers in the SAME
+// file. The helper reads the JSON into its own type parameter and hands it
+// back as a member of an object of its own; each caller passes an inline
+// type argument and reads `body` off the result.
+const SAME_FILE_TS = `export async function call<T>(path: string, init?: RequestInit): Promise<{ status: number; body: T }> {
+  const res = await fetch(\`/call\${path}\`, init);
+  const body: T = await res.json();
+  return { status: res.status, body };
+}
+
+export async function callCast<T>(path: string): Promise<{ status: number; body: T }> {
+  const res = await fetch(\`/cast\${path}\`);
+  const body = (await res.json()) as T;
+  return { status: res.status, body };
+}
+
+export async function readToken(path: string): Promise<string | null> {
+  const res = await fetch(\`/token\${path}\`);
+  if (!res.ok) return null;
+  return res.text();
+}
+
+export async function readNote(path: string): Promise<string | null> {
+  const res = await fetch(\`/note\${path}\`);
+  const text = await res.text();
+  return text;
+}
+
+export async function loadOrder() {
+  const { body } = await call<{ id: number; slug: string }>('/orders/1');
+  return body;
+}
+
+export async function loadCount() {
+  return (await callCast<{ count: number }>('/counts')).body;
+}
+
+export const token = () => readToken('/me');
+export const note = () => readNote('/me');
+`;
+
 const CALLERS_TS = `import { relay, timed, forward, viaClient, readsItself, callApi, Order } from './wrappers';
 
 export const orders = () => callApi<Order[]>('/orders');
@@ -137,6 +178,7 @@ describe('a call result read below a wrapper falls back to the deciding call', (
   let repoDir: string;
   let wrappersPath: string;
   let callersPath: string;
+  let sameFilePath: string;
 
   const spanOf = (source: string, text: string): { start: number; end: number } => {
     const start = source.indexOf(text);
@@ -163,6 +205,8 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     callersPath = path.join(repoDir, 'src', 'callers.ts');
     fs.writeFileSync(wrappersPath, WRAPPERS_TS);
     fs.writeFileSync(callersPath, CALLERS_TS);
+    sameFilePath = path.join(repoDir, 'src', 'same-file.ts');
+    fs.writeFileSync(sameFilePath, SAME_FILE_TS);
     client = new SidecarClient();
     await client.start();
     await client.send({ action: 'init', request_id: 'init-below-wrapper', repo_root: repoDir });
@@ -173,22 +217,33 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     fs.rmSync(repoDir, { recursive: true, force: true });
   });
 
-  const infer = async (alias: string, belowCall: string, decidingCall: string, result?: { whole: true }) => {
-    const at = spanOf(WRAPPERS_TS, belowCall);
-    const through = spanOf(CALLERS_TS, decidingCall);
+  const infer = async (
+    alias: string,
+    belowCall: string,
+    decidingCall: string,
+    result?: { whole: true },
+    files: { below: [string, string]; deciding: [string, string] } = {
+      below: [wrappersPath, WRAPPERS_TS],
+      deciding: [callersPath, CALLERS_TS],
+    }
+  ) => {
+    const [belowPath, belowSource] = files.below;
+    const [decidingPath, decidingSource] = files.deciding;
+    const at = spanOf(belowSource, belowCall);
+    const through = spanOf(decidingSource, decidingCall);
     const response = await client.send<InferShape>({
       action: 'infer',
       request_id: `infer-${alias}`,
       requests: [
         {
-          file_path: wrappersPath,
-          line_number: lineAt(WRAPPERS_TS, at.start),
+          file_path: belowPath,
+          line_number: lineAt(belowSource, at.start),
           span_start: at.start,
           span_end: at.end,
           infer_kind: 'call_result',
           alias,
           ...(result ? { result } : {}),
-          through_call: { file_path: callersPath, span_start: through.start, span_end: through.end },
+          through_call: { file_path: decidingPath, span_start: through.start, span_end: through.end },
         },
       ],
       extraction_config: EXTRACTION_CONFIG,
@@ -263,5 +318,75 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     const { text, anchor } = await infer('Inline', 'http.get<T>(`/api${route}`)', "callApi<{ sku: string }>('/skus')");
     assert.match(text, /^\{ sku: string;? \}$/, text);
     assert.strictEqual(anchor, undefined);
+  });
+
+  // carrick#4513 box shape. The read is made where the request is (the
+  // wrapper hands back an object of its own), and the caller holds the
+  // value at the same spot of the call's result, with its type argument.
+  const sameFile = () => ({
+    below: [sameFilePath, SAME_FILE_TS] as [string, string],
+    deciding: [sameFilePath, SAME_FILE_TS] as [string, string],
+  });
+
+  it('a JSON read annotated with the wrapper T reads the member the caller holds, never T', async () => {
+    const { text, anchor } = await infer(
+      'SameFileAnnotated',
+      'fetch(`/call${path}`, init)',
+      "call<{ id: number; slug: string }>('/orders/1')",
+      undefined,
+      sameFile()
+    );
+    assert.match(text, /^\{ id: number; slug: string;? \}$/, text);
+    assert.notStrictEqual(anchor, 'T');
+  });
+
+  it('a JSON read cast to the wrapper T reads the member the caller holds, never T', async () => {
+    const { text, anchor } = await infer(
+      'SameFileCast',
+      'fetch(`/cast${path}`)',
+      "callCast<{ count: number }>('/counts')",
+      undefined,
+      sameFile()
+    );
+    assert.match(text, /^\{ count: number;? \}$/, text);
+    assert.notStrictEqual(anchor, 'T');
+  });
+
+  it('a JSON read stated as the wrapper T, with no call to bind it, states no type', async () => {
+    for (const [alias, below] of [
+      ['OwnAnnotated', 'fetch(`/call${path}`, init)'],
+      ['OwnCast', 'fetch(`/cast${path}`)'],
+    ] as const) {
+      const at = spanOf(SAME_FILE_TS, below);
+      const response = await client.send<InferShape>({
+        action: 'infer',
+        request_id: `infer-${alias}`,
+        requests: [
+          {
+            file_path: sameFilePath,
+            line_number: lineAt(SAME_FILE_TS, at.start),
+            span_start: at.start,
+            span_end: at.end,
+            infer_kind: 'call_result',
+            alias,
+          },
+        ],
+        extraction_config: EXTRACTION_CONFIG,
+      });
+      const inferred = response.inferred_types?.find((t) => t.alias === alias);
+      assert.ok(inferred, `no answer for ${alias}: ${JSON.stringify(response.errors)}`);
+      assert.strictEqual(inferred.type_string, 'unknown', alias);
+      assert.deepStrictEqual((inferred.any_provenance ?? []).map((p) => p.reason), ['bound_by_callers'], alias);
+    }
+  });
+
+  it('a text read behind an early null keeps the null the caller holds', async () => {
+    const { text } = await infer('SameFileEarlyNull', 'fetch(`/token${path}`)', "readToken('/me')", undefined, sameFile());
+    assert.strictEqual(text, 'string | null');
+  });
+
+  it('a text read under a declared nullable return keeps the null the caller holds', async () => {
+    const { text } = await infer('SameFileDeclaredNull', 'fetch(`/note${path}`)', "readNote('/me')", undefined, sameFile());
+    assert.strictEqual(text, 'string | null');
   });
 });
