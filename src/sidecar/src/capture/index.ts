@@ -110,6 +110,8 @@ export {
 export { runCheck, judgeTscPath } from './check.js';
 export type { CheckProgress } from './check.js';
 export {
+  absentBodyApplies,
+  absentBodyRule,
   graphqlComparandLeafRule,
   graphqlComparandRule,
   graphqlExpectedRule,
@@ -121,6 +123,7 @@ export {
   jsonWireDeclarations,
   jsonWireRule,
   judgeTolerances,
+  topTypeDeclarations,
   wireFormFor,
   type JudgeTolerances,
 } from './check-probe.js';
