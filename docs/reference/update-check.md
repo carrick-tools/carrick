@@ -180,15 +180,15 @@ it — that one is reported, never replaced.
 Never installed onto silently. Interactive `carrick init` asks;
 `carrick init --yes` prints the command and installs nothing, because `--yes`
 is an answer about the workspace; `carrick init --install-global` is the
-consent a script gives. The answer decides what the hook entries say: with a
-global they are the bare `carrick`, and without one they name the install that
-wrote them — which, under npx, is a cache directory that gets cleared.
+consent a script gives.
 
-`init` used to write the bare command whenever `which carrick` succeeded, and
-inside an npx run that is always: npm puts the exec tree's own
-`node_modules/.bin` first on PATH for the child it runs. Every hook entry
-written that way named a command that stopped existing when npx exited.
-`findCarrick` walks PATH itself and skips that entry.
+Every hook entry calls `carrick-hook.sh`, which `carrick init` writes beside the
+settings file (`.claude/` and `.codex/`). It runs the `carrick` on PATH. When
+the default Node changes and the name stops resolving, it finds a global install
+under nvm, fnm, volta, asdf, mise or the npm global prefix and runs that.
+Where it finds none, it prints one line at session start and does nothing for
+any other hook. `carrick doctor` reports an install under another Node than the
+one the shell runs.
 
 ### Release-age policy, measured
 
