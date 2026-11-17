@@ -41,6 +41,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { writeIfChanged } from "./files.ts";
+import { CODEX_LAUNCHER_CALL, removeLauncher, writeLauncher } from "./launcher.ts";
 import {
   flattenHooks,
   installedCarrickHooks,
@@ -57,7 +58,7 @@ export const CODEX_DIR = ".codex";
 export const CODEX_HOOKS_FILE = path.join(CODEX_DIR, "hooks.json");
 
 /** What this package registers with Codex, and the only entries it removes. */
-export function codexHooks(command = "carrick"): Record<string, HookGroup[]> {
+export function codexHooks(command = CODEX_LAUNCHER_CALL): Record<string, HookGroup[]> {
   return {
     // No matcher, timeout 30 as the Claude entry has it. Without this entry the
     // agent is never told the index exists and starts without calling Carrick.
@@ -88,7 +89,7 @@ export function codexHooks(command = "carrick"): Record<string, HookGroup[]> {
 }
 
 /** What `codexHooks` writes, flattened the way `installedCarrickHooks` reads. */
-export function expectedCodexHooks(command = "carrick"): InstalledHook[] {
+export function expectedCodexHooks(command = CODEX_LAUNCHER_CALL): InstalledHook[] {
   return flattenHooks(codexHooks(command));
 }
 
@@ -133,9 +134,11 @@ export type CodexWrite = "written" | "unchanged";
  * file somebody hand-edited into something unparseable is reported, never
  * overwritten.
  */
-export function writeCodexHooks(workspace: string, command: string): CodexWrite {
+export function writeCodexHooks(workspace: string): CodexWrite {
   const existing = readHooksFile(workspace);
-  const merged = mergeHookSet(existing, codexHooks(command));
+  const merged = mergeHookSet(existing, codexHooks());
+  // The launcher the entries call, beside them (carrick#4759).
+  writeLauncher(path.join(workspace, CODEX_DIR));
   return writeIfChanged(path.join(workspace, CODEX_HOOKS_FILE), merged.body);
 }
 
@@ -178,6 +181,7 @@ export function uninstallCodexHooks(workspace: string): CodexRemoval {
   const cleaned = removeCarrickHooks(existing);
   if (!cleaned.changed) return null;
   const target = path.join(workspace, CODEX_HOOKS_FILE);
+  removeLauncher(path.join(workspace, CODEX_DIR));
   if (!isEmptyHooksDocument(cleaned.body)) {
     fs.writeFileSync(target, cleaned.body);
     return "removed";

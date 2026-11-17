@@ -303,7 +303,7 @@ process.exit(0);
 
   // The Codex half of the same install (carrick#1335), in a file that also
   // holds a hook of the user's own: the entries come out and the file stays.
-  writeCodexHooks(workspace, "carrick");
+  writeCodexHooks(workspace);
   const codex = JSON.parse(fs.readFileSync(path.join(workspace, CODEX_HOOKS_FILE), "utf8")) as {
     hooks: Record<string, unknown[]>;
   };
@@ -653,7 +653,7 @@ test("remove takes the hooks and skills back out of each repo in the folder, wit
     exclude: fs.readFileSync(excludeFile(dir)!, "utf8"),
     status: spawnSync("git", ["-C", dir, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout,
   }));
-  for (const dir of repos) writeRepoCopy(dir, "carrick", { slug: "shop" });
+  for (const dir of repos) writeRepoCopy(dir, { slug: "shop" });
 
   const result = carrick(state, "remove", "--workspace", state.workspace, "--confirm", "repo");
   assert.equal(result.status, 0, result.stderr);
@@ -685,7 +685,7 @@ test("remove run inside a repo takes its copy back whole, and git sees nothing l
   const status = (): string =>
     spawnSync("git", ["-C", repo, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" }).stdout;
   const before = status();
-  writeRepoCopy(repo, "carrick", { slug: "shop" });
+  writeRepoCopy(repo, { slug: "shop" });
 
   // The copy is one item, and its settings file, Codex file and skills are not
   // listed again as this folder's own: they are the copy (carrick#1573).

@@ -36,12 +36,13 @@ import { downloadHostedIndex, hostedReport, nativeRunner, STEP_LABEL } from "./h
 import { listProjects, projectLabel, SLUG, type Project } from "./projects.ts";
 import { writeRepoCopy } from "./repo-copies.ts";
 import { claudeCodeFound, connectMcpClients, mcpLine, offeredFileClients, type OfferedClient } from "./mcp.ts";
-import { hookCommand, mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
+import { mergeCarrickHooks, removeCarrickHooks } from "./settings.ts";
+import { writeLauncher } from "./launcher.ts";
 import { CODEX_HOOKS_FILE, writeCodexHooks } from "./codex.ts";
 import { AGENTS_FILE, CLAUDE_FILE, writeAgentsSection, writeClaudeSection } from "./agents-section.ts";
 import { ignoredSkillRoots, taskSkillWarnings, writeTaskSkills } from "./task-skills.ts";
 import { recordCliVersion } from "./outdated.ts";
-import { findCarrick, offerGlobalInstall } from "../global-install.ts";
+import { offerGlobalInstall } from "../global-install.ts";
 import { currentVersion } from "../update.ts";
 import { writeIfChanged } from "./files.ts";
 import { excludedRepos, readWorkspaceFile, removeSelection, writeSelection, WORKSPACE_FILE } from "./workspace-file.ts";
@@ -220,19 +221,6 @@ function help(): string {
     `What init installs, the hooks included: ${DOCS_INIT_FILES}`,
     `The editor extension: ${DOCS_EDITOR}`,
   ].join("\n");
-}
-
-/**
- * Whether `carrick` answers on this machine after this run ends.
- *
- * Not `which`: npm puts the exec tree's own `node_modules/.bin` first on PATH
- * for the child it runs, so inside `npx carrick init` a `which carrick` says
- * yes on a machine with no global — and the hooks were then written as a bare
- * `carrick hook post-edit`, naming a command that stopped existing when npx
- * exited (carrick#1372). `findCarrick` skips the copy doing the looking.
- */
-function carrickOnPath(): boolean {
-  return findCarrick() !== null;
 }
 
 /**
@@ -773,12 +761,10 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
     process.stderr.write(`carrick init: ${(error as Error).message}\n`);
     return 1;
   }
-  // Before the hook commands are decided, because what they say depends on the
-  // answer: with a global, they are the bare `carrick`, which every shell and
-  // every agent on this machine resolves; without one, they name this install,
-  // and an npx cache is cleared (carrick#1372). A machine that already has one
-  // was brought level before this command started. Nothing is asked: the line
-  // names the command, and `--install-global` runs it.
+  // A global install is what the launcher finds first, and an npx cache is
+  // cleared (carrick#1372). A machine that already has one was brought level
+  // before this command started. Nothing is asked: the line names the command,
+  // and `--install-global` runs it.
   try {
     await offerGlobalInstall({
       assumeYes: true,
@@ -791,20 +777,24 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
       out.warn(`The global install was not offered: ${(error as Error).message}`);
     }
   }
-  const command = hookCommand({ onPath: carrickOnPath });
-  const settingsName = path.join(".claude", command.bare ? "settings.json" : "settings.local.json");
+  // Every entry calls the launcher written beside the settings file, which
+  // finds Carrick again after the default Node changes (carrick#4759). The
+  // settings file is the shared one: no machine path is in it. An entry an
+  // older version wrote into the local file goes out of it.
+  const settingsName = path.join(".claude", "settings.json");
   const settingsFile = path.join(workspace, settingsName);
   try {
     const settings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, "utf8") : null;
-    const otherFile = path.join(workspace, ".claude", command.bare ? "settings.local.json" : "settings.json");
+    const otherFile = path.join(workspace, ".claude", "settings.local.json");
     const other = fs.existsSync(otherFile) ? fs.readFileSync(otherFile, "utf8") : null;
     // The same removal `carrick remove` runs, so a file holding no entry of
     // ours is left byte for byte rather than reformatted on the way past.
     const cleaned = other === null ? null : removeCarrickHooks(other);
-    const hooks = mergeCarrickHooks(settings, command.command);
+    const hooks = mergeCarrickHooks(settings);
     // Validate both documents before migrating our entries between them.
     if (cleaned?.changed) writeIfChanged(otherFile, cleaned.body);
     writeIfChanged(settingsFile, hooks.body);
+    writeLauncher(path.join(workspace, ".claude"));
   } catch (error) {
     out.refuse(
       `Could not configure Carrick hooks: ${(error as Error).message}. Fix ${settingsName} and ${again()}.`,
@@ -816,7 +806,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   // know, and a hook file for a host nobody runs costs nothing.
   try {
     // Said once, last, in the closing block.
-    if (writeCodexHooks(workspace, command.command) === "written") codexTrust = true;
+    if (writeCodexHooks(workspace) === "written") codexTrust = true;
   } catch (error) {
     out.refuse(
       `Could not configure the Codex hooks: ${(error as Error).message}. Fix ${CODEX_HOOKS_FILE} and ${again()}.`,
@@ -867,7 +857,7 @@ export async function initWith(argv: string[], out: InitOutput, interactive: boo
   for (const repo of selected) {
     if (realPath(repo.path) === realPath(workspace)) continue;
     try {
-      writeRepoCopy(repo.path, command.command, { slug: project });
+      writeRepoCopy(repo.path, { slug: project });
     } catch (error) {
       out.refuse(`Could not add Carrick's hooks and skills to ${path.basename(repo.path)}: ${(error as Error).message}.`);
     }

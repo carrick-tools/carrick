@@ -15,6 +15,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { CLAUDE_LAUNCHER_CALL, writeLauncher } from "../src/init/launcher.ts";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -252,60 +253,45 @@ test("the services a config declares, flat and as an array", () => {
 /** A machine where `carrick` is wherever the test says it is. */
 function hookMachine(overrides: Partial<HookMachine> = {}): HookMachine {
   return {
-    resolveOnPath: () => null,
-    realpath: (target) => target,
-    entryPoint: "/usr/lib/node_modules/carrick/bin/carrick.mjs",
+    onPath: () => null,
+    where: () => null,
+    node: "26.0.0",
     ...overrides,
   };
 }
 
-function withHooks(command: string | null): string {
+/** A workspace holding the entries this version writes, and the launcher they call. */
+function withHooks(command: string | null, launcher = true): string {
   const root = workspace({});
   if (command !== null) {
     fs.mkdirSync(path.join(root, ".claude"), { recursive: true });
     fs.writeFileSync(path.join(root, ".claude", "settings.json"), mergeCarrickHooks(null, command).body);
+    if (launcher) writeLauncher(path.join(root, ".claude"));
   }
   return root;
 }
 
-test("hooks that are installed, current, and run this package", () => {
-  const root = withHooks("carrick");
+test("hooks that are installed and current, with carrick on PATH", () => {
+  const root = withHooks(CLAUDE_LAUNCHER_CALL);
   const lines = checkHooks(
     root,
-    hookMachine({ resolveOnPath: () => "/usr/lib/node_modules/carrick/bin/carrick.mjs" }),
+    hookMachine({ onPath: () => "/usr/bin/carrick", where: () => "/usr/bin/carrick" }),
   );
   assert.equal(findingCount(lines), 0, texts(lines).join("\n"));
-  assert.match(lines[0]!.text, /^Agent hooks are installed here and run this package/);
+  assert.match(lines[0]!.text, /^Agent hooks are installed here and run `carrick` on PATH/);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test("an install PATH reaches through a shim, and a doctor run under npx, prove resolution and stop", () => {
-  // A pnpm global install and every Windows install put a shim on PATH, and a
-  // shim does not realpath to an entry point. Comparing it to this package's
-  // would report two installs on a machine that has one, and the command exits
-  // non-zero on any finding, so that is every run for those users.
-  const shim = withHooks("carrick");
-  const shimLines = checkHooks(
-    shim,
-    hookMachine({ resolveOnPath: () => "/home/dev/.local/share/pnpm/carrick" }),
+test("an install under another Node than this shell's is named, and the hooks still run it", () => {
+  const root = withHooks(CLAUDE_LAUNCHER_CALL);
+  const lines = checkHooks(
+    root,
+    hookMachine({ where: () => "/home/dev/.nvm/versions/node/v24.9.0/bin/carrick", node: "26.1.0" }),
   );
-  assert.equal(findingCount(shimLines), 0, texts(shimLines).join("\n"));
-  assert.match(shimLines[0]!.text, /resolves to \/home\/dev\/\.local\/share\/pnpm\/carrick\.$/);
-
-  // `npx carrick doctor` makes the transient copy the one asking. The hooks
-  // are pointing at the real install; blaming them for it inverts the finding.
-  const underNpx = withHooks("carrick");
-  const npxLines = checkHooks(
-    underNpx,
-    hookMachine({
-      resolveOnPath: () => "/usr/lib/node_modules/carrick/bin/carrick.mjs",
-      entryPoint: "/home/dev/.npm/_npx/abc123/node_modules/carrick/bin/carrick.mjs",
-    }),
-  );
-  assert.equal(findingCount(npxLines), 0, texts(npxLines).join("\n"));
-  assert.match(npxLines[0]!.text, /cannot say whether that is the same one/);
-
-  for (const root of [shim, underNpx]) fs.rmSync(root, { recursive: true, force: true });
+  assert.equal(lines[0]!.level, "warn");
+  assert.match(lines[0]!.text, /installed under Node 24\.9\.0 .*this shell runs Node 26\.1\.0/);
+  assert.match(lines[0]!.text, /Agent hooks still work/);
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test("the ways a hook entry stops working, each named", () => {
@@ -315,35 +301,31 @@ test("the ways a hook entry stops working, each named", () => {
   const empty = workspace({ ".claude/settings.json": '{ "permissions": { "allow": [] } }' });
   assert.match(checkHooks(empty, hookMachine())[0]!.text, /No Carrick hook entries/);
 
-  // Written when `carrick` was on PATH, run on a machine where it is not.
-  const gone = withHooks("carrick");
+  // Installed nowhere: the launcher finds nothing.
+  const gone = withHooks(CLAUDE_LAUNCHER_CALL);
   const goneLines = checkHooks(gone, hookMachine());
   assert.equal(goneLines[0]!.level, "refuse");
-  assert.match(goneLines[0]!.text, /does not resolve on PATH, so every edit fails silently/);
+  assert.match(goneLines[0]!.text, /not installed for this shell or under any Node version manager/);
 
-  // An npx install resolves for the length of one command and never again.
-  const transient = withHooks("carrick");
-  const npx = path.join("/home", "dev", ".npm", "_npx", "abc123", "node_modules", "carrick", "bin", "carrick.mjs");
-  const npxLines = checkHooks(transient, hookMachine({ resolveOnPath: () => npx }));
-  assert.equal(npxLines[0]!.level, "warn");
-  assert.match(npxLines[0]!.text, /temporary npx install/);
+  // Entries an older version wrote: a bare command, and an absolute path.
+  for (const old of ["carrick", "/opt/old/carrick/bin/carrick.mjs"]) {
+    const stale = withHooks(old);
+    const staleLines = checkHooks(stale, hookMachine({ onPath: () => "/usr/bin/carrick" }));
+    assert.equal(staleLines[0]!.level, "warn");
+    assert.match(staleLines[0]!.text, /not the ones this version installs.*Re-run `carrick init`/);
+    fs.rmSync(stale, { recursive: true, force: true });
+  }
 
-  // A second install answers for the machine and the hooks use the other one.
-  const other = withHooks("carrick");
-  const otherLines = checkHooks(other, hookMachine({ resolveOnPath: () => "/opt/old/carrick/bin/carrick.mjs" }));
-  assert.equal(otherLines[0]!.level, "warn");
-  assert.match(otherLines[0]!.text, /Two installs answer for one machine/);
-
-  // An absolute entry whose file has been uninstalled.
-  const stale = withHooks("/opt/old/carrick/bin/carrick.mjs");
-  const staleLines = checkHooks(stale, hookMachine({ realpath: () => null }));
-  assert.equal(staleLines[0]!.level, "refuse");
-  assert.match(staleLines[0]!.text, /is not a file on this machine/);
+  // The entries are current and the file they call is gone.
+  const noLauncher = withHooks(CLAUDE_LAUNCHER_CALL, false);
+  const noLauncherLines = checkHooks(noLauncher, hookMachine({ where: () => "/usr/bin/carrick" }));
+  assert.equal(noLauncherLines[0]!.level, "warn");
+  assert.match(noLauncherLines[0]!.text, /carrick-hook\.sh is missing/);
 
   const broken = workspace({ ".claude/settings.json": "{ oops" });
   assert.equal(checkHooks(broken, hookMachine())[0]!.level, "refuse");
 
-  for (const root of [missing, empty, gone, transient, other, stale, broken]) {
+  for (const root of [missing, empty, gone, noLauncher, broken]) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -363,7 +345,7 @@ test("a settings file holding last version's entries is a finding, not a pass", 
       null,
       2,
     );
-  const onPath = hookMachine({ resolveOnPath: () => "/usr/lib/node_modules/carrick/bin/carrick.mjs" });
+  const onPath = hookMachine({ onPath: () => "/usr/bin/carrick", where: () => "/usr/bin/carrick" });
 
   const noSessionStart = workspace({ ".claude/settings.json": settings("Write|Edit|MultiEdit") });
   const lines = checkHooks(noSessionStart, onPath);
@@ -372,9 +354,9 @@ test("a settings file holding last version's entries is a finding, not a pass", 
   // learns a new entry (the Stop hook, carrick#1330) reports it without a
   // line of its own here.
   // The Read hook (carrick#2069) is missing from this file too, and named first.
-  assert.match(lines[0]!.text, /not the ones this version installs: PostToolUse `carrick hook post-read`/);
-  assert.match(lines[0]!.text, /SessionStart `carrick hook session-start`/);
-  assert.match(lines[0]!.text, /Stop `carrick hook stop`/);
+  assert.match(lines[0]!.text, /not the ones this version installs: PostToolUse `.*hook post-read`/);
+  assert.match(lines[0]!.text, /SessionStart `.*hook session-start`/);
+  assert.match(lines[0]!.text, /Stop `.*hook stop`/);
 
   // A matcher that no longer covers every editing tool is the same failure:
   // the entry is ours, it runs, and it never fires on a MultiEdit.
@@ -623,7 +605,6 @@ test("the whole command, on a workspace with exactly three findings", () => {
   // Claude Code already connected, and an index whose hosted half never arrived. Three
   // findings, exit 1, and everything else a line that costs nothing.
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "carrick-doctor-home-")));
-  const entry = path.join(packageRoot, "bin", "carrick.mjs");
   const root = workspace({
     "carrick.json": JSON.stringify(
       { serviceName: "api", directory: "api", include: ["packages/shared"] },
@@ -632,8 +613,9 @@ test("the whole command, on a workspace with exactly three findings", () => {
     ),
     "api/index.ts": "export {};\n",
     [workflowPath]: renderTemplate("workflow"),
-    ".claude/settings.json": mergeCarrickHooks(null, entry).body,
+    ".claude/settings.json": mergeCarrickHooks(null).body,
   });
+  writeLauncher(path.join(root, ".claude"));
   const fixture = path.join(root, "status.json");
   fs.writeFileSync(
     fixture,
@@ -665,6 +647,9 @@ test("the whole command, on a workspace with exactly three findings", () => {
     `#!/bin/sh\nif [ "$1 $2 $3" = "mcp get carrick" ]; then echo "carrick:"; echo "  URL: https://api.carrick.tools/mcp"; exit 0; fi\nexit 1\n`,
   );
   fs.chmodSync(path.join(bin, "claude"), 0o755);
+  // A `carrick` of the test's own on PATH, so what the hooks find does not depend on this machine.
+  fs.writeFileSync(path.join(bin, "carrick"), "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(path.join(bin, "carrick"), 0o755);
   const run = spawnSync(process.execPath, [path.join(packageRoot, "bin", "carrick.mjs"), "doctor", root], {
     encoding: "utf8",
     env: {
@@ -689,7 +674,7 @@ test("the whole command, on a workspace with exactly three findings", () => {
   assert.deepEqual(lines, [
     `■ ${path.basename(root)}: service "api" includes "packages/shared", which is not a directory in this repo.`,
     `${path.basename(root)}: Carrick now scans this repo in its own cloud runners on every push, so .github/workflows/carrick.yml is no longer needed and only uses CI minutes. You can delete it.`,
-    `◇ Agent hooks are installed here and run this package (${entry}).`,
+    `◇ Agent hooks are installed here and run \`carrick\` on PATH (${path.join(bin, "carrick")}).`,
     "▲ 8 of the 8 task skill file(s) are missing here (.claude/skills/carrick-impact/SKILL.md and others), so your agent has no Carrick task to follow. `carrick init` writes them.",
     // Found with no ~/.claude at all: the command is the detection.
     "◇ MCP server connected for Claude Code.",

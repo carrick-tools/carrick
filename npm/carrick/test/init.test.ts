@@ -11,6 +11,7 @@ import test from "node:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { CLAUDE_LAUNCHER_CALL } from "../src/init/launcher.ts";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,9 +23,7 @@ import {
 } from "../src/init/repos.ts";
 import {
   carrickHooks,
-  hookCommand,
   mergeCarrickHooks,
-  ownEntryPoint,
   removeCarrickHooks,
 } from "../src/init/settings.ts";
 import {
@@ -437,21 +436,21 @@ test("the hook entries land beside everything else the settings file holds", () 
   // The user's own session-start script survives, with ours after it.
   assert.equal(written.hooks.SessionStart.length, 2);
   assert.equal(written.hooks.SessionStart[0].hooks[0].command, "./my-own-start.sh");
-  assert.equal(written.hooks.SessionStart[1].hooks[0].command, "carrick hook session-start");
-  assert.equal(written.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
+  assert.equal(written.hooks.SessionStart[1].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook session-start`);
+  assert.equal(written.hooks.PostToolUse[0].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook post-edit`);
   // The Read hook (carrick#2069) is its own group beside the Edit one.
   assert.equal(written.hooks.PostToolUse[0].matcher, "Write|Edit|MultiEdit");
   assert.equal(written.hooks.PostToolUse[1].matcher, "Read");
-  assert.equal(written.hooks.PostToolUse[1].hooks[0].command, "carrick hook post-read");
+  assert.equal(written.hooks.PostToolUse[1].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook post-read`);
   assert.equal(written.hooks.PostToolUse[1].hooks[0].timeout, 5);
   // The same answer for a file a shell command reads.
   assert.equal(written.hooks.PostToolUse[2].matcher, "Bash");
-  assert.equal(written.hooks.PostToolUse[2].hooks[0].command, "carrick hook post-bash");
+  assert.equal(written.hooks.PostToolUse[2].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook post-bash`);
   // The end-of-task delivery of the background re-checks (carrick#3198), which
   // never waits. Installed beside the other two rather than by anything the
   // user has to add, with the prompt hook that carries what lands after it.
-  assert.equal(written.hooks.Stop[0].hooks[0].command, "carrick hook stop");
-  assert.equal(written.hooks.UserPromptSubmit[0].hooks[0].command, "carrick hook user-prompt");
+  assert.equal(written.hooks.Stop[0].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook stop`);
+  assert.equal(written.hooks.UserPromptSubmit[0].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook user-prompt`);
   assert.equal(written.hooks.Stop[0].matcher, undefined, "a Stop hook has no matcher");
 });
 
@@ -486,12 +485,12 @@ test("init replaces the scaffold's session-start entry and keeps its nudges and 
   assert.deepEqual(written.permissions, { allow: ["Bash(ls:*)"] });
   assert.deepEqual(
     written.hooks.SessionStart.map((group: { hooks: Array<{ command: string }> }) => group.hooks[0]!.command),
-    ["carrick hook session-start"],
+    [`${CLAUDE_LAUNCHER_CALL} hook session-start`],
     "one session-start message",
   );
   assert.deepEqual(written.hooks.UserPromptSubmit, [
     { hooks: [pack("turn-reminder")] },
-    { hooks: [{ type: "command", command: "carrick hook user-prompt", timeout: 5 }] },
+    { hooks: [{ type: "command", command: `${CLAUDE_LAUNCHER_CALL} hook user-prompt`, timeout: 5 }] },
   ]);
   assert.deepEqual(written.hooks.PreToolUse, [
     { matcher: "Grep", hooks: [pack("search-gate")] },
@@ -546,7 +545,7 @@ test("an entry of ours that has moved on is replaced, not duplicated", () => {
   const commands = written.hooks.PostToolUse.flatMap((group: { hooks: Array<{ command: string }> }) =>
     group.hooks.map((entry) => entry.command),
   );
-  assert.deepEqual(commands, ["eslint --fix", "carrick hook post-edit", "carrick hook post-read", "carrick hook post-bash", "carrick hook post-search"]);
+  assert.deepEqual(commands, ["eslint --fix", `${CLAUDE_LAUNCHER_CALL} hook post-edit`, `${CLAUDE_LAUNCHER_CALL} hook post-read`, `${CLAUDE_LAUNCHER_CALL} hook post-bash`, `${CLAUDE_LAUNCHER_CALL} hook post-search`]);
 });
 
 test("a settings file that is not JSON is reported, never overwritten", () => {
@@ -557,37 +556,22 @@ test("the hooks it claims are the only commands it will remove", () => {
   for (const groups of Object.values(carrickHooks())) {
     for (const group of groups) {
       for (const entry of group.hooks) {
-        assert.match(entry.command, /^carrick hook /);
+        assert.match(entry.command, /^sh ".*carrick-hook\.sh" hook /);
       }
     }
   }
 });
 
-test("the hook command is the bare name only when the bare name resolves", () => {
-  const global = hookCommand({ onPath: () => true });
-  assert.deepEqual(global, { command: "carrick", bare: true });
-
-  const npxOnly = hookCommand({ onPath: () => false, root: "/opt/carrick" });
-  assert.equal(npxOnly.bare, false);
-  assert.equal(npxOnly.command, ownEntryPoint("/opt/carrick"));
-  assert.match(npxOnly.command, /bin\/carrick\.mjs$/);
-
-  // A path with a space in it is a path a shell must be handed quoted.
-  const spaced = hookCommand({ onPath: () => false, root: "/opt/my tools/carrick" });
-  assert.equal(spaced.command, `"${ownEntryPoint("/opt/my tools/carrick")}"`);
-});
-
-test("an absolute hook command is written, and is still recognised as ours", () => {
-  const entry = ownEntryPoint("/opt/carrick");
+test("an absolute hook command from an older version is still recognised as ours", () => {
+  const entry = "/opt/carrick/bin/carrick.mjs";
   const written = JSON.parse(mergeCarrickHooks(null, entry).body);
   assert.equal(written.hooks.PostToolUse[0].hooks[0].command, `${entry} hook post-edit`);
-  assert.equal(written.hooks.SessionStart[0].hooks[0].command, `${entry} hook session-start`);
 
-  // The same workspace, now with carrick installed globally: one entry, not two.
+  // Re-running init: one entry, not two, and it calls the launcher.
   const rewritten = JSON.parse(mergeCarrickHooks(JSON.stringify(written, null, 2)).body);
   assert.equal(rewritten.hooks.PostToolUse.length, 4);
   assert.equal(rewritten.hooks.PostToolUse[0].hooks.length, 1);
-  assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, "carrick hook post-edit");
+  assert.equal(rewritten.hooks.PostToolUse[0].hooks[0].command, `${CLAUDE_LAUNCHER_CALL} hook post-edit`);
   assert.equal(rewritten.hooks.SessionStart.length, 1);
 });
 
@@ -616,10 +600,10 @@ test("a quoted absolute hook command is ours too, and a lookalike is not", () =>
   );
   assert.deepEqual(commands, [
     "carrickctl hook post-edit",
-    "carrick hook post-edit",
-    "carrick hook post-read",
-    "carrick hook post-bash",
-    "carrick hook post-search",
+    `${CLAUDE_LAUNCHER_CALL} hook post-edit`,
+    `${CLAUDE_LAUNCHER_CALL} hook post-read`,
+    `${CLAUDE_LAUNCHER_CALL} hook post-bash`,
+    `${CLAUDE_LAUNCHER_CALL} hook post-search`,
   ]);
 });
 
@@ -1221,9 +1205,6 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
     // The run reaches its closing line, the project and its repo.
     assert.match(result.stdout, /^◇ Set up in project payments: repo$/m);
 
-    const onPath =
-      spawnSync(process.platform === "win32" ? "where" : "which", ["carrick"], { stdio: "ignore" })
-        .status === 0;
     assert.deepEqual(
       pathsUnder(fixture.repo),
       [
@@ -1231,9 +1212,12 @@ test("a first init writes the ignored .carrick directory, the hook settings, the
         // Which build wrote the files below, so a hook running an older
         // `carrick` than this one says so (carrick#1372).
         path.join(".carrick", "cli-version"),
-        path.join(".claude", onPath ? "settings.json" : "settings.local.json"),
+        path.join(".claude", "settings.json"),
+        // The launcher every entry calls, whatever PATH holds (carrick#4759).
+        path.join(".claude", "carrick-hook.sh"),
         // The same hooks, for the other host (carrick#1335).
         CODEX_HOOKS_FILE,
+        path.join(".codex", "carrick-hook.sh"),
         // The check section for agents (carrick#2828).
         "AGENTS.md",
         ...taskSkillPaths(),

@@ -56,6 +56,7 @@ import { removeSessions, sessionRecords, sessionsDir } from "../hook/reuse.ts";
 import { disconnectMcpClients, inspectMcpClients, type McpRemoval } from "./mcp.ts";
 import { repoRoots } from "./repos.ts";
 import { removeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
+import { removeLauncher } from "./launcher.ts";
 import { CODEX_HOOKS_FILE, isEmptyHooksDocument, readHooksFile, uninstallCodexHooks } from "./codex.ts";
 import { AGENTS_FILE, CLAUDE_FILE, hasAgentsSection, hasClaudeSection, removeAgentsSection, removeClaudeSection } from "./agents-section.ts";
 import { inspectTaskSkills, removeTaskSkills, SKILL_ROOTS, skillRootLink } from "./task-skills.ts";
@@ -470,6 +471,8 @@ function removeFolder(plan: FolderPlan, out: InitOutput): void {
       out.refuse(`Could not read ${relative}: ${(error as Error).message}. Remove the carrick hook entries there by hand.`);
     }
   }
+  // The launcher those entries called goes with them (carrick#4759).
+  if (plan.settings.length > 0) removeLauncher(path.join(workspace, ".claude"));
 
   // Codex's half of the same pair. Unlike a settings file, this one exists
   // because init wrote it, so a file left holding no hooks at all goes with the

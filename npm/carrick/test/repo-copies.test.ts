@@ -43,7 +43,7 @@ test("a repo's copy holds the hooks and the skills, and git sees none of it", po
   const { dir, cleanup } = repo();
   try {
     const before = status(dir);
-    const written = writeRepoCopy(dir, "carrick", { slug: "shop" });
+    const written = writeRepoCopy(dir, { slug: "shop" });
     // The personal settings file, never the one a team commits.
     assert.deepEqual(written?.sort(), repoCopyPaths().sort());
     assert.equal(fs.existsSync(path.join(dir, ".claude", "settings.json")), false);
@@ -56,7 +56,7 @@ test("a repo's copy holds the hooks and the skills, and git sees none of it", po
     assert.equal(status(dir), before);
     // And a second run changes nothing, the exclude file included.
     const exclude = fs.readFileSync(excludeFile(dir)!, "utf8");
-    writeRepoCopy(dir, "carrick", { slug: "shop" });
+    writeRepoCopy(dir, { slug: "shop" });
     assert.equal(fs.readFileSync(excludeFile(dir)!, "utf8"), exclude);
   } finally {
     cleanup();
@@ -70,7 +70,7 @@ test("a path the repo tracks is the team's copy, and is neither written nor excl
     fs.mkdirSync(path.dirname(tracked), { recursive: true });
     fs.writeFileSync(tracked, '{ "hooks": {} }\n');
     execFileSync("git", ["-C", dir, "add", CODEX_HOOKS_FILE]);
-    const written = writeRepoCopy(dir, "carrick", { slug: "shop" }) ?? [];
+    const written = writeRepoCopy(dir, { slug: "shop" }) ?? [];
     assert.ok(!written.includes(CODEX_HOOKS_FILE), written.join("\n"));
     assert.equal(fs.readFileSync(tracked, "utf8"), '{ "hooks": {} }\n');
     assert.doesNotMatch(fs.readFileSync(excludeFile(dir)!, "utf8"), /\/\.codex\/hooks\.json/);
@@ -92,7 +92,7 @@ test("remove takes back exactly what the lines name, and the lines, and leaves t
       path.join(dir, LOCAL_SETTINGS),
       JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "say done" }] }] } }, null, 2),
     );
-    writeRepoCopy(dir, "carrick", { slug: "shop" });
+    writeRepoCopy(dir, { slug: "shop" });
     // Recorded in our block even though the owner excludes it too: the block
     // is the record of what init wrote.
     assert.equal(fs.readFileSync(exclude, "utf8").split("\n").filter((line) => line === "/.claude/settings.local.json").length, 2);
@@ -118,7 +118,7 @@ test("remove takes back exactly what the lines name, and the lines, and leaves t
 test("a settings file left holding nothing goes with the copy", posix, () => {
   const { dir, cleanup } = repo();
   try {
-    writeRepoCopy(dir, "carrick", { slug: null });
+    writeRepoCopy(dir, { slug: null });
     removeRepoCopy(dir);
     assert.equal(fs.existsSync(path.join(dir, ".claude")), false);
     assert.equal(fs.existsSync(path.join(dir, ".codex")), false);
@@ -134,7 +134,7 @@ test("a settings file left holding nothing goes with the copy", posix, () => {
 test("a recorded settings file already emptied of our hooks is deleted, not left behind", posix, () => {
   const { dir, cleanup } = repo();
   try {
-    writeRepoCopy(dir, "carrick", { slug: null });
+    writeRepoCopy(dir, { slug: null });
     fs.writeFileSync(path.join(dir, LOCAL_SETTINGS), '{\n  "hooks": {}\n}\n');
     removeRepoCopy(dir);
     assert.equal(fs.existsSync(path.join(dir, LOCAL_SETTINGS)), false);
@@ -180,7 +180,7 @@ test("a folder inside another repository gets no copy, and that repository's exc
     fs.writeFileSync(path.join(inner, "package.json"), "{}\n");
     const before = fs.readFileSync(excludeFile(dir)!, "utf8");
     assert.equal(ownRepository(inner), false);
-    assert.equal(writeRepoCopy(inner, "carrick", { slug: "shop" }), null);
+    assert.equal(writeRepoCopy(inner, { slug: "shop" }), null);
     assert.equal(fs.readFileSync(excludeFile(dir)!, "utf8"), before);
     assert.deepEqual(fs.readdirSync(inner), ["package.json"]);
     assert.equal(removeRepoCopy(inner), null);
@@ -198,7 +198,7 @@ test("a hooks file that is not JSON stops the copy before anything is written", 
     fs.mkdirSync(path.join(dir, ".codex"));
     fs.writeFileSync(path.join(dir, CODEX_HOOKS_FILE), "{ not json");
     const exclude = fs.readFileSync(excludeFile(dir)!, "utf8");
-    assert.throws(() => writeRepoCopy(dir, "carrick", { slug: "shop" }));
+    assert.throws(() => writeRepoCopy(dir, { slug: "shop" }));
     assert.equal(fs.readFileSync(excludeFile(dir)!, "utf8"), exclude);
     assert.equal(fs.existsSync(path.join(dir, LOCAL_SETTINGS)), false);
     for (const skill of taskSkillPaths()) assert.equal(fs.existsSync(path.join(dir, skill)), false, skill);
@@ -212,7 +212,7 @@ test("an exclude file init created goes with the copy", posix, () => {
   const { dir, cleanup } = repo();
   try {
     fs.rmSync(excludeFile(dir)!);
-    writeRepoCopy(dir, "carrick", { slug: "shop" });
+    writeRepoCopy(dir, { slug: "shop" });
     assert.ok(fs.existsSync(excludeFile(dir)!));
     removeRepoCopy(dir);
     assert.equal(fs.existsSync(excludeFile(dir)!), false);

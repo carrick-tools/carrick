@@ -56,6 +56,7 @@ import {
   recordedCliVersion,
 } from "./outdated.ts";
 import { expectedCarrickHooks, installedCarrickHooks, mergeCarrickHooks, SETTINGS_FILES } from "./settings.ts";
+import { launcherDiffers, writeLauncher } from "./launcher.ts";
 import { trackedPaths } from "./repo-copies.ts";
 import { inspectTaskSkills, renderTaskSkill, scopeOf, SKILL_ROOTS, TASK_SKILLS, type TaskSkill } from "./task-skills.ts";
 
@@ -107,15 +108,17 @@ export function updateHooks(
     if (stamp[key] === running) continue;
     try {
       const body = fs.readFileSync(target, "utf8");
-      if (!entriesAreStale(body, expectedCarrickHooks)) continue;
-      const prefix = installedCarrickHooks(body)[0]!.command.split(/\s+hook\s+/)[0]!;
-      const merged = merge(body, prefix);
-      if (!merged.changed) continue;
+      const folder = path.dirname(target);
+      const launcherStale = installedCarrickHooks(body).length > 0 && launcherDiffers(folder);
+      if (!entriesAreStale(body, expectedCarrickHooks) && !launcherStale) continue;
+      const merged = merge(body);
+      if (!merged.changed && !launcherStale) continue;
       if (tracked.has(relative)) {
         held.push(relative);
         continue;
       }
       writeAtomic(target, merged.body);
+      writeLauncher(folder);
       stamp[key] = running;
       changed.push(relative);
     } catch {
