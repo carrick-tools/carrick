@@ -7249,9 +7249,13 @@ fn schema_keyed_root_fields(
 
 /// Records where the schema-keyed reader placed each producer
 /// (carrick#1295): one place, or `Ambiguous` when two claims disagree on
-/// `(file, line)`. This moves where the row is served and nothing else: the
-/// model's resolver location, which anchors the producer's type, is joined
-/// by [`merge_graphql_resolver_locations`] exactly as without the reader.
+/// `(file, line)`. The place is the one answer to where the field's resolver
+/// is: it serves the row ([`graphql_producer_row_place`]) and anchors the
+/// producer's type (`resolver_file`/`resolver_line`). The model's resolver
+/// and backing-type claims are ignored for a producer the reader placed
+/// ([`merge_graphql_resolver_locations`] skips it), so an `Ambiguous` one
+/// stays unlocated and a producer the reader did not claim joins the model's
+/// claim exactly as before.
 fn apply_schema_keyed_claims(
     graphql: &mut crate::graphql::GraphqlExtraction,
     claims: &[SchemaKeyedClaim],
@@ -7285,6 +7289,12 @@ fn apply_schema_keyed_claims(
                 Some(SchemaKeyedPlace::Ambiguous)
             }
         };
+    }
+    for producer in &mut graphql.producers {
+        if let Some(SchemaKeyedPlace::At { file, line }) = &producer.schema_keyed_place {
+            producer.resolver_file = Some(file.clone());
+            producer.resolver_line = Some(*line);
+        }
     }
 }
 
@@ -9754,8 +9764,8 @@ fn fold_graphql_transport_calls(
 /// Where a GraphQL producer row is served: the schema-keyed reader's place
 /// first (carrick#1295), with two of them keeping the row on its schema line;
 /// otherwise the resolver the model located (carrick#1157); otherwise the
-/// schema line. Only the row reads this: the producer's type stays anchored
-/// at `resolver_file`/`resolver_line` or the schema.
+/// schema line. A place also anchors the producer's type, at
+/// `resolver_file`/`resolver_line` ([`apply_schema_keyed_claims`]).
 ///
 /// The third answer is why the row stays on the schema line
 /// ([`crate::request_summary::Stop::HandlerNotLocated`], carrick#3989): no reader placed the
@@ -10994,6 +11004,11 @@ fn merge_graphql_resolver_locations(
     }
 
     for (idx, producer) in graphql.producers.iter_mut().enumerate() {
+        // The schema-keyed reader answered for this field (a place, or two
+        // that disagree): the model's claims do not join (carrick#1295).
+        if producer.schema_keyed_place.is_some() {
+            continue;
+        }
         if resolver_conflicts.contains(&idx) {
             debug!(
                 op = %producer.key.canonical(),
@@ -35027,23 +35042,27 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         }
     }
 
-    /// The schema-keyed reader's claims decide where a field is SERVED before
-    /// the model's location (carrick#1295): alone, over a model claim at
-    /// another line, and failing closed to the schema line when two disagree.
-    /// The model still places a field the reader does not claim. What anchors
-    /// the producer's TYPE is the model's resolver location alone, exactly as
-    /// without the reader: a field only the reader placed has none.
+    /// The schema-keyed reader's place is the one answer to where a root field
+    /// is (carrick#1295): it serves the row and anchors the producer's type,
+    /// alone, over a model claim at another line, and failing closed when two
+    /// disagree (the model does not break the tie). A field the reader does
+    /// not claim joins the model's location as before.
     #[test]
-    fn schema_keyed_claims_move_the_row_and_never_the_type_anchor() {
+    fn schema_keyed_claims_place_the_row_and_the_type_anchor() {
         use crate::operation::GraphqlOperationKind::Query;
         let mut graphql = crate::graphql::GraphqlExtraction {
-            producers: ["alone", "both", "twice", "model"]
+            producers: ["alone", "omitted", "both", "twice", "model"]
                 .into_iter()
                 .map(|field| graphql_op(Query, field, Some("Parcel")))
                 .collect(),
             ..Default::default()
         };
+        // The file the reader placed `omitted` in was analysed, and the model
+        // listed no GraphQL operation in it.
+        let mut omitted_file = model_claim("omitted", 1);
+        omitted_file.graphql_operations.clear();
         let file_results: HashMap<String, FileAnalysisResult> = [
+            ("src/omitted.ts", omitted_file),
             ("src/both.ts", model_claim("both", 27)),
             ("src/twice.ts", model_claim("twice", 4)),
             ("src/model.ts", model_claim("model", 9)),
@@ -35053,6 +35072,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
         .collect();
         let structural = [
             schema_keyed("alone", "src/alone.ts", 5),
+            schema_keyed("omitted", "src/omitted.ts", 6),
             schema_keyed("both", "src/both.ts", 20),
             schema_keyed("twice", "src/twice.ts", 4),
             schema_keyed("twice", "src/copy.ts", 4),
@@ -35091,15 +35111,106 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             "two schema-keyed places fail closed, and the model does not break the tie"
         );
         assert_eq!(served("model"), "src/model.ts:9");
-        // What anchors each producer's type: the model's location, untouched.
-        assert_eq!(type_anchor("alone"), None, "the reader adds no type anchor");
+        // What anchors each producer's type.
+        assert_eq!(
+            type_anchor("alone").as_deref(),
+            Some("src/alone.ts:5"),
+            "(b): a file never sent to the model is anchored by the place"
+        );
+        assert_eq!(
+            type_anchor("omitted").as_deref(),
+            Some("src/omitted.ts:6"),
+            "(a): a file the model returned no GraphQL operation for is anchored by the place"
+        );
         assert_eq!(
             type_anchor("both").as_deref(),
-            Some("src/both.ts:27"),
-            "the reader does not move the model's type anchor"
+            Some("src/both.ts:20"),
+            "(c): the place beats the model's claim"
         );
-        assert_eq!(type_anchor("twice").as_deref(), Some("src/twice.ts:4"));
-        assert_eq!(type_anchor("model").as_deref(), Some("src/model.ts:9"));
+        assert_eq!(
+            type_anchor("twice"),
+            None,
+            "(d): two places leave the producer unlocated, the model's claim is ignored"
+        );
+        assert_eq!(
+            type_anchor("model").as_deref(),
+            Some("src/model.ts:9"),
+            "(e): no place, the model's line"
+        );
+    }
+
+    /// A place also beats the model's backing-type claim (carrick#1295): the
+    /// field is read at its own place, not through a located type.
+    #[test]
+    fn a_schema_keyed_place_ignores_the_models_backing_type() {
+        use crate::agents::file_analyzer_agent::GraphqlOperation;
+        use crate::operation::GraphqlOperationKind::Query;
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![graphql_op(Query, "held", Some("Parcel"))],
+            ..Default::default()
+        };
+        let mut claim = model_claim("held", 1);
+        claim.graphql_operations = vec![GraphqlOperation {
+            kind: Query,
+            field: "held".to_string(),
+            resolver_function: None,
+            resolver_line: None,
+            primary_type_symbol: None,
+            type_import_source: None,
+            backing_type_symbol: Some("Parcel".to_string()),
+            backing_type_source: None,
+        }];
+        let file_results: HashMap<String, FileAnalysisResult> =
+            [("src/types.ts".to_string(), claim)].into_iter().collect();
+        apply_schema_keyed_claims(&mut graphql, &[schema_keyed("held", "src/held.ts", 8)]);
+        merge_graphql_resolver_locations(&mut graphql, &file_results);
+        let op = &graphql.producers[0];
+        assert_eq!(op.resolver_file.as_deref(), Some(Path::new("src/held.ts")));
+        assert_eq!(op.resolver_line, Some(8));
+        assert_eq!(op.response_type_symbol, None);
+    }
+
+    /// (f) A reader-placed field whose value is not a function literal sends
+    /// no type request, not a line-only anchor that would bind the builder
+    /// callback above it (carrick#1295); a placed field with a literal does.
+    #[test]
+    fn a_placed_field_without_a_function_literal_sends_no_infer_request() {
+        use crate::operation::GraphqlOperationKind::Query;
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path().join("mutations.ts");
+        let source = "kit.queryFields((t) => ({\n  holdParcel: t.field({\n    type: Parcel,\n    resolve: async (_r, a) => loadParcel(a.id),\n  }),\n  linked: t.relation('x'),\n}));\n";
+        std::fs::write(&module, source).unwrap();
+        let mut graphql = crate::graphql::GraphqlExtraction {
+            producers: vec![
+                graphql_op(Query, "holdParcel", Some("Parcel")),
+                graphql_op(Query, "linked", Some("Parcel")),
+            ],
+            ..Default::default()
+        };
+        let file = module.to_string_lossy().into_owned();
+        apply_schema_keyed_claims(
+            &mut graphql,
+            &[
+                schema_keyed("holdParcel", &file, 2),
+                schema_keyed("linked", &file, 6),
+            ],
+        );
+        let orchestrator = FileOrchestrator::new(AgentService::new());
+        let requests = orchestrator.collect_graphql_producer_infer_requests(
+            &graphql,
+            tmp.path().to_str().unwrap(),
+            &modules_without_config(),
+        );
+        assert_eq!(requests.len(), 1, "only the field with a function literal");
+        assert!(requests[0].span_start.is_some(), "anchored by its span");
+        assert!(
+            requests[0]
+                .alias
+                .as_deref()
+                .unwrap_or("")
+                .contains("holdParcel")
+                || requests[0].line_number == 2
+        );
     }
 
     /// Why a row stays on its schema line (carrick#3989): one producer per arm

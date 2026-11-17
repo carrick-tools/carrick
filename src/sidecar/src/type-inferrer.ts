@@ -1776,8 +1776,10 @@ export class TypeInferrer {
     // resolves to `AsyncGenerator<Order>` (or `Promise<AsyncGenerator<Order>>`),
     // whose contract lives in the yield position. Unwrap it to the yield type so
     // both forms reduce to `Order` before structural expansion / rule matching.
+    // A returned library thenable (a query builder's un-awaited result) is
+    // what `await` yields for it, the value the handler sends.
     const awaitedType = this.unwrapAsyncIterableType(
-      this.unwrapPromiseType(returnType)
+      this.awaitedBeyondPromise(returnType) ?? this.unwrapPromiseType(returnType)
     );
     // carrick#2200: a `{ statusCode, body: string }` return is transport the
     // handler built itself; its contract is the value it serialised into

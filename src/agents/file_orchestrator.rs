@@ -7219,7 +7219,8 @@ impl FileOrchestrator {
     /// name does not lead to a function literal gets NO request, and so does a
     /// resolver the pass sees but cannot follow at all: the manifest entry
     /// stays `Unknown` rather than carrying a neighbour's type. A line the
-    /// pass cannot read at all keeps the line-only anchor.
+    /// pass cannot read at all keeps the line-only anchor, except a field the
+    /// schema-keyed reader placed (carrick#1295), which sends none.
     pub fn collect_graphql_producer_infer_requests(
         &self,
         graphql: &crate::graphql::GraphqlExtraction,
@@ -7322,6 +7323,19 @@ impl FileOrchestrator {
                         file = %file_abs,
                         line = resolver_line,
                         "graphql resolver is not a function literal at its field; sending no type anchor"
+                    );
+                    continue;
+                }
+                // A line-only anchor binds the builder callback a line above
+                // the field. A field the schema-keyed reader placed is read
+                // by its own span or not at all (carrick#1295).
+                ResolverAnchor::Absent if op.schema_keyed_place.is_some() => {
+                    withheld += 1;
+                    debug!(
+                        op = %op.key.canonical(),
+                        file = %file_abs,
+                        line = resolver_line,
+                        "graphql resolver place has no function span; sending no type anchor"
                     );
                     continue;
                 }
