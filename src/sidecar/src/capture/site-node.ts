@@ -572,27 +572,6 @@ export function isPreferredTarget(node: ts.Node): boolean {
   );
 }
 
-/**
- * Whether `node` is the name a declaration or a member access spells, not a
- * value read there: `response` in `const response = ...` or in
- * `reply.response`. To `ts.isExpression` every identifier is one.
- */
-function isSpelledName(node: ts.Node): boolean {
-  const parent = node.parent;
-  if (!parent) return false;
-  return (
-    (ts.isVariableDeclaration(parent) ||
-      ts.isParameter(parent) ||
-      ts.isBindingElement(parent) ||
-      ts.isFunctionDeclaration(parent) ||
-      ts.isPropertyAssignment(parent) ||
-      ts.isPropertyDeclaration(parent) ||
-      ts.isMethodDeclaration(parent) ||
-      ts.isPropertyAccessExpression(parent)) &&
-    parent.name === node
-  );
-}
-
 /** A located node is the row's own, or why none is. */
 export type HandlerAnchor = { node: ts.Node } | { reason: string };
 
@@ -659,7 +638,6 @@ export function anchorInHandler(
       if (
         !seen.has(candidate) &&
         isPreferredTarget(candidate) &&
-        !isSpelledName(candidate) &&
         normalizeLocatorText(candidate.getText(sourceFile)) === wanted &&
         ownFunction(candidate)
       ) {
