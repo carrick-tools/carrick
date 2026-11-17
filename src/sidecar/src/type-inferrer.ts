@@ -3640,8 +3640,8 @@ export class TypeInferrer {
   /**
    * Where the value `terminal` holds lands in what `func` returns: the whole
    * returned value, or one member of a returned object literal, reached
-   * unchanged (through `await`, parentheses, casts, or one `const` it is
-   * given to). `undefined` for no spot or more than one.
+   * unchanged (through `await`, parentheses, casts, a branch of a
+   * conditional, or one `const` it is given to). `undefined` for no spot or more than one.
    */
   private landingInReturn(terminal: Node, func: FunctionLike): { member?: string } | undefined {
     let value: Node = terminal;
@@ -3652,7 +3652,10 @@ export class TypeInferrer {
         Node.isAsExpression(parent) ||
         Node.isTypeAssertion(parent) ||
         Node.isSatisfiesExpression(parent) ||
-        Node.isNonNullExpression(parent)
+        Node.isNonNullExpression(parent) ||
+        // A branch of a conditional is handed back as the conditional is:
+        // the caller's type holds every branch (`ok ? text : null`).
+        (Node.isConditionalExpression(parent) && parent.getCondition() !== value)
       ) {
         value = parent;
         continue;

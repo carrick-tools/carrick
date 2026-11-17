@@ -56,7 +56,9 @@ export async function readsItself(route: string) {
 // file. The helper reads the JSON into its own type parameter and hands it
 // back as a member of an object of its own; each caller passes an inline
 // type argument and reads `body` off the result.
-const SAME_FILE_TS = `export async function call<T>(path: string, init?: RequestInit): Promise<{ status: number; body: T }> {
+const SAME_FILE_TS = `import { http } from 'tiny-http';
+
+export async function call<T>(path: string, init?: RequestInit): Promise<{ status: number; body: T }> {
   const res = await fetch(\`/call\${path}\`, init);
   const body: T = await res.json();
   return { status: res.status, body };
@@ -80,6 +82,23 @@ export async function readNote(path: string): Promise<string | null> {
   return text;
 }
 
+export async function callData<T>(path: string): Promise<{ status: number; body: T }> {
+  const res = await http.get(\`/data\${path}\`);
+  const body: T = res.data;
+  return { status: res.status, body };
+}
+
+export async function callDataCast<T>(path: string): Promise<{ status: number; body: T }> {
+  const res = await http.get(\`/datacast\${path}\`);
+  const body = res.data as T;
+  return { status: res.status, body };
+}
+
+export async function readFlag(path: string): Promise<string | null> {
+  const res = await fetch(\`/flag\${path}\`);
+  return res.ok ? await res.text() : null;
+}
+
 export async function loadOrder() {
   const { body } = await call<{ id: number; slug: string }>('/orders/1');
   return body;
@@ -89,6 +108,9 @@ export async function loadCount() {
   return (await callCast<{ count: number }>('/counts')).body;
 }
 
+export const data = () => callData<{ id: number }>('/one');
+export const dataCast = () => callDataCast<{ id: number }>('/one');
+export const flag = () => readFlag('/me');
 export const token = () => readToken('/me');
 export const note = () => readNote('/me');
 `;
@@ -221,7 +243,7 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     alias: string,
     belowCall: string,
     decidingCall: string,
-    result?: { whole: true },
+    result?: { whole: true } | { member: string[] },
     files: { below: [string, string]; deciding: [string, string] } = {
       below: [wrappersPath, WRAPPERS_TS],
       deciding: [callersPath, CALLERS_TS],
@@ -378,6 +400,50 @@ describe('a call result read below a wrapper falls back to the deciding call', (
       assert.strictEqual(inferred.type_string, 'unknown', alias);
       assert.deepStrictEqual((inferred.any_provenance ?? []).map((p) => p.reason), ['bound_by_callers'], alias);
     }
+  });
+
+  it('a labelled read stated as the wrapper T never states T, labelled or not, bound or not', async () => {
+    const results = [undefined, { whole: true as const }, { member: ['data'] }];
+    for (const [name, below, deciding] of [
+      ['Data', 'http.get(`/data${path}`)', "callData<{ id: number }>('/one')"],
+      ['DataCast', 'http.get(`/datacast${path}`)', "callDataCast<{ id: number }>('/one')"],
+    ] as const) {
+      for (const [index, result] of results.entries()) {
+        const at = spanOf(SAME_FILE_TS, below);
+        const through = spanOf(SAME_FILE_TS, deciding);
+        for (const bound of [false, true]) {
+          const alias = `${name}${index}${bound ? 'Bound' : 'Own'}`;
+          const response = await client.send<InferShape>({
+            action: 'infer',
+            request_id: `infer-${alias}`,
+            requests: [
+              {
+                file_path: sameFilePath,
+                line_number: lineAt(SAME_FILE_TS, at.start),
+                span_start: at.start,
+                span_end: at.end,
+                infer_kind: 'call_result',
+                alias,
+                ...(result ? { result } : {}),
+                ...(bound ? { through_call: { file_path: sameFilePath, span_start: through.start, span_end: through.end } } : {}),
+              },
+            ],
+            extraction_config: EXTRACTION_CONFIG,
+          });
+          const inferred = response.inferred_types?.find((t) => t.alias === alias);
+          if (!inferred) continue;
+          const text = collapse(inferred.type_string).replace(/import\("[^"]*"\)/g, '');
+          assert.doesNotMatch(text, /\bT\b/, `${alias}: ${inferred.type_string}`);
+          assert.notStrictEqual(inferred.primary_type_symbol, 'T', alias);
+        }
+      }
+    }
+  });
+
+  it('a text read behind a conditional null keeps the null the caller holds', async () => {
+    const { text, rawText } = await infer('SameFileConditionalNull', 'fetch(`/flag${path}`)', "readFlag('/me')", undefined, sameFile());
+    assert.strictEqual(text, 'string | null');
+    assert.strictEqual(rawText, false);
   });
 
   it('a text read behind an early null keeps the null the caller holds', async () => {
