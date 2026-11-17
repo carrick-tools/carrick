@@ -34,7 +34,7 @@ import {
 } from 'ts-morph';
 import { declarationKey, type LabelledMembers } from './library-claims.js';
 import type { ClaimSlot, ResultShape } from './types.js';
-import type { ReplyStatus } from './capture/reply-status.js';
+import type { ReplyStatus } from './capture/index.js';
 
 /** A function a handler can be: what the inferrer follows a registration to. */
 export type HandlerFunction = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
