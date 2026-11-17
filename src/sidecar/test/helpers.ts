@@ -204,12 +204,15 @@ export class SidecarClient {
     reject: (error: Error) => void;
   }> = [];
 
+  /** `script` is the program to run; tests of this class give a stand-in. */
+  constructor(private readonly script: string = SIDECAR_PATH) {}
+
   /**
    * Start the sidecar process, with `env` added to this process's environment
    */
   async start(env?: NodeJS.ProcessEnv): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.process = spawn('node', [SIDECAR_PATH], {
+      this.process = spawn('node', [this.script], {
         stdio: ['pipe', 'pipe', 'pipe'],
         ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
       });
@@ -252,6 +255,14 @@ export class SidecarClient {
         reject(err);
       });
 
+      // A sidecar that dies mid-request answers nothing: fail the waiting
+      // requests now, naming the death, instead of leaving them pending.
+      this.process.on('exit', (code, signal) => {
+        for (const p of this.responsePromises.splice(0)) {
+          p.reject(new Error(`sidecar exited (code ${code}, signal ${signal}) before it answered`));
+        }
+      });
+
       // Give it a moment to start up
       setTimeout(resolve, 100);
     });
@@ -280,7 +291,7 @@ export class SidecarClient {
         const index = this.responsePromises.findIndex((p) => p.resolve === resolve);
         if (index !== -1) {
           this.responsePromises.splice(index, 1);
-          reject(new Error('Request timeout'));
+          reject(new Error(`Request timeout: no answer to '${String(request.action)}' (${String(request.request_id)}) within ${timeoutMs} ms`));
         }
       }, timeoutMs);
       timer.unref();
@@ -288,18 +299,33 @@ export class SidecarClient {
   }
 
   /**
-   * Stop the sidecar process
+   * Stop the sidecar process. A sidecar stuck in a synchronous loop never
+   * runs its SIGTERM handler, and a child that stays alive keeps the whole
+   * test process from exiting (carrick#4781): after a bounded wait the child
+   * is killed outright, and this returns only once it is gone.
    */
-  async stop(): Promise<void> {
-    if (this.process) {
-      try {
-        await this.send({ action: 'shutdown', request_id: 'shutdown' });
-      } catch {
-        // Ignore shutdown errors
-      }
-      this.process.kill();
-      this.process = null;
+  async stop(graceMs: number = 5000): Promise<void> {
+    const child = this.process;
+    if (!child) return;
+    this.process = null;
+    const gone = new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      else child.once('exit', () => resolve());
+    });
+    this.process = child;
+    try {
+      await this.send({ action: 'shutdown', request_id: 'shutdown' }, 3000);
+    } catch {
+      // Ignore shutdown errors
     }
+    this.process = null;
+    child.kill();
+    const timer = setTimeout(() => {
+      console.error(`[helpers] sidecar ignored SIGTERM for ${graceMs} ms (pid ${child.pid}); killing it`);
+      child.kill('SIGKILL');
+    }, graceMs);
+    await gone;
+    clearTimeout(timer);
   }
 }
 
