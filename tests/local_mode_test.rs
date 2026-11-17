@@ -9211,3 +9211,167 @@ fn an_http_response_mismatch_item_is_unchanged() {
         "the HTTP item is byte for byte today's:\n{row:#}"
     );
 }
+
+/// The pr-seeds pair with the storefront emitting `order:update` at two more
+/// places: again in `live.ts` (line 20, inline) and in a new `live2.ts`
+/// (line 8, typed). Three emits of one event in one service (carrick#4779).
+fn message_pair_with_three_emits() -> (tempfile::TempDir, tempfile::TempDir) {
+    let workspace = workspace_prepared("pr-seeds", &["orders-api", "storefront"], |repo| {
+        if !repo.ends_with("storefront") {
+            return;
+        }
+        let live = repo.join("src/live.ts");
+        let mut text = std::fs::read_to_string(&live).expect("read live.ts");
+        text.push_str(
+            "\nexport function sendAgain(orderId: string): void {\n  socket.emit(\"order:update\", { orderId, status: \"open\" });\n}\n",
+        );
+        std::fs::write(&live, text).expect("write live.ts");
+        std::fs::write(
+            repo.join("src/live2.ts"),
+            "import { io } from \"socket.io-client\";\nimport type { OrderUpdate } from \"./live.js\";\n\nconst socket = io(\"https://orders.internal\");\n\nexport function sendElsewhere(orderId: string): void {\n  const update: OrderUpdate = { orderId, status: \"else\" };\n  socket.emit(\"order:update\", update);\n}\n",
+        )
+        .expect("write live2.ts");
+    });
+    let claims = claims_cassette("pr-seeds", &["orders-api", "storefront"]);
+    run_with_env(
+        workspace.path(),
+        &["refresh", "--workspace", "."],
+        &[(
+            "CARRICK_MOCK_FIXTURE_DIR",
+            claims.path().to_str().expect("utf-8 path"),
+        )],
+    );
+    (workspace, claims)
+}
+
+/// The `CLIENT->SERVER order:update` items of a re-check of `file`, by line.
+fn order_update_items(
+    root: &Path,
+    claims: &Path,
+    file: &str,
+) -> std::collections::BTreeMap<u64, serde_json::Value> {
+    let answer = recheck_json(
+        root,
+        file,
+        &[
+            ("CARRICK_RECHECK_BUDGET_MS", "600000"),
+            (
+                "CARRICK_MOCK_FIXTURE_DIR",
+                claims.to_str().expect("utf-8 path"),
+            ),
+        ],
+    );
+    answer["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| {
+            item["method"] == serde_json::json!("CLIENT->SERVER")
+                && item["path"] == serde_json::json!("order:update")
+        })
+        .map(|item| (item["line"].as_u64().expect("a line"), item.clone()))
+        .collect()
+}
+
+/// carrick#4779: each of the three emits is judged, where main judged the
+/// first and read the other two `not_checked`.
+#[test]
+#[serial]
+fn a_second_emit_in_another_file_is_judged_on_its_own_alias() {
+    let (workspace, claims) = message_pair_with_three_emits();
+    let root = workspace.path();
+    let live = order_update_items(root, claims.path(), "storefront/src/live.ts");
+    assert_eq!(live.keys().copied().collect::<Vec<_>>(), vec![12, 20]);
+    for (line, item) in &live {
+        assert_eq!(
+            item["verdict"]["result"],
+            serde_json::json!("compatible"),
+            "live.ts:{line} is judged:\n{item:#}"
+        );
+    }
+    let other = order_update_items(root, claims.path(), "storefront/src/live2.ts");
+    assert_eq!(other.keys().copied().collect::<Vec<_>>(), vec![8]);
+    assert_eq!(
+        other[&8]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "live2.ts:8 is judged:\n{:#}",
+        other[&8]
+    );
+}
+
+/// carrick#4779: breaking only the second emit is a mismatch at its own
+/// line, and the first emit (another file) stays compatible.
+#[test]
+#[serial]
+fn breaking_only_the_second_emit_is_a_mismatch_at_its_own_line() {
+    let (workspace, claims) = message_pair_with_three_emits();
+    let root = workspace.path();
+    edit(
+        &root.join("storefront/src/live2.ts"),
+        "  const update: OrderUpdate = { orderId, status: \"else\" };\n  socket.emit(\"order:update\", update);",
+        "  const note = orderId;\n  socket.emit(\"order:update\", { orderId, state: note });",
+    );
+    let row = rechecked_mismatch(
+        root,
+        claims.path(),
+        "storefront/src/live2.ts",
+        "CLIENT->SERVER",
+        "order:update",
+    );
+    assert_eq!(row["line"], serde_json::json!(8), "{row:#}");
+    // The listener's type is a named one here, so the reader's side reads
+    // as its name; the emit's own payload is what was sent.
+    assert!(
+        row["actual_type"]
+            .as_str()
+            .is_some_and(|text| text.contains("state: string")),
+        "actual_type is the second emit's payload:\n{row:#}"
+    );
+    assert_eq!(row["expected_type"], serde_json::json!("OrderUpdate"));
+    assert_eq!(row["sent_by"], serde_json::json!("consumer"), "{row:#}");
+    let live = order_update_items(root, claims.path(), "storefront/src/live.ts");
+    assert_eq!(
+        live[&12]["verdict"]["result"],
+        serde_json::json!("compatible"),
+        "the first emit is unmoved:\n{:#}",
+        live[&12]
+    );
+}
+
+/// carrick#4779: the first emit's item is byte for byte what main states
+/// for it (the counterpart's `repo` is this run's temp dir, left out).
+#[test]
+#[serial]
+fn the_first_emits_verdict_and_type_text_are_unchanged() {
+    let (workspace, claims) = message_pair_with_three_emits();
+    let live = order_update_items(workspace.path(), claims.path(), "storefront/src/live.ts");
+    let mut first = live[&12].clone();
+    for counterpart in first["counterparts"].as_array_mut().expect("counterparts") {
+        counterpart
+            .as_object_mut()
+            .expect("a counterpart object")
+            .remove("repo");
+    }
+    assert_eq!(
+        first,
+        serde_json::json!({
+            "col": null,
+            "counterparts": [
+                {"file": "src/realtime.ts", "line": 11, "role": "producer", "service": "orders-api"}
+            ],
+            "evidence": "library_claim",
+            "kind": "call",
+            "line": 12,
+            "method": "CLIENT->SERVER",
+            "path": "order:update",
+            "resolution_source": "library_claim",
+            "source": "fact",
+            "verdict": {
+                "detail": "the compiler compared both sides and found them compatible",
+                "result": "compatible",
+                "state": "resolved"
+            }
+        }),
+        "{first:#}"
+    );
+}
