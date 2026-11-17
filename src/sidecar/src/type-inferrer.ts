@@ -96,6 +96,7 @@ import {
   anchorInHandler,
   joinTypes,
   sameType,
+  typeOfSeveralReturns,
   callNamedBy,
   callResultNamesNoCall,
   constituentsOf,
@@ -680,13 +681,16 @@ interface WrapperReading {
 const LOOP_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'function_return', 'request_body']);
 
 /**
- * carrick#4778: a function whose several returns answer for a route; `kept`
- * is set where some of its returns left the answer (an error or redirect
- * reply), with the union type of those that stay.
+ * carrick#4778: a function whose several returns answer for a route. `kept`
+ * holds the returns that answer and the type read: for a `response_body` row
+ * the union of their payloads, for a `function_return` row (set only where an
+ * error or redirect reply left) the union of the returns that stay.
  */
 interface SurvivingReturns {
   func: FunctionLike;
   kept?: { returns: ReadonlySet<ts.Node>; type: Type };
+  /** Why no return-by-return read answers (`typeOfSeveralReturns`). */
+  unread?: string;
 }
 
 export class TypeInferrer {
@@ -1497,8 +1501,22 @@ export class TypeInferrer {
     while (found && found.compilerNode !== wanted) found = found.getParent();
     if (!found) return undefined;
     const kept = own.severalReturns.returns.map((r) => r.expression);
+    const func = found as FunctionLike;
+    if (request.infer_kind === 'response_body') {
+      // A lone return's body is read at the located node, so each return is
+      // read at the node the located one stands for in it: the payloads, as
+      // the capture reads them, never the replies that carry them.
+      const read = typeOfSeveralReturns(checker, own.severalReturns, (type) =>
+        typeIsOrContainsMachinery(checker, type, this.declaredOutside)
+      );
+      if ('reason' in read) return { func, unread: read.reason };
+      return {
+        func,
+        kept: { returns: new Set<ts.Node>(kept), type: this.wrapCompilerType(found, read.type) },
+      };
+    }
     if (!own.severalReturns.dropped) {
-      return { func: found as FunctionLike };
+      return { func };
     }
     // Some returns left the answer: the function's own return type would
     // still carry them, so the type read is the union of the ones that stay.
@@ -1511,7 +1529,7 @@ export class TypeInferrer {
     const joined = types.length === 1 ? types[0] : joinTypes(checker, types);
     if (!joined) return undefined;
     return {
-      func: found as FunctionLike,
+      func,
       kept: { returns: new Set<ts.Node>(kept), type: this.wrapCompilerType(found, joined) },
     };
   }
@@ -1537,6 +1555,10 @@ export class TypeInferrer {
     several: SurvivingReturns,
     extractionConfig: ExtractionConfig | undefined
   ): InferredType | null {
+    if (several.unread) {
+      this.log(`Response at ${request.file_path}:${request.line_number}: ${several.unread}`);
+      return null;
+    }
     const previous = this.keptReturns;
     this.keptReturns = several.kept ? { func: several.func.compilerNode, ...several.kept } : undefined;
     try {

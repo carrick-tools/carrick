@@ -97,6 +97,7 @@ export { moduleExport } from './anchors.js';
 export {
   anchorInHandler,
   sameType,
+  typeOfSeveralReturns,
   callNamedBy,
   callResultNamesNoCall,
   isFrameworkMachinery,

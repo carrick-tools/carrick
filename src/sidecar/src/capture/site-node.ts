@@ -15,6 +15,7 @@
 
 import ts from 'typescript';
 import { isDroppedReplyStatus, replyStatus } from './reply-status.js';
+import { joinTypes } from './result-label.js';
 
 // ===========================================================================
 // Call-result locators
@@ -681,6 +682,45 @@ function severalReturnsOf(
     if (answers.every((a) => sameType(checker, first, a))) return undefined;
   }
   return { fn, returns, dropped };
+}
+
+/**
+ * carrick#4778: the type of a function with several differing returns, as
+ * the union of what each answers with (`ReturnRead.member`). A return with no
+ * such node that is framework machinery (a reply that carries no body) states
+ * no payload and is left out; any other is unread, and so is the whole.
+ * One reader for the capture and the inferrer's `response_body` rows, so
+ * each return is read as a lone return is: at the node the located one
+ * stands for in it.
+ */
+export function typeOfSeveralReturns(
+  checker: ts.TypeChecker,
+  several: SeveralReturns,
+  isMachinery: (type: ts.Type) => boolean
+): { type: ts.Type } | { reason: string } {
+  const read: ts.Type[] = [];
+  for (const { expression, member } of several.returns) {
+    const type = checker.getTypeAtLocation(member ?? expression);
+    if (!member) {
+      const awaited = checker.getAwaitedType(type) ?? type;
+      if (isMachinery(awaited)) continue;
+      return {
+        reason:
+          'several_returns: the function that answers has several returns of different types ' +
+          'and one of them has no payload this anchor reads, so no single return is its type',
+      };
+    }
+    if (!read.some((r) => sameType(checker, r, type))) read.push(type);
+  }
+  if (read.length === 0) {
+    return { reason: 'several_returns: no return of the function that answers states a payload' };
+  }
+  if (read.length === 1) return { type: read[0] };
+  const joined = joinTypes(checker, read);
+  if (!joined) {
+    return { reason: 'several_returns: the returns of the function that answers cannot be joined' };
+  }
+  return { type: joined };
 }
 
 /** The nodes a value type can be read at: the capture's own target rule. */

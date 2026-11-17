@@ -495,11 +495,21 @@ describe('carrick#4778: a function with several differing returns is not one ret
     }
   });
 
-  it('a handler whose two returns call two helpers: the inferrer reads both, the capture is unknown', () => {
-    both(read('splitPreview'));
-    // No return's payload node mirrors the located one, so the capture cannot
-    // join them: unknown, never the located helper's one return.
+  it('a handler whose two returns call two helpers: unknown on both paths', () => {
+    // No return's payload node mirrors the located one, so neither path can
+    // read each return as a lone return is read: unknown, never the located
+    // helper's one return and never the replies that carry the payloads.
     assert.strictEqual(captured('splitPreview'), 'unknown');
+    assert.strictEqual(inferred.get('Infer_splitPreview'), undefined);
+  });
+
+  it('with no wrapper rule, each return is read as a lone return is: the payloads, not the replies', () => {
+    for (const name of ['helperPreview', 'helperOrder', 'inlinePreview', 'guardedOrder', 'createDraft', 'relayOrder']) {
+      for (const text of [captured(name), read(name)]) {
+        assert.match(text, /order/, `${name}: ${text}`);
+        assert.doesNotMatch(text, /body:|tag:|JsonReply/, `${name}: ${text}`);
+      }
+    }
   });
 
   const successAlone = (name: string): void => {
@@ -559,14 +569,12 @@ describe('carrick#4778: a function with several differing returns is not one ret
   });
 
   it('a return that mirrors no send is not judged by its arguments: never dropped', () => {
-    // `rows().slice(0, 500)` is no reply, so its `500` is no status. The
-    // inferrer reads both returns. Located on the order (the argument), the
-    // capture cannot read that return's payload, so the whole is unknown;
-    // located on the whole call, the capture reads both calls. Never the
-    // order alone.
-    assert.match(read('pageOrder'), /row/);
-    assert.match(read('pageOrder'), /order/);
+    // `rows().slice(0, 500)` is no reply, so its `500` is no status. Located
+    // on the order (the argument), neither path can read that return's
+    // payload, so the whole is unknown; located on the whole call, both read
+    // both calls. Never the order alone.
     assert.strictEqual(captured('pageOrder'), 'unknown');
+    assert.strictEqual(inferred.get('Infer_pageOrder'), undefined);
     assert.match(read('pageCall'), /row/);
     assert.match(read('pageCall'), /order/);
     assert.match(captured('pageCall'), /row/);

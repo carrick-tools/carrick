@@ -26,10 +26,10 @@ import {
   callResultNamesNoCall,
   firstExactLocatorMatch,
   isPreferredTarget,
-  sameType,
+  typeOfSeveralReturns,
   type SeveralReturns,
 } from './site-node.js';
-import { joinTypes, readResultLabel } from './result-label.js';
+import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import { statesNoShape, statusTableBody } from './status-table.js';
@@ -473,7 +473,9 @@ export function resolveAnchor(
     // differ. The answer is all of them, or unknown; never the one the
     // locator landed on.
     if (own.severalReturns) {
-      const read = typeOfSeveralReturns(program, checker, own.severalReturns, args.repoRoot);
+      const read = typeOfSeveralReturns(checker, own.severalReturns, (type) =>
+        typeIsOrContainsMachinery(program, type, args.repoRoot)
+      );
       if ('reason' in read) {
         return {
           request,
@@ -575,42 +577,6 @@ export function resolveAnchor(
   );
 }
 
-/**
- * carrick#4778: the type of a function with several differing returns, as
- * the union of what each answers with (`ReturnRead.member`). A return with no
- * such node that is framework machinery (a reply that carries no body) states
- * no payload and is left out; any other is unread, and so is the whole.
- */
-function typeOfSeveralReturns(
-  program: ts.Program,
-  checker: ts.TypeChecker,
-  several: SeveralReturns,
-  repoRoot: string
-): { type: ts.Type } | { reason: string } {
-  const read: ts.Type[] = [];
-  for (const { expression, member } of several.returns) {
-    const type = checker.getTypeAtLocation(member ?? expression);
-    if (!member) {
-      const awaited = checker.getAwaitedType(type) ?? type;
-      if (typeIsOrContainsMachinery(program, awaited, repoRoot)) continue;
-      return {
-        reason:
-          'several_returns: the function that answers has several returns of different types ' +
-          'and one of them has no payload this anchor reads, so no single return is its type',
-      };
-    }
-    if (!read.some((r) => sameType(checker, r, type))) read.push(type);
-  }
-  if (read.length === 0) {
-    return { reason: 'several_returns: no return of the function that answers states a payload' };
-  }
-  if (read.length === 1) return { type: read[0] };
-  const joined = joinTypes(checker, read);
-  if (!joined) {
-    return { reason: 'several_returns: the returns of the function that answers cannot be joined' };
-  }
-  return { type: joined };
-}
 
 /**
  * Shared tail of the infer paths (locator-resolved node and #498
