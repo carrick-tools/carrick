@@ -1615,6 +1615,13 @@ pub struct Checked {
     /// when zero, so a run whose main side held is unchanged.
     #[serde(skip_serializing_if = "is_zero")]
     pub removals_not_checked: usize,
+    /// Rows of edited files a no-model carry did not carry, by reason code
+    /// (carrick#4768): the scanner's own tally over the services this run
+    /// read, `carried_untyped` included. Absent when no carry ran, which is
+    /// every model-asking PR check, so absent is never zero; `{}` when it ran
+    /// and dropped nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_not_carried: Option<std::collections::BTreeMap<String, usize>>,
     pub dependencies: DependencyCounts,
 }
 
@@ -2313,6 +2320,7 @@ mod tests {
             }),
             pairs_left_uncompared: 1,
             removals_not_checked: 0,
+            rows_not_carried: None,
             dependencies: DependencyCounts {
                 shared: 41,
                 changed: Some(2),
@@ -2338,7 +2346,18 @@ mod tests {
                 "sdk_pairs": { "compatible": 4, "unverifiable": 0, "incompatible": 1, "not_compared": 2 },
                 "pairs_left_uncompared": 1,
                 "dependencies": { "shared": 41, "changed": 2 },
-            })
+            }),
+            "no carry ran: the key is absent, never zero"
+        );
+        payload.checked.as_mut().unwrap().rows_not_carried = Some(Default::default());
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["checked"]["rows_not_carried"], json!({}));
+        payload.checked.as_mut().unwrap().rows_not_carried =
+            Some([("no_matching_call".to_string(), 2)].into_iter().collect());
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            v["checked"]["rows_not_carried"],
+            json!({"no_matching_call": 2})
         );
 
         let Some(baseline) = &mut payload.baseline else {

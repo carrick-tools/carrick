@@ -5085,7 +5085,7 @@ fn rename_connected(root: &Path) {
 
 /// The no-model re-scan the re-check and `refresh` run for the producer, with
 /// the stored index as its previous generation, and the blob it writes.
-fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
+fn no_model_rescan_command(root: &Path, changed_only: bool) -> Command {
     let out = root.join("rescan-out");
     let _ = std::fs::remove_dir_all(&out);
     std::fs::create_dir_all(&out).expect("create the scan dir");
@@ -5095,7 +5095,8 @@ fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
         serde_json::to_vec(&vec![stored_blob(root, "items-api")]).expect("serialise"),
     )
     .expect("write the previous generation");
-    let output = Command::new(carrick())
+    let mut command = Command::new(carrick());
+    command
         .arg(root.join("items-api"))
         .args(changed_only.then_some("--changed-only"))
         .env_remove("CARRICK_TOKEN")
@@ -5118,7 +5119,13 @@ fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
         .env("CARRICK_SKIP_SIGNATURES", "1")
         .env("CARRICK_MOCK_ALL", "1")
         .env("CARRICK_LOCAL_STORAGE_DIR", &out)
-        .env("CARRICK_LOCAL_HOSTED_PREVIOUS", &previous)
+        .env("CARRICK_LOCAL_HOSTED_PREVIOUS", &previous);
+    command
+}
+
+fn no_model_rescan(root: &Path, changed_only: bool) -> serde_json::Value {
+    let out = root.join("rescan-out");
+    let output = no_model_rescan_command(root, changed_only)
         .output()
         .expect("spawn the re-scan");
     assert!(
@@ -5464,6 +5471,58 @@ fn a_changed_registration_line_is_not_carried_and_is_counted() {
         routes.iter().any(|r| r.starts_with("/api/v1/items/:id@"))
             && routes.iter().any(|r| r.starts_with("/api/v1/items@")),
         "the untouched registrations kept their routes: {routes:?}"
+    );
+}
+
+/// The PR result counts the rows a no-model PR scan did not carry
+/// (carrick#4768), as `checked.rows_not_carried`, by the scanner's own reason
+/// codes.
+#[test]
+#[serial]
+fn a_pr_result_counts_rows_not_carried() {
+    let workspace = carry_workspace();
+    let root = workspace.path();
+    let repo = root.join("items-api");
+    let rev = |spec: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", spec])
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let base = rev("HEAD");
+    edit(
+        &root.join(CARRY_ROUTES),
+        "'/items/:id/status'",
+        "'/items/:id/state'",
+    );
+    commit_all(&repo, "edit a registration line");
+    let head = rev("HEAD");
+
+    let result = root.join("payload.json");
+    let output = no_model_rescan_command(root, false)
+        .args(["--pr", "1", "--pr-head", &head, "--pr-base", &base])
+        .arg("--changed-only")
+        .env("CARRICK_PR_RESULT_OUT", &result)
+        .output()
+        .expect("spawn the PR scan");
+    assert!(
+        output.status.success(),
+        "the PR scan failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&result).expect("a PR run posts its result"))
+            .expect("the PR result is JSON");
+    assert_eq!(
+        payload["checked"]["rows_not_carried"],
+        serde_json::json!({"registration_line_changed": 1}),
+        "{:#}\nfindings: {:#}\ndelta: {:#}",
+        payload["checked"],
+        payload["findings"],
+        payload["delta"]
     );
 }
 

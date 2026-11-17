@@ -3128,6 +3128,18 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Whether each pair's check compared two known types, which decides if a
     // compatible verdict counts as one (carrick#2284).
     let pair_directions = analyzer.pair_directions();
+    // Services `--changed-only` took from main's stored blob: their boundary
+    // is main's, so the PR's not-carried count skips them (carrick#4768).
+    let carried_services: HashSet<String> = runs
+        .iter()
+        .filter(|run| run.carried)
+        .map(|run| {
+            run.data
+                .service_name
+                .clone()
+                .unwrap_or_else(|| run.data.repo_name.clone())
+        })
+        .collect();
     let pr_result = pr_context().map(|pr| crate::findings::PrResultPayload {
         repo: repo_name.clone(),
         pr_number: pr.number,
@@ -3175,6 +3187,11 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     |pair| pair_directions.for_edge(pair).resolved(),
                 ),
                 removals_not_checked,
+                rows_not_carried: crate::boundary::rows_not_carried(
+                    boundaries
+                        .iter()
+                        .map(|(id, boundary)| (carried_services.contains(id), boundary)),
+                ),
                 dependencies: evidence.dependencies,
             }),
         functions: pr_functions,

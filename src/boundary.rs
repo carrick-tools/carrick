@@ -581,6 +581,32 @@ impl ServiceBoundary {
     }
 }
 
+/// Rows of edited files a no-model carry did not carry, summed over the
+/// services this run read (carrick#4768): `reason code -> rows`, the scanner's
+/// own tally verbatim (`carried_untyped` included).
+///
+/// Each item is `(carried, boundary)`: `carried` is true for a service
+/// `--changed-only` took from main's stored blob, whose boundary is main's and
+/// is skipped. `None` unless a read service's carry looked at a row, so an
+/// ordinary model-asking run states nothing; `Some({})` when it looked and
+/// dropped nothing. Read by the PR result's `checked.rows_not_carried`.
+pub fn rows_not_carried<'a>(
+    services: impl IntoIterator<Item = (bool, &'a ServiceBoundary)>,
+) -> Option<std::collections::BTreeMap<String, usize>> {
+    let mut ran = false;
+    let mut sum = std::collections::BTreeMap::new();
+    for (_, boundary) in services.into_iter().filter(|(carried, _)| !carried) {
+        if boundary.model_rows_carried.is_none() {
+            continue;
+        }
+        ran = true;
+        for (reason, rows) in boundary.model_rows_not_carried_by_reason.iter().flatten() {
+            *sum.entry(reason.clone()).or_insert(0) += rows;
+        }
+    }
+    ran.then_some(sum)
+}
+
 impl ServiceBoundary {
     /// What a scan left for a model to classify, as a table cell — empty when
     /// there is nothing waiting, or when this blob predates the count.
@@ -852,6 +878,57 @@ fn no_body_sites(
 mod tests {
     use super::*;
     use crate::cloud_storage::SdkUnresolved;
+
+    fn carry_boundary(carried_rows: Option<usize>, by_reason: &[(&str, usize)]) -> ServiceBoundary {
+        ServiceBoundary {
+            model_rows_carried: carried_rows,
+            model_rows_not_carried_by_reason: (!by_reason.is_empty()).then(|| {
+                by_reason
+                    .iter()
+                    .map(|(reason, rows)| (reason.to_string(), *rows))
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rows_not_carried_sums_the_tallies_of_the_services_read() {
+        let one = carry_boundary(
+            Some(3),
+            &[("registration_line_changed", 2), ("carried_untyped", 1)],
+        );
+        let two = carry_boundary(Some(1), &[("no_matching_call", 1)]);
+        let sum = rows_not_carried([(false, &one), (false, &two)]).expect("a carry ran");
+        let want: std::collections::BTreeMap<String, usize> = [
+            ("registration_line_changed", 2),
+            ("carried_untyped", 1),
+            ("no_matching_call", 1),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(sum, want);
+
+        let clean = carry_boundary(Some(3), &[]);
+        assert_eq!(
+            rows_not_carried([(false, &clean)]),
+            Some(Default::default())
+        );
+        let none = carry_boundary(None, &[]);
+        assert_eq!(rows_not_carried([(false, &none)]), None);
+        assert_eq!(rows_not_carried(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn rows_not_carried_skips_a_service_carried_from_main() {
+        let stored = carry_boundary(Some(5), &[("no_matching_call", 4)]);
+        let read = carry_boundary(Some(1), &[("registration_line_changed", 1)]);
+        let sum = rows_not_carried([(true, &stored), (false, &read)]).unwrap();
+        assert_eq!(sum.get("no_matching_call"), None);
+        assert_eq!(sum.get("registration_line_changed"), Some(&1));
+        assert_eq!(rows_not_carried([(true, &stored)]), None);
+    }
 
     #[test]
     fn a_count_keeps_the_exact_total_when_the_reasons_are_capped() {
