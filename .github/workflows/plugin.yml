@@ -324,6 +324,15 @@ jobs:
           - name: yarn, Linux x64
             runner: ubuntu-latest
             manager: yarn
+          # The Node floor is 24 (every leg above) and this is the newest
+          # current line. Two ends, no matrix over the versions between: the
+          # floor is where an API this package needs goes missing, the newest
+          # is where one it uses gets removed. Bump `node` here when a newer
+          # line is current.
+          - name: npm, Linux x64, Node 26
+            runner: ubuntu-latest
+            manager: npm
+            node: "26"
     defaults:
       run:
         # Windows runs pwsh by default, and every step below is a shell script.
@@ -334,7 +343,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node || '24' }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
