@@ -50,8 +50,16 @@ export type UnarmedReason = "twin_passes" | "decl_error" | `clean_check_fails:TS
  */
 export type GraphqlForm = { kind: "graphql"; leaf: string | null };
 
+/**
+ * A socket send-form check (an emit's payload, the listener's parameter type
+ * held fixed). The callback receives `__carrick_MsgSent<V, O<k>>`, the
+ * engine's message rule (`write_shadow`'s `message`). An emit argument is a
+ * value, never a promise, so nothing is awaited.
+ */
+export type MessageForm = { kind: "message" };
+
 /** One (row, position) pair, numbered across the overlay, with one stated type per group. */
-export type CheckInput = { n: number; value: Value; groups: Array<{ type: string }>; form?: GraphqlForm };
+export type CheckInput = { n: number; value: Value; groups: Array<{ type: string }>; form?: GraphqlForm | MessageForm };
 
 export type Check = {
   n: number;
@@ -63,7 +71,7 @@ export type Check = {
   /** The check's declaration lines in the appended namespace. */
   declSpan: [number, number];
   /**
-   * A GraphQL form check only: where the callback's body (the `o` of
+   * A GraphQL or message form check only: where the callback's body (the `o` of
    * `, (o) => o)`) starts. Its own diagnostics start exactly there (P8).
    */
   callback?: number;
@@ -218,7 +226,9 @@ export function overlay(file: string, text: string, checks: CheckInput[], wire: 
       const k = `${input.n}_${group}`;
       const stated = mode === "twin" ? `(${g.type}) & { readonly __carrick_never: true }` : `(${g.type})`;
       decls.push(`  type O${k} = ${stated};`);
-      if (form) {
+      if (form?.kind === "message") {
+        decls.push(`  function send${k}<V>(v: V, c: (o: __carrick_MsgSent<V, O${k}>) => O${k}): V;`);
+      } else if (form) {
         const leaf = form.leaf !== null;
         if (leaf) decls.push(`  type L${k} = ${form.leaf};`);
         const sent = leaf ? `__carrick_GqlSentS<Awaited<V>, O${k}, L${k}>` : `__carrick_GqlSent<Awaited<V>, O${k}>`;

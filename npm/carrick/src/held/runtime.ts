@@ -39,11 +39,13 @@ import {
   type CheckInput,
   type Diag,
   type GraphqlForm,
+  type MessageForm,
   type Overlay,
   type Region,
   type SiteFinder,
   type Value,
 } from "./place.ts";
+import { messageSendRows } from "./message-rows.ts";
 import { engineEntry, engineSiteFinder, writeShadow, type FitOptions, type ShadowAnswer, type ShadowGraphql } from "./shadow.ts";
 import { StepTimer, type Steps } from "./steps.ts";
 
@@ -58,7 +60,7 @@ export type RuntimeDeps = {
   env?: NodeJS.ProcessEnv;
   /** The built compiler engine's entry; found from the environment when unset. */
   entry?: string | null;
-  /** The producer response rows now, HTTP and GraphQL. Default: the fact file's. */
+  /** The rows a check can sit on now: producer responses (HTTP, GraphQL) and socket emitters joined to their listeners. Default: the fact file's. */
   rows?: () => Promise<ContractRow[]>;
   /** A service's GraphQL SDL table now, or null. Default: the fact file's `gqltypes` row. */
   graphqlTypes?: (repo: string, service: string) => Promise<GraphqlTypeTable | null>;
@@ -72,8 +74,8 @@ export type RuntimeDeps = {
   site?: SiteFinder;
 };
 
-type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null };
-type Armed = { label: string; protocol: string; file: string; group: number; position: number };
+type Unarmed = { label: string; protocol: string; file: string; reason: string; group: number; position: number | null; line?: number | null };
+type Armed = { label: string; protocol: string; file: string; group: number; position: number; line?: number | null };
 
 /** A GraphQL row's checks stay unarmed: the service's table is absent, or the compiler engine refused it. */
 const GRAPHQL_TABLE_UNUSABLE = "graphql_table_unusable";
@@ -81,6 +83,10 @@ const GRAPHQL_TABLE_UNUSABLE = "graphql_table_unusable";
 const GRAPHQL_TABLE_CHANGED = "graphql_table_changed";
 
 const isGraphql = (row: ContractRow): boolean => row.protocol === "graphql";
+/** A socket emitter row: its check wraps the emit's payload and holds the listener's parameter type fixed. */
+const isMessage = (row: ContractRow): boolean => row.protocol === "socket" && row.side === "consumer";
+/** A socket row's checks stay unarmed: the compiler engine answered without the judge's message rules. */
+const MESSAGE_RULES_MISSING = "message_rules_missing";
 
 /** The roots a service's GraphQL rows answer, each once, in a stable order. */
 function rootsOf(rows: ContractRow[]): ShadowGraphql["roots"] {
@@ -95,7 +101,12 @@ const graphqlInput = (rows: ContractRow[], table: GraphqlTypeTable | null): stri
 /** The service's GraphQL checks: the declarations a file with one appends, each scalar-form root's leaf, and why none arms. */
 type GraphqlChecks = { wire: string[]; leaves: Map<string, string>; reason: string | null; input: string };
 
-const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}`;
+/** A row's identity. Emitter rows of one event in one file differ only by their line, so theirs carries it; the others' stay as they were. */
+const identity = (row: ContractRow): string => `${row.repo}\0${row.file}\0${row.label}\0${row.site ?? ""}${row.side === "consumer" ? `\0${row.side}\0${row.line ?? ""}` : ""}`;
+/** A consumer row's call line, for its placed row and its held key; every other row adds nothing (HTTP and GraphQL keep their keys). */
+const callLine = (row: ContractRow): { line?: number | null } => (row.side === "consumer" ? { line: row.line } : {});
+/** The once-per-session key of a held line: `contractKey` plus, for a consumer row, its index line (two emits of one event are two lines). */
+const heldKey = (row: ContractRow, g: number): string => `${contractKey(row, g)}${row.side === "consumer" ? `::line::${row.line ?? ""}` : ""}`;
 const groupKey = (row: ContractRow, group: number): string => `${identity(row)}\0${row.groups[group]!.type}`;
 /** One group at one position of its row's `values`. */
 const checkKey = (row: ContractRow, group: number, at: number): string => `${groupKey(row, group)}\0${at}`;
@@ -191,6 +202,8 @@ class HeldService implements ServiceEngine {
   private readonly w: string;
   private readonly wire: string[];
   private readonly gql: GraphqlChecks;
+  /** The engine's message rules a file with a socket check appends; null when the engine gave none. */
+  private readonly message: string[] | null;
 
   constructor(
     init: ServiceInit,
@@ -200,6 +213,7 @@ class HeldService implements ServiceEngine {
     ownFiles: string[],
     wire: string[],
     gql: GraphqlChecks,
+    message: string[] | null,
   ) {
     this.init = init;
     this.deps = deps;
@@ -207,6 +221,7 @@ class HeldService implements ServiceEngine {
     this.w = w;
     this.wire = wire;
     this.gql = gql;
+    this.message = message;
     this.ownFiles = new Set(ownFiles);
     this.program = new Set(ownFiles);
     for (const rel of this.ownFiles) this.sigs.set(rel, this.sigOf(rel));
@@ -286,7 +301,7 @@ class HeldService implements ServiceEngine {
       const key = checkKey(p.row, g, p.at);
       if (onlyNew && decided(key)) return;
       this.armed.delete(key);
-      this.unarmed.set(key, { label: p.row.label, protocol: p.row.protocol, file: rel, reason, group: g, position: p.at });
+      this.unarmed.set(key, { label: p.row.label, protocol: p.row.protocol, file: rel, reason, group: g, position: p.at, ...callLine(p.row) });
     };
     const noneFor = (reason: string): void => {
       for (const p of positions) p.row.groups.forEach((_, g) => no(p, g, reason));
@@ -311,6 +326,10 @@ class HeldService implements ServiceEngine {
         p.row.groups.forEach((_, g) => no(p, g, this.gql.reason!));
         continue;
       }
+      if (isMessage(p.row) && this.message === null) {
+        p.row.groups.forEach((_, g) => no(p, g, MESSAGE_RULES_MISSING));
+        continue;
+      }
       const span = p.row.values![p.at]!.span;
       let placed: Value | string;
       try {
@@ -325,7 +344,8 @@ class HeldService implements ServiceEngine {
       }
       this.values.set(p.id, placed);
       // A GraphQL check never arms on a stated top type or bytes (L-G1a): the engine's form composes none of the judge's gates for them.
-      const groups = p.row.groups.map((_, g) => g).filter((g) => !(isGraphql(p.row) && isTopOrBytes(p.row.groups[g]!.type)));
+      // A socket check neither: a listener typed any, unknown, never or bytes states no contract the held form reads.
+      const groups = p.row.groups.map((_, g) => g).filter((g) => !((isGraphql(p.row) || isMessage(p.row)) && isTopOrBytes(p.row.groups[g]!.type)));
       p.row.groups.forEach((_, g) => { if (!groups.includes(g)) no(p, g, "top_type"); });
       if (groups.length > 0) entries.push({ pos: p, value: placed, groups });
     }
@@ -371,16 +391,24 @@ class HeldService implements ServiceEngine {
     });
   }
 
-  /** A GraphQL row's form: the scalar form where the engine gave its root a leaf, else the JSON form (P5). */
-  private formOf(row: ContractRow): GraphqlForm | undefined {
+  /** A GraphQL row's form: the scalar form where the engine gave its root a leaf, else the JSON form (P5). A socket emitter's: the message form. */
+  private formOf(row: ContractRow): GraphqlForm | MessageForm | undefined {
+    if (isMessage(row)) return { kind: "message" };
     if (!isGraphql(row)) return undefined;
     const root = row.graphql_root;
     return { kind: "graphql", leaf: (root && this.gql.leaves.get(`${root.type}.${root.field}`)) ?? null };
   }
 
-  /** `overlay` with the wire its checks read: a file with a GraphQL check also appends the engine's GraphQL rules; any other keeps its text. */
+  /**
+   * `overlay` with the wire its checks read, per kind: a file with a GraphQL
+   * check also appends the engine's GraphQL rules, a file with a socket check
+   * the engine's message rules, a file with both appends both; a file with
+   * neither keeps its text.
+   */
   private overlayOf(rel: string, text: string, inputs: CheckInput[], mode: "clean" | "twin"): Overlay {
-    return overlay(this.shadow(rel), text, inputs, inputs.some((i) => i.form) ? this.gql.wire : this.wire, mode);
+    const base = inputs.some((i) => i.form?.kind === "graphql") ? this.gql.wire : this.wire;
+    const wire = inputs.some((i) => i.form?.kind === "message") ? [...base, ...(this.message ?? [])] : base;
+    return overlay(this.shadow(rel), text, inputs, wire, mode);
   }
 
   /** The armed groups of each position of `rel`, placed where they are now. */
@@ -415,13 +443,13 @@ class HeldService implements ServiceEngine {
     const unarmed: Unarmed[] = [];
     for (const row of this.rows) {
       if (!hasValues(row)) {
-        row.groups.forEach((_, g) => unarmed.push({ label: row.label, protocol: row.protocol, file: row.file, reason: "no_values", group: g, position: null }));
+        row.groups.forEach((_, g) => unarmed.push({ label: row.label, protocol: row.protocol, file: row.file, reason: "no_values", group: g, position: null, ...callLine(row) }));
         continue;
       }
       row.values!.forEach((v, at) => {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
-          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at });
+          if (this.armed.has(key)) armed.push({ label: row.label, protocol: row.protocol, file: v.file, group: g, position: at, ...callLine(row) });
           else if (this.unarmed.has(key)) unarmed.push(this.unarmed.get(key)!);
         });
       });
@@ -520,7 +548,7 @@ class HeldService implements ServiceEngine {
         row.groups.forEach((_, g) => {
           const key = checkKey(row, g, at);
           this.armed.delete(key);
-          this.unarmed.set(key, { label: row.label, protocol: row.protocol, file: v.file, reason, group: g, position: at });
+          this.unarmed.set(key, { label: row.label, protocol: row.protocol, file: v.file, reason, group: g, position: at, ...callLine(row) });
         });
       });
     }
@@ -554,12 +582,12 @@ class HeldService implements ServiceEngine {
         const entry = view.entries[check.n]!;
         const g = entry.groups[check.group]!;
         const row = entry.pos.row;
-        const key = `${contractKey(row, g)}\0${g}`;
+        const key = `${heldKey(row, g)}\0${g}`;
         if (said.has(key)) continue;
         said.add(key);
         const first = diags[0]!;
         out.push({
-          row_key: contractKey(row, g),
+          row_key: heldKey(row, g),
           group: g,
           label: row.label,
           consumer: [...new Set(row.groups[g]!.places.map((p) => p.service))].join(", "),
@@ -572,6 +600,7 @@ class HeldService implements ServiceEngine {
           row_path: path.join(this.init.repo_path, row.file),
           places: row.groups[g]!.places.map((p) => ({ service: p.service, file: p.file, line: p.line })),
           expected: row.groups[g]!.type,
+          ...(isMessage(row) ? { side: "consumer" as const } : {}),
         });
       }
     }
@@ -674,7 +703,7 @@ async function factRows(root: string): Promise<ContractRow[]> {
   const store = await openFacts(root);
   if (store === null) return [];
   try {
-    return [...store.producerResponses(), ...store.graphqlProducerResponses()];
+    return [...store.producerResponses(), ...store.graphqlProducerResponses(), ...messageSendRows(store.messageRows())];
   } finally {
     store.close();
   }
@@ -692,7 +721,7 @@ async function factTable(root: string, repo: string, service: string): Promise<G
 
 /** Every row of `rows` unarmed, each for the reason `why` gives it. */
 const allUnarmed = (rows: ContractRow[], why: (row: ContractRow) => string): Unarmed[] =>
-  rows.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, protocol: row.protocol, file: row.file, reason: why(row), group: g, position: null })));
+  rows.flatMap((row) => row.groups.map((_, g) => ({ label: row.label, protocol: row.protocol, file: row.file, reason: why(row), group: g, position: null, ...callLine(row) })));
 
 export function createRuntime(options: RuntimeDeps): ServiceRuntime {
   const env = options.env ?? process.env;
@@ -733,9 +762,12 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, () => "options_differ"));
         return { engine: new IdleService() };
       }
-      const armable = (row: ContractRow): boolean => hasValues(row) && !(isGraphql(row) && graphqlReason !== null);
+      const message = shadow.message ?? null;
+      const blocked = (row: ContractRow): string | null =>
+        isGraphql(row) && graphqlReason !== null ? graphqlReason : isMessage(row) && message === null ? MESSAGE_RULES_MISSING : null;
+      const armable = (row: ContractRow): boolean => hasValues(row) && blocked(row) === null;
       if (!mine.some(armable)) {
-        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, (row) => (hasValues(row) ? graphqlReason! : "no_values")));
+        writePlaced(placedPath(options.root, init.service, options.home), init.service, [], allUnarmed(mine, (row) => (hasValues(row) ? blocked(row)! : "no_values")));
         return { engine: new IdleService() };
       }
       const w = path.dirname(shadow.tsconfig);
@@ -749,7 +781,7 @@ export function createRuntime(options: RuntimeDeps): ServiceRuntime {
         reason: graphqlReason,
         input: graphqlInput(mine, table),
       };
-      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql);
+      const service = new HeldService(init, { ...deps, site }, engine, w, shadow.own_files, wire, gql, message);
       try {
         service.loadRows(mine);
         await service.gate(false);

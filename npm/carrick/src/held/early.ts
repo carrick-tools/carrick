@@ -143,6 +143,8 @@ export function earlyResult(entry: EarlyFor, lines: readonly HeldLine[]): CheckR
   const items = new Map<string, CheckItem>();
   const moved = new Map<string, MovedRow>();
   for (const line of lines) {
+    // A socket emitter's break (a consumer-side row) is held back: its item shape and its join with part 2 are not built yet.
+    if (line.side === "consumer") continue;
     const detail = heldDetail(line);
     if (detail === null) continue;
     const parts = splitLabel(line.label);

@@ -36,6 +36,8 @@ export type ShadowAnswer = {
    * `Type.field`. A root with no leaf is the judge's JSON form (S-G1).
    */
   graphql?: { lines: string[]; types_decl: string | null; leaves: Record<string, unknown> };
+  /** The judge's message rules a socket check appends beside `tolerances` (`__carrick_MsgSent<S, E>`); absent from an engine built before them. */
+  message?: string[];
 };
 
 /** What `write_shadow` is told of the service's GraphQL: its SDL table and the roots its rows answer. */
