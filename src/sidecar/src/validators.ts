@@ -264,7 +264,11 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
       .optional(),
     raw_text_read: z.literal(true).optional(),
     absent_body_tolerated: z.literal(true).optional(),
-    unread_cause: z.enum(['not_located', 'site_unreadable']).optional(),
+    // Any word; the capture refuses one that is not a key of
+    // `capture/type-reasons.json`, the one list of reasons. This file is
+    // vendored alone by the cloud (see `validators-compiles-alone.test.ts`),
+    // so it cannot import that list.
+    unread_cause: z.string().min(1).optional(),
   }),
 ]);
 

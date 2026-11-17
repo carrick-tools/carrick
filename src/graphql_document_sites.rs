@@ -186,6 +186,11 @@ struct ExecutedDocument {
     /// 1-based line of the call.
     line: u32,
     document: DeclaredDocument,
+    /// The document's generated module is not on the scanned tree: the
+    /// document was read from the service's own document file by the name the
+    /// import spells (carrick#4642). Scan-local; its rows say so
+    /// ([`GraphqlOp::document_module_absent`]).
+    module_absent: bool,
 }
 
 /// Drop HTTP data calls at GraphQL document sites across one service's file
@@ -341,6 +346,7 @@ pub fn read_document_sites(
                         operations: vec![operation.clone()],
                         field_types: HashMap::new(),
                     },
+                    module_absent: true,
                 },
             ));
             continue;
@@ -370,6 +376,7 @@ pub fn read_document_sites(
                     ExecutedDocument {
                         line: call.line,
                         document,
+                        module_absent: false,
                     },
                 ));
             }
@@ -474,6 +481,7 @@ impl DocumentSiteConsumers {
                         executed.line,
                         operation,
                         document.field_types.get(field).cloned(),
+                        executed.module_absent,
                     ));
                 }
             }
@@ -543,6 +551,7 @@ fn site_consumer(
     line: u32,
     operation: &DocumentOperation,
     declared: Option<DeclaredFieldType>,
+    module_absent: bool,
 ) -> GraphqlOp {
     GraphqlOp {
         key,
@@ -569,6 +578,7 @@ fn site_consumer(
         undeclared_selection: None,
         arguments: None,
         sdl_root_type: None,
+        document_module_absent: module_absent,
     }
 }
 
@@ -2029,6 +2039,13 @@ export function MissingPage() {
                 .all(|op| op.declared_result_type.is_none()),
             "untyped until the generated type can be read"
         );
+        assert!(
+            extraction
+                .consumers
+                .iter()
+                .all(|op| op.document_module_absent),
+            "each row placed by the not-on-disk arm says its module is absent"
+        );
     }
 
     #[test]
@@ -2553,6 +2570,7 @@ export type PairQuery = { first?: { id: string } | null, second?: { id: string }
                 3,
                 &operation(document.unwrap_or("query { unused }")),
                 None,
+                false,
             );
             op.operation = document.map(operation);
             op.consumer_located_type_symbol = Some(symbol.to_string());

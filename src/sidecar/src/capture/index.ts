@@ -295,6 +295,18 @@ export function captureStub(opts: CaptureStubOptions): CaptureStubResult {
   const packageName = `@carrick/${sanitizeServiceName(opts.serviceName)}`;
   const stubDir = path.resolve(opts.outDir);
   const errors: string[] = [];
+  // A cause the driver names is a word of the one list of reasons.
+  const unknownCause = opts.anchors.find(
+    (anchor) =>
+      anchor.kind === 'literal' &&
+      anchor.unread_cause !== undefined &&
+      !Object.hasOwn(typeReasons, anchor.unread_cause)
+  );
+  if (unknownCause?.kind === 'literal') {
+    return fail(stubDir, packageName, [
+      `unread_cause '${unknownCause.unread_cause}' on ${unknownCause.alias} is not a key of type-reasons.json`,
+    ]);
+  }
   // Under CARRICK_UNTRUSTED_TREE every compiler read below is held to the
   // checkout, the sidecar's own install, these stub dirs and a Deno graph's
   // npm packages (`bound`, built once the Deno graph exists); otherwise
