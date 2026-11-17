@@ -272,3 +272,42 @@ fn a_caller_that_writes_the_path_keeps_its_request_body_type() {
         );
     }
 }
+
+/// carrick#4513: the generic wrapper reads the JSON into its own `T`
+/// (`(await response.json()) as T`) and returns `{ body, response }`; each
+/// caller in the same file passes `Note` and destructures `body`. The
+/// response is typed where the caller holds it: `body` of the call's awaited
+/// result, `Note`'s members (it is not exported, so no name would resolve).
+/// Never `T`, in the manifest or in the stored text.
+#[test]
+fn a_caller_that_destructures_the_wrappers_body_reads_its_type_argument() {
+    let blob = scan();
+    let bundled = blob["bundled_types"].as_str().unwrap_or_default();
+    for line in [38, 47] {
+        let entries: Vec<&serde_json::Value> = blob["type_manifest"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry["file_path"] == "src/net/site-client.ts"
+                    && entry["line_number"] == line
+                    && entry["evidence"]["infer_kind"] == "call_result"
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "site-client.ts:{line}: {entries:#?}");
+        let entry = entries[0];
+        assert_eq!(
+            entry["expanded_definition"], "{ id: number; slug: string; }",
+            "site-client.ts:{line} response: {entry:#?}"
+        );
+        let alias = entry["type_alias"].as_str().unwrap_or_default();
+        let stored = bundled
+            .lines()
+            .find(|text| text.starts_with(&format!("export type {alias} = ")))
+            .unwrap_or_default();
+        assert!(
+            !stored.ends_with("= T;"),
+            "site-client.ts:{line} stored {stored}"
+        );
+    }
+}

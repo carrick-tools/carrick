@@ -3508,7 +3508,241 @@ export class TypeInferrer {
     return { type: atCaller.type };
   }
 
+  /**
+   * The type of `call` as the call `through_call` names instantiates the
+   * wrapper it is made in (carrick#4375): `typeAtThroughCall`, with no
+   * answer recorded. A request that names no call, or a call that binds
+   * nothing the type holds, reads the call's own type.
+   */
+  private callTypeAsCallerBinds(call: CallExpression, request: InferRequestItem): Type {
+    if (!request.through_call) return call.getType();
+    const atCaller = this.typeAtThroughCall(call, request);
+    return atCaller.kind === 'instantiated' ? atCaller.type : call.getType();
+  }
+
+  /**
+   * A call's result as the caller reads it. A request made below a wrapper
+   * (`through_call` names the call that reaches the wrapper) is read at the
+   * call it names, where the caller states what it reads, in two cases:
+   *
+   *  - the read below finds only transport (a decided `machinery_envelope`,
+   *    or the response object itself, stated by nothing): the wrapper hands
+   *    the transport on, and the body is read off it by its caller;
+   *  - the caller chooses a raw text body: a text read of the value, or a
+   *    text format passed at the call (carrick#4513). A raw text body has no
+   *    JSON shape, so the mark is read at the deciding call whichever call
+   *    the type came from.
+   *
+   * A read below the wrapper that finds a body keeps it.
+   */
   private inferCallResult(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    extractionConfig?: ExtractionConfig
+  ): InferredType | null {
+    const read = this.inferCallResultBelowWrapper(sourceFile, request, extractionConfig);
+    const through = request.through_call;
+    if (!through) return read;
+    const callerFile = this.getSourceFile(through.file_path);
+    const deciding = callerFile
+      ? this.findCallExpressionAtSpan(callerFile, through.span_start, through.span_end)
+      : undefined;
+    if (!callerFile || !deciding || !callNamedBy(deciding.compilerNode)) return read;
+    const held = this.heldAtDecidingCall(sourceFile, request, deciding);
+    if (held) {
+      // A raw text body keeps its mark whichever call the type came from:
+      // `string | null` off a text read is as unverifiable as `string`.
+      markRawTextRead(held, read?.raw_text_read === true);
+      return this.markedAtDecidingCall(held, deciding);
+    }
+    if (read && !this.readIsOnlyTransport(sourceFile, request, read)) {
+      return this.markedAtDecidingCall(read, deciding);
+    }
+    const decidingRequest: InferRequestItem = {
+      ...request,
+      file_path: through.file_path,
+      line_number: deciding.getStartLineNumber(),
+      span_start: through.span_start,
+      span_end: through.span_end,
+      expression_text: undefined,
+      expression_line: undefined,
+      through_call: undefined,
+      result: undefined,
+    };
+    const atDeciding = this.inferCallResultBelowWrapper(callerFile, decidingRequest, extractionConfig);
+    if (!atDeciding || this.readIsOnlyTransport(callerFile, decidingRequest, atDeciding)) {
+      return read ?? atDeciding;
+    }
+    this.log(
+      `Call result at ${request.file_path}:${request.line_number} is only transport; ` +
+        `reading it at the call that reaches the wrapper, ${through.file_path}:${decidingRequest.line_number}`
+    );
+    return atDeciding;
+  }
+
+  /**
+   * carrick#4513: the value a read below a wrapper makes, typed where the
+   * caller holds it. The wrapper the deciding call runs hands that value back
+   * unchanged, as the whole value it returns or as one member of an object it
+   * returns (`return { status: res.status, body }`); the checker then reads
+   * the same spot on the deciding call's awaited result, with the call's type
+   * arguments applied (`call<{ id: number }>(…)` gives `body` that type, and
+   * a declared `Promise<string | null>` keeps its null). Only a call the
+   * store labels no result for is read this way. `undefined` where the
+   * value lands nowhere one spot names, or where the caller's type is a top
+   * type, holds an open type parameter or is transport: the read below then
+   * answers as before.
+   */
+  private heldAtDecidingCall(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    deciding: CallExpression
+  ): InferredType | undefined {
+    // A labelled call's value is not its body: the label names the part that
+    // is, and the read below applies it (carrick#2818).
+    if (request.result) return undefined;
+    const callExpr = this.resolveTargetCallExpression(sourceFile, request);
+    if (!callExpr) return undefined;
+    const func = this.findContainingFunctionForNode(callExpr);
+    if (!func || calledFunction(deciding) !== func) return undefined;
+    const terminal = this.resolveCallResultTerminalNode(callExpr, func).terminal;
+    const landing = this.landingInReturn(terminal, func);
+    if (!landing) return undefined;
+    const awaited = this.unwrapPromiseType(deciding.getType());
+    let held = awaited;
+    if (landing.member !== undefined) {
+      const property = awaited.getProperty(landing.member);
+      if (!property) return undefined;
+      held = property.getTypeAtLocation(deciding);
+    }
+    const text = typeText(held, deciding);
+    if (
+      printedTypeHoldsTopType(text) ||
+      this.openTypeParameterAt(held, deciding) !== undefined ||
+      this.typeIsOrContainsResponseMachinery(held)
+    ) {
+      return undefined;
+    }
+    this.log(
+      `Call result at ${request.file_path}:${request.line_number} lands in what its wrapper returns` +
+        `${landing.member !== undefined ? ` as '${landing.member}'` : ''}; reading it at the call that holds it`
+    );
+    const anchor = this.unwrapArrayLevels(held);
+    return this.createInferredType(
+      request,
+      // A type the service declares but does not export (`interface Note`)
+      // has no name the capture's declarations can follow: print its members.
+      this.expandResolvedTypeStructural(held, text),
+      false,
+      this.getNodeLocation(deciding),
+      undefined,
+      this.primaryTypeSymbol(anchor.element),
+      anchor.depth,
+      undefined,
+      held,
+      anchor.element
+    );
+  }
+
+  /**
+   * Where the value `terminal` holds lands in what `func` returns: the whole
+   * returned value, or one member of a returned object literal, reached
+   * unchanged (through `await`, parentheses, casts, a branch of a
+   * conditional, or one `const` it is given to). `undefined` for no spot or more than one.
+   */
+  private landingInReturn(terminal: Node, func: FunctionLike): { member?: string } | undefined {
+    let value: Node = terminal;
+    for (let parent = value.getParent(); parent; parent = value.getParent()) {
+      if (
+        Node.isAwaitExpression(parent) ||
+        Node.isParenthesizedExpression(parent) ||
+        Node.isAsExpression(parent) ||
+        Node.isTypeAssertion(parent) ||
+        Node.isSatisfiesExpression(parent) ||
+        Node.isNonNullExpression(parent) ||
+        // A branch of a conditional is handed back as the conditional is:
+        // the caller's type holds every branch (`ok ? text : null`).
+        (Node.isConditionalExpression(parent) && parent.getCondition() !== value)
+      ) {
+        value = parent;
+        continue;
+      }
+      break;
+    }
+    const checker = this.project.getTypeChecker().compilerObject;
+    const parent = value.getParent();
+    const local =
+      parent && Node.isVariableDeclaration(parent) && parent.getInitializer() === value
+        ? parent.getNameNode()
+        : undefined;
+    const localSymbol = local && Node.isIdentifier(local) ? local.getSymbol()?.compilerSymbol : undefined;
+    const peel = (node: Node): Node => {
+      let current = peelValueWrappers(node);
+      while (Node.isAwaitExpression(current)) current = peelValueWrappers(current.getExpression());
+      return current;
+    };
+    const holds = (node: Node): boolean =>
+      node === value ||
+      peel(node) === peel(value) ||
+      (localSymbol !== undefined && Node.isIdentifier(peel(node)) && peel(node).getSymbol()?.compilerSymbol === localSymbol);
+    const landings = new Set<string>();
+    for (const returned of this.returnedExpressions(func)) {
+      const expression = peel(returned);
+      if (holds(expression)) {
+        landings.add('');
+        continue;
+      }
+      if (!Node.isObjectLiteralExpression(expression)) continue;
+      for (const property of expression.getProperties()) {
+        if (Node.isShorthandPropertyAssignment(property)) {
+          const symbol = checker.getShorthandAssignmentValueSymbol(property.compilerNode);
+          if (localSymbol !== undefined && symbol === localSymbol) landings.add(`.${property.getName()}`);
+        } else if (Node.isPropertyAssignment(property)) {
+          const name = property.getNameNode();
+          const initializer = property.getInitializer();
+          if ((Node.isIdentifier(name) || Node.isStringLiteral(name)) && initializer && holds(initializer)) {
+            landings.add(`.${Node.isIdentifier(name) ? name.getText() : name.getLiteralText()}`);
+          }
+        }
+      }
+    }
+    if (landings.size !== 1) return undefined;
+    const [landing] = [...landings];
+    return landing === '' ? {} : { member: landing.slice(1) };
+  }
+
+  /** The read states nothing but transport: a decided envelope, or the response object unstated. */
+  private readIsOnlyTransport(
+    sourceFile: SourceFile,
+    request: InferRequestItem,
+    read: InferredType
+  ): boolean {
+    if ((read.any_provenance ?? []).some((p) => p.path === '' && p.reason === 'machinery_envelope')) {
+      return true;
+    }
+    if (read.is_explicit || (read.any_provenance ?? []).length > 0 || request.result) return false;
+    const call = this.resolveTargetCallExpression(sourceFile, request);
+    if (!call) return false;
+    const value = this.unwrapPromiseType(call.getType());
+    return (
+      this.typeIsOrContainsResponseMachinery(value) &&
+      read.type_string.replace(/\s+/g, ' ').trim() === typeText(value, call).replace(/\s+/g, ' ').trim()
+    );
+  }
+
+  /** The raw-text mark the deciding call states, added to a read that did not carry it. */
+  private markedAtDecidingCall(read: InferredType, deciding: CallExpression): InferredType {
+    if (read.raw_text_read || !isBareStringText(read.type_string)) return read;
+    const func = this.findContainingFunctionForNode(deciding);
+    const terminal = this.resolveCallResultTerminalNode(deciding, func).terminal;
+    markRawTextRead(
+      read,
+      this.textReadAtTerminal(deciding, terminal) || this.callChoosesTextBody(deciding)
+    );
+    return read;
+  }
+
+  private inferCallResultBelowWrapper(
     sourceFile: SourceFile,
     request: InferRequestItem,
     extractionConfig?: ExtractionConfig
@@ -3576,6 +3810,16 @@ export class TypeInferrer {
     // model symbol naming an element inside it is not kept as the body.
     const narrowed =
       func && !use.handedUnreadBody ? this.narrowedBodyStatement(terminalNode, func) : undefined;
+    // carrick#4513, carrick#4201: a type the source states inside a generic
+    // wrapper (`const body: T = await res.json()`, `as T`) can name the
+    // wrapper's own type parameter, which only its callers set. Such a read
+    // states no type: the same decided answer as any other read holding it.
+    const statedOpen = [explicitType ? this.explicitTypeNodeFromAncestor(terminalNode) : undefined, narrowed?.typeNode]
+      .map((typeNode) => (typeNode ? this.openTypeParameterAt(typeNode.getType(), terminalNode) : undefined))
+      .find((name) => name !== undefined);
+    if (statedOpen !== undefined) {
+      return this.boundByCallers(request, this.getNodeLocation(terminalNode), statedOpen);
+    }
     if (narrowed) {
       typeString = narrowed.text;
       isExplicit = true;
@@ -3902,7 +4146,12 @@ export class TypeInferrer {
     // type. Where no rule matched that type as the names peel it, the same
     // protocol reading the text takes is read here, so a subclass of
     // `Promise` anchors the row on what it resolves to and never on itself.
-    let callPayloadType = this.unwrapPromiseType(callExpr.getType());
+    //
+    // carrick#4513: a call read below a wrapper is anchored on its payload as
+    // the call `through_call` names instantiates it, as its text is
+    // (`callResultAtThroughCall`): read inside a generic wrapper, the call's
+    // own type holds the wrapper's type parameter, which is never an anchor.
+    let callPayloadType = this.unwrapPromiseType(this.callTypeAsCallerBinds(callExpr, request));
     let callUnwrap = this.unwrapTypeWithConfig(callPayloadType, callExpr, extractionConfig);
     let readByProtocol = false;
     if (!callUnwrap.wasUnwrapped) {
@@ -3965,7 +4214,11 @@ export class TypeInferrer {
     // call is what judges such a call today.
     if (!anchor || !this.primaryTypeSymbol(anchor.element)) {
       const typeArgs = callExpr.getTypeArguments();
-      if (typeArgs.length === 1) {
+      // carrick#4513: a type argument that is the enclosing function's own
+      // type parameter (`http.remove<T>(…)` inside `makeReader<T>`) names
+      // no type of this site's: only that function's callers set it (the
+      // carrick#4201 rule).
+      if (typeArgs.length === 1 && this.openTypeParameterAt(typeArgs[0].getType(), callExpr) === undefined) {
         const argType = this.unwrapPromiseType(typeArgs[0].getType());
         const argUnwrap = this.unwrapTypeWithConfig(
           argType,

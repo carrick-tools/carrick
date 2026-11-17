@@ -70,6 +70,7 @@ fn record(role: &str, handler: bool, payloads: PayloadSlots) -> SiteRecord {
         lead: None,
         unread: None,
         receiver: None,
+        hands_back: None,
     }
 }
 
@@ -241,6 +242,54 @@ fn a_body_built_in_the_wrapper_names_the_call_that_reaches_it() {
     assert_eq!(
         (request.span_start, request.span_end),
         (Some(start), Some(start + built.len() as u32))
+    );
+    let (call_start, call_end) = sidecar_span("http.post(\"/orders\", order)");
+    assert_eq!(
+        request.through_call,
+        Some(ThroughCall {
+            file_path: dir.path().join(FILE).to_string_lossy().into_owned(),
+            span_start: call_start.unwrap(),
+            span_end: call_end.unwrap(),
+        })
+    );
+}
+
+/// carrick#4371 T5: a response read at the labelled call inside the wrapper
+/// (the wrapper hands back something other than the body) names the site's
+/// own call beside it, so the wrapper's type parameter is read as that call
+/// binds it (carrick#4375).
+#[test]
+fn a_result_read_at_the_labelled_call_names_the_call_that_reaches_it() {
+    const WRAPPER: &str = "src/net.ts";
+    const WRAPPER_SOURCE: &str =
+        "export const save = async <T>(o: T) => (await http.post<T>(\"/orders\", o)).ok;\n";
+    let dir = repo();
+    std::fs::write(dir.path().join(WRAPPER), WRAPPER_SOURCE).unwrap();
+    let labelled = "http.post<T>(\"/orders\", o)";
+    let start = WRAPPER_SOURCE.find(labelled).unwrap() as u32;
+    let slots = PayloadSlots {
+        request: None,
+        response: Some(PayloadAt::Result(AnchorAt {
+            file: WRAPPER.to_string(),
+            line: 1,
+            span_start: start + crate::swc_scanner::SWC_SPAN_BASE,
+            span_end: start + labelled.len() as u32 + crate::swc_scanner::SWC_SPAN_BASE,
+        })),
+    };
+    let payloads = SitePayloads::of(&[record("http_client", false, slots)]);
+    let requests = payloads.requests(
+        &[entry(http(), "consumer", "response", "Res", 2)],
+        &dir.path().to_string_lossy(),
+        &ResultIndex::default(),
+        &HashSet::new(),
+    );
+    let [request] = requests.as_slice() else {
+        panic!("{requests:?}");
+    };
+    assert_eq!(request.infer_kind, InferKind::CallResult);
+    assert_eq!(
+        request.file_path,
+        dir.path().join(WRAPPER).to_string_lossy()
     );
     let (call_start, call_end) = sidecar_span("http.post(\"/orders\", order)");
     assert_eq!(
