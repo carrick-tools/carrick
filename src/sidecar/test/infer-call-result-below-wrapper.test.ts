@@ -37,6 +37,13 @@ export function viaClient(route: string) {
   return http.get(\`/client\${route}\`);
 }
 
+// Forwards the caller's type argument to the client (carrick#4513).
+export interface Order { id: string }
+export async function callApi<T>(route: string): Promise<T> {
+  const res = await http.get<T>(\`/api\${route}\`);
+  return res.data;
+}
+
 // Reads the body itself: the read below the call finds a body.
 export async function readsItself(route: string) {
   const res = await fetch(\`/own\${route}\`);
@@ -45,7 +52,9 @@ export async function readsItself(route: string) {
 }
 `;
 
-const CALLERS_TS = `import { relay, timed, forward, viaClient, readsItself } from './wrappers';
+const CALLERS_TS = `import { relay, timed, forward, viaClient, readsItself, callApi, Order } from './wrappers';
+
+export const orders = () => callApi<Order[]>('/orders');
 
 export async function viaRelay() {
   const res = await relay('/item');
@@ -114,6 +123,8 @@ interface InferShape {
     type_string: string;
     raw_text_read?: boolean;
     any_provenance?: Array<{ reason: string }>;
+    primary_type_symbol?: string;
+    type_home?: { symbol?: string };
   }>;
   errors?: string[];
 }
@@ -187,6 +198,8 @@ describe('a call result read below a wrapper falls back to the deciding call', (
       text: collapse(inferred.type_string),
       provenance: (inferred.any_provenance ?? []).map((p) => p.reason),
       rawText: inferred.raw_text_read === true,
+      anchor: inferred.primary_type_symbol,
+      home: inferred.type_home?.symbol,
     };
   };
 
@@ -236,5 +249,12 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     const { text, provenance } = await infer('Self', 'fetch(`/own${route}`)', "readsItself('/own')");
     assert.match(text, /^\{ own: number;? \}$/, text);
     assert.deepStrictEqual(provenance, []);
+  });
+
+  it('a generic wrapper anchors on the type argument its caller passes, never its own parameter', async () => {
+    const { text, anchor, home } = await infer('Generic', 'http.get<T>(`/api${route}`)', "callApi<Order[]>('/orders')");
+    assert.strictEqual(text, 'Order[]');
+    assert.strictEqual(anchor, 'Order');
+    assert.notStrictEqual(home, 'T');
   });
 });

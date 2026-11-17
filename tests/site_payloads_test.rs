@@ -690,6 +690,13 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("keep-retried", "{ n: number; }"),
         ("then-data", "{ size: number; }"),
         ("keep-local-run", "{ done: boolean; }"),
+        // carrick#4513 seeds.
+        ("seed-generic", "import(\"./src/seed-generic-lib\").Order[]"),
+        ("seed-exact", "import(\"./src/seed-exact-lib\").Order[]"),
+        ("seed-chained", "{ items: { id: string; }[]; }"),
+        ("seed-widen", "string | null"),
+        ("seed-widen-caught", "string | null"),
+        ("seed-envelope", "unknown"),
     ] {
         let file = format!("src/{name}.ts");
         let got = captured_flat(&on, &alias_at(&on, "response", &file, 2));

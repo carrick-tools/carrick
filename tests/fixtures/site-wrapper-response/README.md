@@ -49,6 +49,19 @@ deciding call.
 | `keep-retried` | `retry(run)`, a closure handed on | `{ n: number; }` | same |
 | `then-data` | `.then((r) => r.data)`, open `T` | `{ size: number; }` | same |
 | `keep-local-run` | `run()`, a local closure | `{ done: boolean; }` | same |
+| `seed-generic` | `res.data`, open `T`, the caller passes `Order[]` | `Order[]` | same |
+| `seed-exact` | `res.data` (the labelled member) | `Order[]` | same |
+| `seed-chained` | `const { data } = …; const { items } = data; return items` | `{ items: { id: string; }[]; }` | `Order[]` |
+| `seed-widen` | `res.data \|\| null` | `string \| null` | `string` |
+| `seed-widen-caught` | `res.data`, or `null` from a `catch` | `string \| null` | same |
+| `seed-envelope` | `{ body, response }` over an unlabelled `fetch`, body unstated | `unknown` | same |
+
+The `seed-*` rows are carrick#4513's. `seed-chained` holds a member of a
+member, which no one key names, so the response is the labelled call's
+body. `seed-widen` hands back the body or no body (`|| null`, `?? undefined`),
+as a second `return null` would, so it is read at the deciding call, as
+`seed-widen-caught` already was. `seed-generic`'s cassette names `T` as the
+row's symbol, as a model reading the wrapper can.
 
 `keep-retried`, `then-data` and `keep-local-run` move from the deciding call
 to the labelled call; the labelled call holds the wrapper's open `T`, which
