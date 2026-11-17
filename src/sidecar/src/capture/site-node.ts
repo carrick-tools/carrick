@@ -603,17 +603,39 @@ function sameCallee(
   return sent ? sent === there : !there && a.expression.getText() === b.expression.getText();
 }
 
+type SendCall = ts.CallExpression | ts.NewExpression;
+const isSendCall = (n: ts.Node): n is SendCall => ts.isCallExpression(n) || ts.isNewExpression(n);
+
 /**
- * Whether `other` is a send of the one the located return makes: a call of
- * the same callee (carrick#4778, D7). Only such a return is judged by its
- * reply status; `rows.slice(0, 500)` beside `c.json(order)` is no reply.
+ * The send the located node is: the located call itself, or the call it is
+ * an argument of (`c.json(<located>)`). None for any other node.
  */
-function mirrorsSend(checker: ts.TypeChecker, inReturn: ts.Expression, other: ts.Expression): boolean {
-  const mine = unwrapTransparent(inReturn);
-  const theirs = unwrapTransparent(other);
-  const isCall = (n: ts.Expression): n is ts.CallExpression | ts.NewExpression =>
-    ts.isCallExpression(n) || ts.isNewExpression(n);
-  return isCall(mine) && isCall(theirs) && sameCallee(checker, mine, theirs);
+function locatedSend(located: ts.Node): SendCall | undefined {
+  let node: ts.Node = located;
+  while (ts.isExpression(node) && node.parent && wrapsValueTransparently(node.parent as ts.Expression)) {
+    node = node.parent;
+  }
+  const inner = ts.isExpression(located) ? unwrapTransparent(located) : located;
+  if (isSendCall(inner)) return inner;
+  const parent = node.parent;
+  return parent && isSendCall(parent) && (parent.arguments ?? []).some((a) => a === node) ? parent : undefined;
+}
+
+/**
+ * Whether a return is a reply that sends no success body (carrick#4778): a
+ * call of the located send's own callee, which makes it a reply by the
+ * locator's word, whose status the reader calls error or redirect. A return
+ * that calls anything else (a helper, `rows.slice(0, 500)`) is kept, as is
+ * a reply whose status is success, variable or undecided.
+ */
+function leavesAnswer(checker: ts.TypeChecker, send: SendCall | undefined, returned: ts.Expression): boolean {
+  if (!send) return false;
+  const call = unwrapTransparent(returned);
+  return (
+    isSendCall(call) &&
+    sameCallee(checker, send, call) &&
+    isDroppedReplyStatus(replyStatus(checker, call, { readChain: true }))
+  );
 }
 
 /**
@@ -640,16 +662,10 @@ function severalReturnsOf(
     const member = inReturn ? memberOf(checker, located, inReturn, expression) : undefined;
     return member ? { expression, member } : { expression };
   });
-  // A return that sends what the located return sends is a reply by the
-  // locator's word; one whose status is an error or a redirect sends no
-  // success body and is no part of the route's answer. Any other return is
-  // never judged by status (`rows.slice(0, 500)` is not a reply).
-  const returns = all.filter(
-    (r) =>
-      !r.member ||
-      !mirrorsSend(checker, inReturn!, r.expression) ||
-      !isDroppedReplyStatus(replyStatus(checker, r.expression, { readChain: true }))
-  );
+  // Each return is asked on its own merits, whichever function the others
+  // call: an error or redirect reply is no part of the route's answer.
+  const send = locatedSend(located);
+  const returns = all.filter((r) => !leavesAnswer(checker, send, r.expression));
   if (returns.length === 0) return undefined;
   const dropped = returns.length < all.length;
   // The located return left the answer: what stays is the answer, however

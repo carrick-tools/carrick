@@ -34,15 +34,24 @@ export interface Reply {
   status(code: number): Reply;
   send(payload: unknown): Response;
 }
+export interface Delivered<T> { readonly payload: T; readonly tag: 'delivered' }
+export interface Courier {
+  status(code: number): Courier;
+  deliver<T>(payload: T): Delivered<T>;
+}
 export type Handler = (c: Ctx) => unknown;
-export interface Server { get(path: string, handler: Handler): void }
+export interface Server {
+  get(path: string, handler: Handler): void;
+  on(path: string, handler: (courier: Courier) => unknown): void;
+}
 `;
 
-const ROUTES_TS = `import type { Ctx, JsonReply, Reply, Server } from './framework.js';
+const ROUTES_TS = `import type { Courier, Ctx, JsonReply, Reply, Server } from './framework.js';
 
 declare function render(): string;
 declare function load(): { id: number }[];
 declare function rows(): { row: string }[];
+declare function flag(): boolean;
 
 function show(c: Ctx) {
   if (c.query('preview')) return c.json({ preview: true, html: render() });
@@ -110,6 +119,10 @@ function page(c: Ctx) {
   return c.json({ order: load(), total: 3 });
 }
 
+function deliverPart(courier: Courier) {
+  return courier.deliver({ order: load(), total: 3 });
+}
+
 function previewPart(c: Ctx) {
   return c.json({ preview: true, html: render() });
 }
@@ -150,6 +163,16 @@ export function routes(app: Server) {
   });
 
   app.get('/stated', (c) => stated(c));
+
+  app.get('/helper-then-error', (c) => {
+    if (c.query('id')) return orderPart(c);
+    return c.json({ error: 'not found' }, 404);
+  });
+
+  app.on('/chain-mirror', (courier) => {
+    if (flag()) return deliverPart(courier);
+    return courier.status(404).deliver({ error: 'missing' });
+  });
 
   app.get('/create', (c) => create(c));
 
@@ -273,13 +296,28 @@ const ASKS: Record<string, Ask> = {
     line: lineWith("return c.json({ error: 'gone' }, 410)"),
     handler_lines: handler("app.get('/twice'", true),
   },
-  // The handler's inline error reply beside a return of a helper's reply:
-  // no return sends what the other sends, so none is judged by status (D7).
+  // carrick#4796: the handler's inline error reply beside a return of a
+  // helper's reply. The error reply calls the located send's own callee, so
+  // it leaves; one return stays and the row reads as on main.
   guardThenHelper: {
     kind: 'response_body',
     text: ORDER,
     line: lineWith('return c.json({ order: load()', lineWith('function orderPart')),
     handler_lines: handler("app.get('/guard-then-helper'"),
+  },
+  // Its mirror: the helper first, the inline error second.
+  helperThenError: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function orderPart')),
+    handler_lines: handler("app.get('/helper-then-error'"),
+  },
+  // The mirror again, with the error status stated by the reply chain.
+  chainMirror: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return courier.deliver({ order', lineWith('function deliverPart')),
+    handler_lines: handler("app.on('/chain-mirror'"),
   },
   // An annotated helper, located on its error reply.
   statedError: {
@@ -547,14 +585,16 @@ describe('carrick#4778: a function with several differing returns is not one ret
     assert.strictEqual(row?.is_explicit, false, JSON.stringify(row));
   });
 
-  it('an inline error reply beside a helper reply is not judged by status (D7): kept', () => {
-    // Pinned as measured. The two returns send through different calls
-    // (`c.json` beside `orderPart(c)`), so neither is a send of the other and
-    // no status is read: the inferrer reads the handler's whole return, error
-    // reply included; the capture cannot join them and says unknown.
-    assert.match(read('guardThenHelper'), /error/);
-    assert.match(read('guardThenHelper'), /order/);
-    assert.strictEqual(captured('guardThenHelper'), 'unknown');
+  it('carrick#4796: an inline error reply beside a helper reply leaves; the helper success type, as on main', () => {
+    successAlone('guardThenHelper');
+  });
+
+  it('carrick#4796 mirrored: the helper reply first, the inline error second', () => {
+    successAlone('helperThenError');
+  });
+
+  it('carrick#4796 mirrored, the error status stated by the reply chain', () => {
+    successAlone('chainMirror');
   });
 
   it('with a wrapper rule for the reply type, the kept returns alone are unwrapped', () => {
