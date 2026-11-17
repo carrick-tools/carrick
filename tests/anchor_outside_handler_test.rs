@@ -36,7 +36,7 @@ function listInvoices(request: RouteRequest<unknown>) {
   return { invoices: rows, pages: 1 };
 }
 
-export function registerRoutes(server: Server, ids: string[], store: Store) {
+export function registerRoutes(server: Server, ids: string[], store: Store, legacy: any) {
   server.post('/gadgets', async (request: RouteRequest<unknown>, reply: RouteReply) => {
     const payload: GadgetBody = request.body as GadgetBody;
     const a = 1;
@@ -81,6 +81,9 @@ export function registerRoutes(server: Server, ids: string[], store: Store) {
 
   server.get('/tags', (request: RouteRequest<unknown>, reply: RouteReply) =>
     ids.map((id) => ({ tag: id, weight: 1 })));
+
+  server.get('/legacy', (request: RouteRequest<unknown>, reply: RouteReply) =>
+    legacy.map((row: unknown) => ({ legacyRow: 1 })));
 
   server.get('/late', // the late list
     async (request: RouteRequest<unknown>, reply: RouteReply) => {
@@ -675,5 +678,25 @@ fn a_handler_opening_after_a_comment_is_stamped_with_the_literals_lines() {
     assert_eq!(
         lines.end_line as i32,
         line_of("return { lateCount: 2 }") + 1
+    );
+}
+
+/// The handler returns an untyped receiver's `.map(callback)`: the call's
+/// type is `any`, which every type relates to, so it is no evidence that the
+/// callback's return is the response.
+#[test]
+fn a_response_hint_in_a_callback_of_an_untyped_call_is_not_the_handlers_return() {
+    let routes = returning_route(
+        "server.get('/legacy'",
+        "/legacy",
+        "({ legacyRow: 1 })",
+        line_of("legacy.map((row: unknown)"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/legacy'") else {
+        return;
+    };
+    assert!(
+        !both.contains("legacyRow"),
+        "an untyped call's callback return was stored as the response: {both}"
     );
 }
