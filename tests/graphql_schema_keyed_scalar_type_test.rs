@@ -182,8 +182,8 @@ fn a_schema_keyed_field_is_typed_from_its_place() {
     assert!(
         files
             .iter()
-            .all(|file| file == "apps/api/src/graphql/shipments.ts"),
-        "the producer type is anchored at the field's place: {files:?}"
+            .all(|file| file == "apps/api/dist/schema.graphql"),
+        "the manifest entry stays on the schema; the anchor origin below is what moved: {files:?}"
     );
     assert_eq!(
         producer_anchor_origin(&blobs).as_deref(),
