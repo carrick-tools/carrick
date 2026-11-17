@@ -448,12 +448,15 @@ const DEPOT_TYPES: GraphqlTypes = {
       owner: nn(ref('Person')),
       memo: scalar('String'),
       subject: ref('Subject'),
+      contact: ref('Contact'),
     },
   },
   Line: { fields: { sku: nn(scalar('String')) } },
   Note: { fields: { text: nn(scalar('String')) } },
   Person: { fields: { name: nn(scalar('String')) } },
   Subject: { members: ['Person', 'Line'] },
+  // An interface: the table holds its own fields, as for an object.
+  Contact: { fields: { name: nn(scalar('String')) } },
 };
 
 const depot = (pair_key: string, consumerAlias: string): CheckPairSpec => ({
@@ -494,8 +497,12 @@ const DEPOT_CONSUMERS: Record<string, string> = {
   // A union-typed field read through fragments: the table holds only the
   // fields every member shares.
   Fs1_Exp: "{ subject: { __typename: 'Person'; name: string } | { __typename: 'Line'; sku: string } | null }",
+  // An interface-typed field read through a fragment on an implementation.
+  Fi1_Exp: "{ contact: { __typename: 'Person'; name: string; email: string } | null }",
   // An aliased selection inside an absent object field (`owner { who: name }`).
   Falias_Exp: '{ owner: { who: string } }',
+  // A declared sub-field beside the undeclared keys still decides.
+  Fi2_Exp: '{ contact: { name: number; email: string } | null }',
 };
 
 describe('check_v2: fields the record lacks or converts compare in the type the schema declares (carrick#4726)', () => {
@@ -613,20 +620,25 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
     assertCompatible('Ftags_Exp');
   });
 
-  it('a union-typed field read through fragments: pinned as measured (open decision on carrick#4726)', () => {
-    // The table holds a union as the fields every member shares (none here),
-    // and an interface as its own fields, so a member-only field a fragment
-    // reads is not declared on the abstract type and fails. Before the
-    // declared fill this pair read unverifiable.
-    const v = verdict('Fs1_Exp');
-    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  // carrick#4726 ruling: inside a filled object, a consumer key the schema
+  // type does not declare is `any`; whether a selection is declared is the
+  // selection reader's question (carrick#3201). Main read these three
+  // unverifiable (the record-field gate); they now read compatible, never
+  // incompatible.
+  it('a union-typed field read through fragments: compatible', () => {
+    assertCompatible('Fs1_Exp');
   });
 
-  it('an aliased selection inside an absent object field: pinned as measured (open decision on carrick#4726)', () => {
-    // The alias is not a field the schema type declares, so it fails like the
-    // fragment case above. Before the declared fill this pair read unverifiable.
-    const v = verdict('Falias_Exp');
-    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  it('an interface-typed field read through a fragment: compatible', () => {
+    assertCompatible('Fi1_Exp');
+  });
+
+  it('an aliased selection inside an absent object field: compatible', () => {
+    assertCompatible('Falias_Exp');
+  });
+
+  it('a declared sub-field beside undeclared keys still breaks', () => {
+    assertBreak('Fi2_Exp', 'name');
   });
 });
 

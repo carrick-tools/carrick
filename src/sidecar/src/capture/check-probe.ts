@@ -209,8 +209,8 @@ export interface ProbePlan {
    * only: its first line, after the wire line, and its assignment, which sends
    * the wire type with the fields the root record lacks or converts in the
    * type the served schema declares. When the wire line fails this line
-   * decides; any other diagnostic from `declaredFromLine` to it means the fill
-   * was never judged.
+   * decides; any other diagnostic from the line after `assignmentLine` (the
+   * wire alias the fill is built on) to it means the fill was never judged.
    */
   declaredFromLine?: number;
   declaredAssignmentLine?: number;
@@ -466,11 +466,16 @@ export function graphqlScalarWireRule(
  *    elements;
  *  - a built-in scalar is the type it sends (`GqlScalarSent`); a custom
  *    scalar, an enum and a type the table does not hold are `any`, since the
- *    table holds no enum values and no scalar's wire form;
- *  - an object type keeps only the consumer's keys the schema type declares,
- *    so `__typename` (read as optional) passes and a required key the schema
- *    does not declare fails; a consumer that reads it as a non-object gets
- *    `{}`, which assigns to no primitive and no array;
+ *    table holds no enum values and no scalar's wire form. The leaf walk
+ *    (`GqlLeafSent`) does the same for a field the record has: it keeps the
+ *    record's own form and states no constraint of its own;
+ *  - an object type maps each consumer key the schema type declares to its
+ *    declared type; a key it does not declare is `any`: a union member's or
+ *    an interface implementation's field read through a fragment, an alias
+ *    and `__typename` all name fields the table does not hold for the type,
+ *    and whether a selection is declared is the selection reader's question
+ *    (carrick#3201), not this fill's. A consumer that reads the field as a
+ *    non-object gets `{}`, which assigns to no primitive and no array;
  *  - the depth bound gives `any`, and so does a field the consumer does not
  *    read, which it never compares.
  *
@@ -492,7 +497,7 @@ export function graphqlDeclaredDeclarations(prefix: string): string[] {
     `type ${p}GqlConvertedField<C, F> = [unknown] extends [C] ? false : [${p}GqlObjectLeaf<F>] extends [true] ? ${p}GqlNotShape<Exclude<C, null | undefined>> : false;`,
     `type ${p}GqlAt<E, K> = E extends object ? (K extends keyof E ? E[K] : never) : never;`,
     `type ${p}GqlElemOf<E> = E extends readonly (infer X)[] ? X : never;`,
-    `type ${p}GqlSdlObject<E, T extends keyof ${p}GqlTypes, D extends number> = [E] extends [never] ? {} : E extends readonly unknown[] ? {} : E extends (...args: any[]) => any ? {} : E extends object ? { [K in keyof E as K extends keyof ${p}GqlTypes[T] ? K : never]: ${p}GqlSdlDeclared<E[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } : {};`,
+    `type ${p}GqlSdlObject<E, T extends keyof ${p}GqlTypes, D extends number> = [E] extends [never] ? {} : E extends readonly unknown[] ? {} : E extends (...args: any[]) => any ? {} : E extends object ? { [K in keyof E]: K extends keyof ${p}GqlTypes[T] ? ${p}GqlSdlDeclared<E[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> : any } : {};`,
     `type ${p}GqlSdlInner<E, F, D extends number> = [F] extends [{ list: infer I }] ? ${p}GqlSdlDeclared<${p}GqlElemOf<E>, I, ${p}GqlDepth[D]>[] : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : any) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? ${p}GqlSdlObject<Exclude<E, null | undefined>, T, D> : any) : any;`,
     `type ${p}GqlSdlDeclared<E, F, D extends number = 15> = [D] extends [never] ? any : [E] extends [never] ? any : [unknown] extends [E] ? E : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlInner<E, I, D> : ${p}GqlSdlInner<E, F, D> | null;`,
     `type ${p}GqlSdlFilled<C, F, E, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, E, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlElemOf<E>, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [${p}GqlConvertedField<C[K], ${p}GqlFieldOf<T, K>>] extends [true] ? ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> : ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlAt<E, K>, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C> & ${p}GqlNames<E>]: ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } : C) : C) : C;`,

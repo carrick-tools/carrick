@@ -414,13 +414,14 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   );
   // 5'. A GraphQL wire line that fails is read once more (carrick#4726): with
   //     the fields the root record lacks or converts in the type the served
-  //     schema declares. That line decides. Any other diagnostic in its block
-  //     (a type too deep to instantiate makes its alias an error type that
-  //     assigns to anything) means the fill was never judged: unverifiable,
-  //     never compatible.
+  //     schema declares. That line decides. Any other diagnostic from the wire
+  //     alias down to it (a type too deep to instantiate makes its alias an
+  //     error type that assigns to anything, and the fill is built on the
+  //     wire type) means the fill was never judged: unverifiable, never
+  //     compatible.
   let declaredCleared = false;
   if (assignDiag && plan.declaredAssignmentLine !== undefined) {
-    const from = plan.declaredFromLine!;
+    const from = plan.assignmentLine + 1;
     const to = plan.declaredAssignmentLine;
     const unjudged = probeDiags.find(
       (d) => d.line >= from && d.line <= to && !ASSIGNMENT_CODES.has(d.code)

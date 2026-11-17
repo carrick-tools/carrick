@@ -202,6 +202,59 @@ describe('the held GraphQL form agrees with the judge over typed pairs (P13)', (
   }
 });
 
+/**
+ * A type too deep to instantiate (carrick#4726, carrick#4691): a recursive
+ * JSON value beside a Date. The held form never reads compatible on it, and
+ * the judge's declared line never clears it.
+ */
+const DOC = 'type Doc = string | number | boolean | null | Doc[] | { [key: string]: Doc };';
+const DEEP: Case[] = [
+  // carrick#4691, open: the TS2589 lands on the wire alias and the wire line is silent, so the judge reads compatible, as on main.
+  { key: 'deep-doc', root: 'order', sent: '{ id: string; meta: Doc; placed: Date }', expected: '{ id: string; meta: { color: string }; placed: string }', bucket: 'compatible' },
+  // The wire line fails, so the declared line would decide; it is built on the too-deep wire type: unverifiable (main: unverifiable, the record-field gate).
+  { key: 'deep-doc-lines', root: 'order', sent: '{ id: string; lines: Doc; placed: Date }', expected: '{ id: string; lines: { sku: string }[]; label: string | null; placed: string }', bucket: 'unverifiable' },
+];
+
+describe('a too-deep type: the held form speaks, and the declared line never clears it', () => {
+  let root: string;
+  let verdicts: Map<string, CheckVerdict>;
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-held-gql-deep-'));
+    writeStub(root, 'shop', [DOC, ...DEEP.map((c) => `export type S_${c.key.replace(/-/g, '_')} = ${c.sent};`)].join('\n') + '\n');
+    writeStub(root, 'till', DEEP.map((c) => `export type E_${c.key.replace(/-/g, '_')} = ${c.expected};`).join('\n') + '\n');
+    const pairs: CheckPairSpec[] = DEEP.map((c) => ({
+      pair_key: c.key,
+      protocol: 'graphql',
+      type_kind: 'response',
+      producer: { service_name: 'shop', alias: `S_${c.key.replace(/-/g, '_')}` },
+      consumer: { service_name: 'till', alias: `E_${c.key.replace(/-/g, '_')}` },
+      graphql_root: { type: 'Query', field: c.root! },
+    }));
+    const stubs: CheckStubInput[] = [
+      { service_name: 'shop', stub_dir: path.join(root, 'shop'), graphql_types: SHOP_TYPES },
+      { service_name: 'till', stub_dir: path.join(root, 'till') },
+    ];
+    const result = await runCheck({ stubs, pairs });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    verdicts = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  for (const c of DEEP) {
+    it(`${c.key}: judge ${c.bucket}, the held form speaks`, () => {
+      const v = verdicts.get(c.key);
+      assert.ok(v, `verdict for ${c.key}`);
+      assert.strictEqual(v.bucket, c.bucket, JSON.stringify(v));
+      const errors = tscErrors(heldSource(c).replace('type S = ', `${DOC}\ntype S = `));
+      assert.ok(errors.some((e) => /TS2589/.test(e)), JSON.stringify(errors));
+    });
+  }
+});
+
 describe('write_shadow carries the judge\'s GraphQL rules', () => {
   const FIXTURE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures', 'held-node');
 
