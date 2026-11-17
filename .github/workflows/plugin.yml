@@ -465,10 +465,13 @@ jobs:
           . "$NVM_DIR/nvm.sh"
           nvm install 24 >/dev/null
           npm install -g --ignore-scripts --omit=optional "$PWD/$(ls pack/carrick-*.tgz)"
+          GLOBAL="$(npm root -g)/carrick"
           nvm install 22 >/dev/null
           nvm alias default 22 >/dev/null
           NODE22="$(dirname "$(nvm which 22)")"
-          GLOBAL="$(npm root -g)/carrick"
+          # `nvm install` switched this shell to 22; the steps below that run
+          # the package's own code run on the Node it was installed under.
+          nvm use 24 >/dev/null
 
           PROJ="$RUNNER_TEMP/hook-project"
           mkdir -p "$PROJ/.claude"
