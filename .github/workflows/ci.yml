@@ -436,6 +436,9 @@ jobs:
   sidecar:
     name: Sidecar tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    # A shard takes 3 to 4 minutes, 14 at most; a hang must fail, not wait for
+    # the 6-hour default (carrick#4752).
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
