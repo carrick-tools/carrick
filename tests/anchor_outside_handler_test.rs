@@ -36,6 +36,11 @@ function listInvoices(request: RouteRequest<unknown>) {
   return { invoices: rows, pages: 1 };
 }
 
+async function listCredits(request: RouteRequest<unknown>) {
+  const creditRows = [{ creditNo: 'c1', cents: 5 }];
+  return { credits: creditRows };
+}
+
 export function registerRoutes(server: Server, ids: string[], store: Store, legacy: any) {
   server.post('/gadgets', async (request: RouteRequest<unknown>, reply: RouteReply) => {
     const payload: GadgetBody = request.body as GadgetBody;
@@ -68,6 +73,10 @@ export function registerRoutes(server: Server, ids: string[], store: Store, lega
     }));
 
   server.get('/invoices', (request: RouteRequest<unknown>, reply: RouteReply) => listInvoices(request));
+
+  server.get('/credits', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    return await listCredits(request);
+  });
 
   server.get('/receipts', async (request: RouteRequest<unknown>, reply: RouteReply) => {
     return await listReceipts(request);
@@ -109,6 +118,8 @@ export class AuditRoutes {
 
 const RECEIPTS_TS: &str = r#"import { RouteRequest } from './framework';
 
+// Receipts are read from the ledger, one page only. The return below sits on
+// the line of an expression outside every handler in routes.ts.
 export async function listReceipts(request: RouteRequest<unknown>) {
   const receiptTotal = 3;
   return { receipts: ['r1'], receiptTotal };
@@ -529,8 +540,10 @@ fn returning_route(
 }
 
 fn stored_return(routes: &[Route], opening: &str) -> Option<String> {
-    stored(routes, InferKind::FunctionReturn, opening)
-        .map(|(inferred, declared)| format!("{inferred} | {declared}"))
+    stored(routes, InferKind::FunctionReturn, opening).map(|(inferred, declared)| {
+        eprintln!("{opening}: inferred={inferred} declared={declared}");
+        format!("{inferred} | {declared}")
+    })
 }
 
 /// (A) A thin handler returns a helper's call: the hint is the helper's
@@ -698,5 +711,42 @@ fn a_response_hint_in_a_callback_of_an_untyped_call_is_not_the_handlers_return()
     assert!(
         !both.contains("legacyRow"),
         "an untyped call's callback return was stored as the response: {both}"
+    );
+}
+
+/// (A, awaited) The handler's block body returns an awaited helper's call.
+#[test]
+fn a_response_hint_in_an_awaited_helper_the_handler_returns_keeps_the_return_type() {
+    let routes = returning_route(
+        "server.get('/credits'",
+        "/credits",
+        "{ credits: creditRows }",
+        line_of("return { credits: creditRows }"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/credits'") else {
+        return;
+    };
+    assert!(
+        both.contains("creditNo"),
+        "awaited helper's return lost: {both}"
+    );
+}
+
+/// A return hint that sits in the previous route's handler is that
+/// handler's return, not this route's.
+#[test]
+fn a_response_hint_in_the_previous_routes_return_is_not_this_routes_return() {
+    let routes = returning_route(
+        "server.get('/wrapped'",
+        "/wrapped",
+        "{ count: labels.length, labels }",
+        line_of("return { count: labels.length"),
+    );
+    let Some(both) = stored_return(&routes, "server.get('/wrapped'") else {
+        return;
+    };
+    assert!(
+        !both.contains("count"),
+        "the previous route's return was stored: {both}"
     );
 }

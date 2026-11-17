@@ -424,19 +424,25 @@ function linesOf(sourceFile: ts.SourceFile, node: ts.Node): HandlerLines {
 }
 
 /**
- * The function the scanner stamped `lines` for: the outermost function in
+ * The function the scanner stamped `lines` for: an outermost function in
  * `sourceFile` that starts and ends on exactly those lines (a callback that
- * shares both lines with its handler sits inside it).
+ * shares both lines with its handler sits inside it), the last of several as
+ * the registration's handler is its last argument.
  */
 function handlerOnLines(sourceFile: ts.SourceFile, lines: HandlerLines): FunctionNode | undefined {
-  const visit = (node: ts.Node): FunctionNode | undefined => {
+  let handler: FunctionNode | undefined;
+  const visit = (node: ts.Node): void => {
     if (isFunctionNode(node)) {
       const own = linesOf(sourceFile, node);
-      if (own.start_line === lines.start_line && own.end_line === lines.end_line) return node;
+      if (own.start_line === lines.start_line && own.end_line === lines.end_line) {
+        handler = node;
+        return;
+      }
     }
-    return ts.forEachChild(node, visit);
+    ts.forEachChild(node, visit);
   };
-  return ts.forEachChild(sourceFile, visit);
+  ts.forEachChild(sourceFile, visit);
+  return handler;
 }
 
 /** The expressions `fn` returns: its expression body, or its own `return`s. */
@@ -481,40 +487,37 @@ const RETURN_REACH_HOPS = 3;
  * The functions whose return is `handler`'s own answer: the handler, and
  * every function its return reaches. A function returns (directly, awaited or
  * through a transparent wrapper) a call; that call reaches the declaration it
- * resolves to and each function literal passed to it, on any callee form,
- * whose awaited return is the handler's awaited return (the checker decides:
- * each type assignable to the other, neither `any`, `unknown`, `never` nor a
- * type parameter). So `db.transaction(cb)` reaches `cb`,
- * whose return is the call's result, and `items.map(cb)` does not, its result
- * being a list of `cb`'s return. A handler with several returns of different
- * types reaches nothing: one helper's return is then only a part of its answer.
+ * resolves to, and each function literal passed to it, on any callee form,
+ * whose awaited return is the call's awaited type (the checker decides: each
+ * assignable to the other, neither `any`, `unknown`, `never` nor a type
+ * parameter). So `db.transaction(cb)` reaches `cb`, whose return is the
+ * call's result, and `items.map(cb)` does not, its result being a list of
+ * `cb`'s return.
  */
 function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): Set<FunctionNode> {
-  const own = awaitedReturn(checker, handler);
   const reached = new Set<FunctionNode>([handler]);
   let frontier: FunctionNode[] = [handler];
   for (let hop = 0; hop < RETURN_REACH_HOPS && frontier.length > 0; hop += 1) {
     const next: FunctionNode[] = [];
+    const reach = (fn: ts.Node | undefined): void => {
+      if (!fn || !isFunctionNode(fn) || !fn.body || reached.has(fn)) return;
+      reached.add(fn);
+      next.push(fn);
+    };
     for (const fn of frontier) {
       for (const returned of returnedExpressions(fn)) {
         const call = unwrapTransparent(returned);
         if (!ts.isCallExpression(call)) continue;
-        const declaration = checker.getResolvedSignature(call)?.getDeclaration();
-        const candidates: ts.Node[] = [
-          ...(declaration ? [declaration] : []),
-          ...call.arguments.map(unwrapTransparent),
-        ];
-        for (const candidate of candidates) {
+        reach(checker.getResolvedSignature(call)?.getDeclaration());
+        const result = checker.getTypeAtLocation(call);
+        const answered = checker.getAwaitedType(result) ?? result;
+        for (const argument of call.arguments.map(unwrapTransparent)) {
           if (
-            !isFunctionNode(candidate) ||
-            !candidate.body ||
-            reached.has(candidate) ||
-            !sameAnswer(checker, awaitedReturn(checker, candidate), own)
+            (ts.isArrowFunction(argument) || ts.isFunctionExpression(argument)) &&
+            sameAnswer(checker, awaitedReturn(checker, argument), answered)
           ) {
-            continue;
+            reach(argument);
           }
-          reached.add(candidate);
-          next.push(candidate);
         }
       }
     }
