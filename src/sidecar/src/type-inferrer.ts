@@ -4066,7 +4066,11 @@ export class TypeInferrer {
     // call is what judges such a call today.
     if (!anchor || !this.primaryTypeSymbol(anchor.element)) {
       const typeArgs = callExpr.getTypeArguments();
-      if (typeArgs.length === 1) {
+      // carrick#4513: a type argument that is the enclosing function's own
+      // type parameter (`http.remove<T>(…)` inside `makeReader<T>`) names
+      // no type of this site's: only that function's callers set it (the
+      // carrick#4201 rule).
+      if (typeArgs.length === 1 && this.openTypeParameterAt(typeArgs[0].getType(), callExpr) === undefined) {
         const argType = this.unwrapPromiseType(typeArgs[0].getType());
         const argUnwrap = this.unwrapTypeWithConfig(
           argType,

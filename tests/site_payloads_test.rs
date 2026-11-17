@@ -502,6 +502,19 @@ fn captured_flat(blob: &serde_json::Value, alias: &str) -> String {
         .to_string()
 }
 
+/// carrick#4513: the consumer entries whose symbol is a wrapper's own type
+/// parameter, read inside the wrapper. Only the wrapper's callers set it,
+/// so no entry may name it.
+fn entries_naming_a_type_parameter(blob: &serde_json::Value) -> Vec<String> {
+    blob["type_manifest"]
+        .as_array()
+        .expect("type_manifest")
+        .iter()
+        .filter(|entry| entry["role"] == "consumer" && entry["primary_type_symbol"] == "T")
+        .map(|entry| format!("{}:{}", entry["file_path"], entry["line_number"]))
+        .collect()
+}
+
 /// carrick#4319 T1: `tests/fixtures/site-maker-response/`. Where the
 /// deciding call only makes the function that sends (`makeGate({ base })`
 /// returns a closure that calls `http.remove`), the site row's response is
@@ -534,6 +547,11 @@ fn a_maker_decided_site_reads_its_response_at_the_labelled_call() {
         response("src/typed-maker.ts", 6),
         "{ count: number; }",
         "response at src/typed-maker.ts:6"
+    );
+    assert!(
+        entries_naming_a_type_parameter(&on).is_empty(),
+        "{:#?}",
+        entries_naming_a_type_parameter(&on)
     );
     // The request slot does not move.
     let order = captured_flat(&on, &alias_at(&on, "request", "src/poster.ts", 7));
@@ -705,4 +723,9 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(
+        entries_naming_a_type_parameter(&on).is_empty(),
+        "{:#?}",
+        entries_naming_a_type_parameter(&on)
+    );
 }

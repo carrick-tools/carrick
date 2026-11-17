@@ -55,6 +55,7 @@ export async function readsItself(route: string) {
 const CALLERS_TS = `import { relay, timed, forward, viaClient, readsItself, callApi, Order } from './wrappers';
 
 export const orders = () => callApi<Order[]>('/orders');
+export const skus = () => callApi<{ sku: string }>('/skus');
 
 export async function viaRelay() {
   const res = await relay('/item');
@@ -256,5 +257,11 @@ describe('a call result read below a wrapper falls back to the deciding call', (
     assert.strictEqual(text, 'Order[]');
     assert.strictEqual(anchor, 'Order');
     assert.notStrictEqual(home, 'T');
+  });
+
+  it('a generic wrapper given an inline type argument anchors nothing, never its own parameter', async () => {
+    const { text, anchor } = await infer('Inline', 'http.get<T>(`/api${route}`)', "callApi<{ sku: string }>('/skus')");
+    assert.match(text, /^\{ sku: string;? \}$/, text);
+    assert.strictEqual(anchor, undefined);
   });
 });
