@@ -41,7 +41,7 @@ export function getTask(req, res) {
 const IN_LIST = "res.json({ id: req.id });";
 const ON = { CARRICK_COMPILER_LINES: "1", CARRICK_CONTRACT_LINES: "1" };
 const EARLY_HEAD = "Carrick's compiler engine checked api/src/tasks.ts";
-const DETAIL = "Type '{ name: string; }' is not assignable to type the type it expects.";
+const DETAIL = "This code sends '{ name: string; }'; the caller expects '{ id: string }'.";
 
 const group = (label: string, file: string, line: number) => ({
   type: A,

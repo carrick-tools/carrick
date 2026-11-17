@@ -16,12 +16,12 @@ import type { CheckItem, CheckResult, Counterpart, MovedRow } from "../contract.
 import { realPath } from "../fs-util.ts";
 import type { HeldLine } from "./daemon.ts";
 
-/** A quoted inline object type longer than this becomes `the reply`. */
-const MAX_INLINE_TYPE = 80;
+/** A type longer than this is cut to its start, each side on its own. */
+const MAX_SIDE = 60;
 /** The check's alias in a message: `O<row>_<group>`. */
 const ALIAS = /'O\d+_\d+'/g;
 /** A quoted inline object type; its inner text has no quote of its own (the compiler quotes literals with double quotes). */
-const INLINE_OBJECT = /'(\{[^']*\})'/g;
+const INLINE_OBJECT = /'\{[^']*\}'/g;
 /** What must never reach an agent. */
 const MACHINERY = /__C\b|\bsend\d|\bO\d+_\d+\b|__carrick_/;
 /** At most this many characters in one detail. */
@@ -29,11 +29,63 @@ export const MAX_HELD_DETAIL = 240;
 /** What the expected type is cut to, as the CLI cuts its own. */
 const MAX_TYPE = 200;
 
+/** The type a message names for the check's own alias. */
+function expectedName(line: Pick<HeldLine, "symbol"> & { expected?: string }): string {
+  if (line.symbol) return `'${line.symbol}'`;
+  const own = line.expected?.replace(/\s+/g, " ").trim();
+  return own ? shortSide(`'${own.replace(/'/g, '"')}'`) : "a different type";
+}
+
+/** One quoted type in a message, cut to `MAX_SIDE` characters when it is longer. */
+function shortSide(quoted: string): string {
+  if (quoted.length <= MAX_SIDE) return quoted;
+  const inner = quoted.startsWith("'") && quoted.endsWith("'") ? quoted.slice(1, -1) : quoted;
+  const open = inner.startsWith("{");
+  return `'${inner.slice(0, MAX_SIDE - 6).trimEnd()} …${open ? " }" : ""}'`;
+}
+
+const TYPE = "('[^']*'|a different type)";
+const PROP_MISSING = new RegExp(`Property '([^']+)' is missing in type ${TYPE} but required in type ${TYPE}`);
+const NOT_ASSIGNABLE = new RegExp(`^Type ${TYPE} is not assignable to type ${TYPE}\\.?$`);
+const PROP_PATH = /^Types of property '([^']+)' are incompatible\.?$/;
+
+/** The detail's wording for the three kinds of leaf the compiler gives. */
+function missingDetail(prop: string, sent: string, expected: string): string {
+  return `'${prop}' is missing. This code sends ${sent}; the caller expects ${expected}.`;
+}
+function differsDetail(prop: string, sent: string, expected: string): string {
+  return `'${prop}' has a different type. This code sends ${sent}; the caller expects ${expected}.`;
+}
+function wholeDetail(sent: string, expected: string): string {
+  return `This code sends ${sent}; the caller expects ${expected}.`;
+}
+
+/**
+ * The part of the compiler's chain that names the difference. The chain runs
+ * from the whole types down to the leaf, so the leaf is the last line: a
+ * missing property, or a property path ending in two types. Returns null when
+ * the message is none of those.
+ */
+function leafDetail(message: string): string | null {
+  const lines = message.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter((l) => l !== "");
+  const last = lines[lines.length - 1];
+  if (last === undefined) return null;
+  const missing = PROP_MISSING.exec(last);
+  if (missing) {
+    const path = lines.slice(0, -1).flatMap((l) => PROP_PATH.exec(l)?.[1] ?? []);
+    return missingDetail([...path, missing[1]!].join("."), shortSide(missing[2]!), shortSide(missing[3]!));
+  }
+  const path = lines.slice(0, -1).flatMap((l) => PROP_PATH.exec(l)?.[1] ?? []);
+  const pair = NOT_ASSIGNABLE.exec(last);
+  if (pair === null) return null;
+  const [sent, expected] = [shortSide(pair[1]!), shortSide(pair[2]!)];
+  return path.length > 0 ? differsDetail(path.join("."), sent, expected) : wholeDetail(sent, expected);
+}
+
 /** The compiler's message for one break, in words an agent may read, or null when it still shows the check's machinery. */
-export function heldDetail(line: Pick<HeldLine, "message" | "symbol">): string | null {
-  const message = line.message
-    .replace(ALIAS, line.symbol ? `'${line.symbol}'` : "the type it expects")
-    .replace(INLINE_OBJECT, (whole, inner: string) => (inner.length > MAX_INLINE_TYPE ? "the reply" : whole))
+export function heldDetail(line: Pick<HeldLine, "message" | "symbol"> & { expected?: string }): string | null {
+  const aliased = line.message.replace(ALIAS, () => expectedName(line));
+  const message = (leafDetail(aliased) ?? aliased.replace(INLINE_OBJECT, (whole) => shortSide(whole)))
     .replace(/\s+/g, " ")
     .trim();
   if (MACHINERY.test(message)) return null;
