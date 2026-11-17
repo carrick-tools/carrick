@@ -155,7 +155,6 @@ export type GateName =
   | 'sent:form'
   | 'sent:bytes'
   | 'sent:wire_form'
-  | 'sent:field_resolver'
   | 'expected:any'
   | 'expected:unknown'
   | 'expected:never'
@@ -205,6 +204,23 @@ export interface ProbePlan {
    * sends with no literal widened.
    */
   unwidenedFromLine?: number;
+  /**
+   * The GraphQL declared block (carrick#4726), present on a scalar-form probe
+   * only: its first line, after the wire line, and its assignment, which sends
+   * the wire type with the fields the root record lacks or converts in the
+   * type the served schema declares. When the wire line fails this line
+   * decides; any other diagnostic from the line after `assignmentLine` (the
+   * wire alias the fill is built on) to it means the fill was never judged.
+   */
+  declaredFromLine?: number;
+  declaredAssignmentLine?: number;
+  /**
+   * The same assignment with every consumer key the table could not answer
+   * (one the schema type does not declare: a fragment on a union member or an
+   * interface implementation, an alias) as a type that assigns to nothing.
+   * It fails where the declared line passed only through such a key.
+   */
+  declaredReadLine?: number;
 }
 
 /**
@@ -466,51 +482,80 @@ export function graphqlScalarWireRule(
 }
 
 /**
- * The record-field rule's helpers (carrick#1875), namespaced by `prefix`:
- * `<p>GqlObjectLeaf`, `<p>GqlJsonValueLike`, `<p>GqlNotShape`,
- * `<p>GqlConvertedField` and `<p>GqlSdlFilled`. They read `<p>GqlTypes`,
- * `<p>GqlFieldOf` and `<p>GqlDepth`, so they follow the leaf walk's lines.
+ * The declared fill's helpers (carrick#1875 option 1, carrick#4726), namespaced
+ * by `prefix`. They read `<p>GqlTypes`, `<p>GqlScalarSent`, `<p>GqlFieldOf`,
+ * `<p>GqlDepth` and `<p>GqlNames`, so they follow the leaf walk's lines.
  *
- * `GqlSdlFilled<C, F>` is `C` with every field the SDL type `F` declares and
- * the record lacks filled with `any`: a root resolver's record often lacks
- * fields (relations, computed fields) that field resolvers the check does not
- * read supply. A field the SDL does not declare, and a leaf that mismatches
- * beside the absent fields, still fail with the filling, so they stay breaks.
+ * A root resolver's record often lacks fields the schema declares (relations,
+ * computed fields), or holds one as a generic JSON value or a primitive where
+ * the schema declares an object type. Field resolvers the check does not read
+ * supply or convert them. `GqlSdlFilled<C, F, E>` is the record `C` (declared
+ * as `F`) with each such field replaced by `GqlSdlDeclared`, the type the
+ * schema declares for it, read over the consumer's own reading `E`:
  *
- * Rule G: a field the record HAS is filled too when the SDL types it as an
- * object type (or a list of them, at any depth) and the record's own type for
- * it is not an object shape: a primitive, or a generic JSON value. A field
- * resolver converts it. The JSON value is read by its structure, on the whole
- * field before any union splits: it holds every JSON primitive, and an array
- * of itself and a string-keyed object of itself both assign to it. A field
- * that is, or includes, an object shape is still compared field by field. The
- * root record is never a field, so it is never filled whole.
+ *  - non-null strips `null`, a nullable field adds `| null`, a list maps its
+ *    elements;
+ *  - a built-in scalar is the type it sends (`GqlScalarSent`); a custom
+ *    scalar, an enum and a type the table does not hold are `any`, since the
+ *    table holds no enum values and no scalar's wire form. The leaf walk
+ *    (`GqlLeafSent`) does the same for a field the record has: it keeps the
+ *    record's own form and states no constraint of its own;
+ *  - an object type maps each consumer key the schema type declares to its
+ *    declared type. A key it does not declare (a union member's or an
+ *    interface implementation's field read through a fragment, an alias) is
+ *    `U`: `any` on the declared line, `GqlUnread` on the read line, so a pair
+ *    that passes only through such a key is told apart from one the table
+ *    answered. `__typename` is supplied by the server and is `any`. Whether a
+ *    selection is declared at all is the selection reader's question
+ *    (carrick#3201). A consumer that reads the field as a non-object gets
+ *    `{}`, which assigns to no primitive and no array;
+ *  - the depth bound gives `any`, and so does a field the consumer does not
+ *    read, which it never compares.
+ *
+ * Rule G decides conversion: a field the record HAS is converted when the
+ * schema types it as an object type (or a list of them, at any depth) and the
+ * record's own type for it is a primitive or a generic JSON value. The JSON
+ * value is read by its structure, on the whole field before any union splits:
+ * it holds every JSON primitive, and an array of itself and a string-keyed
+ * object of itself both assign to it. A field that is, or includes, an object
+ * shape is compared field by field. The root record is never a field, so it
+ * is never replaced whole. No branch yields `never`.
  */
-export function graphqlFieldResolverDeclarations(prefix: string): string[] {
+export function graphqlDeclaredDeclarations(prefix: string): string[] {
   const p = prefix;
   return [
     `type ${p}GqlObjectLeaf<F> = [F] extends [{ non_null: infer I }] ? ${p}GqlObjectLeaf<I> : [F] extends [{ list: infer I }] ? ${p}GqlObjectLeaf<I> : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? true : false) : false;`,
     `type ${p}GqlJsonValueLike<X> = [string | number | boolean] extends [X] ? ([X[]] extends [X] ? ([{ [k: string]: X }] extends [X] ? true : false) : false) : false;`,
     `type ${p}GqlNotShape<X> = [X] extends [never] ? false : [X] extends [string | number | boolean | bigint] ? true : ${p}GqlJsonValueLike<X>;`,
     `type ${p}GqlConvertedField<C, F> = [unknown] extends [C] ? false : [${p}GqlObjectLeaf<F>] extends [true] ? ${p}GqlNotShape<Exclude<C, null | undefined>> : false;`,
-    `type ${p}GqlSdlFilled<C, F, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [${p}GqlConvertedField<C[K], ${p}GqlFieldOf<T, K>>] extends [true] ? any : ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C>]: any } : C) : C) : C;`,
+    `type ${p}GqlAt<E, K> = E extends object ? (K extends keyof E ? E[K] : never) : never;`,
+    `type ${p}GqlElemOf<E> = E extends readonly (infer X)[] ? X : never;`,
+    `type ${p}GqlUnread = { readonly __carrick_unread: never };`,
+    `type ${p}GqlSdlObject<E, T extends keyof ${p}GqlTypes, D extends number, U> = [E] extends [never] ? {} : E extends readonly unknown[] ? {} : E extends (...args: any[]) => any ? {} : E extends object ? { [K in keyof E]: K extends keyof ${p}GqlTypes[T] ? ${p}GqlSdlDeclared<E[K], ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> : K extends '__typename' ? any : U } : {};`,
+    `type ${p}GqlSdlInner<E, F, U, D extends number> = [F] extends [{ list: infer I }] ? ${p}GqlSdlDeclared<${p}GqlElemOf<E>, I, U, ${p}GqlDepth[D]>[] : [F] extends [{ scalar: infer N }] ? (N extends keyof ${p}GqlScalarSent ? ${p}GqlScalarSent[N] : any) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? ${p}GqlSdlObject<Exclude<E, null | undefined>, T, D, U> : any) : any;`,
+    `type ${p}GqlSdlDeclared<E, F, U, D extends number = 15> = [D] extends [never] ? any : [E] extends [never] ? any : [unknown] extends [E] ? E : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlInner<E, I, U, D> : ${p}GqlSdlInner<E, F, U, D> | null;`,
+    `type ${p}GqlSdlFilled<C, F, E, U, D extends number = 15> = [D] extends [never] ? C : [unknown] extends [C] ? C : [F] extends [{ non_null: infer I }] ? ${p}GqlSdlFilled<C, I, E, U, D> : C extends null | undefined ? C : [F] extends [{ list: infer I }] ? (C extends readonly unknown[] ? { [K in keyof C]: ${p}GqlSdlFilled<C[K], I, ${p}GqlElemOf<E>, U, ${p}GqlDepth[D]> } : C) : [F] extends [{ type: infer T }] ? ([T] extends [keyof ${p}GqlTypes] ? (C extends readonly unknown[] ? C : C extends (...args: any[]) => any ? C : C extends object ? { [K in keyof C]: [${p}GqlConvertedField<C[K], ${p}GqlFieldOf<T, K>>] extends [true] ? ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> : ${p}GqlSdlFilled<C[K], ${p}GqlFieldOf<T, K>, ${p}GqlAt<E, K>, U, ${p}GqlDepth[D]> } & { [K in Exclude<keyof ${p}GqlTypes[T], keyof C> & ${p}GqlNames<E>]: ${p}GqlSdlDeclared<${p}GqlAt<E, K>, ${p}GqlFieldOf<T, K>, U, ${p}GqlDepth[D]> } : C) : C) : C;`,
   ];
 }
 
 /**
- * The record-field gate's question (carrick#1875): true when the wire line
- * fails and the wire type with SDL-declared fields filled
- * (`graphqlFieldResolverDeclarations`) passes, so the verdict hangs on a
- * field resolver nobody read. `wire` is the scalar form's wire type, `leaf`
- * the comparand's SDL leaf.
+ * The declared line's sent type (carrick#4726): the scalar form's wire type
+ * whenever that already assigns, else the wire type with the fields the
+ * record lacks or converts in the type the schema declares
+ * (`graphqlDeclaredDeclarations`). The short-circuit keeps every pair the wire
+ * line passes exactly as it was. `wire` is the scalar form's wire type,
+ * `relaxed` the consumer's reading, `leaf` the comparand's SDL leaf. The probe
+ * and the held check write this one text.
  */
-export function graphqlFieldResolverRule(
+export function graphqlDeclaredRule(
   wire: string,
   relaxed: string,
   leaf: string,
-  prefix: string
+  prefix: string,
+  unread: 'any' | 'unread' = 'any'
 ): string {
-  return `[${wire}] extends [${relaxed}] ? false : [${prefix}GqlSdlFilled<${wire}, ${leaf}>] extends [${relaxed}] ? true : false`;
+  const u = unread === 'any' ? 'any' : `${prefix}GqlUnread`;
+  return `[${wire}] extends [${relaxed}] ? ${wire} : ${prefix}GqlSdlFilled<${wire}, ${leaf}, ${relaxed}, ${u}>`;
 }
 
 export function decisiveAssignmentLine(plan: ProbePlan): number {
@@ -678,6 +723,9 @@ export function buildProbe(
   });
   let assignmentLine: number;
   let wireAssignmentLine: number | undefined;
+  let declaredFromLine: number | undefined;
+  let declaredAssignmentLine: number | undefined;
+  let declaredReadLine: number | undefined;
   if (spec.protocol === 'graphql') {
     // GraphQL selection-set semantics (v1 `unwrapGraphqlPayload` parity): the
     // producer side (always `sent` for graphql — see the direction table) is
@@ -780,16 +828,21 @@ export function buildProbe(
       );
       push(`declare const sentWire: GqlWire;`);
       wireAssignmentLine = push(`const expectedWire: GqlExpected = sentWire;`);
-      // carrick#1875: the record-field gate (`graphqlFieldResolverRule`).
-      // Every line sits after the wire line, so no line above it moves.
-      for (const line of graphqlFieldResolverDeclarations('')) push(line);
-      push(
-        `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`
-      );
-      gateLines.set(
-        push(`type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;`),
-        'sent:field_resolver'
-      );
+      // carrick#4726: the declared line (`graphqlDeclaredRule`). Every line
+      // sits after the wire line, so no line above it moves. When the wire
+      // line fails, this line decides.
+      const [firstDeclared, ...restDeclared] = graphqlDeclaredDeclarations('');
+      declaredFromLine = push(firstDeclared);
+      for (const line of restDeclared) push(line);
+      push(`type GqlDeclared = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`);
+      push(`declare const sentDeclared: GqlDeclared;`);
+      declaredAssignmentLine = push(`const expectedDeclared: GqlExpected = sentDeclared;`);
+      // The same fill with every key the table could not answer as a type
+      // that assigns to nothing the consumer reads: it fails where the line
+      // above passed only through such a key.
+      push(`type GqlDeclaredRead = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '', 'unread')};`);
+      push(`declare const sentDeclaredRead: GqlDeclaredRead;`);
+      declaredReadLine = push(`const expectedDeclaredRead: GqlExpected = sentDeclaredRead;`);
     }
   } else {
     assignmentLine = push(`const expected: Expected = sent;`);
@@ -887,6 +940,9 @@ export function buildProbe(
     gateLines,
     assignmentLine,
     wireAssignmentLine,
+    ...(declaredAssignmentLine === undefined
+      ? {}
+      : { declaredFromLine, declaredAssignmentLine, declaredReadLine }),
     ...(unwidenedFromLine === undefined ? {} : { unwidenedFromLine }),
   };
 }

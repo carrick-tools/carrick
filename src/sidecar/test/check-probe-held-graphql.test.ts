@@ -18,8 +18,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   buildProbe,
-  graphqlFieldResolverDeclarations,
-  graphqlFieldResolverRule,
+  graphqlDeclaredDeclarations,
+  graphqlDeclaredRule,
   jsonWireDeclarations,
   jsonWireRule,
   judgeTolerances,
@@ -51,11 +51,15 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
     assert.deepEqual(Object.keys(GOLDEN).sort(), FIXED_SPECS.map((s) => s.pair_key).sort());
   });
 
-  it('the record-field rule (carrick#1875) follows the wire line in every scalar-form probe', () => {
+  it('the declared line (carrick#4726) follows the wire line in every scalar-form probe', () => {
     const rule = [
-      ...graphqlFieldResolverDeclarations(''),
-      `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
-      'type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;',
+      ...graphqlDeclaredDeclarations(''),
+      `type GqlDeclared = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
+      'declare const sentDeclared: GqlDeclared;',
+      'const expectedDeclared: GqlExpected = sentDeclared;',
+      `type GqlDeclaredRead = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '', 'unread')};`,
+      'declare const sentDeclaredRead: GqlDeclaredRead;',
+      'const expectedDeclaredRead: GqlExpected = sentDeclaredRead;',
     ].join('\n');
     for (const key of Object.keys(GOLDEN)) {
       if (key.startsWith('scalar-')) assert.ok(GOLDEN[key].endsWith(`const expectedWire: GqlExpected = sentWire;\n${rule}\n`), key);
@@ -63,10 +67,11 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
     }
   });
 
-  it('the record-field rule names only prefixed declarations under a prefix', () => {
+  it('the declared rule names only prefixed declarations under a prefix', () => {
     const text = [
-      ...graphqlFieldResolverDeclarations('__carrick_'),
-      graphqlFieldResolverRule('W', 'X', 'L', '__carrick_'),
+      ...graphqlDeclaredDeclarations('__carrick_'),
+      graphqlDeclaredRule('W', 'X', 'L', '__carrick_'),
+      graphqlDeclaredRule('W', 'X', 'L', '__carrick_', 'unread'),
     ].join('\n');
     assert.deepEqual(text.match(/(?<!__carrick_)\bGql\w+/g), null);
   });
@@ -100,14 +105,20 @@ const CASES: Case[] = [
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
-  // carrick#4708: where the judge's record-field gate reads the pair unverifiable, the held form is silent.
-  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  // The same gate must not hide a real break: a leaf mismatch beside an absent field, a sub-field the schema does not declare.
-  { key: 'rf-leaf-beside-absent', root: 'order', sent: '{ id: string; total: number }', expected: '{ label: string; total: string }', bucket: 'incompatible' },
-  { key: 'rf-undeclared-sub-field', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { hint: string }[] }', bucket: 'incompatible' },
+  // carrick#4726: a field the record lacks or converts is read in the type the schema declares, by the judge and the held form alike.
+  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string | null }', bucket: 'compatible' },
+  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'compatible' },
+  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'compatible' },
+  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'compatible' },
+  { key: 'rf-absent-typename', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: "{ __typename: 'Order'; id: string; lines: { __typename: 'Line'; sku: string }[] }", bucket: 'compatible' },
+  // A key the table cannot answer (an alias) inside an absent object: the judge abstains, the held form is silent.
+  { key: 'rf-absent-alias', root: 'order', sent: '{ id: string }', expected: '{ id: string; lines: { code: string }[] }', bucket: 'unverifiable', gate: 'producer:undeclared_selection' },
+  // The declared type decides, so it breaks too: a nullable field read as non-null, a scalar read as another, a list read as a string.
+  { key: 'rf-absent-nullable-read-non-null', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'incompatible' },
+  { key: 'rf-absent-wrong-scalar', root: 'order', sent: '{ id: string }', expected: '{ id: string; total: string }', bucket: 'incompatible' },
+  { key: 'rf-converted-read-as-string', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: string }', bucket: 'compatible' },
+  { key: 'rf-absent-list-read-as-string', root: 'order', sent: '{ id: string }', expected: '{ id: string; lines: string }', bucket: 'incompatible' },
+  // A real leaf mismatch beside an absent field, and a sub-field the schema does not declare, stay breaks.
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },
 ];
@@ -193,6 +204,59 @@ describe('the held GraphQL form agrees with the judge over typed pairs (P13)', (
       const errors = tscErrors(heldSource(c));
       if (c.bucket === 'incompatible') assert.ok(errors.length > 0, 'held should speak');
       else assert.deepEqual(errors, []);
+    });
+  }
+});
+
+/**
+ * A type too deep to instantiate (carrick#4726, carrick#4691): a recursive
+ * JSON value beside a Date. The held form never reads compatible on it, and
+ * the judge's declared line never clears it.
+ */
+const DOC = 'type Doc = string | number | boolean | null | Doc[] | { [key: string]: Doc };';
+const DEEP: Case[] = [
+  // carrick#4691, open: the TS2589 lands on the wire alias and the wire line is silent, so the judge reads compatible, as on main.
+  { key: 'deep-doc', root: 'order', sent: '{ id: string; meta: Doc; placed: Date }', expected: '{ id: string; meta: { color: string }; placed: string }', bucket: 'compatible' },
+  // The wire line fails, so the declared line would decide; it is built on the too-deep wire type: unverifiable (main: unverifiable, the record-field gate).
+  { key: 'deep-doc-lines', root: 'order', sent: '{ id: string; lines: Doc; placed: Date }', expected: '{ id: string; lines: { sku: string }[]; label: string | null; placed: string }', bucket: 'unverifiable' },
+];
+
+describe('a too-deep type: the held form speaks, and the declared line never clears it', () => {
+  let root: string;
+  let verdicts: Map<string, CheckVerdict>;
+
+  before(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-held-gql-deep-'));
+    writeStub(root, 'shop', [DOC, ...DEEP.map((c) => `export type S_${c.key.replace(/-/g, '_')} = ${c.sent};`)].join('\n') + '\n');
+    writeStub(root, 'till', DEEP.map((c) => `export type E_${c.key.replace(/-/g, '_')} = ${c.expected};`).join('\n') + '\n');
+    const pairs: CheckPairSpec[] = DEEP.map((c) => ({
+      pair_key: c.key,
+      protocol: 'graphql',
+      type_kind: 'response',
+      producer: { service_name: 'shop', alias: `S_${c.key.replace(/-/g, '_')}` },
+      consumer: { service_name: 'till', alias: `E_${c.key.replace(/-/g, '_')}` },
+      graphql_root: { type: 'Query', field: c.root! },
+    }));
+    const stubs: CheckStubInput[] = [
+      { service_name: 'shop', stub_dir: path.join(root, 'shop'), graphql_types: SHOP_TYPES },
+      { service_name: 'till', stub_dir: path.join(root, 'till') },
+    ];
+    const result = await runCheck({ stubs, pairs });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    verdicts = new Map(result.verdicts.map((v) => [v.pair_key, v]));
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  for (const c of DEEP) {
+    it(`${c.key}: judge ${c.bucket}, the held form speaks`, () => {
+      const v = verdicts.get(c.key);
+      assert.ok(v, `verdict for ${c.key}`);
+      assert.strictEqual(v.bucket, c.bucket, JSON.stringify(v));
+      const errors = tscErrors(heldSource(c).replace('type S = ', `${DOC}\ntype S = `));
+      assert.ok(errors.some((e) => /TS2589/.test(e)), JSON.stringify(errors));
     });
   }
 });

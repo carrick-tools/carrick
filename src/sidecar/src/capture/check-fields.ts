@@ -135,7 +135,8 @@ function assignabilityOf(
  *
  * The sent side is whatever that assignment actually sent: the GraphQL
  * comparand where one exists, then the JSON wire form where serialising
- * changes the type. Reading `sent` there instead would describe a type the
+ * changes the type, then the GraphQL declared fill where the wire form does
+ * not assign. Reading `sent` there instead would describe a type the
  * judge did not compare, which is the one way a reader of this pair could
  * contradict it.
  */
@@ -181,8 +182,16 @@ export function comparedTypes(
   // optionality gap or the wire note (carrick#1341). Where serialisation did
   // change the type the wire form is a mapped type with real members, and it
   // stays the thing compared, because that is what the judge judged.
+  const sentForm = wireApplied ? wire.type : declared.type;
+  // A GraphQL wire form that does not assign is decided by the declared line
+  // (carrick#4726): the wire type with the fields the root record lacks or
+  // converts in the type the served schema declares. That is what the judge
+  // compared, so the report reads it, and never calls a filled field missing.
+  const filled = declaredConstType(source, checker, 'sentDeclared');
+  const compared =
+    filled !== undefined && !isAssignableTo(sentForm, expected.type) ? filled.type : sentForm;
   return {
-    compared: wireApplied ? wire.type : declared.type,
+    compared,
     expected,
     wireApplied,
     checker,
@@ -222,7 +231,7 @@ export function pairFieldReports(
 function declaredConstType(
   file: ts.SourceFile,
   checker: ts.TypeChecker,
-  name: 'sent' | 'sentComparand' | 'sentWire' | 'expected'
+  name: 'sent' | 'sentComparand' | 'sentWire' | 'sentDeclared' | 'expected'
 ): { type: ts.Type; node: ts.Node } | undefined {
   for (const statement of file.statements) {
     if (!ts.isVariableStatement(statement)) continue;
