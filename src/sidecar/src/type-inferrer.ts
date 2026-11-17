@@ -2569,12 +2569,13 @@ export class TypeInferrer {
     if (walked === null) {
       // The walk read everything the handler returns and published nothing.
       // A located expression inside one of those returns was part of that.
-      if (this.returnedSendHolding(returned, located)) {
+      const holding = this.returnedSendHolding(returned, located);
+      if (holding) {
         this.log(
           `Response locator at ${request.file_path}:${request.line_number} names a send ` +
             'its handler returns, which carries no body a contract can describe; abstaining'
         );
-        return null;
+        return this.noSuccessPayloadOf(request, handler, returned, holding) ?? null;
       }
       // Outside the return, it is either a send itself or what one was handed.
       const sends = [
@@ -2608,9 +2609,13 @@ export class TypeInferrer {
     // Blueprint row N34: the callee resolves to nothing, so only the model's
     // locator says the returned call is a response sender. That is a lead,
     // never a type the check enforces: the row keeps its honest `any`, and the
-    // located argument's reading rides in the provenance for a reader.
+    // located argument's reading rides in the provenance for a reader. Where
+    // every reply the handler returns states an error or redirect status or
+    // carries no body, the lead says there is no success body: decided.
     const sender = this.returnedSendHolding(returned, located);
     if (sender) {
+      const noSuccess = this.noSuccessPayloadOf(request, handler, returned, sender);
+      if (noSuccess) return noSuccess;
       // The printed type names a module the use site does not import by its
       // declaring file, `import("/abs/path").Name`, and this text reaches a
       // reader: keep the bare name, before truncation can split the path.
@@ -2631,6 +2636,98 @@ export class TypeInferrer {
       );
     }
     return walked;
+  }
+
+  /**
+   * The decided answer of a declared handler none of whose replies carries a
+   * success body, or `undefined` when one might (reply-status T2a).
+   *
+   * Every branch of what the handler returns (`responseReturnedExpressions`,
+   * conditionals split; a returned call whose callbacks' returns are already
+   * listed, such as `.match(ok, err)`, is a container and not judged itself)
+   * must be a reply that states an error or redirect status
+   * (`replyStatus`, chain read), or a reply stating a success status that
+   * carries no body: no first argument, `null`, `undefined`, or an init
+   * object (`statesResponseInit`). A branch counts as a reply only when it
+   * is the located send, makes the same call as the located send (callee
+   * root and member, so `reply.status(400).send(x)` matches
+   * `reply.status(410).send(y)`), or types as framework machinery: a status
+   * read off an argument of any other call (`clip(rows, 404)`) is no reply's
+   * status. A status no source states (`new Response(null)`, `next()`) or a
+   * computed one keeps the row undecided.
+   */
+  private noSuccessPayloadOf(
+    request: InferRequestItem,
+    handler: FunctionLike,
+    returned: Node[],
+    locatedSend: Node | undefined
+  ): InferredType | undefined {
+    const branches = returned.flatMap((expression) => this.expandResponseBranches(expression, 0));
+    const judged = branches.filter(
+      (branch) =>
+        !branches.some(
+          (inner) =>
+            inner !== branch &&
+            branch.getStart() <= inner.getStart() &&
+            inner.getEnd() <= branch.getEnd()
+        )
+    );
+    const sentWith = locatedSend ? this.sendCalleeKey(locatedSend) : undefined;
+    const isReply = (branch: Node): boolean =>
+      branch === locatedSend ||
+      (sentWith !== undefined && this.sendCalleeKey(branch) === sentWith) ||
+      this.typeIsOrContainsResponseMachinery(this.unwrapPromiseType(branch.getType()));
+    const carriesNoSuccessBody = (branch: Node): boolean => {
+      if (!isReply(branch)) return false;
+      const status = replyStatus(this.replyChecker(), branch.compilerNode, { readChain: true });
+      if (isDroppedReplyStatus(status)) return true;
+      if (status !== 'success') return false;
+      if (!Node.isCallExpression(branch) && !Node.isNewExpression(branch)) return false;
+      const body = branch.getArguments()[0];
+      if (body === undefined) return true;
+      const peeled = this.peelTransparentExpression(body);
+      return (
+        Node.isNullLiteral(peeled) ||
+        (Node.isIdentifier(peeled) && peeled.getText() === 'undefined') ||
+        this.statesResponseInit(peeled)
+      );
+    };
+    if (judged.length === 0 || !judged.every(carriesNoSuccessBody)) {
+      return undefined;
+    }
+    this.log(
+      `Response locator at ${request.file_path}:${request.line_number} names a send of a ` +
+        'handler whose every reply states an error or redirect status or carries no body; ' +
+        'no success payload'
+    );
+    return this.decidedAbstain(request, this.getNodeLocation(handler), {
+      path: '',
+      kind: 'unknown',
+      reason: 'no_success_payload',
+      detail:
+        "every response this route's handler sends states an error or redirect status, " +
+        'or carries no body a JSON contract can describe, so it publishes no success body',
+    });
+  }
+
+  /**
+   * What a send calls, as two sends of one reply API share it: `new` and the
+   * constructor's text, or the root of the callee chain and the member
+   * called (`reply.status(400).send` -> `reply…send`), or the callee's text.
+   */
+  private sendCalleeKey(node: Node): string | undefined {
+    const send = this.peelTransparentExpression(node);
+    if (Node.isNewExpression(send)) {
+      return `new ${send.getExpression().getText()}`;
+    }
+    if (!Node.isCallExpression(send)) return undefined;
+    const callee = send.getExpression();
+    if (!Node.isPropertyAccessExpression(callee)) return callee.getText();
+    let root: Node = callee.getExpression();
+    while (Node.isPropertyAccessExpression(root) || Node.isCallExpression(root)) {
+      root = root.getExpression();
+    }
+    return `${root.getText()}…${callee.getName()}`;
   }
 
   /**
