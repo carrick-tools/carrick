@@ -583,27 +583,43 @@ impl DeltaBaseline {
     }
 }
 
-/// A route registration this scan holds whose own path the code writes in no
-/// whole way: the receiver trace's guessed site
-/// ([`crate::site_rows::GuessedRoute`]), in the service that holds it. It
-/// states that a route of `method` is registered at `place`, at a path only
-/// the running program knows (carrick#3222).
+/// A registration this scan holds whose name the code writes in no whole way
+/// ([`crate::site_rows::UnreadRegistration`]), in the service that holds it.
+/// It states that something of `kind` is registered at `place`, under a name
+/// only the running program knows (carrick#3222, #3224).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UnreadRoute {
+struct UnreadAt {
     place: crate::pr_delta_anchor::Place,
-    /// Upper case, as the trace's label forces it.
-    method: String,
+    kind: crate::site_rows::UnreadKind,
 }
 
-impl UnreadRoute {
-    fn of(service: &Option<String>, site: &crate::site_rows::GuessedRoute) -> Self {
-        UnreadRoute {
+impl UnreadAt {
+    fn of(service: &Option<String>, site: &crate::site_rows::UnreadRegistration) -> Self {
+        UnreadAt {
             place: crate::pr_delta_anchor::Place::parse(
                 service,
                 &format!("{}:{}", site.file, site.line),
             ),
-            method: site.method.clone(),
+            kind: site.kind.clone(),
         }
+    }
+
+    /// Whether this registration could serve a removed operation `key` of
+    /// `service`: the same service and the same protocol, and for an HTTP
+    /// route a method that serves the route's ([`carrick_match::method_matches`]).
+    /// A socket registration states no direction, so it serves a socket
+    /// removal of either (carrick#3224).
+    fn could_serve(&self, service: &Option<String>, key: &OperationKey) -> bool {
+        use crate::site_rows::UnreadKind;
+        self.place.service == *service
+            && match (&self.kind, key) {
+                (UnreadKind::Http(site), OperationKey::Http { method, .. }) => {
+                    carrick_match::method_matches(site, method)
+                }
+                (UnreadKind::Socket, OperationKey::Socket { .. })
+                | (UnreadKind::Pubsub, OperationKey::Pubsub { .. }) => true,
+                _ => false,
+            }
     }
 }
 
@@ -634,12 +650,13 @@ struct DeltaCandidates {
     documented: Vec<crate::pr_delta_anchor::Candidate<DeltaItem>>,
 }
 
-/// `unread` is every route site this scan could not read a path for: a
-/// removed HTTP route names those of its service that could serve it.
+/// `unread` is every registration this scan could not read a name for: a
+/// removed HTTP, socket or pub/sub row names those of its service and
+/// protocol that could serve it.
 fn delta_candidates(
     previous: &HashMap<ServiceEndpointKey, DeltaRow>,
     current: &[CloudRepoData],
-    unread: &[UnreadRoute],
+    unread: &[UnreadAt],
 ) -> DeltaCandidates {
     let candidate = |service: &Option<String>,
                      row: &DeltaRow,
@@ -647,16 +664,14 @@ fn delta_candidates(
                      places: Vec<&std::path::PathBuf>,
                      documented: bool| {
         let (label, name) = row.key.display_labels();
-        let serving = match &row.key {
-            crate::operation::OperationKey::Http { method, .. } if removed => unread
+        let serving: Vec<crate::pr_delta_anchor::Place> = if removed {
+            unread
                 .iter()
-                .filter(|site| {
-                    site.place.service == *service
-                        && carrick_match::method_matches(&site.method, method)
-                })
+                .filter(|site| site.could_serve(service, &row.key))
                 .map(|site| site.place.clone())
-                .collect(),
-            _ => Vec::new(),
+                .collect()
+        } else {
+            Vec::new()
         };
         crate::pr_delta_anchor::Candidate {
             item: DeltaItem {
@@ -870,7 +885,7 @@ fn anchored_delta(
     current: &[CloudRepoData],
     services: &[Config],
     changes: Option<&crate::change_scope::ChangedSince>,
-    unread: &[UnreadRoute],
+    unread: &[UnreadAt],
     unread_sources: &[UnreadSource],
 ) -> Option<crate::findings::PrDelta> {
     let Some(base) = base else {
@@ -2534,6 +2549,20 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // Main's copy by commit, read here because the copy moves into the
     // baseline input below (carrick#2284).
     let main_index = crate::pr_baseline::main_index(&main_self_data);
+    // The registrations each service analysed in this run could not read a
+    // name for (carrick#3222, #3224). A held-back service is represented by
+    // its served generation and a carried one by its stored one, so neither
+    // brings this run's registrations. The delta rows and the break rows
+    // read this one list.
+    let unread: Vec<UnreadAt> = runs
+        .iter()
+        .filter(|run| !run.held_back && !run.carried)
+        .flat_map(|run| {
+            run.unread_registrations
+                .iter()
+                .map(|site| UnreadAt::of(&run.data.service_name, site))
+        })
+        .collect();
     let main_baseline_input =
         (is_pr_run && had_prior_index && !main_self_data.is_empty()).then(|| {
             // Main's copy passed the upload boundary, which replaces machine
@@ -2565,6 +2594,7 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
                     &current_services_data,
                     &services,
                     pr_changes.as_deref(),
+                    &unread,
                 )
             };
             MainBaselineInput {
@@ -2720,31 +2750,16 @@ async fn run_analysis_engine_inner<T: CloudStorage + Sync>(
     // landed on main since its last scan rather than in this PR. Computed
     // before `current_services_data` is moved into the analyzer.
     let pr_delta = match delta_baseline {
-        DeltaBaseline::Keys(previous) => {
-            // The route sites each service analysed in this run could not
-            // read a path for (carrick#3222). A held-back service is
-            // represented by its served generation and a carried one by its
-            // stored one, so neither brings this run's sites.
-            let unread: Vec<UnreadRoute> = runs
-                .iter()
-                .filter(|run| !run.held_back && !run.carried)
-                .flat_map(|run| {
-                    run.unread_routes
-                        .iter()
-                        .map(|site| UnreadRoute::of(&run.data.service_name, site))
-                })
-                .collect();
-            anchored_delta(
-                repo_path,
-                pr_base.as_deref(),
-                &previous,
-                &current_services_data,
-                &services,
-                pr_changes.as_deref(),
-                &unread,
-                &unread_sources,
-            )
-        }
+        DeltaBaseline::Keys(previous) => anchored_delta(
+            repo_path,
+            pr_base.as_deref(),
+            &previous,
+            &current_services_data,
+            &services,
+            pr_changes.as_deref(),
+            &unread,
+            &unread_sources,
+        ),
         DeltaBaseline::OtherScanner(versions) => {
             info!(
                 "Main's index was written by Carrick {} and this run is Carrick {}, so the PR \
@@ -3388,9 +3403,10 @@ struct ServiceRun {
     /// Its type-reach record, stored beside its payload (carrick#3101).
     /// `None` for a carried service and wherever the type stage made none.
     type_reach: Option<crate::cloud_storage::TypeReachObject>,
-    /// Its route sites whose path the receiver trace could not read, for a
-    /// PR's endpoint delta (carrick#3222). Empty for a carried service.
-    unread_routes: Vec<crate::site_rows::GuessedRoute>,
+    /// Its registrations whose name the scan could not read, for a PR's
+    /// endpoint delta and removal marking (carrick#3222, #3224). Empty for a
+    /// carried service.
+    unread_registrations: Vec<crate::site_rows::UnreadRegistration>,
     /// The call edges its discovery walk entered, written once every
     /// service's call-through is settled. Empty for a carried service, whose
     /// stored definitions hold them already.
@@ -3423,7 +3439,7 @@ impl ServiceRun {
             boundaries,
             fallbacks: None,
             type_reach: None,
-            unread_routes: Vec::new(),
+            unread_registrations: Vec::new(),
             discovered_edges: Default::default(),
         }
     }
@@ -4009,7 +4025,7 @@ impl ServiceScan {
             boundaries: analysis.route_boundaries,
             fallbacks: analysis.fallbacks,
             type_reach: analysis.type_reach,
-            unread_routes: analysis.unread_routes,
+            unread_registrations: analysis.unread_registrations,
             discovered_edges: analysis.discovered_edges,
         })
     }
@@ -6355,7 +6371,7 @@ async fn analyze_current_repo_incremental(
             log_definition_withdrawals(withdrawn);
             let guessed_withdrawn = withdraw_guessed_routes(
                 &mut mount_graph,
-                &protocol_extractions.site.traced.guessed,
+                &protocol_extractions.site.traced.unread,
                 repo_path,
             );
             let (applied, traced_asks) = apply_traced_routes(
@@ -6369,7 +6385,7 @@ async fn analyze_current_repo_incremental(
             };
             let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
             let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
-            let unread_routes = std::mem::take(&mut protocol_extractions.site.traced.guessed);
+            let unread_registrations = std::mem::take(&mut protocol_extractions.site.traced.unread);
             crate::phase_timing::mark(crate::phase_timing::Phase::Protocols);
 
             // Collect the intents started after discovery (body_source is
@@ -6785,7 +6801,7 @@ async fn analyze_current_repo_incremental(
                 route_boundaries,
                 fallbacks: Some(fallbacks),
                 type_reach,
-                unread_routes,
+                unread_registrations,
                 discovered_edges: discovered_edges
                     .relativized(|file| repo_relative(file, repo_path)),
             });
@@ -8970,7 +8986,7 @@ fn withdraw_model_routes_at_library_definitions(
 }
 
 /// Withdraw the reader's route rows at the route sites whose own path the
-/// code writes in no whole way ([`crate::site_rows::GuessedRoute`]; ruling
+/// code writes in no whole way ([`crate::site_rows::UnreadRegistration`]; ruling
 /// on PR #3182, 2026-11-02): a row the model stated of the site's method at
 /// its line guesses at a value only the running program knows, so it is no
 /// route, and the site stays a possible call. A path that writes its first
@@ -8980,7 +8996,7 @@ fn withdraw_model_routes_at_library_definitions(
 /// Returns how many rows it withdrew.
 fn withdraw_guessed_routes(
     mount_graph: &mut MountGraph,
-    guessed: &[crate::site_rows::GuessedRoute],
+    guessed: &[crate::site_rows::UnreadRegistration],
     repo_path: &str,
 ) -> usize {
     if guessed.is_empty() {
@@ -8995,7 +9011,11 @@ fn withdraw_guessed_routes(
                 guessed.iter().any(|site| {
                     site.file == relative
                         && site.line == line
-                        && site.method.eq_ignore_ascii_case(&endpoint.method)
+                        && matches!(
+                            &site.kind,
+                            crate::site_rows::UnreadKind::Http(method)
+                                if method.eq_ignore_ascii_case(&endpoint.method)
+                        )
                 })
             })
     });
@@ -15814,7 +15834,7 @@ async fn analyze_current_repo(
     log_definition_withdrawals(withdrawn);
     let guessed_withdrawn = withdraw_guessed_routes(
         &mut analysis_result.mount_graph,
-        &protocol_extractions.site.traced.guessed,
+        &protocol_extractions.site.traced.unread,
         repo_path,
     );
     let (applied, traced_asks) = apply_traced_routes(
@@ -15828,7 +15848,7 @@ async fn analyze_current_repo(
     };
     let fallbacks = route_fallbacks(fallbacks, &protocol_extractions.site, &traced);
     let route_boundaries = std::mem::take(&mut protocol_extractions.site.boundaries);
-    let unread_routes = std::mem::take(&mut protocol_extractions.site.traced.guessed);
+    let unread_registrations = std::mem::take(&mut protocol_extractions.site.traced.unread);
     // The repo's own statement of what a body-dispatching handler serves
     // (carrick#831), applied after every pass that reads the source: a
     // declaration replaces what inference produced for the same handler, so
@@ -16141,7 +16161,7 @@ async fn analyze_current_repo(
         route_boundaries,
         fallbacks: Some(fallbacks),
         type_reach,
-        unread_routes,
+        unread_registrations,
         discovered_edges: discovered_edges.relativized(|file| repo_relative(file, repo_path)),
     })
 }
@@ -33516,10 +33536,10 @@ unfollowed_member_calls_total: 0,
                 ResolutionSource::Model,
             ),
         ];
-        let guessed = |line: u32, method: &str| crate::site_rows::GuessedRoute {
+        let guessed = |line: u32, method: &str| crate::site_rows::UnreadRegistration {
             file: "src/index.ts".to_string(),
             line,
-            method: method.to_string(),
+            kind: crate::site_rows::UnreadKind::Http(method.to_string()),
         };
         let withdrawn =
             withdraw_guessed_routes(&mut graph, &[guessed(14, "GET"), guessed(19, "GET")], ".");
@@ -38350,7 +38370,7 @@ io.on("bare:in", (event) => {});
         use crate::agents::file_analyzer_agent::ResolutionSource;
         use crate::findings::EdgeSource;
         use crate::pr_delta_anchor::Place;
-        use crate::site_rows::GuessedRoute;
+        use crate::site_rows::{UnreadKind, UnreadRegistration};
         const THIS: &str = "0.4.0";
         let mut main = service_stating("web", Some(THIS), &["/reports", "/orders", "/kept"]);
         main.endpoints[1].key = OperationKey::http("POST", "/orders");
@@ -38368,12 +38388,12 @@ io.on("bare:in", (event) => {});
         };
         let current = service_stating("web", Some(THIS), &["/kept", "/fresh"]);
         let site = |service: &str, file: &str, line: u32, method: &str| {
-            UnreadRoute::of(
+            UnreadAt::of(
                 &Some(service.to_string()),
-                &GuessedRoute {
+                &UnreadRegistration {
                     file: file.to_string(),
                     line,
-                    method: method.to_string(),
+                    kind: UnreadKind::Http(method.to_string()),
                 },
             )
         };
@@ -38449,6 +38469,122 @@ io.on("bare:in", (event) => {});
             named([fact, fact, fact]),
             "a site of another service serves none"
         );
+    }
+
+    /// One removed listener or subscriber of `web`, as the delta lists it
+    /// beside the unread registrations `unread` names (carrick#3224): the
+    /// source of the removed row once the PR wrote the registrations at
+    /// `written`.
+    fn removed_listener_source(
+        key: OperationKey,
+        unread: &[crate::site_rows::UnreadKind],
+        written: bool,
+    ) -> (
+        Vec<crate::pr_delta_anchor::Place>,
+        Option<crate::findings::EdgeSource>,
+    ) {
+        use crate::agents::file_analyzer_agent::ResolutionSource;
+        use crate::site_rows::UnreadRegistration;
+        const THIS: &str = "0.4.0";
+        let mut main = service_stating("web", Some(THIS), &["/kept"]);
+        main.endpoints[0].key = key;
+        main.endpoints[0].resolution_source = Some(ResolutionSource::ReceiverType);
+        let DeltaBaseline::Keys(previous) = DeltaBaseline::of([&main], THIS) else {
+            panic!("this version's index is the baseline");
+        };
+        let current = service_stating("web", Some(THIS), &["/other"]);
+        let unread: Vec<UnreadAt> = unread
+            .iter()
+            .map(|kind| {
+                UnreadAt::of(
+                    &Some("web".to_string()),
+                    &UnreadRegistration {
+                        file: "src/realtime.ts".to_string(),
+                        line: 7,
+                        kind: kind.clone(),
+                    },
+                )
+            })
+            .collect();
+        let DeltaCandidates { removed, .. } = delta_candidates(&previous, &[current], &unread);
+        let item = removed
+            .into_iter()
+            .map(|candidate| candidate.item)
+            .find(|item| item.endpoint.path != "/kept")
+            .expect("the listener is a removed row");
+        let serving = item.serving.clone();
+        let written: Vec<crate::pr_delta_anchor::Place> =
+            if written { serving.clone() } else { Vec::new() };
+        let rows = removed_rows(vec![item], &written);
+        (serving, rows[0].edge_source)
+    }
+
+    /// carrick#3224: a socket listener the PR rewrote into a name the scan
+    /// cannot read (an option's default, a parameter) may still be
+    /// registered, so its removed row is a candidate.
+    #[test]
+    fn socket_listener_name_in_option_default_removal_is_candidate() {
+        use crate::operation::SocketDirection;
+        use crate::site_rows::UnreadKind;
+        let key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        let (serving, source) = removed_listener_source(key, &[UnreadKind::Socket], true);
+        assert_eq!(serving.len(), 1);
+        assert_eq!(source, Some(crate::findings::EdgeSource::Candidate));
+    }
+
+    /// carrick#3224: the same for a pub/sub or queue subscriber.
+    #[test]
+    fn pubsub_subscriber_topic_in_option_default_removal_is_candidate() {
+        use crate::site_rows::UnreadKind;
+        let key = OperationKey::pubsub("payments.settled");
+        let (serving, source) = removed_listener_source(key, &[UnreadKind::Pubsub], true);
+        assert_eq!(serving.len(), 1);
+        assert_eq!(source, Some(crate::findings::EdgeSource::Candidate));
+    }
+
+    /// A removal no unread registration could serve stays the fact its rows
+    /// state (the PR deleted or renamed the registration).
+    #[test]
+    fn listener_removed_with_no_unread_registration_stays_fact() {
+        use crate::operation::SocketDirection;
+        let key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        let (serving, source) = removed_listener_source(key, &[], true);
+        assert!(serving.is_empty());
+        assert_eq!(source, Some(crate::findings::EdgeSource::Fact));
+    }
+
+    /// D4: an unread registration on a line the PR did not write is named as
+    /// serving, but never softens the removal.
+    #[test]
+    fn an_unread_registration_on_an_unwritten_line_does_not_soften_a_removal() {
+        use crate::operation::SocketDirection;
+        use crate::site_rows::UnreadKind;
+        let key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        let (serving, source) = removed_listener_source(key, &[UnreadKind::Socket], false);
+        assert_eq!(serving.len(), 1);
+        assert_eq!(source, Some(crate::findings::EdgeSource::Fact));
+    }
+
+    /// D3: protocols do not cross. An unread socket registration does not
+    /// serve a pub/sub removal, nor a pub/sub registration a socket one.
+    #[test]
+    fn an_unread_socket_registration_does_not_soften_a_pubsub_removal() {
+        use crate::operation::SocketDirection;
+        use crate::site_rows::UnreadKind;
+        let (serving, source) = removed_listener_source(
+            OperationKey::pubsub("payments.settled"),
+            &[UnreadKind::Socket],
+            true,
+        );
+        assert!(serving.is_empty());
+        assert_eq!(source, Some(crate::findings::EdgeSource::Fact));
+        let (serving, source) = removed_listener_source(
+            OperationKey::socket("order:update", SocketDirection::ClientToServer),
+            &[UnreadKind::Pubsub],
+            true,
+        );
+        assert!(serving.is_empty());
+        assert_eq!(source, Some(crate::findings::EdgeSource::Fact));
     }
 
     fn repo_with_bundle(

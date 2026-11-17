@@ -29,7 +29,7 @@ use crate::operation::{OperationKey, Protocol};
 use crate::pr_baseline::{MainConsumer, MainPairing, MainProducer, RemovedOperation, RemovedSend};
 use crate::pr_delta_anchor::{Candidate, MainSource, Place};
 
-use super::{DeltaRow, ServiceEndpointKey, delta_identity, keep_first_spelling};
+use super::{DeltaRow, ServiceEndpointKey, UnreadAt, delta_identity, keep_first_spelling};
 
 /// The key a removed operation and a pairing's producer are compared by: the
 /// delta's identity, so a route only re-spelled is no removal (carrick#3079).
@@ -81,6 +81,7 @@ impl Removals {
         current: &[CloudRepoData],
         services: &[Config],
         changes: Option<&crate::change_scope::ChangedSince>,
+        unread: &[UnreadAt],
     ) -> Self {
         let mut operations = removed_operations(main_self, current);
         let added = added_operations(main_self, current);
@@ -128,7 +129,23 @@ impl Removals {
                 })
                 .collect()
         };
-        place(
+        // The unread registrations that could serve a removed socket or
+        // pub/sub operation: where the PR wrote one, the registration may
+        // still be there, so the break row it would mark is a candidate, as
+        // the delta's removed row is (carrick#3224). An HTTP removal's break
+        // row reads none.
+        let serving: Vec<Vec<Place>> = operations
+            .iter()
+            .map(|removal| serving_places(removal, unread))
+            .collect();
+        let serving_all: Vec<Place> = serving
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let unread_written = place(
             repo_path,
             base,
             &mut operations,
@@ -137,7 +154,15 @@ impl Removals {
             "operation",
             services,
             changes,
+            &serving_all,
         );
+        for (removal, serving) in operations.iter_mut().zip(&serving) {
+            if serving.iter().any(|place| unread_written.contains(place)) {
+                for row in &mut removal.rows {
+                    row.unread_registration = true;
+                }
+            }
+        }
         place(
             repo_path,
             base,
@@ -147,6 +172,7 @@ impl Removals {
             "send",
             services,
             changes,
+            &[],
         );
         Removals {
             operations: operations.into_iter().flat_map(|op| op.rows).collect(),
@@ -179,7 +205,25 @@ impl Placeable for RemovedSend {
     }
 }
 
-/// Mark each of `removed` placed when the PR's diff lists it.
+/// The places of the unread registrations that could serve a removed socket
+/// or pub/sub operation of main's copy: the same service and protocol
+/// ([`UnreadAt::could_serve`]). Empty for any other protocol.
+fn serving_places(removal: &Removed<RemovedOperation>, unread: &[UnreadAt]) -> Vec<Place> {
+    let Some(row) = removal.rows.first() else {
+        return Vec::new();
+    };
+    let Some(key) = OperationKey::from_canonical(&row.key).filter(is_message_protocol) else {
+        return Vec::new();
+    };
+    unread
+        .iter()
+        .filter(|site| site.could_serve(&row.service_name, &key))
+        .map(|site| site.place.clone())
+        .collect()
+}
+
+/// Mark each of `removed` placed when the PR's diff lists it. Returns, of
+/// `serving` (unread registrations), those the PR wrote.
 #[allow(clippy::too_many_arguments)]
 fn place<R: Placeable>(
     repo_path: &str,
@@ -190,9 +234,10 @@ fn place<R: Placeable>(
     what: &str,
     services: &[Config],
     changes: Option<&crate::change_scope::ChangedSince>,
-) {
+    serving: &[Place],
+) -> Vec<Place> {
     if removed.is_empty() {
-        return;
+        return Vec::new();
     }
     let candidates: Vec<Candidate<usize>> = removed
         .iter()
@@ -214,7 +259,7 @@ fn place<R: Placeable>(
         scan,
         main,
         reading_moved,
-        &[],
+        serving,
         &[],
     ) {
         Ok(anchored) => {
@@ -229,11 +274,15 @@ fn place<R: Placeable>(
                     row.set_placed(listed.contains(&index));
                 }
             }
+            anchored.unread_written
         }
-        Err(reason) => info!(
-            "Git could not read this PR's diff ({}), so no removed {what} is placed in it",
-            reason.trim()
-        ),
+        Err(reason) => {
+            info!(
+                "Git could not read this PR's diff ({}), so no removed {what} is placed in it",
+                reason.trim()
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -305,6 +354,7 @@ fn removed_operations(
                         path: path.clone(),
                         place,
                         placed: false,
+                        unread_registration: false,
                         source,
                     })
                     .collect(),
@@ -533,10 +583,19 @@ mod tests {
             &current(Some("routes")),
             &[],
             None,
+            &[],
         );
         assert_eq!(named.operations.len(), 1);
         assert_eq!(named.operations[0].service_name.as_deref(), Some("routes"));
-        let root = Removals::of("/nowhere", None, &main(None), &current(None), &[], None);
+        let root = Removals::of(
+            "/nowhere",
+            None,
+            &main(None),
+            &current(None),
+            &[],
+            None,
+            &[],
+        );
         assert_eq!(root.operations.len(), 1);
         assert_eq!(root.operations[0].service_name, None);
     }

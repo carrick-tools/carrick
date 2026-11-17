@@ -8958,6 +8958,20 @@ export function listen(): void {
         );
     }
 
+    /// The unread HTTP route sites of a trace, as `file:line METHOD`.
+    fn unread_http(routes: &crate::site_rows::TracedRoutes) -> Vec<String> {
+        routes
+            .unread
+            .iter()
+            .filter_map(|site| match &site.kind {
+                crate::site_rows::UnreadKind::Http(method) => {
+                    Some(format!("{}:{} {}", site.file, site.line, method))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// carrick#2386: a route's own path written through a conditional or a
     /// default (`base ? \`${base}api\` : "/api"`, `base ?? "/"`) is served at
     /// each way the code writes whole, read the way a mount's prefix is. A
@@ -8996,11 +9010,7 @@ export function listen(): void {
                 })
                 .collect();
             served.sort();
-            let guessed: Vec<String> = routes
-                .guessed
-                .iter()
-                .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
-                .collect();
+            let guessed = unread_http(&routes);
             (served, routes.untraced, guessed)
         };
         let (_, decided) = decided_traced(&on, &exports, &declarations, &scopes);
@@ -9080,11 +9090,7 @@ export function listen(): void {
             ]),
             "{served:#?}"
         );
-        let mut guessed: Vec<String> = routes
-            .guessed
-            .iter()
-            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
-            .collect();
+        let mut guessed: Vec<String> = unread_http(&routes);
         guessed.sort();
         assert_eq!(
             guessed,
@@ -9140,11 +9146,7 @@ export function listen(): void {
             ]),
             "{served:#?}"
         );
-        let mut guessed: Vec<String> = routes
-            .guessed
-            .iter()
-            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
-            .collect();
+        let mut guessed: Vec<String> = unread_http(&routes);
         guessed.sort();
         assert_eq!(
             guessed,
@@ -9172,17 +9174,13 @@ export function listen(): void {
         let records =
             super::super::site_record::site_records(&on.inputs, &[], &on.repo, &decided, &labels);
         let routes = crate::site_rows::traced(&decided, &records);
-        let mut guessed: Vec<String> = routes
-            .guessed
-            .iter()
-            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
-            .collect();
+        let mut guessed: Vec<String> = unread_http(&routes);
         guessed.sort();
         assert_eq!(
             guessed,
             texts(&["packages/routes/src/families.ts:21 GET"]),
             "{:#?}",
-            routes.guessed
+            routes.unread
         );
         // `/docs/spec${tail}` alone: the loop over the stated `KINDS` at
         // `:14` is read, one way per element (carrick#2093), and its chains
@@ -9243,16 +9241,12 @@ export function listen(): void {
             ]),
             "{served:#?}"
         );
-        let guessed: Vec<String> = routes
-            .guessed
-            .iter()
-            .map(|site| format!("{}:{} {}", site.file, site.line, site.method))
-            .collect();
+        let guessed: Vec<String> = unread_http(&routes);
         assert_eq!(
             guessed,
             texts(&["packages/server/src/main.ts:11 GET"]),
             "{:#?}",
-            routes.guessed
+            routes.unread
         );
         // Each record states the name the trace serves, whole: forced, not
         // a lead. The one that does not fold is a lead.

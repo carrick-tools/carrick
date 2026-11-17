@@ -77,6 +77,10 @@ pub struct RemovedOperation {
     pub place: String,
     /// Whether the diff anchor listed this removal (`pr_delta_anchor::run`).
     pub placed: bool,
+    /// A socket or pub/sub registration whose name the scan could not read
+    /// sits on a line the PR wrote, in the same service: the removal may
+    /// still be there, so its row is a candidate (carrick#3224).
+    pub unread_registration: bool,
     pub source: Option<ResolutionSource>,
 }
 
@@ -186,8 +190,8 @@ fn is_message_protocol(protocol: Protocol) -> bool {
 
 /// One lost pairing's surviving rows, grouped to one output row.
 struct Group {
-    /// The removals behind it, as `(placed, source)`.
-    removals: Vec<(bool, Option<ResolutionSource>)>,
+    /// The removals behind it, as `(placed, source, unread registration)`.
+    removals: Vec<(bool, Option<ResolutionSource>, bool)>,
     removed: RemovedSide,
     removed_service: String,
     /// Surviving side.
@@ -201,7 +205,8 @@ struct Group {
 impl Group {
     fn removal(&self, copy: MainCopy, untouched: Option<&Untouched>) -> Removal {
         // Every removal behind the row must be placed: one unplaced is doubt.
-        let placed = !self.removals.is_empty() && self.removals.iter().all(|(placed, _)| *placed);
+        let placed =
+            !self.removals.is_empty() && self.removals.iter().all(|(placed, _, _)| *placed);
         let decision = decide(
             placed,
             copy,
@@ -213,12 +218,20 @@ impl Group {
         };
         Removal {
             removed: self.removed.clone(),
-            edge_source: EdgeSource::fold(
-                self.surviving_sources
-                    .iter()
-                    .copied()
-                    .chain(self.removals.iter().map(|(_, source)| *source)),
-            ),
+            // A registration the PR wrote whose name the scan could not read
+            // may still serve the removed operation: the row is a candidate
+            // whatever its rows on main were (carrick#3224), as the delta's
+            // removed row is.
+            edge_source: if self.removals.iter().any(|(_, _, unread)| *unread) {
+                Some(EdgeSource::Candidate)
+            } else {
+                EdgeSource::fold(
+                    self.surviving_sources
+                        .iter()
+                        .copied()
+                        .chain(self.removals.iter().map(|(_, source, _)| *source)),
+                )
+            },
             verdict_state: Some(VerdictState::NotChecked),
             on_main,
             on_main_unknown,
@@ -293,7 +306,10 @@ pub fn mark_lost_pairings(
                         },
                     ))
                     .or_insert_with(|| Group {
-                        removals: operations.iter().map(|op| (op.placed, op.source)).collect(),
+                        removals: operations
+                            .iter()
+                            .map(|op| (op.placed, op.source, op.unread_registration))
+                            .collect(),
                         removed: RemovedSide {
                             method: first.method.clone(),
                             path: first.path.clone(),
@@ -349,7 +365,7 @@ pub fn mark_lost_pairings(
                     .or_insert_with(|| Group {
                         removals: sends
                             .iter()
-                            .map(|send| (send.placed, send.source))
+                            .map(|send| (send.placed, send.source, false))
                             .collect(),
                         removed: RemovedSide {
                             method: first.method.clone(),
@@ -502,6 +518,7 @@ mod tests {
             path: "/orders/:orderId".into(),
             place: "app/orders.ts:9".into(),
             placed,
+            unread_registration: false,
             source: Some(ResolutionSource::RequestSpec),
         }
     }
@@ -1081,6 +1098,22 @@ mod tests {
         );
         assert_eq!(edge(&|main, _| main.operations[0].source = None), None);
         assert_eq!(edge(&|_, run| run.calls[0].source = None), None);
+    }
+
+    /// A removed operation an unread registration the PR wrote may still
+    /// serve marks a candidate row, whatever its sources (carrick#3224); one
+    /// with none stays the fact its sources state.
+    #[test]
+    fn a_removal_an_unread_registration_may_serve_marks_a_candidate() {
+        let edge = |unread: bool| {
+            let (mut main, run) = http_break(true);
+            main.operations[0].unread_registration = unread;
+            let mut pr = vec![];
+            mark_lost_pairings(&mut pr, &main, &run, MainCopy::Current, None);
+            serde_json::to_value(&pr[0]).unwrap()["edge_source"].clone()
+        };
+        assert_eq!(edge(true), json!("candidate"));
+        assert_eq!(edge(false), json!("fact"));
     }
 
     /// One row per (removed operation, surviving service): two files of one
