@@ -463,6 +463,9 @@ pub fn traced(decided: &Decided, records: &[SiteRecord]) -> TracedRoutes {
 /// broker receive). A send is no registration, and a name the trace read
 /// whole is no lead.
 fn unread_message_receive(decided: &Decided, record: &SiteRecord) -> Option<UnreadRegistration> {
+    // No `composed.own` check as the HTTP branch's `ways_read` keeps: a Lead
+    // receive exists only when the name is unstated, so a name read through
+    // whole ways never reaches this record.
     if record.bucket != Bucket::Lead
         || record.state.forced.get(&Slot::Role).map(String::as_str) != Some("handles")
     {

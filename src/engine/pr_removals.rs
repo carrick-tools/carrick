@@ -607,4 +607,47 @@ mod tests {
         edge.relationship = carrick_match::MatchRelationship::SharedExternalContract;
         assert!(main_pairings(&[edge]).is_empty());
     }
+
+    /// carrick#3224: the break row of a removed socket listener is softened
+    /// only by an unread socket registration the PR wrote, found through the
+    /// real path (`Removals::of`: `serving_places`, `place`, the marking).
+    /// One on a line the PR left alone changes nothing.
+    #[test]
+    fn an_unread_registration_softens_a_removed_listener_only_where_the_pr_wrote_it() {
+        use crate::operation::SocketDirection;
+        use crate::site_rows::{UnreadKind, UnreadRegistration};
+        let (repo, base) = crate::git_state::tests::committed_repo(&[
+            ("src/realtime.ts", "a\nlistener\nc\nd\n"),
+            ("src/other.ts", "p\nq\nr\n"),
+        ]);
+        // The PR rewrites the listener's line; `other.ts` is untouched.
+        std::fs::write(repo.path().join("src/realtime.ts"), "a\nreworked\nc\nd\n").unwrap();
+        let mut listener = row("GET", "/unused", "src/realtime.ts:2");
+        listener.key = OperationKey::socket("order:update", SocketDirection::ClientToServer);
+        let main = vec![blob(None, vec![listener])];
+        let current = vec![blob(None, vec![])];
+        let softened = |file: &str, line: u32| {
+            let unread = [UnreadAt::of(
+                &None,
+                &UnreadRegistration {
+                    file: file.to_string(),
+                    line,
+                    kind: UnreadKind::Socket,
+                },
+            )];
+            let removals = Removals::of(
+                &repo.path().to_string_lossy(),
+                Some(&base),
+                &main,
+                &current,
+                &[],
+                None,
+                &unread,
+            );
+            assert_eq!(removals.operations.len(), 1);
+            removals.operations[0].unread_registration
+        };
+        assert!(!softened("src/other.ts", 2), "a line the PR did not write");
+        assert!(softened("src/realtime.ts", 2), "a line the PR wrote");
+    }
 }
