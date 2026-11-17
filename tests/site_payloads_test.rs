@@ -458,6 +458,38 @@ fn a_verified_library_pubsub_call_is_anchored_and_typed_at_its_slot() {
     assert_eq!(unique.len(), aliases.len(), "no alias twice: {aliases:#?}");
 }
 
+/// carrick#4677: the same fixture's `jobs.done` subscriber stores the place of
+/// its handler's message parameter as its one value span, so a reader of the
+/// blob can open the node the receive was typed from.
+#[test]
+fn a_subscriber_entry_stores_the_span_of_its_message_parameter() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/site-payloads-pubsub-verified");
+    let on = scan(&repo, &[]);
+    let entries = pubsub_entries(&on, "producer", "src/jobs.ts", 10);
+    assert_eq!(
+        entries.len(),
+        1,
+        "one subscriber entry: {:#}",
+        on["type_manifest"]
+    );
+    let spans = entries[0]["evidence"]["value_spans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("value_spans: {:#}", entries[0]));
+    assert_eq!(spans.len(), 1, "one parameter span: {spans:?}");
+    assert_eq!(spans[0]["file_path"], "src/jobs.ts");
+    let source = std::fs::read_to_string(repo.join("src/jobs.ts")).expect("source");
+    let units: Vec<u16> = source.encode_utf16().collect();
+    let (start, end) = (
+        spans[0]["span_start"].as_u64().unwrap() as usize,
+        spans[0]["span_end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(
+        String::from_utf16(&units[start..end]).unwrap(),
+        "event: { jobId: string; ok: boolean }"
+    );
+}
+
 /// carrick#4245: `tests/fixtures/site-payloads-pubsub-loop/`, a publisher and
 /// a subscriber each registered in a loop over a list of topics
 /// (`src/publish.ts` over a same-file list, `src/listen.ts` over an imported

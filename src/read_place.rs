@@ -10,12 +10,9 @@
 //! and the unit `contractPlace` reads in the cloud, so a reader that wants the
 //! place of a contract row needs no conversion.
 //!
-//! One writer, [`store_read_places`], sets it. It takes the first ask for the
-//! entry's alias that names a value:
-//!
-//! - any ask on a consumer entry (a call, a call's payload, a document);
-//! - an `Expression` or `FunctionParam` ask on a non-HTTP entry (a pub/sub or
-//!   socket payload, a subscriber's message).
+//! One writer, [`store_read_places`], sets it. It takes the first ask for a
+//! consumer entry's alias that names a value (a call, a call's payload, a
+//! document).
 //!
 //! The ask's own span is the place. An ask located by text carries none, so
 //! the place is the node the compiler engine's answer read (its
@@ -29,6 +26,12 @@
 //! `evidence.value_spans`, repo-relative, unless the alias has an explicit
 //! symbol entry (its text did not come from the answer) or the span is in a
 //! file outside the repo.
+//!
+//! A listener or subscriber entry (a socket, pub/sub or queue receive, typed
+//! through its handler's message parameter) has no read spans: its answer
+//! names the parameter, and that node is stored as its one value span. An HTTP
+//! handler's parameter is not its body (carrick#4197), so an HTTP entry never
+//! takes one (carrick#4677).
 //!
 //! # What is never placed
 //!
@@ -83,7 +86,16 @@ pub(crate) fn store_read_places(
             let read = answered
                 .get(alias)
                 .filter(|_| !explicit.contains(alias))
-                .map(|answer| value_spans(answer, repo_root));
+                .map(|answer| {
+                    let spans = value_spans(answer, repo_root);
+                    if !spans.is_empty() {
+                        return spans;
+                    }
+                    let own_asks = asks.get(alias).map(Vec::as_slice).unwrap_or_default();
+                    message_parameter_span(entry, own_asks, answer, repo_root, read_file)
+                        .into_iter()
+                        .collect()
+                });
             if let Some(spans) = read {
                 entry.evidence.value_spans = spans;
             }
@@ -123,18 +135,58 @@ fn value_spans(answer: &InferredType, repo_root: &Path) -> Vec<ValueSpan> {
         .read_spans
         .iter()
         .filter_map(|span| {
-            let relative = Path::new(&span.file_path).strip_prefix(repo_root).ok()?;
             Some(ValueSpan {
-                file_path: relative
-                    .components()
-                    .map(|part| part.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/"),
+                file_path: repo_relative(&span.file_path, repo_root)?,
                 span_start: span.start,
                 span_end: span.end,
             })
         })
         .collect()
+}
+
+/// `path` under `repo_root`, `/`-separated; `None` outside the repo.
+fn repo_relative(path: &str, repo_root: &Path) -> Option<String> {
+    let relative = Path::new(path).strip_prefix(repo_root).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// The place of the message parameter a listener or subscriber entry was typed
+/// through: its `FunctionParam` ask's answer read that parameter. An HTTP
+/// entry, an ask at the registration, an unanswered ask or an ask in another
+/// file gives none (carrick#4677).
+fn message_parameter_span(
+    entry: &TypeManifestEntry,
+    asks: &[&InferRequestItem],
+    answer: &InferredType,
+    repo_root: &Path,
+    read_file: &dyn Fn(&str) -> Option<String>,
+) -> Option<ValueSpan> {
+    if entry.key.protocol() == Protocol::Http {
+        return None;
+    }
+    let ask = asks.iter().find(|ask| {
+        ask.infer_kind == InferKind::FunctionParam
+            && !ask.result_unanswered
+            && !ask.at_registration
+            && in_entry_file(entry, ask)
+    })?;
+    let (start, end) = answer_place(answer, &ask.file_path, read_file)?;
+    Some(ValueSpan {
+        file_path: repo_relative(&ask.file_path, repo_root)?,
+        span_start: start,
+        span_end: end,
+    })
+}
+
+/// Whether `ask` sits in the file `entry` was found in.
+fn in_entry_file(entry: &TypeManifestEntry, ask: &InferRequestItem) -> bool {
+    Path::new(&ask.file_path).ends_with(entry.evidence.file_path.trim_start_matches("./"))
 }
 
 /// Whether `ask` points at the value `entry`'s type was read from.
@@ -144,19 +196,14 @@ fn names_a_value(entry: &TypeManifestEntry, ask: &InferRequestItem) -> bool {
     }
     // The place sits beside `evidence.file_path`, so an ask in another file
     // (a wrapper's body) is not this entry's place.
-    if !Path::new(&ask.file_path).ends_with(entry.evidence.file_path.trim_start_matches("./")) {
+    if !in_entry_file(entry, ask) {
         return false;
     }
-    if entry.role == ManifestRole::Consumer {
-        return !matches!(
+    // Producers are placed by `value_spans`, never here.
+    entry.role == ManifestRole::Consumer
+        && !matches!(
             ask.infer_kind,
             InferKind::RequestConfig | InferKind::ReceiverType
-        );
-    }
-    entry.key.protocol() != Protocol::Http
-        && matches!(
-            ask.infer_kind,
-            InferKind::Expression | InferKind::FunctionParam
         )
 }
 
@@ -480,6 +527,151 @@ mod tests {
         assert_eq!(
             manifest[0].evidence.span_start, None,
             "the registration ask is still no place"
+        );
+    }
+
+    /// `inbox:ping` listener and `order:placed` subscriber sources: the message
+    /// parameter sits on line 2, after a two-unit character on line 1.
+    const RECEIVE_SOURCE: &str =
+        "\u{1F600};\nonPing(msg: OrderPlaced);\non({ id }: OrderPlaced);\n";
+
+    fn receive_entry(key: OperationKey, alias: &str) -> TypeManifestEntry {
+        entry(
+            key,
+            ManifestRole::Producer,
+            ManifestTypeKind::Request,
+            alias,
+            InferKind::FunctionParam,
+        )
+    }
+
+    fn param_ask(alias: &str) -> InferRequestItem {
+        ask(alias, InferKind::FunctionParam, Some((900, 901)))
+    }
+
+    fn stored(entry: &TypeManifestEntry) -> Vec<(String, u32, u32)> {
+        entry
+            .evidence
+            .value_spans
+            .iter()
+            .map(|v| (v.file_path.clone(), v.span_start, v.span_end))
+            .collect()
+    }
+
+    fn run(
+        manifest: &mut [TypeManifestEntry],
+        infer: &[InferRequestItem],
+        answers: &[InferredType],
+    ) {
+        let read = |_: &str| Some(RECEIVE_SOURCE.to_string());
+        store_read_places(
+            manifest,
+            infer,
+            answers,
+            &HashSet::new(),
+            Path::new("/repo"),
+            &read,
+        );
+    }
+
+    #[test]
+    fn a_listener_entry_stores_the_span_of_its_message_parameter() {
+        let mut manifest = vec![receive_entry(
+            OperationKey::socket(
+                "inbox:ping",
+                crate::operation::SocketDirection::ClientToServer,
+            ),
+            "Ping",
+        )];
+        // `msg: OrderPlaced` on line 2: 2 units of line 1, `;`, `\n`, then
+        // `onPing(` is 7 columns.
+        run(
+            &mut manifest,
+            &[param_ask("Ping")],
+            &[answer("Ping", at(2, 7, 23))],
+        );
+        assert_eq!(
+            stored(&manifest[0]),
+            vec![("src/a.ts".to_string(), 4 + 7, 4 + 23)]
+        );
+        assert_eq!(
+            manifest[0].evidence.span_start, None,
+            "the entry's own span stays as it was"
+        );
+    }
+
+    #[test]
+    fn a_subscriber_with_a_destructured_message_stores_the_binding_span() {
+        let mut manifest = vec![receive_entry(
+            OperationKey::pubsub("order:placed"),
+            "Placed",
+        )];
+        // Line 3 starts at 4 + 26 = 30; the binding `{ id }: OrderPlaced`.
+        run(
+            &mut manifest,
+            &[param_ask("Placed")],
+            &[answer("Placed", at(3, 3, 22))],
+        );
+        assert_eq!(
+            stored(&manifest[0]),
+            vec![("src/a.ts".to_string(), 30 + 3, 30 + 22)]
+        );
+    }
+
+    #[test]
+    fn a_listener_whose_parameter_went_unanswered_stores_no_value_span() {
+        let mut gone = param_ask("Gone");
+        gone.result_unanswered = true;
+        let mut at_site = param_ask("AtSite");
+        at_site.at_registration = true;
+        let mut manifest = vec![
+            receive_entry(OperationKey::pubsub("order:placed"), "Gone"),
+            receive_entry(OperationKey::pubsub("order:placed"), "AtSite"),
+            receive_entry(OperationKey::pubsub("order:placed"), "NoAnswer"),
+        ];
+        run(
+            &mut manifest,
+            &[gone, at_site, param_ask("NoAnswer")],
+            &[answer("Gone", at(2, 7, 23)), answer("AtSite", at(2, 7, 23))],
+        );
+        for entry in &manifest {
+            assert!(stored(entry).is_empty(), "{}", entry.type_alias);
+        }
+    }
+
+    #[test]
+    fn an_http_handler_parameter_entry_stores_no_value_span() {
+        let mut manifest = vec![receive_entry(
+            OperationKey::http("POST", "/orders"),
+            "Handler",
+        )];
+        run(
+            &mut manifest,
+            &[param_ask("Handler")],
+            &[answer("Handler", at(2, 7, 23))],
+        );
+        assert!(stored(&manifest[0]).is_empty());
+    }
+
+    #[test]
+    fn a_producer_entry_with_read_spans_keeps_them() {
+        let mut manifest = vec![
+            receive_entry(OperationKey::http("GET", "/items"), "Http"),
+            receive_entry(OperationKey::pubsub("order:placed"), "Bus"),
+        ];
+        let mut answers = vec![answer("Http", at(2, 7, 23)), answer("Bus", at(2, 7, 23))];
+        answers[0].read_spans = vec![read_span("/repo/src/a.ts", 10, 20)];
+        answers[1].read_spans = vec![read_span("/repo/src/a.ts", 30, 40)];
+        run(
+            &mut manifest,
+            &[param_ask("Http"), param_ask("Bus")],
+            &answers,
+        );
+        assert_eq!(stored(&manifest[0]), vec![("src/a.ts".to_string(), 10, 20)]);
+        assert_eq!(
+            stored(&manifest[1]),
+            vec![("src/a.ts".to_string(), 30, 40)],
+            "read spans win; the parameter is not added"
         );
     }
 
