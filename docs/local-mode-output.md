@@ -216,7 +216,8 @@ counter means this scan did not record it.
 with the rows of those files (carrick#2894). A row whose call sits on a line the
 edit left alone is carried: it moves to its new line and its types are read from
 the working tree. Every other row is counted in `model_rows_not_carried` as
-`file:line reason`, and is not checked. The reasons are
+`file:line reason`, and is not checked. `model_rows_not_carried_by_reason` holds
+the same rows as a count per reason, whole even when the site list is cut. The reasons are
 `registration_line_changed` (the edit replaced the registration line),
 `no_matching_call` (no single call on that line matches the one the answer
 named), `hint_outside_registration_changed` (a handler named at the

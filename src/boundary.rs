@@ -103,6 +103,11 @@ pub struct ServiceBoundary {
     /// checked. Absent when every row was carried and typed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_rows_not_carried: Option<Counted>,
+    /// The same rows by reason: `reason code -> how many` (carrick#4749).
+    /// `model_rows_not_carried` keeps only the first [`MAX_REASONS`] sites;
+    /// this keeps every row's reason. Present exactly when that one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_rows_not_carried_by_reason: Option<std::collections::BTreeMap<String, usize>>,
     /// A no-model scan could not replay the previous generation's model
     /// answers, because the commit that generation was written at is not in
     /// this clone and could not be fetched (carrick#3000). Every row that only
@@ -383,6 +388,7 @@ impl ServiceBoundary {
             candidates_withheld_changed_files: None,
             model_rows_carried: None,
             model_rows_not_carried: None,
+            model_rows_not_carried_by_reason: None,
             model_answers_unavailable: None,
             library_ask_failed: crate::scan_health::library_ask_failed_for(
                 data.service_name.as_deref(),
