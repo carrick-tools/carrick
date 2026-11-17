@@ -1,0 +1,83 @@
+{
+ "http": {
+  "text": "// Synthetic sends in the shapes a producer's reply takes. Every name is\n// invented; the checks in held-place.test.ts wrap the values below.\n\ndeclare const res: { json(body?: any): unknown };\ndeclare const c: { json(body?: any): unknown };\ndeclare const order: { id: string; total: number };\ndeclare function load(): { orders: string[] };\n\nexport function expressShape(): void {\n  res.json(__C.send0_0({ id: order.id, total: order.total }, (o) => o));\n}\n\nexport function honoShape(): unknown {\n  const result = load();\n  return c.json(result);\n}\n\nexport function lambdaShape(payload: { ok: boolean }): { statusCode: number; body: string } {\n  return { statusCode: 200, body: JSON.stringify(payload) };\n}\n\nexport function twoSends(flag: boolean): unknown {\n  if (flag) {\n    return res.json(__C.send1_1(__C.send1_0({ first: 1 }, (o) => o), (o) => o));\n  }\n  return res.json({ second: 2 });\n}\n\nexport function shorthandShape(): { result: { orders: string[] } } {\n  const result = load();\n  return { result };\n}\n\nexport function dateShape(): unknown {\n  return res.json({ at: new Date(0), n: 1 });\n}\n\ndeclare namespace __C {\n  type __carrick_Sent<S, E> = S;\n  type __carrick_GqlExpected<E> = E;\n  type __carrick_GqlSent<S, E> = S;\n  type __carrick_GqlSentS<S, E, R> = S;\n  type O0_0 = ({ id: string; total: number });\n  function send0_0<V>(v: V, c: (o: __carrick_Sent<V, O0_0>) => O0_0): V;\n  type O1_0 = ({ first: number });\n  function send1_0<V>(v: V, c: (o: __carrick_Sent<V, O1_0>) => O1_0): V;\n  type O1_1 = (any);\n  function send1_1<V>(v: V, c: (o: __carrick_Sent<V, O1_1>) => O1_1): V;\n}\n",
+  "checks": [
+   {
+    "n": 0,
+    "group": 0,
+    "k": "0_0",
+    "span": [
+     391,
+     450
+    ],
+    "declSpan": [
+     1269,
+     1388
+    ]
+   },
+   {
+    "n": 1,
+    "group": 0,
+    "k": "1_0",
+    "span": [
+     803,
+     838
+    ],
+    "declSpan": [
+     1389,
+     1496
+    ]
+   },
+   {
+    "n": 1,
+    "group": 1,
+    "k": "1_1",
+    "span": [
+     791,
+     849
+    ],
+    "declSpan": [
+     1497,
+     1590
+    ]
+   }
+  ],
+  "unplaced": [],
+  "bodyEnd": 1098
+ },
+ "gql": {
+  "text": "// Synthetic GraphQL resolvers. Every name is invented; held-place-graphql.test.ts\n// wraps the returned values below.\n\ntype OrderShape = { id: string; total: number };\n\ndeclare function loadOrder(id: string): Promise<OrderShape>;\ndeclare const payload: any;\n\nexport const orderResolvers = {\n  async order(_p: unknown, args: { id: string }) {\n    return __C.send0_0(loadOrder(args.id), (o) => o);\n  },\n  orders() {\n    return __C.send1_0({ edges: [{ id: \"1\", total: 2 }], totalCount: 1 }, (o) => o);\n  },\n  archived() {\n    return null;\n  },\n  paid() {\n    return true;\n  },\n  raw() {\n    return payload;\n  },\n};\n\ndeclare namespace __C {\n  type __carrick_Sent<S, E> = S;\n  type __carrick_GqlExpected<E> = E;\n  type __carrick_GqlSent<S, E> = S;\n  type __carrick_GqlSentS<S, E, R> = S;\n  type O0_0 = ({ id: string }) & { readonly __carrick_never: true };\n  function send0_0<V>(v: V, c: (o: __carrick_GqlSent<Awaited<V>, O0_0>) => __carrick_GqlExpected<O0_0>): V;\n  type O1_0 = ({ totalCount: number }) & { readonly __carrick_never: true };\n  type L1_0 = {\"type\":\"Orders\"};\n  function send1_0<V>(v: V, c: (o: __carrick_GqlSentS<Awaited<V>, O1_0, L1_0>) => __carrick_GqlExpected<O1_0>): V;\n}\n",
+  "checks": [
+   {
+    "n": 0,
+    "group": 0,
+    "k": "0_0",
+    "span": [
+     354,
+     395
+    ],
+    "declSpan": [
+     784,
+     960
+    ],
+    "callback": 393
+   },
+   {
+    "n": 1,
+    "group": 0,
+    "k": "1_0",
+    "span": [
+     426,
+     498
+    ],
+    "declSpan": [
+     961,
+     1185
+    ],
+    "callback": 496
+   }
+  ],
+  "unplaced": [],
+  "bodyEnd": 613
+ }
+}
