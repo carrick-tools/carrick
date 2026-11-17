@@ -1,0 +1,348 @@
+{
+  "library_claims": [
+    {
+      "package": "@hono/trpc-server",
+      "version": "0.4.2",
+      "status": "answered",
+      "type_packages": [
+        "@types/aws-lambda",
+        "@types/body-parser",
+        "@types/connect",
+        "@types/express",
+        "@types/express-serve-static-core",
+        "@types/http-errors",
+        "@types/qs",
+        "@types/range-parser",
+        "@types/send",
+        "@types/serve-static",
+        "@types/ws"
+      ],
+      "exports": [
+        {
+          "specifier": "@hono/trpc-server",
+          "export": "trpcServer",
+          "role": "server_framework",
+          "label": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "key_labels": {
+                "endpoint": "not_name"
+              },
+              "member": null,
+              "runs": {
+                "arg": 0,
+                "key": "router"
+              }
+            }
+          ],
+          "scopes": [],
+          "ops": [],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "@trpc/react-query",
+      "version": "11.16.0",
+      "status": "answered",
+      "type_packages": [
+        "@types/react"
+      ],
+      "exports": [
+        {
+          "specifier": "@trpc/react-query",
+          "export": "createTRPCReact",
+          "role": "http_client",
+          "label": "request_runner",
+          "side": null,
+          "makes": [],
+          "scopes": [],
+          "ops": [
+            {
+              "op": "request",
+              "member": "useQuery",
+              "of": "type:@trpc/react-query#CreateTRPCReact",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "GET"
+            },
+            {
+              "op": "request",
+              "member": "useSuspenseQuery",
+              "of": "type:@trpc/react-query#CreateTRPCReact",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "GET"
+            },
+            {
+              "op": "request",
+              "member": "useInfiniteQuery",
+              "of": "type:@trpc/react-query#CreateTRPCReact",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "GET"
+            },
+            {
+              "op": "request",
+              "member": "useMutation",
+              "of": "type:@trpc/react-query#CreateTRPCReact",
+              "protocol": "rpc",
+              "name": {
+                "bound": "path",
+                "join": "."
+              },
+              "method": "POST"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": [],
+          "receiver_types": {
+            "instance:()": [
+              "type:@trpc/react-query#CreateTRPCReact"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "package": "@trpc/server",
+      "version": "11.16.0",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "@trpc/server",
+          "export": "initTRPC",
+          "role": "server_framework",
+          "label": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "call",
+              "member": "create"
+            }
+          ],
+          "scopes": [
+            {
+              "member": "router",
+              "of": "instance:create",
+              "collects": {
+                "arg": 0,
+                "join": "."
+              }
+            }
+          ],
+          "ops": [
+            {
+              "op": "receive",
+              "member": "query",
+              "path": [
+                "procedure"
+              ],
+              "of": "instance:create",
+              "name": {
+                "bound": "key"
+              },
+              "handler": {
+                "arg": 0
+              },
+              "method": "GET"
+            },
+            {
+              "op": "receive",
+              "member": "mutation",
+              "path": [
+                "procedure"
+              ],
+              "of": "instance:create",
+              "name": {
+                "bound": "key"
+              },
+              "handler": {
+                "arg": 0
+              },
+              "method": "POST"
+            },
+            {
+              "op": "receive",
+              "member": "subscription",
+              "path": [
+                "procedure"
+              ],
+              "of": "instance:create",
+              "name": {
+                "bound": "key"
+              },
+              "handler": {
+                "arg": 0
+              }
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    },
+    {
+      "package": "hono",
+      "version": "4.12.12",
+      "status": "answered",
+      "exports": [
+        {
+          "specifier": "hono",
+          "export": "Hono",
+          "role": "server_framework",
+          "label": "server_framework",
+          "side": null,
+          "makes": [
+            {
+              "form": "new",
+              "member": null
+            }
+          ],
+          "scopes": [
+            {
+              "member": "basePath",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new"
+            },
+            {
+              "member": "mount",
+              "mounts": {
+                "arg": 1
+              },
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new"
+            },
+            {
+              "member": "route",
+              "mounts": {
+                "arg": 1
+              },
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new"
+            },
+            {
+              "member": "use",
+              "of": "instance:new",
+              "name": {
+                "arg": 0
+              },
+              "mounts": {
+                "arg": 1,
+                "handle": true
+              }
+            },
+            {
+              "member": "use",
+              "of": "instance:new",
+              "mounts": {
+                "arg": 0,
+                "handle": true
+              }
+            }
+          ],
+          "ops": [
+            {
+              "member": "all",
+              "method": "ALL",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "delete",
+              "method": "DELETE",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "get",
+              "method": "GET",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "on",
+              "method_key": {
+                "arg": 0
+              },
+              "name": {
+                "arg": 1
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "options",
+              "method": "OPTIONS",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "patch",
+              "method": "PATCH",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "post",
+              "method": "POST",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            },
+            {
+              "member": "put",
+              "method": "PUT",
+              "name": {
+                "arg": 0
+              },
+              "of": "instance:new",
+              "op": "receive"
+            }
+          ],
+          "reserved": [],
+          "calls": [],
+          "patterns": []
+        }
+      ]
+    }
+  ]
+}

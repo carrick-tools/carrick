@@ -1,0 +1,11 @@
+{
+  "name": "@fixture/svc-web",
+  "exports": "./src/hooks.ts",
+  "imports": {
+    "@trpc/react-query": "npm:@trpc/react-query@11.16.0",
+    "@trpc/server": "npm:@trpc/server@11.16.0",
+    "@tanstack/react-query": "npm:@tanstack/react-query@5.107.1",
+    "react": "npm:react@19.3.1",
+    "@types/react": "npm:@types/react@19.3.0"
+  }
+}

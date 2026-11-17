@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "svc-api", "directory": "svc-api" },
+    { "serviceName": "svc-web", "directory": "svc-web" }
+  ]
+}
