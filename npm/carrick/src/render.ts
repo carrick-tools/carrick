@@ -562,7 +562,7 @@ function earlyHeadline(where: string, problems: number, movedRoles: string[], la
   const after = late ? "your earlier edit to it" : "this edit";
   if (problems > 0) return `Carrick's compiler engine checked ${where} after ${after}: ${problems} contract ${problems === 1 ? "problem" : "problems"}.`;
   if (movedRoles.length === 0) return null;
-  // DRAFT wording for calls (copy-pass owed): the noun follows the moved rows' roles.
+  // The noun follows the moved rows' roles.
   const what = movedRoles.every((r) => r === "call") ? "calls" : movedRoles.some((r) => r === "call") ? "routes and calls" : "routes";
   return `Carrick's compiler engine checked ${where} after ${after}; ${what} in other files broke:`;
 }

@@ -53,8 +53,7 @@ const PROP_PATH = /^Types of property '([^']+)' are incompatible\.?$/;
  * The voice table (HM4 D4): who sends and who reads, by which end of the check
  * this code is. The sentences are built from these two subjects in one place.
  * In the compiler's "Type S is not assignable to type E", S is always the
- * "sends" slot and E the "expects" slot; only the subjects move. DRAFT wording
- * for the two consumer rows (copy-pass owed).
+ * "sends" slot and E the "expects" slot; only the subjects move.
  */
 type Voice = { sender: string; reader: string };
 const PRODUCER_VOICE: Voice = { sender: "This code", reader: "the caller" };
