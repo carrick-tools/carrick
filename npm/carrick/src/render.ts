@@ -193,6 +193,12 @@ export function stateWord(state: string | undefined): string {
  * finding that names the operation, so naming one of them would state that
  * THAT consumer reads the type — which the payload does not say. The
  * unchanged Counterparts line lists them all.
+ *
+ * A socket event or a pub/sub topic has no request or response half, so the
+ * CLI states its sender in `sent_by` (decided once, `typed_sides` in
+ * `src/local_mode/join.rs`, carrick#4770), and the sentence names the two sides
+ * from that field and never from the direction: the sending code sends, the
+ * listener expects.
  */
 export function typedMismatchClause(item: CheckItem): string | null {
   const direction = item.direction;
@@ -204,12 +210,7 @@ export function typedMismatchClause(item: CheckItem): string | null {
   // those words are exactly "the compiler compared these two and they differ".
   if (item.verdict?.state !== "resolved" || item.verdict?.result !== "type_mismatch") return null;
 
-  const verb = direction === "response" ? "reads" : "expects";
-  const sender = direction === "response" ? "producer" : "consumer";
-  const reader = direction === "response" ? "consumer" : "producer";
   const rowSide = item.kind === "route" ? "producer" : item.kind === "call" ? "consumer" : null;
-  const payload = `${direction} is ${actual}`;
-
   const site = (role: string): string | null => {
     const named = (item.counterparts ?? []).filter((counterpart) => counterpart.role === role);
     if (named.length !== 1) return null;
@@ -218,6 +219,22 @@ export function typedMismatchClause(item: CheckItem): string | null {
     const where = `${only.file}${only.line ? `:${only.line}` : ""}`;
     return only.service ? `${only.service} ${where}` : where;
   };
+
+  if (item.sent_by === "producer" || item.sent_by === "consumer") {
+    const sender = item.sent_by;
+    const reader = sender === "producer" ? "consumer" : "producer";
+    if (rowSide === reader) {
+      const from = site(sender);
+      return `${from ? `code at ${from}` : "other code"} sends ${actual}; this code expects ${expected}`;
+    }
+    const at = site(reader);
+    return `this code sends ${actual}; ${at ? `code at ${at}` : "other code"} expects ${expected}`;
+  }
+
+  const verb = direction === "response" ? "reads" : "expects";
+  const sender = direction === "response" ? "producer" : "consumer";
+  const reader = direction === "response" ? "consumer" : "producer";
+  const payload = `${direction} is ${actual}`;
 
   if (rowSide === reader) {
     const from = site(sender);

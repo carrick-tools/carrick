@@ -204,9 +204,9 @@ pub struct Item {
     pub evidence: Option<String>,
     pub counterparts: Vec<Counterpart>,
     pub verdict: Option<Verdict>,
-    /// The type the READING side of [`Item::direction`] declares: the
-    /// producer's request type on a `request`, what the call site reads on a
-    /// `response`. Capped at [`MAX_TYPE_TEXT_CHARS`] characters, with `...`
+    /// The type the READING side declares: the producer's request type on a
+    /// `request`, what the call site reads on a `response`, the listener's or
+    /// subscriber's type on a socket or pub/sub row ([`Item::sent_by`]). Capped at [`MAX_TYPE_TEXT_CHARS`] characters, with `...`
     /// where the cap cut it.
     ///
     /// `expected` and `actual` are the two ends of one assignability check,
@@ -220,9 +220,10 @@ pub struct Item {
     /// absent field is "this run did not state it", never a type of `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_type: Option<String>,
-    /// The type the SENDING side of [`Item::direction`] states: what the
-    /// consumer sends on a `request`, the producer's response type on a
-    /// `response`. Capped and absent on the same terms as
+    /// The type the SENDING side states: what the consumer sends on a
+    /// `request`, the producer's response type on a `response`, the emitter's
+    /// or publisher's payload on a socket or pub/sub row ([`Item::sent_by`]).
+    /// Capped and absent on the same terms as
     /// [`Item::expected_type`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_type: Option<String>,
@@ -231,6 +232,16 @@ pub struct Item {
     /// because it is the same fact the type check keyed its outcome on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// Which side sends, `producer` or `consumer`, where [`Item::direction`]
+    /// does not say it: a socket event or a pub/sub topic, whose emitter or
+    /// publisher (the `call` row, so `consumer`) sends and whose listener or
+    /// subscriber (the `route` row) reads, whichever way the event travels.
+    /// On such a row [`Item::actual_type`] is the emitter's payload and
+    /// [`Item::expected_type`] the listener's type. Absent on every HTTP and
+    /// GraphQL row, where the direction names the sender (carrick#4770).
+    /// Decided in one place, `local_mode::join::typed_sides`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<String>,
     /// The re-check judged this row a problem of the edit, by the rule a plain
     /// `check --changed` lists on (`changed.rs`, `Problem::listed_without_all`):
     /// it fails, or rests on an index another build wrote. Absent on every
@@ -1327,6 +1338,7 @@ mod tests {
                 expected_type: None,
                 actual_type: None,
                 direction: None,
+                sent_by: None,
                 stated: false,
             }],
             boundary: None,
@@ -1911,7 +1923,7 @@ mod hosted_wire_tests {
             "an answer with no re-check states no block at all"
         );
 
-        for field in ["expected_type", "actual_type", "direction"] {
+        for field in ["expected_type", "actual_type", "direction", "sent_by"] {
             assert!(
                 bare["items"][0].get(field).is_none(),
                 "{field} is written only when the index holds it"

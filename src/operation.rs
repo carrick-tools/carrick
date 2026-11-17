@@ -31,6 +31,17 @@ pub enum Protocol {
     Pubsub,
 }
 
+impl Protocol {
+    /// A message protocol (a socket event, a pub/sub topic): the side that
+    /// sends is the emitter or publisher, which is the CALL (consumer) row,
+    /// and the listener or subscriber is the endpoint (producer) row that
+    /// reads, whichever way the event travels. HTTP and GraphQL are not:
+    /// their sender follows the request or response half.
+    pub fn is_message(self) -> bool {
+        matches!(self, Protocol::Websocket | Protocol::Pubsub)
+    }
+}
+
 /// Per-pair type-compatibility verdict, the three-way result of the type
 /// sidecar's check. Distinct from `Option<bool>` (`type_compatible`): that
 /// collapses `Unverifiable` and "never evaluated" both to `None`, which is

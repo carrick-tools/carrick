@@ -142,6 +142,10 @@ pub struct IndexedItem {
     pub actual_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+    /// Which side sends, on a message pair only (carrick#4770), as
+    /// [`super::contract::Item::sent_by`] publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<String>,
     /// The per-edit re-check's judge stated this row as the edit's problem
     /// (`changed.rs`, `Problem::stated`). Relative to one `before`, so it is
     /// never read from or written to `.carrick/index.json`.

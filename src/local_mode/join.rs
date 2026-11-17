@@ -113,6 +113,11 @@ pub struct JoinedFinding {
     /// The type the SENDING side of that direction states, capped the same
     /// way. See [`super::contract::Item::actual_type`].
     pub actual_type: Option<String>,
+    /// Which side sends, where the direction does not say it: see
+    /// [`super::contract::Item::sent_by`]. Absent from every HTTP and GraphQL
+    /// finding, so their stored bytes are unchanged (carrick#4770).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_by: Option<String>,
     /// Whether every row behind the pairing is one the source states:
     /// `fact` or `candidate`, the finding's own [`crate::findings::EdgeSource`]
     /// in its wire spelling. `None` when the scan could not state it. What
@@ -320,9 +325,10 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             verdict_state,
             direction,
             edge_source,
+            protocol,
             ..
         } => {
-            let (expected, actual) = typed_sides(*direction, producer_type, consumer_type);
+            let sides = typed_sides(*direction, *protocol, producer_type, consumer_type);
             Some(JoinedFinding {
                 kind: "type_mismatch".to_string(),
                 service: service.clone(),
@@ -332,8 +338,9 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
                 detail: detail.clone(),
                 verdict_state: wire_verdict_state(*verdict_state),
                 direction: direction.map(wire_direction),
-                expected_type: expected,
-                actual_type: actual,
+                expected_type: sides.expected,
+                actual_type: sides.actual,
+                sent_by: sides.sent_by.map(str::to_string),
                 edge_source: wire_edge_source(*edge_source),
             })
         }
@@ -361,37 +368,49 @@ fn project_finding(finding: &crate::findings::Finding) -> Option<JoinedFinding> 
             direction: None,
             expected_type: None,
             actual_type: None,
+            sent_by: None,
             edge_source: wire_edge_source(*edge_source),
         }),
         _ => None,
     }
 }
 
-/// The two type texts of a mismatch, as the direction assigns them.
+/// The two type texts of a mismatch, as the side that sends assigns them,
+/// and that side where the direction does not name it.
 ///
-/// A direction is one assignability check, and the two words name its two
-/// ends: `actual` is the SOURCE, what the sending side states, and `expected`
-/// is the TARGET, what the reading side declares. Which service is which
-/// therefore flips with the direction, which is the whole reason the field is
-/// carried:
+/// A check is one assignability test, and the two words name its two ends:
+/// `actual` is the SOURCE, what the sending side states, and `expected` is the
+/// TARGET, what the reading side declares. This is the one place that decides
+/// which service sends (carrick#4770); it mirrors the type judge's own table,
+/// `directionFor` in `src/sidecar/src/capture/check-probe.ts`:
 ///
+/// * a socket event or a pub/sub topic ([`crate::operation::Protocol::is_message`])
+///   — the emitter or publisher sends and the listener or subscriber reads,
+///   whichever way the event travels. The emitter is the call (consumer) row,
+///   so `actual` is the consumer's payload and `expected` is the listener's
+///   type. The pair's direction says nothing about this, so `sent_by` states
+///   it: `consumer`.
 /// * `request` — the consumer sends and the producer reads, so `actual` is the
 ///   consumer's type and `expected` is the producer's declared request type.
 /// * `response` — the producer sends and the consumer reads, so `actual` is
 ///   the producer's response type and `expected` is what the call site reads.
 ///
-/// `None` for both wherever the finding states no direction: without it the
-/// pair cannot be assigned to the two ends, and a finding whose two strings
-/// are service labels rather than types states none (carrick#1033).
+/// `sent_by` is stated only on a message pair: on HTTP and GraphQL the
+/// direction already names the sender, and their rows stay as they were.
+///
+/// Nothing wherever the finding states no direction: without it the pair
+/// cannot be assigned to the two ends, and a finding whose two strings are
+/// service labels rather than types states none (carrick#1033).
 ///
 /// `None` for one side whose text is empty. A consumer the retype check judged
 /// from its own code states no type, and its finding leaves `consumer_type`
 /// empty rather than naming the generated alias (carrick#1517).
 fn typed_sides(
     direction: Option<crate::cloud_storage::ManifestTypeKind>,
+    protocol: Option<crate::operation::Protocol>,
     producer_type: &str,
     consumer_type: &str,
-) -> (Option<String>, Option<String>) {
+) -> TypedSides {
     use crate::cloud_storage::ManifestTypeKind;
     let cap = |text: &str| {
         let text = text.trim();
@@ -403,11 +422,32 @@ fn typed_sides(
             super::contract::MAX_TYPE_TEXT_CHARS,
         ))
     };
+    let consumer_sends = |sent_by: Option<&'static str>| TypedSides {
+        expected: cap(producer_type),
+        actual: cap(consumer_type),
+        sent_by,
+    };
+    let message = protocol.is_some_and(crate::operation::Protocol::is_message);
     match direction {
-        Some(ManifestTypeKind::Request) => (cap(producer_type), cap(consumer_type)),
-        Some(ManifestTypeKind::Response) => (cap(consumer_type), cap(producer_type)),
-        None => (None, None),
+        None => TypedSides::default(),
+        Some(_) if message => consumer_sends(Some("consumer")),
+        Some(ManifestTypeKind::Request) => consumer_sends(None),
+        Some(ManifestTypeKind::Response) => TypedSides {
+            expected: cap(consumer_type),
+            actual: cap(producer_type),
+            sent_by: None,
+        },
     }
+}
+
+/// What [`typed_sides`] decides for one finding.
+#[derive(Default)]
+struct TypedSides {
+    expected: Option<String>,
+    actual: Option<String>,
+    /// The role (`producer` or `consumer`) that sends, stated only where the
+    /// direction does not name it.
+    sent_by: Option<&'static str>,
 }
 
 /// The direction in the spelling the contract prints, which is the
@@ -466,6 +506,7 @@ mod tests {
     use super::*;
     use crate::cloud_storage::ManifestTypeKind;
     use crate::findings::Finding;
+    use crate::operation::Protocol;
 
     fn mismatch(direction: Option<ManifestTypeKind>) -> Finding {
         Finding::type_mismatch(
@@ -506,6 +547,80 @@ mod tests {
             Some("UsersResponse { users: UserV2[] }")
         );
         assert_eq!(joined.actual_type.as_deref(), Some("number"));
+    }
+
+    /// A message pair as the analyzer raises it: the listener or subscriber
+    /// is the producer row, the emitter or publisher the consumer row, and
+    /// the stored direction is `response` whichever way the event travels.
+    fn message(method: &str, path: &str, protocol: Protocol) -> Finding {
+        Finding::type_mismatch(
+            method,
+            path,
+            None,
+            vec!["src/live.ts:12".to_string()],
+            "{ orderId: string; state: string; }",
+            "{ orderId: string; status: string; }",
+            "not assignable",
+        )
+        .with_direction(Some(ManifestTypeKind::Response))
+        .with_protocol(Some(protocol))
+    }
+
+    /// carrick#4770: on a socket event (either direction) and a pub/sub
+    /// topic the emitter or publisher sends, so its payload is the actual
+    /// type, the listener's type the expected one, and the row says the
+    /// consumer sends.
+    #[test]
+    fn a_message_mismatch_makes_the_emitter_payload_the_actual_one() {
+        for (method, path, protocol) in [
+            ("CLIENT->SERVER", "order:update", Protocol::Websocket),
+            ("SERVER->CLIENT", "order:update", Protocol::Websocket),
+            ("PUBSUB", "orders", Protocol::Pubsub),
+        ] {
+            let joined = project_finding(&message(method, path, protocol))
+                .expect("a type mismatch projects");
+            assert_eq!(
+                joined.actual_type.as_deref(),
+                Some("{ orderId: string; status: string; }"),
+                "{method}: the emitter's payload is what is sent"
+            );
+            assert_eq!(
+                joined.expected_type.as_deref(),
+                Some("{ orderId: string; state: string; }"),
+                "{method}: the listener's type is what is expected"
+            );
+            assert_eq!(joined.sent_by.as_deref(), Some("consumer"), "{method}");
+            // The verdict's own fields are untouched.
+            assert_eq!(joined.direction.as_deref(), Some("response"), "{method}");
+        }
+    }
+
+    /// HTTP and GraphQL keep the direction's rule and state no sender, so
+    /// their rows are byte for byte what they were.
+    #[test]
+    fn http_and_graphql_state_no_sender() {
+        for protocol in [Protocol::Http, Protocol::Graphql] {
+            let joined = project_finding(
+                &mismatch(Some(ManifestTypeKind::Response)).with_protocol(Some(protocol)),
+            )
+            .expect("a type mismatch projects");
+            assert_eq!(
+                joined.actual_type.as_deref(),
+                Some("UsersResponse { users: UserV2[] }")
+            );
+            assert_eq!(joined.expected_type.as_deref(), Some("number"));
+            assert_eq!(joined.sent_by, None);
+            let wire = serde_json::to_value(&joined).unwrap();
+            assert!(wire.get("sent_by").is_none(), "{wire:#}");
+        }
+    }
+
+    /// The protocol is scan-local: the finding the cloud reads is unchanged.
+    #[test]
+    fn the_protocol_is_never_written_to_the_wire() {
+        let wire = serde_json::to_value(message("PUBSUB", "orders", Protocol::Pubsub)).unwrap();
+        assert!(wire.get("protocol").is_none(), "{wire:#}");
+        assert!(wire.get("sent_by").is_none(), "{wire:#}");
     }
 
     /// The SDK-mediated path raises a mismatch whose two strings are a service

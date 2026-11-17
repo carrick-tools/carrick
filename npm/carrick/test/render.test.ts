@@ -20,6 +20,7 @@ import {
 import fs from "node:fs";
 import path from "node:path";
 import type { Boundary, CheckItem, CheckResult } from "../src/contract.ts";
+import { messageOf } from "../src/diagnostics.ts";
 import { asStated, fixture, statusFixture, testDir } from "./helpers.ts";
 
 // What an edit is told (the post-edit hook): only what this edit changed or
@@ -800,6 +801,161 @@ test("the typed sentence is built from the direction, and names no counterpart i
       expected_type: "CreateUser",
     }),
     "request is { name: string } from consumer at notification-service server.ts:25, this route expects CreateUser",
+  );
+});
+
+// carrick#4770: a socket event or a pub/sub topic has no request or response
+// half. The CLI states its sender in `sent_by`, and the sentence names the two
+// sides from that field: the emitting code sends, the listener expects. Each
+// item is the row `carrick check --recheck --json` answered for the pr-seeds
+// pair in `tests/local_mode_test.rs` (the carrick#4770 tests), minus `repo`
+// and a null `col`.
+const C2S_DETAIL =
+  "order:update (client→server) → Response not assignable to order:update (client→server) → Response\n  Property 'state' is missing in type 'order:update (client→server) → Response' but required in type '{ orderId: string; state: string; }";
+const c2sListener: CheckItem = {
+  actual_type: "{ orderId: string; status: string; }",
+  counterparts: [{ file: "src/live.ts", line: 12, role: "consumer", service: "storefront" }],
+  direction: "response",
+  evidence: "library_claim",
+  expected_type: "{ orderId: string; state: string; } & { orderId: string; }",
+  kind: "route",
+  line: 11,
+  method: "CLIENT->SERVER",
+  path: "order:update",
+  resolution_source: "library_claim",
+  sent_by: "consumer",
+  source: "fact",
+  stated: true,
+  verdict: { detail: C2S_DETAIL, result: "type_mismatch", state: "resolved" },
+};
+const s2cEmitter: CheckItem = {
+  actual_type: "{ orderId: string; courier: string; }",
+  counterparts: [{ file: "src/live.ts", line: 15, role: "producer", service: "storefront" }],
+  direction: "response",
+  evidence: "library_claim",
+  expected_type: "{ orderId: string; carrier: string; }",
+  kind: "call",
+  line: 12,
+  method: "SERVER->CLIENT",
+  path: "order:shipped",
+  resolution_source: "library_claim",
+  sent_by: "consumer",
+  source: "fact",
+  stated: true,
+  verdict: {
+    detail:
+      "Property 'carrier' is missing in type 'order:shipped (server→client) → Response' but required in type 'order:shipped (server→client) → Response Fields that differ: 'carrier' is required by the producer and the consumer does not send it; 'courier' is sent by the consumer and the producer declares no such field.",
+    result: "type_mismatch",
+    state: "resolved",
+  },
+};
+const pubsubSubscriber: CheckItem = {
+  actual_type: "{ orderId: string; amount: number; }",
+  counterparts: [{ file: "src/payments.ts", line: 10, role: "consumer", service: "storefront" }],
+  direction: "response",
+  evidence: "library_claim",
+  expected_type: "{ orderId: string; total: number; }",
+  kind: "route",
+  line: 9,
+  method: "PUBSUB",
+  path: "payments.settled",
+  resolution_source: "library_claim",
+  sent_by: "consumer",
+  source: "fact",
+  stated: true,
+  verdict: {
+    detail:
+      "Property 'total' is missing in type 'payments.settled (pub/sub) → Response' but required in type 'payments.settled (pub/sub) → Response Fields that differ: 'amount' is sent by the consumer and the producer declares no such field; 'total' is required by the producer and the consumer does not send it.",
+    result: "type_mismatch",
+    state: "resolved",
+  },
+};
+
+test("a message mismatch read from the listener says the emitting code sends", () => {
+  assert.equal(
+    typedMismatchClause(c2sListener),
+    "code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
+  );
+  // Two senders: neither is named.
+  assert.equal(
+    typedMismatchClause({
+      ...c2sListener,
+      counterparts: [
+        { role: "consumer", service: "storefront", file: "src/live.ts", line: 12 },
+        { role: "consumer", service: "admin-ui", file: "src/live.ts", line: 4 },
+      ],
+    }),
+    "other code sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
+  );
+  // A pub/sub subscriber reads the same way.
+  assert.equal(
+    typedMismatchClause(pubsubSubscriber),
+    "code at storefront src/payments.ts:10 sends { orderId: string; amount: number; }; this code expects { orderId: string; total: number; }",
+  );
+});
+
+test("a message mismatch read from the emitter says this code sends and the listener expects", () => {
+  assert.equal(
+    typedMismatchClause(s2cEmitter),
+    "this code sends { orderId: string; courier: string; }; code at storefront src/live.ts:15 expects { orderId: string; carrier: string; }",
+  );
+  assert.equal(
+    typedMismatchClause({ ...s2cEmitter, counterparts: [] }),
+    "this code sends { orderId: string; courier: string; }; other code expects { orderId: string; carrier: string; }",
+  );
+});
+
+test("the surfaces print the message sentence, and never as a response", () => {
+  const line = itemLine(c2sListener, "src/realtime.ts");
+  assert.ok(
+    line.startsWith(
+      "- src/realtime.ts:11:1 route CLIENT->SERVER order:update [fact, library_claim] code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }. ",
+    ),
+    line,
+  );
+  assert.ok(!line.includes("response is"), line);
+  const message = messageOf(s2cEmitter);
+  assert.ok(
+    message.startsWith(
+      "SERVER->CLIENT order:shipped: this code sends { orderId: string; courier: string; }; code at storefront src/live.ts:15 expects { orderId: string; carrier: string; }\n",
+    ),
+    message,
+  );
+  assert.ok(!message.includes("response is"), message);
+});
+
+test("an HTTP item states no sender and keeps its sentence byte for byte", () => {
+  // The pr-seeds route's mismatch as main and this change both answer it.
+  const http: CheckItem = {
+    actual_type: "{ id: string; total: string; currency: string; } & { id: string; }",
+    counterparts: [
+      { file: "src/checkout.ts", line: 4, role: "consumer", service: "storefront" },
+      { file: "src/orders-client.ts", line: 14, role: "consumer", service: "storefront" },
+    ],
+    direction: "response",
+    evidence: "file_based_route, handler loader",
+    expected_type: "{ id: string; total: number; currency: string; }",
+    kind: "route",
+    line: 9,
+    method: "GET",
+    path: "/api/v1/orders/:orderId",
+    resolution_source: "file_based_route",
+    source: "fact",
+    stated: true,
+    verdict: {
+      detail:
+        "GET /api/v1/orders/:orderId → Response not assignable to GET /api/v1/orders/:encoded → Response\n  Types of property 'total' are incompatible.\n    string not assignable to number",
+      result: "type_mismatch",
+      state: "resolved",
+    },
+  };
+  assert.equal(
+    typedMismatchClause(http),
+    "response is { id: string; total: string; currency: string; } & { id: string; }, a consumer reads { id: string; total: number; currency: string; }",
+  );
+  assert.equal(
+    typedMismatchClause({ ...http, counterparts: http.counterparts!.slice(1) }),
+    "response is { id: string; total: string; currency: string; } & { id: string; }, consumer at storefront src/orders-client.ts:14 reads { id: string; total: number; currency: string; }",
   );
 });
 
