@@ -7,7 +7,7 @@
  * instance, and the class's own parameters print open in its declaration.
  *
  * What the floor keeps: a data interface or a non-generic class an SDK
- * declares, `Order[]` and `Order` read through `Array` and `Promise`,
+ * declares, a generic class of the repo's own workspace package, `Order[]` and `Order` read through `Array` and `Promise`,
  * `ArrayBuffer | null`, and a body shape that holds an open parameter only
  * nested inside it (the capture erases that position and keeps the shape).
  */
@@ -60,7 +60,7 @@ export declare class Page<Item> {
   hasMore(): boolean;
   next(): Promise<Page<Item>>;
 }
-export declare class ApiPromise<T> extends Promise<T> {}
+export declare class CallPromise<T> extends Promise<T> {}
 export interface HttpResponse<T = any> {
   data: T;
   status: number;
@@ -75,18 +75,33 @@ export declare class SdkClient {
 }
 `;
 
-const APP_TS = `import { ResultAsync, okAsync } from '${RESULT_PACKAGE}';
-import { SdkClient, ApiPromise, http } from '${SDK_PACKAGE}';
+// A sibling workspace package of the same repo, linked into node_modules the
+// way a workspace install links it: its source is the repo's own code.
+const WORKSPACE_PACKAGE = '@fixture/paging';
+const WORKSPACE_TS = `export class Cursor<Item> {
+  data: Item[] = [];
+  async next(): Promise<Cursor<Item>> {
+    return this;
+  }
+}
+export async function listCursor(): Promise<Cursor<{ id: string }>> {
+  return new Cursor<{ id: string }>();
+}
+`;
 
-export interface ResultBody { id: string; status: string }
+const APP_TS = `import { ResultAsync, okAsync } from '${RESULT_PACKAGE}';
+import { listCursor } from '${WORKSPACE_PACKAGE}';
+import { SdkClient, CallPromise, http } from '${SDK_PACKAGE}';
+
+export interface ReportBody { id: string; status: string }
 export interface Order { id: string; total: number }
-export type QueryBody = { format: 'json'; results: unknown[] } | { format: 'csv'; results: string };
+export type QueryBody = { kind: 'rows'; items: unknown[] } | { kind: 'text'; items: string };
 export class AppError extends Error {}
 
-export class DocClient {
-  async getResult(id: string): Promise<ResultBody> {
-    const res = await fetch(\`/api/v1/results/\${id}\`);
-    return (await res.json()) as ResultBody;
+export class ReportClient {
+  async fetchReport(id: string): Promise<ReportBody> {
+    const res = await fetch(\`/api/v1/reports/\${id}\`);
+    return (await res.json()) as ReportBody;
   }
   async getOrder(id: string): Promise<Order> {
     const res = await fetch(\`/api/v1/orders/\${id}\`);
@@ -96,26 +111,26 @@ export class DocClient {
     const res = await fetch('/api/v1/orders');
     return (await res.json()) as Array<Order>;
   }
-  query(text: string): ApiPromise<QueryBody> {
-    return new ApiPromise<QueryBody>((resolve) => resolve({ format: 'csv', results: text }));
+  query(text: string): CallPromise<QueryBody> {
+    return new CallPromise<QueryBody>((resolve) => resolve({ kind: 'text', items: text }));
   }
 }
-export const docClient = new DocClient();
+export const reportClient = new ReportClient();
 const sdk = new SdkClient();
 
 // The service's call is handed to a library result class and read through it.
-export function onStatus(id: string): ResultAsync<void, AppError> {
-  return ResultAsync.fromPromise(docClient.getResult(id), (e) => new AppError(String(e))).andThen((body) =>
+export function onReport(id: string): ResultAsync<void, AppError> {
+  return ResultAsync.fromPromise(reportClient.fetchReport(id), (e) => new AppError(String(e))).andThen((body) =>
     okAsync<void, AppError>(record(body))
   );
 }
-function record(body: ResultBody): void {
+function record(body: ReportBody): void {
   void body;
 }
 
 // The same, held in a name: the call's own result is still its body.
-export function onStatusHeld(id: string) {
-  const held = ResultAsync.fromPromise(docClient.getResult(id.trim()), (e) => new AppError(String(e)));
+export function onReportHeld(id: string) {
+  const held = ResultAsync.fromPromise(reportClient.fetchReport(id.trim()), (e) => new AppError(String(e)));
   return held;
 }
 
@@ -125,9 +140,9 @@ export function wrapped<T, E>(run: () => Promise<T>, onError: (e: unknown) => E)
 }
 
 // A generic function stating a body shape that holds its parameter nested.
-export async function execute<TRow>(text: string) {
-  return docClient.query(text).then((r) => r) as Promise<
-    { format: 'json'; results: TRow[] } | { format: 'csv'; results: string }
+export async function runQuery<TItem>(text: string) {
+  return reportClient.query(text).then((r) => r) as Promise<
+    { kind: 'rows'; items: TItem[] } | { kind: 'text'; items: string }
   >;
 }
 
@@ -145,11 +160,12 @@ export async function callApi<T>(route: string): Promise<T> {
 }
 export const skus = () => callApi<{ sku: string }>('/skus');
 
+export const cursor = async () => await listCursor();
 export const customer = async () => await sdk.getCustomer('c1');
 export const invoice = async () => await sdk.getInvoice('i1');
 export const customers = async () => await sdk.listCustomers();
-export const orders = async () => await docClient.listOrders();
-export const order = async () => await docClient.getOrder('o1');
+export const orders = async () => await reportClient.listOrders();
+export const order = async () => await reportClient.getOrder('o1');
 
 export async function bytes(): Promise<ArrayBuffer | null> {
   const res = await fetch('/bytes');
@@ -217,6 +233,15 @@ describe('one floor on a consumer call result (carrick#4513 P1)', () => {
     );
     writePackage(RESULT_PACKAGE, RESULT_DTS);
     writePackage(SDK_PACKAGE, SDK_DTS);
+    const workspaceDir = path.join(repoDir, 'packages', 'paging');
+    fs.mkdirSync(path.join(workspaceDir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(workspaceDir, 'package.json'),
+      JSON.stringify({ name: WORKSPACE_PACKAGE, version: '1.0.0', types: 'src/index.ts', main: 'src/index.ts' })
+    );
+    fs.writeFileSync(path.join(workspaceDir, 'src', 'index.ts'), WORKSPACE_TS);
+    fs.mkdirSync(path.join(repoDir, 'node_modules', '@fixture'), { recursive: true });
+    fs.symlinkSync(workspaceDir, path.join(repoDir, 'node_modules', ...WORKSPACE_PACKAGE.split('/')), 'dir');
     appPath = path.join(repoDir, 'src', 'app.ts');
     fs.writeFileSync(appPath, APP_TS);
     client = new SidecarClient();
@@ -275,13 +300,13 @@ describe('one floor on a consumer call result (carrick#4513 P1)', () => {
   };
 
   it('a call handed to a library result class never states the class', async () => {
-    statesNoType(await infer('OnStatus', 'docClient.getResult(id)'), 'machinery_envelope');
+    statesNoType(await infer('OnReport', 'reportClient.fetchReport(id)'), 'machinery_envelope');
   });
 
   it('a call handed to a library result class and held in a name keeps its own body', async () => {
-    const read = await infer('OnStatusHeld', 'docClient.getResult(id.trim())');
-    assert.strictEqual(read.text, 'ResultBody', JSON.stringify(read));
-    assert.strictEqual(read.anchor, 'ResultBody', JSON.stringify(read));
+    const read = await infer('OnReportHeld', 'reportClient.fetchReport(id.trim())');
+    assert.strictEqual(read.text, 'ReportBody', JSON.stringify(read));
+    assert.strictEqual(read.anchor, 'ReportBody', JSON.stringify(read));
   });
 
   it('a wrapper returning the library result class with both parameters open states no type', async () => {
@@ -299,9 +324,9 @@ describe('one floor on a consumer call result (carrick#4513 P1)', () => {
   });
 
   it('a stated body shape holding a parameter only nested keeps its shape', async () => {
-    const read = await infer('Execute', 'docClient.query(text)');
-    assert.match(read.text, /format: "json"; results: TRow\[\];/, JSON.stringify(read));
-    assert.match(read.text, /format: "csv"; results: string;/, JSON.stringify(read));
+    const read = await infer('RunQuery', 'reportClient.query(text)');
+    assert.match(read.text, /kind: "rows"; items: TItem\[\];/, JSON.stringify(read));
+    assert.match(read.text, /kind: "text"; items: string;/, JSON.stringify(read));
     assert.deepStrictEqual(read.provenance, [], JSON.stringify(read));
   });
 
@@ -309,6 +334,12 @@ describe('one floor on a consumer call result (carrick#4513 P1)', () => {
     const read = await infer('Skus', 'http.get<T>(`/api${route}`)', "callApi<{ sku: string }>('/skus')");
     assert.match(read.text, /^\{ sku: string;? \}$/, JSON.stringify(read));
     assert.strictEqual(read.anchor, undefined, JSON.stringify(read));
+  });
+
+  it("a generic class of the repo's own workspace package keeps its type", async () => {
+    const read = await infer('Cursor', 'listCursor()');
+    assert.match(read.text, /(^|\.)Cursor<\{ id: string; \}>$/, JSON.stringify(read));
+    assert.strictEqual(read.anchor, 'Cursor', JSON.stringify(read));
   });
 
   it('an SDK data interface keeps its type', async () => {
@@ -324,10 +355,10 @@ describe('one floor on a consumer call result (carrick#4513 P1)', () => {
   });
 
   it('Array<Order> and Promise<Order> keep Order[] and Order', async () => {
-    const list = await infer('Orders', 'docClient.listOrders()');
+    const list = await infer('Orders', 'reportClient.listOrders()');
     assert.strictEqual(list.text, 'Order[]', JSON.stringify(list));
     assert.strictEqual(list.anchor, 'Order', JSON.stringify(list));
-    const one = await infer('Order', "docClient.getOrder('o1')");
+    const one = await infer('Order', "reportClient.getOrder('o1')");
     assert.strictEqual(one.text, 'Order', JSON.stringify(one));
     assert.strictEqual(one.anchor, 'Order', JSON.stringify(one));
   });
