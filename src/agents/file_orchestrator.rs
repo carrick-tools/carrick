@@ -946,6 +946,28 @@ impl DispatchWitnesses {
 /// The payload expression text as a bare identifier (`event`), or `None` when
 /// it is anything else (`{ ... }`, `event.data`, `build()`) — the only shape
 /// whose declared type we can resolve from the binding table.
+/// The Response alias of a socket operation's manifest entry. An emitter is a
+/// call, so its alias carries its site id (`build_site_id` over the same file,
+/// line and key `append_protocol_manifest_entries` hashes); a listener keeps
+/// the plain per-event alias (carrick#4779).
+fn socket_alias(op: &crate::socket_io::SocketOp, role: ManifestRole, repo_path: &str) -> String {
+    let site_id = match role {
+        ManifestRole::Consumer => Some(build_site_id(
+            &op.file_path.to_string_lossy(),
+            op.line,
+            &op.key,
+            repo_path,
+        )),
+        ManifestRole::Producer => None,
+    };
+    build_manifest_type_alias_with_site_id(
+        &op.key,
+        role,
+        ManifestTypeKind::Response,
+        site_id.as_deref(),
+    )
+}
+
 fn payload_bare_ident(text: &str) -> Option<&str> {
     let t = text.trim();
     let mut chars = t.chars();
@@ -6269,7 +6291,7 @@ impl FileOrchestrator {
     /// HTTP explicit-symbol case uses. Listeners are producers, emitters are
     /// consumers; each resolves to the Response-kind alias.
     ///
-    /// The alias MUST be `build_manifest_type_alias(&op.key, role, Response)` —
+    /// The alias MUST be [`socket_alias`] —
     /// byte-identical to the alias `append_protocol_manifest_entry` stamped on
     /// the manifest entry — or the resolved `.d.ts` never joins back and the
     /// entry stays `Unknown`. This contract is guarded by a unit test.
@@ -6307,7 +6329,7 @@ impl FileOrchestrator {
                 // No import → same-file declaration: resolve against the file.
                 None => file_abs,
             };
-            let alias = build_manifest_type_alias(&op.key, role, ManifestTypeKind::Response);
+            let alias = socket_alias(op, role, repo_path);
             let dedup_key = format!("{}|{}|{}", source_file, symbol, alias);
             if seen.insert(dedup_key) {
                 requests.push(SymbolRequest {
@@ -6340,12 +6362,12 @@ impl FileOrchestrator {
     /// handler. Sibling of `collect_socket_type_requests`, which covers the
     /// named-symbol ops; the two never ask for one op.
     ///
-    /// The alias is `build_manifest_type_alias(&op.key, role, Response)` with no
-    /// site id, byte-identical to the one `append_protocol_manifest_entries`
-    /// stamps on a socket entry. One request per alias: an alias a symbol
-    /// anchors (same role) or an earlier op already asked is not asked again
-    /// (two inline emitters of one event share the alias, the existing fan-in
-    /// limit, carrick#291). A file that cannot be read yields no request.
+    /// The alias is [`socket_alias`], byte-identical to the one
+    /// `append_protocol_manifest_entries` stamps on a socket entry: an
+    /// emitter's carries its site id, so each emit is asked on its own
+    /// (carrick#4779). One request per alias: an alias a symbol anchors (same
+    /// role) or an earlier op already asked is not asked again. A file that
+    /// cannot be read yields no request.
     pub fn collect_socket_infer_requests(
         &self,
         sockets: &crate::socket_io::SocketExtraction,
@@ -6362,9 +6384,8 @@ impl FileOrchestrator {
                 .unwrap_or_else(|_| repo_root.to_path_buf())
         };
 
-        let alias_of = |op: &crate::socket_io::SocketOp, role: ManifestRole| {
-            build_manifest_type_alias(&op.key, role, ManifestTypeKind::Response)
-        };
+        let alias_of =
+            |op: &crate::socket_io::SocketOp, role: ManifestRole| socket_alias(op, role, repo_path);
         // Aliases the symbol path already anchors: the bundle wins anyway.
         let mut seen: HashSet<String> = HashSet::new();
         for op in &sockets.listeners {
