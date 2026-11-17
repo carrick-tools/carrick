@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.161](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.160...carrick-v0.3.161) (2026-11-17)
+
+
+### Bug Fixes
+
+* **held:** an early break names what this code sends and what the caller expects ([#4688](https://github.com/carrick-tools/carrick/issues/4688)) ([#4725](https://github.com/carrick-tools/carrick/issues/4725)) ([fa26145](https://github.com/carrick-tools/carrick/commit/fa2614527c2317815a3724e6feea4117c502bbd3))
+
 ## [0.3.160](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.159...carrick-v0.3.160) (2026-11-16)
 
 
