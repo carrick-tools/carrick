@@ -867,6 +867,11 @@ pub struct RetypeItem {
     pub producer_unwidened_type: Option<String>,
     /// Judge the form JSON puts on the wire (an `http` response).
     pub wire: bool,
+    /// The key path of the procedure the call names (`orders.list`): the
+    /// call's own type is the router's, so the retype judges the consumer's
+    /// code against it (carrick#937).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure_path: Option<String>,
 }
 
 /// One consumer call to prescreen for the retype (carrick#3132): the call's
@@ -6870,6 +6875,7 @@ mod tests {
                     producer_type: "{ id: string }".into(),
                     producer_unwidened_type: Some("{ id: \"a\" }".into()),
                     wire: true,
+                    procedure_path: None,
                 }],
             },
             SidecarRequest::RetypePrescreen {

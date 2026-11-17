@@ -3477,13 +3477,21 @@ fn carried_serves_schema(service: &Config, stored: &CloudRepoData) -> bool {
 /// same root, so the locators its stored manifest carries name the same
 /// calls.
 fn record_carried_consumer(repo_path: &str, service: &Config, stored: &CloudRepoData) {
-    let Some(manifest) = stored.type_manifest.as_deref() else {
-        return;
-    };
     let absolute_repo = Path::new(repo_path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(repo_path));
-    let calls = type_compat_v2::stored_call_locators(manifest, &absolute_repo);
+    let mut calls = stored
+        .type_manifest
+        .as_deref()
+        .map(|manifest| type_compat_v2::stored_call_locators(manifest, &absolute_repo))
+        .unwrap_or_default();
+    // A service with no manifest but with procedure calls is registered: its
+    // calls are judged from its own code (carrick#937).
+    calls.extend(type_compat_v2::procedure_call_locators(
+        &stored.calls,
+        repo_path,
+        &absolute_repo,
+    ));
     if calls.is_empty() {
         return;
     }
@@ -12642,6 +12650,13 @@ fn run_capture_for_service(
     // in the program this analysis built, before the capture restarts the
     // process (carrick#3132).
     type_compat_v2::prescreen_calls(sidecar, &service_id, &mut calls);
+    // A procedure call's own type is its router's: the retype judges it
+    // with no prescreen and no consumer manifest entry (carrick#937).
+    calls.extend(type_compat_v2::procedure_call_locators(
+        &cloud_data.calls,
+        repo_path,
+        &absolute_repo,
+    ));
     // Stored with the blob, so a run that carries this service retypes the
     // same calls (carrick#2567), and with the place of every value ask
     // (carrick#4244).

@@ -459,8 +459,7 @@
         "rows": [
           {"kind": "risk_introduced", "label": "GET /api/trpc/orders.list", "site": "src/web/orders-view.ts:7"}
         ]
-      },
-      "known_miss": {"stage": "judged", "issues": ["carrick#937"]}
+      }
     },
     {
       "name": "trpc-called-procedure-removed",

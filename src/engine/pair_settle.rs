@@ -400,9 +400,17 @@ impl SettleFrom {
         if !stored.judged || stored.spec_hash != spec_hash(pair) {
             return None;
         }
-        if self.unreached(&pair.producer_service, &pair.producer_alias)
-            && self.unreached(&pair.consumer_service, &pair.consumer_alias)
-        {
+        // A procedure call's verdict is the consumer's own compile against
+        // the router's type, so main's holds only when the consumer service
+        // changed no file (carrick#937). A consumer-only edit keeps main's
+        // types ("not reached") yet may read what the procedure no longer
+        // returns.
+        let consumer_unreached = if pair.consumer_procedure {
+            self.carried.contains(&pair.consumer_service)
+        } else {
+            self.unreached(&pair.consumer_service, &pair.consumer_alias)
+        };
+        if self.unreached(&pair.producer_service, &pair.producer_alias) && consumer_unreached {
             Some((stored, Settled::Unreached))
         } else if same_judge_input(pair, stored) {
             Some((stored, Settled::SameJudgeInput))

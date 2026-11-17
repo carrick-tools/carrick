@@ -1576,6 +1576,10 @@ pub(crate) struct BuiltPair {
     /// reads it (carrick#4403): the table rides on the stub input, outside the
     /// spec, and a kept verdict must not outlive a change to it.
     pub producer_graphql_types: Option<String>,
+    /// The consumer is a procedure call (carrick#937): its type is its
+    /// router's own, so the pair is judged only by type-checking the
+    /// consumer's code, never from a stated type.
+    pub consumer_procedure: bool,
 }
 
 /// What a call's stated message picks from a producer response's modes
@@ -1825,6 +1829,8 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
     // (carrick#831). `[None]` is a call that states no case, which is nearly
     // every entry.
     let mut consumers: Vec<(ServiceEntry, Vec<Option<&crate::dispatch::Dispatch>>)> = Vec::new();
+    // Every call that names a procedure, with its service (carrick#937).
+    let mut procedure_calls: Vec<(&str, &crate::analyzer::ApiEndpointDetails)> = Vec::new();
 
     for repo in all_repo_data {
         let service_id = repo
@@ -1835,6 +1841,14 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
             .capture_stub
             .as_ref()
             .is_some_and(|s| s.artifact_version == CAPTURE_ARTIFACT_VERSION);
+        // A procedure call publishes no consumer entry, so a service with no
+        // manifest at all can still hold one (carrick#937).
+        procedure_calls.extend(
+            repo.calls
+                .iter()
+                .filter(|call| call.procedure.is_some())
+                .map(|call| (service_id, call)),
+        );
         let Some(entries) = repo.type_manifest.as_ref() else {
             continue;
         };
@@ -2071,6 +2085,33 @@ pub(crate) fn build_check_pairs(all_repo_data: &[CloudRepoData]) -> Vec<BuiltPai
         }
     }
 
+    // A call that names a procedure pairs with the procedure's response
+    // through the same procedure arm the analyzer uses (carrick#937). It is
+    // left to the consumer's own code: its type is its router's, so a probe
+    // would compare the producer's type with itself.
+    for (service_id, call) in &procedure_calls {
+        let Some((method, path)) = call.key.as_http() else {
+            continue;
+        };
+        let pairing = http_pool.pair(&carrick_match::Call {
+            service: service_id.to_string(),
+            protocol: "http".to_string(),
+            method: Some(method.to_string()),
+            path: Some(path.to_string()),
+            procedure: call.procedure.clone(),
+            ..Default::default()
+        });
+        if pairing.outcome != carrick_match::PairOutcome::Matched {
+            continue;
+        }
+        for winner in &pairing.winners {
+            pairs.extend(
+                entries_for_route(winner.producer, ManifestTypeKind::Response)
+                    .filter_map(|producer| procedure_pair(producer, service_id, call)),
+            );
+        }
+    }
+
     // Deterministic order regardless of repo download order.
     pairs.sort_by(|a, b| a.spec.pair_key.cmp(&b.spec.pair_key));
     pairs.dedup_by(|a, b| a.spec.pair_key == b.spec.pair_key);
@@ -2086,6 +2127,71 @@ pub(crate) fn probe_protocol(key: &OperationKey) -> ProbeProtocol {
         OperationKey::Socket { .. } => ProbeProtocol::Socket,
         OperationKey::Pubsub { .. } => ProbeProtocol::Pubsub,
     }
+}
+
+/// Why a procedure pair is left to the consumer's own code, as stored.
+const PROCEDURE_PAIR_REASON: &str = "a procedure call's type is its router's own, so only \
+     type-checking the consumer's code can judge the pair";
+
+/// The pair of a procedure call and the procedure's response (carrick#937).
+/// The consumer has no manifest entry, so the pair is built from the call row
+/// alone and decided before any probe: a probe would compare the router's
+/// type with itself. [`retype_consumer_calls`] judges it from the consumer's
+/// code.
+fn procedure_pair(
+    producer: &ServiceEntry,
+    consumer_service: &str,
+    call: &crate::analyzer::ApiEndpointDetails,
+) -> Option<BuiltPair> {
+    let (pseudo_method, identity) = join_identity(&producer.entry.key)?;
+    let consumer_alias = procedure_call_alias(call, ".")?;
+    let (consumer_file, consumer_line) =
+        crate::type_manifest::parse_file_location(&call.file_path.to_string_lossy());
+    let protocol = probe_protocol(&producer.entry.key);
+    let pair_key = format!(
+        "{}/{}~{}/{}",
+        producer.service_id, producer.entry.type_alias, consumer_service, consumer_alias
+    );
+    Some(BuiltPair {
+        spec: CheckPairSpec {
+            pair_key,
+            protocol,
+            type_kind: ProbeTypeKind::Response,
+            producer: CheckPairEndpoint {
+                service_name: producer.service_id.to_string(),
+                alias: producer.entry.type_alias.clone(),
+            },
+            consumer: CheckPairEndpoint {
+                service_name: consumer_service.to_string(),
+                alias: consumer_alias.clone(),
+            },
+            topic: None,
+            procedure: producer.procedure,
+            graphql_root: None,
+        },
+        pseudo_method,
+        identity,
+        consumer_file,
+        consumer_line,
+        type_kind: producer.entry.type_kind,
+        producer_alias: producer.entry.type_alias.clone(),
+        consumer_alias,
+        producer_service: producer.service_id.to_string(),
+        consumer_service: consumer_service.to_string(),
+        pre_verdict: Some(PreVerdict::NotCompared {
+            reason: PROCEDURE_PAIR_REASON.to_string(),
+        }),
+        pre_verdict_side: Some(VerdictSide::Consumer),
+        producer_expanded: producer.entry.expanded_definition.clone(),
+        producer_unwidened: None,
+        consumer_expanded: None,
+        unstated_mode: None,
+        unwidened_out_of_budget: false,
+        producer_surface_hash: None,
+        consumer_surface_hash: None,
+        producer_graphql_types: None,
+        consumer_procedure: true,
+    })
 }
 
 fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltPair> {
@@ -2224,6 +2330,7 @@ fn build_pair(producer: &ServiceEntry, consumer: &ServiceEntry) -> Option<BuiltP
         producer_surface_hash: None,
         consumer_surface_hash: None,
         producer_graphql_types,
+        consumer_procedure: false,
     })
 }
 
@@ -2816,7 +2923,7 @@ pub(crate) fn run_check(
         outcome.left_to_consumer = consumer_blamed.contains(&outcome.pair_key);
     }
     let retype_started = std::time::Instant::now();
-    retype_consumer_calls(
+    let procedure_judged = retype_consumer_calls(
         sidecar,
         &pairs,
         &consumer_blamed,
@@ -2827,7 +2934,7 @@ pub(crate) fn run_check(
     let passes_started = std::time::Instant::now();
     abstain_on_unstated_modes(&pairs, &mut outcomes);
     abstain_on_unwidened_out_of_budget(&pairs, &mut outcomes);
-    hold_back_same_service_mismatches(&mut outcomes);
+    hold_back_same_service_mismatches(&mut outcomes, &procedure_judged);
     info!(
         "v2 check after-judge timing: retype {retype_ms} ms, post-passes {} ms",
         passes_started.elapsed().as_millis()
@@ -2989,10 +3096,18 @@ const SAME_SERVICE_GATE: &str = "same_service";
 /// Done here, on the outcomes, because every reader starts from them: the
 /// stored verdict rows, the edges' `type_compatible`, and the findings a pull
 /// request's output is written from.
-fn hold_back_same_service_mismatches(outcomes: &mut [PairCheckOutcome]) {
+fn hold_back_same_service_mismatches(
+    outcomes: &mut [PairCheckOutcome],
+    procedure_judged: &HashSet<String>,
+) {
     for outcome in outcomes.iter_mut() {
+        // A mismatch the procedure form finds comes from the consumer's own
+        // compile against the router's type, never from the producer's
+        // capture (which only guards that the call carries the output), so
+        // none of carrick#1945's causes applies.
         if outcome.producer_service != outcome.consumer_service
             || outcome.bucket != VerdictBucket::Incompatible
+            || procedure_judged.contains(&outcome.pair_key)
         {
             continue;
         }
@@ -3043,6 +3158,11 @@ pub(crate) struct CallLocator {
     /// a member of the result, so the rewrite decides it. `None` on a carried
     /// consumer's stored locator.
     pub prescreen_undefined_free: Option<String>,
+    /// Set on a procedure call's locator (carrick#937): the key path of the
+    /// procedure the call names. The call's own type is its router's, so the
+    /// retype judges the consumer's code against it, with the call's result
+    /// erased, and states no type of the producer's at the call.
+    pub procedure_path: Option<String>,
 }
 
 /// A service scanned in THIS run, whose sources are on disk: the only kind of
@@ -3141,9 +3261,77 @@ pub(crate) fn consumer_call_locators(infer: &[InferRequestItem]) -> HashMap<Stri
                 prescreen: None,
                 prescreen_fresh_type: None,
                 prescreen_undefined_free: None,
+                procedure_path: None,
             });
     }
     calls
+}
+
+/// The alias a procedure call's pair carries as its consumer side
+/// (carrick#937). A procedure call publishes no consumer manifest entry: its
+/// type is its router's own, so the alias only names the call in the pair key
+/// and in the locator map. `None` for a call that names no procedure.
+/// `repo_root` relativizes the call's path; the pair side passes ".".
+pub(crate) fn procedure_call_alias(
+    call: &crate::analyzer::ApiEndpointDetails,
+    repo_root: &str,
+) -> Option<String> {
+    call.procedure.as_ref()?;
+    let (method, _) = call.key.as_http()?;
+    let (file, line) = crate::type_manifest::parse_file_location(&call.file_path.to_string_lossy());
+    let site = crate::type_manifest::build_site_id(
+        &file,
+        line,
+        &OperationKey::http(
+            method,
+            crate::mount_graph::procedure_suffix(call.procedure.as_ref()),
+        ),
+        repo_root,
+    );
+    Some(
+        crate::type_manifest::build_manifest_type_alias_with_site_id(
+            &call.key,
+            ManifestRole::Consumer,
+            ManifestTypeKind::Response,
+            Some(&site),
+        ),
+    )
+}
+
+/// The locators of a service's procedure calls, by the alias their pairs
+/// carry (carrick#937). `repo_path` is the root the calls' paths are written
+/// under, `absolute_repo` the same root on disk. The first call per alias
+/// wins. None is prescreened: the procedure form decides every call itself.
+pub(crate) fn procedure_call_locators(
+    calls: &[crate::analyzer::ApiEndpointDetails],
+    repo_path: &str,
+    absolute_repo: &Path,
+) -> HashMap<String, CallLocator> {
+    let mut found = HashMap::new();
+    for call in calls {
+        let (Some(alias), Some(procedure)) = (
+            procedure_call_alias(call, repo_path),
+            call.procedure.as_ref(),
+        ) else {
+            continue;
+        };
+        let (file, line) =
+            crate::type_manifest::parse_file_location(&call.file_path.to_string_lossy());
+        let relative = crate::utils::repo_relative_source_path(&file, repo_path);
+        found.entry(alias).or_insert_with(|| CallLocator {
+            file_path: absolute_repo.join(relative).to_string_lossy().into_owned(),
+            line_number: line,
+            span_start: None,
+            span_end: None,
+            expression_text: None,
+            expression_line: None,
+            prescreen: None,
+            prescreen_fresh_type: None,
+            prescreen_undefined_free: None,
+            procedure_path: Some(procedure.path.clone()),
+        });
+    }
+    found
 }
 
 /// Ask the consumer's own analysis which of its calls the retype abstains
@@ -3272,6 +3460,7 @@ pub(crate) fn stored_call_locators(
                 prescreen: None,
                 prescreen_fresh_type: None,
                 prescreen_undefined_free: None,
+                procedure_path: None,
             });
     }
     calls
@@ -3340,6 +3529,39 @@ fn foreign_gate_line(verdicts: &[crate::services::type_sidecar::CheckVerdict]) -
 const RETYPE_NOTE: &str = "judged by retyping the consumer's call with the producer's response \
      type and type-checking the consumer's own code";
 
+/// Said on every procedure pair the consumer's own code decided
+/// (carrick#937).
+const PROCEDURE_NOTE: &str = "judged by type-checking the consumer's code against the \
+     router's type, with and without the call's result";
+
+/// The abstention lead of a procedure pair the consumer's code did not decide.
+const PROCEDURE_ABSTAIN_LEAD: &str = "type-checking the consumer's code was inconclusive";
+
+/// The words a retype answer is stored with: the note a decided pair carries
+/// and the lead of an abstention.
+#[derive(Clone, Copy)]
+struct RetypeForm {
+    note: &'static str,
+    abstain_lead: &'static str,
+}
+
+/// A stated type retyped at the consumer's call.
+const STATED_FORM: RetypeForm = RetypeForm {
+    note: RETYPE_NOTE,
+    abstain_lead: "retyping the consumer's call did not decide it",
+};
+
+/// A procedure call judged by the consumer's own code.
+const PROCEDURE_FORM: RetypeForm = RetypeForm {
+    note: PROCEDURE_NOTE,
+    abstain_lead: PROCEDURE_ABSTAIN_LEAD,
+};
+
+const PROCEDURE_NOT_ON_DISK: &str = "the consumer's code was not on disk in this run";
+const PROCEDURE_CALL_NOT_RECORDED: &str = "the consumer's call was not recorded for the check";
+const PROCEDURE_OUTPUT_UNUSABLE: &str = "the producer's output is empty or holds 'any' or \
+     'unknown', so the call's result cannot be checked against it";
+
 /// Said on a pair whose producer type is wider than what its handler returns
 /// (carrick#1516), before the places the published type fails.
 const PRODUCER_WIDER_NOTE: &str = "the producer's declared response is wider than what its \
@@ -3371,10 +3593,26 @@ fn retype_items<'a>(
         {
             continue;
         }
+        // A procedure pair says why it was not judged: it is left to the
+        // consumer's code, so each silent skip is a decided abstention
+        // (carrick#937).
+        let stop = |decided: &mut Vec<RetypeOutcome>, why: &str| {
+            if pair.consumer_procedure {
+                decided.push(RetypeOutcome {
+                    item_id: pair.spec.pair_key.clone(),
+                    outcome: RetypeVerdict::Abstain,
+                    diagnostics: Vec::new(),
+                    reason: Some(why.to_string()),
+                    run_failed: false,
+                });
+            }
+        };
         let Some(consumer) = local_consumers.get(&pair.consumer_service) else {
+            stop(&mut decided, PROCEDURE_NOT_ON_DISK);
             continue;
         };
         let Some(call) = consumer.calls.get(&pair.consumer_alias) else {
+            stop(&mut decided, PROCEDURE_CALL_NOT_RECORDED);
             continue;
         };
         let Some(producer_type) = pair
@@ -3382,6 +3620,7 @@ fn retype_items<'a>(
             .as_deref()
             .filter(|text| !contains_disqualifying_top_type(text) && !text.trim().is_empty())
         else {
+            stop(&mut decided, PROCEDURE_OUTPUT_UNUSABLE);
             continue;
         };
         if let Some(reason) = call
@@ -3446,6 +3685,7 @@ fn retype_items<'a>(
                 // retype compares it as declared only, never clearing it in
                 // JSON form.
                 wire: !pair.spec.procedure,
+                procedure_path: call.procedure_path.clone(),
             });
     }
 
@@ -3790,11 +4030,25 @@ fn retype_consumer_calls(
     consumer_blamed: &HashSet<String>,
     local_consumers: &LocalConsumers,
     outcomes: &mut [PairCheckOutcome],
-) {
+) -> HashSet<String> {
+    // The pairs the consumer's own code judges (carrick#937): their mismatch
+    // is the consumer's compile against the router's type.
+    let procedure_pairs: HashSet<String> = pairs
+        .iter()
+        .filter(|pair| pair.consumer_procedure)
+        .map(|pair| pair.spec.pair_key.clone())
+        .collect();
+    let form_of = |key: &str| {
+        if procedure_pairs.contains(key) {
+            PROCEDURE_FORM
+        } else {
+            STATED_FORM
+        }
+    };
     // Test only: `tests/check_changed_retype_reach_test.rs` runs a check with
     // and without the retype to see whether any printed line depends on it.
     if std::env::var_os(SKIP_RETYPE_FOR_TEST_ENV).is_some() {
-        return;
+        return procedure_pairs;
     }
     let (by_service, decided) = retype_items(pairs, consumer_blamed, local_consumers);
     let decided: HashMap<&str, &RetypeOutcome> = decided
@@ -3803,7 +4057,7 @@ fn retype_consumer_calls(
         .collect();
     for outcome in outcomes.iter_mut() {
         if let Some(answer) = decided.get(outcome.pair_key.as_str()) {
-            apply_retype(outcome, answer);
+            apply_retype(outcome, answer, form_of(&outcome.pair_key));
         }
     }
     let ceiling = RetypeCeiling::starting_now(RETYPE_SCAN_CEILING);
@@ -3824,10 +4078,11 @@ fn retype_consumer_calls(
         );
         for outcome in outcomes.iter_mut() {
             if let Some(answer) = answers.get(&outcome.pair_key) {
-                apply_retype(outcome, answer);
+                apply_retype(outcome, answer, form_of(&outcome.pair_key));
             }
         }
     }
+    procedure_pairs
 }
 
 /// Retype one service's items, one request per file, until the scan's
@@ -4097,7 +4352,7 @@ fn scope_within(
 /// Write one retype answer onto its pair's outcome. An outcome check_v2
 /// already found incompatible keeps its verdict whatever the answer: the
 /// retype only lifts what compared nothing.
-fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
+fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome, form: RetypeForm) {
     if outcome.bucket == VerdictBucket::Incompatible {
         return;
     }
@@ -4117,7 +4372,7 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
             ));
             outcome.resolved = true;
             outcome.unresolved_reason = None;
-            outcome.notes.push(RETYPE_NOTE.to_string());
+            outcome.notes.push(form.note.to_string());
         }
         RetypeVerdict::Agrees => {
             outcome.bucket = VerdictBucket::Compatible;
@@ -4125,7 +4380,7 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
             outcome.diagnostic = None;
             outcome.resolved = true;
             outcome.unresolved_reason = None;
-            outcome.notes.push(RETYPE_NOTE.to_string());
+            outcome.notes.push(form.note.to_string());
         }
         // Not a break, so nothing rides `diagnostic` (a reason is read as a
         // mismatch); the places the published type fails are a note.
@@ -4144,7 +4399,7 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
                 "{PRODUCER_WIDER_NOTE}; against the declared type: {}",
                 places.join("; ")
             ));
-            outcome.notes.push(RETYPE_NOTE.to_string());
+            outcome.notes.push(form.note.to_string());
         }
         RetypeVerdict::Abstain => {
             // An item the retype never judged (out of time, no process, a
@@ -4153,11 +4408,10 @@ fn apply_retype(outcome: &mut PairCheckOutcome, answer: &RetypeOutcome) {
                 outcome.judged = false;
             }
             let why = answer.reason.as_deref().unwrap_or("no reason given");
+            let lead = form.abstain_lead;
             outcome.unresolved_reason = Some(match outcome.unresolved_reason.take() {
-                Some(reason) => {
-                    format!("{reason}; retyping the consumer's call did not decide it: {why}")
-                }
-                None => format!("retyping the consumer's call did not decide it: {why}"),
+                Some(reason) => format!("{reason}; {lead}: {why}"),
+                None => format!("{lead}: {why}"),
             });
         }
     }
@@ -4882,6 +5136,7 @@ mod tests {
                         prescreen: None,
                         prescreen_fresh_type: None,
                         prescreen_undefined_free: None,
+                        procedure_path: None,
                     },
                 )]),
             },
@@ -5631,7 +5886,7 @@ mod tests {
             left_to_consumer: false,
             decided_by_pr_diff: false,
         };
-        apply_retype(&mut outcome, answer);
+        apply_retype(&mut outcome, answer, STATED_FORM);
         outcome
     }
 
@@ -6208,7 +6463,11 @@ mod tests {
         };
 
         let mut mismatch = unresolved();
-        apply_retype(&mut mismatch, &answer(RetypeVerdict::Mismatch, None));
+        apply_retype(
+            &mut mismatch,
+            &answer(RetypeVerdict::Mismatch, None),
+            STATED_FORM,
+        );
         assert_eq!(mismatch.bucket, VerdictBucket::Incompatible);
         assert!(mismatch.resolved);
         assert_eq!(mismatch.unresolved_reason, None);
@@ -6224,7 +6483,11 @@ mod tests {
         assert_eq!(mismatch.consumer_reads, vec![9]);
 
         let mut agrees = unresolved();
-        apply_retype(&mut agrees, &answer(RetypeVerdict::Agrees, None));
+        apply_retype(
+            &mut agrees,
+            &answer(RetypeVerdict::Agrees, None),
+            STATED_FORM,
+        );
         assert_eq!(agrees.bucket, VerdictBucket::Compatible);
         assert!(agrees.resolved);
         assert_eq!((agrees.gate, agrees.diagnostic), (None, None));
@@ -6232,7 +6495,7 @@ mod tests {
         // carrick#1516: its own class, a fact, and never a mismatch reason:
         // what the declared type fails on is a note.
         let mut wider = unresolved();
-        apply_retype(&mut wider, &answer(RetypeVerdict::Wider, None));
+        apply_retype(&mut wider, &answer(RetypeVerdict::Wider, None), STATED_FORM);
         assert_eq!(wider.bucket, VerdictBucket::ProducerWider);
         assert!(wider.resolved);
         assert_eq!(wider.unresolved_reason, None);
@@ -6255,6 +6518,7 @@ mod tests {
                 RetypeVerdict::Abstain,
                 Some("the consumer never reads the response"),
             ),
+            STATED_FORM,
         );
         assert_eq!(abstain.bucket, VerdictBucket::Unverifiable);
         assert!(!abstain.resolved);
@@ -6320,6 +6584,7 @@ mod tests {
                 reason: None,
                 run_failed: false,
             },
+            STATED_FORM,
         );
         assert_eq!(outcome.bucket, VerdictBucket::Incompatible);
         assert_eq!(
@@ -6359,7 +6624,7 @@ mod tests {
             verdict.notes.clone(),
         );
         let mut outcomes = vec![outcome];
-        hold_back_same_service_mismatches(&mut outcomes);
+        hold_back_same_service_mismatches(&mut outcomes, &HashSet::new());
         abstain_on_unstated_modes(std::slice::from_ref(&pair), &mut outcomes);
         assert_eq!(outcomes[0].bucket, VerdictBucket::ProducerWider);
 
@@ -6409,7 +6674,7 @@ mod tests {
             Some("Property 'y' is missing"),
             Vec::new(),
         )];
-        hold_back_same_service_mismatches(&mut held);
+        hold_back_same_service_mismatches(&mut held, &HashSet::new());
         let line = pair_verdict_line(&held[0], None, false);
         assert!(line.contains("unverifiable resolved=false judged=true gate=same_service reason_kind=abstain: a mismatch between"), "{line}");
 
@@ -7277,6 +7542,289 @@ mod tests {
         assert!(!pair_with(false).spec.procedure);
     }
 
+    // ---- procedure pairs (carrick#937) --------------------------------------
+
+    fn procedure_key(path: &str) -> carrick_match::ProcedureKey {
+        carrick_match::ProcedureKey {
+            path: path.to_string(),
+            router: carrick_match::RouterId {
+                repo: "api".to_string(),
+                file: "src/router.ts".to_string(),
+                binding: "appRouter".to_string(),
+            },
+        }
+    }
+
+    /// A client call to the procedure `path`, written at `file`:`line`.
+    fn procedure_call(path: &str, file: &str, line: u32) -> crate::analyzer::ApiEndpointDetails {
+        let mut row = dispatch_row("GET", "", &format!("{file}:{line}"), None);
+        row.procedure = Some(procedure_key(path));
+        row
+    }
+
+    /// `api` serves the procedure `served` and `web`, which has no manifest,
+    /// holds `calls`. Both are stamped as this build's.
+    fn procedure_repos(
+        served: &str,
+        calls: Vec<crate::analyzer::ApiEndpointDetails>,
+    ) -> Vec<CloudRepoData> {
+        let path = format!("/api/trpc/{served}");
+        let mut producer = entry(
+            OperationKey::http("GET", &path),
+            ManifestRole::Producer,
+            ManifestTypeKind::Response,
+            "P",
+            "src/router.ts",
+            3,
+            ManifestTypeState::Explicit,
+        );
+        producer.expanded_definition = Some("{ id: string; }[]".to_string());
+        let mut row = dispatch_row("GET", &path, "src/router.ts:3", None);
+        row.procedure = Some(procedure_key(served));
+        let mut served_route = route_at("GET", &path, "src/router.ts:3", None);
+        served_route.procedure = Some(procedure_key(served));
+        let mut graph = crate::mount_graph::MountGraph::new();
+        graph.endpoints.push(served_route);
+        let mut api = repo("api", None, vec![producer], Some(fake_artifact()));
+        api.endpoints = vec![row];
+        api.mount_graph = Some(graph);
+        let mut web = repo("web", None, Vec::new(), Some(fake_artifact()));
+        web.calls = calls;
+        let mut repos = vec![api, web];
+        for blob in &mut repos {
+            blob.cache_version = Some(crate::engine::CACHE_VERSION);
+            blob.scanner_build = crate::cloud_storage::ScannerBuild::current();
+        }
+        repos
+    }
+
+    const VIEW: &str = "src/web/orders-view.ts";
+
+    #[test]
+    fn a_procedure_call_pairs_with_its_procedure_left_to_the_consumer() {
+        let call = procedure_call("orders.list", VIEW, 7);
+        let pairs = build_check_pairs(&procedure_repos("orders.list", vec![call.clone()]));
+        assert_eq!(pairs.len(), 1, "one pair for the one call");
+        let pair = &pairs[0];
+        assert!(pair.consumer_procedure);
+        assert!(pair.spec.procedure, "the producer's row stamps the pair");
+        assert_eq!(
+            pair.pre_verdict,
+            Some(PreVerdict::NotCompared {
+                reason: PROCEDURE_PAIR_REASON.to_string()
+            })
+        );
+        assert_eq!(pair.pre_verdict_side, Some(VerdictSide::Consumer));
+        assert_eq!(pair.consumer_service, "web");
+        assert_eq!(pair.consumer_file, VIEW);
+        assert_eq!(pair.consumer_line, 7);
+        assert_eq!(
+            Some(pair.consumer_alias.clone()),
+            procedure_call_alias(&call, ".")
+        );
+        assert_eq!(pair.producer_expanded.as_deref(), Some("{ id: string; }[]"));
+    }
+
+    #[test]
+    fn a_procedure_no_row_serves_builds_no_pair_and_two_calls_build_two() {
+        let call = procedure_call("orders.list", VIEW, 7);
+        let unserved = build_check_pairs(&procedure_repos("orders.other", vec![call.clone()]));
+        assert!(unserved.is_empty(), "{} pair(s)", unserved.len());
+
+        let two = build_check_pairs(&procedure_repos(
+            "orders.list",
+            vec![call, procedure_call("orders.list", VIEW, 9)],
+        ));
+        assert_eq!(two.len(), 2);
+        assert_ne!(two[0].consumer_alias, two[1].consumer_alias);
+    }
+
+    #[test]
+    fn procedure_call_locators_key_by_the_pair_alias() {
+        let relative = procedure_call("orders.list", VIEW, 7);
+        let pair = &build_check_pairs(&procedure_repos("orders.list", vec![relative.clone()]))[0];
+        // A scan reads the calls under the checkout's root and relativizes
+        // them only at the end: the locator keys by the same alias.
+        let mut absolute = relative;
+        absolute.file_path = PathBuf::from(format!("/repo/{VIEW}:7"));
+        let locators = procedure_call_locators(&[absolute], "/repo", Path::new("/repo"));
+        let locator = locators
+            .get(&pair.consumer_alias)
+            .expect("keyed by the pair's alias");
+        assert_eq!(locator.file_path, format!("/repo/{VIEW}"));
+        assert_eq!(locator.line_number, 7);
+        assert_eq!(locator.procedure_path.as_deref(), Some("orders.list"));
+        assert_eq!(locator.prescreen, None);
+        assert_eq!(locators.len(), 1);
+    }
+
+    fn procedure_consumers(pair: &BuiltPair) -> LocalConsumers {
+        let call = procedure_call("orders.list", VIEW, 7);
+        let calls = procedure_call_locators(&[call], ".", Path::new("/repo"));
+        assert!(calls.contains_key(&pair.consumer_alias));
+        LocalConsumers::from([(
+            "web".to_string(),
+            LocalConsumer {
+                root: PathBuf::from("/repo"),
+                tsconfig: None,
+                calls,
+            },
+        )])
+    }
+
+    #[test]
+    fn retype_items_sends_the_procedure_path() {
+        let pair = build_check_pairs(&procedure_repos(
+            "orders.list",
+            vec![procedure_call("orders.list", VIEW, 7)],
+        ))
+        .remove(0);
+        let blamed = HashSet::from([pair.spec.pair_key.clone()]);
+        let pairs = [pair];
+        let consumers = procedure_consumers(&pairs[0]);
+        let (by_service, decided) = retype_items(&pairs, &blamed, &consumers);
+        assert!(decided.is_empty(), "{decided:?}");
+        let items = &by_service["web"];
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].procedure_path.as_deref(), Some("orders.list"));
+        assert_eq!(items[0].producer_type, "{ id: string; }[]");
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap()["procedure_path"],
+            "orders.list"
+        );
+
+        // An item of a plain call is byte-identical to what it was.
+        let plain = retype_pair(ManifestTypeKind::Response, Some("{ id: string; }"));
+        let plain_blamed = HashSet::from([plain.spec.pair_key.clone()]);
+        let plain_pairs = [plain];
+        let (plain_items, _) = retype_items(&plain_pairs, &plain_blamed, &web_consumer());
+        let json = serde_json::to_value(&plain_items["web"][0]).unwrap();
+        assert!(json.get("procedure_path").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_procedure_pair_whose_consumer_is_not_local_says_so() {
+        let pair = build_check_pairs(&procedure_repos(
+            "orders.list",
+            vec![procedure_call("orders.list", VIEW, 7)],
+        ))
+        .remove(0);
+        let blamed = HashSet::from([pair.spec.pair_key.clone()]);
+        let pairs = [pair];
+        let (sent, decided) = retype_items(&pairs, &blamed, &LocalConsumers::new());
+        assert!(sent.is_empty());
+        assert_eq!(decided.len(), 1);
+        assert_eq!(
+            decided[0].reason.as_deref(),
+            Some("the consumer's code was not on disk in this run")
+        );
+
+        let mut outcome = pre_verdict_outcome(
+            &pairs[0],
+            pairs[0].pre_verdict.as_ref().expect("pre-verdicted"),
+        );
+        apply_retype(&mut outcome, &decided[0], PROCEDURE_FORM);
+        assert_eq!(
+            outcome.unresolved_reason.as_deref(),
+            Some(
+                "a procedure call's type is its router's own, so only type-checking the \
+                 consumer's code can judge the pair; type-checking the consumer's code was \
+                 inconclusive: the consumer's code was not on disk in this run"
+            )
+        );
+        assert_eq!(outcome.bucket, VerdictBucket::Unverifiable);
+
+        // A plain HTTP pair stays silent when its consumer is not local.
+        let plain = retype_pair(ManifestTypeKind::Response, Some("{ id: string; }"));
+        let plain_blamed = HashSet::from([plain.spec.pair_key.clone()]);
+        let (_, silent) = retype_items(&[plain], &plain_blamed, &LocalConsumers::new());
+        assert!(silent.is_empty());
+    }
+
+    /// An empty or top-typed published output cannot be carried by the call's
+    /// result, so the pair says so instead of dropping out of the run.
+    #[test]
+    fn a_procedure_pair_with_an_unusable_output_says_so() {
+        let mut pair = build_check_pairs(&procedure_repos(
+            "orders.list",
+            vec![procedure_call("orders.list", VIEW, 7)],
+        ))
+        .remove(0);
+        pair.producer_expanded = Some("{ id: any; }[]".to_string());
+        let blamed = HashSet::from([pair.spec.pair_key.clone()]);
+        let pairs = [pair];
+        let consumers = procedure_consumers(&pairs[0]);
+        let (sent, decided) = retype_items(&pairs, &blamed, &consumers);
+        assert!(sent.is_empty());
+        assert_eq!(decided.len(), 1);
+        assert!(
+            decided[0]
+                .reason
+                .as_deref()
+                .is_some_and(|why| why.contains("empty or holds 'any' or 'unknown'")),
+            "{decided:?}"
+        );
+    }
+
+    /// carrick#937: a mismatch the procedure form finds is the consumer's own
+    /// compile against the router's type, so the same-service hold-back does
+    /// not apply to it. An HTTP mismatch inside one service is still held back.
+    #[test]
+    fn a_procedure_mismatch_in_one_service_is_not_held_back() {
+        let mut procedure = same_service_outcome(
+            VerdictBucket::Incompatible,
+            Some("the consumer uses what the producer's response does not provide"),
+            Vec::new(),
+        );
+        procedure.pair_key = "judged-by-the-consumer".to_string();
+        let mut http = same_service_outcome(VerdictBucket::Incompatible, Some("x"), Vec::new());
+        http.pair_key = "judged-by-the-probe".to_string();
+        let mut outcomes = vec![procedure, http];
+        hold_back_same_service_mismatches(
+            &mut outcomes,
+            &HashSet::from(["judged-by-the-consumer".to_string()]),
+        );
+        assert_eq!(outcomes[0].bucket, VerdictBucket::Incompatible);
+        assert_eq!(outcomes[0].gate, None);
+        assert_eq!(outcomes[1].bucket, VerdictBucket::Unverifiable);
+        assert_eq!(outcomes[1].gate.as_deref(), Some(SAME_SERVICE_GATE));
+    }
+
+    /// carrick#937: main's verdict of a procedure pair holds only when the
+    /// consumer service changed no file. A consumer-only edit keeps main's
+    /// types (no alias reached), and it may read what the procedure no longer
+    /// returns.
+    #[test]
+    fn a_procedure_pair_is_judged_again_when_its_consumer_service_changed() {
+        let repos = procedure_repos("orders.list", vec![procedure_call("orders.list", VIEW, 7)]);
+        let pairs = build_check_pairs(&repos);
+        let mut outcome = pre_verdict_outcome(&pairs[0], pairs[0].pre_verdict.as_ref().unwrap());
+        outcome.left_to_consumer = true;
+        let mut blobs = repos.clone();
+        crate::cloud_storage::attach_pair_outcomes(
+            &mut blobs,
+            &[outcome],
+            "test",
+            crate::cloud_storage::ScannerBuild::current().as_ref(),
+        );
+        let kept_main_types = HashMap::from([(
+            "web".to_string(),
+            super::super::type_reach::ReachDecision::Partial {
+                reached: Default::default(),
+                unreached: [pairs[0].consumer_alias.clone()].into(),
+            },
+        )]);
+        // `web` changed (it kept main's types), `api` is carried.
+        let changed = settle_from(&blobs, &["api"], kept_main_types.clone());
+        assert!(changed.settled(&pairs[0]).is_none());
+        // Neither changed: main's verdict stands.
+        let carried = settle_from(&blobs, &["api", "web"], kept_main_types);
+        assert_eq!(
+            carried.settled(&pairs[0]).map(|(_, how)| how),
+            Some(super::super::pair_settle::Settled::Unreached)
+        );
+    }
+
     /// carrick#4403: a GraphQL producer response's root travels on the pair
     /// spec and its service's type table on that service's stub input, in
     /// the shape the sidecar's validator reads; a pair that reads no table
@@ -7590,7 +8138,7 @@ mod tests {
         ];
         let compatible = format!("{:?}", outcomes[1]);
         abstain_on_unstated_modes(&pairs, &mut outcomes);
-        hold_back_same_service_mismatches(&mut outcomes);
+        hold_back_same_service_mismatches(&mut outcomes, &HashSet::new());
 
         for held in [&outcomes[0], &outcomes[2]] {
             assert_eq!(held.bucket, VerdictBucket::Unverifiable, "{held:?}");
@@ -9820,7 +10368,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             outcome("api", "web", VerdictBucket::Incompatible),
         ];
         let mut after = before.clone();
-        hold_back_same_service_mismatches(&mut after);
+        hold_back_same_service_mismatches(&mut after, &HashSet::new());
 
         let held = &after[0];
         assert_eq!(held.bucket, VerdictBucket::Unverifiable);
@@ -9941,7 +10489,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             Some("Property 'y' is missing in type '{ x: string; }'."),
             vec!["a note the check made".to_string()],
         )];
-        hold_back_same_service_mismatches(&mut outcomes);
+        hold_back_same_service_mismatches(&mut outcomes, &HashSet::new());
 
         assert_eq!(
             outcomes[0].diagnostic.as_deref(),
@@ -9991,10 +10539,11 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 reason: None,
                 run_failed: false,
             },
+            STATED_FORM,
         );
         assert_eq!(outcome.consumer_reads, vec![9, 14]);
         let mut outcomes = vec![outcome];
-        hold_back_same_service_mismatches(&mut outcomes);
+        hold_back_same_service_mismatches(&mut outcomes, &HashSet::new());
 
         let held = &outcomes[0];
         assert_eq!(held.bucket, VerdictBucket::Unverifiable);
@@ -10025,7 +10574,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 diagnostic,
                 Vec::new(),
             )];
-            hold_back_same_service_mismatches(&mut outcomes);
+            hold_back_same_service_mismatches(&mut outcomes, &HashSet::new());
             assert_eq!(outcomes[0].bucket, VerdictBucket::Unverifiable);
             assert_eq!(outcomes[0].diagnostic, None, "{diagnostic:?}");
         }
@@ -10041,7 +10590,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             Some("Property 'y' is missing"),
             Vec::new(),
         )];
-        hold_back_same_service_mismatches(&mut held);
+        hold_back_same_service_mismatches(&mut held, &HashSet::new());
         assert_eq!(
             unresolved_pair_line(&held[0]).as_deref(),
             Some(
@@ -10059,7 +10608,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             Some(chain),
             Vec::new(),
         )];
-        hold_back_same_service_mismatches(&mut chained);
+        hold_back_same_service_mismatches(&mut chained, &HashSet::new());
         let line = unresolved_pair_line(&chained[0]).expect("a line");
         assert!(!line.contains('\n'), "{line}");
         assert!(
@@ -10076,7 +10625,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             None,
             Vec::new(),
         )];
-        hold_back_same_service_mismatches(&mut nothing_found);
+        hold_back_same_service_mismatches(&mut nothing_found, &HashSet::new());
         assert_eq!(
             unresolved_pair_line(&nothing_found[0]).as_deref(),
             Some(
@@ -11092,6 +11641,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             producer_surface_hash: None,
             consumer_surface_hash: None,
             producer_graphql_types: None,
+            consumer_procedure: false,
         }
     }
 
@@ -13703,6 +14253,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                                 prescreen: None,
                                 prescreen_fresh_type: None,
                                 prescreen_undefined_free: None,
+                                procedure_path: None,
                             },
                         )
                     })
@@ -13797,6 +14348,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             prescreen: None,
             prescreen_fresh_type: None,
             prescreen_undefined_free: None,
+            procedure_path: None,
         };
         LocalConsumers::from([(
             "web".to_string(),
@@ -14565,6 +15117,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             producer_type: "{ id: string; }".to_string(),
             producer_unwidened_type: None,
             wire: true,
+            procedure_path: None,
         };
         let mut decided = outcome.clone();
         apply_retype(
@@ -14576,9 +15129,14 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 reason: Some("the consumer never reads the response".to_string()),
                 run_failed: false,
             },
+            STATED_FORM,
         );
         assert!(decided.judged, "the call decided it");
-        apply_retype(&mut outcome, &abstained(&[item], RETYPE_UNSENT)[0]);
+        apply_retype(
+            &mut outcome,
+            &abstained(&[item], RETYPE_UNSENT)[0],
+            STATED_FORM,
+        );
         assert!(!outcome.judged, "no process was left to judge it");
     }
 
