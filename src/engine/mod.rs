@@ -6558,6 +6558,8 @@ async fn analyze_current_repo_incremental(
             // deterministic `protocol_extractions`, so their payload anchors
             // bundle through the same path (#corpus-2 resolution dim). A row
             // withdrawn as in-process has no operation to type (carrick#1513).
+            let unresolved_module_aliases =
+                unresolved_document_module_aliases(&protocol_extractions.graphql);
             let pubsub_results = in_process_pubsub.pubsub_rows_kept(&merged_results);
             // Where the fact layer places a payload, the type capture reads it
             // there (empty with no compiler rows), so a
@@ -6709,6 +6711,7 @@ async fn analyze_current_repo_incremental(
                     &protocol_infer,
                     &payload_infer,
                     server_claims.as_ref(),
+                    &unresolved_module_aliases,
                     &mut cloud_data,
                 )
             };
@@ -12241,6 +12244,7 @@ fn resolve_types_if_available(
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
+    unresolved_module_aliases: &HashSet<String>,
     cloud_data: &mut CloudRepoData,
 ) -> TypesOutcome {
     let (outcome, hand_back_bodies) = resolve_types_stage(
@@ -12256,6 +12260,7 @@ fn resolve_types_if_available(
         extra_infer,
         payload_infer,
         server_claims,
+        unresolved_module_aliases,
         cloud_data,
     );
     if let Some(manifest) = cloud_data.type_manifest.as_mut() {
@@ -12281,6 +12286,7 @@ fn resolve_types_stage(
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     server_claims: Option<&crate::services::type_sidecar::ServerClaims>,
+    unresolved_module_aliases: &HashSet<String>,
     cloud_data: &mut CloudRepoData,
 ) -> (TypesOutcome, BTreeSet<String>) {
     let Some(sidecar) = sidecar else {
@@ -12403,6 +12409,7 @@ fn resolve_types_stage(
                         extra_infer,
                         payload_infer,
                         &type_resolution,
+                        unresolved_module_aliases,
                         cloud_data,
                     );
                     crate::phase_timing::mark(crate::phase_timing::Phase::Capture);
@@ -12550,6 +12557,26 @@ fn type_reach_object(
     Some(object)
 }
 
+/// The consumer response aliases of a service's GraphQL rows with a row at a
+/// call whose generated document module is not on the scanned tree
+/// ([`crate::graphql::GraphqlOp::document_module_absent`]).
+fn unresolved_document_module_aliases(
+    graphql: &crate::graphql::GraphqlExtraction,
+) -> HashSet<String> {
+    graphql
+        .consumers
+        .iter()
+        .filter(|op| op.document_module_absent)
+        .map(|op| {
+            crate::type_manifest::build_manifest_type_alias(
+                &op.key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response,
+            )
+        })
+        .collect()
+}
+
 /// Derive capture anchors and run `capture_v2` for one service, storing the
 /// stub artifact on its `CloudRepoData`. Returns the on-disk stub dir for
 /// the definitions re-point (caller cleans it up). Non-fatal: a degraded
@@ -12573,6 +12600,7 @@ fn run_capture_for_service(
     extra_infer: &[crate::services::type_sidecar::InferRequestItem],
     payload_infer: &[crate::services::type_sidecar::InferRequestItem],
     type_resolution: &TypeResolutionResult,
+    unresolved_module_aliases: &HashSet<String>,
     cloud_data: &mut CloudRepoData,
 ) -> Option<PathBuf> {
     crate::scan_stage::enter(crate::scan_stage::Stage::TypeCapture);
@@ -12697,7 +12725,7 @@ fn run_capture_for_service(
                 .collect()
         })
         .unwrap_or_default();
-    let anchors = type_compat_v2::derive_capture_anchors(
+    let mut anchors = type_compat_v2::derive_capture_anchors(
         &explicit,
         &infer,
         &inline_aliases,
@@ -12705,6 +12733,7 @@ fn run_capture_for_service(
         &manifest_aliases,
         &capture_root,
     );
+    type_compat_v2::state_unresolved_imports(&mut anchors, unresolved_module_aliases);
     if anchors.is_empty() {
         return None;
     }
@@ -15985,6 +16014,8 @@ async fn analyze_current_repo(
     // deterministic `protocol_extractions`, so their payload anchors bundle
     // through the same path (#corpus-2 resolution dim). A row withdrawn as
     // in-process has no operation to type (carrick#1513).
+    let unresolved_module_aliases =
+        unresolved_document_module_aliases(&protocol_extractions.graphql);
     let pubsub_results = in_process_pubsub.pubsub_rows_kept(&analysis_result.file_results);
     // A payload the fact layer places is read there, so the pub/sub symbol and
     // locator the reader stated for that alias are not the ones asked
@@ -16062,6 +16093,7 @@ async fn analyze_current_repo(
         &protocol_infer,
         &payload_infer,
         server_claims.as_ref(),
+        &unresolved_module_aliases,
         &mut cloud_data,
     );
 
@@ -17640,6 +17672,7 @@ mod tests {
             &[],
             &[],
             &resolution,
+            &HashSet::new(),
             &mut data,
         );
         scope_sidecar_to_service(Some(&sidecar), root.to_str().unwrap(), &Config::default());
@@ -17655,6 +17688,7 @@ mod tests {
             &[],
             &[],
             &resolution,
+            &HashSet::new(),
             &mut data,
         );
         let requests: Vec<serde_json::Value> = std::fs::read_to_string(log)
@@ -17842,6 +17876,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                     request_files: Default::default(),
                     hand_back_bodies: Default::default(),
                 },
+                &HashSet::new(),
                 &mut data,
             );
             Self {
@@ -18002,6 +18037,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             &[],
             &[],
             &resolution,
+            &HashSet::new(),
             &mut data,
         );
         if let Some(stub_dir) = stub_dir {
@@ -29448,11 +29484,32 @@ unfollowed_member_calls_total: 0,
             undeclared_selection: None,
             arguments: None,
             sdl_root_type: None,
+            document_module_absent: false,
         }
     }
 
     /// A GraphQL consumer op carrying a `request<T>` call-site anchor in
     /// `payload_type_symbol` (the field SDL producers can't provide).
+    #[test]
+    fn only_a_row_at_a_call_with_an_absent_document_module_names_its_alias() {
+        let mut absent = graphql_consumer_op("orders", None, None);
+        absent.document_module_absent = true;
+        let present = graphql_consumer_op("pay", None, None);
+        let extraction = crate::graphql::GraphqlExtraction {
+            consumers: vec![absent.clone(), present],
+            ..Default::default()
+        };
+        let aliases = unresolved_document_module_aliases(&extraction);
+        assert_eq!(
+            aliases,
+            HashSet::from([crate::type_manifest::build_manifest_type_alias(
+                &absent.key,
+                ManifestRole::Consumer,
+                ManifestTypeKind::Response
+            )])
+        );
+    }
+
     fn graphql_consumer_op(
         field: &str,
         payload_symbol: Option<&str>,
@@ -29481,6 +29538,7 @@ unfollowed_member_calls_total: 0,
             undeclared_selection: None,
             arguments: None,
             sdl_root_type: None,
+            document_module_absent: false,
         }
     }
 
@@ -29907,6 +29965,7 @@ unfollowed_member_calls_total: 0,
             undeclared_selection: None,
             arguments: None,
             sdl_root_type: None,
+            document_module_absent: false,
         }
     }
 
@@ -34530,6 +34589,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
                 &[],
                 &[],
                 None,
+                &HashSet::new(),
                 &mut data,
             )
         });

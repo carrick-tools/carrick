@@ -70,6 +70,30 @@ describe('capture: a placeholder literal keeps its cause on the record (carrick#
     assert.strictEqual(withCause?.surface_hash, without?.surface_hash);
   });
 
+  it('every word of the one list of reasons is accepted, an unknown word is refused', () => {
+    const records = capture('unresolved', [
+      { ...placeholder('Orders_Absent'), unread_cause: 'unresolved_import' },
+    ]);
+    assert.strictEqual(records.get('Orders_Absent')?.unread_cause, 'unresolved_import');
+    const request = (word: string) => ({
+      action: 'capture_v2',
+      request_id: 'r2',
+      repo_root: root,
+      service_name: 'orders',
+      out_dir: path.join(root, 'word-stub'),
+      anchors: [{ ...placeholder('Orders_Word'), unread_cause: word }],
+    });
+    assert.doesNotThrow(() => parseRequest(request('unresolved_import')));
+    const refused = captureStub({
+      repoRoot: path.join(root, 'word-repo'),
+      serviceName: 'word',
+      outDir: path.join(root, 'word-out'),
+      anchors: [{ ...placeholder('Orders_Word'), unread_cause: 'made_up_word' as never }],
+    });
+    assert.strictEqual(refused.success, false);
+    assert.match(refused.errors.join(), /made_up_word/);
+  });
+
   it('the request validator keeps the cause on a literal anchor', () => {
     const parsed = parseRequest({
       action: 'capture_v2',

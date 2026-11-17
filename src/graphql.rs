@@ -171,6 +171,12 @@ pub struct GraphqlOp {
     /// key of [`GraphqlTypes`] the response is read from (carrick#4403).
     /// `None` for every consumer.
     pub sdl_root_type: Option<String>,
+    /// CONSUMER-only, scan-local (never written to the blob): the row sits at
+    /// a call whose generated document module is not on the scanned tree
+    /// (carrick#4642), so its result type is unread for that reason and no
+    /// other. Read by the capture to state `unresolved_import` where it would
+    /// state `not_located`.
+    pub document_module_absent: bool,
 }
 
 /// A schema root field's arguments, printed from the SDL (carrick#1158).
@@ -2532,6 +2538,7 @@ fn parse_document_text(
                     undeclared_selection: None,
                     arguments: sdl_arguments(field),
                     sdl_root_type: Some(name.clone()),
+                    document_module_absent: false,
                 });
             }
         }
@@ -2600,6 +2607,7 @@ fn parse_document_text(
                     undeclared_selection: None,
                     arguments: None,
                     sdl_root_type: None,
+                    document_module_absent: false,
                 });
             }
         }

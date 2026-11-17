@@ -888,6 +888,29 @@ pub(crate) fn derive_capture_anchors(
     anchors
 }
 
+/// A consumer alias whose result type is unread only because its generated
+/// document module is not on the scanned tree says so: the placeholder
+/// [`derive_capture_anchors`] wrote for it states `unresolved_import` where it
+/// stated `not_located`. An alias any other anchor answers has no placeholder
+/// and is untouched, and so is every alias outside `aliases`.
+pub(crate) fn state_unresolved_imports(
+    anchors: &mut [CaptureAnchor],
+    aliases: &std::collections::HashSet<String>,
+) {
+    for anchor in anchors {
+        if let CaptureAnchor::Literal {
+            alias,
+            anchor_origin: AnchorOrigin::ManifestPlaceholder,
+            unread_cause,
+            ..
+        } = anchor
+            && aliases.contains(alias.as_str())
+        {
+            *unread_cause = Some("unresolved_import");
+        }
+    }
+}
+
 /// Why a service's capture produced no stub (carrick#1921). The caller writes
 /// it on the service, so the index says what happened without anyone probing
 /// the sidecar afterwards.
@@ -8535,6 +8558,70 @@ mod tests {
         assert!(
             line_of("Route_middleware_Response").ends_with("= unknown;"),
             "the middleware registration must not serve `void`:\n{surface}"
+        );
+    }
+
+    /// A consumer whose generated document module is not on the scanned tree
+    /// states `unresolved_import` on its placeholder, only when it is one of
+    /// the aliases the engine named; an alias another anchor answers keeps
+    /// that anchor.
+    #[test]
+    fn a_placeholder_for_an_absent_document_module_states_unresolved_import() {
+        let absent = "C_GraphqlResponse_absent".to_string();
+        let other = "C_GraphqlResponse_other".to_string();
+        let answered = "C_GraphqlResponse_answered".to_string();
+        let literal = |alias: &str| CaptureAnchor::Literal {
+            alias: alias.to_string(),
+            type_text: "{ id: string }".to_string(),
+            anchor_origin: AnchorOrigin::LlmSymbol,
+            source_file: None,
+            printed_names: Vec::new(),
+            raw_text_read: false,
+            absent_body_tolerated: false,
+            unread_cause: None,
+        };
+        let manifest = [absent.clone(), other.clone(), answered.clone()];
+        let mut anchors = derive_capture_anchors(
+            &[],
+            &[],
+            &[(answered.clone(), "{ id: string }".to_string())],
+            &[],
+            &manifest,
+            "/repo",
+        );
+        anchors.push(literal("C_GraphqlResponse_literal"));
+        let named: std::collections::HashSet<String> = [
+            absent.clone(),
+            answered.clone(),
+            "C_GraphqlResponse_literal".to_string(),
+        ]
+        .into();
+        state_unresolved_imports(&mut anchors, &named);
+        let cause = |wanted: &str| {
+            anchors.iter().find_map(|anchor| match anchor {
+                CaptureAnchor::Literal {
+                    alias,
+                    unread_cause,
+                    ..
+                } if alias == wanted => Some(*unread_cause),
+                _ => None,
+            })
+        };
+        assert_eq!(cause(&absent), Some(Some("unresolved_import")));
+        assert_eq!(
+            cause(&other),
+            Some(Some("not_located")),
+            "an alias the engine did not name keeps its reason"
+        );
+        assert_eq!(
+            cause(&answered),
+            Some(None),
+            "an alias another anchor answers has no placeholder"
+        );
+        assert_eq!(
+            cause("C_GraphqlResponse_literal"),
+            Some(None),
+            "a stated literal is no placeholder"
         );
     }
 
