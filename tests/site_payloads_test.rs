@@ -696,7 +696,7 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("reply-status", "{ name: string; }"),
         ("reply-whole", "{ city: string; }"),
         ("reply-generic-whole", "{ size: number; }"),
-        ("caught", "{ c: number; }"),
+        ("caught", "{ c: number; } | null"),
         ("own-member-unlabelled", "boolean"),
         ("keep-whole", "{ total: number; }"),
         ("keep-awaited", "{ rows: number; }"),
@@ -715,6 +715,8 @@ fn a_wrapper_site_reads_its_response_where_its_chain_hands_back_the_body() {
         ("seed-widen", "string | null"),
         ("seed-widen-caught", "string | null"),
         ("seed-envelope", "unknown"),
+        ("seed-caught-void", "void | { gone: boolean; }"),
+        ("seed-caught-value", "{ rows: string[]; }"),
     ] {
         let file = format!("src/{name}.ts");
         let got = captured_flat(&on, &alias_at(&on, "response", &file, 2));

@@ -982,6 +982,12 @@ fn resolve<'a>(expr: &'a Expr, scope: &'a Scope) -> Resolved<'a> {
             Expr::TsConstAssertion(cast) => &cast.expr,
             Expr::TsNonNull(cast) => &cast.expr,
             Expr::TsSatisfies(cast) => &cast.expr,
+            // `call.catch(() => null)`: the call's value or no body, as a
+            // `return null` in a `catch` block hands back (carrick#4513).
+            Expr::Call(call) => match no_body_catch(call) {
+                Some(caught) => caught,
+                None => break,
+            },
             Expr::Ident(ident) => {
                 let name: &str = &ident.sym;
                 match scope.given.get(name).map(Vec::as_slice) {
@@ -1095,6 +1101,52 @@ fn is_parse(call: &CallExpr) -> bool {
                     if matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "json")
             )
         )
+}
+
+/// The value `.catch` is called on, where the handler hands back no body:
+/// `null`, `undefined`, `void 0`, or nothing (`() => {}`, a bare `return`).
+fn no_body_catch(call: &CallExpr) -> Option<&Expr> {
+    let Callee::Expr(callee) = &call.callee else {
+        return None;
+    };
+    let Expr::Member(member) = &**callee else {
+        return None;
+    };
+    if !matches!(&member.prop, MemberProp::Ident(name) if &*name.sym == "catch") {
+        return None;
+    }
+    let [handler] = call.args.as_slice() else {
+        return None;
+    };
+    if handler.spread.is_some() {
+        return None;
+    }
+    let no_body = |expr: &Expr| match expr {
+        Expr::Ident(ident) => &*ident.sym == "undefined",
+        Expr::Lit(swc_ecma_ast::Lit::Null(_)) => true,
+        Expr::Unary(unary) => unary.op == swc_ecma_ast::UnaryOp::Void,
+        _ => false,
+    };
+    let block_no_body = |stmts: &[swc_ecma_ast::Stmt]| {
+        stmts.iter().all(|stmt| match stmt {
+            swc_ecma_ast::Stmt::Return(ret) => ret.arg.as_deref().is_none_or(no_body),
+            swc_ecma_ast::Stmt::Empty(_) => true,
+            _ => false,
+        })
+    };
+    let hands_back_none = match &*handler.expr {
+        Expr::Arrow(arrow) => match &*arrow.body {
+            ArrowFunctionBody::Expr(expr) => no_body(expr),
+            ArrowFunctionBody::FunctionBody(block) => block_no_body(&block.stmts),
+        },
+        Expr::Fn(function) => function
+            .function
+            .body
+            .as_ref()
+            .is_some_and(|block| block_no_body(&block.stmts)),
+        _ => false,
+    };
+    hands_back_none.then_some(&*member.obj)
 }
 
 /// A property named in the source: `.data` or `["data"]`.
@@ -1352,6 +1404,26 @@ mod tests {
             let step = whole_shape(source).and_then(|shape| shape.step());
             assert_eq!(step, Some(Step::Member("data".to_string())), "{source}");
         }
+        // A rejection handler that hands back no body is a no-body path.
+        // The chain ends at the request, `call(o)`, as an uncaught return's does.
+        let whole = whole_shape("function f(o) { return call(o); }").expect("a call's value");
+        for source in [
+            "function f(o) { return call(o).catch(() => null); }",
+            "function f(o) { return call(o).catch(() => undefined); }",
+            "function f(o) { return call(o).catch(() => {}); }",
+        ] {
+            assert_eq!(whole_shape(source), Some(whole.clone()), "{source}");
+        }
+        let member = whole_shape("async function f(o) { const r = await call(o); return r.data; }")
+            .expect("a member");
+        let caught_member = whole_shape(
+            "async function f(o) { const r = await call(o).catch(() => null); return r.data; }",
+        );
+        assert_eq!(caught_member, Some(member));
+        // One that hands back a value of its own is that value.
+        let own_value = whole_shape("function f(o) { return call(o).catch(() => []); }")
+            .expect("a call's value");
+        assert_ne!(own_value.base, whole.base);
         // A fallback to a value of the function's own is not the value.
         let own = whole_shape(
             "async function f(o) { const r = await call(o); return r.data || 'none'; }",

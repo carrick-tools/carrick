@@ -37,7 +37,7 @@ deciding call.
 | `reply-status` | `res.status` | `{ name: string; }` | `number` |
 | `reply-whole` | `reply.get(...)` whole | `{ city: string; }` | `Reply<{ city: string; }>` |
 | `reply-generic-whole` | whole, open `T` | `{ size: number; }` | `Reply<{ size: number; }>` |
-| `caught` | `.catch(() => null)` | `{ c: number; }` | `null \| { c: number; }` |
+| `caught` | `.catch(() => null)`, a no-body path | `{ c: number; } \| null` | same |
 | `own-member-unlabelled` | `res.gone` (`purge`, no result label) | `boolean` (undecided: unchanged) | `boolean` |
 | `keep-whole` | the request's value | `{ total: number; }` | same |
 | `keep-awaited` | the request's value, awaited | `{ rows: number; }` | same |
@@ -54,13 +54,19 @@ deciding call.
 | `seed-chained` | `const { data } = …; const { items } = data; return items` | `{ items: { id: string; }[]; }` | `Order[]` |
 | `seed-widen` | `res.data \|\| null` | `string \| null` | `string` |
 | `seed-widen-caught` | `res.data`, or `null` from a `catch` | `string \| null` | same |
+| `seed-caught-void` | `.catch(() => {})`, a no-body path | `void \| { gone: boolean; }` | `{ gone: boolean; }` |
+| `seed-caught-value` | `.catch(() => ({ rows: [] }))`, a value of its own | `{ rows: string[]; }` | same |
 | `seed-envelope` | `{ body, response }` over an unlabelled `fetch`, body unstated | `unknown` | same |
 
 The `seed-*` rows are carrick#4513's. `seed-chained` holds a member of a
 member, which no one key names, so the response is the labelled call's
 body. `seed-widen` hands back the body or no body (`|| null`, `?? undefined`),
 as a second `return null` would, so it is read at the deciding call, as
-`seed-widen-caught` already was. `seed-generic`'s cassette names `T` as the
+`seed-widen-caught` already was. A rejection handler that hands back no
+body (`.catch(() => null)`, `() => undefined`, `() => {}`) is the same
+no-body path (ruled 2026-11-17): `caught` and `seed-caught-void` keep the
+null or void. One that hands back a value of its own stays at the
+labelled call. `seed-generic`'s cassette names `T` as the
 row's symbol, as a model reading the wrapper can.
 
 `keep-retried`, `then-data` and `keep-local-run` move from the deciding call
