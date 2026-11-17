@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.160](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.159...carrick-v0.3.160) (2026-11-16)
+
+
+### Features
+
+* **engine:** export the judge's GraphQL rules for the held check (S-G1) ([#4679](https://github.com/carrick-tools/carrick/issues/4679)) ([6e00de1](https://github.com/carrick-tools/carrick/commit/6e00de19bd6072afa592f2f7fca709562bf4c0f8))
+* **facts:** contract line and chain line on by default; off with "0" ([#4664](https://github.com/carrick-tools/carrick/issues/4664)) ([24d1508](https://github.com/carrick-tools/carrick/commit/24d1508f41e5080b92727b430ee45c194e1ba6ba))
+* **held:** fact store and check overlay for GraphQL send-form rows (L-G1a) ([#4681](https://github.com/carrick-tools/carrick/issues/4681)) ([3eed7dd](https://github.com/carrick-tools/carrick/commit/3eed7dd67d7949d6d578a069cc4950d6746d92cf))
+* **held:** the held compiler arms GraphQL resolver rows; early answer joins part 2 by label (L-G1b) ([#4684](https://github.com/carrick-tools/carrick/issues/4684)) ([b941486](https://github.com/carrick-tools/carrick/commit/b941486a022b696743152f4b0bc49cc37f38e0ac))
+* **local:** a hosted move rebuilds the local read model in the same run ([#4649](https://github.com/carrick-tools/carrick/issues/4649)) ([0ff143b](https://github.com/carrick-tools/carrick/commit/0ff143b226e269b3e973f4306f57d27f89b1a3a9))
+* **model_carry:** carry an edited file's GraphQL, pub/sub and dispatch rows ([#4713](https://github.com/carrick-tools/carrick/issues/4713)) ([af33a43](https://github.com/carrick-tools/carrick/commit/af33a43eca3c1b6849136aa73a976cb3fae1b1b6))
+* **sidecar:** word a sent type wider than the expected one (open leaf note) ([#4685](https://github.com/carrick-tools/carrick/issues/4685)) ([#4692](https://github.com/carrick-tools/carrick/issues/4692)) ([3e7e2dd](https://github.com/carrick-tools/carrick/commit/3e7e2dd1718975205a4dc065383aa2a47805577f))
+
+
+### Bug Fixes
+
+* **capture:** import a printed package type from its bare specifier ([#1855](https://github.com/carrick-tools/carrick/issues/1855)) ([#4666](https://github.com/carrick-tools/carrick/issues/4666)) ([856e4bb](https://github.com/carrick-tools/carrick/commit/856e4bb59cedddff01f404bc75e48b98cf560376))
+* **engine:** exit only after stdout has drained ([#4683](https://github.com/carrick-tools/carrick/issues/4683)) ([d4c0261](https://github.com/carrick-tools/carrick/commit/d4c026107b92e7bf6cc2e840e5304d9045088702))
+* **graphql:** a break the PR's own schema diff proves is introduced, not main_types_unjudged ([#4682](https://github.com/carrick-tools/carrick/issues/4682)) ([97c50bb](https://github.com/carrick-tools/carrick/commit/97c50bbd5896b920e3ab1e9e8ce82fdf5ccb93f0)), closes [#4670](https://github.com/carrick-tools/carrick/issues/4670)
+* **graphql:** place a call whose generated document import is absent at the operation its name states ([#4652](https://github.com/carrick-tools/carrick/issues/4652)) ([cfac480](https://github.com/carrick-tools/carrick/commit/cfac480e29cdafe507e8b17155fa788aaa5c99b4))
+* **hook:** a full re-check that ran nothing never retracts an early break ([#4678](https://github.com/carrick-tools/carrick/issues/4678)) ([607037c](https://github.com/carrick-tools/carrick/commit/607037c9411558251f89bdab6a26692d6e966e2a))
+* **judge:** a field the served GraphQL schema declares and the record lacks reads unverifiable ([#4669](https://github.com/carrick-tools/carrick/issues/4669)) ([866a7e2](https://github.com/carrick-tools/carrick/commit/866a7e2e1d82c5ed5ff6bb9ec0da6bad4cd14e47))
+* **local-mode:** the edit hook states only what the re-check's judge stated ([#4716](https://github.com/carrick-tools/carrick/issues/4716)) ([c13c271](https://github.com/carrick-tools/carrick/commit/c13c2713a7465ce9e1083be4ec0227d07ab30617))
+* **local-mode:** the re-check lists each operation once ([#4714](https://github.com/carrick-tools/carrick/issues/4714)) ([5bbecb3](https://github.com/carrick-tools/carrick/commit/5bbecb397b378bb9e73c65799e3c275b13bb8233))
+* **npm:** depend on @ts-morph/common with ts-morph's own range so yarn installs one copy ([#4719](https://github.com/carrick-tools/carrick/issues/4719)) ([#4722](https://github.com/carrick-tools/carrick/issues/4722)) ([30a952c](https://github.com/carrick-tools/carrick/commit/30a952c9527c7782e358216be8acd3cc4e3f0cf4))
+* **sidecar:** a request read never takes an unrelated cast or a line's first expression ([#4709](https://github.com/carrick-tools/carrick/issues/4709)) ([#4711](https://github.com/carrick-tools/carrick/issues/4711)) ([51c4540](https://github.com/carrick-tools/carrick/commit/51c454066567e5d3ed1062918b97e9f6d7ef7efc))
+* **sidecar:** a request read off the reply object answers reply_state ([#4700](https://github.com/carrick-tools/carrick/issues/4700)) ([746e390](https://github.com/carrick-tools/carrick/commit/746e3906c4d6f6e188bd937949a9319875926e70))
+* **sidecar:** an open wrapper generic is not replaced by the next argument ([#4689](https://github.com/carrick-tools/carrick/issues/4689)) ([#4699](https://github.com/carrick-tools/carrick/issues/4699)) ([7354f2d](https://github.com/carrick-tools/carrick/commit/7354f2d5e97df67a0cdeab2b35d0bc6174945052))
+
 ## [0.3.159](https://github.com/carrick-tools/carrick/compare/carrick-v0.3.158...carrick-v0.3.159) (2026-11-16)
 
 
