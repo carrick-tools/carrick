@@ -26,6 +26,7 @@ import {
   callResultNamesNoCall,
   firstExactLocatorMatch,
   isPreferredTarget,
+  sameType,
   type SeveralReturns,
 } from './site-node.js';
 import { joinTypes, readResultLabel } from './result-label.js';
@@ -598,7 +599,7 @@ function typeOfSeveralReturns(
           'and one of them has no payload this anchor reads, so no single return is its type',
       };
     }
-    if (!read.includes(type)) read.push(type);
+    if (!read.some((r) => sameType(checker, r, type))) read.push(type);
   }
   if (read.length === 0) {
     return { reason: 'several_returns: no return of the function that answers states a payload' };

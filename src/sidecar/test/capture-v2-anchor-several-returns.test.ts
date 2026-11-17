@@ -22,22 +22,27 @@ import * as path from 'node:path';
 import { Project } from 'ts-morph';
 import { captureStub } from '../src/capture/index.js';
 import { TypeInferrer } from '../src/type-inferrer.js';
-import type { InferRequestItem } from '../src/types.js';
+import type { InferRequestItem, InferredType } from '../src/types.js';
 
 const FRAMEWORK_TS = `export interface JsonReply<T> { readonly body: T; readonly tag: 'json' }
 export interface Ctx {
   query(key: string): string | undefined;
-  json<T>(value: T): JsonReply<T>;
+  json<T>(value: T, status?: number): JsonReply<T>;
   notFound(): Response;
+}
+export interface Reply {
+  status(code: number): Reply;
+  send(payload: unknown): Response;
 }
 export type Handler = (c: Ctx) => unknown;
 export interface Server { get(path: string, handler: Handler): void }
 `;
 
-const ROUTES_TS = `import type { Ctx, Server } from './framework.js';
+const ROUTES_TS = `import type { Ctx, JsonReply, Reply, Server } from './framework.js';
 
 declare function render(): string;
 declare function load(): { id: number }[];
+declare function rows(): { row: string }[];
 
 function show(c: Ctx) {
   if (c.query('preview')) return c.json({ preview: true, html: render() });
@@ -56,6 +61,53 @@ function sameType(c: Ctx) {
 function early(c: Ctx) {
   if (!c.query('id')) return c.notFound();
   return c.json({ found: true, label: render() });
+}
+
+function lookup(c: Ctx) {
+  if (!c.query('id')) return c.json({ error: 'not found' }, 404);
+  return c.json({ order: load(), total: 3 });
+}
+
+function chained(reply: Reply, id: string | undefined) {
+  if (!id) return reply.status(404).send({ error: 'missing' });
+  return reply.send({ order: load(), total: 3 });
+}
+
+function guarded(c: Ctx) {
+  if (!c.query('id')) return c.json({ error: 'not found' }, 404);
+  if (c.query('preview')) return c.json({ preview: true, html: render() });
+  return c.json({ order: load(), total: 3 });
+}
+
+function twice(c: Ctx) {
+  if (!c.query('id')) return c.json({ error: 'gone' }, 410);
+  if (c.query('fresh')) return c.json({ order: load(), total: 3 });
+  return c.json({ order: load(), total: 3 });
+}
+
+function stated(c: Ctx): JsonReply<{ error: string }> | JsonReply<{ order: { id: number }[]; total: number }> {
+  if (!c.query('id')) return c.json({ error: 'not found' }, 404);
+  return c.json({ order: load(), total: 3 });
+}
+
+function create(c: Ctx) {
+  if (c.query('draft')) return c.json({ draft: true, html: render() }, 201);
+  return c.json({ order: load(), total: 3 }, 200);
+}
+
+function moved(c: Ctx) {
+  if (c.query('old')) return c.json({ location: '/orders' }, 302);
+  return c.json({ order: load(), total: 3 });
+}
+
+function relay(c: Ctx, code: number) {
+  if (c.query('upstream')) return c.json({ problem: render() }, code);
+  return c.json({ order: load(), total: 3 });
+}
+
+function page(c: Ctx) {
+  if (c.query('raw')) return rows().slice(0, 500);
+  return c.json({ order: load(), total: 3 });
 }
 
 function previewPart(c: Ctx) {
@@ -78,6 +130,34 @@ export function routes(app: Server) {
     if (c.query('preview')) return previewPart(c);
     return orderPart(c);
   });
+
+  app.get('/lookup', (c) => lookup(c));
+
+  app.get('/inline-error', (c) => {
+    if (!c.query('id')) return c.json({ error: 'not found' }, 404);
+    return c.json({ order: load(), total: 3 });
+  });
+
+  app.get('/chained/:id', (c) => chained(c as unknown as Reply, c.query('id')));
+
+  app.get('/guarded', (c) => guarded(c));
+
+  app.get('/twice', (c) => twice(c));
+
+  app.get('/guard-then-helper', (c) => {
+    if (!c.query('id')) return c.json({ error: 'not found' }, 404);
+    return orderPart(c);
+  });
+
+  app.get('/stated', (c) => stated(c));
+
+  app.get('/create', (c) => create(c));
+
+  app.get('/moved', (c) => moved(c));
+
+  app.get('/relay', (c) => relay(c, 502));
+
+  app.get('/page', (c) => page(c));
 
   app.get('/solo', (c) => single(c));
 
@@ -148,6 +228,101 @@ const ASKS: Record<string, Ask> = {
     line: lineWith('return c.json({ preview: true', lineWith('function previewPart')),
     handler_lines: handler("app.get('/split/:id'"),
   },
+  // An error reply with a body beside the success reply: the success body alone.
+  lookupSuccess: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load(), total: 3 });', lineWith('function lookup')),
+    handler_lines: handler("app.get('/lookup'", true),
+  },
+  lookupError: {
+    kind: 'response_body',
+    text: "{ error: 'not found' }",
+    line: lineWith("return c.json({ error: 'not found' }, 404)", lineWith('function lookup')),
+    handler_lines: handler("app.get('/lookup'", true),
+  },
+  inlineErrorSuccess: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load(), total: 3 });', lineWith("app.get('/inline-error'")),
+    handler_lines: handler("app.get('/inline-error'"),
+  },
+  chainedSuccess: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return reply.send({ order'),
+    handler_lines: handler("app.get('/chained/:id'", true),
+  },
+  chainedError: {
+    kind: 'response_body',
+    text: "{ error: 'missing' }",
+    line: lineWith("return reply.status(404).send({ error: 'missing' })"),
+    handler_lines: handler("app.get('/chained/:id'", true),
+  },
+  // An error reply beside two differing success replies: the two, not the error.
+  guardedOrder: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function guarded')),
+    handler_lines: handler("app.get('/guarded'", true),
+  },
+  // Located on the error reply, two returns of one type stay: that type.
+  twiceError: {
+    kind: 'response_body',
+    text: "{ error: 'gone' }",
+    line: lineWith("return c.json({ error: 'gone' }, 410)"),
+    handler_lines: handler("app.get('/twice'", true),
+  },
+  // The handler's inline error reply beside a return of a helper's reply:
+  // no return sends what the other sends, so none is judged by status (D7).
+  guardThenHelper: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function orderPart')),
+    handler_lines: handler("app.get('/guard-then-helper'"),
+  },
+  // An annotated helper, located on its error reply.
+  statedError: {
+    kind: 'response_body',
+    text: "{ error: 'not found' }",
+    line: lineWith("return c.json({ error: 'not found' }, 404)", lineWith('function stated')),
+    handler_lines: handler("app.get('/stated'", true),
+  },
+  // Two success statuses with different bodies: both.
+  createDraft: {
+    kind: 'response_body',
+    text: '{ draft: true, html: render() }',
+    line: lineWith('return c.json({ draft: true', lineWith('function create')),
+    handler_lines: handler("app.get('/create'", true),
+  },
+  // A redirect beside a JSON reply: the JSON reply alone.
+  movedOrder: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function moved')),
+    handler_lines: handler("app.get('/moved'", true),
+  },
+  // A status held in a variable is `variable`: kept, so both (fail open).
+  relayOrder: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function relay')),
+    handler_lines: handler("app.get('/relay'", true),
+  },
+  // The same, located on the whole returned call.
+  pageCall: {
+    kind: 'function_return',
+    text: `c.json(${ORDER})`,
+    line: lineWith('return c.json({ order: load()', lineWith('function page')),
+    handler_lines: handler("app.get('/page'", true),
+  },
+  // A return that mirrors no send is never judged by status.
+  pageOrder: {
+    kind: 'response_body',
+    text: ORDER,
+    line: lineWith('return c.json({ order: load()', lineWith('function page')),
+    handler_lines: handler("app.get('/page'", true),
+  },
   // (c) controls.
   solo: {
     kind: 'response_body',
@@ -176,6 +351,8 @@ describe('carrick#4778: a function with several differing returns is not one ret
   let outRoot: string;
   let surface: string;
   let inferred: Map<string, string>;
+  let configured: Map<string, string>;
+  let rows: Map<string, InferredType>;
 
   before(() => {
     repoDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-4778-')));
@@ -228,6 +405,19 @@ describe('carrick#4778: a function with several differing returns is not one ret
     }));
     const res = inferrer.infer(requests);
     inferred = new Map((res.inferred_types ?? []).map((t) => [t.alias, collapse(t.type_string)]));
+    rows = new Map((res.inferred_types ?? []).map((t) => [t.alias, t]));
+    // The scan's extraction config names the framework's reply type; each
+    // kept return's reply is unwrapped to its payload.
+    const configuredInferrer = new TypeInferrer({
+      project: new Project({ tsConfigFilePath: path.join(repoDir, 'tsconfig.json') }),
+      repoRoot: repoDir,
+    });
+    const withRule = configuredInferrer.infer(requests, {
+      rules: [{ wrapperSymbols: ['JsonReply'], payloadPropertyPath: ['body'] }],
+    });
+    configured = new Map(
+      (withRule.inferred_types ?? []).map((t) => [t.alias, collapse(t.type_string)])
+    );
   });
 
   after(() => {
@@ -272,6 +462,111 @@ describe('carrick#4778: a function with several differing returns is not one ret
     // No return's payload node mirrors the located one, so the capture cannot
     // join them: unknown, never the located helper's one return.
     assert.strictEqual(captured('splitPreview'), 'unknown');
+  });
+
+  const successAlone = (name: string): void => {
+    for (const text of [captured(name), read(name)]) {
+      assert.match(text, /order/, `${name}: ${text}`);
+      assert.doesNotMatch(text, /error|location/, `${name}: ${text}`);
+    }
+  };
+
+  it('an error reply beside the success reply, in a helper: the success payload alone', () => {
+    successAlone('lookupSuccess');
+  });
+
+  it('the same, located on the error reply: the success payload alone', () => {
+    successAlone('lookupError');
+  });
+
+  it('an error reply beside the success reply, inline: the success payload alone', () => {
+    successAlone('inlineErrorSuccess');
+  });
+
+  it('an error status stated by the reply chain: the success payload alone', () => {
+    successAlone('chainedSuccess');
+  });
+
+  it('an error reply beside two differing success replies: the union of the two', () => {
+    for (const text of [captured('guardedOrder'), read('guardedOrder')]) {
+      both(text);
+      assert.doesNotMatch(text, /error/, text);
+    }
+  });
+
+  it('the same, located on the chained error reply: never the error payload', () => {
+    // The inferrer reads the success reply alone. The capture's builder-chain
+    // rule (a located node inside `a.b(x).c(y)`) demotes it first: unknown.
+    assert.match(read('chainedError'), /order/);
+    assert.doesNotMatch(read('chainedError'), /error/);
+    assert.strictEqual(captured('chainedError'), 'unknown');
+  });
+
+  it('a redirect beside a JSON reply: the JSON reply alone', () => {
+    successAlone('movedOrder');
+  });
+
+  it('a 201 beside a 200 with different bodies: both', () => {
+    for (const text of [captured('createDraft'), read('createDraft')]) {
+      assert.match(text, /draft/, text);
+      assert.match(text, /order/, text);
+    }
+  });
+
+  it('a status held in a variable is kept: both', () => {
+    for (const text of [captured('relayOrder'), read('relayOrder')]) {
+      assert.match(text, /problem/, text);
+      assert.match(text, /order/, text);
+    }
+  });
+
+  it('a return that mirrors no send is not judged by its arguments: never dropped', () => {
+    // `rows().slice(0, 500)` is no reply, so its `500` is no status. The
+    // inferrer reads both returns. Located on the order (the argument), the
+    // capture cannot read that return's payload, so the whole is unknown;
+    // located on the whole call, the capture reads both calls. Never the
+    // order alone.
+    assert.match(read('pageOrder'), /row/);
+    assert.match(read('pageOrder'), /order/);
+    assert.strictEqual(captured('pageOrder'), 'unknown');
+    assert.match(read('pageCall'), /row/);
+    assert.match(read('pageCall'), /order/);
+    assert.match(captured('pageCall'), /row/);
+  });
+
+  it('located on the error reply beside two returns of one type: that type alone', () => {
+    for (const text of [captured('twiceError'), read('twiceError')]) {
+      assert.strictEqual(text.match(/order:/g)?.length, 1, text);
+      assert.doesNotMatch(text, /error/, text);
+    }
+  });
+
+  it('an annotated helper: the kept return is read, not the annotation that names the error', () => {
+    successAlone('statedError');
+    const row = rows.get('Infer_statedError');
+    assert.strictEqual(row?.is_explicit, false, JSON.stringify(row));
+  });
+
+  it('an inline error reply beside a helper reply is not judged by status (D7): kept', () => {
+    // Pinned as measured. The two returns send through different calls
+    // (`c.json` beside `orderPart(c)`), so neither is a send of the other and
+    // no status is read: the inferrer reads the handler's whole return, error
+    // reply included; the capture cannot join them and says unknown.
+    assert.match(read('guardThenHelper'), /error/);
+    assert.match(read('guardThenHelper'), /order/);
+    assert.strictEqual(captured('guardThenHelper'), 'unknown');
+  });
+
+  it('with a wrapper rule for the reply type, the kept returns alone are unwrapped', () => {
+    for (const name of ['lookupError', 'guardedOrder', 'twiceError']) {
+      const text = configured.get(`Infer_${name}`) ?? '';
+      assert.match(text, /order/, `${name}: ${text}`);
+      assert.doesNotMatch(text, /error|tag/, `${name}: ${text}`);
+    }
+    assert.match(configured.get('Infer_guardedOrder') ?? '', /preview/);
+    // Control: no return left, the rule unwraps both as before.
+    assert.match(configured.get('Infer_helperOrder') ?? '', /preview/);
+    assert.match(configured.get('Infer_helperOrder') ?? '', /order/);
   });
 
   it('(c) one return is that return, alone', () => {

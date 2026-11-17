@@ -94,6 +94,8 @@ import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.j
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
 import {
   anchorInHandler,
+  joinTypes,
+  sameType,
   callNamedBy,
   callResultNamesNoCall,
   constituentsOf,
@@ -677,6 +679,16 @@ interface WrapperReading {
  */
 const LOOP_ROW_KINDS: ReadonlySet<string> = new Set(['response_body', 'function_return', 'request_body']);
 
+/**
+ * carrick#4778: a function whose several returns answer for a route; `kept`
+ * is set where some of its returns left the answer (an error or redirect
+ * reply), with the union type of those that stay.
+ */
+interface SurvivingReturns {
+  func: FunctionLike;
+  kept?: { returns: ReadonlySet<ts.Node>; type: Type };
+}
+
 export class TypeInferrer {
   private readonly project: Project;
   private readonly packageOf: ((filePath: string) => string | undefined) | undefined;
@@ -939,6 +951,11 @@ export class TypeInferrer {
    * by the name a service imports them as.
    */
   private frameworkPackages: ReadonlySet<string> = new Set();
+  /**
+   * carrick#4778: while a several-returns read runs, the function it reads
+   * and the returns that answer for it (`readSurvivingReturns`).
+   */
+  private keptReturns: { func: ts.Node; returns: ReadonlySet<ts.Node>; type: Type } | undefined;
   private statedParams = this.statedParamsFor({ sends: new Map(), sets: new Map(), returns: new Map(), bodies: new Set() });
 
   /**
@@ -1450,13 +1467,14 @@ export class TypeInferrer {
   /**
    * carrick#4778: the function that answers for this route row when it has
    * several returns of different types (`anchorInHandler`, one rule with the
-   * capture), as the function node the whole-return reading takes. None for
-   * any row that rule leaves alone.
+   * capture), with the returns that answer for it: the ones `anchorInHandler`
+   * kept, which leaves out a reply that states an error or redirect status.
+   * None for any row that rule leaves alone.
    */
   private functionWithSeveralReturns(
     sourceFile: SourceFile,
     request: InferRequestItem
-  ): FunctionLike | undefined {
+  ): SurvivingReturns | undefined {
     const lines = request.handler_lines;
     if (!lines || !request.expression_text || request.span_start !== undefined) return undefined;
     if (request.infer_kind !== 'response_body' && request.infer_kind !== 'function_return') {
@@ -1464,8 +1482,9 @@ export class TypeInferrer {
     }
     const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
     if (!node) return undefined;
+    const checker = this.project.getTypeChecker().compilerObject;
     const own = anchorInHandler(
-      this.project.getTypeChecker().compilerObject,
+      checker,
       sourceFile.compilerNode,
       node.compilerNode,
       lines,
@@ -1474,9 +1493,63 @@ export class TypeInferrer {
     );
     if ('reason' in own || !own.severalReturns) return undefined;
     const wanted = own.severalReturns.fn;
-    let found = sourceFile.getDescendantAtPos(wanted.getStart(sourceFile.compilerNode));
+    let found: Node | undefined = sourceFile.getDescendantAtPos(wanted.getStart(sourceFile.compilerNode));
     while (found && found.compilerNode !== wanted) found = found.getParent();
-    return found as FunctionLike | undefined;
+    if (!found) return undefined;
+    const kept = own.severalReturns.returns.map((r) => r.expression);
+    if (!own.severalReturns.dropped) {
+      return { func: found as FunctionLike };
+    }
+    // Some returns left the answer: the function's own return type would
+    // still carry them, so the type read is the union of the ones that stay.
+    const types: ts.Type[] = [];
+    for (const e of kept) {
+      const at = checker.getTypeAtLocation(e);
+      const type = checker.getAwaitedType(at) ?? at;
+      if (!types.some((t) => sameType(checker, t, type))) types.push(type);
+    }
+    const joined = types.length === 1 ? types[0] : joinTypes(checker, types);
+    if (!joined) return undefined;
+    return {
+      func: found as FunctionLike,
+      kept: { returns: new Set<ts.Node>(kept), type: this.wrapCompilerType(found, joined) },
+    };
+  }
+
+  /** ts-morph has no public wrapper for a compiler type it did not hand out. */
+  private wrapCompilerType(node: Node, type: ts.Type): Type {
+    const factory = (
+      node.getSourceFile() as unknown as {
+        _context: { compilerFactory: { getType(type: ts.Type): Type } };
+      }
+    )._context.compilerFactory;
+    return factory.getType(type);
+  }
+
+  /**
+   * carrick#4778: a several-returns read of a function some of whose returns
+   * left its answer. Its return type is the union of the returns that stay,
+   * and every reading of its returns (the payload recovery, the
+   * body-less-reply test) sees only those while it runs.
+   */
+  private readSurvivingReturns(
+    request: InferRequestItem,
+    several: SurvivingReturns,
+    extractionConfig: ExtractionConfig | undefined
+  ): InferredType | null {
+    const previous = this.keptReturns;
+    this.keptReturns = several.kept ? { func: several.func.compilerNode, ...several.kept } : undefined;
+    try {
+      return this.buildFunctionReturnInferredType(
+        request,
+        several.func,
+        extractionConfig,
+        true,
+        several.kept?.type
+      );
+    } finally {
+      this.keptReturns = previous;
+    }
   }
 
   /**
@@ -1511,7 +1584,7 @@ export class TypeInferrer {
         return this.withoutOpenTypeParameter(
           request,
           several
-            ? this.buildFunctionReturnInferredType(request, several, extractionConfig, true)
+            ? this.readSurvivingReturns(request, several, extractionConfig)
             : this.inferFunctionReturn(sourceFile, request, extractionConfig)
         );
       case 'response_body':
@@ -1523,7 +1596,7 @@ export class TypeInferrer {
           this.withoutOpenTypeParameter(
             request,
             several
-              ? this.buildFunctionReturnInferredType(request, several, extractionConfig, true)
+              ? this.readSurvivingReturns(request, several, extractionConfig)
               : this.inferResponseBody(sourceFile, request, extractionConfig)
           )
         );
@@ -1764,11 +1837,14 @@ export class TypeInferrer {
     request: InferRequestItem,
     func: FunctionLike,
     extractionConfig?: ExtractionConfig,
-    treatVoidAsUnresolved = false
+    treatVoidAsUnresolved = false,
+    keptReturnType?: Type
   ): InferredType | null {
-    const returnTypeNode = func.getReturnTypeNode();
+    // carrick#4778: with some returns left out, the kept returns' union is
+    // read, which no annotation states: the type and its reads are theirs.
+    const returnTypeNode = keptReturnType ? undefined : func.getReturnTypeNode();
     const isExplicit = returnTypeNode !== undefined;
-    let returnType = func.getReturnType();
+    let returnType = keptReturnType ?? func.getReturnType();
     // carrick#2372: a handler that returns its executor's result answers only
     // the executor's returns its own arguments leave reachable.
     const byArguments = this.returnNarrowedByArguments(func, this.unwrapPromiseType(returnType));
@@ -7552,13 +7628,7 @@ export class TypeInferrer {
     if (!union || openAt(checker, union, node.compilerNode).kind !== 'as_read') {
       return undefined;
     }
-    // ts-morph has no public wrapper for a compiler type it did not hand out.
-    const factory = (
-      node.getSourceFile() as unknown as {
-        _context: { compilerFactory: { getType(type: ts.Type): Type } };
-      }
-    )._context.compilerFactory;
-    return factory.getType(union);
+    return this.wrapCompilerType(node, union);
   }
 
   private extractExplicitTypeFromAncestor(node: Node): string | null {
@@ -8483,10 +8553,11 @@ export class TypeInferrer {
     if (!Node.isBlock(body)) return [body];
 
     const returned: Node[] = [];
+    const kept = this.keptReturns?.func === func.compilerNode ? this.keptReturns.returns : undefined;
     for (const statement of body.getDescendantsOfKind(SyntaxKind.ReturnStatement)) {
       if (this.findContainingFunctionForNode(statement) !== func) continue;
       const expression = statement.getExpression();
-      if (expression) returned.push(expression);
+      if (expression && (!kept || kept.has(expression.compilerNode))) returned.push(expression);
     }
     return returned;
   }
