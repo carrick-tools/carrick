@@ -34,6 +34,7 @@ import {
 } from 'ts-morph';
 import { declarationKey, type LabelledMembers } from './library-claims.js';
 import type { ClaimSlot, ResultShape } from './types.js';
+import type { ReplyStatus } from './capture/index.js';
 
 /** A function a handler can be: what the inferrer follows a registration to. */
 export type HandlerFunction = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
@@ -50,10 +51,10 @@ export interface StatedReply {
 }
 
 /** The status a send's own chain states, as the inferrer reads it. */
-export type ChainStatus = (call: CallExpression) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided' | undefined;
+export type ChainStatus = (call: CallExpression) => ReplyStatus | undefined;
 
 /** The status a value states, read as a send's status argument is: `undecided` when it states none. */
-export type ValueStatus = (value: Node) => 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
+export type ValueStatus = (value: Node) => ReplyStatus;
 
 /** The node a value is read from: `JSON.stringify(x)` is read as `x`. */
 export type PayloadNode = (value: Node) => Node;

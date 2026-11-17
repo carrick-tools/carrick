@@ -112,7 +112,14 @@ import { enclosingTypeParameterIn, instantiatedAtCall } from './type-parameters.
 import { endsWithPath, loopElementPick, type LoopPick } from './loop-element.js';
 import {
   classifyStatusCodes,
-  httpStatus,
+  STATUS_MEMBER_NAMES,
+  chainStatus,
+  isDroppedReplyStatus,
+  replyStatus,
+  statedStatusCodes,
+  statusCodesOfType,
+  valueStatus,
+  type ReplyStatus,
   statesNoBody,
   statesNoShape,
   statusKeyCode,
@@ -254,25 +261,6 @@ const TEXT_READ: ReadonlySet<string> = new Set([RAW_TEXT_FORMAT]);
 const WRAPPER_CALL_MAX_DEPTH = 3;
 
 /**
- * Members an options object uses to state an HTTP status. A >= 400 status marks
- * the branch an error path, whose shape is not the endpoint's contract.
- */
-const STATUS_MEMBER_NAMES = ['status', 'statusCode'] as const;
-
-/**
- * What a response send's status says about its body (carrick#1161).
- * `success` (below 300) and `undecided` (no status stated anywhere) send the
- * route's contract; `error` (400 and up) and `redirect` (3xx) do not; and
- * `variable` is a status the source computes, which fails open into the
- * union so no success body is ever guessed away.
- */
-type ResponseSiteStatus = 'success' | 'error' | 'redirect' | 'variable' | 'undecided';
-
-/** An error or redirect send carries no body the route's contract describes. */
-const isDroppedResponseStatus = (status: ResponseSiteStatus): boolean =>
-  status === 'error' || status === 'redirect';
-
-/**
  * The reasons an `unknown` answer is a decision, not a failure to read, on the
  * response path that reads this set: the words `capture/type-reasons.json`
  * marks `always` (carrick#4231). A stated reply never replaces one
@@ -305,7 +293,7 @@ interface EnvelopeBuilder {
   builder: BuilderFunction;
   payloadParameter: number;
   statusParameter?: number;
-  fixedStatus?: ResponseSiteStatus;
+  fixedStatus?: ReplyStatus;
 }
 
 /**
@@ -372,23 +360,6 @@ function distinctByText<T>(items: T[], text: (item: T) => string): T[] {
     seen.add(key);
     return true;
   });
-}
-
-/**
- * The status codes a TYPE fixes: a numeric literal, or a union made only of
- * them, every one in the HTTP range. `undefined` for anything else, including
- * a plain `number`.
- */
-function statusCodesOfType(type: Type): number[] | undefined {
-  const members = type.isUnion() ? type.getUnionTypes() : [type];
-  const codes: number[] = [];
-  for (const member of members) {
-    if (!member.isNumberLiteral()) return undefined;
-    const code = httpStatus(member.getLiteralValue());
-    if (code === undefined) return undefined;
-    codes.push(code);
-  }
-  return codes.length > 0 ? codes : undefined;
 }
 
 /**
@@ -2611,7 +2582,7 @@ export class TypeInferrer {
         this.receivingCallOf(located, () => true),
       ];
       const statesNoBody = sends.some((send) => {
-        const status = send ? this.responseSiteStatus(send) : 'undecided';
+        const status = send ? replyStatus(this.replyChecker(), send.compilerNode, { readChain: false }) : 'undecided';
         return status === 'error' || status === 'redirect';
       });
       if (statesNoBody) {
@@ -2712,7 +2683,7 @@ export class TypeInferrer {
    * True when a located call hands back the reply of the registration handler
    * it sits in (`handsBackHandlerParameter`, `isRegisteredHandler`), is
    * handed a status-shaped value, read as a chain's status call is read
-   * (`statusOfValue`, as `chainStatus` reads it), and does not take any
+   * (`valueStatus`, as `chainStatus` reads it), and does not take any
    * value in that slot (`takesAnyValue`): `reply.code(204)`,
    * `res.status(204)`. Such a call states a status and names no body
    * (carrick#4300); a send of a number (`reply.send(count)`) keeps its
@@ -2729,14 +2700,14 @@ export class TypeInferrer {
 
   /**
    * The one status-only shape: a call that hands one of the handler's
-   * parameters back, is handed a status-shaped value (`statusOfValue`), and
+   * parameters back, is handed a status-shaped value (`valueStatus`), and
    * does not take any value in that slot (`takesAnyValue`). Read by the
    * located-call check and by `returnsHandlerParameterType` (carrick#4341).
    */
   private statesOnlyStatus(call: Node, handler: FunctionLike): boolean {
     return (
       Node.isCallExpression(call) &&
-      this.statusOfValue(call.getArguments()[0]) !== 'undecided' &&
+      valueStatus(this.replyChecker(), call.getArguments()[0]?.compilerNode) !== 'undecided' &&
       !this.takesAnyValue(call) &&
       this.handsBackHandlerParameter(call, handler)
     );
@@ -2879,7 +2850,7 @@ export class TypeInferrer {
    * expression selects the HANDLER: the function that contains it, on a row
    * whose line is a route registration. Its returned sends are enumerated
    * (conditional branches split), each is classified by the status it states
-   * (`responseSiteStatus`), the error and redirect branches are dropped, and
+   * (`replyStatus`), the error and redirect branches are dropped, and
    * the success bodies are joined exactly as the payload walk joins return
    * statements.
    *
@@ -2952,8 +2923,8 @@ export class TypeInferrer {
     const locatedBranch = locatingBranches.find((branch) => contains(branch, site));
     if (!locatedBranch) return undefined;
 
-    const dropped = isDroppedResponseStatus;
-    const siteStatus = this.responseSiteStatus(site, true);
+    const dropped = isDroppedReplyStatus;
+    const siteStatus = replyStatus(this.replyChecker(), site.compilerNode, { readChain: true });
     if (!tied && !dropped(siteStatus)) return undefined;
     let branches: Node[];
     if (dropped(siteStatus)) {
@@ -2977,7 +2948,7 @@ export class TypeInferrer {
     }
     let survivors: Node[] = [];
     for (const branch of branches) {
-      const status = branch === locatedBranch ? siteStatus : this.responseSiteStatus(branch, true);
+      const status = branch === locatedBranch ? siteStatus : replyStatus(this.replyChecker(), branch.compilerNode, { readChain: true });
       if (status === 'variable') {
         this.log(
           `Response status at ${request.file_path}:${this.getNodeLocation(branch).start_line} ` +
@@ -3175,7 +3146,7 @@ export class TypeInferrer {
       this.isLabelledSend(candidate)
     )
       .map((s) => s.send)
-      .filter((send) => !isDroppedResponseStatus(this.responseSiteStatus(send, true)));
+      .filter((send) => !isDroppedReplyStatus(replyStatus(this.replyChecker(), send.compilerNode, { readChain: true })));
     if (survivors.length === 0) return null;
     const recovered = this.recoverPayloadFromResponseExpressions(
       survivors,
@@ -7865,7 +7836,7 @@ export class TypeInferrer {
       if (!body || !(body.isString() || body.isStringLiteral())) return false;
       return STATUS_MEMBER_NAMES.some((name) => {
         const status = this.envelopeMemberType(member, name, at);
-        return status !== undefined && (status.isNumber() || statusCodesOfType(status) !== undefined);
+        return status !== undefined && (status.isNumber() || statusCodesOfType(status.compilerType) !== undefined);
       });
     });
   }
@@ -8105,7 +8076,7 @@ export class TypeInferrer {
     );
     return (
       branches.length > 0 &&
-      branches.every((branch) => isDroppedResponseStatus(this.responseSiteStatus(branch, true)))
+      branches.every((branch) => isDroppedReplyStatus(replyStatus(this.replyChecker(), branch.compilerNode, { readChain: true })))
     );
   }
 
@@ -8171,7 +8142,7 @@ export class TypeInferrer {
     const inner = envelopes[0];
     const innerStatus = inner ? this.envelopeOwnStatus(inner) : 'undecided';
     if (innerStatus === 'undecided' || innerStatus === 'variable') {
-      const outer = this.responseSiteStatus(node);
+      const outer = replyStatus(this.replyChecker(), node.compilerNode, { readChain: false });
       if (outer === 'error' || outer === 'redirect') return 'dropped';
     }
     if (!inner) return { unread: 'builder' };
@@ -8179,9 +8150,9 @@ export class TypeInferrer {
   }
 
   /** The status a builder call sends: its status argument, or the builder's literal. */
-  private builderCallStatus(call: CallExpression, builder: EnvelopeBuilder): ResponseSiteStatus {
+  private builderCallStatus(call: CallExpression, builder: EnvelopeBuilder): ReplyStatus {
     if (builder.statusParameter !== undefined) {
-      return this.statusOfValue(call.getArguments()[builder.statusParameter]);
+      return valueStatus(this.replyChecker(), call.getArguments()[builder.statusParameter]?.compilerNode);
     }
     return builder.fixedStatus ?? 'undecided';
   }
@@ -8191,7 +8162,7 @@ export class TypeInferrer {
    * member, or what a followable builder call sends. `'undecided'` for
    * anything else (a variable holding an envelope states nothing here).
    */
-  private envelopeOwnStatus(expression: Node): ResponseSiteStatus {
+  private envelopeOwnStatus(expression: Node): ReplyStatus {
     const node = this.peelTransparentExpression(expression);
     if (Node.isObjectLiteralExpression(node)) return this.envelopeLiteralStatus(node);
     if (!Node.isCallExpression(node)) return 'undecided';
@@ -8201,22 +8172,12 @@ export class TypeInferrer {
   }
 
   /** The status an envelope literal's `statusCode` or `status` member states. */
-  private envelopeLiteralStatus(literal: ObjectLiteralExpression): ResponseSiteStatus {
+  private envelopeLiteralStatus(literal: ObjectLiteralExpression): ReplyStatus {
     for (const name of STATUS_MEMBER_NAMES) {
       const value = this.envelopeMemberValue(literal, name);
-      if (value) return this.statusOfValue(value);
+      if (value) return valueStatus(this.replyChecker(), value.compilerNode);
     }
     return 'undecided';
-  }
-
-  /** The status a value states, classified as a send's status argument is. */
-  private statusOfValue(value: Node | undefined): ResponseSiteStatus {
-    if (!value) return 'undecided';
-    const read = this.statedStatusCodes(this.peelTransparentExpression(value));
-    if (read === 'variable') return 'variable';
-    if (!read) return 'undecided';
-    const kind = classifyStatusCodes(read);
-    return kind === 'mixed' ? 'variable' : kind;
   }
 
   /**
@@ -8325,9 +8286,9 @@ export class TypeInferrer {
       ).find((value) => value !== undefined);
       if (!statusValue) return undefined;
       const statusParameter = this.parameterIndexOf(statusValue, params);
-      let fixedStatus: ResponseSiteStatus | undefined;
+      let fixedStatus: ReplyStatus | undefined;
       if (statusParameter === undefined) {
-        const codes = this.statedStatusCodes(this.peelTransparentExpression(statusValue));
+        const codes = statedStatusCodes(this.replyChecker(), this.peelTransparentExpression(statusValue).compilerNode);
         if (!Array.isArray(codes)) return undefined;
         const kind = classifyStatusCodes(codes);
         if (kind === 'error') {
@@ -8564,7 +8525,7 @@ export class TypeInferrer {
     const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
     if (args.length === 0) return undefined;
     // An error or redirect branch sends no success body (carrick#1161).
-    const status = this.responseSiteStatus(call);
+    const status = replyStatus(this.replyChecker(), call.compilerNode, { readChain: false });
     if (status === 'error' || status === 'redirect') return undefined;
     if (Node.isCallExpression(call) && this.callsFailureHelper(call, depth)) return undefined;
 
@@ -8616,7 +8577,7 @@ export class TypeInferrer {
     );
     if (branches.length === 0) return false;
     return branches.every((branch) => {
-      const status = this.responseSiteStatus(branch);
+      const status = replyStatus(this.replyChecker(), branch.compilerNode, { readChain: false });
       if (status === 'error' || status === 'redirect') return true;
       const inner = this.peelTransparentExpression(branch);
       return Node.isCallExpression(inner) && this.callsFailureHelper(inner, depth + 1);
@@ -8745,156 +8706,16 @@ export class TypeInferrer {
         statesInit = true;
         continue;
       }
-      if (name === 'status' && this.statedStatusCodes(value) !== undefined) {
+      if (name === 'status' && statedStatusCodes(this.replyChecker(), value.compilerNode) !== undefined) {
         statesInit = true;
       }
     }
     return statesInit;
   }
 
-  /**
-   * What a response send states about its HTTP status (carrick#1161).
-   *
-   * Read in order, and the first that states anything decides:
-   *
-   *  1. an argument past the body that carries a status: a numeric literal
-   *     (`send(body, 404)`), an options object (`{ status: 401 }`), or any
-   *     expression whose TYPE is a status literal or a union of them
-   *     (`let code: 400 | 500`). A numeric argument whose type is a plain
-   *     `number` states a status the source does not fix, which is
-   *     `variable`: the branch fails open into the union and is logged.
-   *  2. the send call's own RESULT type, when a member of it is typed as a
-   *     status literal. A framework that types its sends records the status
-   *     there, and a redirect helper's default `302` is only visible there.
-   *     A result whose status member spans success and error codes (the
-   *     default of a typed `json(body, status?)`) says nothing either way.
-   *
-   * A status in the FIRST argument is a field of the body and is never read.
-   * No method or framework name is consulted anywhere.
-   */
-  private responseSiteStatus(expression: Node, readChain = false): ResponseSiteStatus {
-    const call = this.peelTransparentExpression(expression);
-    if (!Node.isCallExpression(call) && !Node.isNewExpression(call)) {
-      return 'undecided';
-    }
-    const args = call.getArguments().map((a) => this.peelTransparentExpression(a));
-    const stated: number[] = [];
-    let variable = false;
-    for (const arg of args.slice(1)) {
-      const read = this.statedStatusCodes(arg);
-      if (read === 'variable') {
-        variable = true;
-      } else if (read) {
-        stated.push(...read);
-      }
-    }
-    if (stated.length > 0) {
-      const kind = classifyStatusCodes(stated);
-      return kind === 'mixed' ? 'variable' : kind;
-    }
-    if (variable) return 'variable';
-
-    // carrick#2005: a status an earlier call of the same chain states
-    // (`reply.status(401).json(body)`). Read only where the caller asks for
-    // it; the return walk does not read it yet (carrick#1962).
-    if (readChain) {
-      const chained = this.chainStatus(call);
-      if (chained) return chained;
-    }
-
-    const typed = this.sendResultStatusCodes(call);
-    if (typed) {
-      const kind = classifyStatusCodes(typed);
-      if (kind !== 'mixed') return kind;
-    }
-    return 'undecided';
-  }
-
-  /**
-   * The status an earlier call of a send's own chain states: the receiver
-   * calls `call` is invoked on (`a.status(401).json(body)` has `a.status(401)`),
-   * innermost last. Each receiver call's first argument is read by the rule
-   * an argument past a body is, so a numeric literal or a literal-typed value
-   * counts and a plain `number` is `variable`. `undefined` when no receiver
-   * call states a status. No method name is consulted: a receiver call that
-   * is handed no status-shaped value says nothing.
-   */
-  private chainStatus(call: Node): ResponseSiteStatus | undefined {
-    if (!Node.isCallExpression(call)) return undefined;
-    let callee = call.getExpression();
-    while (Node.isPropertyAccessExpression(callee)) {
-      const receiver = this.peelTransparentExpression(callee.getExpression());
-      if (!Node.isCallExpression(receiver)) return undefined;
-      const status = this.statusOfValue(receiver.getArguments()[0]);
-      if (status !== 'undecided') return status;
-      callee = receiver.getExpression();
-    }
-    return undefined;
-  }
-
-  /**
-   * The HTTP status codes an argument states, `'variable'` when it is a
-   * status-shaped value the source does not fix, or `undefined` when it says
-   * nothing about a status.
-   *
-   * Read from the AST first: `{ status: 400 }` in an argument position widens
-   * to `{ status: number }`, so the literal only survives syntactically. The
-   * type read behind it catches `as const`, hoisted option objects and
-   * literal-typed variables. Only values in the HTTP range count: an
-   * arbitrary number named `status` on a domain object (`{ status: 2 }`)
-   * states nothing about transport.
-   */
-  private statedStatusCodes(node: Node): number[] | 'variable' | undefined {
-    if (Node.isNumericLiteral(node)) {
-      const code = httpStatus(node.getLiteralValue());
-      return code === undefined ? undefined : [code];
-    }
-
-    if (Node.isObjectLiteralExpression(node)) {
-      for (const name of STATUS_MEMBER_NAMES) {
-        const property = node.getProperty(name);
-        if (!property || !Node.isPropertyAssignment(property)) continue;
-        const initializer = property.getInitializer();
-        if (!initializer) continue;
-        const read = this.statedStatusCodes(this.peelTransparentExpression(initializer));
-        if (read) return read;
-      }
-      return undefined;
-    }
-
-    const type = node.getType();
-    const fromType = statusCodesOfType(type);
-    if (fromType) return fromType;
-    if (type.isNumber()) return 'variable';
-    for (const name of STATUS_MEMBER_NAMES) {
-      const property = type.getProperty(name);
-      const declaration = property?.getDeclarations()[0];
-      if (!property || !declaration) continue;
-      const propertyType = property.getTypeAtLocation(declaration).getNonNullableType();
-      const codes = statusCodesOfType(propertyType);
-      if (codes) return codes;
-      if (propertyType.isNumber()) return 'variable';
-    }
-    return undefined;
-  }
-
-  /**
-   * Status codes a send call's result type records: the members (of the
-   * result, or of each part of an intersection result) typed as a status
-   * literal or a union of them. `undefined` when none is.
-   */
-  private sendResultStatusCodes(call: Node): number[] | undefined {
-    const result = this.unwrapPromiseType(call.getType());
-    const parts = result.isIntersection() ? result.getIntersectionTypes() : [result];
-    const codes: number[] = [];
-    for (const part of parts) {
-      if (part.isAny() || part.isUnknown() || !part.isObject()) continue;
-      for (const property of part.getProperties()) {
-        const codesHere = statusCodesOfType(property.getTypeAtLocation(call));
-        if (codesHere) codes.push(...codesHere);
-      }
-    }
-    return codes.length > 0 ? codes : undefined;
+  /** The raw checker the shared reply-status reader (`capture/reply-status.ts`) reads with. */
+  private replyChecker(): ts.TypeChecker {
+    return this.project.getTypeChecker().compilerObject;
   }
 
   /**
@@ -11230,8 +11051,8 @@ export class TypeInferrer {
           externalImportsOf(this.project)
         );
       },
-      (call) => this.chainStatus(call),
-      (value) => this.statusOfValue(value),
+      (call) => chainStatus(this.replyChecker(), call.compilerNode),
+      (value) => valueStatus(this.replyChecker(), value.compilerNode),
       (value) => this.unwrapJsonStringifyArg(this.unwrapExpressionNode(value))
     );
   }
