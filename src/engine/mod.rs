@@ -6783,6 +6783,8 @@ async fn analyze_current_repo_incremental(
                 boundary.model_rows_carried = (carried.examined > 0).then_some(carried.carried);
                 boundary.model_rows_not_carried = (!carried.not_carried.is_empty())
                     .then(|| crate::boundary::Counted::from_reasons(carried.not_carried.clone()));
+                boundary.model_rows_not_carried_by_reason = (!carried.not_carried.is_empty())
+                    .then(|| crate::model_carry::tally_by_reason(&carried.not_carried));
             }
             // Everything between the marks above: manifest assembly, the
             // deterministic attachments, relativisation. Named so the printed

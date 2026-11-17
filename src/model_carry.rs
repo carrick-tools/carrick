@@ -126,13 +126,7 @@ pub fn carry_edited_files(
         }
     }
     if out.examined > 0 {
-        // The reasons by name, whole: the boundary keeps the first few sites.
-        let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for line in &out.not_carried {
-            if let Some((_, reason)) = line.split_once(' ') {
-                *tally.entry(reason).or_default() += 1;
-            }
-        }
+        let tally = tally_by_reason(&out.not_carried);
         tracing::debug!(
             "Edited files: {} row(s) carried of {} examined; not carried by reason: {:?}",
             out.carried,
@@ -141,6 +135,18 @@ pub fn carry_edited_files(
         );
     }
     out
+}
+
+/// How many rows each reason left out: the one answer to "why", read by the
+/// boundary and the debug line. A line is `file:line reason` or `file reason`.
+pub fn tally_by_reason(lines: &[String]) -> std::collections::BTreeMap<String, usize> {
+    let mut tally = std::collections::BTreeMap::new();
+    for line in lines {
+        if let Some((_, reason)) = line.rsplit_once(' ') {
+            *tally.entry(reason.to_string()).or_default() += 1;
+        }
+    }
+    tally
 }
 
 fn row_count(answer: &FileAnalysisResult) -> usize {
@@ -785,6 +791,10 @@ function listItems() {
         assert_eq!(
             carry.not_carried,
             vec!["routes.ts:5 carried_untyped".to_string()]
+        );
+        assert_eq!(
+            tally_by_reason(&carry.not_carried),
+            std::collections::BTreeMap::from([(CARRIED_UNTYPED.to_string(), 1)])
         );
     }
 

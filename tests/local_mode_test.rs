@@ -5228,6 +5228,13 @@ fn an_edited_handler_keeps_its_route_and_is_re_judged() {
         "every row was carried and typed: {:?}",
         blob["boundary"]
     );
+    assert!(
+        blob["boundary"]
+            .get("model_rows_not_carried_by_reason")
+            .is_none(),
+        "no row left out, no count: {:?}",
+        blob["boundary"]
+    );
 }
 
 /// The fixture's routes with a field typed through an uninstalled import added
@@ -5436,6 +5443,12 @@ fn a_changed_registration_line_is_not_carried_and_is_counted() {
         "{:?}",
         blob["boundary"]
     );
+    assert_eq!(
+        blob["boundary"]["model_rows_not_carried_by_reason"],
+        serde_json::json!({"registration_line_changed": 1}),
+        "{:?}",
+        blob["boundary"]
+    );
     let routes = carried_routes(&blob);
     assert!(
         routes.iter().any(|r| r.starts_with("/api/v1/items/:id@"))
@@ -5467,6 +5480,12 @@ fn a_named_handler_whose_body_changed_is_not_carried() {
     assert_eq!(
         not_carried(&blob),
         vec!["src/routes.ts:14 hint_outside_registration_changed".to_string()],
+        "{:?}",
+        blob["boundary"]
+    );
+    assert_eq!(
+        blob["boundary"]["model_rows_not_carried_by_reason"],
+        serde_json::json!({"hint_outside_registration_changed": 1}),
         "{:?}",
         blob["boundary"]
     );
