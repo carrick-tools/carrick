@@ -358,22 +358,6 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
-  // 4c''. A GraphQL root record that lacks fields the served schema declares
-  //       (carrick#1875): the wire line fails, and passes once every such
-  //       field is filled, so the verdict hangs on field resolvers the check
-  //       does not read. Not a fact either way, and no side to retype: a
-  //       retype would read the same record.
-  if (firedGates.has('sent:field_resolver')) {
-    const { side } = sideForGate('sent:field_resolver', plan);
-    return {
-      ...base,
-      bucket: 'unverifiable',
-      gate: `${side}:field_resolver`,
-      diagnostic: `${graphqlFieldResolverReason()}.`,
-      ...notAFact(graphqlFieldResolverReason()),
-    };
-  }
-
   // 4d. A body read as raw text (carrick#1842): a `.text()` read, or a request
   //     library's text format, takes the body unparsed, so `string` there
   //     states no structural contract. Like bytes, the pair is not compared,
@@ -425,9 +409,39 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
   // disagree only over what serialisation changes (a producer `Date` read as
   // the `string` it becomes) has no error on this line and is not a drift.
   const decisiveLine = decisiveAssignmentLine(plan);
-  const assignDiag = probeDiags.find(
+  let assignDiag = probeDiags.find(
     (d) => d.line === decisiveLine && ASSIGNMENT_CODES.has(d.code)
   );
+  // 5'. A GraphQL wire line that fails is read once more (carrick#4726): with
+  //     the fields the root record lacks or converts in the type the served
+  //     schema declares. That line decides. Any other diagnostic in its block
+  //     (a type too deep to instantiate makes its alias an error type that
+  //     assigns to anything) means the fill was never judged: unverifiable,
+  //     never compatible.
+  let declaredCleared = false;
+  if (assignDiag && plan.declaredAssignmentLine !== undefined) {
+    const from = plan.declaredFromLine!;
+    const to = plan.declaredAssignmentLine;
+    const unjudged = probeDiags.find(
+      (d) => d.line >= from && d.line <= to && !ASSIGNMENT_CODES.has(d.code)
+    );
+    if (unjudged) {
+      return {
+        ...base,
+        bucket: 'unverifiable',
+        gate: 'assignment:other',
+        diagnostic: scrubDiagnostic(
+          unjudged.message,
+          scrubCtx,
+          plan.sentEndpoint.alias,
+          plan.expectedEndpoint.alias
+        ),
+        ...notAFact('the probe raised a diagnostic that is not an assignment mismatch'),
+      };
+    }
+    assignDiag = probeDiags.find((d) => d.line === to && ASSIGNMENT_CODES.has(d.code));
+    declaredCleared = assignDiag === undefined;
+  }
   // 5a. Unless the mismatch is a sent union the expected type takes in part,
   //     the members it rejects sharing no field with a type whose every field
   //     is optional (carrick#1995). That is a route answering a body per
@@ -539,8 +553,13 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     };
   }
 
-  // 6. No diagnostics -> compatible.
-  return { ...base, bucket: 'compatible', ...factness(input) };
+  // 6. No diagnostics -> compatible. A pair the declared line cleared says so.
+  return {
+    ...base,
+    bucket: 'compatible',
+    ...(declaredCleared ? { notes: [...base.notes, GRAPHQL_DECLARED_FIELDS_NOTE] } : {}),
+    ...factness(input),
+  };
 }
 
 /**
@@ -552,13 +571,13 @@ export function wireFormUnknownReason(side: Side): string {
 }
 
 /**
- * Why a GraphQL pair whose producer record lacks a field the served schema
- * declares is not compared (carrick#1875). Customer-facing: it prints after
- * "Types not verified".
+ * The note on a GraphQL pair the declared line cleared (carrick#4726): the
+ * wire line failed on fields the root record lacks or converts, and the pair
+ * agrees once they take the type the served schema declares.
  */
-export function graphqlFieldResolverReason(): string {
-  return "the root resolver's return type lacks a schema field or holds it as a JSON value or primitive where the schema declares an object, and Carrick does not read the field resolvers that usually supply or convert it";
-}
+export const GRAPHQL_DECLARED_FIELDS_NOTE =
+  "fields the root resolver's record lacks or converts were compared in the type the served schema declares; " +
+  'Carrick did not read their field resolvers';
 
 /**
  * The note on a request the consumer's unwidened reading cleared

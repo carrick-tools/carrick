@@ -33,8 +33,8 @@ import {
   graphqlComparandLeafRule,
   graphqlComparandRule,
   graphqlExpectedRule,
-  graphqlFieldResolverDeclarations,
-  graphqlFieldResolverRule,
+  graphqlDeclaredDeclarations,
+  graphqlDeclaredRule,
   graphqlGenericDeclarations,
   graphqlLeafWalkDeclarations,
   graphqlReachableFields,
@@ -327,8 +327,8 @@ export interface HeldGraphql {
  *    `E` the caller's expected type;
  *  - `__carrick_GqlSentS<S, E, R>`: the scalar form, `R` the root's leaf
  *    (`leaves`); it reads `__carrick_GqlTypes` (`types_decl`). A
- *    declared-void caller states no contract, and is kept; a pair the judge's
- *    record-field gate abstains on (carrick#1875) is silent too.
+ *    declared-void caller states no contract, and is kept; where the wire
+ *    form does not assign, the judge's declared line decides (carrick#4726).
  *
  * `scalar` adds the scalar form's lines; they name `__carrick_GqlTypes`, so
  * they are written only when the table is declared.
@@ -352,11 +352,12 @@ export function heldGraphqlWire(scalar: boolean): string[] {
     `type ${p}GqlComparandLeaf<S, E, R> = ${graphqlComparandLeafRule('S', 'E', relaxed, 'R', p)};`,
     `type ${p}GqlWireForm<S, E, R> = ${graphqlScalarWireRule(comparand, relaxed, leaf, p)};`,
     `type ${p}GqlWire<S, E, R> = ${form};`,
-    // carrick#4708: where the judge's record-field gate reads unverifiable (a
-    // field resolver nobody read supplies a field), the held form is silent:
-    // it returns the relaxed expected type, as the void gate returns `E`.
-    ...graphqlFieldResolverDeclarations(p),
-    `type ${p}GqlSentS<S, E, R> = ${p}IsVoid<E> extends true ? E : (${graphqlFieldResolverRule(`${p}GqlWire<S, E, R>`, relaxed, leaf, p)}) extends true ? ${relaxed} : ${p}GqlWire<S, E, R>;`,
+    // carrick#4726: the judge's declared line. Where the wire form does not
+    // assign, the held form sends what the judge's decisive line sends: the
+    // wire type with the fields the root record lacks or converts in the type
+    // the served schema declares.
+    ...graphqlDeclaredDeclarations(p),
+    `type ${p}GqlSentS<S, E, R> = ${p}IsVoid<E> extends true ? E : ${graphqlDeclaredRule(`${p}GqlWire<S, E, R>`, relaxed, leaf, p)};`,
   ];
 }
 

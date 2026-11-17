@@ -18,8 +18,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   buildProbe,
-  graphqlFieldResolverDeclarations,
-  graphqlFieldResolverRule,
+  graphqlDeclaredDeclarations,
+  graphqlDeclaredRule,
   jsonWireDeclarations,
   jsonWireRule,
   judgeTolerances,
@@ -51,11 +51,12 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
     assert.deepEqual(Object.keys(GOLDEN).sort(), FIXED_SPECS.map((s) => s.pair_key).sort());
   });
 
-  it('the record-field rule (carrick#1875) follows the wire line in every scalar-form probe', () => {
+  it('the declared line (carrick#4726) follows the wire line in every scalar-form probe', () => {
     const rule = [
-      ...graphqlFieldResolverDeclarations(''),
-      `type SdlFieldDecides = ${graphqlFieldResolverRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
-      'type _G_sent_field_resolver = Assert<Not<SdlFieldDecides>>;',
+      ...graphqlDeclaredDeclarations(''),
+      `type GqlDeclared = ${graphqlDeclaredRule('GqlWire', 'GqlExpected', 'GqlComparandLeaf', '')};`,
+      'declare const sentDeclared: GqlDeclared;',
+      'const expectedDeclared: GqlExpected = sentDeclared;',
     ].join('\n');
     for (const key of Object.keys(GOLDEN)) {
       if (key.startsWith('scalar-')) assert.ok(GOLDEN[key].endsWith(`const expectedWire: GqlExpected = sentWire;\n${rule}\n`), key);
@@ -63,10 +64,10 @@ describe('the judge probe text is unchanged by the rule extraction', () => {
     }
   });
 
-  it('the record-field rule names only prefixed declarations under a prefix', () => {
+  it('the declared rule names only prefixed declarations under a prefix', () => {
     const text = [
-      ...graphqlFieldResolverDeclarations('__carrick_'),
-      graphqlFieldResolverRule('W', 'X', 'L', '__carrick_'),
+      ...graphqlDeclaredDeclarations('__carrick_'),
+      graphqlDeclaredRule('W', 'X', 'L', '__carrick_'),
     ].join('\n');
     assert.deepEqual(text.match(/(?<!__carrick_)\bGql\w+/g), null);
   });
@@ -100,14 +101,18 @@ const CASES: Case[] = [
   { key: 'null-ok', root: 'order', sent: '{ id: string } | null', expected: '{ id: string } | null', bucket: 'compatible' },
   { key: 'null-break', root: 'order', sent: '{ id: string } | null', expected: '{ id: string }', bucket: 'incompatible' },
   { key: 'field-not-in-sdl', root: 'order', sent: '{ id: string }', expected: '{ id: string; missing: string }', bucket: 'incompatible' },
-  // carrick#4708: where the judge's record-field gate reads the pair unverifiable, the held form is silent.
-  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'unverifiable', gate: 'producer:field_resolver' },
-  // The same gate must not hide a real break: a leaf mismatch beside an absent field, a sub-field the schema does not declare.
-  { key: 'rf-leaf-beside-absent', root: 'order', sent: '{ id: string; total: number }', expected: '{ label: string; total: string }', bucket: 'incompatible' },
-  { key: 'rf-undeclared-sub-field', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { hint: string }[] }', bucket: 'incompatible' },
+  // carrick#4726: a field the record lacks or converts is read in the type the schema declares, by the judge and the held form alike.
+  { key: 'rf-absent-label', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string | null }', bucket: 'compatible' },
+  { key: 'rf-absent-nested-sku', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'compatible' },
+  { key: 'rf-converted-lines', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: { sku: string }[] }', bucket: 'compatible' },
+  { key: 'rf-absent-list', root: 'orders', sent: '{ id: string }[]', expected: '{ id: string; total: number }[]', bucket: 'compatible' },
+  { key: 'rf-absent-typename', root: 'order', sent: '{ id: string; lines: { qty: number }[] }', expected: "{ __typename: 'Order'; id: string; lines: { __typename: 'Line'; sku: string }[] }", bucket: 'compatible' },
+  // The declared type decides, so it breaks too: a nullable field read as non-null, a scalar read as another, a list read as a string.
+  { key: 'rf-absent-nullable-read-non-null', root: 'order', sent: '{ id: string; total: number }', expected: '{ id: string; label: string }', bucket: 'incompatible' },
+  { key: 'rf-absent-wrong-scalar', root: 'order', sent: '{ id: string }', expected: '{ id: string; total: string }', bucket: 'incompatible' },
+  { key: 'rf-converted-read-as-string', root: 'order', sent: '{ id: string; lines: string }', expected: '{ id: string; lines: string }', bucket: 'compatible' },
+  { key: 'rf-absent-list-read-as-string', root: 'order', sent: '{ id: string }', expected: '{ id: string; lines: string }', bucket: 'incompatible' },
+  // A real leaf mismatch beside an absent field, and a sub-field the schema does not declare, stay breaks.
   { key: 'json-ok', sent: '{ at: Date }', expected: '{ at: string }', bucket: 'compatible' },
   { key: 'json-break', sent: '{ at: number }', expected: '{ at: string }', bucket: 'incompatible' },
 ];

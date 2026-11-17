@@ -1,17 +1,19 @@
 /**
  * v2 check — a field the served schema declares and the producer's root
- * record lacks is not a break (carrick#1875).
+ * record lacks or converts is compared in the type the schema declares
+ * (carrick#1875, carrick#4726).
  *
  * A GraphQL resolver often returns a record without some fields the schema
- * declares: relations and computed fields are supplied by field resolvers the
- * check does not read. Comparing the record alone then reports every such
- * field as missing, a break that cannot happen. With the producer's SDL types
- * and the root field, the probe asks a second question when the wire
- * assignment fails: would it pass if every field the SDL declares and the
- * record lacks were filled? If so the pair reads unverifiable
- * (`producer:field_resolver`), not incompatible. A field the SDL does not
- * declare, and a real leaf mismatch beside the absent fields, stay breaks.
- * Without a table the probe is what it was, byte for byte.
+ * declares (relations and computed fields), or with a field held as a JSON
+ * value or a primitive where the schema declares an object type: field
+ * resolvers the check does not read supply or convert them. With the
+ * producer's SDL types and the root field, the probe adds one line after the
+ * wire line: the wire type with every such field filled with the type the
+ * schema declares for it, walked over the consumer's own keys. When the wire
+ * line fails, that line decides: it passes, the pair is compatible with a
+ * note; it fails, the pair is incompatible. A field the SDL does not declare,
+ * and a real leaf mismatch beside the absent fields, stay breaks. Without a
+ * table the probe is what it was, byte for byte.
  *
  * Real vendored pnpm + tsc, in the style of check-v2-graphql-leaves.
  */
@@ -23,7 +25,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runCheck } from '../src/capture/index.js';
-import { buildProbe } from '../src/capture/check-probe.js';
+import { buildProbe, type ProbePlan } from '../src/capture/check-probe.js';
+import { classifyPair, type RawDiagnostic } from '../src/capture/check-classify.js';
 import type {
   CheckPairSpec,
   CheckStubInput,
@@ -75,6 +78,15 @@ const ref = (name: string): GraphqlLeaf => ({ type: name });
 const list = (leaf: GraphqlLeaf): GraphqlLeaf => ({ list: leaf });
 
 /** The shop service's SDL output types. */
+/** The compatible note's words (`GRAPHQL_DECLARED_FIELDS_NOTE`). */
+const DECLARED_NOTE = /compared in the type the served schema declares/;
+
+/** The declared block's first line and its assignment line (carrick#4726). */
+function declaredLines(p: ProbePlan): { from?: number; line?: number } {
+  const lines = p as unknown as { declaredFromLine?: number; declaredAssignmentLine?: number };
+  return { from: lines.declaredFromLine, line: lines.declaredAssignmentLine };
+}
+
 const SHOP_TYPES: GraphqlTypes = {
   Query: {
     fields: {
@@ -124,7 +136,7 @@ function byKey(verdicts: CheckVerdict[]): Map<string, CheckVerdict> {
   return new Map(verdicts.map((v) => [v.pair_key, v]));
 }
 
-describe('check_v2: a field the served schema declares and the record lacks is unverifiable (carrick#1875)', () => {
+describe('check_v2: a field the served schema declares and the record lacks is compared in its declared type (carrick#4726)', () => {
   let verdicts: Map<string, CheckVerdict>;
 
   before(async () => {
@@ -177,18 +189,15 @@ describe('check_v2: a field the served schema declares and the record lacks is u
     return v;
   };
 
-  const assertResolverServed = (key: string): void => {
+  const assertDeclaredCompatible = (key: string): void => {
     const v = verdict(key);
-    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
-    assert.strictEqual(v.gate, 'producer:field_resolver', JSON.stringify(v));
-    assert.strictEqual(v.resolved, false);
-    assert.match(v.unresolved_reason ?? '', /field resolver/);
-    // No side to blame, so no retype runs.
-    assert.strictEqual(v.unresolved_side, undefined, JSON.stringify(v));
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+    assert.ok(v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
   };
 
-  it('(a) a field the SDL declares and the record lacks: unverifiable, not a break', () => {
-    assertResolverServed('rf-a');
+  it('(a) a field the SDL declares and the record lacks: compared in its declared type', () => {
+    assertDeclaredCompatible('rf-a');
   });
 
   it('(b) a field the SDL does not declare stays a break', () => {
@@ -200,11 +209,11 @@ describe('check_v2: a field the served schema declares and the record lacks is u
   it('(c) a real leaf mismatch beside a resolver-served field stays a break', () => {
     const v = verdict('rf-c');
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
-    assert.doesNotMatch(v.diagnostic!, /GqlSdlFilled|SdlFieldDecides|GqlWire|GqlTypes/, v.diagnostic);
+    assert.doesNotMatch(v.diagnostic!, /GqlSdlFilled|GqlSdlDeclared|GqlDeclared|GqlWire|GqlTypes/, v.diagnostic);
   });
 
-  it('(d) a nested record lacking a field its SDL type declares: unverifiable', () => {
-    assertResolverServed('rf-d');
+  it('(d) a nested record lacking a field its SDL type declares: compared in its declared type', () => {
+    assertDeclaredCompatible('rf-d');
   });
 
   it('(e) with no table the pair is compared on the record, as before', () => {
@@ -215,20 +224,20 @@ describe('check_v2: a field the served schema declares and the record lacks is u
     assert.strictEqual(verdict('rf-f').bucket, 'compatible', JSON.stringify(verdict('rf-f')));
   });
 
-  it('a nullable root record and a list root lacking a declared field: unverifiable', () => {
-    assertResolverServed('rf-nullable');
-    assertResolverServed('rf-list');
+  it('a nullable root record and a list root lacking a declared field: compared in its declared type', () => {
+    assertDeclaredCompatible('rf-nullable');
+    assertDeclaredCompatible('rf-list');
   });
 
-  it('a self-referring record: an absent declared field is unverifiable, a leaf mismatch a break', () => {
-    assertResolverServed('rf-cycle');
+  it('a self-referring record: an absent declared field is compared in its declared type, a leaf mismatch a break', () => {
+    assertDeclaredCompatible('rf-cycle');
     const v = verdict('rf-cycle-leaf');
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
     assert.strictEqual(v.gate, undefined, JSON.stringify(v));
   });
 
-  it('a consumer that names itself reads the same: unverifiable, and a leaf mismatch a break', () => {
-    assertResolverServed('rf-cycle-rec');
+  it('a consumer that names itself reads the same, and a leaf mismatch a break', () => {
+    assertDeclaredCompatible('rf-cycle-rec');
     const v = verdict('rf-cycle-rec-leaf');
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
     assert.strictEqual(v.gate, undefined, JSON.stringify(v));
@@ -236,7 +245,7 @@ describe('check_v2: a field the served schema declares and the record lacks is u
   });
 });
 
-describe('the record-field gate leaves other probes as they were (carrick#1875)', () => {
+describe('the declared line leaves other probes as they were (carrick#4726)', () => {
   const probe = (field?: string, types: GraphqlTypes | null = SHOP_TYPES) =>
     buildProbe(
       gql('k', 'Order_Sent', 'Label_Exp', field),
@@ -253,7 +262,7 @@ describe('the record-field gate leaves other probes as they were (carrick#1875)'
     assert.strictEqual(sha(probe('order', null).source), main);
   });
 
-  it('(f) every line up to the wire assignment is main\'s; the gate comes after it', () => {
+  it('(f) every line up to the wire assignment is main\'s; the declared line comes after it', () => {
     const p = probe('order');
     const lines = p.source.split('\n');
     assert.strictEqual(p.wireAssignmentLine, 47);
@@ -261,9 +270,13 @@ describe('the record-field gate leaves other probes as they were (carrick#1875)'
       sha(lines.slice(0, p.wireAssignmentLine).join('\n')),
       'c2b40c5e6d1c8f376ca10abe3fb7fcf565eca21e3ea8f651cf83fd9826677560'
     );
-    const gate = [...p.gateLines].find(([, name]) => (name as string) === 'sent:field_resolver');
-    assert.ok(gate, 'the probe carries the field_resolver gate');
-    assert.ok(gate[0] > p.wireAssignmentLine!, `gate line ${gate[0]}`);
+    const { from, line } = declaredLines(p);
+    assert.ok(from !== undefined && from > p.wireAssignmentLine!, `declared block from ${from}`);
+    assert.ok(line !== undefined && line >= from!, `declared line ${line}`);
+    assert.strictEqual(lines[line! - 1], 'const expectedDeclared: GqlExpected = sentDeclared;');
+    // No gate: the record-field gate is gone.
+    assert.ok(![...p.gateLines.values()].some((name) => (name as string).includes('field_resolver')));
+    assert.ok(!p.source.includes('field_resolver'));
   });
 });
 
@@ -271,7 +284,8 @@ describe('the record-field gate leaves other probes as they were (carrick#1875)'
  * Rule G (carrick#1875): the record HAS the field, typed as a generic JSON
  * value or a primitive, where the schema declares an object type (or a list
  * of them). A field resolver converts it; the check reads no resolver, so
- * the pair is unverifiable. The JSON value is recognised by its structure
+ * the field compares in the type the schema declares (carrick#4726). The
+ * JSON value is recognised by its structure
  * (every JSON primitive, arrays of itself, string-keyed objects of itself),
  * spelled here the way ORM clients emit it. A record field that is an object
  * shape is still compared field by field.
@@ -317,7 +331,7 @@ const YARD_PAIRS: CheckPairSpec[] = [
   yard('rg-string-array', 'OrderStringArray_Sent', 'Warnings_Exp'),
 ];
 
-describe('check_v2: a record field the schema converts to an object type is unverifiable (carrick#1875 rule G)', () => {
+describe('check_v2: a record field the schema converts to an object type is compared in its declared type (carrick#1875 rule G, carrick#4726)', () => {
   let groot: string;
   let verdicts: Map<string, CheckVerdict>;
 
@@ -374,10 +388,9 @@ describe('check_v2: a record field the schema converts to an object type is unve
 
   const assertConverted = (key: string): void => {
     const v = verdict(key);
-    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
-    assert.strictEqual(v.gate, 'producer:field_resolver', JSON.stringify(v));
-    assert.strictEqual(v.resolved, false);
-    assert.strictEqual(v.unresolved_side, undefined, JSON.stringify(v));
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+    assert.ok(v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
   };
 
   const assertBreak = (key: string): void => {
@@ -386,15 +399,15 @@ describe('check_v2: a record field the schema converts to an object type is unve
     assert.strictEqual(v.gate, undefined, JSON.stringify(v));
   };
 
-  it('(1) a JSON value where the schema declares a list of objects: unverifiable', () => {
+  it('(1) a JSON value where the schema declares a list of objects: compared in its declared type', () => {
     assertConverted('rg-json-list');
   });
 
-  it('(1b) the same after the wire line rewrites the record: unverifiable', () => {
+  it('(1b) the same after the wire line rewrites the record', () => {
     assertConverted('rg-json-list-wire');
   });
 
-  it('(2) a primitive where the schema declares an object type: unverifiable', () => {
+  it('(2) a primitive where the schema declares an object type: compared in its declared type', () => {
     assertConverted('rg-string-object');
   });
 
@@ -412,5 +425,243 @@ describe('check_v2: a record field the schema converts to an object type is unve
 
   it('an array of strings under a list of objects stays a break', () => {
     assertBreak('rg-string-array');
+  });
+});
+
+/**
+ * The declared fill (carrick#4726, #1875 option 1's declared half): a field
+ * the record lacks or converts compares in the type the served schema
+ * declares, walked over the consumer's keys. Its own table, so the pins above
+ * stay.
+ */
+const DEPOT_TYPES: GraphqlTypes = {
+  Query: { fields: { order: ref('Order') } },
+  Order: {
+    fields: {
+      id: nn(scalar('ID')),
+      label: nn(scalar('String')),
+      total: nn(scalar('Int')),
+      lines: nn(list(nn(ref('Line')))),
+      notes: nn(list(nn(ref('Note')))),
+      state: nn({ enum: 'OrderState' }),
+      tags: nn(list(nn(scalar('String')))),
+      owner: nn(ref('Person')),
+      memo: scalar('String'),
+      subject: ref('Subject'),
+    },
+  },
+  Line: { fields: { sku: nn(scalar('String')) } },
+  Note: { fields: { text: nn(scalar('String')) } },
+  Person: { fields: { name: nn(scalar('String')) } },
+  Subject: { members: ['Person', 'Line'] },
+};
+
+const depot = (pair_key: string, consumerAlias: string): CheckPairSpec => ({
+  pair_key,
+  protocol: 'graphql',
+  type_kind: 'response',
+  producer: { service_name: 'depot', alias: 'DepotOrder_Sent' },
+  consumer: { service_name: 'kiosk', alias: consumerAlias },
+  graphql_root: { type: 'Query', field: 'order' },
+});
+
+/** Consumer alias -> its type, one pair each. */
+const DEPOT_CONSUMERS: Record<string, string> = {
+  // (a)-(g), (j): the plan's cases.
+  Fa_Exp: '{ id: string; label: string }',
+  Fb_Exp: '{ label: number }',
+  Fc_Exp: '{ lines: { sku: string }[] }',
+  Fd_Exp: '{ notes: { text: string }[] }',
+  Fe_Exp: '{ missing: string }',
+  Ff_Exp: '{ total: string }',
+  Fg_Exp: "{ state: 'OPEN' | 'DONE' }",
+  Fj_Exp: "{ __typename: 'Order'; lines: { __typename: 'Line'; sku: string }[] }",
+  // Wrong kinds: a filled field never reads as `never`.
+  Fw1_Exp: '{ label: { text: string } }',
+  Fw2_Exp: '{ tags: string }',
+  Fw3_Exp: '{ owner: string }',
+  Fw4_Exp: '{ notes: string }',
+  Fw5_Exp: '{ owner: { name: number } }',
+  // Nullability: a nullable field adds null.
+  Fn1_Exp: '{ memo: string }',
+  Fn2_Exp: '{ memo: string | null }',
+  Fn3_Exp: '{ label: string | null; owner: { name: string } }',
+  // Optional reads keep their modifier.
+  Fo_Exp: '{ label?: string; tags?: string[] }',
+  // A consumer that reads the field as `any`, and one that reads a list of scalars.
+  Fany_Exp: '{ label: any }',
+  Ftags_Exp: '{ tags: string[] }',
+  // A union-typed field read through fragments: the table holds only the
+  // fields every member shares.
+  Fs1_Exp: "{ subject: { __typename: 'Person'; name: string } | { __typename: 'Line'; sku: string } | null }",
+};
+
+describe('check_v2: fields the record lacks or converts compare in the type the schema declares (carrick#4726)', () => {
+  let droot: string;
+  let verdicts: Map<string, CheckVerdict>;
+  const key = (alias: string) => `df-${alias.replace(/_Exp$/, '').slice(1).toLowerCase()}`;
+
+  before(async () => {
+    droot = fs.mkdtempSync(path.join(os.tmpdir(), 'carrick-check-v2-gql-declared-'));
+    writeStub(
+      droot,
+      'depot',
+      [
+        'export type Blob = string | number | boolean | BlobObject | BlobArray | null;',
+        'export type BlobObject = { [Key in string]?: Blob };',
+        'export interface BlobArray extends Array<Blob> {}',
+        // Two object-valued fields, so no consumer here reads the record as an envelope.
+        'export type DepotOrder_Sent = { id: string; total: number; lines: { qty: number }[]; notes: Blob; audit: { by: string } };',
+      ].join('\n') + '\n'
+    );
+    writeStub(
+      droot,
+      'kiosk',
+      Object.entries(DEPOT_CONSUMERS)
+        .map(([alias, type]) => `export type ${alias} = ${type};`)
+        .join('\n') + '\n'
+    );
+    const stubs: CheckStubInput[] = [
+      { service_name: 'depot', stub_dir: path.join(droot, 'depot'), graphql_types: DEPOT_TYPES },
+      { service_name: 'kiosk', stub_dir: path.join(droot, 'kiosk') },
+    ];
+    const pairs = Object.keys(DEPOT_CONSUMERS).map((alias) => depot(key(alias), alias));
+    const result = await runCheck({ stubs, pairs });
+    assert.strictEqual(result.success, true, JSON.stringify(result.errors));
+    assert.strictEqual(result.install_ok, true);
+    verdicts = byKey(result.verdicts);
+  });
+
+  after(() => {
+    fs.rmSync(droot, { recursive: true, force: true });
+  });
+
+  const verdict = (alias: string): CheckVerdict => {
+    const v = verdicts.get(key(alias));
+    assert.ok(v, `verdict for ${alias}`);
+    assert.ok(!v.codes.includes(2589), JSON.stringify(v.codes));
+    return v;
+  };
+
+  const assertCompatible = (alias: string): void => {
+    const v = verdict(alias);
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.ok(v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
+  };
+
+  const assertBreak = (alias: string, field?: string): void => {
+    const v = verdict(alias);
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+    assert.strictEqual(v.gate, undefined, JSON.stringify(v));
+    assert.doesNotMatch(v.diagnostic!, /GqlSdlFilled|GqlSdlDeclared|GqlDeclared|GqlTypes/, v.diagnostic);
+    if (field !== undefined) assert.match(v.diagnostic!, new RegExp(`\\b${field}\\b`), v.diagnostic);
+  };
+
+  it('(a) an absent field read as its declared scalar: compatible, with the note', () => {
+    assertCompatible('Fa_Exp');
+  });
+
+  it('(b) an absent field read as another scalar: incompatible, naming the field', () => {
+    assertBreak('Fb_Exp', 'label');
+  });
+
+  it('(c) an absent sub-field of a present list of objects: compatible', () => {
+    assertCompatible('Fc_Exp');
+  });
+
+  it('(d) a JSON value the schema declares as a list of objects: compatible', () => {
+    assertCompatible('Fd_Exp');
+  });
+
+  it('(e) a field the schema does not declare stays a break', () => {
+    assertBreak('Fe_Exp', 'missing');
+  });
+
+  it('(f) a present leaf mismatch stays a break', () => {
+    assertBreak('Ff_Exp', 'total');
+  });
+
+  it('(g) an absent enum is any: the table holds no enum values', () => {
+    assertCompatible('Fg_Exp');
+  });
+
+  it('(j) a nested __typename the server supplies: compatible', () => {
+    assertCompatible('Fj_Exp');
+  });
+
+  it('a filled field read as the wrong kind is a break, never `never`', () => {
+    assertBreak('Fw1_Exp', 'label');
+    assertBreak('Fw2_Exp', 'tags');
+    assertBreak('Fw3_Exp', 'owner');
+    assertBreak('Fw4_Exp', 'notes');
+    assertBreak('Fw5_Exp', 'name');
+  });
+
+  it('a nullable field adds null; a non-null one does not', () => {
+    assertBreak('Fn1_Exp', 'memo');
+    assertCompatible('Fn2_Exp');
+    assertCompatible('Fn3_Exp');
+  });
+
+  it('an optional read, an any read and a list of scalars: compatible', () => {
+    assertCompatible('Fo_Exp');
+    assertCompatible('Fany_Exp');
+    assertCompatible('Ftags_Exp');
+  });
+
+  it('a union-typed field read through fragments: pinned as measured (open decision on carrick#4726)', () => {
+    // The table holds a union as the fields every member shares (none here),
+    // and an interface as its own fields, so a member-only field a fragment
+    // reads is not declared on the abstract type and fails. Before the
+    // declared fill this pair read unverifiable.
+    const v = verdict('Fs1_Exp');
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  });
+});
+
+describe('a too-deep declared line never reads compatible (carrick#4726, carrick#4691)', () => {
+  const plan = buildProbe(depot('df-deep', 'Fa_Exp'), (s) => `@carrick/${s}`, undefined, undefined, () => DEPOT_TYPES);
+  const classify = (probeDiags: RawDiagnostic[]) =>
+    classifyPair({
+      plan,
+      probeDiags,
+      poisonReason: () => undefined,
+      scrubCtx: { workspaceRoot: '/tmp/ws', packageLabelOf: () => undefined },
+    });
+  const diag = (line: number, code: number): RawDiagnostic => ({
+    file: `probes/${plan.fileName}`,
+    line,
+    col: 1,
+    code,
+    message: code === 2589 ? 'Type instantiation is excessively deep and possibly infinite.' : "Type 'X' is not assignable to type 'GqlExpected'.",
+  });
+
+  it('a TS2589 on any line of the declared block, with the wire line failing: unverifiable', () => {
+    const { from, line } = declaredLines(plan);
+    assert.ok(from !== undefined && line !== undefined, 'the probe carries the declared block');
+    for (let at = from!; at <= line!; at++) {
+      const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(at, 2589)]);
+      assert.strictEqual(v.bucket, 'unverifiable', `line ${at}: ${JSON.stringify(v)}`);
+      assert.strictEqual(v.gate, 'assignment:other', `line ${at}`);
+      assert.strictEqual(v.resolved, false);
+    }
+  });
+
+  it('the wire line failing and the declared line passing: compatible with the note', () => {
+    const v = classify([diag(plan.wireAssignmentLine!, 2322)]);
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.ok(v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
+  });
+
+  it('the declared line failing: incompatible', () => {
+    const { line } = declaredLines(plan);
+    const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(line!, 2322)]);
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  });
+
+  it('the wire line passing: compatible, no note, whatever the block says', () => {
+    const v = classify([]);
+    assert.strictEqual(v.bucket, 'compatible', JSON.stringify(v));
+    assert.ok(!v.notes.some((n) => DECLARED_NOTE.test(n)), JSON.stringify(v.notes));
   });
 });
