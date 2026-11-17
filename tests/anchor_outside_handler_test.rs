@@ -191,7 +191,7 @@ fn analyzer_result(routes_file: &str, routes: &[Route]) -> HashMap<String, FileA
                 payload_expression_line: route.payload.map(|(_, line)| line),
                 response_expression_text: route.response.map(|(text, _)| text.to_string()),
                 response_expression_line: route.response.map(|(_, line)| line),
-                emission_style: route.emission.clone(),
+                emission_style: route.emission,
                 primary_type_symbol: None,
                 type_import_source: None,
                 resolution_source: None,

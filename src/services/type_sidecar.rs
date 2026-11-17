@@ -6559,6 +6559,7 @@ mod tests {
             param_name: None,
             result: None,
             infer_kind: Some(InferKind::CallResult),
+            handler_lines: None,
         };
         let json = serde_json::to_string(&infer).unwrap();
         assert!(json.contains(r#""kind":"infer""#));
@@ -6726,6 +6727,7 @@ mod tests {
                             span_start: 30,
                             span_end: 60,
                         }),
+                        handler_lines: None,
                     })
                     .collect(),
                 extraction_config: Some(ExtractionConfig {
@@ -6822,6 +6824,7 @@ mod tests {
                         param_name: Some("event".into()),
                         result: None,
                         infer_kind: None,
+                        handler_lines: None,
                     },
                     CaptureAnchor::Literal {
                         alias: "D".into(),
@@ -9536,6 +9539,7 @@ require('readline').createInterface({ input: process.stdin, terminal: false }).o
             param_name: None,
             result: Some(ResultShape::Member(["data".into()])),
             infer_kind: None,
+            handler_lines: None,
         };
         let wire = serde_json::to_string(&anchor).unwrap();
         assert!(wire.contains(r#""result":{"member":["data"]}"#), "{wire}");
