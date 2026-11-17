@@ -541,7 +541,7 @@ function notJudgedReason(result: CheckResult): string {
  */
 function headline(result: CheckResult, where: string, problems: number, late: boolean, early: boolean): string | null {
   const moved = movedLines(result).length > 0;
-  if (early) return earlyHeadline(where, problems, moved, late);
+  if (early) return earlyHeadline(where, problems, moved ? statedMoved(result).map((row) => row.role) : [], late);
   if (problems === 0) return moved ? `Carrick re-checked ${where} after ${late ? "your earlier edit to it" : "this edit"}; rows elsewhere moved:` : null;
   const count = `${problems} contract ${problems === 1 ? "problem" : "problems"}`;
   if (recheckDidNotRun(result)) return `Carrick: ${where}: ${count}.`;
@@ -558,10 +558,13 @@ function headline(result: CheckResult, where: string, problems: number, late: bo
  * check of an HTTP route's response, which the full re-check later confirms or
  * corrects (`hook/confirm.ts`). Null when it states no break.
  */
-function earlyHeadline(where: string, problems: number, moved: boolean, late: boolean): string | null {
+function earlyHeadline(where: string, problems: number, movedRoles: string[], late: boolean): string | null {
   const after = late ? "your earlier edit to it" : "this edit";
   if (problems > 0) return `Carrick's compiler engine checked ${where} after ${after}: ${problems} contract ${problems === 1 ? "problem" : "problems"}.`;
-  return moved ? `Carrick's compiler engine checked ${where} after ${after}; routes in other files broke:` : null;
+  if (movedRoles.length === 0) return null;
+  // The noun follows the moved rows' roles.
+  const what = movedRoles.every((r) => r === "call") ? "calls" : movedRoles.some((r) => r === "call") ? "routes and calls" : "routes";
+  return `Carrick's compiler engine checked ${where} after ${after}; ${what} in other files broke:`;
 }
 
 /**
