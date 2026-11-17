@@ -572,6 +572,25 @@ export function isPreferredTarget(node: ts.Node): boolean {
   );
 }
 
+/**
+ * Whether `node` is a member or key name, not the value its text names:
+ * `payload` in `reply.payload`, `{ payload: true }` or a class or function
+ * member's name. A variable's or parameter's own name stays: it names the
+ * value the text does, and it is where the source states its type.
+ */
+function isMemberName(node: ts.Node): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  return (
+    (ts.isPropertyAccessExpression(parent) ||
+      ts.isPropertyAssignment(parent) ||
+      ts.isPropertyDeclaration(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isFunctionDeclaration(parent)) &&
+    parent.name === node
+  );
+}
+
 /** A located node is the row's own, or why none is. */
 export type HandlerAnchor = { node: ts.Node } | { reason: string };
 
@@ -638,6 +657,7 @@ export function anchorInHandler(
       if (
         !seen.has(candidate) &&
         isPreferredTarget(candidate) &&
+        !isMemberName(candidate) &&
         normalizeLocatorText(candidate.getText(sourceFile)) === wanted &&
         ownFunction(candidate)
       ) {

@@ -33,6 +33,7 @@ export interface Reply {
   send(payload: unknown): void;
   status(code: number): Reply;
   text(words: string): string;
+  page(words: string): Response;
 }
 export type Handler = (request: Incoming, reply: Reply) => unknown;
 export interface Server {
@@ -74,6 +75,10 @@ function sayPlain(reply: Reply, words: string) {
   return reply.text(words);
 }
 
+function sayPage(reply: Reply, words: string) {
+  return reply.page(words);
+}
+
 export function routes(server: Server, ids: string[]): void {
   server.post('/drafts', (request, reply) => saveDraft(request, reply));
 
@@ -102,6 +107,12 @@ export function routes(server: Server, ids: string[]): void {
   });
 
   server.post('/touch', (request, reply) => { reply.send({ touched: true }); });
+
+  server.post('/flag', (request, reply) => { reply.send({ payload: true }); });
+
+  server.get('/hello', (request, reply) => sayPage(reply, 'hello'));
+
+  server.get('/bye', (request, reply) => sayPage(reply, 'bye'));
 
   server.get('/left', async (request, reply) => {
     const row: TallyBody = { tallied: 1 };
@@ -192,6 +203,26 @@ const ASKS: Record<string, Ask> = {
     text: 'payload',
     line: lineWith('const payload = request.body as OrderBody'),
     handler_lines: handler("server.post('/touch'", true),
+  },
+  // Must abstain: the hint is spelled in the handler only as an object key.
+  flagRequest: {
+    kind: 'request_body',
+    text: 'payload',
+    line: lineWith('const payload = request.body as OrderBody'),
+    handler_lines: handler("server.post('/flag'", true),
+  },
+  // Must abstain: the returned helper answers with a Response, no body.
+  helloPage: {
+    kind: 'response_body',
+    text: 'reply.page(words)',
+    line: lineWith('return reply.page(words)'),
+    handler_lines: handler("server.get('/hello'", true),
+  },
+  byePage: {
+    kind: 'response_body',
+    text: 'reply.page(words)',
+    line: lineWith('return reply.page(words)'),
+    handler_lines: handler("server.get('/bye'", true),
   },
   // Must abstain: inside the handler the text reads two types.
   rightSend: {
@@ -305,6 +336,15 @@ describe('stale-position T2: a capture anchor is bound by the handler and what i
 
   it('a request hint for a handler that reads no body stays unknown', () => {
     assertUnknown('touchRequest');
+  });
+
+  it('a request hint spelled only as an object key in the handler stays unknown', () => {
+    assertUnknown('flagRequest');
+  });
+
+  it('a Response a returned helper answers with stays unknown', () => {
+    assertUnknown('helloPage');
+    assertUnknown('byePage');
   });
 
   it('a text that reads two types inside the handler stays unknown', () => {

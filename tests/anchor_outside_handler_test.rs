@@ -31,6 +31,7 @@ import {
   DigestBody,
   DraftBody,
   GadgetBody,
+  NoteBody,
   InvoiceRow,
   OrderBody,
   SummaryBody,
@@ -62,6 +63,15 @@ function issueInvoice(request: RouteRequest<unknown>, reply: RouteReply) {
 
 function sayPlain(reply: RouteReply, words: string) {
   return reply.text(words);
+}
+
+const saveNote = async (request: RouteRequest<unknown>, reply: RouteReply) => {
+  const note = request.body as NoteBody;
+  return { kept: note.noteText };
+};
+
+function sayPage(reply: RouteReply, words: string) {
+  return reply.page(words);
 }
 
 export function registerRoutes(server: Server, ids: string[], store: Store, legacy: any) {
@@ -154,6 +164,19 @@ export function registerRoutes(server: Server, ids: string[], store: Store, lega
 
   server.post('/touch', (request: RouteRequest<unknown>, reply: RouteReply) => { reply.send({ touched: true }); });
 
+  server.post('/flag', (request: RouteRequest<unknown>, reply: RouteReply) => { reply.send({ payload: true }); });
+
+  server.post('/drafts/inline', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const inlineDraft = await request.json<DraftBody>();
+    return { stored: inlineDraft.draftTitle };
+  });
+
+  server.post('/notes', (request: RouteRequest<unknown>, reply: RouteReply) => saveNote(request, reply));
+
+  server.get('/hello', (request: RouteRequest<unknown>, reply: RouteReply) => sayPage(reply, 'hello'));
+
+  server.get('/bye', (request: RouteRequest<unknown>, reply: RouteReply) => sayPage(reply, 'bye'));
+
   server.get('/left', async (request: RouteRequest<unknown>, reply: RouteReply) => {
     const row: TallyBody = { tallied: 1 };
     reply.send(row);
@@ -229,6 +252,7 @@ export interface RouteReply {
   send(payload: unknown): void;
   status(code: number): RouteReply;
   text(words: string): string;
+  page(words: string): Response;
 }
 
 export interface Tx {
@@ -280,6 +304,10 @@ export interface DigestBody {
 export interface TicketBody {
   ticketTitle: string;
   severity: number;
+}
+
+export interface NoteBody {
+  noteText: string;
 }
 
 export interface TallyBody {
@@ -527,25 +555,33 @@ fn gadget_and_order(order_payload: (&'static str, i32)) -> Vec<Route> {
 }
 
 /// (s1) The payload hint for `/orders` sits in the previous route's handler.
-/// Its text, `payload`, is read once inside `/orders`' own handler (the
-/// declaration's name is not a read), so that read is the request: never the
-/// previous route's.
+/// Its text, `payload`, names one value inside `/orders`' own handler (the
+/// local and its read; a member name or key would not count), so that value
+/// is the request, with the label the same hint carries inside the handler:
+/// never the previous route's type.
 #[test]
 fn a_request_hint_in_the_previous_routes_handler_is_not_this_routes_request() {
-    let routes = gadget_and_order(("payload", line_of("const payload: GadgetBody")));
-    let Some((inferred, declared)) =
-        stored(&routes, InferKind::RequestBody, "server.post('/orders'")
-    else {
+    let stale = gadget_and_order(("payload", line_of("const payload: GadgetBody")));
+    let own = gadget_and_order(("payload", line_of("const payload: OrderBody")));
+    let (Some(row), Some(control)) = (
+        stored_row(&stale, InferKind::RequestBody, "server.post('/orders'"),
+        stored_row(&own, InferKind::RequestBody, "server.post('/orders'"),
+    ) else {
         return;
     };
-    let both = format!("{inferred} | {declared}");
     assert!(
-        !both.contains("weightGrams"),
-        "the previous route's request type was stored: {both}"
+        !row.both().contains("weightGrams"),
+        "the previous route's request type was stored: {}",
+        row.both()
     );
     assert!(
-        both.contains("quantity"),
-        "the text's one read in the route's own handler is its request: {both}"
+        row.both().contains("quantity"),
+        "the text's one value in the route's own handler is its request: {}",
+        row.both()
+    );
+    assert_eq!(
+        row.explicit, control.explicit,
+        "label differs from the own-line hint"
     );
 }
 
@@ -1110,4 +1146,124 @@ fn a_text_found_outside_that_reads_two_types_inside_the_handler_stays_unknown() 
         "an ambiguous text was read: {}",
         row.both()
     );
+}
+
+/// Must abstain: the hint's text is spelled inside the handler only as an
+/// object key, which is not a read of anything.
+#[test]
+fn a_request_hint_spelled_only_as_a_key_in_the_handler_stays_unknown() {
+    let routes = vec![route(
+        "server.post('/flag'",
+        "POST",
+        "/flag",
+        None,
+        Some(("payload", line_of("const payload: OrderBody"))),
+        None,
+    )];
+    let Some(row) = stored_row(&routes, InferKind::RequestBody, "server.post('/flag'") else {
+        return;
+    };
+    assert!(
+        !row.both().contains("boolean") && !row.both().contains("quantity"),
+        "a key or another route's read was stored: {}",
+        row.both()
+    );
+}
+
+/// (1, label) A request read in the helper the handler returns carries the
+/// label the same read carries inside a handler; a cast read there is
+/// explicit.
+#[test]
+fn a_request_read_in_a_returned_helper_keeps_the_label_of_an_inline_read() {
+    let inline = vec![route(
+        "server.post('/drafts/inline'",
+        "POST",
+        "/drafts/inline",
+        None,
+        Some((
+            "request.json<DraftBody>()",
+            line_of("const inlineDraft = await request.json<DraftBody>()"),
+        )),
+        None,
+    )];
+    let helper = vec![route(
+        "server.post('/drafts'",
+        "POST",
+        "/drafts",
+        None,
+        Some((
+            "request.json<DraftBody>()",
+            line_of("const draft = await request.json<DraftBody>()"),
+        )),
+        None,
+    )];
+    let cast = vec![route(
+        "server.post('/notes'",
+        "POST",
+        "/notes",
+        None,
+        Some((
+            "request.body as NoteBody",
+            line_of("const note = request.body as NoteBody"),
+        )),
+        None,
+    )];
+    let (Some(inline), Some(helper), Some(cast)) = (
+        stored_row(
+            &inline,
+            InferKind::RequestBody,
+            "server.post('/drafts/inline'",
+        ),
+        stored_row(&helper, InferKind::RequestBody, "server.post('/drafts'"),
+        stored_row(&cast, InferKind::RequestBody, "server.post('/notes'"),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        helper.explicit,
+        inline.explicit,
+        "helper read {} against inline read {}",
+        helper.both(),
+        inline.both()
+    );
+    assert!(
+        cast.both().contains("noteText"),
+        "cast read lost: {}",
+        cast.both()
+    );
+    assert_eq!(
+        cast.explicit,
+        Some(true),
+        "cast read in the helper: {}",
+        cast.both()
+    );
+}
+
+/// Two one-line arrows return a helper that answers with a framework page
+/// reply (`Response`): the reply is the arrows' answer, and a `Response` is
+/// no body contract, so the row stays unknown.
+#[test]
+fn a_response_reply_a_returned_helper_answers_with_stays_unknown() {
+    let hint = ("reply.page(words)", line_of("return reply.page(words)"));
+    let routes = vec![
+        route(
+            "server.get('/hello'",
+            "GET",
+            "/hello",
+            None,
+            None,
+            Some(hint),
+        ),
+        route("server.get('/bye'", "GET", "/bye", None, None, Some(hint)),
+    ];
+    for opening in ["server.get('/hello'", "server.get('/bye'"] {
+        let Some(row) = stored_row(&routes, InferKind::ResponseBody, opening) else {
+            return;
+        };
+        assert!(
+            row.inferred == "<none>" && row.declared.contains("= unknown;"),
+            "{opening}: the helper's page reply was stored: {}",
+            row.both()
+        );
+    }
 }

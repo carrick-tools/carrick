@@ -791,10 +791,7 @@ export class TypeInferrer {
     const loopRows: Array<{ request: InferRequestItem; at: number }> = [];
 
     for (const asked of requests) {
-      // Stale-position T2: every later reader of this request (the unwidened
-      // re-read included) reads the node the handler bound picked.
-      const anchored = this.anchoredRequest(asked);
-      const request = typeof anchored === 'string' ? asked : anchored;
+      let request = asked;
       const slotStarted = performance.now();
       const phasesStarted = phaseClock();
       const firstInFile = !this.filesAsked.has(request.file_path);
@@ -824,6 +821,10 @@ export class TypeInferrer {
         // carrick#1029: a route registered once per loop element is read
         // last. Its reading rewrites its file, and a rewrite forgets every
         // node of the file that the readings below still hold.
+        // Stale-position T2: every later reader of this request (the
+        // unwidened re-read included) reads the node the handler bound picked.
+        const anchored = this.anchoredRequest(request);
+        if (typeof anchored !== 'string') request = anchored;
         if (this.loopPickFor(request)) {
           loopRows.push({ request, at: inferredTypes.length });
           continue;
