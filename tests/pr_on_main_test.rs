@@ -3619,6 +3619,51 @@ async fn seed_http_path_into_option_default() {
     assert_manifest_delta(&payload, "http-path-into-option-default");
 }
 
+/// A removed socket or pub/sub row the PR rewrote into a registration whose
+/// name the scan cannot read is a candidate in the delta, and so is the break
+/// row its lost pairing marks (carrick#3224): the registration may still be
+/// there, so neither is stated as fact.
+fn assert_unread_registration_removal_is_candidate(
+    payload: &serde_json::Value,
+    break_row: (&str, &str, &str),
+) {
+    let removed = payload["delta"]["removed_endpoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!removed.is_empty(), "no removed row: {payload:#}");
+    for row in removed {
+        assert_eq!(row["edge_source"], "candidate", "{row:#}");
+    }
+    let (kind, method, path) = break_row;
+    let row = lost_pairing_row(payload, kind, method, path);
+    assert_eq!(row["edge_source"], "candidate", "{row:#}");
+}
+
+/// A socket listener's event moves into an option whose default is the same
+/// event, read through a value the scan does not hold.
+#[tokio::test]
+async fn seed_socket_listener_name_in_option_default() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("socket-listener-name-in-option-default").await;
+    assert_unread_registration_removal_is_candidate(
+        &payload,
+        ("missing_endpoint", "CLIENT->SERVER", "order:update"),
+    );
+}
+
+/// A pub/sub subscriber's topic moves into an option whose default is the
+/// same topic.
+#[tokio::test]
+async fn seed_pubsub_subscriber_topic_in_option_default() {
+    let _serial = SERIAL.lock().await;
+    let payload = manifest_seed_payload("pubsub-subscriber-topic-in-option-default").await;
+    assert_unread_registration_removal_is_candidate(
+        &payload,
+        ("missing_endpoint", "PUBSUB", "payments.settled"),
+    );
+}
+
 /// Every removed row of the payload's delta is a fact: a removal whose
 /// registration the PR deleted or rewrote to another key stays one
 /// (carrick#3222).
