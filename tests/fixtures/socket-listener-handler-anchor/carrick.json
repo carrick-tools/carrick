@@ -1,0 +1,6 @@
+{
+  "services": [
+    { "serviceName": "orders-server", "directory": "services/orders-server" },
+    { "serviceName": "orders-client", "directory": "services/orders-client" }
+  ]
+}
