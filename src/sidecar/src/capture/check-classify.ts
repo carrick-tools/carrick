@@ -532,7 +532,10 @@ export function classifyPair(input: ClassifyInput): CheckVerdict {
     const declaredMismatch = probeDiags.find(
       (d) => d.line === plan.assignmentLine && ASSIGNMENT_CODES.has(d.code)
     );
-    if (declaredMismatch) {
+    // Not for a GraphQL probe with a declared block (carrick#4726): its first
+    // line compares the root record alone, which misses every field a field
+    // resolver supplies, so a mismatch there is no judgment of the pair.
+    if (declaredMismatch && plan.declaredAssignmentLine === undefined) {
       return {
         ...base,
         bucket: 'incompatible',

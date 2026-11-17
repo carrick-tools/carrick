@@ -494,6 +494,8 @@ const DEPOT_CONSUMERS: Record<string, string> = {
   // A union-typed field read through fragments: the table holds only the
   // fields every member shares.
   Fs1_Exp: "{ subject: { __typename: 'Person'; name: string } | { __typename: 'Line'; sku: string } | null }",
+  // An aliased selection inside an absent object field (`owner { who: name }`).
+  Falias_Exp: '{ owner: { who: string } }',
 };
 
 describe('check_v2: fields the record lacks or converts compare in the type the schema declares (carrick#4726)', () => {
@@ -583,6 +585,8 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
 
   it('(g) an absent enum is any: the table holds no enum values', () => {
     assertCompatible('Fg_Exp');
+    // Pinned as measured: the fact walk reads the two declared sides, not the fill.
+    assert.strictEqual(verdict('Fg_Exp').resolved, true, JSON.stringify(verdict('Fg_Exp')));
   });
 
   it('(j) a nested __typename the server supplies: compatible', () => {
@@ -615,6 +619,13 @@ describe('check_v2: fields the record lacks or converts compare in the type the 
     // reads is not declared on the abstract type and fails. Before the
     // declared fill this pair read unverifiable.
     const v = verdict('Fs1_Exp');
+    assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  });
+
+  it('an aliased selection inside an absent object field: pinned as measured (open decision on carrick#4726)', () => {
+    // The alias is not a field the schema type declares, so it fails like the
+    // fragment case above. Before the declared fill this pair read unverifiable.
+    const v = verdict('Falias_Exp');
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
   });
 });
@@ -657,6 +668,12 @@ describe('a too-deep declared line never reads compatible (carrick#4726, carrick
     const { line } = declaredLines(plan);
     const v = classify([diag(plan.wireAssignmentLine!, 2322), diag(line!, 2322)]);
     assert.strictEqual(v.bucket, 'incompatible', JSON.stringify(v));
+  });
+
+  it('a TS2589 on the wire line itself: unverifiable, never judged off the raw record', () => {
+    const v = classify([diag(plan.assignmentLine, 2322), diag(plan.wireAssignmentLine!, 2589)]);
+    assert.strictEqual(v.bucket, 'unverifiable', JSON.stringify(v));
+    assert.strictEqual(v.gate, 'assignment:other');
   });
 
   it('the wire line passing: compatible, no note, whatever the block says', () => {
