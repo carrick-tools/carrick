@@ -83,6 +83,14 @@ const PinnedDependencySnapshotSchema = z.record(z.string());
 // Symbol Request Schema
 // ============================================================================
 
+/** The lines of the handler a route request is for (stale-position T2). */
+const HandlerLinesSchema = z
+  .object({
+    start_line: z.number().int().positive(),
+    end_line: z.number().int().positive(),
+  })
+  .strict();
+
 export const SymbolRequestSchema = z.object({
   symbol_name: z.string().min(1, 'Symbol name cannot be empty'),
   source_file: z.string().min(1, 'Source file cannot be empty'),
@@ -139,6 +147,8 @@ export const InferRequestItemSchema = z.object({
     })
     .strict()
     .optional(),
+  // The handler's lines: a node found by text or line outside them is refused.
+  handler_lines: HandlerLinesSchema.optional(),
 });
 
 /**
@@ -246,6 +256,7 @@ const CaptureAnchorRequestSchema = z.discriminatedUnion('kind', [
     unwrap: z.enum(['awaited', 'none']).optional(),
     result: ResultLabelSchema.optional(),
     infer_kind: InferKindSchema.optional(),
+    handler_lines: HandlerLinesSchema.optional(),
   }),
   z.object({
     kind: z.literal('literal'),

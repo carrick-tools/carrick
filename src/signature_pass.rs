@@ -535,6 +535,7 @@ fn build_infer_requests(
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             });
             targets.insert(
                 alias,
@@ -568,6 +569,7 @@ fn build_infer_requests(
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             });
             targets.insert(
                 alias,

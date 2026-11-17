@@ -20,7 +20,12 @@ import {
   undeclaredNamesIn,
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
-import { callNamedBy, callResultNamesNoCall, firstExactLocatorMatch } from './site-node.js';
+import {
+  anchorOutsideHandler,
+  callNamedBy,
+  callResultNamesNoCall,
+  firstExactLocatorMatch,
+} from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
@@ -433,6 +438,27 @@ export function resolveAnchor(
   const found = locate(sourceFile, request);
   if (!found) {
     return demote(locatorFailureReason(request), 'site_unreadable');
+  }
+  // Stale-position T2: a node the text or line locator found must sit in the
+  // handler of the row it is for. Another route's node, or a callback's
+  // return, is that node's type and not this route's, so the anchor abstains
+  // (final: it does not fall through to a later locator).
+  if (found.by !== 'span' && request.handler_lines) {
+    const outside = anchorOutsideHandler(
+      sourceFile,
+      found.node,
+      request.handler_lines,
+      request.infer_kind
+    );
+    if (outside) {
+      return {
+        request,
+        aliasText: 'unknown',
+        serialization: 'structural_fallback',
+        abstainReason: outside,
+        unreadCause: 'not_located',
+      };
+    }
   }
   // carrick#1785: the line fallback takes the first expression on the line,
   // and a declaration's NAME is an expression to `ts.isExpression`. On a line

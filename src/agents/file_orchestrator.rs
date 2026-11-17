@@ -1758,6 +1758,7 @@ pub(crate) fn route_response_request(
         at_registration: false,
         result_unanswered: false,
         through_call: None,
+        handler_lines: None,
     }
 }
 
@@ -5258,6 +5259,74 @@ impl FileOrchestrator {
         marked
     }
 
+    /// Stale-position T2: set `handler_lines` on every producer route-row
+    /// request located by text, where the row's registration hands in a
+    /// function literal, so the sidecar can refuse a node outside that
+    /// handler (a model's hint line that is in another route's handler, or
+    /// a text that recurs near a wrong line). Two rows on one registration
+    /// line with different handlers get none. Returns how many it set.
+    ///
+    /// Reading the registration call is [`crate::handler_span`]'s one reader,
+    /// so a handler passed by name (placed later from the function
+    /// definitions) has no bounds and its locator is unchecked.
+    fn mark_handler_lines(
+        requests: &mut [InferRequestItem],
+        file_results: &HashMap<String, FileAnalysisResult>,
+        repo_root_absolute: &std::path::Path,
+    ) -> usize {
+        let mut rows: Vec<(String, u32, String)> = Vec::new();
+        for (file, result) in file_results {
+            for endpoint in &result.endpoints {
+                rows.push((
+                    file.clone(),
+                    endpoint.line_number.max(1) as u32,
+                    endpoint.method.clone(),
+                ));
+            }
+        }
+        let read = |file: &str| {
+            std::fs::read_to_string(Self::to_absolute_path(file, repo_root_absolute)).ok()
+        };
+        let placed = crate::handler_span::literal_handler_lines(
+            file_results,
+            |f| f.to_string(),
+            &rows,
+            read,
+        );
+        let mut by_line: HashMap<(String, u32), Option<crate::mount_graph::HandlerSpan>> =
+            HashMap::new();
+        for ((file, line, _), span) in rows.iter().zip(placed) {
+            let key = (Self::to_absolute_path(file, repo_root_absolute), *line);
+            by_line
+                .entry(key)
+                .and_modify(|held| {
+                    if *held != span {
+                        *held = None;
+                    }
+                })
+                .or_insert(span);
+        }
+        let mut marked = 0;
+        for request in requests.iter_mut().filter(|request| {
+            matches!(
+                request.infer_kind,
+                InferKind::ResponseBody | InferKind::FunctionReturn | InferKind::RequestBody
+            ) && request.expression_text.is_some()
+                && request.span_start.is_none()
+                && request
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.contains("_At"))
+        }) {
+            if let Some(Some(span)) = by_line.get(&(request.file_path.clone(), request.line_number))
+            {
+                request.handler_lines = Some(*span);
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// Collect type requests from analysis results for sidecar processing.
     ///
     /// Returns two vectors:
@@ -5472,6 +5541,7 @@ impl FileOrchestrator {
                         at_registration,
                         result_unanswered,
                         through_call: None,
+                        handler_lines: None,
                     });
                     true
                 }
@@ -5502,6 +5572,7 @@ impl FileOrchestrator {
                         at_registration: false,
                         result_unanswered,
                         through_call: None,
+                        handler_lines: None,
                     });
                     true
                 }
@@ -5531,6 +5602,7 @@ impl FileOrchestrator {
                         at_registration: false,
                         result_unanswered,
                         through_call: None,
+                        handler_lines: None,
                     });
                     true
                 }
@@ -6245,6 +6317,7 @@ impl FileOrchestrator {
         }
 
         let shared = Self::mark_shared_route_lines(&mut infer_requests, mount_graph, repo_path);
+        Self::mark_handler_lines(&mut infer_requests, file_results, &repo_root_absolute);
         debug!(
             "[FileOrchestrator] Collected {} explicit type requests, {} inference requests ({} on a line shared by several routes), {} inline aliases",
             explicit_requests.len(),
@@ -6435,6 +6508,7 @@ impl FileOrchestrator {
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             });
         }
         debug!(
@@ -6812,6 +6886,7 @@ impl FileOrchestrator {
                         at_registration: false,
                         result_unanswered: false,
                         through_call: None,
+                        handler_lines: None,
                     },
                     ManifestRole::Producer => InferRequestItem {
                         member: None,
@@ -6836,6 +6911,7 @@ impl FileOrchestrator {
                         at_registration: false,
                         result_unanswered: false,
                         through_call: None,
+                        handler_lines: None,
                     },
                 };
                 requests.push(request);
@@ -7094,6 +7170,7 @@ impl FileOrchestrator {
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             });
         }
         debug!(
@@ -7268,6 +7345,7 @@ impl FileOrchestrator {
                     at_registration: false,
                     result_unanswered: false,
                     through_call: None,
+                    handler_lines: None,
                 });
             }
         }

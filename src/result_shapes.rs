@@ -645,6 +645,7 @@ mod tests {
                 result_unanswered: index.unanswered_at(&end.file, span, end.line),
                 at_registration: false,
                 through_call: None,
+                handler_lines: None,
             }
         };
         let aliases: Vec<String> = (0..ends.len()).map(|i| format!("Call{i}")).collect();

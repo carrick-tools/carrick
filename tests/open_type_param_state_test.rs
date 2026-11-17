@@ -113,6 +113,7 @@ fn a_model_type_and_a_root_abstain_answer_the_same_alias() {
         at_registration: false,
         result_unanswered: false,
         through_call: None,
+        handler_lines: None,
     }];
 
     let sidecar = TypeSidecar::spawn(&sidecar_path).expect("spawn sidecar");

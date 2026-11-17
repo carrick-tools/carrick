@@ -571,6 +571,7 @@ pub fn declared_infer_requests(
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let response = alias(ManifestTypeKind::Response);
         if asked.insert((response.clone(), "response")) {

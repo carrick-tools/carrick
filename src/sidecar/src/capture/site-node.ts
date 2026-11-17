@@ -383,6 +383,113 @@ function startLine(sourceFile: ts.SourceFile, node: ts.Node): number {
   return sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
 }
 
+// ===========================================================================
+// Anchors outside the row's own handler (stale-position T2)
+// ===========================================================================
+
+/** The 1-based, inclusive lines of the handler a route request is for. */
+export interface HandlerLines {
+  start_line: number;
+  end_line: number;
+}
+
+type FunctionNode =
+  | ts.ArrowFunction
+  | ts.FunctionExpression
+  | ts.FunctionDeclaration
+  | ts.MethodDeclaration;
+
+function isFunctionNode(node: ts.Node): node is FunctionNode {
+  return (
+    ts.isArrowFunction(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node)
+  );
+}
+
+/** `node` itself or its nearest enclosing function. */
+function functionAtOrAbove(node: ts.Node): FunctionNode | undefined {
+  let current: ts.Node | undefined = node;
+  while (current && !isFunctionNode(current)) current = current.parent;
+  return current;
+}
+
+/**
+ * Whether `fn` is the function a registration hands in (the lines the scanner
+ * recorded for it), or one on the return path of it: handed to a call
+ * (`gated(reply, async () => ...)`) that the handler returns. A callback of a
+ * method call (`items.map(...)`) is not on the path: its return is a part of
+ * a value, never the handler's own.
+ */
+function onHandlerReturnPath(
+  sourceFile: ts.SourceFile,
+  fn: FunctionNode,
+  lines: HandlerLines
+): boolean {
+  const lineOf = (position: number): number =>
+    sourceFile.getLineAndCharacterOfPosition(position).line + 1;
+  let current: FunctionNode = fn;
+  // The chain of wrappers is short; the bound keeps a malformed tree finite.
+  for (let step = 0; step < 8; step += 1) {
+    if (
+      lineOf(current.getStart(sourceFile)) === lines.start_line &&
+      lineOf(current.getEnd()) === lines.end_line
+    ) {
+      return true;
+    }
+    const call = current.parent;
+    if (
+      !call ||
+      !ts.isCallExpression(call) ||
+      !ts.isIdentifier(call.expression) ||
+      !call.arguments.some((argument) => argument === current)
+    ) {
+      return false;
+    }
+    let returned: ts.Node = call;
+    while (returned.parent && wrapsValueTransparently(returned.parent)) returned = returned.parent;
+    const parent = returned.parent;
+    let host: FunctionNode | undefined;
+    if (parent && ts.isReturnStatement(parent)) {
+      host = functionAtOrAbove(parent);
+    } else if (parent && isFunctionNode(parent) && parent.body === returned) {
+      host = parent;
+    }
+    if (!host) return false;
+    current = host;
+  }
+  return false;
+}
+
+/**
+ * Why a node a text or line locator found cannot be this route's anchor, or
+ * undefined when it can: it starts outside the handler's lines, or (for a
+ * `function_return`, whose answer is the containing function's return) the
+ * function around it is neither the handler nor on its return path. A span
+ * locator is the scanner's own and is not checked. One rule for the inferrer
+ * and the capture. The reason carries lines only, never a path.
+ */
+export function anchorOutsideHandler(
+  sourceFile: ts.SourceFile,
+  node: ts.Node,
+  lines: HandlerLines,
+  inferKind: string | undefined
+): string | undefined {
+  const line = startLine(sourceFile, node);
+  const where = `the route's handler (lines ${lines.start_line}-${lines.end_line})`;
+  if (line < lines.start_line || line > lines.end_line) {
+    return `anchor_outside_handler: the located node starts at line ${line}, outside ${where}`;
+  }
+  if (inferKind === 'function_return') {
+    const around = functionAtOrAbove(node);
+    if (!around || !onHandlerReturnPath(sourceFile, around, lines)) {
+      return `anchor_outside_handler: the function around the located node (line ${line}) is neither ${where} nor on its return path`;
+    }
+  }
+  return undefined;
+}
+
 /**
  * The capture's locator: the first node in pre-order that `accept`s, whose
  * text equals the locator's (`exactLocatorText`), and that ends on or after

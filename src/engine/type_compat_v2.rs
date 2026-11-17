@@ -843,6 +843,7 @@ pub(crate) fn derive_capture_anchors(
             param_name,
             result: request.result.clone(),
             infer_kind: Some(request.infer_kind.clone()),
+            handler_lines: request.handler_lines,
         });
     }
 
@@ -5827,6 +5828,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let with = |unwidened: Option<&str>| {
             let mut inf = inferred("Endpoint_a_Response", "{ scope: string; }", None, None);
@@ -5923,6 +5925,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let mut text_read = inferred("Endpoint_a_Response_Call1", "string", None, None);
         text_read.infer_kind = InferKind::CallResult;
@@ -5990,6 +5993,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let mut tolerant = inferred("Endpoint_a_Request", "{ limit?: number }", None, None);
         tolerant.infer_kind = InferKind::RequestBody;
@@ -6512,6 +6516,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let calls = consumer_call_locators(&[
             item(InferKind::RequestBody, "Req", 3),
@@ -6566,6 +6571,7 @@ mod tests {
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             },
             crate::services::type_sidecar::InferRequestItem {
                 member: None,
@@ -6583,6 +6589,7 @@ mod tests {
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             },
         ];
         let inline = vec![
@@ -6701,6 +6708,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }
     }
 
@@ -7697,6 +7705,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         let text = "{ members: { id: string; name: string; email: string; }[]; }";
         let mut inf = inferred(alias, text, None, None);
@@ -7932,6 +7941,7 @@ mod tests {
             route_path: None,
             at_registration: false,
             through_call: None,
+            handler_lines: None,
             result: None,
             result_unanswered: false,
         };
@@ -8563,6 +8573,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             body_member: None,
@@ -8661,6 +8672,7 @@ mod tests {
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             }
         };
 
@@ -8731,6 +8743,7 @@ mod tests {
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let inferred_type = |alias: &str, text: &str| crate::services::type_sidecar::InferredType {
             body_member: None,
@@ -11843,6 +11856,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let infer = vec![
             call(6, "api.post<{ x: number }>(\"/checkout\")", &typed_alias),
@@ -12089,6 +12103,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         let inferred = sidecar
             .infer_types(&producer_infer, None)
@@ -12194,6 +12209,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         let consumer_inferred = sidecar
             .infer_types(&consumer_infer, None)
@@ -12350,6 +12366,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12564,6 +12581,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         }];
         let inferred = sidecar
             .infer_types(&infer, None)
@@ -12796,6 +12814,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             })
             .collect();
         let api_inferred = api_sidecar
@@ -12922,6 +12941,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
                 at_registration: false,
                 result_unanswered: false,
                 through_call: None,
+                handler_lines: None,
             })
             .collect();
         let web_inferred = web_sidecar
@@ -13110,6 +13130,7 @@ require('readline').createInterface({{ input: process.stdin, terminal: false }})
             at_registration: false,
             result_unanswered: false,
             through_call: None,
+            handler_lines: None,
         };
         let infer = vec![request(named, "message"), request(unnamed, "message.data")];
         let anchors = derive_capture_anchors(

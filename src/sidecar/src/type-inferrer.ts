@@ -93,6 +93,7 @@ import {
 import { elapsedMs, inferTiming, phaseClock, timedPhase } from './infer-timing.js';
 import { importedNameOf, packageNameOf, type LabelledMembers } from './library-claims.js';
 import {
+  anchorOutsideHandler,
   callNamedBy,
   callResultNamesNoCall,
   constituentsOf,
@@ -1424,6 +1425,35 @@ export class TypeInferrer {
   }
 
   /**
+   * Stale-position T2: why the node `request`'s expression text finds is not
+   * this route's anchor, or undefined. Only a producer route request that
+   * carries its handler's lines (`handler_lines`) and is located by text is
+   * checked; the rule is the capture's (`anchorOutsideHandler`).
+   */
+  private textAnchorOutsideHandler(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): string | undefined {
+    const lines = request.handler_lines;
+    if (!lines || !request.expression_text || request.span_start !== undefined) return undefined;
+    if (
+      request.infer_kind !== 'request_body' &&
+      request.infer_kind !== 'response_body' &&
+      request.infer_kind !== 'function_return'
+    ) {
+      return undefined;
+    }
+    const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
+    if (!node) return undefined;
+    return anchorOutsideHandler(
+      sourceFile.compilerNode,
+      node.compilerNode,
+      lines,
+      request.infer_kind
+    );
+  }
+
+  /**
    * Infer a single type from a request
    */
   private inferSingle(
@@ -1433,6 +1463,15 @@ export class TypeInferrer {
     const sourceFile = this.getSourceFile(request.file_path);
     if (!sourceFile) {
       this.logError(`Source file not found: ${request.file_path}`);
+      return null;
+    }
+
+    // Stale-position T2: a node found by text outside the row's own handler is
+    // another node's type. The answer is none, final: it does not fall to the
+    // registration, the line or the containing function below.
+    const outside = this.textAnchorOutsideHandler(sourceFile, request);
+    if (outside) {
+      this.log(`${outside} (${request.file_path}:${request.expression_line ?? request.line_number})`);
       return null;
     }
 

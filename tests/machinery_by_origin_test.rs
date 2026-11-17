@@ -79,6 +79,7 @@ fn variable_item(file: &str, declaration: &str, alias: &str) -> InferRequestItem
         at_registration: false,
         result_unanswered: false,
         through_call: None,
+        handler_lines: None,
     }
 }
 
