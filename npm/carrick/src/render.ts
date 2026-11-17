@@ -225,10 +225,10 @@ export function typedMismatchClause(item: CheckItem): string | null {
     const reader = sender === "producer" ? "consumer" : "producer";
     if (rowSide === reader) {
       const from = site(sender);
-      return `${from ? `the sending code at ${from}` : "the sending code"} sends ${actual}; this code expects ${expected}`;
+      return `${from ? `code at ${from}` : "other code"} sends ${actual}; this code expects ${expected}`;
     }
     const at = site(reader);
-    return `this code sends ${actual}; ${at ? `the listener at ${at}` : "a listener"} expects ${expected}`;
+    return `this code sends ${actual}; ${at ? `code at ${at}` : "other code"} expects ${expected}`;
   }
 
   const verb = direction === "response" ? "reads" : "expects";

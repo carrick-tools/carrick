@@ -874,7 +874,7 @@ const pubsubSubscriber: CheckItem = {
 test("a message mismatch read from the listener says the emitting code sends", () => {
   assert.equal(
     typedMismatchClause(c2sListener),
-    "the sending code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
+    "code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
   );
   // Two senders: neither is named.
   assert.equal(
@@ -885,23 +885,23 @@ test("a message mismatch read from the listener says the emitting code sends", (
         { role: "consumer", service: "admin-ui", file: "src/live.ts", line: 4 },
       ],
     }),
-    "the sending code sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
+    "other code sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }",
   );
   // A pub/sub subscriber reads the same way.
   assert.equal(
     typedMismatchClause(pubsubSubscriber),
-    "the sending code at storefront src/payments.ts:10 sends { orderId: string; amount: number; }; this code expects { orderId: string; total: number; }",
+    "code at storefront src/payments.ts:10 sends { orderId: string; amount: number; }; this code expects { orderId: string; total: number; }",
   );
 });
 
 test("a message mismatch read from the emitter says this code sends and the listener expects", () => {
   assert.equal(
     typedMismatchClause(s2cEmitter),
-    "this code sends { orderId: string; courier: string; }; the listener at storefront src/live.ts:15 expects { orderId: string; carrier: string; }",
+    "this code sends { orderId: string; courier: string; }; code at storefront src/live.ts:15 expects { orderId: string; carrier: string; }",
   );
   assert.equal(
     typedMismatchClause({ ...s2cEmitter, counterparts: [] }),
-    "this code sends { orderId: string; courier: string; }; a listener expects { orderId: string; carrier: string; }",
+    "this code sends { orderId: string; courier: string; }; other code expects { orderId: string; carrier: string; }",
   );
 });
 
@@ -909,7 +909,7 @@ test("the surfaces print the message sentence, and never as a response", () => {
   const line = itemLine(c2sListener, "src/realtime.ts");
   assert.ok(
     line.startsWith(
-      "- src/realtime.ts:11:1 route CLIENT->SERVER order:update [fact, library_claim] the sending code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }. ",
+      "- src/realtime.ts:11:1 route CLIENT->SERVER order:update [fact, library_claim] code at storefront src/live.ts:12 sends { orderId: string; status: string; }; this code expects { orderId: string; state: string; } & { orderId: string; }. ",
     ),
     line,
   );
@@ -917,7 +917,7 @@ test("the surfaces print the message sentence, and never as a response", () => {
   const message = messageOf(s2cEmitter);
   assert.ok(
     message.startsWith(
-      "SERVER->CLIENT order:shipped: this code sends { orderId: string; courier: string; }; the listener at storefront src/live.ts:15 expects { orderId: string; carrier: string; }\n",
+      "SERVER->CLIENT order:shipped: this code sends { orderId: string; courier: string; }; code at storefront src/live.ts:15 expects { orderId: string; carrier: string; }\n",
     ),
     message,
   );
