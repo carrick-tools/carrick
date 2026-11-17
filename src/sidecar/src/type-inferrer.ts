@@ -1448,6 +1448,38 @@ export class TypeInferrer {
   }
 
   /**
+   * carrick#4778: the function that answers for this route row when it has
+   * several returns of different types (`anchorInHandler`, one rule with the
+   * capture), as the function node the whole-return reading takes. None for
+   * any row that rule leaves alone.
+   */
+  private functionWithSeveralReturns(
+    sourceFile: SourceFile,
+    request: InferRequestItem
+  ): FunctionLike | undefined {
+    const lines = request.handler_lines;
+    if (!lines || !request.expression_text || request.span_start !== undefined) return undefined;
+    if (request.infer_kind !== 'response_body' && request.infer_kind !== 'function_return') {
+      return undefined;
+    }
+    const node = this.findNodeByText(sourceFile, request.expression_text, request.expression_line);
+    if (!node) return undefined;
+    const own = anchorInHandler(
+      this.project.getTypeChecker().compilerObject,
+      sourceFile.compilerNode,
+      node.compilerNode,
+      lines,
+      request.infer_kind,
+      request.expression_text
+    );
+    if ('reason' in own || !own.severalReturns) return undefined;
+    const wanted = own.severalReturns.fn;
+    let found = sourceFile.getDescendantAtPos(wanted.getStart(sourceFile.compilerNode));
+    while (found && found.compilerNode !== wanted) found = found.getParent();
+    return found as FunctionLike | undefined;
+  }
+
+  /**
    * Infer a single type from a request
    */
   private inferSingle(
@@ -1470,12 +1502,17 @@ export class TypeInferrer {
       return null;
     }
     request = anchored;
+    // carrick#4778: a response read that lands on one return of a function
+    // with several differing returns is read as the whole function's return.
+    const several = this.functionWithSeveralReturns(sourceFile, request);
 
     switch (request.infer_kind) {
       case 'function_return':
         return this.withoutOpenTypeParameter(
           request,
-          this.inferFunctionReturn(sourceFile, request, extractionConfig)
+          several
+            ? this.buildFunctionReturnInferredType(request, several, extractionConfig, true)
+            : this.inferFunctionReturn(sourceFile, request, extractionConfig)
         );
       case 'response_body':
         // Checked before a stated reply is weighed: the decided answer stands
@@ -1485,7 +1522,9 @@ export class TypeInferrer {
           request,
           this.withoutOpenTypeParameter(
             request,
-            this.inferResponseBody(sourceFile, request, extractionConfig)
+            several
+              ? this.buildFunctionReturnInferredType(request, several, extractionConfig, true)
+              : this.inferResponseBody(sourceFile, request, extractionConfig)
           )
         );
       case 'call_result':

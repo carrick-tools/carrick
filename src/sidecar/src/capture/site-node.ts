@@ -562,6 +562,75 @@ function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): 
 /** Each handler's reach set, per checker (the inferrer and the capture hold two programs). */
 const reachSets = new WeakMap<FunctionNode, { checker: ts.TypeChecker; reached: Set<FunctionNode> }>();
 
+function awaitedAt(checker: ts.TypeChecker, node: ts.Node): ts.Type {
+  const type = checker.getTypeAtLocation(node);
+  return checker.getAwaitedType(type) ?? type;
+}
+
+/** One type, or two the checker holds for one (a top type is one only with itself). */
+function sameType(checker: ts.TypeChecker, a: ts.Type, b: ts.Type): boolean {
+  return a === b || sameAnswer(checker, a, b);
+}
+
+/**
+ * The node of `other` that `located` stands for in `own`'s return (see
+ * `ReturnRead.member`), or none.
+ */
+function memberOf(
+  checker: ts.TypeChecker,
+  located: ts.Node,
+  inReturn: ts.Expression,
+  other: ts.Expression
+): ts.Node | undefined {
+  const mine = unwrapTransparent(inReturn);
+  const theirs = unwrapTransparent(other);
+  if (mine === unwrapTransparent(located as ts.Expression)) return theirs;
+  if (!ts.isCallExpression(mine) || !ts.isCallExpression(theirs)) return undefined;
+  const index = mine.arguments.findIndex((a) => unwrapTransparent(a) === unwrapTransparent(located as ts.Expression));
+  if (index < 0 || index >= theirs.arguments.length) return undefined;
+  const sent = checker.getResolvedSignature(mine)?.getDeclaration();
+  const there = checker.getResolvedSignature(theirs)?.getDeclaration();
+  const sameCallee = sent
+    ? sent === there
+    : !there && mine.expression.getText() === theirs.expression.getText();
+  return sameCallee ? unwrapTransparent(theirs.arguments[index]) : undefined;
+}
+
+/**
+ * carrick#4778: whether `fn` has several returns whose answers differ. Each
+ * return answers with the node `located` stands for in it where it has one
+ * (so `c.json(a)` beside `c.json(b)` differ by `a` and `b`, not by the one
+ * reply type both calls give); a return with no such node answers with its
+ * whole expression. `located` outside every return of `fn` (a send in a
+ * statement) leaves the function alone.
+ */
+function severalReturnsOf(
+  checker: ts.TypeChecker,
+  fn: FunctionNode,
+  located: ts.Node,
+  within: boolean
+): SeveralReturns | undefined {
+  const expressions = returnedExpressions(fn);
+  if (expressions.length < 2) return undefined;
+  const inReturn = within
+    ? expressions.find((e) => e.getStart() <= located.getStart() && located.getEnd() <= e.getEnd())
+    : undefined;
+  if (within && !inReturn) return undefined;
+  const returns: ReturnRead[] = expressions.map((expression) => {
+    const member = inReturn ? memberOf(checker, located, inReturn, expression) : undefined;
+    return member ? { expression, member } : { expression };
+  });
+  const answers = returns.map((r) => awaitedAt(checker, r.member ?? r.expression));
+  const mirrored = returns.every((r) => r.member);
+  const first = answers[0];
+  if (mirrored && answers.every((a) => sameType(checker, first, a))) return undefined;
+  if (!mirrored && !inReturn) {
+    // The located node is in a helper: only the handler's own returns decide.
+    if (answers.every((a) => sameType(checker, first, a))) return undefined;
+  }
+  return { fn, returns };
+}
+
 /** The nodes a value type can be read at: the capture's own target rule. */
 export function isPreferredTarget(node: ts.Node): boolean {
   return (
@@ -591,8 +660,30 @@ function isMemberName(node: ts.Node): boolean {
   );
 }
 
+/**
+ * One return of a function that answers for a route (carrick#4778). `member`
+ * is the node of that return the located node stands for: the located node
+ * itself or, where the located node is the argument of the call the function
+ * returns (`c.json(<located>)`), the same argument of this return's call.
+ * Absent where this return has no such node (a framework reply that carries
+ * no body, a return of another shape).
+ */
+export interface ReturnRead {
+  expression: ts.Expression;
+  member?: ts.Node;
+}
+
+/**
+ * The function that answers for a route has several returns that do not all
+ * answer with one type, so no one return is its answer.
+ */
+export interface SeveralReturns {
+  fn: FunctionNode;
+  returns: ReturnRead[];
+}
+
 /** A located node is the row's own, or why none is. */
-export type HandlerAnchor = { node: ts.Node } | { reason: string };
+export type HandlerAnchor = { node: ts.Node; severalReturns?: SeveralReturns } | { reason: string };
 
 /**
  * The node a route row reads, given the node a text or line locator found
@@ -643,7 +734,17 @@ export function anchorInHandler(
     }
     return undefined;
   };
-  if (ownFunction(node)) return { node };
+  const done = (answer: ts.Node): HandlerAnchor => {
+    // carrick#4778: the handler's own several returns answer first (the
+    // located node may sit in a helper it returns); else the function around
+    // the node.
+    const own = ownFunction(answer);
+    const several =
+      severalReturnsOf(checker, handler, answer, own === handler) ??
+      (own && own !== handler ? severalReturnsOf(checker, own, answer, true) : undefined);
+    return several ? { node: answer, severalReturns: several } : { node: answer };
+  };
+  if (ownFunction(node)) return done(node);
 
   const outside =
     `anchor_outside_handler: the located node (line ${line}) is outside ${where} and ` +
@@ -680,7 +781,7 @@ export function anchorInHandler(
       reason: `${outside}, and its text names ${answers.size} different answers inside them`,
     };
   }
-  return { node: matches[0] };
+  return done(matches[0]);
 }
 
 /**

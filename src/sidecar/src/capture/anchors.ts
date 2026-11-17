@@ -26,8 +26,9 @@ import {
   callResultNamesNoCall,
   firstExactLocatorMatch,
   isPreferredTarget,
+  type SeveralReturns,
 } from './site-node.js';
-import { readResultLabel } from './result-label.js';
+import { joinTypes, readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
 import { realPath } from './service-config.js';
 import { statesNoShape, statusTableBody } from './status-table.js';
@@ -445,6 +446,7 @@ export function resolveAnchor(
   // elsewhere is replaced by the one node inside them its text names, or the
   // anchor abstains (final: it does not fall through to a later locator).
   let found = located0;
+  let severalType: ts.Type | undefined;
   if (found.by !== 'span' && request.handler_lines) {
     const own = anchorInHandler(
       checker,
@@ -466,6 +468,22 @@ export function resolveAnchor(
     // A node re-found by the locator's text is a text match, whichever
     // locator found the first one.
     if (own.node !== found.node) found = { node: own.node, by: 'text' };
+    // carrick#4778: the function that answers has several returns that
+    // differ. The answer is all of them, or unknown; never the one the
+    // locator landed on.
+    if (own.severalReturns) {
+      const read = typeOfSeveralReturns(program, checker, own.severalReturns, args.repoRoot);
+      if ('reason' in read) {
+        return {
+          request,
+          aliasText: 'unknown',
+          serialization: 'structural_fallback',
+          abstainReason: read.reason,
+          unreadCause: 'not_located',
+        };
+      }
+      severalType = read.type;
+    }
   }
   // carrick#1785: the line fallback takes the first expression on the line,
   // and a declaration's NAME is an expression to `ts.isExpression`. On a line
@@ -552,8 +570,45 @@ export function resolveAnchor(
     args.placeholder,
     reaimNote,
     args.repoRoot,
-    armsType
+    severalType ?? armsType
   );
+}
+
+/**
+ * carrick#4778: the type of a function with several differing returns, as
+ * the union of what each answers with (`ReturnRead.member`). A return with no
+ * such node that is framework machinery (a reply that carries no body) states
+ * no payload and is left out; any other is unread, and so is the whole.
+ */
+function typeOfSeveralReturns(
+  program: ts.Program,
+  checker: ts.TypeChecker,
+  several: SeveralReturns,
+  repoRoot: string
+): { type: ts.Type } | { reason: string } {
+  const read: ts.Type[] = [];
+  for (const { expression, member } of several.returns) {
+    const type = checker.getTypeAtLocation(member ?? expression);
+    if (!member) {
+      const awaited = checker.getAwaitedType(type) ?? type;
+      if (typeIsOrContainsMachinery(program, awaited, repoRoot)) continue;
+      return {
+        reason:
+          'several_returns: the function that answers has several returns of different types ' +
+          'and one of them has no payload this anchor reads, so no single return is its type',
+      };
+    }
+    if (!read.includes(type)) read.push(type);
+  }
+  if (read.length === 0) {
+    return { reason: 'several_returns: no return of the function that answers states a payload' };
+  }
+  if (read.length === 1) return { type: read[0] };
+  const joined = joinTypes(checker, read);
+  if (!joined) {
+    return { reason: 'several_returns: the returns of the function that answers cannot be joined' };
+  }
+  return { type: joined };
 }
 
 /**
