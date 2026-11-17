@@ -3549,7 +3549,12 @@ export class TypeInferrer {
       : undefined;
     if (!callerFile || !deciding || !callNamedBy(deciding.compilerNode)) return read;
     const held = this.heldAtDecidingCall(sourceFile, request, deciding);
-    if (held) return this.markedAtDecidingCall(held, deciding);
+    if (held) {
+      // A raw text body keeps its mark whichever call the type came from:
+      // `string | null` off a text read is as unverifiable as `string`.
+      markRawTextRead(held, read?.raw_text_read === true);
+      return this.markedAtDecidingCall(held, deciding);
+    }
     if (read && !this.readIsOnlyTransport(sourceFile, request, read)) {
       return this.markedAtDecidingCall(read, deciding);
     }

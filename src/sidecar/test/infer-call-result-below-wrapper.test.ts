@@ -443,16 +443,18 @@ describe('a call result read below a wrapper falls back to the deciding call', (
   it('a text read behind a conditional null keeps the null the caller holds', async () => {
     const { text, rawText } = await infer('SameFileConditionalNull', 'fetch(`/flag${path}`)', "readFlag('/me')", undefined, sameFile());
     assert.strictEqual(text, 'string | null');
-    assert.strictEqual(rawText, false);
+    assert.strictEqual(rawText, true);
   });
 
   it('a text read behind an early null keeps the null the caller holds', async () => {
-    const { text } = await infer('SameFileEarlyNull', 'fetch(`/token${path}`)', "readToken('/me')", undefined, sameFile());
+    const { text, rawText } = await infer('SameFileEarlyNull', 'fetch(`/token${path}`)', "readToken('/me')", undefined, sameFile());
     assert.strictEqual(text, 'string | null');
+    assert.strictEqual(rawText, true);
   });
 
   it('a text read under a declared nullable return keeps the null the caller holds', async () => {
-    const { text } = await infer('SameFileDeclaredNull', 'fetch(`/note${path}`)', "readNote('/me')", undefined, sameFile());
+    const { text, rawText } = await infer('SameFileDeclaredNull', 'fetch(`/note${path}`)', "readNote('/me')", undefined, sameFile());
     assert.strictEqual(text, 'string | null');
+    assert.strictEqual(rawText, true);
   });
 });
