@@ -23443,8 +23443,9 @@ unfollowed_member_calls_total: 0,
 
     /// carrick#1601 / carrick#3823: a wrapper that hands back something other
     /// than its request's parsed body leaves its caller's row marked: a
-    /// second return of a value read off a caught parse (E, until
-    /// carrick#3842), the body wrapped in an object (G), the raw response
+    /// second return of a value read off a caught parse (E: no longer marked,
+    /// since `.catch(() => null)` hands back no body of its own, carrick#4513),
+    /// the body wrapped in an object (G), the raw response
     /// (RAW).
     #[test]
     fn a_wrapper_that_does_not_hand_back_its_parsed_body_leaves_its_caller_marked() {
@@ -23484,7 +23485,7 @@ unfollowed_member_calls_total: 0,
         assert_eq!(
             marks,
             vec![
-                ("widgets-e", true),
+                ("widgets-e", false),
                 ("widgets-g", true),
                 ("widgets-raw", true)
             ],

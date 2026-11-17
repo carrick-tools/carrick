@@ -5656,7 +5656,8 @@ impl Decided {
     /// on the way back (`res.arrayBuffer()`), which only the deciding call
     /// follows, so it stays undecided. A function this pass did not read
     /// (another service's) is left unanswered, read at the deciding call as
-    /// before. Runs before [`Self::yield_to_summaries`], so the yielded
+    /// before; so is a chain whose record ends at a call on the site's own
+    /// chain above the labelled call (a helper in another service). Runs before [`Self::yield_to_summaries`], so the yielded
     /// sites carry the answer too.
     pub fn read_responses(
         &mut self,
@@ -5688,6 +5689,20 @@ impl Decided {
                 let at_end = relative(root, &record.end.file) == end_file
                     && (record.end.span_start, record.end.span_end) == span;
                 if !at_end {
+                    // The record ends at a call on the site's own chain, above
+                    // the labelled call: the function that call runs is one
+                    // this pass did not read (another service's), so the
+                    // record stops where the walk went on. No answer, read at
+                    // the deciding call (carrick#4755 T0).
+                    let end_at =
+                        format!("{}:{}", relative(root, &record.end.file), record.end.line);
+                    let above_labelled = site.via.len().saturating_sub(1);
+                    if site.via[..above_labelled]
+                        .iter()
+                        .any(|via| via.at == end_at)
+                    {
+                        return None;
+                    }
                     return Some(if read == EndRead::PlatformFetch {
                         HandBack::Undecided
                     } else {
@@ -9032,6 +9047,96 @@ pub(crate) mod tests {
         assert_eq!(got, vec![("load".to_string(), 14, 1, Vec::new())]);
     }
 
+    /// carrick#4319: a deciding call that only makes the function that
+    /// sends (`makeGate("/svc")` returns a closure that calls `fetch`)
+    /// `makes_end`; one that runs the send, a local closure it runs or hands
+    /// to a call, or a function that may return either the closure or its
+    /// result does not.
+    #[test]
+    fn a_call_that_only_makes_the_sending_function_makes_its_end() {
+        const MAKER: &str = "export function makeGate(base: string) {\n\
+             \x20 return async () => fetch(`${base}/gate`);\n\
+             }\n\
+             export const gate = makeGate(\"/svc\");\n";
+        const WRAPPER: &str = "function send(base: string) {\n\
+             \x20 return fetch(`${base}/wrap`);\n\
+             }\n\
+             export const wrapped = () => send(\"/w\");\n";
+        const LOCAL_RUN: &str = "function runJob(base: string) {\n\
+             \x20 const run = () => fetch(`${base}/run`);\n\
+             \x20 return run();\n\
+             }\n\
+             export const job = () => runJob(\"/jobs\");\n";
+        const HANDED: &str = "function retry<R>(attempt: () => R): R { return attempt(); }\n\
+             function retried(base: string) {\n\
+             \x20 const run = () => fetch(`${base}/retry`);\n\
+             \x20 return retry(run);\n\
+             }\n\
+             export const again = () => retried(\"/tasks\");\n";
+        const EITHER: &str = "function either(base: string, dry: boolean) {\n\
+             \x20 async function run() { return fetch(`${base}/either`); }\n\
+             \x20 if (dry) { return run; }\n\
+             \x20 return run();\n\
+             }\n\
+             export const maybe = either(\"/e\", true);\n";
+        let on = super::super::fixture_walk::walked(
+            "factory-closure",
+            "services/web",
+            "web",
+            &[
+                ("src/t-maker.ts", MAKER),
+                ("src/t-wrapper.ts", WRAPPER),
+                ("src/t-local-run.ts", LOCAL_RUN),
+                ("src/t-handed.ts", HANDED),
+                ("src/t-either.ts", EITHER),
+            ],
+            true,
+        )
+        .expect("the fixture walks with rows: a skipped test proves nothing");
+        let text = std::fs::read_to_string(
+            manifest().join("tests/fixtures/factory-closure/library-claims.json"),
+        )
+        .unwrap();
+        let answer = crate::library_store::parse_answer(&text);
+        let labels = super::super::discovery::Labels::of_answer(&answer);
+        let discovery = super::super::discovery::discover(&on.inputs, &labels, &on.repo);
+        let sites: Vec<DiscoverySite> = discovery
+            .sites
+            .iter()
+            .map(|site| {
+                serde_json::from_value(serde_json::to_value(site).unwrap()).expect("a site")
+            })
+            .collect();
+        let decided = decided_sites(
+            &on.inputs,
+            &on.repo,
+            &sites,
+            &SiteLabel::from_exports(&answer.exports),
+        );
+        let makes = |file: &str| -> Vec<(u32, bool)> {
+            decided
+                .sites
+                .iter()
+                .filter(|site| site.file.ends_with(file))
+                .map(|site| (site.line, site.makes_end))
+                .collect()
+        };
+        let every: Vec<String> = decided
+            .sites
+            .iter()
+            .map(|site| format!("{}:{} {}", site.file, site.line, site.makes_end))
+            .collect();
+        for (file, wanted) in [
+            ("t-maker.ts", (4, true)),
+            ("t-wrapper.ts", (4, false)),
+            ("t-local-run.ts", (5, false)),
+            ("t-handed.ts", (6, false)),
+            ("t-either.ts", (6, false)),
+        ] {
+            assert_eq!(makes(file), vec![wanted], "{file}: {every:#?}");
+        }
+    }
+
     /// carrick#4371 (after carrick#4319): a deciding call hands back the
     /// labelled call's body only where the function it runs returns that
     /// call's body down a chain of returns. `fetch` resolves to a
@@ -9134,11 +9239,9 @@ pub(crate) mod tests {
             chain("t-two-hop.ts", "outer"),
             Some(Some((vec![], 2, true)))
         );
-        // Ends at the `.catch` call, which is no `fetch`.
-        assert_eq!(
-            chain("t-caught.ts", "tryIt"),
-            Some(Some((vec![], 2, false)))
-        );
+        // `.catch(() => null)` hands back no body (carrick#4513), so the chain
+        // goes through it to the same `fetch`.
+        assert_eq!(chain("t-caught.ts", "tryIt"), Some(Some((vec![], 2, true))));
         // Ends at the call of `retry`'s parameter, which runs what a caller
         // hands in.
         assert_eq!(
