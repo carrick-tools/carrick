@@ -1678,3 +1678,17 @@ export {
   statusTableOf,
   successEntries,
 } from './status-table.js';
+
+// The one reader of a reply's HTTP status: the inferrer reads
+// a located reply with it; the capture reads the same module.
+export {
+  STATUS_MEMBER_NAMES,
+  chainStatus,
+  isDroppedReplyStatus,
+  replyStatus,
+  resultTypeStatusCodes,
+  statedStatusCodes,
+  statusCodesOfType,
+  valueStatus,
+  type ReplyStatus,
+} from './reply-status.js';
