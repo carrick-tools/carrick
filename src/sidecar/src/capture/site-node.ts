@@ -439,24 +439,39 @@ function handedInLast(fn: FunctionNode): boolean {
   );
 }
 
+/** Every function in `sourceFile`, by the lines it starts and ends on. */
+const functionsByLines = new WeakMap<ts.SourceFile, Map<string, FunctionNode[]>>();
+
+function linesKey(lines: HandlerLines): string {
+  return `${lines.start_line}:${lines.end_line}`;
+}
+
 /**
  * The function the scanner stamped `lines` for, among the functions in
  * `sourceFile` that start and end on exactly those lines: the outermost one
  * handed in last to a call of two or more arguments, as the registration
  * hands in its handler, else the outermost of them. Several literals can
  * share one line: a callback inside its handler, or a handler inside the
- * loop callback that registers it.
+ * loop callback that registers it. The file is walked once per source file.
  */
 function handlerOnLines(sourceFile: ts.SourceFile, lines: HandlerLines): FunctionNode | undefined {
-  const onLines: FunctionNode[] = [];
-  const visit = (node: ts.Node): void => {
-    if (isFunctionNode(node)) {
-      const own = linesOf(sourceFile, node);
-      if (own.start_line === lines.start_line && own.end_line === lines.end_line) onLines.push(node);
-    }
-    ts.forEachChild(node, visit);
-  };
-  ts.forEachChild(sourceFile, visit);
+  let index = functionsByLines.get(sourceFile);
+  if (!index) {
+    const built = new Map<string, FunctionNode[]>();
+    const visit = (node: ts.Node): void => {
+      if (isFunctionNode(node)) {
+        const key = linesKey(linesOf(sourceFile, node));
+        const held = built.get(key);
+        if (held) held.push(node);
+        else built.set(key, [node]);
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(sourceFile, visit);
+    functionsByLines.set(sourceFile, built);
+    index = built;
+  }
+  const onLines = index.get(linesKey(lines)) ?? [];
   return onLines.find(handedInLast) ?? onLines[0];
 }
 
@@ -510,6 +525,8 @@ const RETURN_REACH_HOPS = 3;
  * `cb`'s return.
  */
 function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): Set<FunctionNode> {
+  const held = reachSets.get(handler);
+  if (held && held.checker === checker) return held.reached;
   const reached = new Set<FunctionNode>([handler]);
   let frontier: FunctionNode[] = [handler];
   for (let hop = 0; hop < RETURN_REACH_HOPS && frontier.length > 0; hop += 1) {
@@ -538,41 +555,134 @@ function functionsAnsweringFor(checker: ts.TypeChecker, handler: FunctionNode): 
     }
     frontier = next;
   }
+  reachSets.set(handler, { checker, reached });
   return reached;
 }
 
+/** Each handler's reach set, per checker (the inferrer and the capture hold two programs). */
+const reachSets = new WeakMap<FunctionNode, { checker: ts.TypeChecker; reached: Set<FunctionNode> }>();
+
+/** The nodes a value type can be read at: the capture's own target rule. */
+export function isPreferredTarget(node: ts.Node): boolean {
+  return (
+    ts.isExpression(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isParameter(node) ||
+    ts.isPropertyAssignment(node)
+  );
+}
+
 /**
- * Why a node a text or line locator found cannot be this route's anchor, or
- * undefined when it can. A request or response body must start inside the
- * handler's lines. A `function_return`, whose answer is the return of the
- * function around the node, needs that function to be the handler or one its
- * return reaches (`functionsAnsweringFor`), wherever it is declared. A span
- * locator is the scanner's own and is not checked. One rule for the inferrer
- * and the capture. The reason carries lines only, never a path.
+ * Whether `node` is the name a declaration or a member access spells, not a
+ * value read there: `response` in `const response = ...` or in
+ * `reply.response`. To `ts.isExpression` every identifier is one.
  */
-export function anchorOutsideHandler(
+function isSpelledName(node: ts.Node): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  return (
+    (ts.isVariableDeclaration(parent) ||
+      ts.isParameter(parent) ||
+      ts.isBindingElement(parent) ||
+      ts.isFunctionDeclaration(parent) ||
+      ts.isPropertyAssignment(parent) ||
+      ts.isPropertyDeclaration(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isPropertyAccessExpression(parent)) &&
+    parent.name === node
+  );
+}
+
+/** A located node is the row's own, or why none is. */
+export type HandlerAnchor = { node: ts.Node } | { reason: string };
+
+/**
+ * The node a route row reads, given the node a text or line locator found
+ * (stale-position T2). One rule for the inferrer and the capture; a span
+ * locator is the scanner's own and is not checked.
+ *
+ * The row's own functions are the handler (the function on its stamped
+ * lines) and every function its return reaches (`functionsAnsweringFor`). A
+ * request or response body is the row's own anywhere inside one of them; a
+ * `function_return`, whose answer is the return of the function around the
+ * node, only when that function is one of them (so a `.map` callback's
+ * return is not).
+ *
+ * A node found elsewhere is looked for again by the locator's text (or its
+ * own) inside those functions, the handler first, then by hop: where every
+ * match gives one answer (one function's return; one type for a body), the
+ * first match is read, else the row abstains. Never the stale node, the
+ * registration or a function outside the reach set. With no function on the
+ * stamped lines a body keeps the line bound and a return abstains. The
+ * reason carries lines only, never a path.
+ */
+export function anchorInHandler(
   checker: ts.TypeChecker,
   sourceFile: ts.SourceFile,
   node: ts.Node,
   lines: HandlerLines,
-  inferKind: string | undefined
-): string | undefined {
+  inferKind: string | undefined,
+  expressionText: string | undefined
+): HandlerAnchor {
   const line = startLine(sourceFile, node);
   const where = `the route's handler (lines ${lines.start_line}-${lines.end_line})`;
-  const inside = line >= lines.start_line && line <= lines.end_line;
-  if (inferKind === 'function_return') {
-    const handler = handlerOnLines(sourceFile, lines);
-    if (!handler) {
-      return `anchor_outside_handler: no function starts and ends on ${where}`;
+  const returns = inferKind === 'function_return';
+  const handler = handlerOnLines(sourceFile, lines);
+  if (!handler) {
+    if (returns) return { reason: `anchor_outside_handler: no function starts and ends on ${where}` };
+    return line >= lines.start_line && line <= lines.end_line
+      ? { node }
+      : { reason: `anchor_outside_handler: the located node starts at line ${line}, outside ${where}` };
+  }
+  const reached = functionsAnsweringFor(checker, handler);
+  const ownFunction = (candidate: ts.Node): FunctionNode | undefined => {
+    if (returns) {
+      const around = functionAtOrAbove(candidate);
+      return around && reached.has(around) ? around : undefined;
     }
-    const around = functionAtOrAbove(node);
-    if (around && functionsAnsweringFor(checker, handler).has(around)) return undefined;
-    return `anchor_outside_handler: the function around the located node (line ${line}) is neither ${where} nor one its return reaches`;
+    for (let current: ts.Node | undefined = candidate; current; current = current.parent) {
+      if (isFunctionNode(current) && reached.has(current)) return current;
+    }
+    return undefined;
+  };
+  if (ownFunction(node)) return { node };
+
+  const outside =
+    `anchor_outside_handler: the located node (line ${line}) is outside ${where} and ` +
+    'every function its return reaches';
+  const wanted = normalizeLocatorText(expressionText ?? node.getText(sourceFile));
+  if (!wanted) return { reason: outside };
+  const matches: ts.Node[] = [];
+  const seen = new Set<ts.Node>();
+  for (const fn of reached) {
+    const visit = (candidate: ts.Node): void => {
+      if (
+        !seen.has(candidate) &&
+        isPreferredTarget(candidate) &&
+        !isSpelledName(candidate) &&
+        normalizeLocatorText(candidate.getText(sourceFile)) === wanted &&
+        ownFunction(candidate)
+      ) {
+        matches.push(candidate);
+      }
+      seen.add(candidate);
+      ts.forEachChild(candidate, visit);
+    };
+    if (fn.body) ts.forEachChild(fn.body, visit);
   }
-  if (!inside) {
-    return `anchor_outside_handler: the located node starts at line ${line}, outside ${where}`;
+  if (matches.length === 0) {
+    return { reason: `${outside}, and its text is not inside them` };
   }
-  return undefined;
+  // One answer: a return is its function's, a body is its node's type.
+  const answers = new Set<unknown>(
+    matches.map((match) => (returns ? ownFunction(match) : checker.getTypeAtLocation(match)))
+  );
+  if (answers.size > 1) {
+    return {
+      reason: `${outside}, and its text names ${answers.size} different answers inside them`,
+    };
+  }
+  return { node: matches[0] };
 }
 
 /**

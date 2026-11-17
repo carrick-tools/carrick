@@ -27,7 +27,16 @@ use carrick::url_normalizer::UrlNormalizer;
 use tempfile::TempDir;
 
 const ROUTES_TS: &str = r#"import { Server, RouteReply, RouteRequest, Store } from './framework';
-import { GadgetBody, OrderBody } from './shapes';
+import {
+  DigestBody,
+  DraftBody,
+  GadgetBody,
+  InvoiceRow,
+  OrderBody,
+  SummaryBody,
+  TallyBody,
+  TicketBody,
+} from './shapes';
 import { gated } from './gate';
 import { listReceipts } from './receipts';
 
@@ -39,6 +48,20 @@ function listInvoices(request: RouteRequest<unknown>) {
 async function listCredits(request: RouteRequest<unknown>) {
   const creditRows = [{ creditNo: 'c1', cents: 5 }];
   return { credits: creditRows };
+}
+
+const saveDraft = async (request: RouteRequest<unknown>, reply: RouteReply) => {
+  const draft = await request.json<DraftBody>();
+  return { stored: draft.draftTitle };
+};
+
+function issueInvoice(request: RouteRequest<unknown>, reply: RouteReply) {
+  const invoice: InvoiceRow = { invoiceRef: 'i1', amountDue: 10 };
+  return reply.status(201).send(invoice);
+}
+
+function sayPlain(reply: RouteReply, words: string) {
+  return reply.text(words);
 }
 
 export function registerRoutes(server: Server, ids: string[], store: Store, legacy: any) {
@@ -98,6 +121,53 @@ export function registerRoutes(server: Server, ids: string[], store: Store, lega
     async (request: RouteRequest<unknown>, reply: RouteReply) => {
       return { lateCount: 2 };
     });
+
+  server.post('/drafts', (request: RouteRequest<unknown>, reply: RouteReply) => saveDraft(request, reply));
+
+  server.post('/bills', (request: RouteRequest<unknown>, reply: RouteReply) => issueInvoice(request, reply));
+
+  server.patch('/bills', (request: RouteRequest<unknown>, reply: RouteReply) => issueInvoice(request, reply));
+
+  server.get('/summary', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const response: SummaryBody = { openCount: 1 };
+    response.openCount += 1;
+    return response;
+  });
+
+  server.get('/digest', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const response: DigestBody = { digestLines: [] };
+    return response;
+  });
+
+  server.post('/tickets', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const ticket = request.body as TicketBody;
+    reply.send({ filed: ticket.ticketTitle });
+  });
+  server.post('/tickets/bulk', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const ticket = request.body as TicketBody;
+    reply.send({ filedMany: ticket.ticketTitle });
+  });
+
+  server.get('/ping', (request: RouteRequest<unknown>, reply: RouteReply) => { sayPlain(reply, 'ping'); });
+
+  server.get('/pong', (request: RouteRequest<unknown>, reply: RouteReply) => { sayPlain(reply, 'pong'); });
+
+  server.post('/touch', (request: RouteRequest<unknown>, reply: RouteReply) => { reply.send({ touched: true }); });
+
+  server.get('/left', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    const row: TallyBody = { tallied: 1 };
+    reply.send(row);
+  });
+
+  server.get('/right', async (request: RouteRequest<unknown>, reply: RouteReply) => {
+    if (ids.length > 0) {
+      const row: TallyBody = { tallied: 2 };
+      reply.send(row);
+      return;
+    }
+    const row: DigestBody = { digestLines: [] };
+    reply.send(row);
+  });
 }
 
 export class AuditRoutes {
@@ -152,10 +222,13 @@ fn write_fixture_repo(repo: &Path) {
         repo.join("src/framework.ts"),
         r#"export interface RouteRequest<TBody> {
   body: TBody;
+  json<T>(): Promise<T>;
 }
 
 export interface RouteReply {
   send(payload: unknown): void;
+  status(code: number): RouteReply;
+  text(words: string): string;
 }
 
 export interface Tx {
@@ -169,6 +242,7 @@ export interface Store {
 export interface Server {
   post(path: string, handler: (request: never, reply: RouteReply) => unknown): void;
   get(path: string, handler: (request: never, reply: RouteReply) => unknown): void;
+  patch(path: string, handler: (request: never, reply: RouteReply) => unknown): void;
 }
 "#,
     )
@@ -183,6 +257,33 @@ export interface Server {
 export interface OrderBody {
   sku: string;
   quantity: number;
+}
+
+export interface DraftBody {
+  draftTitle: string;
+  pages: number;
+}
+
+export interface InvoiceRow {
+  invoiceRef: string;
+  amountDue: number;
+}
+
+export interface SummaryBody {
+  openCount: number;
+}
+
+export interface DigestBody {
+  digestLines: string[];
+}
+
+export interface TicketBody {
+  ticketTitle: string;
+  severity: number;
+}
+
+export interface TallyBody {
+  tallied: number;
 }
 "#,
     )
@@ -325,10 +426,32 @@ fn sidecar_path() -> Option<PathBuf> {
     Some(path)
 }
 
+/// What the scan stores for the one request of `kind` the routes collect.
+struct Stored {
+    /// The inferred type's text (`<none>` where the inferrer answered none).
+    inferred: String,
+    /// Whether the inferrer read a type the source states (the row's
+    /// `explicit` label); `None` where it answered none.
+    explicit: Option<bool>,
+    /// The declaration the bundle writes for the alias (`unknown` where the
+    /// request abstained).
+    declared: String,
+}
+
+impl Stored {
+    fn both(&self) -> String {
+        format!("{} | {}", self.inferred, self.declared)
+    }
+}
+
 /// What the scan stores for the one request of `kind` the routes collect: the
 /// inferred type's text, and the declaration the bundle writes for its alias
 /// (`unknown` where the request abstained). `None` when no sidecar is built.
 fn stored(routes: &[Route], kind: InferKind, opening: &str) -> Option<(String, String)> {
+    stored_row(routes, kind, opening).map(|row| (row.inferred, row.declared))
+}
+
+fn stored_row(routes: &[Route], kind: InferKind, opening: &str) -> Option<Stored> {
     let sidecar_path = sidecar_path()?;
     let temp = TempDir::new().expect("temp dir");
     let repo = temp.path().join("api");
@@ -352,12 +475,7 @@ fn stored(routes: &[Route], kind: InferKind, opening: &str) -> Option<(String, S
     let result = sidecar
         .resolve_all_types(&[], &items, None, None)
         .expect("resolve_all_types");
-    let inferred = result
-        .inferred_types
-        .iter()
-        .find(|t| t.alias == alias)
-        .map(|t| t.type_string.clone())
-        .unwrap_or_else(|| "<none>".to_string());
+    let inferred = result.inferred_types.iter().find(|t| t.alias == alias);
     let declared = result
         .dts_content
         .as_deref()
@@ -367,7 +485,18 @@ fn stored(routes: &[Route], kind: InferKind, opening: &str) -> Option<(String, S
         })
         .unwrap_or("<no declaration>")
         .to_string();
-    Some((inferred, declared))
+    let row = Stored {
+        inferred: inferred
+            .map(|t| t.type_string.clone())
+            .unwrap_or_else(|| "<none>".to_string()),
+        explicit: inferred.map(|t| t.is_explicit),
+        declared,
+    };
+    eprintln!(
+        "{opening} {kind:?}: inferred={} explicit={:?} declared={}",
+        row.inferred, row.explicit, row.declared
+    );
+    Some(row)
 }
 
 fn gadget_and_order(order_payload: (&'static str, i32)) -> Vec<Route> {
@@ -398,6 +527,9 @@ fn gadget_and_order(order_payload: (&'static str, i32)) -> Vec<Route> {
 }
 
 /// (s1) The payload hint for `/orders` sits in the previous route's handler.
+/// Its text, `payload`, is read once inside `/orders`' own handler (the
+/// declaration's name is not a read), so that read is the request: never the
+/// previous route's.
 #[test]
 fn a_request_hint_in_the_previous_routes_handler_is_not_this_routes_request() {
     let routes = gadget_and_order(("payload", line_of("const payload: GadgetBody")));
@@ -412,8 +544,8 @@ fn a_request_hint_in_the_previous_routes_handler_is_not_this_routes_request() {
         "the previous route's request type was stored: {both}"
     );
     assert!(
-        both.contains("unknown"),
-        "the request should be unknown: {both}"
+        both.contains("quantity"),
+        "the text's one read in the route's own handler is its request: {both}"
     );
 }
 
@@ -748,5 +880,234 @@ fn a_response_hint_in_the_previous_routes_return_is_not_this_routes_return() {
     assert!(
         !both.contains("count"),
         "the previous route's return was stored: {both}"
+    );
+}
+
+/// One route row: `payload` and `response` hints as the model stated them.
+fn route(
+    opening: &'static str,
+    method: &'static str,
+    path: &'static str,
+    emission: Option<EmissionStyle>,
+    payload: Option<(&'static str, i32)>,
+    response: Option<(&'static str, i32)>,
+) -> Route {
+    Route {
+        opening,
+        method,
+        path,
+        emission,
+        payload,
+        response,
+    }
+}
+
+/// (1) A thin arrow returns a helper declared above it, and the request body
+/// is read inside that helper: the helper is on the handler's return path, so
+/// its read is this route's request.
+#[test]
+fn a_request_read_in_the_helper_the_handler_returns_keeps_the_request_type() {
+    let routes = vec![route(
+        "server.post('/drafts'",
+        "POST",
+        "/drafts",
+        None,
+        Some((
+            "request.json<DraftBody>()",
+            line_of("const draft = await request.json<DraftBody>()"),
+        )),
+        None,
+    )];
+    let Some(row) = stored_row(&routes, InferKind::RequestBody, "server.post('/drafts'") else {
+        return;
+    };
+    assert!(
+        row.both().contains("draftTitle") || row.both().contains("DraftBody"),
+        "the helper's request read was dropped: {}",
+        row.both()
+    );
+}
+
+/// (2) Two routes return one module-level helper whose own return is a
+/// reply-chain send: the sent value is each route's response.
+#[test]
+fn a_send_in_the_helper_two_routes_return_is_each_routes_response() {
+    let hint = ("invoice", line_of("return reply.status(201).send(invoice)"));
+    let routes = vec![
+        route(
+            "server.post('/bills'",
+            "POST",
+            "/bills",
+            None,
+            None,
+            Some(hint),
+        ),
+        route(
+            "server.patch('/bills'",
+            "PATCH",
+            "/bills",
+            None,
+            None,
+            Some(hint),
+        ),
+    ];
+    for opening in ["server.post('/bills'", "server.patch('/bills'"] {
+        let Some(row) = stored_row(&routes, InferKind::ResponseBody, opening) else {
+            return;
+        };
+        assert!(
+            row.both().contains("amountDue") || row.both().contains("InvoiceRow"),
+            "{opening}: the helper's sent response was dropped: {}",
+            row.both()
+        );
+    }
+}
+
+/// (3) The handler returns a typed local; the text locator lands on the same
+/// text in the next route. The text occurs once (as a read) inside this
+/// route's handler, so that node is read, never the next route's.
+#[test]
+fn a_return_text_found_in_a_later_route_is_read_in_its_own_handler() {
+    let routes = vec![route(
+        "server.get('/summary'",
+        "GET",
+        "/summary",
+        Some(EmissionStyle::ReturnValue),
+        None,
+        Some(("response", line_of("return response") + 1)),
+    )];
+    let Some(row) = stored_row(&routes, InferKind::FunctionReturn, "server.get('/summary'") else {
+        return;
+    };
+    assert!(
+        !row.both().contains("digestLines") && !row.both().contains("DigestBody"),
+        "the later route's return was stored: {}",
+        row.both()
+    );
+    assert!(
+        row.both().contains("openCount") || row.both().contains("SummaryBody"),
+        "the handler's own return was dropped: {}",
+        row.both()
+    );
+}
+
+/// (4) Two adjacent routes read the same request text. The hint line is
+/// nearer the first route's read, so the inferrer's locator found that one
+/// and the inferrer answered none, while the capture found this route's: the
+/// type text survived on the capture alone and lost its `explicit` label.
+/// The inferrer now reads the one match inside this route's handler.
+#[test]
+fn a_request_text_nearer_the_previous_route_keeps_its_explicit_label() {
+    let routes = vec![
+        route(
+            "server.post('/tickets'",
+            "POST",
+            "/tickets",
+            None,
+            Some((
+                "request.body as TicketBody",
+                line_of("const ticket = request.body as TicketBody"),
+            )),
+            None,
+        ),
+        route(
+            "server.post('/tickets/bulk'",
+            "POST",
+            "/tickets/bulk",
+            None,
+            Some((
+                "request.body as TicketBody",
+                line_of("reply.send({ filed: ticket.ticketTitle })"),
+            )),
+            None,
+        ),
+    ];
+    let Some(row) = stored_row(
+        &routes,
+        InferKind::RequestBody,
+        "server.post('/tickets/bulk'",
+    ) else {
+        return;
+    };
+    assert!(
+        row.both().contains("ticketTitle") || row.both().contains("TicketBody"),
+        "the request type was dropped: {}",
+        row.both()
+    );
+    assert_eq!(
+        row.explicit,
+        Some(true),
+        "the stated request lost its explicit label: {}",
+        row.both()
+    );
+}
+
+/// Must abstain: two one-line arrows call a shared helper that answers with a
+/// text reply, and neither returns it. The helper's reply is not either
+/// route's response.
+#[test]
+fn a_text_reply_in_a_helper_the_handler_does_not_return_stays_unknown() {
+    let hint = ("reply.text(words)", line_of("return reply.text(words)"));
+    let routes = vec![
+        route("server.get('/ping'", "GET", "/ping", None, None, Some(hint)),
+        route("server.get('/pong'", "GET", "/pong", None, None, Some(hint)),
+    ];
+    for opening in ["server.get('/ping'", "server.get('/pong'"] {
+        let Some(row) = stored_row(&routes, InferKind::ResponseBody, opening) else {
+            return;
+        };
+        assert!(
+            !row.both().contains("string"),
+            "{opening}: the helper's text reply was stored: {}",
+            row.both()
+        );
+    }
+}
+
+/// Must abstain: a handler that reads no body, given another route's read as
+/// its request hint.
+#[test]
+fn a_request_hint_for_a_handler_that_reads_no_body_stays_unknown() {
+    let routes = vec![route(
+        "server.post('/touch'",
+        "POST",
+        "/touch",
+        None,
+        Some(("payload", line_of("const payload: OrderBody"))),
+        None,
+    )];
+    let Some(row) = stored_row(&routes, InferKind::RequestBody, "server.post('/touch'") else {
+        return;
+    };
+    assert!(
+        !row.both().contains("quantity") && !row.both().contains("OrderBody"),
+        "another route's request was stored: {}",
+        row.both()
+    );
+}
+
+/// The text found outside occurs inside the right handler as two reads of
+/// different types: which one the model meant is not decided, so the row
+/// abstains rather than pick one.
+#[test]
+fn a_text_found_outside_that_reads_two_types_inside_the_handler_stays_unknown() {
+    let routes = vec![route(
+        "server.get('/right'",
+        "GET",
+        "/right",
+        None,
+        None,
+        Some(("row", line_of("reply.send(row)"))),
+    )];
+    let Some(row) = stored_row(&routes, InferKind::ResponseBody, "server.get('/right'") else {
+        return;
+    };
+    assert!(
+        !row.both().contains("tallied")
+            && !row.both().contains("TallyBody")
+            && !row.both().contains("digestLines")
+            && !row.both().contains("DigestBody"),
+        "an ambiguous text was read: {}",
+        row.both()
     );
 }

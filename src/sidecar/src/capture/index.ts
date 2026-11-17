@@ -95,7 +95,7 @@ export { moduleExport } from './anchors.js';
 // One node locator and one machinery test for the inferrer and the capture
 // (carrick#3500).
 export {
-  anchorOutsideHandler,
+  anchorInHandler,
   callNamedBy,
   callResultNamesNoCall,
   isFrameworkMachinery,

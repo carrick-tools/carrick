@@ -21,10 +21,11 @@ import {
 } from './node-builder.js';
 import { typeIsOrContainsMachinery } from './machinery.js';
 import {
-  anchorOutsideHandler,
+  anchorInHandler,
   callNamedBy,
   callResultNamesNoCall,
   firstExactLocatorMatch,
+  isPreferredTarget,
 } from './site-node.js';
 import { readResultLabel } from './result-label.js';
 import { installedPackageSpecifier } from './installed-package.js';
@@ -435,31 +436,36 @@ export function resolveAnchor(
       args.repoRoot
     );
   }
-  const found = locate(sourceFile, request);
-  if (!found) {
+  const located0 = locate(sourceFile, request);
+  if (!located0) {
     return demote(locatorFailureReason(request), 'site_unreadable');
   }
-  // Stale-position T2: a node the text or line locator found must sit in the
-  // handler of the row it is for. Another route's node, or a callback's
-  // return, is that node's type and not this route's, so the anchor abstains
-  // (final: it does not fall through to a later locator).
+  // Stale-position T2: a node the text or line locator found must be the
+  // row's own: inside the handler or a function its return reaches. One found
+  // elsewhere is replaced by the one node inside them its text names, or the
+  // anchor abstains (final: it does not fall through to a later locator).
+  let found = located0;
   if (found.by !== 'span' && request.handler_lines) {
-    const outside = anchorOutsideHandler(
+    const own = anchorInHandler(
       checker,
       sourceFile,
       found.node,
       request.handler_lines,
-      request.infer_kind
+      request.infer_kind,
+      request.expression_text
     );
-    if (outside) {
+    if ('reason' in own) {
       return {
         request,
         aliasText: 'unknown',
         serialization: 'structural_fallback',
-        abstainReason: outside,
+        abstainReason: own.reason,
         unreadCause: 'not_located',
       };
     }
+    // A node re-found by the locator's text is a text match, whichever
+    // locator found the first one.
+    if (own.node !== found.node) found = { node: own.node, by: 'text' };
   }
   // carrick#1785: the line fallback takes the first expression on the line,
   // and a declaration's NAME is an expression to `ts.isExpression`. On a line
@@ -1667,15 +1673,7 @@ function declarationNamedBy(node: ts.Node): ts.Declaration | undefined {
   return named && parent.name === node ? parent : undefined;
 }
 
-/** The nodes a value type can be read at: the capture's own target rule. */
-export function isPreferredTarget(node: ts.Node): boolean {
-  return (
-    ts.isExpression(node) ||
-    ts.isVariableDeclaration(node) ||
-    ts.isParameter(node) ||
-    ts.isPropertyAssignment(node)
-  );
-}
+export { isPreferredTarget };
 
 /**
  * The deepest node a span names: a value-space target covering it, or a TYPE
