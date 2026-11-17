@@ -6,7 +6,10 @@
 //
 // The join (P9): a route row by (row file, `METHOD path{dispatch}`), never by
 // line; a part-2 consumer call row by place identity, its (file, line) being
-// one of the early row's group places. What follows from it (P10), per early
+// one of the early row's group places. An early CALL row (a consumer-side
+// item, HM4 D2) joins the other way round: by the call's place (edited file,
+// the call's current line), method, response side and label; and a part-2
+// route row at one of its producer places is its mirror. What follows from it (P10), per early
 // break:
 // - part 2 states the same break (same result kind): `same`, nothing more;
 // - part 2 calls the row compatible: `differ`, one correction line;
@@ -36,6 +39,7 @@ export type HeldBucket = RowOutcome | "part2_only" | "none";
 
 /** A consumer place of an early row: a counterpart's file (its own repo's) and line. */
 type Place = { file: string; line: number };
+type RowKind = "route" | "call";
 
 /** One break of the early answer: an item in the edited file or a moved row in another. */
 export type EarlyRow = {
@@ -47,7 +51,8 @@ export type EarlyRow = {
   places: Place[];
 };
 
-const keyOf = (file: string, label: string): string => `${file}\0${label}`;
+/** A call's key carries its line: two calls of one event in one file are two rows. */
+const keyOf = (file: string, label: string, line?: number): string => (line === undefined ? `${file}\0${label}` : `${file}\0${label}\0${line}`);
 
 function placeOf(text: string): Place | null {
   const match = /^\S+ (.+):(\d+)$/.exec(text);
@@ -62,11 +67,11 @@ export function earlyRows(early: CheckResult): EarlyRow[] {
     const label = itemLabel(item);
     if (label === null) continue;
     const places = (item.counterparts ?? []).flatMap((c) => (c.file && c.line !== undefined ? [{ file: c.file, line: c.line }] : []));
-    out.push({ key: keyOf(file, label), label, item, places });
+    out.push({ key: keyOf(file, label, item.kind === "call" ? (item.line ?? 0) : undefined), label, item, places });
   }
   for (const row of statedMoved(early)) {
     const label = `${row.method} ${row.path}`;
-    out.push({ key: keyOf(row.file, label), label, moved: row, places: row.counterparts.map(placeOf).filter((p): p is Place => p !== null) });
+    out.push({ key: keyOf(row.file, label, row.role === "call" ? (row.line ?? 0) : undefined), label, moved: row, places: row.counterparts.map(placeOf).filter((p): p is Place => p !== null) });
   }
   return out;
 }
@@ -90,6 +95,19 @@ export type Compared = {
 const samePlace = (file: string, line: number | undefined, place: Place): boolean =>
   line === place.line && (file === place.file || file.endsWith(`/${place.file}`));
 
+/** Whether an early row is a consumer-side call (an item of kind `call`, or a moved row of role `call`). */
+const earlyRowKind = (row: EarlyRow): RowKind => (row.item?.kind === "call" || row.moved?.role === "call" ? "call" : "route");
+
+/** The kind of a part-2 row: a check item's `kind`, a moved row's `role`. */
+const partKind = (row: CheckItem | MovedRow): RowKind => (("kind" in row ? row.kind : row.role) === "call" ? "call" : "route");
+
+/** The label a correction names: a call's label gains its place, so two calls of one event are told apart. */
+function correctionLabel(row: EarlyRow, early: CheckResult): string {
+  if (earlyRowKind(row) !== "call") return row.label;
+  const at = row.item ? `${early.file ?? ""}:${row.item.line ?? ""}` : `${row.moved!.file}:${row.moved!.line ?? ""}`;
+  return `${row.label} at ${at}`;
+}
+
 /** The result kind an early row states: `type_mismatch` for an item, the row's `after` for a moved row. */
 const earlyKind = (row: EarlyRow): string | null => row.item?.verdict?.result ?? row.moved?.after ?? null;
 
@@ -99,9 +117,9 @@ const callKind = (row: CheckItem | MovedRow): string | null => ("kind" in row ? 
 /** Part 2's route item is a response-side statement, the side the early answer states. */
 const responseSide = (item: CheckItem): boolean => item.direction == null || item.direction === "response";
 
-/** The places of the early rows `rows`, each with the kind its row states. */
-const placesOf = (rows: readonly EarlyRow[]): Array<Place & { kind: string | null }> =>
-  rows.flatMap((row) => row.places.map((place) => ({ ...place, kind: earlyKind(row) })));
+/** The places of the early rows `rows`, each with the result its row states and the kind of the row. */
+const placesOf = (rows: readonly EarlyRow[]): Array<Place & { kind: string | null; rowKind: RowKind }> =>
+  rows.flatMap((row) => row.places.map((place) => ({ ...place, kind: earlyKind(row), rowKind: earlyRowKind(row) })));
 
 /**
  * Compare an entry's early answer with its full answer. `full` undefined (or an
@@ -121,9 +139,14 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
   // holds the index's stored verdicts for an older file state: it judged no row, so it corrects none.
   const judged = usable?.recheck?.ran !== "none";
   const matched = new Set<CheckItem | MovedRow>();
+  // An early call item's part-2 row: the same place, method and label on the response side.
+  const callMatch = (own: CheckItem, label: string): CheckItem | null => {
+    const at = items.filter((item) => item.kind === "call" && item.line === own.line && item.method === own.method && responseSide(item) && !matched.has(item) && itemLabel(item) === label);
+    return at[0] ?? null;
+  };
   let compared: RowCompared[] = rows.map((row) => {
     if (row.item) {
-      const match = items.find((item) => item.kind === "route" && itemLabel(item) === row.label && responseSide(item)) ?? null;
+      const match = row.item.kind === "call" ? callMatch(row.item, row.label) : (items.find((item) => item.kind === "route" && itemLabel(item) === row.label && responseSide(item)) ?? null);
       if (match) matched.add(match);
       const verdict = match?.verdict ?? null;
       if (match === null) return { row, outcome: "part3_only", p2_state: "absent", corrected: false, match };
@@ -135,7 +158,10 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
       return { row, outcome: "part3_only", p2_state: "not_judged", corrected: false, match };
     }
     const own = row.moved!;
-    const match = moved.find((m) => m.role === "route" && m.file === own.file && `${m.method} ${m.path}` === row.label) ?? null;
+    const match =
+      own.role === "call"
+        ? (moved.find((m) => m.role === "call" && m.method === own.method && `${m.method} ${m.path}` === row.label && !matched.has(m) && samePlace(m.file, m.line, { file: own.file, line: own.line ?? -1 })) ?? null)
+        : (moved.find((m) => m.role === "route" && m.file === own.file && `${m.method} ${m.path}` === row.label) ?? null);
     if (match === null) return { row, outcome: "part3_only", p2_state: "absent", corrected: false, match };
     matched.add(match);
     return { row, outcome: match.after === own.after ? "same" : "differ", corrected: false, match };
@@ -147,24 +173,25 @@ export function compareEarly(early: CheckResult, full: CheckResult | undefined):
   // only when it states the same result. One of another result is a break the
   // early answer lacked: it prints, and the early row it sits at is `differ`.
   const differing = new Set<EarlyRow>();
+  // A part-2 row mirrors only the places of an early row of the opposite kind: a call row the producer's
+  // consumers, a route row a call's producers.
   const sort = (row: CheckItem | MovedRow, file: string): void => {
-    const at = standing.filter((place) => samePlace(file, row.line, place));
+    const opposite = (rowKind: RowKind): boolean => rowKind !== partKind(row);
+    const at = standing.filter((place) => opposite(place.rowKind) && samePlace(file, row.line, place));
     if (at.length === 0) return void part2Only.push(row);
     if (at.some((place) => place.kind === callKind(row))) return void mirrors.push(row);
-    const flipped = compared.filter((c) => c.outcome === "part3_only" && c.row.places.some((place) => samePlace(file, row.line, place)));
+    const flipped = compared.filter((c) => c.outcome === "part3_only" && opposite(earlyRowKind(c.row)) && c.row.places.some((place) => samePlace(file, row.line, place)));
     for (const c of flipped) differing.add(c.row);
     // Counted once: as the early row's `differ`, or as `part2_only` when no early row was left standing at it.
     if (flipped.length === 0) part2Only.push(row);
   };
   for (const item of usable ? problemItems(usable) : []) {
     if (matched.has(item)) continue;
-    if (item.kind === "call") sort(item, fullFile);
-    else part2Only.push(item);
+    sort(item, fullFile);
   }
   for (const row of moved) {
     if (matched.has(row)) continue;
-    if (row.role === "call") sort(row, row.file);
-    else part2Only.push(row);
+    sort(row, row.file);
   }
   compared = compared.map((c) => (differing.has(c.row) ? { ...c, outcome: "differ", p2_state: undefined } : c));
   return { rows: compared, part2Only, mirrors };
@@ -196,12 +223,12 @@ export function confirmedResult(full: CheckResult, early: CheckResult, said: Rea
   const saidRows = compared.rows.filter((c) => said.has(c.row.key));
   for (const c of saidRows) {
     if (c.outcome === "same" && c.match) drop.add(c.match);
-    if (c.corrected) corrected.push(c.row.label);
+    if (c.corrected) corrected.push(correctionLabel(c.row, early));
   }
   const saidPlaces = placesOf(saidRows.filter((c) => !c.corrected).map((c) => c.row));
   for (const row of compared.mirrors) {
     const file = "kind" in row ? (full.file ?? "") : row.file;
-    if (saidPlaces.some((place) => place.kind === callKind(row) && samePlace(file, row.line, place))) drop.add(row);
+    if (saidPlaces.some((place) => place.rowKind !== partKind(row) && place.kind === callKind(row) && samePlace(file, row.line, place))) drop.add(row);
   }
   if (drop.size === 0) return { result: full, corrected };
   const items = (full.items ?? []).filter((item) => !drop.has(item));
@@ -237,7 +264,7 @@ export function keepRows(early: CheckResult, keep: (row: EarlyRow) => boolean): 
 
 /** An early break on a route in another file, as the item Stop counts: it is never listed, only counted and named. */
 function movedBreak(row: MovedRow): CheckItem {
-  return { kind: "route", method: row.method, path: row.path, direction: "response", verdict: { state: "resolved", result: row.after, detail: row.reason }, stated: true };
+  return { kind: row.role, method: row.method, path: row.path, ...(row.role === "call" && row.line !== undefined ? { line: row.line } : {}), direction: "response", verdict: { state: "resolved", result: row.after, detail: row.reason }, stated: true };
 }
 
 /**
