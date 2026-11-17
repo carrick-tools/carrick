@@ -73,7 +73,18 @@ export type ContractGroup = {
   type: string;
   symbol: string | null;
   home: { file: string; line: number } | null;
-  places: Array<{ service: string; repo: string; file: string; line: number | null; loc: string }>;
+  places: Array<{
+    service: string;
+    repo: string;
+    file: string;
+    line: number | null;
+    loc: string;
+    /** The place's own entry fields, as the wire states them; absent on an older file. */
+    alias?: string | null;
+    infer_kind?: string | null;
+    /** UTF-16 `[start, end)` of the place's payload node in its file, or null when the scan read none. */
+    span?: [number, number] | null;
+  }>;
   total: number;
   shown: number;
   lead: string | null;
@@ -215,6 +226,13 @@ export type FactStore = {
    * `[]` for a file built without the `contracts` table.
    */
   graphqlProducerResponses: () => ContractRow[];
+  /**
+   * Every socket response row of both sides, in wire order: the listener rows
+   * carry the emitters' places (with spans), the emitter rows the listener's
+   * type. Input of `messageSendRows`; nothing calls it yet. `[]` for a file
+   * built without the `contracts` table.
+   */
+  messageRows: () => ContractRow[];
   /** The SDL type table the cloud wrote for `service` of `repo`, or null (no row, or a file an older package built). */
   graphqlTypes: (repo: string, service: string) => GraphqlTypeTable | null;
   /**
@@ -283,6 +301,7 @@ export async function openFacts(root: string): Promise<FactStore | null> {
     let chains: ReturnType<typeof open.prepare> | null | undefined;
     let producerResponses: ReturnType<typeof open.prepare> | null | undefined;
     let graphqlResponses: ReturnType<typeof open.prepare> | null | undefined;
+    let messageResponses: ReturnType<typeof open.prepare> | null | undefined;
     let graphqlTable: ReturnType<typeof open.prepare> | null | undefined;
     handed = true;
     return {
@@ -355,6 +374,20 @@ export async function openFacts(root: string): Promise<FactStore | null> {
         }
         if (graphqlResponses === null) return [];
         return graphqlResponses.all().map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
+      },
+      messageRows: () => {
+        if (messageResponses === undefined) {
+          try {
+            messageResponses = open.prepare(
+              "SELECT row FROM contracts WHERE direction = 'response' AND protocol = 'socket' ORDER BY id",
+            );
+          } catch {
+            // No table: a file an older package built.
+            messageResponses = null;
+          }
+        }
+        if (messageResponses === null) return [];
+        return messageResponses.all().map((raw) => JSON.parse(String(raw["row"])) as ContractRow);
       },
       graphqlTypes: (repo, service) => {
         if (graphqlTable === undefined) {
