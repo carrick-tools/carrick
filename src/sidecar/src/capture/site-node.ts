@@ -424,25 +424,40 @@ function linesOf(sourceFile: ts.SourceFile, node: ts.Node): HandlerLines {
 }
 
 /**
- * The function the scanner stamped `lines` for: an outermost function in
- * `sourceFile` that starts and ends on exactly those lines (a callback that
- * shares both lines with its handler sits inside it), the last of several as
- * the registration's handler is its last argument.
+ * Whether `fn` is handed to a call the way a registration hands in its
+ * handler: the last of at least two arguments (a path or a middleware, then
+ * the handler). A loop callback that registers (`kinds.forEach((k) =>
+ * app.get(...))`) or a transaction callback is a call's only argument.
+ */
+function handedInLast(fn: FunctionNode): boolean {
+  const call = fn.parent;
+  return (
+    !!call &&
+    ts.isCallExpression(call) &&
+    call.arguments.length >= 2 &&
+    call.arguments[call.arguments.length - 1] === fn
+  );
+}
+
+/**
+ * The function the scanner stamped `lines` for, among the functions in
+ * `sourceFile` that start and end on exactly those lines: the outermost one
+ * handed in last to a call of two or more arguments, as the registration
+ * hands in its handler, else the outermost of them. Several literals can
+ * share one line: a callback inside its handler, or a handler inside the
+ * loop callback that registers it.
  */
 function handlerOnLines(sourceFile: ts.SourceFile, lines: HandlerLines): FunctionNode | undefined {
-  let handler: FunctionNode | undefined;
+  const onLines: FunctionNode[] = [];
   const visit = (node: ts.Node): void => {
     if (isFunctionNode(node)) {
       const own = linesOf(sourceFile, node);
-      if (own.start_line === lines.start_line && own.end_line === lines.end_line) {
-        handler = node;
-        return;
-      }
+      if (own.start_line === lines.start_line && own.end_line === lines.end_line) onLines.push(node);
     }
     ts.forEachChild(node, visit);
   };
   ts.forEachChild(sourceFile, visit);
-  return handler;
+  return onLines.find(handedInLast) ?? onLines[0];
 }
 
 /** The expressions `fn` returns: its expression body, or its own `return`s. */
