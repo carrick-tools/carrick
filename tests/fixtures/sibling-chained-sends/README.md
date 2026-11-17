@@ -16,7 +16,7 @@ Answer key, `services/app/src/relay.ts` (the app's blob), floor only (the
 | 5, 6 | construction only; `close()` (controls) | nothing |
 | 7 | `createClient(...).get`, chained | the old path's row `GET /kit/chained`, plus unread `missed_inside` until the reading lands |
 | 8 | `createClient(...).get`, held | the old path's row `GET /kit/held`; a held local is not linked to its maker, so no floor row |
-| 9 | `new BroadcastChannel('kit-bus').postMessage` | unread `missed_inside`, slot `callee` |
+| 9 | `new BroadcastChannel('kit-bus').postMessage` | unread `unanswered`, slot `name`, labelled end `BroadcastChannel.postMessage` (keyed by the type of the `new`, as a held one is; carrick#4498) |
 
 `controls-relay.ts` lines 2 and 3 (a `Queue` construction beside
 `target.addEventListener`; a `BroadcastChannel` construction beside
@@ -29,5 +29,5 @@ needs a `package-lock.json` entry or the store never asks for it.
 With the declaration ask widened to the sibling's members (T1, carrick#4445),
 line 2 is a possible call (`pubsub producer`, `unanswered`) and an unread site
 `unanswered`, slot `kind`, with the labelled end `Queue.add`. Lines 3 to 8 do
-not move. Line 9 stays with the floor: the app loads no DOM lib, so the bus
-send is not verified from the app's root.
+not move. Line 9 is keyed by the type of its `new` (carrick#4498), from the
+language's own library types, so it is an unread site, not a verified send.
